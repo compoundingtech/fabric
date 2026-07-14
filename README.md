@@ -20,7 +20,18 @@ The binary is `target/debug/fabric` during development.
 
 ## Install
 
-From a cloned repo, install `fabric` onto your PATH:
+Fast path for macOS and Linux:
+
+```sh
+curl -sSf https://raw.githubusercontent.com/myobie/fabric/main/install.sh | sh
+```
+
+The remote installer downloads a matching prebuilt release binary into
+`~/.local/bin/fabric` when one exists. If no prebuilt binary matches your
+machine, it falls back to cloning this repo and building with Cargo. Ensure
+`~/.local/bin` is on PATH.
+
+From a cloned repo:
 
 ```sh
 ./install.sh
@@ -32,8 +43,8 @@ or:
 make install
 ```
 
-This builds a release binary and copies it to `~/.local/bin/fabric`. Ensure
-`~/.local/bin` is on PATH.
+The cloned-repo installer builds the current checkout and copies the release
+binary to `~/.local/bin/fabric`.
 
 Rust users can also install through Cargo:
 
