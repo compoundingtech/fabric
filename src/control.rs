@@ -26,6 +26,7 @@ pub enum ControlResponse {
         dial_sockets: Vec<PathBuf>,
     },
     ReachabilityStatus {
+        version: String,
         node_id: String,
         endpoint_addr: serde_json::Value,
         exposed_protocols: Vec<String>,

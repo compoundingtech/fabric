@@ -50,6 +50,23 @@ fn key_gen_writes_identity_consumed_by_id() -> Result<()> {
 }
 
 #[test]
+fn version_flag_prints_semver_and_build_sha() -> Result<()> {
+    let version = stdout(
+        Command::new(fabric_bin())
+            .arg("--version")
+            .output()
+            .context("failed to run fabric --version")?,
+    )?;
+    let prefix = format!("{}+", env!("CARGO_PKG_VERSION"));
+    assert!(
+        version.starts_with(&prefix),
+        "version {version:?} did not start with {prefix:?}"
+    );
+    assert!(version.len() > prefix.len());
+    Ok(())
+}
+
+#[test]
 fn peers_lists_declarative_config_without_add() -> Result<()> {
     let temp = TempDir::new()?;
     let home = temp.path().join("home");

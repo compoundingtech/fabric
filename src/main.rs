@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use fabric::{
     config::{
         FabricHome, PeerBook, generate_identity_file, load_or_create_identity, parse_addr_json,
@@ -23,11 +23,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[command(name = "fabric")]
 #[command(about = "Local socket facade for iroh-backed cross-machine transports")]
 struct Cli {
+    #[arg(long)]
+    version: bool,
+
     #[arg(long, global = true)]
     home: Option<PathBuf>,
 
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -99,8 +102,18 @@ enum KeyCommands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.version {
+        println!("{}", fabric::version_string());
+        return Ok(());
+    }
 
-    match cli.command {
+    let Some(command) = cli.command else {
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    };
+
+    match command {
         Commands::Key {
             command: KeyCommands::Gen { out },
         } => {
@@ -124,6 +137,7 @@ async fn main() -> Result<()> {
                 Commands::Status => {
                     match send_control(&home, ControlRequest::ReachabilityStatus).await? {
                         ControlResponse::ReachabilityStatus {
+                            version,
                             node_id,
                             endpoint_addr,
                             exposed_protocols,
@@ -131,6 +145,7 @@ async fn main() -> Result<()> {
                             peers,
                         } => {
                             print_status(
+                                &version,
                                 &node_id,
                                 &endpoint_addr,
                                 &exposed_protocols,
@@ -240,12 +255,14 @@ async fn main() -> Result<()> {
 }
 
 fn print_status(
+    version: &str,
     node_id: &str,
     endpoint_addr: &serde_json::Value,
     exposed_protocols: &[String],
     dial_sockets: &[PathBuf],
     peers: &[PeerReachability],
 ) -> Result<()> {
+    println!("version\t{version}");
     println!("node\t{node_id}");
     println!("addr\t{}", serde_json::to_string(endpoint_addr)?);
     println!("exposed\t{}", joined_or_dash(exposed_protocols));

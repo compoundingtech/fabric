@@ -247,6 +247,7 @@ impl DaemonState {
             self.local_status_fields().await?;
         let peers = self.peer_reachability().await;
         Ok(ControlResponse::ReachabilityStatus {
+            version: crate::version_string(),
             node_id,
             endpoint_addr,
             exposed_protocols,

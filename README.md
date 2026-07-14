@@ -92,6 +92,12 @@ endpoint allow-list.
 ## Commands
 
 ```sh
+fabric --version
+```
+
+Print the installed build version as `<semver>+<short-git-sha>`.
+
+```sh
 fabric key gen --out <path>
 ```
 
@@ -118,6 +124,7 @@ fabric status
 Show the running daemon's local state and echo-ping every trusted peer. Each
 peer is reported as reachable or unreachable with round-trip latency and, when
 iroh exposes it, the active transport path: `direct`, `relay`, or `mixed`.
+Status also prints the daemon build version.
 
 ```sh
 fabric add <nodeid> [name] [--addr-json JSON]

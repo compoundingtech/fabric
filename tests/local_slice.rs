@@ -237,9 +237,10 @@ async fn status_reports_peer_reachability() -> Result<()> {
     .await?;
 
     let response = send_control(&node_b_home, ControlRequest::ReachabilityStatus).await?;
-    let ControlResponse::ReachabilityStatus { peers, .. } = response else {
+    let ControlResponse::ReachabilityStatus { version, peers, .. } = response else {
         panic!("unexpected response: {response:?}");
     };
+    assert_eq!(version, fabric::version_string());
     let peer = peers
         .iter()
         .find(|peer| peer.name.as_deref() == Some("node-a"))

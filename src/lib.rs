@@ -12,6 +12,14 @@ pub mod shell;
 
 const SPIKE_ALPN: &[u8] = b"fabric/spike/echo/0";
 
+pub fn version_string() -> String {
+    format!(
+        "{}+{}",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("FABRIC_BUILD_SHA").unwrap_or("unknown")
+    )
+}
+
 pub async fn iroh_spike_round_trip(payload: &[u8]) -> Result<Vec<u8>> {
     let router = start_spike_accept_side().await?;
     router.endpoint().online().await;
