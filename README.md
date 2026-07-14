@@ -1,3 +1,5 @@
+> Status: EXPERIMENTAL. Early spike / prototype -- the CLI, APIs, and on-disk formats will change without notice; no stability or security guarantees yet; not production-ready. Use at your own risk.
+
 # fabric
 
 fabric is a standalone Rust CLI and local daemon that hides iroh behind local Unix
