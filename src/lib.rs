@@ -5,6 +5,10 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 
+pub mod config;
+pub mod control;
+pub mod daemon;
+
 const SPIKE_ALPN: &[u8] = b"fabric/spike/echo/0";
 
 pub async fn iroh_spike_round_trip(payload: &[u8]) -> Result<Vec<u8>> {
