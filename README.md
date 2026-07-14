@@ -20,7 +20,22 @@ The binary is `target/debug/fabric` during development.
 
 ## Install
 
-Install `fabric` onto your PATH:
+From a cloned repo, install `fabric` onto your PATH:
+
+```sh
+./install.sh
+```
+
+or:
+
+```sh
+make install
+```
+
+This builds a release binary and copies it to `~/.local/bin/fabric`. Ensure
+`~/.local/bin` is on PATH.
+
+Rust users can also install through Cargo:
 
 ```sh
 cargo install --path .
