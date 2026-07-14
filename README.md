@@ -18,6 +18,25 @@ cargo test
 
 The binary is `target/debug/fabric` during development.
 
+## Install
+
+Install `fabric` onto your PATH:
+
+```sh
+cargo install --path .
+```
+
+This installs `fabric` to `~/.cargo/bin`, which rustup normally adds to PATH via
+`~/.cargo/env`. Re-run the install command after local changes to update the
+installed binary.
+
+For quick development without installing:
+
+```sh
+cargo run -- <command>
+./target/debug/fabric <command>
+```
+
 ## State
 
 By default fabric stores local state in:
