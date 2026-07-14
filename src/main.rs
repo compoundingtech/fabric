@@ -58,6 +58,8 @@ enum Commands {
     },
     /// Create a local Unix socket that tunnels to a peer's exposed protocol.
     Dial { peer: String, protocol: String },
+    /// Round-trip a random nonce through a peer's built-in echo protocol.
+    Ping { peer: String },
     /// Internal foreground daemon entrypoint.
     #[command(hide = true)]
     Daemon,
@@ -126,6 +128,19 @@ async fn main() -> Result<()> {
         Commands::Dial { peer, protocol } => {
             match send_control(&home, ControlRequest::Dial { peer, protocol }).await? {
                 ControlResponse::Dial { socket } => println!("{}", socket.display()),
+                response => bail!("unexpected daemon response: {response:?}"),
+            }
+        }
+        Commands::Ping { peer } => {
+            match send_control(&home, ControlRequest::Ping { peer }).await? {
+                ControlResponse::Pong {
+                    peer,
+                    bytes,
+                    round_trip_micros,
+                } => {
+                    let millis = round_trip_micros as f64 / 1000.0;
+                    println!("pong from {peer}: {bytes} bytes in {millis:.3} ms");
+                }
                 response => bail!("unexpected daemon response: {response:?}"),
             }
         }

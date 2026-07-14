@@ -140,6 +140,15 @@ fabric dial <peer> <protocol>
 Create and print a local Unix socket path. Connections to that socket are
 tunneled to the peer's exposed protocol over iroh.
 
+```sh
+fabric ping <peer>
+```
+
+Connectivity and trust test. `fabric ping` dials the peer's built-in
+ACL-gated echo protocol, sends a random nonce, verifies the same bytes come
+back, and prints the round-trip latency. Use this first when bringing up a new
+machine.
+
 ## Local Two-Node Test
 
 The automated integration test is the canonical local walkthrough:

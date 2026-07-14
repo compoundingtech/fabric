@@ -9,6 +9,7 @@ pub enum ControlRequest {
     ReloadPeers,
     Expose { protocol: String, socket: PathBuf },
     Dial { peer: String, protocol: String },
+    Ping { peer: String },
     Shutdown,
 }
 
@@ -24,6 +25,11 @@ pub enum ControlResponse {
     },
     Dial {
         socket: PathBuf,
+    },
+    Pong {
+        peer: String,
+        bytes: usize,
+        round_trip_micros: u64,
     },
     Error {
         message: String,

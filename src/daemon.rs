@@ -27,6 +27,8 @@ use crate::{
     control::{ControlRequest, ControlResponse},
 };
 
+const BUILTIN_ECHO_ALPN: &[u8] = b"fabric/echo/0";
+
 #[derive(Debug)]
 struct AllowListHook {
     allowed: Arc<RwLock<HashSet<EndpointId>>>,
@@ -68,6 +70,7 @@ impl DaemonState {
         let allowed = Arc::new(RwLock::new(peer_book.trusted_ids()));
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
+            .alpns(vec![BUILTIN_ECHO_ALPN.to_vec()])
             .hooks(AllowListHook {
                 allowed: allowed.clone(),
             })
@@ -104,14 +107,48 @@ impl DaemonState {
 
     pub async fn expose(&self, protocol: &str, socket: PathBuf) -> Result<()> {
         let alpn = validate_protocol(protocol)?;
+        if alpn == BUILTIN_ECHO_ALPN {
+            bail!("{protocol:?} is reserved for fabric's built-in echo protocol");
+        }
         if !socket.is_absolute() {
             bail!("expose socket must be an absolute path");
         }
 
         let mut exposures = self.exposures.write().await;
         exposures.insert(alpn, socket);
-        self.endpoint.set_alpns(exposures.keys().cloned().collect());
+        self.endpoint.set_alpns(accepted_alpns(&exposures));
         Ok(())
+    }
+
+    pub async fn ping(&self, peer: &str) -> Result<PingOutcome> {
+        let peer_addr = self.peer_book.read().await.resolve(peer)?;
+        let nonce = rand::random::<[u8; 32]>();
+        let started = std::time::Instant::now();
+        let connection = self
+            .endpoint
+            .connect(peer_addr.clone(), BUILTIN_ECHO_ALPN)
+            .await
+            .with_context(|| format!("failed to connect to {peer:?} built-in echo"))?;
+        let (mut send, mut recv) = connection.open_bi().await?;
+
+        send.write_all(&nonce).await?;
+        send.finish()?;
+
+        let response = recv.read_to_end(nonce.len() + 1).await?;
+        let round_trip = started.elapsed();
+        if response != nonce {
+            bail!(
+                "ping nonce mismatch from {peer:?}: sent {} bytes, got {} bytes",
+                nonce.len(),
+                response.len()
+            );
+        }
+
+        Ok(PingOutcome {
+            peer: peer_addr.id.to_string(),
+            bytes: response.len(),
+            round_trip,
+        })
     }
 
     pub async fn dial(&self, peer: &str, protocol: &str) -> Result<PathBuf> {
@@ -165,6 +202,13 @@ impl DaemonState {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct PingOutcome {
+    pub peer: String,
+    pub bytes: usize,
+    pub round_trip: Duration,
+}
+
 pub struct FabricNode {
     state: Arc<DaemonState>,
     task: JoinHandle<Result<()>>,
@@ -196,6 +240,10 @@ impl FabricNode {
 
     pub async fn dial(&self, peer: &str, protocol: &str) -> Result<PathBuf> {
         self.state.dial(peer, protocol).await
+    }
+
+    pub async fn ping(&self, peer: &str) -> Result<PingOutcome> {
+        self.state.ping(peer).await
     }
 
     pub async fn shutdown(self) -> Result<()> {
@@ -308,6 +356,14 @@ async fn process_control_request(
             let socket = state.dial(&peer, &protocol).await?;
             ControlResponse::Dial { socket }
         }
+        ControlRequest::Ping { peer } => {
+            let pong = state.ping(&peer).await?;
+            ControlResponse::Pong {
+                peer: pong.peer,
+                bytes: pong.bytes,
+                round_trip_micros: pong.round_trip.as_micros().try_into().unwrap_or(u64::MAX),
+            }
+        }
         ControlRequest::Shutdown => {
             state.cancel.cancel();
             ControlResponse::Ok
@@ -340,6 +396,12 @@ async fn handle_incoming_iroh(incoming: Incoming, state: Arc<DaemonState>) {
 async fn process_incoming_iroh(incoming: Incoming, state: Arc<DaemonState>) -> Result<()> {
     let mut accepting = incoming.accept()?;
     let alpn = accepting.alpn().await?;
+    if alpn == BUILTIN_ECHO_ALPN {
+        let connection = accepting.await?;
+        handle_builtin_echo(connection).await?;
+        return Ok(());
+    }
+
     let socket = {
         let exposures = state.exposures.read().await;
         exposures.get(alpn.as_slice()).cloned()
@@ -355,6 +417,21 @@ async fn process_incoming_iroh(incoming: Incoming, state: Arc<DaemonState>) -> R
         .with_context(|| format!("failed to connect exposed socket {}", socket.display()))?;
     pipe_unix_iroh(local, send, recv).await?;
     Ok(())
+}
+
+async fn handle_builtin_echo(connection: Connection) -> Result<()> {
+    let (mut send, mut recv) = connection.accept_bi().await?;
+    tokio::io::copy(&mut recv, &mut send).await?;
+    send.finish()?;
+    connection.closed().await;
+    Ok(())
+}
+
+fn accepted_alpns(exposures: &HashMap<Vec<u8>, PathBuf>) -> Vec<Vec<u8>> {
+    let mut alpns = Vec::with_capacity(exposures.len() + 1);
+    alpns.push(BUILTIN_ECHO_ALPN.to_vec());
+    alpns.extend(exposures.keys().cloned());
+    alpns
 }
 
 async fn run_dial_socket(

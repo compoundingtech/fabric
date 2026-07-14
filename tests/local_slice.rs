@@ -69,6 +69,9 @@ async fn local_expose_dial_round_trips_and_acl_rejects_unknown_node() -> Result<
     assert_eq!(response, payload);
     assert_eq!(echo_hits.load(Ordering::SeqCst), 1);
 
+    let ping = node_b.ping("node-a").await?;
+    assert_eq!(ping.bytes, 32);
+
     let unauthorized_socket = node_c.dial("node-a", "pty-view").await?;
     let unauthorized = tokio::time::timeout(
         Duration::from_secs(5),
@@ -84,6 +87,23 @@ async fn local_expose_dial_round_trips_and_acl_rejects_unknown_node() -> Result<
         1,
         "unauthorized node reached node A's local service"
     );
+
+    let rejected_ping = node_c.ping("node-a").await;
+    assert!(
+        rejected_ping.is_err(),
+        "unauthorized node unexpectedly reached the built-in echo"
+    );
+
+    trust_peer(
+        &node_a_home,
+        &node_a,
+        node_c.id(),
+        Some("node-c"),
+        Some(node_c.addr()),
+    )
+    .await?;
+    let trusted_later_ping = node_c.ping("node-a").await?;
+    assert_eq!(trusted_later_ping.bytes, 32);
 
     echo_task.abort();
     node_c.shutdown().await?;
