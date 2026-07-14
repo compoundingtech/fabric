@@ -1,13 +1,18 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::PathBuf,
+    process::{Command as ProcessCommand, Stdio},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, bail};
 use iroh::{
@@ -63,10 +68,22 @@ pub struct DaemonState {
     peer_book: RwLock<PeerBook>,
     allowed: Arc<RwLock<HashSet<EndpointId>>>,
     exposures: RwLock<HashMap<Vec<u8>, PathBuf>>,
-    dial_sockets: Mutex<HashMap<(String, String), PathBuf>>,
+    dial_sockets: Mutex<HashMap<(String, String), DialSocket>>,
     builtin_echo_hits: AtomicUsize,
     allow_shell: bool,
     cancel: CancellationToken,
+}
+
+#[derive(Debug, Clone)]
+struct DialSocket {
+    path: PathBuf,
+    peer_addr: EndpointAddr,
+}
+
+#[derive(Debug)]
+struct RestartPlan {
+    log: PathBuf,
+    allow_shell: bool,
 }
 
 impl DaemonState {
@@ -177,28 +194,45 @@ impl DaemonState {
 
     pub async fn dial(&self, peer: &str, protocol: &str) -> Result<PathBuf> {
         let alpn = validate_protocol(protocol)?;
-        self.dial_alpn(peer, protocol, alpn).await
+        self.dial_alpn(peer, protocol, alpn, true).await
     }
 
-    async fn dial_alpn(&self, peer: &str, protocol: &str, alpn: Vec<u8>) -> Result<PathBuf> {
+    async fn dial_alpn(
+        &self,
+        peer: &str,
+        protocol: &str,
+        alpn: Vec<u8>,
+        reuse_existing: bool,
+    ) -> Result<PathBuf> {
         let peer_addr = self.peer_book.read().await.resolve(peer)?;
         let key = (peer_addr.id.to_string(), protocol.to_string());
 
         let mut sockets = self.dial_sockets.lock().await;
         if let Some(existing) = sockets.get(&key)
-            && existing.exists()
+            && reuse_existing
+            && existing.path.exists()
+            && existing.peer_addr == peer_addr
         {
-            return Ok(existing.clone());
+            return Ok(existing.path.clone());
         }
 
         let socket_path = self.home.dial_socket_path(peer_addr.id, protocol);
+        if let Some(existing) = sockets.remove(&key) {
+            let _ = fs::remove_file(existing.path);
+        }
         if socket_path.exists() {
             fs::remove_file(&socket_path)
                 .with_context(|| format!("failed to remove stale {}", socket_path.display()))?;
         }
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("failed to bind {}", socket_path.display()))?;
-        sockets.insert(key, socket_path.clone());
+        sockets.insert(
+            key,
+            DialSocket {
+                path: socket_path.clone(),
+                peer_addr: peer_addr.clone(),
+            },
+        );
         drop(sockets);
 
         tokio::spawn(run_dial_socket(
@@ -222,7 +256,13 @@ impl DaemonState {
             .keys()
             .map(|alpn| String::from_utf8_lossy(alpn).to_string())
             .collect();
-        let dial_sockets = self.dial_sockets.lock().await.values().cloned().collect();
+        let dial_sockets = self
+            .dial_sockets
+            .lock()
+            .await
+            .values()
+            .map(|socket| socket.path.clone())
+            .collect();
         Ok((
             self.id().to_string(),
             serde_json::to_value(self.addr())?,
@@ -239,6 +279,7 @@ impl DaemonState {
             endpoint_addr,
             exposed_protocols,
             dial_sockets,
+            allow_shell: self.allow_shell,
         })
     }
 
@@ -252,7 +293,57 @@ impl DaemonState {
             endpoint_addr,
             exposed_protocols,
             dial_sockets,
+            allow_shell: self.allow_shell,
             peers,
+        })
+    }
+
+    fn schedule_restart(&self, allow_shell: Option<bool>) -> Result<RestartPlan> {
+        let allow_shell = allow_shell.unwrap_or(self.allow_shell);
+        self.home.prepare()?;
+        let log_path = self.home.restart_log_path();
+        let mut log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("failed to open {}", log_path.display()))?;
+        writeln!(
+            log,
+            "fabric restart requested: version={} allow_shell={allow_shell}",
+            crate::version_string()
+        )?;
+        let err = log.try_clone()?;
+        let exe = std::env::current_exe()?;
+        let mut command = ProcessCommand::new(exe);
+        command
+            .arg("--home")
+            .arg(self.home.root())
+            .arg("restart-detacher");
+        if allow_shell {
+            command.arg("--allow-shell");
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(err));
+
+        #[cfg(unix)]
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        command
+            .spawn()
+            .with_context(|| "failed to spawn restart detacher")?;
+
+        Ok(RestartPlan {
+            log: log_path,
+            allow_shell,
         })
     }
 
@@ -412,8 +503,8 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
     state.cancel.cancel();
     state.endpoint.close().await;
     let _ = fs::remove_file(control_path);
-    for path in state.dial_sockets.lock().await.values() {
-        let _ = fs::remove_file(path);
+    for socket in state.dial_sockets.lock().await.values() {
+        let _ = fs::remove_file(&socket.path);
     }
     Ok(())
 }
@@ -485,9 +576,21 @@ async fn process_control_request(
         }
         ControlRequest::Shell { peer } => {
             let socket = state
-                .dial_alpn(&peer, shell::SHELL_PROTOCOL, shell::SHELL_ALPN.to_vec())
+                .dial_alpn(
+                    &peer,
+                    shell::SHELL_PROTOCOL,
+                    shell::SHELL_ALPN.to_vec(),
+                    false,
+                )
                 .await?;
             ControlResponse::Shell { socket }
+        }
+        ControlRequest::Restart { allow_shell } => {
+            let restart = state.schedule_restart(allow_shell)?;
+            ControlResponse::Restarting {
+                log: restart.log,
+                allow_shell: restart.allow_shell,
+            }
         }
         ControlRequest::Shutdown => {
             state.cancel.cancel();

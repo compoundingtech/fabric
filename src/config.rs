@@ -90,6 +90,10 @@ impl FabricHome {
         self.root.join("logs/daemon.log")
     }
 
+    pub fn restart_log_path(&self) -> PathBuf {
+        self.root.join("logs/restart.log")
+    }
+
     pub fn dial_socket_path(&self, peer: EndpointId, protocol: &str) -> PathBuf {
         let peer = peer.to_string();
         let short_peer = &peer[..peer.len().min(8)];

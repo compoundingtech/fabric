@@ -69,6 +69,15 @@ enum Commands {
     },
     /// Stop the local fabric daemon.
     Down,
+    /// Restart the local fabric daemon through a detached helper.
+    Restart {
+        /// Force the restarted daemon to serve remote shells.
+        #[arg(long, conflicts_with = "no_allow_shell")]
+        allow_shell: bool,
+        /// Force the restarted daemon to reject remote shells.
+        #[arg(long)]
+        no_allow_shell: bool,
+    },
     /// Expose a local Unix socket service to trusted peers under an ALPN protocol.
     Expose {
         protocol: String,
@@ -84,6 +93,18 @@ enum Commands {
     /// Internal foreground daemon entrypoint.
     #[command(hide = true)]
     Daemon {
+        #[arg(long)]
+        allow_shell: bool,
+    },
+    /// Internal restart detacher.
+    #[command(hide = true)]
+    RestartDetacher {
+        #[arg(long)]
+        allow_shell: bool,
+    },
+    /// Internal restart worker.
+    #[command(hide = true)]
+    RestartHelper {
         #[arg(long)]
         allow_shell: bool,
     },
@@ -142,6 +163,7 @@ async fn main() -> Result<()> {
                             endpoint_addr,
                             exposed_protocols,
                             dial_sockets,
+                            allow_shell,
                             peers,
                         } => {
                             print_status(
@@ -150,6 +172,7 @@ async fn main() -> Result<()> {
                                 &endpoint_addr,
                                 &exposed_protocols,
                                 &dial_sockets,
+                                allow_shell,
                                 &peers,
                             )?;
                         }
@@ -203,6 +226,20 @@ async fn main() -> Result<()> {
                     send_control(&home, ControlRequest::Shutdown).await?;
                     println!("stopped");
                 }
+                Commands::Restart {
+                    allow_shell,
+                    no_allow_shell,
+                } => {
+                    let allow_shell = allow_shell_override(allow_shell, no_allow_shell);
+                    match send_control(&home, ControlRequest::Restart { allow_shell }).await? {
+                        ControlResponse::Restarting { log, allow_shell } => {
+                            println!("restart scheduled");
+                            println!("log\t{}", log.display());
+                            println!("allow-shell\t{allow_shell}");
+                        }
+                        response => bail!("unexpected daemon response: {response:?}"),
+                    }
+                }
                 Commands::Expose { protocol, socket } => {
                     send_control(&home, ControlRequest::Expose { protocol, socket }).await?;
                     println!("exposed");
@@ -247,6 +284,12 @@ async fn main() -> Result<()> {
                 Commands::Daemon { allow_shell } => {
                     run_daemon(home, allow_shell).await?;
                 }
+                Commands::RestartDetacher { allow_shell } => {
+                    run_restart_detacher(&home, allow_shell)?;
+                }
+                Commands::RestartHelper { allow_shell } => {
+                    run_restart_helper(&home, allow_shell).await?;
+                }
             }
         }
     }
@@ -260,6 +303,7 @@ fn print_status(
     endpoint_addr: &serde_json::Value,
     exposed_protocols: &[String],
     dial_sockets: &[PathBuf],
+    allow_shell: bool,
     peers: &[PeerReachability],
 ) -> Result<()> {
     println!("version\t{version}");
@@ -271,6 +315,10 @@ fn print_status(
         .map(|path| path.display().to_string())
         .collect();
     println!("dials\t{}", joined_or_dash(&dials));
+    println!(
+        "shell\t{}",
+        if allow_shell { "allowed" } else { "disabled" }
+    );
     print_peer_reachability(peers);
     Ok(())
 }
@@ -329,6 +377,114 @@ fn joined_or_dash(values: &[String]) -> String {
         "-".to_string()
     } else {
         values.join(",")
+    }
+}
+
+fn allow_shell_override(allow_shell: bool, no_allow_shell: bool) -> Option<bool> {
+    if allow_shell {
+        Some(true)
+    } else if no_allow_shell {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn run_restart_detacher(home: &FabricHome, allow_shell: bool) -> Result<()> {
+    println!(
+        "restart detacher started: version={} allow_shell={allow_shell}",
+        fabric::version_string()
+    );
+    let exe = std::env::current_exe()?;
+    let mut command = ProcessCommand::new(exe);
+    command.arg("--home").arg(home.root()).arg("restart-helper");
+    if allow_shell {
+        command.arg("--allow-shell");
+    }
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    println!("restart helper spawned: pid={}", child.id());
+    Ok(())
+}
+
+async fn run_restart_helper(home: &FabricHome, allow_shell: bool) -> Result<()> {
+    println!(
+        "restart helper started: version={} allow_shell={allow_shell}",
+        fabric::version_string()
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    match send_control(home, ControlRequest::Shutdown).await {
+        Ok(_) => println!("shutdown requested"),
+        Err(error) => println!("shutdown request failed; continuing: {error:#}"),
+    }
+
+    if let Err(error) = wait_for_daemon_down(home, Duration::from_secs(10)).await {
+        println!("daemon did not report down before restart; continuing: {error:#}");
+    }
+
+    let start_result = spawn_daemon(home, allow_shell).await;
+    if let Err(error) = &start_result {
+        println!("daemon start failed; checking final state: {error:#}");
+    }
+
+    match wait_for_daemon_ready(home, allow_shell, Duration::from_secs(10)).await {
+        Ok(_) => {
+            println!("restart complete");
+            Ok(())
+        }
+        Err(ready_error) => {
+            if let Err(start_error) = start_result {
+                bail!("restart failed: {start_error:#}; final status: {ready_error:#}");
+            }
+            Err(ready_error)
+        }
+    }
+}
+
+async fn wait_for_daemon_down(home: &FabricHome, timeout: Duration) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        if send_control(home, ControlRequest::Status).await.is_err() {
+            return Ok(());
+        }
+        if started.elapsed() > timeout {
+            bail!("daemon still answered after {:.1}s", timeout.as_secs_f32());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_daemon_ready(
+    home: &FabricHome,
+    expected_allow_shell: bool,
+    timeout: Duration,
+) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        match send_control(home, ControlRequest::Status).await {
+            Ok(ControlResponse::Status { allow_shell, .. }) => {
+                if allow_shell != expected_allow_shell {
+                    bail!(
+                        "daemon is running with allow_shell={allow_shell}, expected {expected_allow_shell}"
+                    );
+                }
+                return Ok(());
+            }
+            Ok(response) => bail!("unexpected daemon response: {response:?}"),
+            Err(error) => {
+                if started.elapsed() > timeout {
+                    bail!(
+                        "daemon did not become ready after {:.1}s: {error:#}",
+                        timeout.as_secs_f32()
+                    );
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

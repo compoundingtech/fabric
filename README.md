@@ -159,6 +159,19 @@ fabric down
 Stop the local daemon.
 
 ```sh
+fabric restart [--allow-shell | --no-allow-shell]
+```
+
+Schedule a lockout-safe daemon restart through a detached helper and return
+before the running daemon goes down. This is safe to run over `fabric shell`: the
+helper writes progress to `<home>/logs/restart.log`, stops the old daemon, and
+starts a fresh one even if the invoking shell connection drops.
+
+Plain `fabric restart` preserves the running daemon's flags, including
+`--allow-shell`. Use `--allow-shell` or `--no-allow-shell` to force the restarted
+daemon's shell policy.
+
+```sh
 fabric addr
 ```
 
@@ -201,7 +214,8 @@ remote user's `$SHELL`.
 Enabling shell is a security-sensitive opt-in: every trusted peer in
 `peers.toml` can obtain a remote shell while `--allow-shell` is active. Keep the
 allow-list tight, enable shell only on machines where that access is intended,
-and stop/restart the daemon without `--allow-shell` to turn it back off.
+and use `fabric restart --no-allow-shell` to turn it back off without risking a
+remote lockout.
 
 ## Declarative Peer Config
 

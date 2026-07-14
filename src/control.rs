@@ -12,6 +12,7 @@ pub enum ControlRequest {
     Dial { peer: String, protocol: String },
     Ping { peer: String },
     Shell { peer: String },
+    Restart { allow_shell: Option<bool> },
     Shutdown,
 }
 
@@ -24,6 +25,7 @@ pub enum ControlResponse {
         endpoint_addr: serde_json::Value,
         exposed_protocols: Vec<String>,
         dial_sockets: Vec<PathBuf>,
+        allow_shell: bool,
     },
     ReachabilityStatus {
         version: String,
@@ -31,7 +33,12 @@ pub enum ControlResponse {
         endpoint_addr: serde_json::Value,
         exposed_protocols: Vec<String>,
         dial_sockets: Vec<PathBuf>,
+        allow_shell: bool,
         peers: Vec<PeerReachability>,
+    },
+    Restarting {
+        log: PathBuf,
+        allow_shell: bool,
     },
     Dial {
         socket: PathBuf,
