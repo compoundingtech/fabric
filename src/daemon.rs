@@ -2,7 +2,10 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -11,7 +14,7 @@ use iroh::{
     Endpoint, EndpointAddr, EndpointId,
     endpoint::{
         AfterHandshakeOutcome, Connection, EndpointHooks, Incoming, RecvStream, SendStream, Side,
-        VarInt, presets,
+        TransportAddrUsage, VarInt, presets,
     },
 };
 use tokio::{
@@ -23,11 +26,12 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    config::{FabricHome, PeerBook, load_or_create_identity, validate_protocol},
-    control::{ControlRequest, ControlResponse},
+    config::{FabricHome, Peer, PeerBook, load_or_create_identity, validate_protocol},
+    control::{ControlRequest, ControlResponse, PeerReachability},
 };
 
 const BUILTIN_ECHO_ALPN: &[u8] = b"fabric/echo/0";
+const REACHABILITY_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]
 struct AllowListHook {
@@ -59,6 +63,7 @@ pub struct DaemonState {
     allowed: Arc<RwLock<HashSet<EndpointId>>>,
     exposures: RwLock<HashMap<Vec<u8>, PathBuf>>,
     dial_sockets: Mutex<HashMap<(String, String), PathBuf>>,
+    builtin_echo_hits: AtomicUsize,
     cancel: CancellationToken,
 }
 
@@ -86,6 +91,7 @@ impl DaemonState {
             allowed,
             exposures: RwLock::new(HashMap::new()),
             dial_sockets: Mutex::new(HashMap::new()),
+            builtin_echo_hits: AtomicUsize::new(0),
             cancel,
         }))
     }
@@ -122,6 +128,10 @@ impl DaemonState {
 
     pub async fn ping(&self, peer: &str) -> Result<PingOutcome> {
         let peer_addr = self.peer_book.read().await.resolve(peer)?;
+        self.ping_addr(peer, peer_addr).await
+    }
+
+    async fn ping_addr(&self, peer: &str, peer_addr: EndpointAddr) -> Result<PingOutcome> {
         let nonce = rand::random::<[u8; 32]>();
         let started = std::time::Instant::now();
         let connection = self
@@ -136,6 +146,12 @@ impl DaemonState {
 
         let response = recv.read_to_end(nonce.len() + 1).await?;
         let round_trip = started.elapsed();
+        let mut transport = classify_connection_transport(&connection);
+        if transport.is_none()
+            && let Some(info) = self.endpoint.remote_info(peer_addr.id).await
+        {
+            transport = classify_remote_transport(&info);
+        }
         if response != nonce {
             bail!(
                 "ping nonce mismatch from {peer:?}: sent {} bytes, got {} bytes",
@@ -148,6 +164,7 @@ impl DaemonState {
             peer: peer_addr.id.to_string(),
             bytes: response.len(),
             round_trip,
+            transport,
         })
     }
 
@@ -184,7 +201,9 @@ impl DaemonState {
         Ok(socket_path)
     }
 
-    async fn status_response(&self) -> Result<ControlResponse> {
+    async fn local_status_fields(
+        &self,
+    ) -> Result<(String, serde_json::Value, Vec<String>, Vec<PathBuf>)> {
         let exposed_protocols = self
             .exposures
             .read()
@@ -193,12 +212,90 @@ impl DaemonState {
             .map(|alpn| String::from_utf8_lossy(alpn).to_string())
             .collect();
         let dial_sockets = self.dial_sockets.lock().await.values().cloned().collect();
+        Ok((
+            self.id().to_string(),
+            serde_json::to_value(self.addr())?,
+            exposed_protocols,
+            dial_sockets,
+        ))
+    }
+
+    async fn status_response(&self) -> Result<ControlResponse> {
+        let (node_id, endpoint_addr, exposed_protocols, dial_sockets) =
+            self.local_status_fields().await?;
         Ok(ControlResponse::Status {
-            node_id: self.id().to_string(),
-            endpoint_addr: serde_json::to_value(self.addr())?,
+            node_id,
+            endpoint_addr,
             exposed_protocols,
             dial_sockets,
         })
+    }
+
+    async fn reachability_status_response(&self) -> Result<ControlResponse> {
+        let (node_id, endpoint_addr, exposed_protocols, dial_sockets) =
+            self.local_status_fields().await?;
+        let peers = self.peer_reachability().await;
+        Ok(ControlResponse::ReachabilityStatus {
+            node_id,
+            endpoint_addr,
+            exposed_protocols,
+            dial_sockets,
+            peers,
+        })
+    }
+
+    pub async fn peer_reachability(&self) -> Vec<PeerReachability> {
+        let peers = self.peer_book.read().await.peers().to_vec();
+        let mut statuses = Vec::with_capacity(peers.len());
+        for peer in peers {
+            statuses.push(self.check_peer_reachability(peer).await);
+        }
+        statuses
+    }
+
+    async fn check_peer_reachability(&self, peer: Peer) -> PeerReachability {
+        let addr = peer
+            .addr
+            .clone()
+            .unwrap_or_else(|| EndpointAddr::new(peer.id));
+        let label = peer.name.clone().unwrap_or_else(|| peer.id.to_string());
+
+        match tokio::time::timeout(REACHABILITY_TIMEOUT, self.ping_addr(&label, addr)).await {
+            Ok(Ok(pong)) => PeerReachability {
+                id: peer.id.to_string(),
+                name: peer.name,
+                reachable: true,
+                bytes: Some(pong.bytes),
+                round_trip_micros: Some(pong.round_trip.as_micros().try_into().unwrap_or(u64::MAX)),
+                transport: pong.transport,
+                error: None,
+            },
+            Ok(Err(error)) => PeerReachability {
+                id: peer.id.to_string(),
+                name: peer.name,
+                reachable: false,
+                bytes: None,
+                round_trip_micros: None,
+                transport: None,
+                error: Some(format!("{error:#}")),
+            },
+            Err(_) => PeerReachability {
+                id: peer.id.to_string(),
+                name: peer.name,
+                reachable: false,
+                bytes: None,
+                round_trip_micros: None,
+                transport: None,
+                error: Some(format!(
+                    "timed out after {:.1}s",
+                    REACHABILITY_TIMEOUT.as_secs_f32()
+                )),
+            },
+        }
+    }
+
+    pub fn builtin_echo_hits(&self) -> usize {
+        self.builtin_echo_hits.load(Ordering::SeqCst)
     }
 }
 
@@ -207,6 +304,7 @@ pub struct PingOutcome {
     pub peer: String,
     pub bytes: usize,
     pub round_trip: Duration,
+    pub transport: Option<String>,
 }
 
 pub struct FabricNode {
@@ -344,6 +442,7 @@ async fn process_control_request(
 ) -> Result<ControlResponse> {
     let response = match request {
         ControlRequest::Status => state.status_response().await?,
+        ControlRequest::ReachabilityStatus => state.reachability_status_response().await?,
         ControlRequest::ReloadPeers => {
             state.reload_peers().await?;
             ControlResponse::Ok
@@ -362,6 +461,7 @@ async fn process_control_request(
                 peer: pong.peer,
                 bytes: pong.bytes,
                 round_trip_micros: pong.round_trip.as_micros().try_into().unwrap_or(u64::MAX),
+                transport: pong.transport,
             }
         }
         ControlRequest::Shutdown => {
@@ -398,7 +498,7 @@ async fn process_incoming_iroh(incoming: Incoming, state: Arc<DaemonState>) -> R
     let alpn = accepting.alpn().await?;
     if alpn == BUILTIN_ECHO_ALPN {
         let connection = accepting.await?;
-        handle_builtin_echo(connection).await?;
+        handle_builtin_echo(connection, state).await?;
         return Ok(());
     }
 
@@ -419,7 +519,8 @@ async fn process_incoming_iroh(incoming: Incoming, state: Arc<DaemonState>) -> R
     Ok(())
 }
 
-async fn handle_builtin_echo(connection: Connection) -> Result<()> {
+async fn handle_builtin_echo(connection: Connection, state: Arc<DaemonState>) -> Result<()> {
+    state.builtin_echo_hits.fetch_add(1, Ordering::SeqCst);
     let (mut send, mut recv) = connection.accept_bi().await?;
     tokio::io::copy(&mut recv, &mut send).await?;
     send.finish()?;
@@ -432,6 +533,52 @@ fn accepted_alpns(exposures: &HashMap<Vec<u8>, PathBuf>) -> Vec<Vec<u8>> {
     alpns.push(BUILTIN_ECHO_ALPN.to_vec());
     alpns.extend(exposures.keys().cloned());
     alpns
+}
+
+fn classify_connection_transport(connection: &Connection) -> Option<String> {
+    let paths = connection.paths();
+    let mut selected_ip = false;
+    let mut selected_relay = false;
+    let mut any_ip = false;
+    let mut any_relay = false;
+
+    for path in paths.iter() {
+        let is_ip = path.is_ip();
+        let is_relay = path.is_relay();
+        any_ip |= is_ip;
+        any_relay |= is_relay;
+        if path.is_selected() {
+            selected_ip |= is_ip;
+            selected_relay |= is_relay;
+        }
+    }
+
+    classify_transport(selected_ip, selected_relay)
+        .or_else(|| classify_transport(any_ip, any_relay))
+}
+
+fn classify_remote_transport(info: &iroh::endpoint::RemoteInfo) -> Option<String> {
+    let mut active_ip = false;
+    let mut active_relay = false;
+
+    for addr in info.addrs() {
+        if !matches!(addr.usage(), TransportAddrUsage::Active) {
+            continue;
+        }
+        active_ip |= addr.addr().is_ip();
+        active_relay |= addr.addr().is_relay();
+    }
+
+    classify_transport(active_ip, active_relay)
+}
+
+fn classify_transport(has_ip: bool, has_relay: bool) -> Option<String> {
+    match (has_ip, has_relay) {
+        (true, true) => Some("mixed".to_string()),
+        (true, false) => Some("direct".to_string()),
+        (false, true) => Some("relay".to_string()),
+        (false, false) => None,
+    }
 }
 
 async fn run_dial_socket(

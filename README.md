@@ -112,6 +112,14 @@ fabric peers
 List trusted peers. The peer list is the daemon's endpoint allow-list.
 
 ```sh
+fabric status
+```
+
+Show the running daemon's local state and echo-ping every trusted peer. Each
+peer is reported as reachable or unreachable with round-trip latency and, when
+iroh exposes it, the active transport path: `direct`, `relay`, or `mixed`.
+
+```sh
 fabric add <nodeid> [name] [--addr-json JSON]
 ```
 
@@ -130,7 +138,9 @@ fabric up [--foreground]
 ```
 
 Start the local fabric daemon. Without `--foreground`, this spawns a background
-daemon and logs to `<home>/logs/daemon.log`.
+daemon and logs to `<home>/logs/daemon.log`. After the daemon is ready, `fabric
+up` runs the same echo-ping reachability check used by `fabric status` and
+prints one line per trusted peer.
 
 ```sh
 fabric down
@@ -165,7 +175,8 @@ fabric ping <peer>
 
 Connectivity and trust test. `fabric ping` dials the peer's built-in
 ACL-gated echo protocol, sends a random nonce, verifies the same bytes come
-back, and prints the round-trip latency. Use this first when bringing up a new
+back, and prints the round-trip latency. When available, it also reports whether
+iroh used a direct, relay, or mixed path. Use this first when bringing up a new
 machine.
 
 ## Declarative Peer Config

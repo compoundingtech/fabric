@@ -12,8 +12,8 @@ use fabric::{
         FabricHome, PeerBook, generate_identity_file, load_or_create_identity, parse_addr_json,
         parse_node_id,
     },
-    control::{ControlRequest, ControlResponse},
-    daemon::{run_daemon, send_control},
+    control::{ControlRequest, ControlResponse, PeerReachability},
+    daemon::{FabricNode, run_daemon, send_control},
 };
 
 #[derive(Debug, Parser)]
@@ -38,6 +38,8 @@ enum Commands {
     Id,
     /// Print the running daemon's current EndpointAddr as JSON.
     Addr,
+    /// Show daemon state and echo-ping reachability for trusted peers.
+    Status,
     /// List trusted peers.
     Peers,
     /// Trust a peer NodeID and optionally assign a local name.
@@ -108,6 +110,26 @@ async fn main() -> Result<()> {
                     }
                     response => bail!("unexpected daemon response: {response:?}"),
                 },
+                Commands::Status => {
+                    match send_control(&home, ControlRequest::ReachabilityStatus).await? {
+                        ControlResponse::ReachabilityStatus {
+                            node_id,
+                            endpoint_addr,
+                            exposed_protocols,
+                            dial_sockets,
+                            peers,
+                        } => {
+                            print_status(
+                                &node_id,
+                                &endpoint_addr,
+                                &exposed_protocols,
+                                &dial_sockets,
+                                &peers,
+                            )?;
+                        }
+                        response => bail!("unexpected daemon response: {response:?}"),
+                    }
+                }
                 Commands::Peers => {
                     let book = PeerBook::load(&home)?;
                     for peer in book.peers() {
@@ -139,9 +161,13 @@ async fn main() -> Result<()> {
                 }
                 Commands::Up { foreground } => {
                     if foreground {
-                        run_daemon(home).await?;
+                        let node = FabricNode::start(home).await?;
+                        let peers = node.state().peer_reachability().await;
+                        print_startup_reachability(&peers);
+                        node.wait().await?;
                     } else {
                         spawn_daemon(&home).await?;
+                        print_daemon_reachability(&home).await?;
                     }
                 }
                 Commands::Down => {
@@ -164,9 +190,19 @@ async fn main() -> Result<()> {
                             peer,
                             bytes,
                             round_trip_micros,
+                            transport,
                         } => {
                             let millis = round_trip_micros as f64 / 1000.0;
-                            println!("pong from {peer}: {bytes} bytes in {millis:.3} ms");
+                            match transport {
+                                Some(transport) => {
+                                    println!(
+                                        "pong from {peer}: {bytes} bytes in {millis:.3} ms via {transport}"
+                                    );
+                                }
+                                None => {
+                                    println!("pong from {peer}: {bytes} bytes in {millis:.3} ms");
+                                }
+                            }
                         }
                         response => bail!("unexpected daemon response: {response:?}"),
                     }
@@ -179,6 +215,82 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_status(
+    node_id: &str,
+    endpoint_addr: &serde_json::Value,
+    exposed_protocols: &[String],
+    dial_sockets: &[PathBuf],
+    peers: &[PeerReachability],
+) -> Result<()> {
+    println!("node\t{node_id}");
+    println!("addr\t{}", serde_json::to_string(endpoint_addr)?);
+    println!("exposed\t{}", joined_or_dash(exposed_protocols));
+    let dials: Vec<String> = dial_sockets
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    println!("dials\t{}", joined_or_dash(&dials));
+    print_peer_reachability(peers);
+    Ok(())
+}
+
+async fn print_daemon_reachability(home: &FabricHome) -> Result<()> {
+    match send_control(home, ControlRequest::ReachabilityStatus).await? {
+        ControlResponse::ReachabilityStatus { peers, .. } => {
+            print_startup_reachability(&peers);
+            Ok(())
+        }
+        response => bail!("unexpected daemon response: {response:?}"),
+    }
+}
+
+fn print_startup_reachability(peers: &[PeerReachability]) {
+    if peers.is_empty() {
+        println!("reachability: no trusted peers");
+        return;
+    }
+
+    for peer in peers {
+        println!("reachability: {}", format_peer_reachability(peer));
+    }
+}
+
+fn print_peer_reachability(peers: &[PeerReachability]) {
+    if peers.is_empty() {
+        println!("peers\t-");
+        return;
+    }
+
+    println!("peers");
+    for peer in peers {
+        println!("  {}", format_peer_reachability(peer));
+    }
+}
+
+fn format_peer_reachability(peer: &PeerReachability) -> String {
+    let label = peer.name.as_deref().unwrap_or(&peer.id);
+    if peer.reachable {
+        let millis = peer.round_trip_micros.unwrap_or_default() as f64 / 1000.0;
+        let transport = peer.transport.as_deref().unwrap_or("unknown");
+        format!(
+            "{label}\t{}\treachable\t{} bytes\t{millis:.3} ms\t{transport}",
+            peer.id,
+            peer.bytes.unwrap_or_default()
+        )
+    } else {
+        let error = peer.error.as_deref().unwrap_or("unreachable");
+        format!("{label}\t{}\tunreachable\t{error}", peer.id)
+    }
+}
+
+fn joined_or_dash(values: &[String]) -> String {
+    if values.is_empty() {
+        "-".to_string()
+    } else {
+        values.join(",")
+    }
 }
 
 async fn spawn_daemon(home: &FabricHome) -> Result<()> {
