@@ -93,10 +93,11 @@ Notes:
 
 ## pty Remote-Serve Unit
 
-The pty remote-control server should be owned the same way. The exact `ExecStart`
-must match the pty-owned remote-serve entrypoint when pty finalizes it.
+The pty remote-control server should be owned the same way. pty confirmed that
+`pty remote-serve --socket <SOCK>` is the long-running process systemd should
+own directly with `Type=simple`.
 
-Draft shape:
+Draft:
 
 ```ini
 [Unit]
@@ -106,7 +107,7 @@ Wants=fabric.service
 
 [Service]
 Type=simple
-Environment=PTY_ROOT=%h/.local/share/pty
+Environment=PTY_ROOT=%h/.local/state/convoy/pty
 ExecStart=%h/.local/bin/pty remote-serve --socket %t/pty-remote.sock
 Restart=on-failure
 RestartSec=2s
@@ -121,33 +122,55 @@ StandardError=journal
 WantedBy=default.target
 ```
 
-Open items before deploying this unit:
+Notes:
 
-- Confirm the exact pty command name and flags for the long-running remote
-  control server.
-- Confirm the socket path and whether it should be under `%t`, `PTY_ROOT`, or
-  another stable runtime directory.
-- Confirm the fabric protocol name that exposes the remote-control socket.
-- Decide whether `fabric expose <protocol> --socket <socket>` should be run by
-  the pty service, the fabric service, or an explicit one-shot companion unit.
+- `PTY_ROOT` is critical. On Hetzner, pty sessions live under
+  `%h/.local/state/convoy/pty`. If this environment variable is wrong,
+  remote-serve will read the wrong registry and remote `ls`/`attach` will look
+  empty even though the service is running.
+- `%t/pty-remote.sock` expands to `$XDG_RUNTIME_DIR/pty-remote.sock`, such as
+  `/run/user/<uid>/pty-remote.sock`. Keep this socket outside `PTY_ROOT`; a
+  socket under `PTY_ROOT` can be mis-scanned as a phantom pty session.
+- Use the absolute pty binary path actually installed on Hetzner. systemd does
+  not use an interactive shell `PATH`.
+- Leave `PTY_REMOTE_SERVE_DEBUG` unset in production unless diagnosing this
+  service.
+- `Type=simple` is intentional. Do not background, `nohup`, `setsid`, or
+  double-fork the process.
 
-If exposure should be supervised too, prefer a one-shot unit ordered after both
-services:
+## pty Fabric Exposure Unit
+
+pty stays transport-agnostic, so fabric exposes the pty remote-control socket in
+a separate one-shot unit. pty confirmed the fabric protocol/ALPN is `pty-view`.
+
+Draft:
 
 ```ini
 [Unit]
 Description=Expose pty remote control over fabric
 After=fabric.service pty-remote-serve.service
 Requires=fabric.service pty-remote-serve.service
+PartOf=fabric.service pty-remote-serve.service
 
 [Service]
 Type=oneshot
+ExecStartPre=/bin/sh -lc 'for i in $(seq 1 50); do test -S %t/pty-remote.sock && exit 0; sleep 0.1; done; echo "pty remote socket not ready: %t/pty-remote.sock" >&2; exit 1'
 ExecStart=%h/.local/bin/fabric expose pty-view --socket %t/pty-remote.sock
 RemainAfterExit=yes
 
 [Install]
 WantedBy=default.target
 ```
+
+Notes:
+
+- The `ExecStartPre` wait avoids a startup race where systemd has started
+  remote-serve but the Unix socket has not appeared yet.
+- Exposures are daemon memory, not persistent config. After restarting
+  `fabric.service`, restart this one-shot unit too and verify `fabric status`
+  still lists `pty-view`.
+- If fabric later gains config-backed persistent exposes, this companion unit can
+  go away.
 
 ## Deployment Flow
 
@@ -192,6 +215,7 @@ The fabric version must include the expected short git SHA.
 mkdir -p ~/.config/systemd/user
 $EDITOR ~/.config/systemd/user/fabric.service
 $EDITOR ~/.config/systemd/user/pty-remote-serve.service
+$EDITOR ~/.config/systemd/user/fabric-pty-view-expose.service
 systemctl --user daemon-reload
 ```
 
@@ -201,6 +225,7 @@ systemctl --user daemon-reload
 sudo loginctl enable-linger "$USER"
 systemctl --user enable fabric.service
 systemctl --user enable pty-remote-serve.service
+systemctl --user enable fabric-pty-view-expose.service
 ```
 
 6. Restart fabric first and verify locally before declaring the machine healthy:
@@ -222,13 +247,18 @@ This is a lockout check, not cosmetic output. If shell shows `disabled`, the
 daemon is alive but remote shell recovery is broken; fix the unit command or
 the future shell policy config before declaring the deploy healthy.
 
-7. Restart pty remote-serve and verify locally:
+7. Restart pty remote-serve, expose it through fabric, and verify locally:
 
 ```sh
 systemctl --user restart pty-remote-serve.service
 systemctl --user status pty-remote-serve.service --no-pager
 journalctl --user -u pty-remote-serve.service --no-pager -n 100
+systemctl --user restart fabric-pty-view-expose.service
+systemctl --user status fabric-pty-view-expose.service --no-pager
+~/.local/bin/fabric status
 ```
+
+The `fabric status` output must include `pty-view` in `exposed`.
 
 8. From the Mac, verify remote reachability:
 
@@ -253,8 +283,10 @@ tail -200 ~/.local/share/fabric/logs/daemon.log || true
 tail -200 ~/.local/share/fabric/logs/restart.log || true
 systemctl --user status fabric.service --no-pager || true
 systemctl --user status pty-remote-serve.service --no-pager || true
+systemctl --user status fabric-pty-view-expose.service --no-pager || true
 journalctl --user -u fabric.service --no-pager -n 200 || true
 journalctl --user -u pty-remote-serve.service --no-pager -n 200 || true
+journalctl --user -u fabric-pty-view-expose.service --no-pager -n 200 || true
 df -h
 free -h || true
 ```
@@ -264,6 +296,7 @@ Then restart:
 ```sh
 systemctl --user restart fabric.service
 systemctl --user restart pty-remote-serve.service
+systemctl --user restart fabric-pty-view-expose.service
 ~/.local/bin/fabric status
 ```
 
@@ -271,8 +304,11 @@ systemctl --user restart pty-remote-serve.service
 
 - `systemctl --user is-enabled fabric.service` prints `enabled`.
 - `systemctl --user is-active fabric.service` prints `active`.
+- `systemctl --user is-active pty-remote-serve.service` prints `active`.
 - `fabric status` works locally on Hetzner after a service restart.
 - `fabric status` prints `shell	allowed` after a service restart.
+- `fabric status` lists `pty-view` under `exposed` after restarting
+  `fabric-pty-view-expose.service`.
 - `fabric ping hetzner` works from the Mac after a service restart.
 - Killing the fabric process causes systemd to restart it:
 
@@ -285,8 +321,8 @@ systemctl --user is-active fabric.service
 
 - Rebooting Hetzner brings the fabric service back without SSH login, assuming
   lingering is enabled.
-- The pty remote-control service passes the same restart and reboot checks once
-  its exact command surface is finalized.
+- Rebooting Hetzner brings pty remote-serve and the `pty-view` fabric exposure
+  back without SSH login, assuming lingering is enabled.
 
 ## Later Hardening
 
