@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     fs::{self, OpenOptions},
     io::Write,
     path::PathBuf,
@@ -8,7 +9,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(unix)]
@@ -25,7 +26,7 @@ use iroh::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, UnixListener, UnixStream},
-    sync::{Mutex, RwLock, watch},
+    sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, watch},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -41,6 +42,111 @@ use crate::{
 
 const BUILTIN_ECHO_ALPN: &[u8] = b"fabric/echo/0";
 const REACHABILITY_TIMEOUT: Duration = Duration::from_secs(3);
+const INCOMING_FAILURE_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+const INCOMING_FAILURE_MAX_BACKOFF: Duration = Duration::from_secs(5);
+const DIAL_FAILURE_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+const DIAL_FAILURE_MAX_BACKOFF: Duration = Duration::from_secs(15);
+const FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_INCOMING_HANDLERS: usize = 32;
+const MAX_DIAL_HANDLERS: usize = 32;
+
+#[derive(Debug)]
+struct FailureBackoff {
+    state: Mutex<FailureBackoffState>,
+    initial_delay: Duration,
+    max_delay: Duration,
+    log_interval: Duration,
+}
+
+#[derive(Debug)]
+struct FailureBackoffState {
+    consecutive_failures: usize,
+    not_before: Instant,
+    last_log: Option<Instant>,
+    suppressed: usize,
+}
+
+impl FailureBackoff {
+    fn new(initial_delay: Duration, max_delay: Duration, log_interval: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(FailureBackoffState {
+                consecutive_failures: 0,
+                not_before: Instant::now(),
+                last_log: None,
+                suppressed: 0,
+            }),
+            initial_delay,
+            max_delay,
+            log_interval,
+        })
+    }
+
+    async fn wait(&self, cancel: &CancellationToken) -> bool {
+        loop {
+            let delay = {
+                let state = self.state.lock().await;
+                state.not_before.saturating_duration_since(Instant::now())
+            };
+            if delay.is_zero() {
+                return true;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = cancel.cancelled() => return false,
+            }
+        }
+    }
+
+    async fn record_success(&self) {
+        let mut state = self.state.lock().await;
+        state.consecutive_failures = 0;
+        state.not_before = Instant::now();
+        state.suppressed = 0;
+    }
+
+    async fn record_failure(&self, label: &str, error: &(dyn fmt::Display + Sync)) {
+        let (delay, consecutive_failures, suppressed, should_log) = {
+            let now = Instant::now();
+            let mut state = self.state.lock().await;
+            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            let delay = self.delay_for_step(state.consecutive_failures);
+            state.not_before = now + delay;
+
+            let should_log = state
+                .last_log
+                .is_none_or(|last_log| now.duration_since(last_log) >= self.log_interval);
+            let suppressed = state.suppressed;
+            if should_log {
+                state.last_log = Some(now);
+                state.suppressed = 0;
+            } else {
+                state.suppressed = state.suppressed.saturating_add(1);
+            }
+
+            (delay, state.consecutive_failures, suppressed, should_log)
+        };
+
+        if should_log {
+            if suppressed > 0 {
+                eprintln!(
+                    "fabric: {label}: {error}; backing off for {delay:?} after {consecutive_failures} consecutive failures ({suppressed} similar failures suppressed)"
+                );
+            } else {
+                eprintln!(
+                    "fabric: {label}: {error}; backing off for {delay:?} after {consecutive_failures} consecutive failures"
+                );
+            }
+        }
+    }
+
+    fn delay_for_step(&self, step: usize) -> Duration {
+        let exponent = (step.saturating_sub(1)).min(8) as u32;
+        let multiplier = 1u32 << exponent;
+        self.initial_delay
+            .saturating_mul(multiplier)
+            .min(self.max_delay)
+    }
+}
 
 #[derive(Debug)]
 struct AllowListHook {
@@ -78,6 +184,10 @@ pub struct DaemonState {
     tunnel_blocked: AtomicBool,
     builtin_echo_hits: AtomicUsize,
     allow_shell: bool,
+    incoming_failures: Arc<FailureBackoff>,
+    dial_failures: Arc<FailureBackoff>,
+    incoming_slots: Arc<Semaphore>,
+    dial_slots: Arc<Semaphore>,
     cancel: CancellationToken,
 }
 
@@ -211,6 +321,18 @@ impl DaemonState {
             tunnel_blocked: AtomicBool::new(false),
             builtin_echo_hits: AtomicUsize::new(0),
             allow_shell,
+            incoming_failures: FailureBackoff::new(
+                INCOMING_FAILURE_INITIAL_BACKOFF,
+                INCOMING_FAILURE_MAX_BACKOFF,
+                FAILURE_LOG_INTERVAL,
+            ),
+            dial_failures: FailureBackoff::new(
+                DIAL_FAILURE_INITIAL_BACKOFF,
+                DIAL_FAILURE_MAX_BACKOFF,
+                FAILURE_LOG_INTERVAL,
+            ),
+            incoming_slots: Arc::new(Semaphore::new(MAX_INCOMING_HANDLERS)),
+            dial_slots: Arc::new(Semaphore::new(MAX_DIAL_HANDLERS)),
             cancel,
         }))
     }
@@ -454,6 +576,8 @@ impl DaemonState {
             alpn,
             self.cancel.clone(),
             self.tunnel_drop_rx(),
+            self.dial_failures.clone(),
+            self.dial_slots.clone(),
         ));
 
         Ok(addr)
@@ -504,6 +628,8 @@ impl DaemonState {
                 peer_addr,
                 alpn,
                 self.cancel.clone(),
+                self.dial_failures.clone(),
+                self.dial_slots.clone(),
             ));
         } else {
             tokio::spawn(run_dial_socket(
@@ -514,6 +640,8 @@ impl DaemonState {
                 alpn,
                 self.cancel.clone(),
                 self.tunnel_drop_rx(),
+                self.dial_failures.clone(),
+                self.dial_slots.clone(),
             ));
         }
 
@@ -999,22 +1127,41 @@ async fn process_control_request(
 
 async fn run_iroh_accept_loop(state: Arc<DaemonState>) -> Result<()> {
     loop {
+        if !state.incoming_failures.wait(&state.cancel).await {
+            break;
+        }
+        let permit = tokio::select! {
+            _ = state.cancel.cancelled() => break,
+            permit = state.incoming_slots.clone().acquire_owned() => {
+                permit.context("incoming handler semaphore closed")?
+            }
+        };
         tokio::select! {
             _ = state.cancel.cancelled() => break,
             incoming = state.endpoint.accept() => {
                 let Some(incoming) = incoming else {
                     break;
                 };
-                tokio::spawn(handle_incoming_iroh(incoming, state.clone()));
+                tokio::spawn(handle_incoming_iroh(incoming, state.clone(), permit));
             }
         }
     }
     Ok(())
 }
 
-async fn handle_incoming_iroh(incoming: Incoming, state: Arc<DaemonState>) {
-    if let Err(error) = process_incoming_iroh(incoming, state).await {
-        eprintln!("fabric: incoming iroh connection failed: {error:#}");
+async fn handle_incoming_iroh(
+    incoming: Incoming,
+    state: Arc<DaemonState>,
+    _permit: OwnedSemaphorePermit,
+) {
+    match process_incoming_iroh(incoming, state.clone()).await {
+        Ok(()) => state.incoming_failures.record_success().await,
+        Err(error) => {
+            state
+                .incoming_failures
+                .record_failure("incoming iroh connection failed", &error)
+                .await;
+        }
     }
 }
 
@@ -1147,6 +1294,8 @@ async fn run_dial_socket(
     alpn: Vec<u8>,
     cancel: CancellationToken,
     drop_rx: watch::Receiver<u64>,
+    dial_failures: Arc<FailureBackoff>,
+    dial_slots: Arc<Semaphore>,
 ) {
     loop {
         tokio::select! {
@@ -1155,18 +1304,37 @@ async fn run_dial_socket(
                 let Ok((local, _)) = accepted else {
                     break;
                 };
+                let permit = tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    permit = dial_slots.clone().acquire_owned() => {
+                        let Ok(permit) = permit else {
+                            break;
+                        };
+                        permit
+                    }
+                };
                 let endpoint = endpoint.clone();
                 let home = home.clone();
                 let peer = peer.clone();
                 let alpn = alpn.clone();
                 let cancel = cancel.clone();
                 let drop_rx = drop_rx.clone();
+                let dial_failures = dial_failures.clone();
                 tokio::spawn(async move {
-                    if let Err(error) =
+                    let _permit = permit;
+                    if !dial_failures.wait(&cancel).await {
+                        return;
+                    }
+                    match
                         tunnel::run_client_connection(local, endpoint, home, peer, alpn, cancel, drop_rx)
                             .await
                     {
-                        eprintln!("fabric: dial socket connection failed: {error:#}");
+                        Ok(()) => dial_failures.record_success().await,
+                        Err(error) => {
+                            dial_failures
+                                .record_failure("dial socket connection failed", &error)
+                                .await;
+                        }
                     }
                 });
             }
@@ -1182,6 +1350,8 @@ async fn run_dial_tcp_listener(
     alpn: Vec<u8>,
     cancel: CancellationToken,
     drop_rx: watch::Receiver<u64>,
+    dial_failures: Arc<FailureBackoff>,
+    dial_slots: Arc<Semaphore>,
 ) {
     loop {
         tokio::select! {
@@ -1190,18 +1360,37 @@ async fn run_dial_tcp_listener(
                 let Ok((local, _)) = accepted else {
                     break;
                 };
+                let permit = tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    permit = dial_slots.clone().acquire_owned() => {
+                        let Ok(permit) = permit else {
+                            break;
+                        };
+                        permit
+                    }
+                };
                 let endpoint = endpoint.clone();
                 let home = home.clone();
                 let peer = peer.clone();
                 let alpn = alpn.clone();
                 let cancel = cancel.clone();
                 let drop_rx = drop_rx.clone();
+                let dial_failures = dial_failures.clone();
                 tokio::spawn(async move {
-                    if let Err(error) =
+                    let _permit = permit;
+                    if !dial_failures.wait(&cancel).await {
+                        return;
+                    }
+                    match
                         tunnel::run_client_tcp_connection(local, endpoint, home, peer, alpn, cancel, drop_rx)
                             .await
                     {
-                        eprintln!("fabric: dial tcp connection failed: {error:#}");
+                        Ok(()) => dial_failures.record_success().await,
+                        Err(error) => {
+                            dial_failures
+                                .record_failure("dial tcp connection failed", &error)
+                                .await;
+                        }
                     }
                 });
             }
@@ -1215,6 +1404,8 @@ async fn run_raw_dial_socket(
     peer_addr: EndpointAddr,
     alpn: Vec<u8>,
     cancel: CancellationToken,
+    dial_failures: Arc<FailureBackoff>,
+    dial_slots: Arc<Semaphore>,
 ) {
     loop {
         tokio::select! {
@@ -1223,12 +1414,32 @@ async fn run_raw_dial_socket(
                 let Ok((local, _)) = accepted else {
                     break;
                 };
+                let permit = tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    permit = dial_slots.clone().acquire_owned() => {
+                        let Ok(permit) = permit else {
+                            break;
+                        };
+                        permit
+                    }
+                };
                 let endpoint = endpoint.clone();
                 let peer_addr = peer_addr.clone();
                 let alpn = alpn.clone();
+                let cancel = cancel.clone();
+                let dial_failures = dial_failures.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = handle_raw_dial_socket_connection(local, endpoint, peer_addr, alpn).await {
-                        eprintln!("fabric: dial socket connection failed: {error:#}");
+                    let _permit = permit;
+                    if !dial_failures.wait(&cancel).await {
+                        return;
+                    }
+                    match handle_raw_dial_socket_connection(local, endpoint, peer_addr, alpn).await {
+                        Ok(()) => dial_failures.record_success().await,
+                        Err(error) => {
+                            dial_failures
+                                .record_failure("dial socket connection failed", &error)
+                                .await;
+                        }
                     }
                 });
             }
@@ -1266,4 +1477,64 @@ async fn pipe_unix_iroh(
     };
     tokio::try_join!(to_remote, to_local)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failure_backoff_parks_after_failure_instead_of_tight_looping() {
+        let backoff = FailureBackoff::new(
+            Duration::from_millis(25),
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+        );
+        let cancel = CancellationToken::new();
+
+        backoff.record_failure("test failure", &"boom").await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), backoff.wait(&cancel))
+                .await
+                .is_err(),
+            "failed work should be parked instead of immediately retried"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), backoff.wait(&cancel))
+                .await
+                .expect("backoff did not clear")
+        );
+    }
+
+    #[tokio::test]
+    async fn failure_backoff_resets_after_success() {
+        let backoff = FailureBackoff::new(
+            Duration::from_millis(25),
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+        );
+        let cancel = CancellationToken::new();
+
+        backoff.record_failure("test failure", &"boom").await;
+        backoff.record_success().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), backoff.wait(&cancel))
+                .await
+                .expect("success should clear backoff")
+        );
+    }
+
+    #[tokio::test]
+    async fn failure_backoff_can_be_cancelled_while_parked() {
+        let backoff = FailureBackoff::new(
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        let cancel = CancellationToken::new();
+
+        backoff.record_failure("test failure", &"boom").await;
+        cancel.cancel();
+        assert!(!backoff.wait(&cancel).await);
+    }
 }
