@@ -1,11 +1,88 @@
 # Hetzner Supervisor Plan
 
-Status: design draft, not deployed.
+Status: parked. Do not deploy the standalone systemd-per-daemon units in this
+document.
 
-This plan makes Hetzner self-heal when `fabric` or the pty remote-control server
-exits. The target is a per-machine supervisor owned by systemd user services, so
-remote access survives process crashes and host reboots without requiring an
-active SSH login.
+Nathan chose convoy as the single supervisor. The deployed target is:
+
+```text
+systemd -> convoy up -> fabric + pty remote-serve + st-sync + agents
+```
+
+Systemd may still own `convoy up`, but it should not independently own
+`fabric.service`, `pty-remote-serve.service`, or the fabric exposure unit unless
+Nathan changes that direction. This document is retained as a run-surface and
+diagnostic reference for convoy-owned supervision.
+
+## Run Surfaces For Convoy
+
+Convoy owns lifecycle, restart policy, logging policy, and deploy orchestration.
+These are the process commands and readiness checks convoy needs to preserve.
+
+### Fabric
+
+Run surface:
+
+```sh
+~/.local/bin/fabric --home ~/.local/share/fabric daemon --allow-shell
+```
+
+Required readiness checks:
+
+```sh
+~/.local/bin/fabric status
+```
+
+The status output must include:
+
+```text
+shell	allowed
+```
+
+This is a lockout check. A live daemon with `shell	disabled` is not a healthy
+Hetzner recovery state until pty remote attach fully replaces shell recovery.
+
+### pty Remote-Serve
+
+Run surface:
+
+```sh
+PTY_ROOT=~/.local/state/convoy/pty \
+  ~/.local/bin/pty remote-serve --socket "$XDG_RUNTIME_DIR/pty-remote.sock"
+```
+
+Important constraints:
+
+- `PTY_ROOT` must point at Hetzner's real session registry:
+  `~/.local/state/convoy/pty`.
+- The remote socket must stay outside `PTY_ROOT`; otherwise pty can mis-scan it
+  as a phantom session.
+- pty is adding `pty remote-serve --print-systemd-unit` as an authoritative
+  source for the exact service surface. When that lands, prefer the generated
+  command details over hand-maintained copies.
+
+### Fabric Exposure For pty
+
+Run after both fabric and pty remote-serve are ready, and after the socket
+exists:
+
+```sh
+~/.local/bin/fabric expose pty-view --socket "$XDG_RUNTIME_DIR/pty-remote.sock"
+```
+
+Required readiness check:
+
+```sh
+~/.local/bin/fabric status
+```
+
+The status output must include `pty-view` in `exposed`.
+
+## Historical Standalone Systemd Draft
+
+The remaining sections are the pre-decision standalone systemd draft. They are
+useful for command surfaces and acceptance checks, but convoy-claude owns the
+active supervisor design now.
 
 ## Goals
 
