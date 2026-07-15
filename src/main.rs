@@ -10,11 +10,11 @@ use anyhow::{Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use fabric::{
     config::{
-        FabricHome, PeerBook, generate_identity_file, load_or_create_identity, parse_addr_json,
-        parse_node_id,
+        DEFAULT_EXEC_MAX_CHILDREN, FabricHome, PeerBook, generate_identity_file,
+        load_or_create_identity, parse_addr_json, parse_node_id,
     },
     control::{ControlRequest, ControlResponse, PeerReachability},
-    daemon::{DEFAULT_EXEC_MAX_CHILDREN, FabricNode, run_daemon, send_control},
+    daemon::{FabricNode, run_daemon, send_control},
     shell::{self, ServerFrame},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -82,14 +82,20 @@ enum Commands {
     Expose {
         protocol: String,
         /// Expose an existing local Unix socket service.
-        #[arg(long, conflicts_with = "exec")]
+        #[arg(long, conflicts_with_all = ["exec", "tcp"])]
         socket: Option<PathBuf>,
+        /// Expose an existing local TCP service.
+        #[arg(long, conflicts_with_all = ["socket", "exec"])]
+        tcp: Option<String>,
         /// Spawn a command per incoming fabric tunnel session and pipe stdio.
-        #[arg(long, conflicts_with = "socket")]
+        #[arg(long, conflicts_with_all = ["socket", "tcp"])]
         exec: bool,
         /// Maximum active children for this exec exposure.
         #[arg(long)]
         max_children: Option<usize>,
+        /// Do not write this exposure to config.toml.
+        #[arg(long)]
+        ephemeral: bool,
         /// Command argv for --exec. Use `--` before the command.
         #[arg(
             value_name = "CMD",
@@ -98,8 +104,16 @@ enum Commands {
         )]
         command: Vec<String>,
     },
+    /// Stop exposing a protocol and remove its persisted config entry.
+    Unexpose { protocol: String },
     /// Create a local Unix socket that tunnels to a peer's exposed protocol.
-    Dial { peer: String, protocol: String },
+    Dial {
+        peer: String,
+        protocol: String,
+        /// Listen on a local TCP address instead of creating a Unix socket.
+        #[arg(long)]
+        tcp: Option<String>,
+    },
     /// Round-trip a random nonce through a peer's built-in echo protocol.
     Ping { peer: String },
     /// Open an interactive remote shell on a trusted peer.
@@ -288,18 +302,52 @@ async fn main() -> Result<()> {
                 Commands::Expose {
                     protocol,
                     socket,
+                    tcp,
                     exec,
                     max_children,
+                    ephemeral,
                     command,
                 } => {
-                    let request = expose_request(protocol, socket, exec, max_children, command)?;
+                    let request = expose_request(
+                        protocol,
+                        socket,
+                        tcp,
+                        exec,
+                        max_children,
+                        ephemeral,
+                        command,
+                    )?;
                     send_control(&home, request).await?;
                     println!("exposed");
                 }
-                Commands::Dial { peer, protocol } => {
-                    match send_control(&home, ControlRequest::Dial { peer, protocol }).await? {
-                        ControlResponse::Dial { socket } => println!("{}", socket.display()),
-                        response => bail!("unexpected daemon response: {response:?}"),
+                Commands::Unexpose { protocol } => {
+                    send_control(&home, ControlRequest::Unexpose { protocol }).await?;
+                    println!("unexposed");
+                }
+                Commands::Dial {
+                    peer,
+                    protocol,
+                    tcp,
+                } => {
+                    if let Some(bind) = tcp {
+                        match send_control(
+                            &home,
+                            ControlRequest::DialTcp {
+                                peer,
+                                protocol,
+                                bind,
+                            },
+                        )
+                        .await?
+                        {
+                            ControlResponse::DialTcp { addr } => println!("{addr}"),
+                            response => bail!("unexpected daemon response: {response:?}"),
+                        }
+                    } else {
+                        match send_control(&home, ControlRequest::Dial { peer, protocol }).await? {
+                            ControlResponse::Dial { socket } => println!("{}", socket.display()),
+                            response => bail!("unexpected daemon response: {response:?}"),
+                        }
                     }
                 }
                 Commands::Ping { peer } => {
@@ -382,10 +430,13 @@ async fn main() -> Result<()> {
 fn expose_request(
     protocol: String,
     socket: Option<PathBuf>,
+    tcp: Option<String>,
     exec: bool,
     max_children: Option<usize>,
+    ephemeral: bool,
     command: Vec<String>,
 ) -> Result<ControlRequest> {
+    let persist = !ephemeral;
     if exec {
         if command.is_empty() {
             bail!("--exec requires a command: fabric expose {protocol} --exec -- <cmd> [args...]");
@@ -398,6 +449,7 @@ fn expose_request(
             protocol,
             argv: command,
             max_children,
+            persist,
         });
     }
 
@@ -409,10 +461,22 @@ fn expose_request(
         bail!("command arguments require --exec");
     }
 
+    if let Some(addr) = tcp {
+        return Ok(ControlRequest::ExposeTcp {
+            protocol,
+            addr,
+            persist,
+        });
+    }
+
     let Some(socket) = socket else {
-        bail!("expose requires --socket <path> or --exec -- <cmd> [args...]");
+        bail!("expose requires --socket <path>, --tcp <host:port>, or --exec -- <cmd> [args...]");
     };
-    Ok(ControlRequest::Expose { protocol, socket })
+    Ok(ControlRequest::Expose {
+        protocol,
+        socket,
+        persist,
+    })
 }
 
 fn print_status(

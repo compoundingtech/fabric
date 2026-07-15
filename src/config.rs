@@ -11,6 +11,8 @@ use anyhow::{Context, Result, bail};
 use iroh::{EndpointAddr, EndpointId, SecretKey};
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_EXEC_MAX_CHILDREN: usize = 32;
+
 #[derive(Debug, Clone)]
 pub struct FabricHome {
     root: PathBuf,
@@ -70,6 +72,10 @@ impl FabricHome {
 
     pub fn peers_path(&self) -> PathBuf {
         self.peer_config_path.clone()
+    }
+
+    pub fn config_path(&self) -> PathBuf {
+        self.root.join("config.toml")
     }
 
     fn existing_peers_path(&self) -> Option<PathBuf> {
@@ -185,6 +191,12 @@ pub struct PeerBook {
 
 impl PeerBook {
     pub fn load(home: &FabricHome) -> Result<Self> {
+        if home.config_path().exists() {
+            return Ok(Self {
+                peers: FabricConfig::load(home)?.peers,
+            });
+        }
+
         let Some(path) = home.existing_peers_path() else {
             return Ok(Self::default());
         };
@@ -199,8 +211,9 @@ impl PeerBook {
     pub fn save(&self, home: &FabricHome) -> Result<()> {
         home.prepare()?;
         self.validate()?;
-        let raw = toml::to_string_pretty(self)?;
-        fs::write(home.peers_path(), raw)?;
+        let mut config = FabricConfig::load(home)?;
+        config.peers = self.peers.clone();
+        config.save(home)?;
         Ok(())
     }
 
@@ -281,6 +294,165 @@ impl PeerBook {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedExpose {
+    pub protocol: String,
+    #[serde(flatten)]
+    pub target: PersistedExposeTarget,
+}
+
+impl PersistedExpose {
+    pub fn socket(protocol: String, socket: PathBuf) -> Self {
+        Self {
+            protocol,
+            target: PersistedExposeTarget::Socket { socket },
+        }
+    }
+
+    pub fn exec(protocol: String, argv: Vec<String>, max_children: usize) -> Self {
+        Self {
+            protocol,
+            target: PersistedExposeTarget::Exec { argv, max_children },
+        }
+    }
+
+    pub fn tcp(protocol: String, addr: String) -> Self {
+        Self {
+            protocol,
+            target: PersistedExposeTarget::Tcp { addr },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PersistedExposeTarget {
+    Socket {
+        socket: PathBuf,
+    },
+    Tcp {
+        addr: String,
+    },
+    Exec {
+        argv: Vec<String>,
+        #[serde(default = "default_exec_max_children")]
+        max_children: usize,
+    },
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct FabricConfig {
+    #[serde(default)]
+    allow_shell: Option<bool>,
+    #[serde(default)]
+    peers: Vec<Peer>,
+    #[serde(default)]
+    exposes: Vec<PersistedExpose>,
+}
+
+impl FabricConfig {
+    pub fn load(home: &FabricHome) -> Result<Self> {
+        let path = home.config_path();
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let book: Self =
+            toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
+        book.validate()?;
+        Ok(book)
+    }
+
+    pub fn save(&self, home: &FabricHome) -> Result<()> {
+        home.prepare()?;
+        self.validate()?;
+        let raw = toml::to_string_pretty(self)?;
+        fs::write(home.config_path(), raw)?;
+        Ok(())
+    }
+
+    pub fn allow_shell(&self) -> Option<bool> {
+        self.allow_shell
+    }
+
+    pub fn set_allow_shell(&mut self, allow_shell: bool) {
+        self.allow_shell = Some(allow_shell);
+    }
+
+    pub fn exposes(&self) -> &[PersistedExpose] {
+        &self.exposes
+    }
+
+    pub fn upsert_expose(&mut self, expose: PersistedExpose) {
+        self.exposes
+            .retain(|entry| entry.protocol != expose.protocol);
+        self.exposes.push(expose);
+        self.exposes
+            .sort_by(|left, right| left.protocol.cmp(&right.protocol));
+    }
+
+    pub fn remove_expose(&mut self, protocol: &str) -> bool {
+        let before = self.exposes.len();
+        self.exposes.retain(|entry| entry.protocol != protocol);
+        self.exposes.len() != before
+    }
+
+    fn validate(&self) -> Result<()> {
+        PeerBook {
+            peers: self.peers.clone(),
+        }
+        .validate()?;
+
+        let mut protocols = HashSet::new();
+        for expose in &self.exposes {
+            validate_protocol(&expose.protocol)?;
+            if !protocols.insert(expose.protocol.as_str()) {
+                bail!("duplicate expose protocol {:?}", expose.protocol);
+            }
+            match &expose.target {
+                PersistedExposeTarget::Socket { socket } => {
+                    if !socket.is_absolute() {
+                        bail!("expose {:?} socket path must be absolute", expose.protocol);
+                    }
+                }
+                PersistedExposeTarget::Tcp { addr } => {
+                    validate_tcp_addr(addr)?;
+                }
+                PersistedExposeTarget::Exec { argv, max_children } => {
+                    if argv.is_empty() {
+                        bail!("expose {:?} exec command cannot be empty", expose.protocol);
+                    }
+                    if *max_children == 0 {
+                        bail!(
+                            "expose {:?} max_children must be greater than zero",
+                            expose.protocol
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn default_exec_max_children() -> usize {
+    DEFAULT_EXEC_MAX_CHILDREN
+}
+
+pub fn validate_tcp_addr(addr: &str) -> Result<()> {
+    if addr.trim().is_empty() {
+        bail!("tcp address cannot be empty");
+    }
+    if addr.bytes().any(|byte| byte == 0 || byte == b'\n') {
+        bail!("tcp address cannot contain NUL or newline bytes");
+    }
+    if !addr.contains(':') {
+        bail!("tcp address must be HOST:PORT");
+    }
+    Ok(())
 }
 
 pub fn parse_node_id(node_id: &str) -> Result<EndpointId> {

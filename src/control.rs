@@ -11,15 +11,33 @@ pub enum ControlRequest {
     Expose {
         protocol: String,
         socket: PathBuf,
+        #[serde(default = "default_persist")]
+        persist: bool,
     },
     ExposeExec {
         protocol: String,
         argv: Vec<String>,
         max_children: usize,
+        #[serde(default = "default_persist")]
+        persist: bool,
+    },
+    ExposeTcp {
+        protocol: String,
+        addr: String,
+        #[serde(default = "default_persist")]
+        persist: bool,
+    },
+    Unexpose {
+        protocol: String,
     },
     Dial {
         peer: String,
         protocol: String,
+    },
+    DialTcp {
+        peer: String,
+        protocol: String,
+        bind: String,
     },
     Ping {
         peer: String,
@@ -38,6 +56,10 @@ pub enum ControlRequest {
         allow_shell: Option<bool>,
     },
     Shutdown,
+}
+
+fn default_persist() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -66,6 +88,9 @@ pub enum ControlResponse {
     },
     Dial {
         socket: PathBuf,
+    },
+    DialTcp {
+        addr: String,
     },
     Shell {
         socket: PathBuf,

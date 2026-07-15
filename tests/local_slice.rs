@@ -1,12 +1,14 @@
 use std::{
     fs,
+    io::Read,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{
-        Arc, OnceLock,
-        atomic::{AtomicUsize, Ordering},
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -18,15 +20,28 @@ use fabric::{
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{UnixListener, UnixStream},
-    sync::{Mutex as TokioMutex, MutexGuard as TokioMutexGuard},
+    net::{TcpListener, TcpStream, UnixListener, UnixStream},
     task::JoinHandle,
 };
 
-static TUNNEL_DEBUG_LOCK: OnceLock<TokioMutex<()>> = OnceLock::new();
+// These tests start real iroh endpoints and daemon tasks; keep the default
+// test runner from exercising that transport stack concurrently.
+static LOCAL_SLICE_LOCKED: AtomicBool = AtomicBool::new(false);
+const FABRIC_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
+const LOCAL_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const LOCAL_SLICE_SETTLE: Duration = Duration::from_millis(500);
+
+struct LocalSliceGuard;
+
+impl Drop for LocalSliceGuard {
+    fn drop(&mut self) {
+        LOCAL_SLICE_LOCKED.store(false, Ordering::Release);
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_expose_dial_round_trips_and_acl_rejects_unknown_node() -> Result<()> {
+    let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
     let node_b_dir = TempDir::new()?;
     let node_c_dir = TempDir::new()?;
@@ -120,7 +135,7 @@ async fn local_expose_dial_round_trips_and_acl_rejects_unknown_node() -> Result<
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn generic_tunnel_survives_transport_reconnect_without_reopening_local_service() -> Result<()>
 {
-    let _guard = tunnel_debug_guard().await;
+    let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
     let node_b_dir = TempDir::new()?;
     let node_a_home = FabricHome::new(node_a_dir.path());
@@ -182,6 +197,7 @@ async fn generic_tunnel_survives_transport_reconnect_without_reopening_local_ser
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_expose_round_trips_stdio_handler() -> Result<()> {
+    let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
     let node_b_dir = TempDir::new()?;
     let node_a_home = FabricHome::new(node_a_dir.path());
@@ -224,7 +240,7 @@ async fn exec_expose_round_trips_stdio_handler() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_expose_reconnect_keeps_child_bound_to_tunnel_session() -> Result<()> {
-    let _guard = tunnel_debug_guard().await;
+    let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
     let node_b_dir = TempDir::new()?;
     let node_a_home = FabricHome::new(node_a_dir.path());
@@ -296,6 +312,7 @@ async fn exec_expose_reconnect_keeps_child_bound_to_tunnel_session() -> Result<(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_expose_child_exits_on_stdin_eof() -> Result<()> {
+    let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
     let node_b_dir = TempDir::new()?;
     let node_a_home = FabricHome::new(node_a_dir.path());
@@ -342,7 +359,7 @@ async fn exec_expose_child_exits_on_stdin_eof() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_expose_reaps_child_on_session_ttl_expiry() -> Result<()> {
-    let _guard = tunnel_debug_guard().await;
+    let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
     let node_b_dir = TempDir::new()?;
     let node_a_home = FabricHome::new(node_a_dir.path());
@@ -393,6 +410,7 @@ async fn exec_expose_reaps_child_on_session_ttl_expiry() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_expose_enforces_per_exposure_child_limit() -> Result<()> {
+    let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
     let node_b_dir = TempDir::new()?;
     let node_a_home = FabricHome::new(node_a_dir.path());
@@ -454,6 +472,7 @@ async fn exec_expose_enforces_per_exposure_child_limit() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_expose_spawn_failure_closes_local_stream_and_daemon_survives() -> Result<()> {
+    let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
     let node_b_dir = TempDir::new()?;
     let node_a_home = FabricHome::new(node_a_dir.path());
@@ -499,6 +518,7 @@ async fn exec_expose_spawn_failure_closes_local_stream_and_daemon_survives() -> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_expose_streams_payload_larger_than_tunnel_buffer() -> Result<()> {
+    let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
     let node_b_dir = TempDir::new()?;
     let node_a_home = FabricHome::new(node_a_dir.path());
@@ -555,7 +575,226 @@ async fn exec_expose_streams_payload_larger_than_tunnel_buffer() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unified_config_restores_shell_peers_and_exposes_on_restart() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let node_a_dir = TempDir::new()?;
+    let node_b_dir = TempDir::new()?;
+    let node_a_home = FabricHome::new(node_a_dir.path());
+    let node_b_home = FabricHome::new(node_b_dir.path());
+
+    let node_a = FabricNode::start_with_options(node_a_home.clone(), true).await?;
+    let node_b = FabricNode::start(node_b_home.clone()).await?;
+
+    trust_peer(
+        &node_a_home,
+        &node_a,
+        node_b.id(),
+        Some("node-b"),
+        Some(node_b.addr()),
+    )
+    .await?;
+    trust_peer(
+        &node_b_home,
+        &node_b,
+        node_a.id(),
+        Some("node-a"),
+        Some(node_a.addr()),
+    )
+    .await?;
+
+    node_a
+        .expose_exec("stdio-cat", vec!["/bin/cat".to_string()])
+        .await?;
+    assert_status_exposes(&node_a_home, "stdio-cat").await?;
+    assert_status_shell_allowed(&node_a_home).await?;
+    assert!(
+        node_a_home.config_path().exists(),
+        "daemon config should be persisted to config.toml"
+    );
+    let raw_config = fs::read_to_string(node_a_home.config_path())?;
+    assert!(raw_config.contains("allow_shell = true"));
+    assert!(raw_config.contains("node-b"));
+    assert!(raw_config.contains("stdio-cat"));
+
+    node_a.shutdown().await?;
+    let node_a = FabricNode::start(node_a_home.clone()).await?;
+    trust_peer(
+        &node_b_home,
+        &node_b,
+        node_a.id(),
+        Some("node-a"),
+        Some(node_a.addr()),
+    )
+    .await?;
+
+    assert_status_shell_allowed(&node_a_home).await?;
+    assert_status_exposes(&node_a_home, "stdio-cat").await?;
+    let ping = node_b.ping("node-a").await?;
+    assert_eq!(ping.bytes, 32);
+    let dial_socket = node_b.dial("node-a", "stdio-cat").await?;
+    let response = unix_round_trip(&dial_socket, b"after-restart").await?;
+    assert_eq!(response, b"after-restart");
+
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unexpose_clears_persisted_config_and_restart_does_not_restore() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let node_a_dir = TempDir::new()?;
+    let node_a_home = FabricHome::new(node_a_dir.path());
+
+    let node_a = FabricNode::start(node_a_home.clone()).await?;
+    node_a
+        .expose_exec("stdio-cat", vec!["/bin/cat".to_string()])
+        .await?;
+    assert_status_exposes(&node_a_home, "stdio-cat").await?;
+    assert!(fs::read_to_string(node_a_home.config_path())?.contains("stdio-cat"));
+
+    run_fabric(&node_a_home, &["unexpose", "stdio-cat"])?;
+    assert_status_does_not_expose(&node_a_home, "stdio-cat").await?;
+    assert!(
+        !fs::read_to_string(node_a_home.config_path())?.contains("stdio-cat"),
+        "unexpose should remove the durable config entry"
+    );
+
+    node_a.shutdown().await?;
+    let node_a = FabricNode::start(node_a_home.clone()).await?;
+    assert_status_does_not_expose(&node_a_home, "stdio-cat").await?;
+
+    node_a.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_expose_dial_listener_round_trips_and_reconnects() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let node_a_dir = TempDir::new()?;
+    let node_b_dir = TempDir::new()?;
+    let node_a_home = FabricHome::new(node_a_dir.path());
+    let node_b_home = FabricHome::new(node_b_dir.path());
+
+    let node_a = FabricNode::start(node_a_home.clone()).await?;
+    let node_b = FabricNode::start(node_b_home.clone()).await?;
+
+    trust_peer(
+        &node_a_home,
+        &node_a,
+        node_b.id(),
+        Some("node-b"),
+        Some(node_b.addr()),
+    )
+    .await?;
+    trust_peer(
+        &node_b_home,
+        &node_b,
+        node_a.id(),
+        Some("node-a"),
+        Some(node_a.addr()),
+    )
+    .await?;
+
+    let (tcp_echo_addr, echo_hits, echo_task) = spawn_tcp_echo_service().await?;
+    run_fabric(
+        &node_a_home,
+        &["expose", "tcp-echo", "--tcp", tcp_echo_addr.as_str()],
+    )?;
+    let local_addr = run_fabric(
+        &node_b_home,
+        &["dial", "node-a", "tcp-echo", "--tcp", "127.0.0.1:0"],
+    )?;
+    let mut stream = TcpStream::connect(&local_addr).await?;
+
+    tcp_stream_round_trip(&mut stream, b"before-drop").await?;
+
+    run_fabric(&node_a_home, &["debug", "block-tunnels"])?;
+    run_fabric(&node_a_home, &["debug", "drop-tunnels"])?;
+    stream.write_all(b"during-drop").await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    run_fabric(&node_a_home, &["debug", "unblock-tunnels"])?;
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        read_expected_tcp(&mut stream, b"during-drop"),
+    )
+    .await??;
+    tcp_stream_round_trip(&mut stream, b"after-drop").await?;
+    assert_eq!(
+        echo_hits.load(Ordering::SeqCst),
+        1,
+        "reconnect should keep the exposed TCP connection alive"
+    );
+
+    drop(stream);
+    echo_task.abort();
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persisted_tcp_expose_survives_daemon_restart() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let node_a_dir = TempDir::new()?;
+    let node_b_dir = TempDir::new()?;
+    let node_a_home = FabricHome::new(node_a_dir.path());
+    let node_b_home = FabricHome::new(node_b_dir.path());
+
+    let node_a = FabricNode::start(node_a_home.clone()).await?;
+    let node_b = FabricNode::start(node_b_home.clone()).await?;
+
+    trust_peer(
+        &node_a_home,
+        &node_a,
+        node_b.id(),
+        Some("node-b"),
+        Some(node_b.addr()),
+    )
+    .await?;
+    trust_peer(
+        &node_b_home,
+        &node_b,
+        node_a.id(),
+        Some("node-a"),
+        Some(node_a.addr()),
+    )
+    .await?;
+
+    let (tcp_echo_addr, _echo_hits, echo_task) = spawn_tcp_echo_service().await?;
+    node_a.expose_tcp("tcp-echo", tcp_echo_addr).await?;
+    assert_status_exposes(&node_a_home, "tcp-echo").await?;
+
+    node_a.shutdown().await?;
+    let node_a = FabricNode::start(node_a_home.clone()).await?;
+    trust_peer(
+        &node_b_home,
+        &node_b,
+        node_a.id(),
+        Some("node-a"),
+        Some(node_a.addr()),
+    )
+    .await?;
+
+    assert_status_exposes(&node_a_home, "tcp-echo").await?;
+    let ping = node_b.ping("node-a").await?;
+    assert_eq!(ping.bytes, 32);
+    let local_addr = node_b
+        .dial_tcp("node-a", "tcp-echo", "127.0.0.1:0".to_string())
+        .await?;
+    let response = tcp_round_trip(&local_addr, b"tcp-after-restart").await?;
+    assert_eq!(response, b"tcp-after-restart");
+
+    echo_task.abort();
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ping_round_trips_builtin_echo() -> Result<()> {
+    let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
     let node_b_dir = TempDir::new()?;
     let node_a_home = FabricHome::new(node_a_dir.path());
@@ -593,6 +832,7 @@ async fn ping_round_trips_builtin_echo() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ping_acl_rejects_untrusted_before_echo_handler() -> Result<()> {
+    let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
     let node_b_dir = TempDir::new()?;
     let node_c_dir = TempDir::new()?;
@@ -652,6 +892,7 @@ async fn ping_acl_rejects_untrusted_before_echo_handler() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn status_reports_peer_reachability() -> Result<()> {
+    let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
     let node_b_dir = TempDir::new()?;
     let node_a_home = FabricHome::new(node_a_dir.path());
@@ -697,6 +938,7 @@ async fn status_reports_peer_reachability() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn declarative_peer_config_is_loaded_on_start() -> Result<()> {
+    let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
     let node_b_dir = TempDir::new()?;
     let node_a_home = FabricHome::new(node_a_dir.path());
@@ -739,11 +981,63 @@ async fn trust_peer(
     Ok(())
 }
 
-async fn tunnel_debug_guard() -> TokioMutexGuard<'static, ()> {
-    TUNNEL_DEBUG_LOCK
-        .get_or_init(|| TokioMutex::new(()))
-        .lock()
-        .await
+async fn exposed_protocols(home: &FabricHome) -> Result<Vec<String>> {
+    let response = wait_for_status(home).await?;
+    let ControlResponse::Status {
+        exposed_protocols, ..
+    } = response
+    else {
+        panic!("unexpected response: {response:?}");
+    };
+    Ok(exposed_protocols)
+}
+
+async fn wait_for_status(home: &FabricHome) -> Result<ControlResponse> {
+    for _ in 0..50 {
+        match send_control(home, ControlRequest::Status).await {
+            Ok(response) => return Ok(response),
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    send_control(home, ControlRequest::Status).await
+}
+
+async fn assert_status_exposes(home: &FabricHome, protocol: &str) -> Result<()> {
+    let exposed = exposed_protocols(home).await?;
+    assert!(
+        exposed.iter().any(|entry| entry == protocol),
+        "{protocol:?} missing from exposed protocols: {exposed:?}"
+    );
+    Ok(())
+}
+
+async fn assert_status_does_not_expose(home: &FabricHome, protocol: &str) -> Result<()> {
+    let exposed = exposed_protocols(home).await?;
+    assert!(
+        exposed.iter().all(|entry| entry != protocol),
+        "{protocol:?} unexpectedly exposed: {exposed:?}"
+    );
+    Ok(())
+}
+
+async fn assert_status_shell_allowed(home: &FabricHome) -> Result<()> {
+    let response = wait_for_status(home).await?;
+    let ControlResponse::Status { allow_shell, .. } = response else {
+        panic!("unexpected response: {response:?}");
+    };
+    assert!(allow_shell, "daemon should have shell allowed from config");
+    Ok(())
+}
+
+async fn local_slice_guard() -> LocalSliceGuard {
+    while LOCAL_SLICE_LOCKED
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(LOCAL_SLICE_SETTLE).await;
+    LocalSliceGuard
 }
 
 fn fabric_bin() -> &'static str {
@@ -751,21 +1045,55 @@ fn fabric_bin() -> &'static str {
 }
 
 fn run_fabric(home: &FabricHome, args: &[&str]) -> Result<String> {
-    let output = Command::new(fabric_bin())
+    let mut child = Command::new(fabric_bin())
         .arg("--home")
         .arg(home.root())
         .args(args)
-        .output()?;
-    if !output.status.success() {
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn fabric {args:?}"))?;
+    let started = Instant::now();
+    let (status, timed_out) = loop {
+        if let Some(status) = child.try_wait()? {
+            break (status, false);
+        }
+        if started.elapsed() >= FABRIC_COMMAND_TIMEOUT {
+            let _ = child.kill();
+            break (child.wait()?, true);
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+
+    let mut stdout = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        pipe.read_to_end(&mut stdout)?;
+    }
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_end(&mut stderr)?;
+    }
+
+    if timed_out {
+        bail!(
+            "fabric {:?} timed out after {:?}\nstdout:\n{}\nstderr:\n{}",
+            args,
+            FABRIC_COMMAND_TIMEOUT,
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+
+    if !status.success() {
         bail!(
             "fabric {:?} failed with status {}\nstdout:\n{}\nstderr:\n{}",
             args,
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            status,
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
         );
     }
-    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+    Ok(String::from_utf8(stdout)?.trim().to_string())
 }
 
 async fn spawn_echo_service(path: &Path, hits: Arc<AtomicUsize>) -> Result<JoinHandle<()>> {
@@ -781,7 +1109,26 @@ async fn spawn_echo_service(path: &Path, hits: Arc<AtomicUsize>) -> Result<JoinH
     }))
 }
 
+async fn spawn_tcp_echo_service() -> Result<(String, Arc<AtomicUsize>, JoinHandle<()>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?.to_string();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let task_hits = hits.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            task_hits.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(tcp_echo_connection(stream));
+        }
+    });
+    Ok((addr, hits, task))
+}
+
 async fn echo_connection(stream: UnixStream) {
+    let (mut read, mut write) = stream.into_split();
+    let _ = tokio::io::copy(&mut read, &mut write).await;
+}
+
+async fn tcp_echo_connection(stream: TcpStream) {
     let (mut read, mut write) = stream.into_split();
     let _ = tokio::io::copy(&mut read, &mut write).await;
 }
@@ -789,6 +1136,11 @@ async fn echo_connection(stream: UnixStream) {
 async fn unix_round_trip(socket: &PathBuf, payload: &[u8]) -> Result<Vec<u8>> {
     let mut stream = UnixStream::connect(socket).await?;
     stream_round_trip(&mut stream, payload).await
+}
+
+async fn tcp_round_trip(addr: &str, payload: &[u8]) -> Result<Vec<u8>> {
+    let mut stream = TcpStream::connect(addr).await?;
+    tcp_stream_round_trip(&mut stream, payload).await
 }
 
 async fn assert_tunnel_rejects_quickly(socket: &PathBuf, payload: &[u8]) -> Result<()> {
@@ -808,12 +1160,35 @@ async fn assert_tunnel_rejects_quickly(socket: &PathBuf, payload: &[u8]) -> Resu
 }
 
 async fn stream_round_trip(stream: &mut UnixStream, payload: &[u8]) -> Result<Vec<u8>> {
-    stream.write_all(payload).await?;
-    read_expected(stream, payload).await?;
+    tokio::time::timeout(LOCAL_IO_TIMEOUT, async {
+        stream.write_all(payload).await?;
+        read_expected(stream, payload).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("unix round trip timed out")??;
     Ok(payload.to_vec())
 }
 
 async fn read_expected(stream: &mut UnixStream, expected: &[u8]) -> Result<()> {
+    let mut response = vec![0; expected.len()];
+    stream.read_exact(&mut response).await?;
+    assert_eq!(response, expected);
+    Ok(())
+}
+
+async fn tcp_stream_round_trip(stream: &mut TcpStream, payload: &[u8]) -> Result<Vec<u8>> {
+    tokio::time::timeout(LOCAL_IO_TIMEOUT, async {
+        stream.write_all(payload).await?;
+        read_expected_tcp(stream, payload).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("tcp round trip timed out")??;
+    Ok(payload.to_vec())
+}
+
+async fn read_expected_tcp(stream: &mut TcpStream, expected: &[u8]) -> Result<()> {
     let mut response = vec![0; expected.len()];
     stream.read_exact(&mut response).await?;
     assert_eq!(response, expected);

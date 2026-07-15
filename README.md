@@ -193,26 +193,43 @@ local-test aid for `--addr-json`; it is not part of the consumer contract.
 
 ```sh
 fabric expose <protocol> --socket <local-unix-sock>
+fabric expose <protocol> --tcp <host:port>
 fabric expose <protocol> --exec [--max-children N] -- <cmd> [args...]
+fabric expose <protocol> --ephemeral ...
 ```
 
 Expose a local service to trusted peers under the protocol's ALPN. `--socket`
-connects each fabric tunnel session to an existing Unix socket service. `--exec`
-spawns the configured command with piped stdin/stdout for each fabric tunnel
-session; pass the command as argv after `--`, not as a shell string. Child stderr
-is written to the fabric daemon log with the tunnel session id. Exec exposures
-default to at most 32 active children per exposure; use `--max-children` to set a
-different per-exposure cap.
+connects each fabric tunnel session to an existing Unix socket service. `--tcp`
+connects each tunnel session to an existing local TCP service. `--exec` spawns
+the configured command with piped stdin/stdout for each fabric tunnel session;
+pass the command as argv after `--`, not as a shell string. Child stderr is
+written to the fabric daemon log with the tunnel session id. Exec exposures
+default to at most 32 active children per exposure; use `--max-children` to set
+a different per-exposure cap.
+
+Exposes are persisted by default to `<home>/config.toml` and are restored when
+the daemon starts. That same file also stores shell policy and trusted peers
+written by `fabric add`. Use `--ephemeral` for short-lived test exposes that
+should not survive a daemon restart.
 
 Only allow-listed remote NodeIDs are accepted before the local socket is opened
-or the exec command is spawned.
+or the local TCP connection / exec command is started.
+
+```sh
+fabric unexpose <protocol>
+```
+
+Stop accepting a protocol and remove its persisted config entry.
 
 ```sh
 fabric dial <peer> <protocol>
+fabric dial <peer> <protocol> --tcp <local-host:port>
 ```
 
 Create and print a local Unix socket path. Connections to that socket are
-tunneled to the peer's exposed protocol over iroh.
+tunneled to the peer's exposed protocol over iroh. With `--tcp`, fabric listens
+on the local TCP address and forwards each accepted connection to the peer's
+exposed protocol.
 
 ```sh
 fabric ping <peer>
@@ -430,12 +447,13 @@ streams, or implements allow-list checks. Only fabric owns those details.
 
 ## Architecture
 
-The daemon owns one persisted iroh endpoint per fabric home. `fabric expose`
-registers an ALPN and either a local Unix socket target or an exec target in the
-running daemon; the daemon updates the endpoint's accepted ALPN list
-dynamically. Incoming iroh connections pass through an
-`EndpointHooks::after_handshake` allow-list check before the daemon connects to a
-socket target or spawns an exec target.
+The daemon owns one persisted iroh endpoint per fabric home. `<home>/config.toml`
+stores shell policy, trusted peers, and persisted exposes. `fabric expose`
+registers an ALPN and a local Unix socket, TCP, or exec target in the running
+daemon and, by default, writes it to that config. On startup, the daemon restores
+those exposes before binding its accepted ALPN list. Incoming iroh connections
+pass through an `EndpointHooks::after_handshake` allow-list check before the
+daemon connects to a socket/TCP target or spawns an exec target.
 
 `fabric dial` registers a local Unix listener under `<home>/dials`. Each local
 connection gets a random tunnel session id bound to the remote peer id. Generic

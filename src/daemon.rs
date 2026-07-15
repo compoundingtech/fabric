@@ -24,21 +24,23 @@ use iroh::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{UnixListener, UnixStream},
+    net::{TcpListener, UnixListener, UnixStream},
     sync::{Mutex, RwLock, watch},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    config::{FabricHome, Peer, PeerBook, load_or_create_identity, validate_protocol},
+    config::{
+        DEFAULT_EXEC_MAX_CHILDREN, FabricConfig, FabricHome, Peer, PeerBook, PersistedExpose,
+        PersistedExposeTarget, load_or_create_identity, validate_protocol, validate_tcp_addr,
+    },
     control::{ControlRequest, ControlResponse, PeerReachability},
     shell, tunnel,
 };
 
 const BUILTIN_ECHO_ALPN: &[u8] = b"fabric/echo/0";
 const REACHABILITY_TIMEOUT: Duration = Duration::from_secs(3);
-pub const DEFAULT_EXEC_MAX_CHILDREN: usize = 32;
 
 #[derive(Debug)]
 struct AllowListHook {
@@ -70,6 +72,7 @@ pub struct DaemonState {
     allowed: Arc<RwLock<HashSet<EndpointId>>>,
     exposures: RwLock<HashMap<Vec<u8>, Exposure>>,
     dial_sockets: Mutex<HashMap<(String, String), DialSocket>>,
+    tcp_dials: Mutex<HashMap<(String, String, String), TcpDial>>,
     tunnel_sessions: tunnel::ServerSessions,
     tunnel_drop_tx: watch::Sender<u64>,
     tunnel_blocked: AtomicBool,
@@ -85,8 +88,17 @@ struct DialSocket {
 }
 
 #[derive(Debug, Clone)]
+struct TcpDial {
+    addr: String,
+    peer_addr: EndpointAddr,
+}
+
+#[derive(Debug, Clone)]
 enum Exposure {
     Socket(PathBuf),
+    Tcp {
+        addr: String,
+    },
     Exec {
         argv: Vec<String>,
         limit: Arc<tunnel::ExecLimit>,
@@ -97,12 +109,59 @@ impl Exposure {
     fn to_server_target(&self) -> tunnel::ServerTarget {
         match self {
             Self::Socket(path) => tunnel::ServerTarget::UnixSocket(path.clone()),
+            Self::Tcp { addr } => tunnel::ServerTarget::Tcp { addr: addr.clone() },
             Self::Exec { argv, limit } => tunnel::ServerTarget::Exec {
                 argv: argv.clone(),
                 limit: limit.clone(),
             },
         }
     }
+}
+
+fn load_persisted_exposures(home: &FabricHome) -> Result<HashMap<Vec<u8>, Exposure>> {
+    let mut exposures = HashMap::new();
+    for expose in FabricConfig::load(home)?.exposes() {
+        let alpn = validate_protocol(&expose.protocol)?;
+        if matches_reserved_alpn(&alpn) {
+            bail!(
+                "{:?} in {} is reserved for fabric's built-in protocols",
+                expose.protocol,
+                home.config_path().display()
+            );
+        }
+        let exposure = match &expose.target {
+            PersistedExposeTarget::Socket { socket } => {
+                if !socket.is_absolute() {
+                    bail!("expose socket must be an absolute path");
+                }
+                Exposure::Socket(socket.clone())
+            }
+            PersistedExposeTarget::Tcp { addr } => {
+                validate_tcp_addr(addr)?;
+                Exposure::Tcp { addr: addr.clone() }
+            }
+            PersistedExposeTarget::Exec { argv, max_children } => {
+                if argv.is_empty() {
+                    bail!("exec exposure requires a command");
+                }
+                if *max_children == 0 {
+                    bail!("exec exposure max children must be greater than zero");
+                }
+                Exposure::Exec {
+                    argv: argv.clone(),
+                    limit: tunnel::ExecLimit::new(*max_children),
+                }
+            }
+        };
+        exposures.insert(alpn, exposure);
+    }
+    Ok(exposures)
+}
+
+fn set_config_allow_shell(home: &FabricHome, allow_shell: bool) -> Result<()> {
+    let mut config = FabricConfig::load(home)?;
+    config.set_allow_shell(allow_shell);
+    config.save(home)
 }
 
 #[derive(Debug)]
@@ -119,11 +178,17 @@ impl DaemonState {
     ) -> Result<Arc<Self>> {
         home.prepare()?;
         let secret_key = load_or_create_identity(&home)?;
+        if allow_shell {
+            set_config_allow_shell(&home, true)?;
+        }
+        let config = FabricConfig::load(&home)?;
+        let allow_shell = allow_shell || config.allow_shell().unwrap_or(false);
         let peer_book = PeerBook::load(&home)?;
+        let exposures = load_persisted_exposures(&home)?;
         let allowed = Arc::new(RwLock::new(peer_book.trusted_ids()));
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
-            .alpns(accepted_alpns(&HashMap::new()))
+            .alpns(accepted_alpns(&exposures))
             .hooks(AllowListHook {
                 allowed: allowed.clone(),
             })
@@ -138,8 +203,9 @@ impl DaemonState {
             endpoint,
             peer_book: RwLock::new(peer_book),
             allowed,
-            exposures: RwLock::new(HashMap::new()),
+            exposures: RwLock::new(exposures),
             dial_sockets: Mutex::new(HashMap::new()),
+            tcp_dials: Mutex::new(HashMap::new()),
             tunnel_sessions: Arc::new(Mutex::new(HashMap::new())),
             tunnel_drop_tx,
             tunnel_blocked: AtomicBool::new(false),
@@ -165,6 +231,10 @@ impl DaemonState {
     }
 
     pub async fn expose(&self, protocol: &str, socket: PathBuf) -> Result<()> {
+        self.expose_socket(protocol, socket, true).await
+    }
+
+    async fn expose_socket(&self, protocol: &str, socket: PathBuf, persist: bool) -> Result<()> {
         let alpn = validate_protocol(protocol)?;
         if matches_reserved_alpn(&alpn) {
             bail!("{protocol:?} is reserved for fabric's built-in protocols");
@@ -173,8 +243,45 @@ impl DaemonState {
             bail!("expose socket must be an absolute path");
         }
 
+        if persist {
+            let mut config = FabricConfig::load(&self.home)?;
+            config.upsert_expose(PersistedExpose::socket(
+                protocol.to_string(),
+                socket.clone(),
+            ));
+            config.save(&self.home)?;
+        }
+
         let mut exposures = self.exposures.write().await;
         exposures.insert(alpn, Exposure::Socket(socket));
+        self.endpoint.set_alpns(accepted_alpns(&exposures));
+        Ok(())
+    }
+
+    pub async fn expose_tcp(&self, protocol: &str, addr: String) -> Result<()> {
+        self.expose_tcp_with_persistence(protocol, addr, true).await
+    }
+
+    async fn expose_tcp_with_persistence(
+        &self,
+        protocol: &str,
+        addr: String,
+        persist: bool,
+    ) -> Result<()> {
+        let alpn = validate_protocol(protocol)?;
+        if matches_reserved_alpn(&alpn) {
+            bail!("{protocol:?} is reserved for fabric's built-in protocols");
+        }
+        validate_tcp_addr(&addr)?;
+
+        if persist {
+            let mut config = FabricConfig::load(&self.home)?;
+            config.upsert_expose(PersistedExpose::tcp(protocol.to_string(), addr.clone()));
+            config.save(&self.home)?;
+        }
+
+        let mut exposures = self.exposures.write().await;
+        exposures.insert(alpn, Exposure::Tcp { addr });
         self.endpoint.set_alpns(accepted_alpns(&exposures));
         Ok(())
     }
@@ -184,6 +291,17 @@ impl DaemonState {
         protocol: &str,
         argv: Vec<String>,
         max_children: usize,
+    ) -> Result<()> {
+        self.expose_exec_with_persistence(protocol, argv, max_children, true)
+            .await
+    }
+
+    async fn expose_exec_with_persistence(
+        &self,
+        protocol: &str,
+        argv: Vec<String>,
+        max_children: usize,
+        persist: bool,
     ) -> Result<()> {
         let alpn = validate_protocol(protocol)?;
         if matches_reserved_alpn(&alpn) {
@@ -196,6 +314,16 @@ impl DaemonState {
             bail!("exec exposure max children must be greater than zero");
         }
 
+        if persist {
+            let mut config = FabricConfig::load(&self.home)?;
+            config.upsert_expose(PersistedExpose::exec(
+                protocol.to_string(),
+                argv.clone(),
+                max_children,
+            ));
+            config.save(&self.home)?;
+        }
+
         let mut exposures = self.exposures.write().await;
         exposures.insert(
             alpn,
@@ -204,6 +332,41 @@ impl DaemonState {
                 limit: tunnel::ExecLimit::new(max_children),
             },
         );
+        self.endpoint.set_alpns(accepted_alpns(&exposures));
+        Ok(())
+    }
+
+    pub async fn expose_ephemeral(&self, protocol: &str, socket: PathBuf) -> Result<()> {
+        self.expose_socket(protocol, socket, false).await
+    }
+
+    pub async fn expose_tcp_ephemeral(&self, protocol: &str, addr: String) -> Result<()> {
+        self.expose_tcp_with_persistence(protocol, addr, false)
+            .await
+    }
+
+    pub async fn expose_exec_ephemeral(
+        &self,
+        protocol: &str,
+        argv: Vec<String>,
+        max_children: usize,
+    ) -> Result<()> {
+        self.expose_exec_with_persistence(protocol, argv, max_children, false)
+            .await
+    }
+
+    pub async fn unexpose(&self, protocol: &str) -> Result<()> {
+        let alpn = validate_protocol(protocol)?;
+        if matches_reserved_alpn(&alpn) {
+            bail!("{protocol:?} is reserved for fabric's built-in protocols");
+        }
+
+        let mut config = FabricConfig::load(&self.home)?;
+        config.remove_expose(protocol);
+        config.save(&self.home)?;
+
+        let mut exposures = self.exposures.write().await;
+        exposures.remove(&alpn);
         self.endpoint.set_alpns(accepted_alpns(&exposures));
         Ok(())
     }
@@ -257,6 +420,43 @@ impl DaemonState {
     pub async fn dial(&self, peer: &str, protocol: &str) -> Result<PathBuf> {
         let alpn = validate_protocol(protocol)?;
         self.dial_alpn(peer, protocol, alpn, true).await
+    }
+
+    pub async fn dial_tcp(&self, peer: &str, protocol: &str, bind: String) -> Result<String> {
+        validate_tcp_addr(&bind)?;
+        let alpn = validate_protocol(protocol)?;
+        let peer_addr = self.peer_book.read().await.resolve(peer)?;
+        let key = (peer_addr.id.to_string(), protocol.to_string(), bind.clone());
+
+        let mut tcp_dials = self.tcp_dials.lock().await;
+        if let Some(existing) = tcp_dials.get_mut(&key) {
+            existing.peer_addr = peer_addr;
+            return Ok(existing.addr.clone());
+        }
+        let listener = TcpListener::bind(&bind)
+            .await
+            .with_context(|| format!("failed to bind tcp dial listener {bind}"))?;
+        let addr = listener.local_addr()?.to_string();
+        tcp_dials.insert(
+            key,
+            TcpDial {
+                addr: addr.clone(),
+                peer_addr: peer_addr.clone(),
+            },
+        );
+        drop(tcp_dials);
+
+        tokio::spawn(run_dial_tcp_listener(
+            listener,
+            self.endpoint.clone(),
+            self.home.clone(),
+            peer.to_string(),
+            alpn,
+            self.cancel.clone(),
+            self.tunnel_drop_rx(),
+        ));
+
+        Ok(addr)
     }
 
     async fn dial_alpn(
@@ -372,8 +572,11 @@ impl DaemonState {
         })
     }
 
-    fn schedule_restart(&self, allow_shell: Option<bool>) -> Result<RestartPlan> {
-        let allow_shell = allow_shell.unwrap_or(self.allow_shell);
+    fn schedule_restart(&self, requested_allow_shell: Option<bool>) -> Result<RestartPlan> {
+        if let Some(allow_shell) = requested_allow_shell {
+            set_config_allow_shell(&self.home, allow_shell)?;
+        }
+        let allow_shell = requested_allow_shell.unwrap_or(self.allow_shell);
         self.home.prepare()?;
         let log_path = self.home.restart_log_path();
         let mut log = OpenOptions::new()
@@ -530,6 +733,18 @@ impl FabricNode {
         self.state.expose(protocol, socket).await
     }
 
+    pub async fn expose_ephemeral(&self, protocol: &str, socket: PathBuf) -> Result<()> {
+        self.state.expose_ephemeral(protocol, socket).await
+    }
+
+    pub async fn expose_tcp(&self, protocol: &str, addr: String) -> Result<()> {
+        self.state.expose_tcp(protocol, addr).await
+    }
+
+    pub async fn expose_tcp_ephemeral(&self, protocol: &str, addr: String) -> Result<()> {
+        self.state.expose_tcp_ephemeral(protocol, addr).await
+    }
+
     pub async fn expose_exec(&self, protocol: &str, argv: Vec<String>) -> Result<()> {
         self.state
             .expose_exec(protocol, argv, DEFAULT_EXEC_MAX_CHILDREN)
@@ -545,8 +760,27 @@ impl FabricNode {
         self.state.expose_exec(protocol, argv, max_children).await
     }
 
+    pub async fn expose_exec_ephemeral(
+        &self,
+        protocol: &str,
+        argv: Vec<String>,
+        max_children: usize,
+    ) -> Result<()> {
+        self.state
+            .expose_exec_ephemeral(protocol, argv, max_children)
+            .await
+    }
+
+    pub async fn unexpose(&self, protocol: &str) -> Result<()> {
+        self.state.unexpose(protocol).await
+    }
+
     pub async fn dial(&self, peer: &str, protocol: &str) -> Result<PathBuf> {
         self.state.dial(peer, protocol).await
+    }
+
+    pub async fn dial_tcp(&self, peer: &str, protocol: &str, bind: String) -> Result<String> {
+        self.state.dial_tcp(peer, protocol, bind).await
     }
 
     pub async fn ping(&self, peer: &str) -> Result<PingOutcome> {
@@ -659,21 +893,60 @@ async fn process_control_request(
             state.reload_peers().await?;
             ControlResponse::Ok
         }
-        ControlRequest::Expose { protocol, socket } => {
-            state.expose(&protocol, socket).await?;
+        ControlRequest::Expose {
+            protocol,
+            socket,
+            persist,
+        } => {
+            if persist {
+                state.expose(&protocol, socket).await?;
+            } else {
+                state.expose_ephemeral(&protocol, socket).await?;
+            }
             ControlResponse::Ok
         }
         ControlRequest::ExposeExec {
             protocol,
             argv,
             max_children,
+            persist,
         } => {
-            state.expose_exec(&protocol, argv, max_children).await?;
+            if persist {
+                state.expose_exec(&protocol, argv, max_children).await?;
+            } else {
+                state
+                    .expose_exec_ephemeral(&protocol, argv, max_children)
+                    .await?;
+            }
+            ControlResponse::Ok
+        }
+        ControlRequest::ExposeTcp {
+            protocol,
+            addr,
+            persist,
+        } => {
+            if persist {
+                state.expose_tcp(&protocol, addr).await?;
+            } else {
+                state.expose_tcp_ephemeral(&protocol, addr).await?;
+            }
+            ControlResponse::Ok
+        }
+        ControlRequest::Unexpose { protocol } => {
+            state.unexpose(&protocol).await?;
             ControlResponse::Ok
         }
         ControlRequest::Dial { peer, protocol } => {
             let socket = state.dial(&peer, &protocol).await?;
             ControlResponse::Dial { socket }
+        }
+        ControlRequest::DialTcp {
+            peer,
+            protocol,
+            bind,
+        } => {
+            let addr = state.dial_tcp(&peer, &protocol, bind).await?;
+            ControlResponse::DialTcp { addr }
         }
         ControlRequest::Ping { peer } => {
             let pong = state.ping(&peer).await?;
@@ -894,6 +1167,41 @@ async fn run_dial_socket(
                             .await
                     {
                         eprintln!("fabric: dial socket connection failed: {error:#}");
+                    }
+                });
+            }
+        }
+    }
+}
+
+async fn run_dial_tcp_listener(
+    listener: TcpListener,
+    endpoint: Endpoint,
+    home: FabricHome,
+    peer: String,
+    alpn: Vec<u8>,
+    cancel: CancellationToken,
+    drop_rx: watch::Receiver<u64>,
+) {
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            accepted = listener.accept() => {
+                let Ok((local, _)) = accepted else {
+                    break;
+                };
+                let endpoint = endpoint.clone();
+                let home = home.clone();
+                let peer = peer.clone();
+                let alpn = alpn.clone();
+                let cancel = cancel.clone();
+                let drop_rx = drop_rx.clone();
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        tunnel::run_client_tcp_connection(local, endpoint, home, peer, alpn, cancel, drop_rx)
+                            .await
+                    {
+                        eprintln!("fabric: dial tcp connection failed: {error:#}");
                     }
                 });
             }

@@ -17,7 +17,7 @@ use iroh::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
-    net::UnixStream,
+    net::{TcpStream, UnixStream},
     process::{ChildStderr, Command},
     sync::{Mutex, Notify, watch},
 };
@@ -46,6 +46,9 @@ pub type LocalWrite = Box<dyn AsyncWrite + Send + Unpin + 'static>;
 #[derive(Debug, Clone)]
 pub enum ServerTarget {
     UnixSocket(PathBuf),
+    Tcp {
+        addr: String,
+    },
     Exec {
         argv: Vec<String>,
         limit: Arc<ExecLimit>,
@@ -640,9 +643,57 @@ pub async fn run_client_connection(
     cancel: CancellationToken,
     drop_rx: watch::Receiver<u64>,
 ) -> Result<()> {
+    let (read, write) = local.into_split();
+    run_client_connection_parts(
+        Box::new(read),
+        Box::new(write),
+        endpoint,
+        home,
+        peer,
+        alpn,
+        cancel,
+        drop_rx,
+    )
+    .await
+}
+
+pub async fn run_client_tcp_connection(
+    local: TcpStream,
+    endpoint: Endpoint,
+    home: FabricHome,
+    peer: String,
+    alpn: Vec<u8>,
+    cancel: CancellationToken,
+    drop_rx: watch::Receiver<u64>,
+) -> Result<()> {
+    let (read, write) = local.into_split();
+    run_client_connection_parts(
+        Box::new(read),
+        Box::new(write),
+        endpoint,
+        home,
+        peer,
+        alpn,
+        cancel,
+        drop_rx,
+    )
+    .await
+}
+
+async fn run_client_connection_parts(
+    local_read: LocalRead,
+    local_write: LocalWrite,
+    endpoint: Endpoint,
+    home: FabricHome,
+    peer: String,
+    alpn: Vec<u8>,
+    cancel: CancellationToken,
+    drop_rx: watch::Receiver<u64>,
+) -> Result<()> {
     let peer_id = PeerBook::load(&home)?.resolve(&peer)?.id;
     let session_id = TunnelSessionId::random();
-    let (session, local_read) = TunnelSession::new(session_id, peer_id, local);
+    let (session, local_read) =
+        TunnelSession::new_parts(session_id, peer_id, local_read, local_write);
     let reader = tokio::spawn(session.clone().run_local_reader(local_read));
     let result =
         run_client_attach_loop(session.clone(), endpoint, home, peer, alpn, cancel, drop_rx).await;
@@ -858,6 +909,18 @@ async fn create_server_session(
                 )
             })?;
             Ok(TunnelSession::new(session_id, peer_id, local))
+        }
+        ServerTarget::Tcp { addr } => {
+            let local = TcpStream::connect(&addr)
+                .await
+                .with_context(|| format!("failed to connect exposed tcp {addr}"))?;
+            let (read, write) = local.into_split();
+            Ok(TunnelSession::new_parts(
+                session_id,
+                peer_id,
+                Box::new(read),
+                Box::new(write),
+            ))
         }
         ServerTarget::Exec { argv, limit } => {
             spawn_exec_session(session_id, peer_id, argv, limit).await

@@ -225,7 +225,10 @@ Notes:
 ## pty Fabric Exposure Unit
 
 pty stays transport-agnostic, so fabric exposes the pty remote-control socket in
-a separate one-shot unit. pty confirmed the fabric protocol/ALPN is `pty-view`.
+a separate one-shot unit on older fabric builds. Current fabric persists exposes
+to `<home>/config.toml`, so re-running `fabric expose pty-view ...` once is
+enough for fabric restarts after the socket path is stable. pty confirmed the
+fabric protocol/ALPN is `pty-view`.
 
 Draft:
 
@@ -250,11 +253,14 @@ Notes:
 
 - The `ExecStartPre` wait avoids a startup race where systemd has started
   remote-serve but the Unix socket has not appeared yet.
-- Exposures are daemon memory, not persistent config. After restarting
-  `fabric.service`, restart this one-shot unit too and verify `fabric status`
-  still lists `pty-view`.
-- If fabric later gains config-backed persistent exposes, this companion unit can
-  go away.
+- Current fabric persists exposes by default. After restarting `fabric.service`,
+  verify `fabric status` still lists `pty-view`; no manual re-expose should be
+  needed unless the target socket path changes. Use `fabric unexpose pty-view`
+  to retire the durable mapping.
+- `<home>/config.toml` is the durable daemon config for shell policy, trusted
+  peers, and exposes.
+- The companion unit is only needed for older fabric builds without
+  `<home>/config.toml` persisted-expose support.
 
 ## Deployment Flow
 
@@ -410,10 +416,10 @@ systemctl --user is-active fabric.service
 
 ## Later Hardening
 
-- Move `allow_shell` into fabric config so supervisor restarts do not need a
-  command-line flag to preserve policy.
+- Simplify the Hetzner keepalive unit after rollout so config, not
+  `daemon --allow-shell`, is the source of shell policy.
 - Add `fabric doctor` to collect process, log, version, and reachability facts.
 - Add `fabric status` fields for generic tunnel reconnecting state, attempts,
   last error, and buffered bytes before pty attach becomes user-facing over WAN.
-- Consider a one-shot `fabric expose --persist` or config-backed exposures so
-  ALPN/socket mappings survive daemon restarts without companion units.
+- Add richer `fabric expose` status output that distinguishes socket, exec, and
+  ephemeral targets.
