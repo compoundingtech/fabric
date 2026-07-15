@@ -38,6 +38,7 @@ use crate::{
 
 const BUILTIN_ECHO_ALPN: &[u8] = b"fabric/echo/0";
 const REACHABILITY_TIMEOUT: Duration = Duration::from_secs(3);
+pub const DEFAULT_EXEC_MAX_CHILDREN: usize = 32;
 
 #[derive(Debug)]
 struct AllowListHook {
@@ -67,7 +68,7 @@ pub struct DaemonState {
     endpoint: Endpoint,
     peer_book: RwLock<PeerBook>,
     allowed: Arc<RwLock<HashSet<EndpointId>>>,
-    exposures: RwLock<HashMap<Vec<u8>, PathBuf>>,
+    exposures: RwLock<HashMap<Vec<u8>, Exposure>>,
     dial_sockets: Mutex<HashMap<(String, String), DialSocket>>,
     tunnel_sessions: tunnel::ServerSessions,
     tunnel_drop_tx: watch::Sender<u64>,
@@ -81,6 +82,27 @@ pub struct DaemonState {
 struct DialSocket {
     path: PathBuf,
     peer_addr: EndpointAddr,
+}
+
+#[derive(Debug, Clone)]
+enum Exposure {
+    Socket(PathBuf),
+    Exec {
+        argv: Vec<String>,
+        limit: Arc<tunnel::ExecLimit>,
+    },
+}
+
+impl Exposure {
+    fn to_server_target(&self) -> tunnel::ServerTarget {
+        match self {
+            Self::Socket(path) => tunnel::ServerTarget::UnixSocket(path.clone()),
+            Self::Exec { argv, limit } => tunnel::ServerTarget::Exec {
+                argv: argv.clone(),
+                limit: limit.clone(),
+            },
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -152,9 +174,42 @@ impl DaemonState {
         }
 
         let mut exposures = self.exposures.write().await;
-        exposures.insert(alpn, socket);
+        exposures.insert(alpn, Exposure::Socket(socket));
         self.endpoint.set_alpns(accepted_alpns(&exposures));
         Ok(())
+    }
+
+    pub async fn expose_exec(
+        &self,
+        protocol: &str,
+        argv: Vec<String>,
+        max_children: usize,
+    ) -> Result<()> {
+        let alpn = validate_protocol(protocol)?;
+        if matches_reserved_alpn(&alpn) {
+            bail!("{protocol:?} is reserved for fabric's built-in protocols");
+        }
+        if argv.is_empty() {
+            bail!("exec exposure requires a command");
+        }
+        if max_children == 0 {
+            bail!("exec exposure max children must be greater than zero");
+        }
+
+        let mut exposures = self.exposures.write().await;
+        exposures.insert(
+            alpn,
+            Exposure::Exec {
+                argv,
+                limit: tunnel::ExecLimit::new(max_children),
+            },
+        );
+        self.endpoint.set_alpns(accepted_alpns(&exposures));
+        Ok(())
+    }
+
+    pub async fn reap_tunnel_sessions(&self, ttl: Duration) -> usize {
+        tunnel::reap_server_sessions(self.tunnel_sessions.clone(), ttl).await
     }
 
     pub async fn ping(&self, peer: &str) -> Result<PingOutcome> {
@@ -475,6 +530,21 @@ impl FabricNode {
         self.state.expose(protocol, socket).await
     }
 
+    pub async fn expose_exec(&self, protocol: &str, argv: Vec<String>) -> Result<()> {
+        self.state
+            .expose_exec(protocol, argv, DEFAULT_EXEC_MAX_CHILDREN)
+            .await
+    }
+
+    pub async fn expose_exec_with_limit(
+        &self,
+        protocol: &str,
+        argv: Vec<String>,
+        max_children: usize,
+    ) -> Result<()> {
+        self.state.expose_exec(protocol, argv, max_children).await
+    }
+
     pub async fn dial(&self, peer: &str, protocol: &str) -> Result<PathBuf> {
         self.state.dial(peer, protocol).await
     }
@@ -593,6 +663,14 @@ async fn process_control_request(
             state.expose(&protocol, socket).await?;
             ControlResponse::Ok
         }
+        ControlRequest::ExposeExec {
+            protocol,
+            argv,
+            max_children,
+        } => {
+            state.expose_exec(&protocol, argv, max_children).await?;
+            ControlResponse::Ok
+        }
         ControlRequest::Dial { peer, protocol } => {
             let socket = state.dial(&peer, &protocol).await?;
             ControlResponse::Dial { socket }
@@ -623,6 +701,12 @@ async fn process_control_request(
         }
         ControlRequest::SetTunnelBlocked { blocked } => {
             state.set_tunnel_blocked(blocked);
+            ControlResponse::Ok
+        }
+        ControlRequest::ReapTunnelSessions { ttl_millis } => {
+            state
+                .reap_tunnel_sessions(Duration::from_millis(ttl_millis))
+                .await;
             ControlResponse::Ok
         }
         ControlRequest::Restart { allow_shell } => {
@@ -675,11 +759,11 @@ async fn process_incoming_iroh(incoming: Incoming, state: Arc<DaemonState>) -> R
         return Ok(());
     }
 
-    let socket = {
+    let exposure = {
         let exposures = state.exposures.read().await;
         exposures.get(alpn.as_slice()).cloned()
     };
-    let Some(socket) = socket else {
+    let Some(exposure) = exposure else {
         return Ok(());
     };
 
@@ -695,7 +779,7 @@ async fn process_incoming_iroh(incoming: Incoming, state: Arc<DaemonState>) -> R
         send,
         recv,
         peer_id,
-        socket,
+        exposure.to_server_target(),
         state.tunnel_sessions.clone(),
         state.tunnel_drop_rx(),
     )
@@ -724,7 +808,7 @@ async fn handle_builtin_shell(connection: Connection, state: Arc<DaemonState>) -
     Ok(())
 }
 
-fn accepted_alpns(exposures: &HashMap<Vec<u8>, PathBuf>) -> Vec<Vec<u8>> {
+fn accepted_alpns(exposures: &HashMap<Vec<u8>, Exposure>) -> Vec<Vec<u8>> {
     let mut alpns = Vec::with_capacity(exposures.len() + 2);
     alpns.push(BUILTIN_ECHO_ALPN.to_vec());
     alpns.push(shell::SHELL_ALPN.to_vec());

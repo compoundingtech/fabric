@@ -8,13 +8,35 @@ pub enum ControlRequest {
     Status,
     ReachabilityStatus,
     ReloadPeers,
-    Expose { protocol: String, socket: PathBuf },
-    Dial { peer: String, protocol: String },
-    Ping { peer: String },
-    Shell { peer: String },
+    Expose {
+        protocol: String,
+        socket: PathBuf,
+    },
+    ExposeExec {
+        protocol: String,
+        argv: Vec<String>,
+        max_children: usize,
+    },
+    Dial {
+        peer: String,
+        protocol: String,
+    },
+    Ping {
+        peer: String,
+    },
+    Shell {
+        peer: String,
+    },
     DropTunnelConnections,
-    SetTunnelBlocked { blocked: bool },
-    Restart { allow_shell: Option<bool> },
+    SetTunnelBlocked {
+        blocked: bool,
+    },
+    ReapTunnelSessions {
+        ttl_millis: u64,
+    },
+    Restart {
+        allow_shell: Option<bool>,
+    },
     Shutdown,
 }
 

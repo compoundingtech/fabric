@@ -193,10 +193,19 @@ local-test aid for `--addr-json`; it is not part of the consumer contract.
 
 ```sh
 fabric expose <protocol> --socket <local-unix-sock>
+fabric expose <protocol> --exec [--max-children N] -- <cmd> [args...]
 ```
 
-Expose a local Unix socket service to trusted peers under the protocol's ALPN.
-Only allow-listed remote NodeIDs are accepted before the local socket is opened.
+Expose a local service to trusted peers under the protocol's ALPN. `--socket`
+connects each fabric tunnel session to an existing Unix socket service. `--exec`
+spawns the configured command with piped stdin/stdout for each fabric tunnel
+session; pass the command as argv after `--`, not as a shell string. Child stderr
+is written to the fabric daemon log with the tunnel session id. Exec exposures
+default to at most 32 active children per exposure; use `--max-children` to set a
+different per-exposure cap.
+
+Only allow-listed remote NodeIDs are accepted before the local socket is opened
+or the exec command is spawned.
 
 ```sh
 fabric dial <peer> <protocol>
@@ -422,15 +431,20 @@ streams, or implements allow-list checks. Only fabric owns those details.
 ## Architecture
 
 The daemon owns one persisted iroh endpoint per fabric home. `fabric expose`
-registers an ALPN and local Unix socket in the running daemon; the daemon updates
-the endpoint's accepted ALPN list dynamically. Incoming iroh connections pass
-through an `EndpointHooks::after_handshake` allow-list check before the daemon
-connects to any exposed local service.
+registers an ALPN and either a local Unix socket target or an exec target in the
+running daemon; the daemon updates the endpoint's accepted ALPN list
+dynamically. Incoming iroh connections pass through an
+`EndpointHooks::after_handshake` allow-list check before the daemon connects to a
+socket target or spawns an exec target.
 
 `fabric dial` registers a local Unix listener under `<home>/dials`. Each local
 connection gets a random tunnel session id bound to the remote peer id. Generic
 dials use a small framed byte protocol with offsets and ACKs, so unacked bytes
 can be replayed after a real iroh attach loss while the local Unix socket stays
-open. Built-in `fabric shell` remains on its raw one-shot stream protocol; a
-resilient shell should be built above generic fabric transport, for example by
-running a long-lived `pty` session over `fabric dial`.
+open. On the expose side, the Unix socket connection or exec child is bound to
+that tunnel session, not to each transient iroh attach, so a reconnect resumes
+the same local endpoint. If a detached session exceeds the server TTL, fabric
+removes the session and kills/reaps its exec child. Built-in `fabric shell`
+remains on its raw one-shot stream protocol; a resilient shell should be built
+above generic fabric transport, for example by running a long-lived `pty` session
+over `fabric dial`.

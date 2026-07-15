@@ -14,7 +14,7 @@ use fabric::{
         parse_node_id,
     },
     control::{ControlRequest, ControlResponse, PeerReachability},
-    daemon::{FabricNode, run_daemon, send_control},
+    daemon::{DEFAULT_EXEC_MAX_CHILDREN, FabricNode, run_daemon, send_control},
     shell::{self, ServerFrame},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -78,11 +78,25 @@ enum Commands {
         #[arg(long)]
         no_allow_shell: bool,
     },
-    /// Expose a local Unix socket service to trusted peers under an ALPN protocol.
+    /// Expose a local service to trusted peers under an ALPN protocol.
     Expose {
         protocol: String,
+        /// Expose an existing local Unix socket service.
+        #[arg(long, conflicts_with = "exec")]
+        socket: Option<PathBuf>,
+        /// Spawn a command per incoming fabric tunnel session and pipe stdio.
+        #[arg(long, conflicts_with = "socket")]
+        exec: bool,
+        /// Maximum active children for this exec exposure.
         #[arg(long)]
-        socket: PathBuf,
+        max_children: Option<usize>,
+        /// Command argv for --exec. Use `--` before the command.
+        #[arg(
+            value_name = "CMD",
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
+        command: Vec<String>,
     },
     /// Create a local Unix socket that tunnels to a peer's exposed protocol.
     Dial { peer: String, protocol: String },
@@ -134,6 +148,11 @@ enum DebugCommands {
     BlockTunnels,
     /// Allow new generic tunnel attaches again.
     UnblockTunnels,
+    /// Reap complete or expired generic tunnel sessions.
+    ReapTunnels {
+        #[arg(long, default_value_t = 0)]
+        ttl_ms: u64,
+    },
     /// Run a foreground Unix-socket echo service.
     Echo {
         #[arg(long)]
@@ -266,8 +285,15 @@ async fn main() -> Result<()> {
                         response => bail!("unexpected daemon response: {response:?}"),
                     }
                 }
-                Commands::Expose { protocol, socket } => {
-                    send_control(&home, ControlRequest::Expose { protocol, socket }).await?;
+                Commands::Expose {
+                    protocol,
+                    socket,
+                    exec,
+                    max_children,
+                    command,
+                } => {
+                    let request = expose_request(protocol, socket, exec, max_children, command)?;
+                    send_control(&home, request).await?;
                     println!("exposed");
                 }
                 Commands::Dial { peer, protocol } => {
@@ -322,6 +348,14 @@ async fn main() -> Result<()> {
                             .await?;
                         println!("unblocked tunnel attaches");
                     }
+                    DebugCommands::ReapTunnels { ttl_ms } => {
+                        send_control(
+                            &home,
+                            ControlRequest::ReapTunnelSessions { ttl_millis: ttl_ms },
+                        )
+                        .await?;
+                        println!("reaped tunnel sessions");
+                    }
                     DebugCommands::Echo { socket } => {
                         run_debug_echo(socket).await?;
                     }
@@ -343,6 +377,42 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn expose_request(
+    protocol: String,
+    socket: Option<PathBuf>,
+    exec: bool,
+    max_children: Option<usize>,
+    command: Vec<String>,
+) -> Result<ControlRequest> {
+    if exec {
+        if command.is_empty() {
+            bail!("--exec requires a command: fabric expose {protocol} --exec -- <cmd> [args...]");
+        }
+        let max_children = max_children.unwrap_or(DEFAULT_EXEC_MAX_CHILDREN);
+        if max_children == 0 {
+            bail!("--max-children must be greater than zero");
+        }
+        return Ok(ControlRequest::ExposeExec {
+            protocol,
+            argv: command,
+            max_children,
+        });
+    }
+
+    if max_children.is_some() {
+        bail!("--max-children requires --exec");
+    }
+
+    if !command.is_empty() {
+        bail!("command arguments require --exec");
+    }
+
+    let Some(socket) = socket else {
+        bail!("expose requires --socket <path> or --exec -- <cmd> [args...]");
+    };
+    Ok(ControlRequest::Expose { protocol, socket })
 }
 
 fn print_status(

@@ -2,7 +2,11 @@ use std::{
     collections::{HashMap, VecDeque},
     fmt,
     path::PathBuf,
-    sync::Arc,
+    process::Stdio,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -12,11 +16,9 @@ use iroh::{
     endpoint::{Connection, RecvStream, SendStream},
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{
-        UnixStream,
-        unix::{OwnedReadHalf, OwnedWriteHalf},
-    },
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    net::UnixStream,
+    process::{ChildStderr, Command},
     sync::{Mutex, Notify, watch},
 };
 use tokio_util::sync::CancellationToken;
@@ -36,6 +38,74 @@ const FRAME_HELLO: u8 = 1;
 const FRAME_DATA: u8 = 2;
 const FRAME_ACK: u8 = 3;
 const FRAME_CLOSE: u8 = 4;
+const FRAME_ERROR: u8 = 5;
+
+pub type LocalRead = Box<dyn AsyncRead + Send + Unpin + 'static>;
+pub type LocalWrite = Box<dyn AsyncWrite + Send + Unpin + 'static>;
+
+#[derive(Debug, Clone)]
+pub enum ServerTarget {
+    UnixSocket(PathBuf),
+    Exec {
+        argv: Vec<String>,
+        limit: Arc<ExecLimit>,
+    },
+}
+
+#[derive(Debug)]
+pub struct ExecLimit {
+    max_children: usize,
+    active_children: AtomicUsize,
+}
+
+impl ExecLimit {
+    pub fn new(max_children: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max_children,
+            active_children: AtomicUsize::new(0),
+        })
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<ExecPermit> {
+        let mut active = self.active_children.load(Ordering::SeqCst);
+        loop {
+            if active >= self.max_children {
+                return None;
+            }
+            match self.active_children.compare_exchange(
+                active,
+                active + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Some(ExecPermit {
+                        limit: self.clone(),
+                    });
+                }
+                Err(current) => active = current,
+            }
+        }
+    }
+
+    pub fn max_children(&self) -> usize {
+        self.max_children
+    }
+
+    pub fn active_children(&self) -> usize {
+        self.active_children.load(Ordering::SeqCst)
+    }
+}
+
+struct ExecPermit {
+    limit: Arc<ExecLimit>,
+}
+
+impl Drop for ExecPermit {
+    fn drop(&mut self) {
+        self.limit.active_children.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TunnelSessionId([u8; 16]);
@@ -80,6 +150,9 @@ enum Frame {
     Close {
         offset: u64,
     },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -105,14 +178,28 @@ struct TunnelState {
     last_error: Option<String>,
 }
 
-#[derive(Debug)]
 pub struct TunnelSession {
     id: TunnelSessionId,
     peer_id: EndpointId,
-    local_write: Mutex<OwnedWriteHalf>,
+    local_write: Mutex<Option<LocalWrite>>,
+    cleanup: Mutex<Option<SessionCleanup>>,
     state: Mutex<TunnelState>,
     notify: Notify,
     done: CancellationToken,
+}
+
+#[derive(Debug)]
+struct SessionCleanup {
+    kill: CancellationToken,
+}
+
+impl fmt::Debug for TunnelSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TunnelSession")
+            .field("id", &self.id)
+            .field("peer_id", &self.peer_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TunnelSession {
@@ -120,12 +207,32 @@ impl TunnelSession {
         id: TunnelSessionId,
         peer_id: EndpointId,
         local: UnixStream,
-    ) -> (Arc<Self>, OwnedReadHalf) {
+    ) -> (Arc<Self>, LocalRead) {
         let (read, write) = local.into_split();
+        Self::new_parts(id, peer_id, Box::new(read), Box::new(write))
+    }
+
+    pub fn new_parts(
+        id: TunnelSessionId,
+        peer_id: EndpointId,
+        read: LocalRead,
+        write: LocalWrite,
+    ) -> (Arc<Self>, LocalRead) {
+        Self::new_parts_with_cleanup(id, peer_id, read, write, None)
+    }
+
+    fn new_parts_with_cleanup(
+        id: TunnelSessionId,
+        peer_id: EndpointId,
+        read: LocalRead,
+        write: LocalWrite,
+        cleanup: Option<SessionCleanup>,
+    ) -> (Arc<Self>, LocalRead) {
         let session = Arc::new(Self {
             id,
             peer_id,
-            local_write: Mutex::new(write),
+            local_write: Mutex::new(Some(write)),
+            cleanup: Mutex::new(cleanup),
             state: Mutex::new(TunnelState {
                 send_next: 0,
                 send_acked: 0,
@@ -167,16 +274,6 @@ impl TunnelSession {
             && state.send_acked >= state.send_next
     }
 
-    pub async fn is_expired(&self, ttl: Duration) -> bool {
-        let state = self.state.lock().await;
-        if state.active_attaches > 0 || self.done.is_cancelled() {
-            return false;
-        }
-        state
-            .last_detached
-            .is_some_and(|detached| detached.elapsed() >= ttl)
-    }
-
     pub async fn record_reconnect_attempt(&self, error: Option<String>) -> u64 {
         let mut state = self.state.lock().await;
         state.reconnect_attempts += 1;
@@ -188,10 +285,17 @@ impl TunnelSession {
         self.state.lock().await.last_error = None;
     }
 
-    async fn begin_attach(&self) {
+    async fn begin_attach(&self) -> Result<()> {
+        if self.done.is_cancelled() {
+            bail!("tunnel session {} is closed", self.id);
+        }
         let mut state = self.state.lock().await;
+        if self.done.is_cancelled() {
+            bail!("tunnel session {} is closed", self.id);
+        }
         state.active_attaches += 1;
         state.last_detached = None;
+        Ok(())
     }
 
     async fn end_attach(&self) {
@@ -203,7 +307,7 @@ impl TunnelSession {
         self.notify.notify_waiters();
     }
 
-    pub async fn run_local_reader(self: Arc<Self>, mut read: OwnedReadHalf) -> Result<()> {
+    pub async fn run_local_reader(self: Arc<Self>, mut read: LocalRead) -> Result<()> {
         let mut buf = [0; LOCAL_READ_BUF];
         loop {
             self.wait_for_buffer_space().await;
@@ -281,6 +385,9 @@ impl TunnelSession {
 
         {
             let mut write = self.local_write.lock().await;
+            let Some(write) = write.as_mut() else {
+                bail!("tunnel {} local write is closed", self.id);
+            };
             write.write_all(&bytes).await?;
             write.flush().await?;
         }
@@ -327,8 +434,37 @@ impl TunnelSession {
             state.local_write_closed = true;
         }
         let mut write = self.local_write.lock().await;
-        let _ = write.shutdown().await;
+        if let Some(mut write) = write.take() {
+            let _ = write.shutdown().await;
+        }
         Ok(())
+    }
+
+    pub async fn abort_local(&self) -> Result<()> {
+        self.done.cancel();
+        self.shutdown_local_write().await
+    }
+
+    pub async fn try_expire(&self, ttl: Duration) -> bool {
+        {
+            let state = self.state.lock().await;
+            if state.active_attaches > 0 || self.done.is_cancelled() {
+                return false;
+            }
+            let Some(detached) = state.last_detached else {
+                return false;
+            };
+            if detached.elapsed() < ttl {
+                return false;
+            }
+            self.done.cancel();
+        }
+
+        let _ = self.shutdown_local_write().await;
+        if let Some(cleanup) = self.cleanup.lock().await.take() {
+            cleanup.kill.cancel();
+        }
+        true
     }
 
     pub async fn run_attach(
@@ -337,7 +473,7 @@ impl TunnelSession {
         recv: RecvStream,
         peer_recv_next: u64,
     ) -> Result<()> {
-        self.begin_attach().await;
+        self.begin_attach().await?;
         self.apply_peer_ack(peer_recv_next).await;
 
         let result = async {
@@ -466,6 +602,7 @@ async fn read_attach_loop(session: Arc<TunnelSession>, mut recv: RecvStream) -> 
             Frame::Data { offset, bytes } => session.accept_data(offset, bytes).await?,
             Frame::Ack { recv_next } => session.apply_peer_ack(recv_next).await,
             Frame::Close { offset } => session.accept_remote_close(offset).await?,
+            Frame::Error { message } => bail!("tunnel peer error: {message}"),
         }
     }
     bail!("tunnel attach stream closed")
@@ -607,12 +744,16 @@ async fn connect_and_attach(
     )
     .await?;
 
-    let Some(Frame::Hello {
-        session_id,
-        recv_next,
-    }) = read_frame(&mut recv).await?
-    else {
-        bail!("tunnel server did not send hello");
+    let (session_id, recv_next) = match read_frame(&mut recv).await? {
+        Some(Frame::Hello {
+            session_id,
+            recv_next,
+        }) => (session_id, recv_next),
+        Some(Frame::Error { message }) => {
+            session.abort_local().await?;
+            bail!("tunnel server rejected session: {message}");
+        }
+        Some(_) | None => bail!("tunnel server did not send hello"),
     };
     if session_id != session.id() {
         bail!("tunnel server replied with wrong session id {session_id}");
@@ -628,7 +769,7 @@ pub async fn serve_connection(
     mut send: SendStream,
     mut recv: RecvStream,
     peer_id: EndpointId,
-    local_socket: PathBuf,
+    target: ServerTarget,
     sessions: ServerSessions,
     drop_rx: watch::Receiver<u64>,
 ) -> Result<()> {
@@ -642,7 +783,20 @@ pub async fn serve_connection(
     };
 
     let session =
-        get_or_create_server_session(sessions.clone(), session_id, peer_id, local_socket).await?;
+        match get_or_create_server_session(sessions.clone(), session_id, peer_id, target).await {
+            Ok(session) => session,
+            Err(error) => {
+                let _ = write_frame(
+                    &mut send,
+                    Frame::Error {
+                        message: format!("{error:#}"),
+                    },
+                )
+                .await;
+                let _ = send.finish();
+                return Err(error);
+            }
+        };
     if session.peer_id() != peer_id {
         bail!("tunnel session {session_id} belongs to a different peer");
     }
@@ -657,7 +811,7 @@ pub async fn serve_connection(
     .await?;
 
     let result = session.clone().run_attach(send, recv, recv_next).await;
-    schedule_server_cleanup(sessions, session);
+    schedule_server_cleanup(sessions);
     if let Err(error) = &result
         && is_expected_detach(error)
     {
@@ -677,32 +831,157 @@ async fn get_or_create_server_session(
     sessions: ServerSessions,
     session_id: TunnelSessionId,
     peer_id: EndpointId,
-    local_socket: PathBuf,
+    target: ServerTarget,
 ) -> Result<Arc<TunnelSession>> {
     let mut sessions = sessions.lock().await;
     if let Some(session) = sessions.get(&session_id).cloned() {
         return Ok(session);
     }
 
-    let local = UnixStream::connect(&local_socket).await.with_context(|| {
-        format!(
-            "failed to connect exposed socket {}",
-            local_socket.display()
-        )
-    })?;
-    let (session, local_read) = TunnelSession::new(session_id, peer_id, local);
+    let (session, local_read) = create_server_session(session_id, peer_id, target).await?;
     tokio::spawn(session.clone().run_local_reader(local_read));
     sessions.insert(session_id, session.clone());
     Ok(session)
 }
 
-fn schedule_server_cleanup(sessions: ServerSessions, session: Arc<TunnelSession>) {
+async fn create_server_session(
+    session_id: TunnelSessionId,
+    peer_id: EndpointId,
+    target: ServerTarget,
+) -> Result<(Arc<TunnelSession>, LocalRead)> {
+    match target {
+        ServerTarget::UnixSocket(local_socket) => {
+            let local = UnixStream::connect(&local_socket).await.with_context(|| {
+                format!(
+                    "failed to connect exposed socket {}",
+                    local_socket.display()
+                )
+            })?;
+            Ok(TunnelSession::new(session_id, peer_id, local))
+        }
+        ServerTarget::Exec { argv, limit } => {
+            spawn_exec_session(session_id, peer_id, argv, limit).await
+        }
+    }
+}
+
+async fn spawn_exec_session(
+    session_id: TunnelSessionId,
+    peer_id: EndpointId,
+    argv: Vec<String>,
+    limit: Arc<ExecLimit>,
+) -> Result<(Arc<TunnelSession>, LocalRead)> {
+    let Some(program) = argv.first() else {
+        bail!("exposed exec command is empty");
+    };
+    let permit = limit.try_acquire().with_context(|| {
+        format!(
+            "exposed exec concurrency limit reached ({}/{})",
+            limit.active_children(),
+            limit.max_children()
+        )
+    })?;
+    let label = argv.join(" ");
+    let mut command = Command::new(program);
+    command
+        .args(&argv[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn exposed exec {program:?}"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .context("exposed exec child stdin was not piped")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("exposed exec child stdout was not piped")?;
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(log_child_stderr(session_id, label.clone(), stderr));
+    }
+    let kill = CancellationToken::new();
+    let kill_wait = kill.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(SERVER_SESSION_TTL).await;
-        if session.is_complete().await || session.is_expired(SERVER_SESSION_TTL).await {
-            sessions.lock().await.remove(&session.id());
+        let result = tokio::select! {
+            result = child.wait() => result,
+            _ = kill_wait.cancelled() => {
+                match child.kill().await {
+                    Ok(()) => {
+                        eprintln!("fabric: exec {label:?} session {session_id} killed after tunnel session expiry");
+                        return;
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        drop(permit);
+        match result {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                eprintln!("fabric: exec {label:?} session {session_id} exited with {status}");
+            }
+            Err(error) => {
+                eprintln!("fabric: exec {label:?} session {session_id} wait failed: {error:#}");
+            }
         }
     });
+
+    Ok(TunnelSession::new_parts_with_cleanup(
+        session_id,
+        peer_id,
+        Box::new(stdout),
+        Box::new(stdin),
+        Some(SessionCleanup { kill }),
+    ))
+}
+
+async fn log_child_stderr(session_id: TunnelSessionId, label: String, mut stderr: ChildStderr) {
+    let mut lines = BufReader::new(&mut stderr).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                eprintln!("fabric: exec {label:?} session {session_id} stderr: {line}");
+            }
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!("fabric: exec {label:?} session {session_id} stderr failed: {error:#}");
+                return;
+            }
+        }
+    }
+}
+
+fn schedule_server_cleanup(sessions: ServerSessions) {
+    tokio::spawn(async move {
+        tokio::time::sleep(SERVER_SESSION_TTL).await;
+        reap_server_sessions(sessions, SERVER_SESSION_TTL).await;
+    });
+}
+
+pub async fn reap_server_sessions(sessions: ServerSessions, ttl: Duration) -> usize {
+    let current: Vec<Arc<TunnelSession>> = sessions.lock().await.values().cloned().collect();
+    let mut remove = Vec::new();
+    let mut expired = 0;
+    for session in current {
+        if session.is_complete().await {
+            remove.push(session.id());
+        } else if session.try_expire(ttl).await {
+            expired += 1;
+            remove.push(session.id());
+        }
+    }
+
+    if !remove.is_empty() {
+        let mut sessions = sessions.lock().await;
+        for id in remove {
+            sessions.remove(&id);
+        }
+    }
+    expired
 }
 
 fn attach_drop_closer(connection: Connection, mut drop_rx: watch::Receiver<u64>) {
@@ -775,6 +1054,10 @@ fn encode_frame(frame: Frame) -> Result<(u8, Vec<u8>)> {
             payload.extend_from_slice(&offset.to_be_bytes());
             FRAME_CLOSE
         }
+        Frame::Error { message } => {
+            payload.extend_from_slice(message.as_bytes());
+            FRAME_ERROR
+        }
     };
     Ok((kind, payload))
 }
@@ -815,6 +1098,9 @@ fn decode_frame(kind: u8, payload: Vec<u8>) -> Result<Option<Frame>> {
                 offset: u64::from_be_bytes(payload[..8].try_into()?),
             }
         }
+        FRAME_ERROR => Frame::Error {
+            message: String::from_utf8_lossy(&payload).to_string(),
+        },
         _ => bail!("unknown tunnel frame {kind}"),
     };
     Ok(Some(frame))
