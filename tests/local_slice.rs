@@ -196,6 +196,66 @@ async fn generic_tunnel_survives_transport_reconnect_without_reopening_local_ser
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn generic_tunnel_reap_closes_existing_client_socket() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let node_a_dir = TempDir::new()?;
+    let node_b_dir = TempDir::new()?;
+    let node_a_home = FabricHome::new(node_a_dir.path());
+    let node_b_home = FabricHome::new(node_b_dir.path());
+
+    let node_a = FabricNode::start(node_a_home.clone()).await?;
+    let node_b = FabricNode::start(node_b_home.clone()).await?;
+
+    trust_peer(
+        &node_a_home,
+        &node_a,
+        node_b.id(),
+        Some("node-b"),
+        Some(node_b.addr()),
+    )
+    .await?;
+    trust_peer(
+        &node_b_home,
+        &node_b,
+        node_a.id(),
+        Some("node-a"),
+        Some(node_a.addr()),
+    )
+    .await?;
+
+    let echo_socket = node_a_dir.path().join("echo.sock");
+    let echo_hits = Arc::new(AtomicUsize::new(0));
+    let echo_task = spawn_echo_service(&echo_socket, echo_hits.clone()).await?;
+    node_a.expose("pty-view", echo_socket).await?;
+
+    let dial_socket = node_b.dial("node-a", "pty-view").await?;
+    let mut stream = UnixStream::connect(&dial_socket).await?;
+    stream_round_trip(&mut stream, b"before-reap").await?;
+
+    run_fabric(&node_a_home, &["debug", "block-tunnels"])?;
+    run_fabric(&node_a_home, &["debug", "drop-tunnels"])?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    run_fabric(&node_a_home, &["debug", "reap-tunnels", "--ttl-ms", "0"])?;
+    run_fabric(&node_a_home, &["debug", "unblock-tunnels"])?;
+
+    let mut buf = [0; 1];
+    let read = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf))
+        .await
+        .context("reaped tunnel did not close client socket")??;
+    assert_eq!(read, 0, "reaped tunnel should close the client socket");
+    assert_eq!(
+        echo_hits.load(Ordering::SeqCst),
+        1,
+        "expired reconnect should not open a replacement service connection"
+    );
+
+    echo_task.abort();
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_expose_round_trips_stdio_handler() -> Result<()> {
     let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;

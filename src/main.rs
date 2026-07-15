@@ -14,7 +14,7 @@ use fabric::{
         load_or_create_identity, parse_addr_json, parse_node_id,
     },
     control::{ControlRequest, ControlResponse, PeerReachability},
-    daemon::{FabricNode, run_daemon, send_control},
+    daemon::{DaemonOptions, FabricNode, run_daemon_with_options, send_control},
     shell::{self, ServerFrame},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -66,6 +66,15 @@ enum Commands {
         /// Serve remote shells to trusted peers.
         #[arg(long)]
         allow_shell: bool,
+        /// Maximum total server-side tunnel sessions.
+        #[arg(long)]
+        server_session_max_total: Option<usize>,
+        /// Maximum server-side tunnel sessions for one peer.
+        #[arg(long)]
+        server_session_max_per_peer: Option<usize>,
+        /// Seconds to keep a detached server-side tunnel session for reconnect.
+        #[arg(long)]
+        server_session_detached_ttl_secs: Option<u64>,
     },
     /// Stop the local fabric daemon.
     Down,
@@ -129,6 +138,12 @@ enum Commands {
     Daemon {
         #[arg(long)]
         allow_shell: bool,
+        #[arg(long)]
+        server_session_max_total: Option<usize>,
+        #[arg(long)]
+        server_session_max_per_peer: Option<usize>,
+        #[arg(long)]
+        server_session_detached_ttl_secs: Option<u64>,
     },
     /// Internal restart detacher.
     #[command(hide = true)]
@@ -270,14 +285,23 @@ async fn main() -> Result<()> {
                 Commands::Up {
                     foreground,
                     allow_shell,
+                    server_session_max_total,
+                    server_session_max_per_peer,
+                    server_session_detached_ttl_secs,
                 } => {
+                    let options = daemon_options(
+                        allow_shell,
+                        server_session_max_total,
+                        server_session_max_per_peer,
+                        server_session_detached_ttl_secs,
+                    );
                     if foreground {
-                        let node = FabricNode::start_with_options(home, allow_shell).await?;
+                        let node = FabricNode::start_with_daemon_options(home, options).await?;
                         let peers = node.state().peer_reachability().await;
                         print_startup_reachability(&peers);
                         node.wait().await?;
                     } else {
-                        spawn_daemon(&home, allow_shell).await?;
+                        spawn_daemon(&home, options).await?;
                         print_daemon_reachability(&home).await?;
                     }
                 }
@@ -411,8 +435,22 @@ async fn main() -> Result<()> {
                         run_debug_unix_cat(socket).await?;
                     }
                 },
-                Commands::Daemon { allow_shell } => {
-                    run_daemon(home, allow_shell).await?;
+                Commands::Daemon {
+                    allow_shell,
+                    server_session_max_total,
+                    server_session_max_per_peer,
+                    server_session_detached_ttl_secs,
+                } => {
+                    run_daemon_with_options(
+                        home,
+                        daemon_options(
+                            allow_shell,
+                            server_session_max_total,
+                            server_session_max_per_peer,
+                            server_session_detached_ttl_secs,
+                        ),
+                    )
+                    .await?;
                 }
                 Commands::RestartDetacher { allow_shell } => {
                     run_restart_detacher(&home, allow_shell)?;
@@ -572,6 +610,20 @@ fn allow_shell_override(allow_shell: bool, no_allow_shell: bool) -> Option<bool>
     }
 }
 
+fn daemon_options(
+    allow_shell: bool,
+    server_session_max_total: Option<usize>,
+    server_session_max_per_peer: Option<usize>,
+    server_session_detached_ttl_secs: Option<u64>,
+) -> DaemonOptions {
+    DaemonOptions {
+        allow_shell,
+        server_session_max_total,
+        server_session_max_per_peer,
+        server_session_detached_ttl_secs,
+    }
+}
+
 fn run_restart_detacher(home: &FabricHome, allow_shell: bool) -> Result<()> {
     println!(
         "restart detacher started: version={} allow_shell={allow_shell}",
@@ -608,7 +660,7 @@ async fn run_restart_helper(home: &FabricHome, allow_shell: bool) -> Result<()> 
         println!("daemon did not report down before restart; continuing: {error:#}");
     }
 
-    let start_result = spawn_daemon(home, allow_shell).await;
+    let start_result = spawn_daemon(home, DaemonOptions::new(allow_shell)).await;
     if let Err(error) = &start_result {
         println!("daemon start failed; checking final state: {error:#}");
     }
@@ -812,7 +864,7 @@ impl Drop for RawModeGuard {
     }
 }
 
-async fn spawn_daemon(home: &FabricHome, allow_shell: bool) -> Result<()> {
+async fn spawn_daemon(home: &FabricHome, options: DaemonOptions) -> Result<()> {
     if send_control(home, ControlRequest::Status).await.is_ok() {
         println!("already running");
         return Ok(());
@@ -827,8 +879,23 @@ async fn spawn_daemon(home: &FabricHome, allow_shell: bool) -> Result<()> {
     let exe = std::env::current_exe()?;
     let mut command = ProcessCommand::new(exe);
     command.arg("--home").arg(home.root()).arg("daemon");
-    if allow_shell {
+    if options.allow_shell {
         command.arg("--allow-shell");
+    }
+    if let Some(max_total) = options.server_session_max_total {
+        command
+            .arg("--server-session-max-total")
+            .arg(max_total.to_string());
+    }
+    if let Some(max_per_peer) = options.server_session_max_per_peer {
+        command
+            .arg("--server-session-max-per-peer")
+            .arg(max_per_peer.to_string());
+    }
+    if let Some(detached_ttl_secs) = options.server_session_detached_ttl_secs {
+        command
+            .arg("--server-session-detached-ttl-secs")
+            .arg(detached_ttl_secs.to_string());
     }
     command
         .stdin(Stdio::null())

@@ -31,7 +31,7 @@ use crate::config::{FabricHome, PeerBook};
 const MAX_FRAME_LEN: usize = 1024 * 1024;
 const LOCAL_READ_BUF: usize = 8192;
 const MAX_BUFFERED_BYTES: usize = 4 * 1024 * 1024;
-const SERVER_SESSION_TTL: Duration = Duration::from_secs(30 * 60);
+const SERVER_SESSION_REAP_INTERVAL: Duration = Duration::from_secs(60);
 const ATTACH_STABLE_AFTER: Duration = Duration::from_secs(2);
 
 const FRAME_HELLO: u8 = 1;
@@ -42,6 +42,12 @@ const FRAME_ERROR: u8 = 5;
 
 pub type LocalRead = Box<dyn AsyncRead + Send + Unpin + 'static>;
 pub type LocalWrite = Box<dyn AsyncWrite + Send + Unpin + 'static>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerSessionLimits {
+    pub max_total: usize,
+    pub max_per_peer: usize,
+}
 
 #[derive(Debug, Clone)]
 pub enum ServerTarget {
@@ -142,6 +148,7 @@ enum Frame {
     Hello {
         session_id: TunnelSessionId,
         recv_next: u64,
+        resume: bool,
     },
     Data {
         offset: u64,
@@ -179,6 +186,7 @@ struct TunnelState {
     last_detached: Option<Instant>,
     reconnect_attempts: u64,
     last_error: Option<String>,
+    ever_attached: bool,
 }
 
 pub struct TunnelSession {
@@ -195,6 +203,19 @@ pub struct TunnelSession {
 struct SessionCleanup {
     kill: CancellationToken,
 }
+
+#[derive(Debug)]
+struct ExpiredResumeError {
+    session_id: TunnelSessionId,
+}
+
+impl fmt::Display for ExpiredResumeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "server tunnel session {} expired", self.session_id)
+    }
+}
+
+impl std::error::Error for ExpiredResumeError {}
 
 impl fmt::Debug for TunnelSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -250,6 +271,7 @@ impl TunnelSession {
                 last_detached: None,
                 reconnect_attempts: 0,
                 last_error: None,
+                ever_attached: false,
             }),
             notify: Notify::new(),
             done: CancellationToken::new(),
@@ -269,12 +291,24 @@ impl TunnelSession {
         self.state.lock().await.recv_next
     }
 
+    async fn has_attached(&self) -> bool {
+        self.state.lock().await.ever_attached
+    }
+
     pub async fn is_complete(&self) -> bool {
         let state = self.state.lock().await;
         state.send_closed.is_some()
             && state.remote_closed
             && state.send_buffer.is_empty()
             && state.send_acked >= state.send_next
+    }
+
+    async fn detached_at(&self) -> Option<Instant> {
+        let state = self.state.lock().await;
+        if state.active_attaches > 0 || self.done.is_cancelled() {
+            return None;
+        }
+        state.last_detached
     }
 
     pub async fn record_reconnect_attempt(&self, error: Option<String>) -> u64 {
@@ -298,6 +332,7 @@ impl TunnelSession {
         }
         state.active_attaches += 1;
         state.last_detached = None;
+        state.ever_attached = true;
         Ok(())
     }
 
@@ -448,10 +483,26 @@ impl TunnelSession {
         self.shutdown_local_write().await
     }
 
+    async fn close(&self) {
+        self.done.cancel();
+        let _ = self.shutdown_local_write().await;
+        if let Some(cleanup) = self.cleanup.lock().await.take() {
+            cleanup.kill.cancel();
+        }
+    }
+
+    pub async fn close_for_eviction(&self) {
+        self.close().await;
+    }
+
     pub async fn try_expire(&self, ttl: Duration) -> bool {
+        if self.done.is_cancelled() || self.is_complete().await {
+            self.close().await;
+            return true;
+        }
         {
             let state = self.state.lock().await;
-            if state.active_attaches > 0 || self.done.is_cancelled() {
+            if state.active_attaches > 0 {
                 return false;
             }
             let Some(detached) = state.last_detached else {
@@ -460,13 +511,9 @@ impl TunnelSession {
             if detached.elapsed() < ttl {
                 return false;
             }
-            self.done.cancel();
         }
 
-        let _ = self.shutdown_local_write().await;
-        if let Some(cleanup) = self.cleanup.lock().await.take() {
-            cleanup.kill.cancel();
-        }
+        self.close().await;
         true
     }
 
@@ -791,6 +838,7 @@ async fn connect_and_attach(
         Frame::Hello {
             session_id: session.id(),
             recv_next: session.recv_next().await,
+            resume: session.has_attached().await,
         },
     )
     .await?;
@@ -799,6 +847,7 @@ async fn connect_and_attach(
         Some(Frame::Hello {
             session_id,
             recv_next,
+            ..
         }) => (session_id, recv_next),
         Some(Frame::Error { message }) => {
             session.abort_local().await?;
@@ -813,7 +862,227 @@ async fn connect_and_attach(
     session.run_attach(send, recv, recv_next).await
 }
 
-pub type ServerSessions = Arc<Mutex<HashMap<TunnelSessionId, Arc<TunnelSession>>>>;
+#[derive(Debug, Clone)]
+pub struct ServerSessionStore {
+    inner: Arc<Mutex<HashMap<TunnelSessionId, Arc<TunnelSession>>>>,
+    limits: ServerSessionLimits,
+    detached_ttl: Duration,
+}
+
+impl ServerSessionStore {
+    pub fn new(limits: ServerSessionLimits, detached_ttl: Duration) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            limits,
+            detached_ttl,
+        }
+    }
+
+    async fn get_or_create(
+        &self,
+        session_id: TunnelSessionId,
+        peer_id: EndpointId,
+        target: ServerTarget,
+        resume: bool,
+    ) -> Result<(Arc<TunnelSession>, bool)> {
+        self.reap_expired(self.detached_ttl).await;
+        if let Some(session) = self.get(session_id).await {
+            return Ok((session, false));
+        }
+
+        if resume {
+            return Err(ExpiredResumeError { session_id }.into());
+        }
+        self.evict_to_make_room(peer_id).await;
+        self.ensure_room_for(peer_id).await?;
+
+        let (session, local_read) = create_server_session(session_id, peer_id, target).await?;
+        match self.insert_created(session.clone()).await {
+            Ok(None) => {
+                tokio::spawn(session.clone().run_local_reader(local_read));
+                Ok((session, true))
+            }
+            Ok(Some(existing)) => {
+                session.close_for_eviction().await;
+                Ok((existing, false))
+            }
+            Err(error) => {
+                session.close_for_eviction().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn get(&self, session_id: TunnelSessionId) -> Option<Arc<TunnelSession>> {
+        self.inner.lock().await.get(&session_id).cloned()
+    }
+
+    async fn insert_created(
+        &self,
+        session: Arc<TunnelSession>,
+    ) -> Result<Option<Arc<TunnelSession>>> {
+        let mut sessions = self.inner.lock().await;
+        if let Some(existing) = sessions.get(&session.id()).cloned() {
+            return Ok(Some(existing));
+        }
+
+        ensure_room_for_locked(&sessions, self.limits, session.peer_id())?;
+        sessions.insert(session.id(), session);
+        Ok(None)
+    }
+
+    async fn ensure_room_for(&self, peer_id: EndpointId) -> Result<()> {
+        let sessions = self.inner.lock().await;
+        ensure_room_for_locked(&sessions, self.limits, peer_id)
+    }
+
+    async fn evict_to_make_room(&self, peer_id: EndpointId) {
+        loop {
+            let sessions = self.inner.lock().await;
+            let total_full = sessions.len() >= self.limits.max_total;
+            let peer_full =
+                count_peer_sessions_locked(&sessions, peer_id) >= self.limits.max_per_peer;
+            if !total_full && !peer_full {
+                return;
+            }
+            drop(sessions);
+
+            let candidate = if peer_full {
+                self.oldest_detached(Some(peer_id)).await
+            } else {
+                self.oldest_detached(None).await
+            };
+            let Some((session_id, session)) = candidate else {
+                return;
+            };
+
+            session.close_for_eviction().await;
+            let mut sessions = self.inner.lock().await;
+            if sessions
+                .get(&session_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &session))
+            {
+                sessions.remove(&session_id);
+            }
+        }
+    }
+
+    async fn remove_new_session(&self, session: &Arc<TunnelSession>) {
+        session.close_for_eviction().await;
+        let mut sessions = self.inner.lock().await;
+        if sessions
+            .get(&session.id())
+            .is_some_and(|current| Arc::ptr_eq(current, session))
+        {
+            sessions.remove(&session.id());
+        }
+    }
+
+    async fn oldest_detached(
+        &self,
+        peer_id: Option<EndpointId>,
+    ) -> Option<(TunnelSessionId, Arc<TunnelSession>)> {
+        let current: Vec<Arc<TunnelSession>> = self.inner.lock().await.values().cloned().collect();
+        let mut oldest = None;
+        for session in current {
+            if peer_id.is_some_and(|peer_id| session.peer_id() != peer_id) {
+                continue;
+            }
+            let Some(detached) = session.detached_at().await else {
+                continue;
+            };
+            if oldest.as_ref().is_none_or(
+                |(_, oldest_detached, _): &(TunnelSessionId, Instant, Arc<TunnelSession>)| {
+                    detached < *oldest_detached
+                },
+            ) {
+                oldest = Some((session.id(), detached, session));
+            }
+        }
+        oldest.map(|(session_id, _, session)| (session_id, session))
+    }
+
+    pub async fn reap_expired(&self, ttl: Duration) -> usize {
+        let current: Vec<Arc<TunnelSession>> = self.inner.lock().await.values().cloned().collect();
+        let mut remove = Vec::new();
+        let mut expired = 0;
+        for session in current {
+            if session.try_expire(ttl).await {
+                expired += 1;
+                remove.push((session.id(), session));
+            }
+        }
+
+        if !remove.is_empty() {
+            let mut sessions = self.inner.lock().await;
+            for (id, session) in remove {
+                if sessions
+                    .get(&id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &session))
+                {
+                    sessions.remove(&id);
+                }
+            }
+        }
+        expired
+    }
+
+    #[cfg(test)]
+    async fn len(&self) -> usize {
+        self.inner.lock().await.len()
+    }
+
+    #[cfg(test)]
+    async fn contains(&self, session_id: TunnelSessionId) -> bool {
+        self.inner.lock().await.contains_key(&session_id)
+    }
+}
+
+fn ensure_room_for_locked(
+    sessions: &HashMap<TunnelSessionId, Arc<TunnelSession>>,
+    limits: ServerSessionLimits,
+    peer_id: EndpointId,
+) -> Result<()> {
+    if sessions.len() >= limits.max_total {
+        bail!(
+            "server tunnel session limit reached ({}/{})",
+            sessions.len(),
+            limits.max_total
+        );
+    }
+    let peer_sessions = count_peer_sessions_locked(sessions, peer_id);
+    if peer_sessions >= limits.max_per_peer {
+        bail!(
+            "server tunnel session limit reached for peer {peer_id} ({}/{})",
+            peer_sessions,
+            limits.max_per_peer
+        );
+    }
+    Ok(())
+}
+
+fn count_peer_sessions_locked(
+    sessions: &HashMap<TunnelSessionId, Arc<TunnelSession>>,
+    peer_id: EndpointId,
+) -> usize {
+    sessions
+        .values()
+        .filter(|session| session.peer_id() == peer_id)
+        .count()
+}
+
+pub fn spawn_server_session_reaper(sessions: ServerSessionStore, cancel: CancellationToken) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(SERVER_SESSION_REAP_INTERVAL) => {
+                    sessions.reap_expired(sessions.detached_ttl).await;
+                }
+            }
+        }
+    });
+}
 
 pub async fn serve_connection(
     connection: Connection,
@@ -821,48 +1090,65 @@ pub async fn serve_connection(
     mut recv: RecvStream,
     peer_id: EndpointId,
     target: ServerTarget,
-    sessions: ServerSessions,
+    sessions: ServerSessionStore,
     drop_rx: watch::Receiver<u64>,
 ) -> Result<()> {
     attach_drop_closer(connection, drop_rx);
     let Some(Frame::Hello {
         session_id,
         recv_next,
+        resume,
     }) = read_frame(&mut recv).await?
     else {
         bail!("tunnel client did not send hello");
     };
 
-    let session =
-        match get_or_create_server_session(sessions.clone(), session_id, peer_id, target).await {
-            Ok(session) => session,
-            Err(error) => {
-                let _ = write_frame(
-                    &mut send,
-                    Frame::Error {
-                        message: format!("{error:#}"),
-                    },
-                )
-                .await;
-                let _ = send.finish();
-                return Err(error);
+    let (session, is_new_session) = match sessions
+        .get_or_create(session_id, peer_id, target, resume)
+        .await
+    {
+        Ok(admission) => admission,
+        Err(error) => {
+            let expired_resume = error.downcast_ref::<ExpiredResumeError>().is_some();
+            let _ = write_frame(
+                &mut send,
+                Frame::Error {
+                    message: format!("{error:#}"),
+                },
+            )
+            .await;
+            let _ = send.finish();
+            if expired_resume {
+                return Ok(());
             }
-        };
+            return Err(error);
+        }
+    };
     if session.peer_id() != peer_id {
+        if is_new_session {
+            sessions.remove_new_session(&session).await;
+        }
         bail!("tunnel session {session_id} belongs to a different peer");
     }
 
-    write_frame(
+    if let Err(error) = write_frame(
         &mut send,
         Frame::Hello {
             session_id,
             recv_next: session.recv_next().await,
+            resume: false,
         },
     )
-    .await?;
+    .await
+    {
+        if is_new_session {
+            sessions.remove_new_session(&session).await;
+        }
+        return Err(error);
+    }
 
     let result = session.clone().run_attach(send, recv, recv_next).await;
-    schedule_server_cleanup(sessions);
+    sessions.reap_expired(sessions.detached_ttl).await;
     if let Err(error) = &result
         && is_expected_detach(error)
     {
@@ -876,23 +1162,6 @@ fn is_expected_detach(error: &anyhow::Error) -> bool {
     error.contains("connection lost: closed")
         || error.contains("tunnel attach stream closed")
         || error.contains("closed: closed")
-}
-
-async fn get_or_create_server_session(
-    sessions: ServerSessions,
-    session_id: TunnelSessionId,
-    peer_id: EndpointId,
-    target: ServerTarget,
-) -> Result<Arc<TunnelSession>> {
-    let mut sessions = sessions.lock().await;
-    if let Some(session) = sessions.get(&session_id).cloned() {
-        return Ok(session);
-    }
-
-    let (session, local_read) = create_server_session(session_id, peer_id, target).await?;
-    tokio::spawn(session.clone().run_local_reader(local_read));
-    sessions.insert(session_id, session.clone());
-    Ok(session)
 }
 
 async fn create_server_session(
@@ -1018,35 +1287,6 @@ async fn log_child_stderr(session_id: TunnelSessionId, label: String, mut stderr
     }
 }
 
-fn schedule_server_cleanup(sessions: ServerSessions) {
-    tokio::spawn(async move {
-        tokio::time::sleep(SERVER_SESSION_TTL).await;
-        reap_server_sessions(sessions, SERVER_SESSION_TTL).await;
-    });
-}
-
-pub async fn reap_server_sessions(sessions: ServerSessions, ttl: Duration) -> usize {
-    let current: Vec<Arc<TunnelSession>> = sessions.lock().await.values().cloned().collect();
-    let mut remove = Vec::new();
-    let mut expired = 0;
-    for session in current {
-        if session.is_complete().await {
-            remove.push(session.id());
-        } else if session.try_expire(ttl).await {
-            expired += 1;
-            remove.push(session.id());
-        }
-    }
-
-    if !remove.is_empty() {
-        let mut sessions = sessions.lock().await;
-        for id in remove {
-            sessions.remove(&id);
-        }
-    }
-    expired
-}
-
 fn attach_drop_closer(connection: Connection, mut drop_rx: watch::Receiver<u64>) {
     tokio::spawn(async move {
         if drop_rx.changed().await.is_ok() {
@@ -1099,9 +1339,11 @@ fn encode_frame(frame: Frame) -> Result<(u8, Vec<u8>)> {
         Frame::Hello {
             session_id,
             recv_next,
+            resume,
         } => {
             payload.extend_from_slice(&session_id.0);
             payload.extend_from_slice(&recv_next.to_be_bytes());
+            payload.push(u8::from(resume));
             FRAME_HELLO
         }
         Frame::Data { offset, bytes } => {
@@ -1128,12 +1370,13 @@ fn encode_frame(frame: Frame) -> Result<(u8, Vec<u8>)> {
 fn decode_frame(kind: u8, payload: Vec<u8>) -> Result<Option<Frame>> {
     let frame = match kind {
         FRAME_HELLO => {
-            if payload.len() != 24 {
+            if payload.len() != 24 && payload.len() != 25 {
                 bail!("invalid tunnel hello length {}", payload.len());
             }
             Frame::Hello {
                 session_id: TunnelSessionId::from_slice(&payload[..16])?,
                 recv_next: u64::from_be_bytes(payload[16..24].try_into()?),
+                resume: payload.get(24).is_some_and(|value| *value != 0),
             }
         }
         FRAME_DATA => {
@@ -1167,4 +1410,178 @@ fn decode_frame(kind: u8, payload: Vec<u8>) -> Result<Option<Frame>> {
         _ => bail!("unknown tunnel frame {kind}"),
     };
     Ok(Some(frame))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh::SecretKey;
+    use tokio::io::duplex;
+
+    fn peer_id() -> EndpointId {
+        SecretKey::generate().public()
+    }
+
+    fn session_id(byte: u8) -> TunnelSessionId {
+        TunnelSessionId([byte; 16])
+    }
+
+    fn store(max_total: usize, max_per_peer: usize) -> ServerSessionStore {
+        ServerSessionStore::new(
+            ServerSessionLimits {
+                max_total,
+                max_per_peer,
+            },
+            Duration::from_secs(60),
+        )
+    }
+
+    fn test_session(id: TunnelSessionId, peer: EndpointId) -> Arc<TunnelSession> {
+        let (read, _read_peer) = duplex(64);
+        let (_write_peer, write) = duplex(64);
+        let (session, _local_read) =
+            TunnelSession::new_parts(id, peer, Box::new(read), Box::new(write));
+        session
+    }
+
+    fn test_session_with_cleanup(
+        id: TunnelSessionId,
+        peer: EndpointId,
+        kill: CancellationToken,
+    ) -> Arc<TunnelSession> {
+        let (read, _read_peer) = duplex(64);
+        let (_write_peer, write) = duplex(64);
+        let (session, _local_read) = TunnelSession::new_parts_with_cleanup(
+            id,
+            peer,
+            Box::new(read),
+            Box::new(write),
+            Some(SessionCleanup { kill }),
+        );
+        session
+    }
+
+    async fn mark_detached(session: &TunnelSession) {
+        session.begin_attach().await.unwrap();
+        session.end_attach().await;
+    }
+
+    #[tokio::test]
+    async fn server_session_store_rejects_when_total_cap_has_no_detached_room() {
+        let store = store(1, 1);
+        let first = test_session(session_id(1), peer_id());
+        first.begin_attach().await.unwrap();
+        store.insert_created(first.clone()).await.unwrap();
+
+        store.evict_to_make_room(peer_id()).await;
+
+        let second = test_session(session_id(2), peer_id());
+        let error = store.insert_created(second).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("server tunnel session limit reached"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(store.len().await, 1);
+        assert!(store.contains(first.id()).await);
+    }
+
+    #[tokio::test]
+    async fn server_session_store_evicts_oldest_detached_for_total_cap() {
+        let store = store(2, 2);
+        let first = test_session(session_id(1), peer_id());
+        mark_detached(&first).await;
+        store.insert_created(first.clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        let second = test_session(session_id(2), peer_id());
+        mark_detached(&second).await;
+        store.insert_created(second.clone()).await.unwrap();
+
+        store.evict_to_make_room(peer_id()).await;
+
+        assert_eq!(store.len().await, 1);
+        assert!(!store.contains(first.id()).await);
+        assert!(store.contains(second.id()).await);
+    }
+
+    #[tokio::test]
+    async fn server_session_store_evicts_same_peer_first_for_peer_cap() {
+        let store = store(4, 1);
+        let capped_peer = peer_id();
+        let other_peer = peer_id();
+        let capped = test_session(session_id(1), capped_peer);
+        mark_detached(&capped).await;
+        store.insert_created(capped.clone()).await.unwrap();
+        let other = test_session(session_id(2), other_peer);
+        mark_detached(&other).await;
+        store.insert_created(other.clone()).await.unwrap();
+
+        store.evict_to_make_room(capped_peer).await;
+
+        assert_eq!(store.len().await, 1);
+        assert!(!store.contains(capped.id()).await);
+        assert!(store.contains(other.id()).await);
+    }
+
+    #[tokio::test]
+    async fn server_session_store_does_not_evict_active_sessions() {
+        let store = store(1, 1);
+        let active = test_session(session_id(1), peer_id());
+        active.begin_attach().await.unwrap();
+        store.insert_created(active.clone()).await.unwrap();
+
+        store.evict_to_make_room(peer_id()).await;
+
+        assert_eq!(store.len().await, 1);
+        assert!(store.contains(active.id()).await);
+    }
+
+    #[tokio::test]
+    async fn server_session_reap_expires_detached_sessions() {
+        let store = store(2, 2);
+        let session = test_session(session_id(1), peer_id());
+        mark_detached(&session).await;
+        store.insert_created(session.clone()).await.unwrap();
+
+        let expired = store.reap_expired(Duration::ZERO).await;
+
+        assert_eq!(expired, 1);
+        assert_eq!(store.len().await, 0);
+        assert!(!store.contains(session.id()).await);
+    }
+
+    #[tokio::test]
+    async fn server_session_store_rejects_resume_after_expiry() {
+        let store = store(2, 2);
+        let peer = peer_id();
+        let session = test_session(session_id(1), peer);
+        mark_detached(&session).await;
+        store.insert_created(session.clone()).await.unwrap();
+
+        assert_eq!(store.reap_expired(Duration::ZERO).await, 1);
+        let error = store
+            .get_or_create(
+                session.id(),
+                peer,
+                ServerTarget::UnixSocket(PathBuf::from("/missing")),
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("server tunnel session"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(store.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn server_session_eviction_cancels_cleanup() {
+        let kill = CancellationToken::new();
+        let session = test_session_with_cleanup(session_id(1), peer_id(), kill.clone());
+
+        session.close_for_eviction().await;
+
+        assert!(kill.is_cancelled());
+    }
 }

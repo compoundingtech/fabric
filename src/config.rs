@@ -12,6 +12,9 @@ use iroh::{EndpointAddr, EndpointId, SecretKey};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_EXEC_MAX_CHILDREN: usize = 32;
+pub const DEFAULT_SERVER_SESSION_MAX_TOTAL: usize = 64;
+pub const DEFAULT_SERVER_SESSION_MAX_PER_PEER: usize = 16;
+pub const DEFAULT_SERVER_SESSION_DETACHED_TTL_SECS: u64 = 60;
 
 #[derive(Debug, Clone)]
 pub struct FabricHome {
@@ -347,9 +350,45 @@ pub struct FabricConfig {
     #[serde(default)]
     allow_shell: Option<bool>,
     #[serde(default)]
+    server_sessions: ServerSessionConfig,
+    #[serde(default)]
     peers: Vec<Peer>,
     #[serde(default)]
     exposes: Vec<PersistedExpose>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerSessionConfig {
+    #[serde(default = "default_server_session_max_total")]
+    max_total: usize,
+    #[serde(default = "default_server_session_max_per_peer")]
+    max_per_peer: usize,
+    #[serde(default = "default_server_session_detached_ttl_secs")]
+    detached_ttl_secs: u64,
+}
+
+impl Default for ServerSessionConfig {
+    fn default() -> Self {
+        Self {
+            max_total: DEFAULT_SERVER_SESSION_MAX_TOTAL,
+            max_per_peer: DEFAULT_SERVER_SESSION_MAX_PER_PEER,
+            detached_ttl_secs: DEFAULT_SERVER_SESSION_DETACHED_TTL_SECS,
+        }
+    }
+}
+
+impl ServerSessionConfig {
+    pub fn max_total(&self) -> usize {
+        self.max_total
+    }
+
+    pub fn max_per_peer(&self) -> usize {
+        self.max_per_peer
+    }
+
+    pub fn detached_ttl_secs(&self) -> u64 {
+        self.detached_ttl_secs
+    }
 }
 
 impl FabricConfig {
@@ -376,6 +415,10 @@ impl FabricConfig {
 
     pub fn allow_shell(&self) -> Option<bool> {
         self.allow_shell
+    }
+
+    pub fn server_sessions(&self) -> &ServerSessionConfig {
+        &self.server_sessions
     }
 
     pub fn set_allow_shell(&mut self, allow_shell: bool) {
@@ -405,6 +448,12 @@ impl FabricConfig {
             peers: self.peers.clone(),
         }
         .validate()?;
+
+        validate_server_session_config(
+            self.server_sessions.max_total,
+            self.server_sessions.max_per_peer,
+            self.server_sessions.detached_ttl_secs,
+        )?;
 
         let mut protocols = HashSet::new();
         for expose in &self.exposes {
@@ -440,6 +489,43 @@ impl FabricConfig {
 
 fn default_exec_max_children() -> usize {
     DEFAULT_EXEC_MAX_CHILDREN
+}
+
+fn default_server_session_max_total() -> usize {
+    DEFAULT_SERVER_SESSION_MAX_TOTAL
+}
+
+fn default_server_session_max_per_peer() -> usize {
+    DEFAULT_SERVER_SESSION_MAX_PER_PEER
+}
+
+fn default_server_session_detached_ttl_secs() -> u64 {
+    DEFAULT_SERVER_SESSION_DETACHED_TTL_SECS
+}
+
+pub fn validate_server_session_caps(max_total: usize, max_per_peer: usize) -> Result<()> {
+    if max_total == 0 {
+        bail!("server_sessions.max_total must be greater than zero");
+    }
+    if max_per_peer == 0 {
+        bail!("server_sessions.max_per_peer must be greater than zero");
+    }
+    if max_per_peer > max_total {
+        bail!("server_sessions.max_per_peer cannot exceed server_sessions.max_total");
+    }
+    Ok(())
+}
+
+pub fn validate_server_session_config(
+    max_total: usize,
+    max_per_peer: usize,
+    detached_ttl_secs: u64,
+) -> Result<()> {
+    validate_server_session_caps(max_total, max_per_peer)?;
+    if detached_ttl_secs == 0 {
+        bail!("server_sessions.detached_ttl_secs must be greater than zero");
+    }
+    Ok(())
 }
 
 pub fn validate_tcp_addr(addr: &str) -> Result<()> {
@@ -492,4 +578,85 @@ fn short_hash(input: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     input.hash(&mut hasher);
     hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_session_config_uses_defaults_when_missing() {
+        let config: FabricConfig = toml::from_str("").unwrap();
+
+        config.validate().unwrap();
+
+        assert_eq!(
+            config.server_sessions().max_total(),
+            DEFAULT_SERVER_SESSION_MAX_TOTAL
+        );
+        assert_eq!(
+            config.server_sessions().max_per_peer(),
+            DEFAULT_SERVER_SESSION_MAX_PER_PEER
+        );
+        assert_eq!(
+            config.server_sessions().detached_ttl_secs(),
+            DEFAULT_SERVER_SESSION_DETACHED_TTL_SECS
+        );
+    }
+
+    #[test]
+    fn server_session_config_accepts_custom_caps() {
+        let config: FabricConfig = toml::from_str(
+            r#"
+            [server_sessions]
+            max_total = 10
+            max_per_peer = 3
+            detached_ttl_secs = 30
+            "#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+
+        assert_eq!(config.server_sessions().max_total(), 10);
+        assert_eq!(config.server_sessions().max_per_peer(), 3);
+        assert_eq!(config.server_sessions().detached_ttl_secs(), 30);
+    }
+
+    #[test]
+    fn server_session_config_rejects_invalid_caps() {
+        let config: FabricConfig = toml::from_str(
+            r#"
+            [server_sessions]
+            max_total = 2
+            max_per_peer = 3
+            "#,
+        )
+        .unwrap();
+
+        let error = config.validate().unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("max_per_peer cannot exceed"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn server_session_config_rejects_zero_detached_ttl() {
+        let config: FabricConfig = toml::from_str(
+            r#"
+            [server_sessions]
+            detached_ttl_secs = 0
+            "#,
+        )
+        .unwrap();
+
+        let error = config.validate().unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("detached_ttl_secs must be greater than zero"),
+            "unexpected error: {error:#}"
+        );
+    }
 }

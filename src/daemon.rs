@@ -34,7 +34,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     config::{
         DEFAULT_EXEC_MAX_CHILDREN, FabricConfig, FabricHome, Peer, PeerBook, PersistedExpose,
-        PersistedExposeTarget, load_or_create_identity, validate_protocol, validate_tcp_addr,
+        PersistedExposeTarget, load_or_create_identity, validate_protocol,
+        validate_server_session_config, validate_tcp_addr,
     },
     control::{ControlRequest, ControlResponse, PeerReachability},
     shell, tunnel,
@@ -179,7 +180,7 @@ pub struct DaemonState {
     exposures: RwLock<HashMap<Vec<u8>, Exposure>>,
     dial_sockets: Mutex<HashMap<(String, String), DialSocket>>,
     tcp_dials: Mutex<HashMap<(String, String, String), TcpDial>>,
-    tunnel_sessions: tunnel::ServerSessions,
+    tunnel_sessions: tunnel::ServerSessionStore,
     tunnel_drop_tx: watch::Sender<u64>,
     tunnel_blocked: AtomicBool,
     builtin_echo_hits: AtomicUsize,
@@ -189,6 +190,23 @@ pub struct DaemonState {
     incoming_slots: Arc<Semaphore>,
     dial_slots: Arc<Semaphore>,
     cancel: CancellationToken,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DaemonOptions {
+    pub allow_shell: bool,
+    pub server_session_max_total: Option<usize>,
+    pub server_session_max_per_peer: Option<usize>,
+    pub server_session_detached_ttl_secs: Option<u64>,
+}
+
+impl DaemonOptions {
+    pub fn new(allow_shell: bool) -> Self {
+        Self {
+            allow_shell,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -280,19 +298,45 @@ struct RestartPlan {
     allow_shell: bool,
 }
 
+fn resolve_server_session_settings(
+    config: &FabricConfig,
+    options: DaemonOptions,
+) -> Result<(tunnel::ServerSessionLimits, Duration)> {
+    let server_sessions = config.server_sessions();
+    let max_total = options
+        .server_session_max_total
+        .unwrap_or_else(|| server_sessions.max_total());
+    let max_per_peer = options
+        .server_session_max_per_peer
+        .unwrap_or_else(|| server_sessions.max_per_peer());
+    let detached_ttl_secs = options
+        .server_session_detached_ttl_secs
+        .unwrap_or_else(|| server_sessions.detached_ttl_secs());
+    validate_server_session_config(max_total, max_per_peer, detached_ttl_secs)?;
+    Ok((
+        tunnel::ServerSessionLimits {
+            max_total,
+            max_per_peer,
+        },
+        Duration::from_secs(detached_ttl_secs),
+    ))
+}
+
 impl DaemonState {
     async fn new(
         home: FabricHome,
         cancel: CancellationToken,
-        allow_shell: bool,
+        options: DaemonOptions,
     ) -> Result<Arc<Self>> {
         home.prepare()?;
         let secret_key = load_or_create_identity(&home)?;
-        if allow_shell {
+        if options.allow_shell {
             set_config_allow_shell(&home, true)?;
         }
         let config = FabricConfig::load(&home)?;
-        let allow_shell = allow_shell || config.allow_shell().unwrap_or(false);
+        let allow_shell = options.allow_shell || config.allow_shell().unwrap_or(false);
+        let (tunnel_session_limits, tunnel_session_detached_ttl) =
+            resolve_server_session_settings(&config, options)?;
         let peer_book = PeerBook::load(&home)?;
         let exposures = load_persisted_exposures(&home)?;
         let allowed = Arc::new(RwLock::new(peer_book.trusted_ids()));
@@ -307,6 +351,9 @@ impl DaemonState {
 
         let _ = tokio::time::timeout(Duration::from_secs(5), endpoint.online()).await;
         let (tunnel_drop_tx, _) = watch::channel(0);
+        let tunnel_sessions =
+            tunnel::ServerSessionStore::new(tunnel_session_limits, tunnel_session_detached_ttl);
+        tunnel::spawn_server_session_reaper(tunnel_sessions.clone(), cancel.clone());
 
         Ok(Arc::new(Self {
             home,
@@ -316,7 +363,7 @@ impl DaemonState {
             exposures: RwLock::new(exposures),
             dial_sockets: Mutex::new(HashMap::new()),
             tcp_dials: Mutex::new(HashMap::new()),
-            tunnel_sessions: Arc::new(Mutex::new(HashMap::new())),
+            tunnel_sessions,
             tunnel_drop_tx,
             tunnel_blocked: AtomicBool::new(false),
             builtin_echo_hits: AtomicUsize::new(0),
@@ -494,7 +541,7 @@ impl DaemonState {
     }
 
     pub async fn reap_tunnel_sessions(&self, ttl: Duration) -> usize {
-        tunnel::reap_server_sessions(self.tunnel_sessions.clone(), ttl).await
+        self.tunnel_sessions.reap_expired(ttl).await
     }
 
     pub async fn ping(&self, peer: &str) -> Result<PingOutcome> {
@@ -839,8 +886,15 @@ impl FabricNode {
     }
 
     pub async fn start_with_options(home: FabricHome, allow_shell: bool) -> Result<Self> {
+        Self::start_with_daemon_options(home, DaemonOptions::new(allow_shell)).await
+    }
+
+    pub async fn start_with_daemon_options(
+        home: FabricHome,
+        options: DaemonOptions,
+    ) -> Result<Self> {
         let cancel = CancellationToken::new();
-        let state = DaemonState::new(home, cancel, allow_shell).await?;
+        let state = DaemonState::new(home, cancel, options).await?;
         let task = tokio::spawn(serve(state.clone()));
         Ok(Self { state, task })
     }
@@ -926,7 +980,11 @@ impl FabricNode {
 }
 
 pub async fn run_daemon(home: FabricHome, allow_shell: bool) -> Result<()> {
-    FabricNode::start_with_options(home, allow_shell)
+    run_daemon_with_options(home, DaemonOptions::new(allow_shell)).await
+}
+
+pub async fn run_daemon_with_options(home: FabricHome, options: DaemonOptions) -> Result<()> {
+    FabricNode::start_with_daemon_options(home, options)
         .await?
         .wait()
         .await
@@ -1482,6 +1540,79 @@ async fn pipe_unix_iroh(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_session_limit_options_override_config() {
+        let config: FabricConfig = toml::from_str(
+            r#"
+            [server_sessions]
+            max_total = 64
+            max_per_peer = 16
+            detached_ttl_secs = 60
+            "#,
+        )
+        .unwrap();
+
+        let (limits, detached_ttl) = resolve_server_session_settings(
+            &config,
+            DaemonOptions {
+                server_session_max_total: Some(128),
+                server_session_max_per_peer: Some(32),
+                server_session_detached_ttl_secs: Some(45),
+                ..DaemonOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(limits.max_total, 128);
+        assert_eq!(limits.max_per_peer, 32);
+        assert_eq!(detached_ttl, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn server_session_limit_options_validate_partial_overrides() {
+        let config: FabricConfig = toml::from_str(
+            r#"
+            [server_sessions]
+            max_total = 4
+            max_per_peer = 2
+            "#,
+        )
+        .unwrap();
+
+        let error = resolve_server_session_settings(
+            &config,
+            DaemonOptions {
+                server_session_max_per_peer: Some(8),
+                ..DaemonOptions::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("max_per_peer cannot exceed"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn server_session_limit_options_validate_ttl_override() {
+        let config: FabricConfig = toml::from_str("").unwrap();
+
+        let error = resolve_server_session_settings(
+            &config,
+            DaemonOptions {
+                server_session_detached_ttl_secs: Some(0),
+                ..DaemonOptions::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("detached_ttl_secs must be greater than zero"),
+            "unexpected error: {error:#}"
+        );
+    }
 
     #[tokio::test]
     async fn failure_backoff_parks_after_failure_instead_of_tight_looping() {
