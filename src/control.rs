@@ -12,6 +12,8 @@ pub enum ControlRequest {
     Dial { peer: String, protocol: String },
     Ping { peer: String },
     Shell { peer: String },
+    DropTunnelConnections,
+    SetTunnelBlocked { blocked: bool },
     Restart { allow_shell: Option<bool> },
     Shutdown,
 }

@@ -9,6 +9,7 @@ pub mod config;
 pub mod control;
 pub mod daemon;
 pub mod shell;
+mod tunnel;
 
 const SPIKE_ALPN: &[u8] = b"fabric/spike/echo/0";
 

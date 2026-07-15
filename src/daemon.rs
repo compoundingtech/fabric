@@ -6,7 +6,7 @@ use std::{
     process::{Command as ProcessCommand, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -25,7 +25,7 @@ use iroh::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
-    sync::{Mutex, RwLock},
+    sync::{Mutex, RwLock, watch},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -33,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     config::{FabricHome, Peer, PeerBook, load_or_create_identity, validate_protocol},
     control::{ControlRequest, ControlResponse, PeerReachability},
-    shell,
+    shell, tunnel,
 };
 
 const BUILTIN_ECHO_ALPN: &[u8] = b"fabric/echo/0";
@@ -69,6 +69,9 @@ pub struct DaemonState {
     allowed: Arc<RwLock<HashSet<EndpointId>>>,
     exposures: RwLock<HashMap<Vec<u8>, PathBuf>>,
     dial_sockets: Mutex<HashMap<(String, String), DialSocket>>,
+    tunnel_sessions: tunnel::ServerSessions,
+    tunnel_drop_tx: watch::Sender<u64>,
+    tunnel_blocked: AtomicBool,
     builtin_echo_hits: AtomicUsize,
     allow_shell: bool,
     cancel: CancellationToken,
@@ -106,6 +109,7 @@ impl DaemonState {
             .await?;
 
         let _ = tokio::time::timeout(Duration::from_secs(5), endpoint.online()).await;
+        let (tunnel_drop_tx, _) = watch::channel(0);
 
         Ok(Arc::new(Self {
             home,
@@ -114,6 +118,9 @@ impl DaemonState {
             allowed,
             exposures: RwLock::new(HashMap::new()),
             dial_sockets: Mutex::new(HashMap::new()),
+            tunnel_sessions: Arc::new(Mutex::new(HashMap::new())),
+            tunnel_drop_tx,
+            tunnel_blocked: AtomicBool::new(false),
             builtin_echo_hits: AtomicUsize::new(0),
             allow_shell,
             cancel,
@@ -235,13 +242,25 @@ impl DaemonState {
         );
         drop(sockets);
 
-        tokio::spawn(run_dial_socket(
-            listener,
-            self.endpoint.clone(),
-            peer_addr,
-            alpn,
-            self.cancel.clone(),
-        ));
+        if alpn == shell::SHELL_ALPN {
+            tokio::spawn(run_raw_dial_socket(
+                listener,
+                self.endpoint.clone(),
+                peer_addr,
+                alpn,
+                self.cancel.clone(),
+            ));
+        } else {
+            tokio::spawn(run_dial_socket(
+                listener,
+                self.endpoint.clone(),
+                self.home.clone(),
+                peer.to_string(),
+                alpn,
+                self.cancel.clone(),
+                self.tunnel_drop_rx(),
+            ));
+        }
 
         Ok(socket_path)
     }
@@ -399,6 +418,19 @@ impl DaemonState {
 
     pub fn builtin_echo_hits(&self) -> usize {
         self.builtin_echo_hits.load(Ordering::SeqCst)
+    }
+
+    fn tunnel_drop_rx(&self) -> watch::Receiver<u64> {
+        self.tunnel_drop_tx.subscribe()
+    }
+
+    fn drop_tunnel_connections(&self) {
+        let current = *self.tunnel_drop_tx.borrow();
+        let _ = self.tunnel_drop_tx.send(current.wrapping_add(1));
+    }
+
+    fn set_tunnel_blocked(&self, blocked: bool) {
+        self.tunnel_blocked.store(blocked, Ordering::SeqCst);
     }
 }
 
@@ -585,6 +617,14 @@ async fn process_control_request(
                 .await?;
             ControlResponse::Shell { socket }
         }
+        ControlRequest::DropTunnelConnections => {
+            state.drop_tunnel_connections();
+            ControlResponse::Ok
+        }
+        ControlRequest::SetTunnelBlocked { blocked } => {
+            state.set_tunnel_blocked(blocked);
+            ControlResponse::Ok
+        }
         ControlRequest::Restart { allow_shell } => {
             let restart = state.schedule_restart(allow_shell)?;
             ControlResponse::Restarting {
@@ -644,11 +684,22 @@ async fn process_incoming_iroh(incoming: Incoming, state: Arc<DaemonState>) -> R
     };
 
     let connection = accepting.await?;
+    if state.tunnel_blocked.load(Ordering::SeqCst) {
+        connection.close(0u32.into(), b"fabric tunnel blocked");
+        return Ok(());
+    }
+    let peer_id = connection.remote_id();
     let (send, recv) = connection.accept_bi().await?;
-    let local = UnixStream::connect(&socket)
-        .await
-        .with_context(|| format!("failed to connect exposed socket {}", socket.display()))?;
-    pipe_unix_iroh(local, send, recv).await?;
+    tunnel::serve_connection(
+        connection,
+        send,
+        recv,
+        peer_id,
+        socket,
+        state.tunnel_sessions.clone(),
+        state.tunnel_drop_rx(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -734,6 +785,41 @@ fn classify_transport(has_ip: bool, has_relay: bool) -> Option<String> {
 async fn run_dial_socket(
     listener: UnixListener,
     endpoint: Endpoint,
+    home: FabricHome,
+    peer: String,
+    alpn: Vec<u8>,
+    cancel: CancellationToken,
+    drop_rx: watch::Receiver<u64>,
+) {
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            accepted = listener.accept() => {
+                let Ok((local, _)) = accepted else {
+                    break;
+                };
+                let endpoint = endpoint.clone();
+                let home = home.clone();
+                let peer = peer.clone();
+                let alpn = alpn.clone();
+                let cancel = cancel.clone();
+                let drop_rx = drop_rx.clone();
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        tunnel::run_client_connection(local, endpoint, home, peer, alpn, cancel, drop_rx)
+                            .await
+                    {
+                        eprintln!("fabric: dial socket connection failed: {error:#}");
+                    }
+                });
+            }
+        }
+    }
+}
+
+async fn run_raw_dial_socket(
+    listener: UnixListener,
+    endpoint: Endpoint,
     peer_addr: EndpointAddr,
     alpn: Vec<u8>,
     cancel: CancellationToken,
@@ -749,7 +835,7 @@ async fn run_dial_socket(
                 let peer_addr = peer_addr.clone();
                 let alpn = alpn.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = handle_dial_socket_connection(local, endpoint, peer_addr, alpn).await {
+                    if let Err(error) = handle_raw_dial_socket_connection(local, endpoint, peer_addr, alpn).await {
                         eprintln!("fabric: dial socket connection failed: {error:#}");
                     }
                 });
@@ -758,7 +844,7 @@ async fn run_dial_socket(
     }
 }
 
-async fn handle_dial_socket_connection(
+async fn handle_raw_dial_socket_connection(
     local: UnixStream,
     endpoint: Endpoint,
     peer_addr: EndpointAddr,

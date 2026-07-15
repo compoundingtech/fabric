@@ -114,6 +114,76 @@ async fn local_expose_dial_round_trips_and_acl_rejects_unknown_node() -> Result<
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn generic_tunnel_survives_transport_reconnect_without_reopening_local_service() -> Result<()>
+{
+    let node_a_dir = TempDir::new()?;
+    let node_b_dir = TempDir::new()?;
+    let node_a_home = FabricHome::new(node_a_dir.path());
+    let node_b_home = FabricHome::new(node_b_dir.path());
+
+    let node_a = FabricNode::start(node_a_home.clone()).await?;
+    let node_b = FabricNode::start(node_b_home.clone()).await?;
+
+    trust_peer(
+        &node_a_home,
+        &node_a,
+        node_b.id(),
+        Some("node-b"),
+        Some(node_b.addr()),
+    )
+    .await?;
+    trust_peer(
+        &node_b_home,
+        &node_b,
+        node_a.id(),
+        Some("node-a"),
+        Some(node_a.addr()),
+    )
+    .await?;
+
+    let echo_socket = node_a_dir.path().join("echo.sock");
+    let echo_hits = Arc::new(AtomicUsize::new(0));
+    let echo_task = spawn_echo_service(&echo_socket, echo_hits.clone()).await?;
+    node_a.expose("pty-view", echo_socket).await?;
+
+    let dial_socket = node_b.dial("node-a", "pty-view").await?;
+    let mut stream = UnixStream::connect(&dial_socket).await?;
+
+    stream_round_trip(&mut stream, b"before-drop").await?;
+
+    send_control(
+        &node_a_home,
+        ControlRequest::SetTunnelBlocked { blocked: true },
+    )
+    .await?;
+    send_control(&node_a_home, ControlRequest::DropTunnelConnections).await?;
+    stream.write_all(b"during-drop").await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    send_control(
+        &node_a_home,
+        ControlRequest::SetTunnelBlocked { blocked: false },
+    )
+    .await?;
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        read_expected(&mut stream, b"during-drop"),
+    )
+    .await??;
+    stream_round_trip(&mut stream, b"after-drop").await?;
+    assert_eq!(
+        echo_hits.load(Ordering::SeqCst),
+        1,
+        "reconnect should keep the exposed Unix service connection alive"
+    );
+
+    echo_task.abort();
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ping_round_trips_builtin_echo() -> Result<()> {
     let node_a_dir = TempDir::new()?;
     let node_b_dir = TempDir::new()?;
@@ -318,8 +388,18 @@ async fn echo_connection(stream: UnixStream) {
 
 async fn unix_round_trip(socket: &PathBuf, payload: &[u8]) -> Result<Vec<u8>> {
     let mut stream = UnixStream::connect(socket).await?;
+    stream_round_trip(&mut stream, payload).await
+}
+
+async fn stream_round_trip(stream: &mut UnixStream, payload: &[u8]) -> Result<Vec<u8>> {
     stream.write_all(payload).await?;
-    let mut response = vec![0; payload.len()];
+    read_expected(stream, payload).await?;
+    Ok(payload.to_vec())
+}
+
+async fn read_expected(stream: &mut UnixStream, expected: &[u8]) -> Result<()> {
+    let mut response = vec![0; expected.len()];
     stream.read_exact(&mut response).await?;
-    Ok(response)
+    assert_eq!(response, expected);
+    Ok(())
 }
