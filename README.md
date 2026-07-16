@@ -77,6 +77,10 @@ cargo run -- <command>
 ./target/debug/fabric <command>
 ```
 
+Managed service installation is on the roadmap so `fabric daemon` can be owned by
+systemd, launchd, or Windows SCM with auto-start and auto-restart. See
+[docs/service-install-roadmap.md](docs/service-install-roadmap.md).
+
 ## State
 
 By default fabric stores local runtime state in:
@@ -446,6 +450,30 @@ The consumer never imports iroh types, parses relay addresses, opens QUIC
 streams, or implements allow-list checks. Only fabric owns those details.
 
 ## Architecture
+
+```text
+client machine                                      server machine
+
++------------------+                               +------------------+
+| consumer process |                               | local service    |
+| pty / app / tool  |                               | socket/tcp/exec  |
++--------+---------+                               +---------+--------+
+         |                                                   ^
+         | local Unix socket or TCP                          |
+         v                                                   |
++--------+---------+       iroh direct or relay      +-------+--------+
+| fabric daemon    |<===============================>| fabric daemon   |
+| dial listener    |          QUIC + ALPN            | expose handler  |
+| peer allow-list  |                                 | peer allow-list |
++--------+---------+                                 +-------+--------+
+         |                                                   ^
+         v                                                   |
++--------+---------+                                 +-------+--------+
+| identity.toml    |                                 | identity.toml   |
+| peers.toml       |                                 | peers.toml      |
+| config.toml      |                                 | config.toml     |
++------------------+                                 +----------------+
+```
 
 The daemon owns one persisted iroh endpoint per fabric home. `<home>/config.toml`
 stores shell policy, trusted peers, and persisted exposes. `fabric expose`
