@@ -1032,6 +1032,46 @@ async fn declarative_peer_config_is_loaded_on_start() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_peer_config_is_migrated_when_daemon_creates_config_on_start() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let node_a_dir = TempDir::new()?;
+    let node_b_dir = TempDir::new()?;
+    let node_a_home = FabricHome::new(node_a_dir.path());
+    let node_b_home = FabricHome::new(node_b_dir.path());
+
+    let node_b = FabricNode::start(node_b_home.clone()).await?;
+    fs::write(
+        node_a_home.peers_path(),
+        format!("[[peers]]\nid = \"{}\"\nname = \"node-b\"\n", node_b.id()),
+    )?;
+
+    let node_a = FabricNode::start_with_options(node_a_home.clone(), true).await?;
+    trust_peer(
+        &node_b_home,
+        &node_b,
+        node_a.id(),
+        Some("node-a"),
+        Some(node_a.addr()),
+    )
+    .await?;
+
+    assert_status_shell_allowed(&node_a_home).await?;
+    let ping = node_b.ping("node-a").await?;
+    assert_eq!(ping.bytes, 32);
+    let raw_config = fs::read_to_string(node_a_home.config_path())?;
+    assert!(raw_config.contains("allow_shell = true"));
+    assert!(raw_config.contains("node-b"));
+    assert!(
+        !node_a_home.peers_path().exists(),
+        "legacy peers.toml should be retired after config migration"
+    );
+
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
 async fn trust_peer(
     home: &FabricHome,
     node: &FabricNode,

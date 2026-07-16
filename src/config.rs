@@ -91,6 +91,23 @@ impl FabricHome {
             .cloned()
     }
 
+    fn remove_legacy_peer_configs(&self) -> Result<()> {
+        let mut paths = vec![self.peer_config_path.clone()];
+        if let Some(path) = &self.legacy_peer_config_path
+            && path != &self.peer_config_path
+        {
+            paths.push(path.clone());
+        }
+
+        for path in paths {
+            if path.exists() {
+                fs::remove_file(&path)
+                    .with_context(|| format!("failed to remove {}", path.display()))?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn control_socket_path(&self) -> PathBuf {
         self.root.join("run/control.sock")
     }
@@ -195,20 +212,35 @@ pub struct PeerBook {
 impl PeerBook {
     pub fn load(home: &FabricHome) -> Result<Self> {
         if home.config_path().exists() {
-            return Ok(Self {
-                peers: FabricConfig::load(home)?.peers,
-            });
+            let mut config = FabricConfig::load(home)?;
+            if !config.peers.is_empty() {
+                return Ok(Self {
+                    peers: config.peers,
+                });
+            }
+
+            let Some(book) = Self::load_existing(home)? else {
+                return Ok(Self::default());
+            };
+            config.peers = book.peers.clone();
+            config.save(home)?;
+            home.remove_legacy_peer_configs()?;
+            return Ok(Self { peers: book.peers });
         }
 
+        Ok(Self::load_existing(home)?.unwrap_or_default())
+    }
+
+    fn load_existing(home: &FabricHome) -> Result<Option<Self>> {
         let Some(path) = home.existing_peers_path() else {
-            return Ok(Self::default());
+            return Ok(None);
         };
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         let book: Self =
             toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
         book.validate()?;
-        Ok(book)
+        Ok(Some(book))
     }
 
     pub fn save(&self, home: &FabricHome) -> Result<()> {
@@ -217,6 +249,7 @@ impl PeerBook {
         let mut config = FabricConfig::load(home)?;
         config.peers = self.peers.clone();
         config.save(home)?;
+        home.remove_legacy_peer_configs()?;
         Ok(())
     }
 

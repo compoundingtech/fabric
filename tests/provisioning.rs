@@ -129,3 +129,41 @@ fn default_home_reads_peers_from_config_dir() -> Result<()> {
     assert_eq!(peers, format!("{peer_id}\tconfig-peer"));
     Ok(())
 }
+
+#[test]
+fn default_home_migrates_legacy_peers_when_config_exists() -> Result<()> {
+    let temp = TempDir::new()?;
+    let fake_home = temp.path().join("user-home");
+    let fabric_home = fake_home.join(".local/share/fabric");
+    fs::create_dir_all(&fabric_home)?;
+    fs::write(fabric_home.join("config.toml"), "allow_shell = true\n")?;
+
+    let peer_key = temp.path().join("peer-key.toml");
+    let peer_id = stdout(
+        Command::new(fabric_bin())
+            .args(["key", "gen", "--out"])
+            .arg(&peer_key)
+            .output()
+            .context("failed to run fabric key gen")?,
+    )?;
+    fs::write(
+        fabric_home.join("peers.toml"),
+        format!("[[peers]]\nid = \"{peer_id}\"\nname = \"legacy-peer\"\n"),
+    )?;
+
+    let peers = stdout(
+        Command::new(fabric_bin())
+            .env("HOME", &fake_home)
+            .env_remove("FABRIC_HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .arg("peers")
+            .output()
+            .context("failed to run fabric peers")?,
+    )?;
+    assert_eq!(peers, format!("{peer_id}\tlegacy-peer"));
+    let migrated = fs::read_to_string(fabric_home.join("config.toml"))?;
+    assert!(migrated.contains("allow_shell = true"));
+    assert!(migrated.contains("legacy-peer"));
+    assert!(!fabric_home.join("peers.toml").exists());
+    Ok(())
+}
