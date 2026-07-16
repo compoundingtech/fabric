@@ -59,6 +59,8 @@ const ENDPOINT_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const ENDPOINT_HEALTH_POLL_FAILURES_BEFORE_RECYCLE: usize = 2;
 const ENDPOINT_DIAGNOSTIC_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
 const ENDPOINT_RECYCLE_MIN_INTERVAL: Duration = Duration::from_secs(60);
+const ENDPOINT_RSS_RECYCLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const ENDPOINT_RSS_RECYCLE_THRESHOLD_BYTES: u64 = 300 * 1024 * 1024;
 const NETWORK_CHANGE_DEBOUNCE: Duration = Duration::from_millis(140);
 const VALIDATION_LOG_TARGET: &str = "fabric::validation";
 
@@ -317,6 +319,15 @@ struct RestartPlan {
     log: PathBuf,
     allow_shell: bool,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointRecycleOutcome {
+    Recycled,
+    StaleGeneration,
+    RateLimited { retry_after: Duration },
+}
+
+type RssSampler = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
 
 fn resolve_server_session_settings(
     config: &FabricConfig,
@@ -1250,7 +1261,7 @@ impl DaemonState {
         &self,
         expected_generation: u64,
         reason: &str,
-    ) -> Result<()> {
+    ) -> Result<EndpointRecycleOutcome> {
         let _guard = self.endpoint_recycle.lock().await;
         let old = self.endpoint_handle();
         if old.generation != expected_generation {
@@ -1262,12 +1273,13 @@ impl DaemonState {
                 reason,
                 "endpoint recycle skipped because generation changed"
             );
-            return Ok(());
+            return Ok(EndpointRecycleOutcome::StaleGeneration);
         }
 
         if let Some(last_recycle) = *self.last_endpoint_recycle.lock().await {
             let since = last_recycle.elapsed();
             if since < ENDPOINT_RECYCLE_MIN_INTERVAL {
+                let retry_after = ENDPOINT_RECYCLE_MIN_INTERVAL.saturating_sub(since);
                 warn!(
                     target: VALIDATION_LOG_TARGET,
                     event = "endpoint_recycle_rate_limited",
@@ -1275,9 +1287,10 @@ impl DaemonState {
                     reason,
                     since_ms = since.as_millis() as u64,
                     min_interval_ms = ENDPOINT_RECYCLE_MIN_INTERVAL.as_millis() as u64,
+                    retry_after_ms = retry_after.as_millis() as u64,
                     "endpoint recycle suppressed by rate limit"
                 );
-                return Ok(());
+                return Ok(EndpointRecycleOutcome::RateLimited { retry_after });
             }
         }
 
@@ -1323,13 +1336,14 @@ impl DaemonState {
             "fabric: recycled iroh endpoint generation {} -> {} ({reason})",
             old.generation, new_generation
         );
-        Ok(())
+        Ok(EndpointRecycleOutcome::Recycled)
     }
 
     pub(crate) async fn force_endpoint_recycle(&self, reason: &str) -> Result<()> {
         let generation = self.endpoint_handle().generation;
         self.recycle_endpoint_if_generation(generation, reason)
-            .await
+            .await?;
+        Ok(())
     }
 
     fn set_tunnel_blocked(&self, blocked: bool) {
@@ -1492,6 +1506,7 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
         result = run_iroh_accept_loop(state.clone()) => result?,
         result = run_network_rehome_loop(state.clone()) => result?,
         result = run_endpoint_health_poll_loop(state.clone()) => result?,
+        result = run_endpoint_rss_recycle_loop(state.clone()) => result?,
         result = run_endpoint_snapshot_loop(state.clone()) => result?,
         _ = state.cancel.cancelled() => {}
     }
@@ -1666,6 +1681,103 @@ async fn run_endpoint_health_poll_loop(state: Arc<DaemonState>) -> Result<()> {
                         eprintln!("fabric: failed to recycle iroh endpoint after health poll: {error:#}");
                     }
                     consecutive_failures = 0;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_endpoint_rss_recycle_loop(state: Arc<DaemonState>) -> Result<()> {
+    run_endpoint_rss_recycle_loop_with_sampler(
+        state,
+        ENDPOINT_RSS_RECYCLE_POLL_INTERVAL,
+        ENDPOINT_RSS_RECYCLE_THRESHOLD_BYTES,
+        Arc::new(current_rss_bytes),
+    )
+    .await
+}
+
+async fn run_endpoint_rss_recycle_loop_with_sampler(
+    state: Arc<DaemonState>,
+    poll_interval: Duration,
+    threshold_bytes: u64,
+    sample_rss: RssSampler,
+) -> Result<()> {
+    let mut interval = tokio::time::interval(poll_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.tick().await;
+    let mut next_recycle_attempt = Instant::now();
+
+    loop {
+        tokio::select! {
+            _ = state.cancel.cancelled() => break,
+            _ = interval.tick() => {
+                let Some(rss_bytes) = sample_rss() else {
+                    debug!(
+                        target: VALIDATION_LOG_TARGET,
+                        event = "endpoint_rss_monitor",
+                        rss_known = false,
+                        threshold_bytes,
+                        poll_interval_ms = poll_interval.as_millis() as u64,
+                        "endpoint RSS monitor could not read current RSS"
+                    );
+                    continue;
+                };
+
+                if !rss_exceeds_recycle_threshold(Some(rss_bytes), threshold_bytes) {
+                    next_recycle_attempt = Instant::now();
+                    continue;
+                }
+
+                let now = Instant::now();
+                if now < next_recycle_attempt {
+                    debug!(
+                        target: VALIDATION_LOG_TARGET,
+                        event = "endpoint_rss_recycle_deferred",
+                        rss_bytes,
+                        threshold_bytes,
+                        retry_after_ms = next_recycle_attempt.saturating_duration_since(now).as_millis() as u64,
+                        "endpoint RSS remains over threshold; waiting before next recycle attempt"
+                    );
+                    continue;
+                }
+
+                let endpoint = state.endpoint_handle();
+                warn!(
+                    target: VALIDATION_LOG_TARGET,
+                    event = "endpoint_rss_recycle_trigger",
+                    generation = endpoint.generation,
+                    rss_bytes,
+                    threshold_bytes,
+                    poll_interval_ms = poll_interval.as_millis() as u64,
+                    "endpoint RSS threshold exceeded; recycling endpoint"
+                );
+                eprintln!(
+                    "fabric: iroh endpoint generation {} RSS {} MiB exceeded {} MiB; recycling",
+                    endpoint.generation,
+                    bytes_to_mib(rss_bytes),
+                    bytes_to_mib(threshold_bytes),
+                );
+
+                match state
+                    .recycle_endpoint_if_generation(endpoint.generation, "rss threshold exceeded")
+                    .await
+                {
+                    Ok(EndpointRecycleOutcome::Recycled) => {
+                        next_recycle_attempt = Instant::now() + ENDPOINT_RECYCLE_MIN_INTERVAL;
+                    }
+                    Ok(EndpointRecycleOutcome::RateLimited { retry_after }) => {
+                        next_recycle_attempt = Instant::now() + retry_after;
+                    }
+                    Ok(EndpointRecycleOutcome::StaleGeneration) => {
+                        next_recycle_attempt = Instant::now();
+                    }
+                    Err(error) => {
+                        eprintln!("fabric: failed to recycle iroh endpoint after RSS threshold: {error:#}");
+                        next_recycle_attempt = Instant::now() + ENDPOINT_RSS_RECYCLE_POLL_INTERVAL;
+                    }
                 }
             }
         }
@@ -1961,6 +2073,14 @@ fn matches_reserved_alpn(alpn: &[u8]) -> bool {
 
 fn current_rss_bytes() -> Option<u64> {
     current_rss_bytes_impl()
+}
+
+fn rss_exceeds_recycle_threshold(rss_bytes: Option<u64>, threshold_bytes: u64) -> bool {
+    matches!(rss_bytes, Some(rss_bytes) if rss_bytes >= threshold_bytes)
+}
+
+fn bytes_to_mib(bytes: u64) -> u64 {
+    bytes / (1024 * 1024)
 }
 
 #[cfg(target_os = "linux")]
@@ -2406,6 +2526,58 @@ mod tests {
             "default_route=Some(en0) have_v4=true have_v6=true"
         );
         assert!(debouncer.take_due(now + Duration::from_secs(3)).is_none());
+    }
+
+    #[test]
+    fn rss_recycle_threshold_triggers_at_300_mib() {
+        assert_eq!(ENDPOINT_RSS_RECYCLE_THRESHOLD_BYTES, 300 * 1024 * 1024);
+        assert!(!rss_exceeds_recycle_threshold(
+            None,
+            ENDPOINT_RSS_RECYCLE_THRESHOLD_BYTES
+        ));
+        assert!(!rss_exceeds_recycle_threshold(
+            Some(ENDPOINT_RSS_RECYCLE_THRESHOLD_BYTES - 1),
+            ENDPOINT_RSS_RECYCLE_THRESHOLD_BYTES
+        ));
+        assert!(rss_exceeds_recycle_threshold(
+            Some(ENDPOINT_RSS_RECYCLE_THRESHOLD_BYTES),
+            ENDPOINT_RSS_RECYCLE_THRESHOLD_BYTES
+        ));
+        assert!(rss_exceeds_recycle_threshold(
+            Some(550 * 1024 * 1024),
+            ENDPOINT_RSS_RECYCLE_THRESHOLD_BYTES
+        ));
+    }
+
+    #[tokio::test]
+    async fn rss_recycle_threshold_recycles_even_when_endpoint_online() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let node = FabricNode::start(FabricHome::new(temp.path())).await?;
+        let state = node.state();
+        let initial = state.endpoint_handle();
+        tokio::time::timeout(ENDPOINT_HEALTH_TIMEOUT, initial.endpoint.online()).await?;
+
+        let rss_monitor = tokio::spawn(run_endpoint_rss_recycle_loop_with_sampler(
+            state.clone(),
+            Duration::from_millis(10),
+            ENDPOINT_RSS_RECYCLE_THRESHOLD_BYTES,
+            Arc::new(|| Some(ENDPOINT_RSS_RECYCLE_THRESHOLD_BYTES)),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state.endpoint_handle().generation > initial.generation {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+
+        state.cancel.cancel();
+        node.shutdown().await?;
+        rss_monitor.await??;
+        Ok(())
     }
 
     #[test]
