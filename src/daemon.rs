@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     env, fmt,
     fs::{self, OpenOptions},
     io::Write,
@@ -59,7 +59,7 @@ const ENDPOINT_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const ENDPOINT_HEALTH_POLL_FAILURES_BEFORE_RECYCLE: usize = 2;
 const ENDPOINT_DIAGNOSTIC_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
 const ENDPOINT_RECYCLE_MIN_INTERVAL: Duration = Duration::from_secs(60);
-const NETWORK_CHANGE_DEBOUNCE: Duration = Duration::from_secs(1);
+const NETWORK_CHANGE_DEBOUNCE: Duration = Duration::from_millis(140);
 const VALIDATION_LOG_TARGET: &str = "fabric::validation";
 
 #[derive(Debug)]
@@ -391,6 +391,7 @@ fn validation_log_filter() -> EnvFilter {
             "fabric=info,",
             "iroh=warn,",
             "noq=warn,",
+            "iroh::socket=debug,",
             "iroh::socket::remote_map=debug,",
             "iroh::socket::remote_map::remote_state=debug,",
             "noq_proto::connection=debug"
@@ -425,16 +426,16 @@ impl NetworkChangeDebouncer {
     }
 
     fn record(&mut self, reason: String, network_usable: bool, now: Instant) {
-        let coalesced_events = self
-            .pending
-            .as_ref()
-            .map_or(1, |event| event.coalesced_events.saturating_add(1));
+        let (coalesced_events, due_at) = match self.pending.as_ref() {
+            Some(event) => (event.coalesced_events.saturating_add(1), self.due_at),
+            None => (1, Some(now + self.quiet_window)),
+        };
         self.pending = Some(NetworkChangeEvent {
             reason,
             network_usable,
             coalesced_events,
         });
-        self.due_at = Some(now + self.quiet_window);
+        self.due_at = due_at;
     }
 
     fn due_at(&self) -> Option<Instant> {
@@ -453,6 +454,45 @@ impl NetworkChangeDebouncer {
         self.pending
             .as_ref()
             .map_or(0, |event| event.coalesced_events)
+    }
+}
+
+#[derive(Debug)]
+struct InterfaceSnapshot {
+    interface_count: usize,
+    up_interface_count: usize,
+    default_route_interface: String,
+    netwatch_regular_addr_count: usize,
+    netwatch_loopback_addr_count: usize,
+    up_interfaces: String,
+    netwatch_regular_addrs: String,
+}
+
+fn interface_snapshot(state: &netwatch::interfaces::State) -> InterfaceSnapshot {
+    let up_interfaces = state
+        .interfaces
+        .values()
+        .filter(|iface| iface.is_up())
+        .map(|iface| iface.name().to_string())
+        .collect::<BTreeSet<_>>();
+    let netwatch_regular_addrs = state
+        .local_addresses
+        .regular
+        .iter()
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>();
+
+    InterfaceSnapshot {
+        interface_count: state.interfaces.len(),
+        up_interface_count: up_interfaces.len(),
+        default_route_interface: state.default_route_interface.clone().unwrap_or_default(),
+        netwatch_regular_addr_count: state.local_addresses.regular.len(),
+        netwatch_loopback_addr_count: state.local_addresses.loopback.len(),
+        up_interfaces: up_interfaces.into_iter().collect::<Vec<_>>().join(","),
+        netwatch_regular_addrs: netwatch_regular_addrs
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(","),
     }
 }
 
@@ -1022,7 +1062,7 @@ impl DaemonState {
         let endpoint = self.endpoint_handle();
         info!(
             target: VALIDATION_LOG_TARGET,
-            event = "network_change_fire",
+            event = "manual_network_change_fire",
             generation = endpoint.generation,
             network_usable,
             reason,
@@ -1141,6 +1181,8 @@ impl DaemonState {
     async fn log_endpoint_snapshot(&self) {
         let endpoint = self.endpoint_handle();
         let peers = self.peer_book.read().await.peers().to_vec();
+        let network_state = netwatch::interfaces::State::new().await;
+        let interfaces = interface_snapshot(&network_state);
         let mut relay_watcher = endpoint.endpoint.home_relay_status();
         let relays = relay_watcher.get();
         let home_relays = relays.len();
@@ -1190,6 +1232,13 @@ impl DaemonState {
             home_relays,
             home_relays_connected,
             home_relays_with_error,
+            netwatch_interface_count = interfaces.interface_count,
+            netwatch_up_interface_count = interfaces.up_interface_count,
+            netwatch_default_route_interface = %interfaces.default_route_interface,
+            netwatch_regular_addr_count = interfaces.netwatch_regular_addr_count,
+            netwatch_loopback_addr_count = interfaces.netwatch_loopback_addr_count,
+            netwatch_up_interfaces = %interfaces.up_interfaces,
+            netwatch_regular_addrs = %interfaces.netwatch_regular_addrs,
             "endpoint diagnostic snapshot"
         );
     }
@@ -1483,8 +1532,8 @@ async fn run_network_rehome_loop(state: Arc<DaemonState>) -> Result<()> {
                         coalesced_events = event.coalesced_events,
                         network_usable = event.network_usable,
                         reason = %event.reason,
-                        quiet_ms = NETWORK_CHANGE_DEBOUNCE.as_millis() as u64,
-                        "network-change debounce quiet window elapsed"
+                        debounce_ms = NETWORK_CHANGE_DEBOUNCE.as_millis() as u64,
+                        "network-change debounce window elapsed"
                     );
                     state
                         .rehome_after_network_change(&event.reason, event.network_usable)
@@ -1506,11 +1555,19 @@ async fn run_network_rehome_loop(state: Arc<DaemonState>) -> Result<()> {
                     network_state.have_v6,
                     network_state.last_unsuspend.is_some()
                 );
+                let interfaces = interface_snapshot(&network_state);
                 info!(
                     target: VALIDATION_LOG_TARGET,
                     event = "netmon_raw",
                     network_usable,
                     reason = %reason,
+                    netwatch_interface_count = interfaces.interface_count,
+                    netwatch_up_interface_count = interfaces.up_interface_count,
+                    netwatch_default_route_interface = %interfaces.default_route_interface,
+                    netwatch_regular_addr_count = interfaces.netwatch_regular_addr_count,
+                    netwatch_loopback_addr_count = interfaces.netwatch_loopback_addr_count,
+                    netwatch_up_interfaces = %interfaces.up_interfaces,
+                    netwatch_regular_addrs = %interfaces.netwatch_regular_addrs,
                     "raw network monitor update"
                 );
                 debouncer.record(reason.clone(), network_usable, Instant::now());
@@ -1520,7 +1577,7 @@ async fn run_network_rehome_loop(state: Arc<DaemonState>) -> Result<()> {
                     coalesced_events = debouncer.pending_count(),
                     network_usable,
                     reason = %reason,
-                    quiet_ms = NETWORK_CHANGE_DEBOUNCE.as_millis() as u64,
+                    debounce_ms = NETWORK_CHANGE_DEBOUNCE.as_millis() as u64,
                     "network-change update queued for debounce"
                 );
             }
@@ -1944,25 +2001,39 @@ fn current_rss_bytes_impl() -> Option<u64> {
     None
 }
 
-fn connection_path_counts(connection: &Connection) -> (usize, usize, usize, usize) {
+fn connection_path_summary(
+    connection: &Connection,
+) -> (usize, usize, usize, usize, String, String) {
     let paths = connection.paths();
     let mut total = 0usize;
     let mut selected = 0usize;
     let mut ip = 0usize;
     let mut relay = 0usize;
+    let mut local_addrs = BTreeSet::new();
+    let mut remote_addrs = BTreeSet::new();
 
     for path in paths.iter() {
         total += 1;
         selected += usize::from(path.is_selected());
         ip += usize::from(path.is_ip());
         relay += usize::from(path.is_relay());
+        local_addrs.insert(format!("{:?}", path.local_addr()));
+        remote_addrs.insert(path.remote_addr().to_string());
     }
 
-    (total, selected, ip, relay)
+    (
+        total,
+        selected,
+        ip,
+        relay,
+        local_addrs.into_iter().collect::<Vec<_>>().join(","),
+        remote_addrs.into_iter().collect::<Vec<_>>().join(","),
+    )
 }
 
 fn log_connection_paths(event: &'static str, connection: &Connection) {
-    let (paths_total, paths_selected, paths_ip, paths_relay) = connection_path_counts(connection);
+    let (paths_total, paths_selected, paths_ip, paths_relay, path_local_addrs, path_remote_addrs) =
+        connection_path_summary(connection);
     info!(
         target: VALIDATION_LOG_TARGET,
         event,
@@ -1971,6 +2042,8 @@ fn log_connection_paths(event: &'static str, connection: &Connection) {
         paths_selected,
         paths_ip,
         paths_relay,
+        path_local_addrs = %path_local_addrs,
+        path_remote_addrs = %path_remote_addrs,
         "connection path snapshot"
     );
 }
@@ -2292,8 +2365,8 @@ mod tests {
     }
 
     #[test]
-    fn network_change_debouncer_coalesces_burst_into_one_event() {
-        let mut debouncer = NetworkChangeDebouncer::new(Duration::from_secs(1));
+    fn network_change_debouncer_coalesces_burst_into_one_leading_edge_event() {
+        let mut debouncer = NetworkChangeDebouncer::new(Duration::from_millis(140));
         let now = Instant::now();
 
         debouncer.record(
@@ -2304,25 +2377,25 @@ mod tests {
         debouncer.record(
             "default_route=Some(en0) have_v4=false".to_string(),
             false,
-            now + Duration::from_millis(250),
+            now + Duration::from_millis(40),
         );
         debouncer.record(
             "default_route=Some(en0) have_v4=true have_v6=true".to_string(),
             true,
-            now + Duration::from_millis(900),
+            now + Duration::from_millis(120),
         );
 
         assert_eq!(debouncer.pending_count(), 3);
         assert!(
             debouncer
-                .take_due(now + Duration::from_millis(1899))
+                .take_due(now + Duration::from_millis(139))
                 .is_none(),
-            "quiet window should be extended by the last event"
+            "leading-edge debounce should wait for the initial window"
         );
 
         let event = debouncer
-            .take_due(now + Duration::from_millis(1900))
-            .expect("debounced event should fire once after quiet window");
+            .take_due(now + Duration::from_millis(140))
+            .expect("debounced event should fire once after the initial window");
         assert_eq!(event.coalesced_events, 3);
         assert!(event.network_usable);
         assert_eq!(
