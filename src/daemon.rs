@@ -1531,6 +1531,11 @@ async fn run_network_rehome_loop(state: Arc<DaemonState>) -> Result<()> {
 }
 
 async fn run_endpoint_snapshot_loop(state: Arc<DaemonState>) -> Result<()> {
+    if !tracing::dispatcher::has_been_set() {
+        state.cancel.cancelled().await;
+        return Ok(());
+    }
+
     let mut interval = tokio::time::interval(ENDPOINT_DIAGNOSTIC_SNAPSHOT_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     interval.tick().await;
