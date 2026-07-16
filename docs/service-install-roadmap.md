@@ -63,6 +63,9 @@ Linux:
 - Support a documented system unit mode later for dedicated boxes if needed.
 - Enable restart-on-failure with bounded restart delay.
 - First slice uses `Restart=on-failure`, `RestartSec=5s`, and `MemoryMax`.
+- The default memory cap is 1 GiB, not 512 MiB, because live RSS-triggered
+  endpoint recycle briefly peaked above 512 MiB while the replacement endpoint
+  overlapped the old endpoint.
 - On servers that must survive logout/reboot, document `loginctl enable-linger`.
 - Expose `journalctl --user -u fabric.service` through `fabric service logs`.
 
@@ -72,6 +75,8 @@ macOS:
 - Use `KeepAlive` and `RunAtLoad`.
 - First slice uses `KeepAlive` with `SuccessfulExit=false`, `RunAtLoad`, and
   launchd resident-set resource limits.
+- The default resident-set cap is 1 GiB for the same recycle headroom reason as
+  Linux.
 - Write stdout/stderr to the fabric home log directory, not a system-wide root
   path.
 - Keep a LaunchDaemon/system mode as a later option only if Nathan wants a

@@ -7,7 +7,7 @@ use crate::config::{FabricConfig, FabricHome};
 #[cfg(target_os = "linux")]
 const SERVICE_NAME: &str = "fabric.service";
 const LAUNCHD_LABEL: &str = "com.myobie.fabric";
-pub const DEFAULT_MEMORY_MAX_MB: u64 = 512;
+pub const DEFAULT_MEMORY_MAX_MB: u64 = 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ServiceInstallOptions {
@@ -379,6 +379,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_systemd_unit_uses_one_gib_memory_headroom() -> Result<()> {
+        let spec = ServiceSpec::new(
+            "/usr/local/bin/fabric",
+            "/home/nathan/.local/share/fabric",
+            false,
+            DEFAULT_MEMORY_MAX_MB,
+        )?;
+
+        let unit = render_systemd_user_unit(&spec);
+
+        assert_eq!(DEFAULT_MEMORY_MAX_MB, 1024);
+        assert!(unit.contains("MemoryMax=1024M"));
+        Ok(())
+    }
+
+    #[test]
     fn systemd_unit_runs_foreground_daemon_with_restart_and_memory_limit() -> Result<()> {
         let spec = ServiceSpec::new(
             "/usr/local/bin/fabric",
@@ -410,6 +426,23 @@ mod tests {
 
         assert!(unit.contains("ExecStart=\"/Applications/Fabric Tools/fabric\" --home \"/Users/nathan/Fabric 100%%\" daemon"));
         assert!(unit.contains("WorkingDirectory=\"/Users/nathan/Fabric 100%%\""));
+        Ok(())
+    }
+
+    #[test]
+    fn default_launch_agent_uses_one_gib_resident_set_headroom() -> Result<()> {
+        let home = FabricHome::new("/Users/nathan/.local/share/fabric");
+        let spec = ServiceSpec::new(
+            "/Users/nathan/.local/bin/fabric",
+            home.root(),
+            false,
+            DEFAULT_MEMORY_MAX_MB,
+        )?;
+
+        let plist = render_launch_agent_plist(&home, &spec)?;
+
+        assert_eq!(DEFAULT_MEMORY_MAX_MB, 1024);
+        assert!(plist.contains("<integer>1073741824</integer>"));
         Ok(())
     }
 

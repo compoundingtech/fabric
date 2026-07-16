@@ -86,7 +86,13 @@ fabric service install
 On Linux this writes and starts a systemd user unit. On macOS this writes and
 starts a per-user LaunchAgent. The service runs the foreground daemon directly as
 `fabric --home <home> daemon`; it does not run `fabric up`. The default memory
-ceiling is 512 MiB and can be changed with `--memory-max-mb`.
+ceiling is 1 GiB and can be changed with `--memory-max-mb`.
+
+The default intentionally leaves headroom above fabric's in-process RSS recycle
+trigger. During endpoint recycle, the replacement endpoint can briefly overlap
+with the old endpoint in memory; setting the service cap too close to the
+300 MiB recycle threshold can let the OS kill fabric during a successful
+self-heal.
 
 Remote shell serving remains off unless you opt in:
 
@@ -294,7 +300,9 @@ native service manager entry and enables it for future user sessions. `status`
 delegates to `systemctl --user status fabric.service --no-pager` on Linux and
 `launchctl print gui/$UID/com.myobie.fabric` on macOS. `uninstall` stops the
 managed service and removes only the systemd/launchd artifact; it leaves the
-fabric home, identity, peers, logs, and config in place.
+fabric home, identity, peers, logs, and config in place. The default service
+memory ceiling is 1 GiB; use a lower `--memory-max-mb` only after validating
+that endpoint recycle can complete below that cap on the target machine.
 
 ### Debug Transport Test Commands
 
