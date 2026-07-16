@@ -67,6 +67,20 @@ fn version_flag_prints_semver_and_build_sha() -> Result<()> {
 }
 
 #[test]
+fn service_help_lists_user_service_lifecycle_commands() -> Result<()> {
+    let help = stdout(
+        Command::new(fabric_bin())
+            .args(["service", "--help"])
+            .output()
+            .context("failed to run fabric service --help")?,
+    )?;
+    assert!(help.contains("install"));
+    assert!(help.contains("status"));
+    assert!(help.contains("uninstall"));
+    Ok(())
+}
+
+#[test]
 fn peers_lists_declarative_config_without_add() -> Result<()> {
     let temp = TempDir::new()?;
     let home = temp.path().join("home");

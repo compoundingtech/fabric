@@ -77,9 +77,32 @@ cargo run -- <command>
 ./target/debug/fabric <command>
 ```
 
-Managed service installation is on the roadmap so `fabric daemon` can be owned by
-systemd, launchd, or Windows SCM with auto-start and auto-restart. See
-[docs/service-install-roadmap.md](docs/service-install-roadmap.md).
+To install fabric as a user-managed service with OS restart supervision:
+
+```sh
+fabric service install
+```
+
+On Linux this writes and starts a systemd user unit. On macOS this writes and
+starts a per-user LaunchAgent. The service runs the foreground daemon directly as
+`fabric --home <home> daemon`; it does not run `fabric up`. The default memory
+ceiling is 512 MiB and can be changed with `--memory-max-mb`.
+
+Remote shell serving remains off unless you opt in:
+
+```sh
+fabric service install --allow-shell
+```
+
+To force it off in the persisted config:
+
+```sh
+fabric service install --no-allow-shell
+```
+
+The service uses the same fabric home, identity, persisted exposes, and trusted
+peer allow-list. It does not install SSH keys or change fabric's authorization
+model.
 
 ## State
 
@@ -258,7 +281,20 @@ Enabling shell is a security-sensitive opt-in: every trusted peer in
 `peers.toml` can obtain a remote shell while `--allow-shell` is active. Keep the
 allow-list tight, enable shell only on machines where that access is intended,
 and use `fabric restart --no-allow-shell` to turn it back off without risking a
-remote lockout.
+lockout.
+
+```sh
+fabric service install [--allow-shell | --no-allow-shell] [--memory-max-mb N]
+fabric service status
+fabric service uninstall
+```
+
+Install, inspect, or remove the OS user service. `install` starts/restarts the
+native service manager entry and enables it for future user sessions. `status`
+delegates to `systemctl --user status fabric.service --no-pager` on Linux and
+`launchctl print gui/$UID/com.myobie.fabric` on macOS. `uninstall` stops the
+managed service and removes only the systemd/launchd artifact; it leaves the
+fabric home, identity, peers, logs, and config in place.
 
 ### Debug Transport Test Commands
 

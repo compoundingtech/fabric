@@ -17,6 +17,7 @@ use fabric::{
     daemon::{
         DaemonOptions, FabricNode, init_daemon_tracing, run_daemon_with_options, send_control,
     },
+    service::{self, DEFAULT_MEMORY_MAX_MB, ServiceInstallOptions},
     shell::{self, ServerFrame},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -129,6 +130,11 @@ enum Commands {
     Ping { peer: String },
     /// Open an interactive remote shell on a trusted peer.
     Shell { peer: String },
+    /// Install or remove fabric as a user-managed OS service.
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommands,
+    },
     /// Internal/debug commands for transport testing.
     #[command(hide = true)]
     Debug {
@@ -169,6 +175,26 @@ enum KeyCommands {
         #[arg(long)]
         out: PathBuf,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommands {
+    /// Install and start a user service for the foreground daemon.
+    Install {
+        /// Start the managed daemon with remote shell serving enabled.
+        #[arg(long, conflicts_with = "no_allow_shell")]
+        allow_shell: bool,
+        /// Persist remote shell serving as disabled for the managed daemon.
+        #[arg(long)]
+        no_allow_shell: bool,
+        /// Memory ceiling applied by systemd/launchd, in MiB.
+        #[arg(long, default_value_t = DEFAULT_MEMORY_MAX_MB)]
+        memory_max_mb: u64,
+    },
+    /// Show native service-manager status.
+    Status,
+    /// Stop and remove only service-manager artifacts.
+    Uninstall,
 }
 
 #[derive(Debug, Subcommand)]
@@ -410,6 +436,27 @@ async fn main() -> Result<()> {
                     let code = run_shell_client(&socket).await?;
                     std::process::exit(code);
                 }
+                Commands::Service { command } => match command {
+                    ServiceCommands::Install {
+                        allow_shell,
+                        no_allow_shell,
+                        memory_max_mb,
+                    } => {
+                        service::install(
+                            &home,
+                            ServiceInstallOptions {
+                                allow_shell: allow_shell_override(allow_shell, no_allow_shell),
+                                memory_max_mb,
+                            },
+                        )?;
+                    }
+                    ServiceCommands::Status => {
+                        service::status()?;
+                    }
+                    ServiceCommands::Uninstall => {
+                        service::uninstall()?;
+                    }
+                },
                 Commands::Debug { command } => match command {
                     DebugCommands::DropTunnels => {
                         send_control(&home, ControlRequest::DropTunnelConnections).await?;

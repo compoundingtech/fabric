@@ -41,6 +41,10 @@ fabric service restart
 fabric service uninstall
 ```
 
+First slice status: `install`, `status`, and `uninstall` are implemented for
+Linux systemd user units and macOS per-user LaunchAgents. `restart` and `logs`
+remain follow-up convenience commands.
+
 The installed service should run the foreground daemon entrypoint directly:
 
 ```sh
@@ -58,6 +62,7 @@ Linux:
   dials, and logs are user-owned.
 - Support a documented system unit mode later for dedicated boxes if needed.
 - Enable restart-on-failure with bounded restart delay.
+- First slice uses `Restart=on-failure`, `RestartSec=5s`, and `MemoryMax`.
 - On servers that must survive logout/reboot, document `loginctl enable-linger`.
 - Expose `journalctl --user -u fabric.service` through `fabric service logs`.
 
@@ -65,6 +70,8 @@ macOS:
 
 - Prefer a per-user LaunchAgent by default for the same state ownership reason.
 - Use `KeepAlive` and `RunAtLoad`.
+- First slice uses `KeepAlive` with `SuccessfulExit=false`, `RunAtLoad`, and
+  launchd resident-set resource limits.
 - Write stdout/stderr to the fabric home log directory, not a system-wide root
   path.
 - Keep a LaunchDaemon/system mode as a later option only if Nathan wants a
