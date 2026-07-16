@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    fmt,
+    env, fmt,
     fs::{self, OpenOptions},
     io::Write,
     path::PathBuf,
@@ -23,6 +23,7 @@ use iroh::{
         TransportAddrUsage, VarInt, presets,
     },
 };
+use n0_watcher::Watcher as _;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, UnixListener, UnixStream},
@@ -30,6 +31,8 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
+use tracing_subscriber::EnvFilter;
 
 use crate::{
     config::{
@@ -50,6 +53,14 @@ const DIAL_FAILURE_MAX_BACKOFF: Duration = Duration::from_secs(15);
 const FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_INCOMING_HANDLERS: usize = 32;
 const MAX_DIAL_HANDLERS: usize = 32;
+const ENDPOINT_ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
+const ENDPOINT_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+const ENDPOINT_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const ENDPOINT_HEALTH_POLL_FAILURES_BEFORE_RECYCLE: usize = 2;
+const ENDPOINT_DIAGNOSTIC_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
+const ENDPOINT_RECYCLE_MIN_INTERVAL: Duration = Duration::from_secs(60);
+const NETWORK_CHANGE_DEBOUNCE: Duration = Duration::from_secs(1);
+const VALIDATION_LOG_TARGET: &str = "fabric::validation";
 
 #[derive(Debug)]
 struct FailureBackoff {
@@ -174,7 +185,9 @@ impl EndpointHooks for AllowListHook {
 #[derive(Debug)]
 pub struct DaemonState {
     home: FabricHome,
-    endpoint: Endpoint,
+    endpoint_tx: watch::Sender<CurrentEndpoint>,
+    endpoint_recycle: Mutex<()>,
+    last_endpoint_recycle: Mutex<Option<Instant>>,
     peer_book: RwLock<PeerBook>,
     allowed: Arc<RwLock<HashSet<EndpointId>>>,
     exposures: RwLock<HashMap<Vec<u8>, Exposure>>,
@@ -183,6 +196,7 @@ pub struct DaemonState {
     tunnel_sessions: tunnel::ServerSessionStore,
     tunnel_drop_tx: watch::Sender<u64>,
     tunnel_blocked: AtomicBool,
+    network_usable: AtomicBool,
     builtin_echo_hits: AtomicUsize,
     allow_shell: bool,
     incoming_failures: Arc<FailureBackoff>,
@@ -190,6 +204,12 @@ pub struct DaemonState {
     incoming_slots: Arc<Semaphore>,
     dial_slots: Arc<Semaphore>,
     cancel: CancellationToken,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CurrentEndpoint {
+    pub(crate) generation: u64,
+    pub(crate) endpoint: Endpoint,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -322,6 +342,120 @@ fn resolve_server_session_settings(
     ))
 }
 
+async fn build_daemon_endpoint(
+    home: &FabricHome,
+    allowed: Arc<RwLock<HashSet<EndpointId>>>,
+    exposures: &HashMap<Vec<u8>, Exposure>,
+) -> Result<Endpoint> {
+    let secret_key = load_or_create_identity(home)?;
+    let endpoint = Endpoint::builder(presets::N0)
+        .secret_key(secret_key)
+        .alpns(accepted_alpns(exposures))
+        .hooks(AllowListHook { allowed })
+        .bind()
+        .await?;
+    let _ = tokio::time::timeout(ENDPOINT_ONLINE_TIMEOUT, endpoint.online()).await;
+    Ok(endpoint)
+}
+
+pub fn init_daemon_tracing(home: &FabricHome) -> Result<()> {
+    home.prepare()?;
+    let appender =
+        tracing_appender::rolling::daily(home.validation_log_dir(), home.validation_log_prefix());
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(validation_log_filter())
+        .with_target(true)
+        .with_writer(appender)
+        .finish();
+
+    if tracing::subscriber::set_global_default(subscriber).is_ok() {
+        info!(
+            target: VALIDATION_LOG_TARGET,
+            event = "diagnostic_logging_init",
+            iroh_path_trace = env::var_os("FABRIC_IROH_PATH_TRACE").is_some(),
+            "fabric validation logging initialized"
+        );
+    }
+
+    Ok(())
+}
+
+fn validation_log_filter() -> EnvFilter {
+    if let Ok(filter) = env::var("FABRIC_LOG") {
+        return EnvFilter::try_new(filter).unwrap_or_else(|_| EnvFilter::new("fabric=info"));
+    }
+
+    let filter = if env::var_os("FABRIC_IROH_PATH_TRACE").is_some() {
+        concat!(
+            "fabric=info,",
+            "iroh=warn,",
+            "noq=warn,",
+            "iroh::socket::remote_map=debug,",
+            "iroh::socket::remote_map::remote_state=debug,",
+            "noq_proto::connection=debug"
+        )
+    } else {
+        "fabric=info,iroh=warn,noq=warn,netwatch=warn"
+    };
+    EnvFilter::new(filter)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NetworkChangeEvent {
+    reason: String,
+    network_usable: bool,
+    coalesced_events: usize,
+}
+
+#[derive(Debug)]
+struct NetworkChangeDebouncer {
+    quiet_window: Duration,
+    pending: Option<NetworkChangeEvent>,
+    due_at: Option<Instant>,
+}
+
+impl NetworkChangeDebouncer {
+    fn new(quiet_window: Duration) -> Self {
+        Self {
+            quiet_window,
+            pending: None,
+            due_at: None,
+        }
+    }
+
+    fn record(&mut self, reason: String, network_usable: bool, now: Instant) {
+        let coalesced_events = self
+            .pending
+            .as_ref()
+            .map_or(1, |event| event.coalesced_events.saturating_add(1));
+        self.pending = Some(NetworkChangeEvent {
+            reason,
+            network_usable,
+            coalesced_events,
+        });
+        self.due_at = Some(now + self.quiet_window);
+    }
+
+    fn due_at(&self) -> Option<Instant> {
+        self.due_at
+    }
+
+    fn take_due(&mut self, now: Instant) -> Option<NetworkChangeEvent> {
+        if self.due_at.is_some_and(|due_at| now >= due_at) {
+            self.due_at = None;
+            return self.pending.take();
+        }
+        None
+    }
+
+    fn pending_count(&self) -> usize {
+        self.pending
+            .as_ref()
+            .map_or(0, |event| event.coalesced_events)
+    }
+}
+
 impl DaemonState {
     async fn new(
         home: FabricHome,
@@ -329,7 +463,6 @@ impl DaemonState {
         options: DaemonOptions,
     ) -> Result<Arc<Self>> {
         home.prepare()?;
-        let secret_key = load_or_create_identity(&home)?;
         if options.allow_shell {
             set_config_allow_shell(&home, true)?;
         }
@@ -340,16 +473,11 @@ impl DaemonState {
         let peer_book = PeerBook::load(&home)?;
         let exposures = load_persisted_exposures(&home)?;
         let allowed = Arc::new(RwLock::new(peer_book.trusted_ids()));
-        let endpoint = Endpoint::builder(presets::N0)
-            .secret_key(secret_key)
-            .alpns(accepted_alpns(&exposures))
-            .hooks(AllowListHook {
-                allowed: allowed.clone(),
-            })
-            .bind()
-            .await?;
-
-        let _ = tokio::time::timeout(Duration::from_secs(5), endpoint.online()).await;
+        let endpoint = build_daemon_endpoint(&home, allowed.clone(), &exposures).await?;
+        let (endpoint_tx, _) = watch::channel(CurrentEndpoint {
+            generation: 0,
+            endpoint,
+        });
         let (tunnel_drop_tx, _) = watch::channel(0);
         let tunnel_sessions =
             tunnel::ServerSessionStore::new(tunnel_session_limits, tunnel_session_detached_ttl);
@@ -357,7 +485,9 @@ impl DaemonState {
 
         Ok(Arc::new(Self {
             home,
-            endpoint,
+            endpoint_tx,
+            endpoint_recycle: Mutex::new(()),
+            last_endpoint_recycle: Mutex::new(None),
             peer_book: RwLock::new(peer_book),
             allowed,
             exposures: RwLock::new(exposures),
@@ -366,6 +496,7 @@ impl DaemonState {
             tunnel_sessions,
             tunnel_drop_tx,
             tunnel_blocked: AtomicBool::new(false),
+            network_usable: AtomicBool::new(true),
             builtin_echo_hits: AtomicUsize::new(0),
             allow_shell,
             incoming_failures: FailureBackoff::new(
@@ -384,12 +515,24 @@ impl DaemonState {
         }))
     }
 
+    fn endpoint_handle(&self) -> CurrentEndpoint {
+        self.endpoint_tx.borrow().clone()
+    }
+
+    fn current_endpoint(&self) -> Endpoint {
+        self.endpoint_handle().endpoint
+    }
+
+    fn endpoint_rx(&self) -> watch::Receiver<CurrentEndpoint> {
+        self.endpoint_tx.subscribe()
+    }
+
     pub fn id(&self) -> EndpointId {
-        self.endpoint.id()
+        self.current_endpoint().id()
     }
 
     pub fn addr(&self) -> EndpointAddr {
-        self.endpoint.addr()
+        self.current_endpoint().addr()
     }
 
     pub async fn reload_peers(&self) -> Result<()> {
@@ -423,7 +566,8 @@ impl DaemonState {
 
         let mut exposures = self.exposures.write().await;
         exposures.insert(alpn, Exposure::Socket(socket));
-        self.endpoint.set_alpns(accepted_alpns(&exposures));
+        self.current_endpoint()
+            .set_alpns(accepted_alpns(&exposures));
         Ok(())
     }
 
@@ -451,7 +595,8 @@ impl DaemonState {
 
         let mut exposures = self.exposures.write().await;
         exposures.insert(alpn, Exposure::Tcp { addr });
-        self.endpoint.set_alpns(accepted_alpns(&exposures));
+        self.current_endpoint()
+            .set_alpns(accepted_alpns(&exposures));
         Ok(())
     }
 
@@ -501,7 +646,8 @@ impl DaemonState {
                 limit: tunnel::ExecLimit::new(max_children),
             },
         );
-        self.endpoint.set_alpns(accepted_alpns(&exposures));
+        self.current_endpoint()
+            .set_alpns(accepted_alpns(&exposures));
         Ok(())
     }
 
@@ -536,7 +682,8 @@ impl DaemonState {
 
         let mut exposures = self.exposures.write().await;
         exposures.remove(&alpn);
-        self.endpoint.set_alpns(accepted_alpns(&exposures));
+        self.current_endpoint()
+            .set_alpns(accepted_alpns(&exposures));
         Ok(())
     }
 
@@ -550,10 +697,19 @@ impl DaemonState {
     }
 
     async fn ping_addr(&self, peer: &str, peer_addr: EndpointAddr) -> Result<PingOutcome> {
+        let endpoint = self.current_endpoint();
+        self.ping_addr_on_endpoint(endpoint, peer, peer_addr).await
+    }
+
+    async fn ping_addr_on_endpoint(
+        &self,
+        endpoint: Endpoint,
+        peer: &str,
+        peer_addr: EndpointAddr,
+    ) -> Result<PingOutcome> {
         let nonce = rand::random::<[u8; 32]>();
         let started = std::time::Instant::now();
-        let connection = self
-            .endpoint
+        let connection = endpoint
             .connect(peer_addr.clone(), BUILTIN_ECHO_ALPN)
             .await
             .with_context(|| format!("failed to connect to {peer:?} built-in echo"))?;
@@ -566,7 +722,7 @@ impl DaemonState {
         let round_trip = started.elapsed();
         let mut transport = classify_connection_transport(&connection);
         if transport.is_none()
-            && let Some(info) = self.endpoint.remote_info(peer_addr.id).await
+            && let Some(info) = endpoint.remote_info(peer_addr.id).await
         {
             transport = classify_remote_transport(&info);
         }
@@ -617,7 +773,7 @@ impl DaemonState {
 
         tokio::spawn(run_dial_tcp_listener(
             listener,
-            self.endpoint.clone(),
+            self.endpoint_rx(),
             self.home.clone(),
             peer.to_string(),
             alpn,
@@ -671,7 +827,7 @@ impl DaemonState {
         if alpn == shell::SHELL_ALPN {
             tokio::spawn(run_raw_dial_socket(
                 listener,
-                self.endpoint.clone(),
+                self.endpoint_rx(),
                 peer_addr,
                 alpn,
                 self.cancel.clone(),
@@ -681,7 +837,7 @@ impl DaemonState {
         } else {
             tokio::spawn(run_dial_socket(
                 listener,
-                self.endpoint.clone(),
+                self.endpoint_rx(),
                 self.home.clone(),
                 peer.to_string(),
                 alpn,
@@ -862,6 +1018,268 @@ impl DaemonState {
         let _ = self.tunnel_drop_tx.send(current.wrapping_add(1));
     }
 
+    async fn rehome_after_network_change(&self, reason: &str, network_usable: bool) {
+        let endpoint = self.endpoint_handle();
+        info!(
+            target: VALIDATION_LOG_TARGET,
+            event = "network_change_fire",
+            generation = endpoint.generation,
+            network_usable,
+            reason,
+            "notifying iroh endpoint of debounced network change"
+        );
+        eprintln!(
+            "fabric: network change detected ({reason}); notifying iroh endpoint generation {}",
+            endpoint.generation
+        );
+        endpoint.endpoint.network_change().await;
+        self.drop_tunnel_connections();
+
+        if !network_usable {
+            info!(
+                target: VALIDATION_LOG_TARGET,
+                event = "network_change_defer_health",
+                generation = endpoint.generation,
+                reason,
+                "network has no usable default route"
+            );
+            eprintln!(
+                "fabric: network has no usable default route yet; deferring endpoint health check"
+            );
+            return;
+        }
+
+        if self
+            .endpoint_health_recovered(endpoint.clone(), "network change")
+            .await
+        {
+            return;
+        }
+
+        if let Err(error) = self
+            .recycle_endpoint_if_generation(endpoint.generation, "network health did not recover")
+            .await
+        {
+            eprintln!("fabric: failed to recycle iroh endpoint after network change: {error:#}");
+        }
+    }
+
+    async fn endpoint_health_recovered(&self, endpoint: CurrentEndpoint, context: &str) -> bool {
+        if tokio::time::timeout(ENDPOINT_HEALTH_TIMEOUT, endpoint.endpoint.online())
+            .await
+            .is_ok()
+        {
+            info!(
+                target: VALIDATION_LOG_TARGET,
+                event = "endpoint_health",
+                context,
+                generation = endpoint.generation,
+                online = true,
+                peer_reachable = false,
+                recovered = true,
+                "endpoint health recovered via online status"
+            );
+            eprintln!(
+                "fabric: iroh endpoint generation {} is online during {context}",
+                endpoint.generation,
+            );
+            return true;
+        }
+
+        if self.endpoint_handle().generation != endpoint.generation {
+            debug!(
+                target: VALIDATION_LOG_TARGET,
+                event = "endpoint_health",
+                context,
+                generation = endpoint.generation,
+                stale_generation = true,
+                "endpoint generation changed while health check was running"
+            );
+            return true;
+        }
+
+        let peer_reachable = tokio::time::timeout(
+            ENDPOINT_HEALTH_TIMEOUT,
+            self.any_peer_reachable_on_endpoint(endpoint.endpoint, context),
+        )
+        .await
+        .unwrap_or(false);
+        info!(
+            target: VALIDATION_LOG_TARGET,
+            event = "endpoint_health",
+            context,
+            generation = endpoint.generation,
+            online = false,
+            peer_reachable,
+            recovered = peer_reachable,
+            "endpoint health checked trusted peer echo"
+        );
+        peer_reachable
+    }
+
+    async fn any_peer_reachable_on_endpoint(&self, endpoint: Endpoint, context: &str) -> bool {
+        let peers = self.peer_book.read().await.peers().to_vec();
+        for peer in peers {
+            let addr = peer
+                .addr
+                .clone()
+                .unwrap_or_else(|| EndpointAddr::new(peer.id));
+            let label = peer.name.clone().unwrap_or_else(|| peer.id.to_string());
+            let result = tokio::time::timeout(
+                REACHABILITY_TIMEOUT,
+                self.ping_addr_on_endpoint(endpoint.clone(), &label, addr),
+            )
+            .await;
+            if matches!(result, Ok(Ok(_))) {
+                eprintln!("fabric: peer {label:?} reachable during {context}");
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn log_endpoint_snapshot(&self) {
+        let endpoint = self.endpoint_handle();
+        let peers = self.peer_book.read().await.peers().to_vec();
+        let mut relay_watcher = endpoint.endpoint.home_relay_status();
+        let relays = relay_watcher.get();
+        let home_relays = relays.len();
+        let home_relays_connected = relays.iter().filter(|relay| relay.is_connected()).count();
+        let home_relays_with_error = relays
+            .iter()
+            .filter(|relay| !relay.is_connected() && relay.last_error().is_some())
+            .count();
+
+        let mut remote_infos = 0usize;
+        let mut remote_addrs_total = 0usize;
+        let mut remote_addrs_active = 0usize;
+        let mut remote_addrs_inactive = 0usize;
+        let mut remote_addrs_ip = 0usize;
+        let mut remote_addrs_relay = 0usize;
+
+        for peer in &peers {
+            let Some(info) = endpoint.endpoint.remote_info(peer.id).await else {
+                continue;
+            };
+            remote_infos += 1;
+            for addr in info.addrs() {
+                remote_addrs_total += 1;
+                match addr.usage() {
+                    TransportAddrUsage::Active => remote_addrs_active += 1,
+                    _ => remote_addrs_inactive += 1,
+                }
+                remote_addrs_ip += usize::from(addr.addr().is_ip());
+                remote_addrs_relay += usize::from(addr.addr().is_relay());
+            }
+        }
+
+        let rss_bytes = current_rss_bytes();
+        info!(
+            target: VALIDATION_LOG_TARGET,
+            event = "endpoint_snapshot",
+            generation = endpoint.generation,
+            rss_known = rss_bytes.is_some(),
+            rss_bytes = rss_bytes.unwrap_or(0),
+            peer_count = peers.len(),
+            remote_infos,
+            remote_addrs_total,
+            remote_addrs_active,
+            remote_addrs_inactive,
+            remote_addrs_ip,
+            remote_addrs_relay,
+            home_relays,
+            home_relays_connected,
+            home_relays_with_error,
+            "endpoint diagnostic snapshot"
+        );
+    }
+
+    async fn recycle_endpoint_if_generation(
+        &self,
+        expected_generation: u64,
+        reason: &str,
+    ) -> Result<()> {
+        let _guard = self.endpoint_recycle.lock().await;
+        let old = self.endpoint_handle();
+        if old.generation != expected_generation {
+            debug!(
+                target: VALIDATION_LOG_TARGET,
+                event = "endpoint_recycle_skip",
+                expected_generation,
+                actual_generation = old.generation,
+                reason,
+                "endpoint recycle skipped because generation changed"
+            );
+            return Ok(());
+        }
+
+        if let Some(last_recycle) = *self.last_endpoint_recycle.lock().await {
+            let since = last_recycle.elapsed();
+            if since < ENDPOINT_RECYCLE_MIN_INTERVAL {
+                warn!(
+                    target: VALIDATION_LOG_TARGET,
+                    event = "endpoint_recycle_rate_limited",
+                    generation = old.generation,
+                    reason,
+                    since_ms = since.as_millis() as u64,
+                    min_interval_ms = ENDPOINT_RECYCLE_MIN_INTERVAL.as_millis() as u64,
+                    "endpoint recycle suppressed by rate limit"
+                );
+                return Ok(());
+            }
+        }
+
+        let started = Instant::now();
+        let rss_before_bytes = current_rss_bytes();
+        let exposures = self.exposures.read().await;
+        let new_endpoint =
+            build_daemon_endpoint(&self.home, self.allowed.clone(), &exposures).await?;
+        drop(exposures);
+
+        if new_endpoint.id() != old.endpoint.id() {
+            bail!(
+                "rebuilt endpoint id {} did not match previous id {}",
+                new_endpoint.id(),
+                old.endpoint.id()
+            );
+        }
+
+        let new_generation = old.generation.wrapping_add(1);
+        self.endpoint_tx.send_replace(CurrentEndpoint {
+            generation: new_generation,
+            endpoint: new_endpoint,
+        });
+        *self.last_endpoint_recycle.lock().await = Some(Instant::now());
+        self.drop_tunnel_connections();
+        old.endpoint.close().await;
+        let duration = started.elapsed();
+        let rss_after_bytes = current_rss_bytes();
+        info!(
+            target: VALIDATION_LOG_TARGET,
+            event = "endpoint_recycle",
+            reason,
+            old_generation = old.generation,
+            new_generation,
+            duration_ms = duration.as_millis() as u64,
+            rss_before_known = rss_before_bytes.is_some(),
+            rss_before_bytes = rss_before_bytes.unwrap_or(0),
+            rss_after_known = rss_after_bytes.is_some(),
+            rss_after_bytes = rss_after_bytes.unwrap_or(0),
+            "recycled iroh endpoint"
+        );
+        eprintln!(
+            "fabric: recycled iroh endpoint generation {} -> {} ({reason})",
+            old.generation, new_generation
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn force_endpoint_recycle(&self, reason: &str) -> Result<()> {
+        let generation = self.endpoint_handle().generation;
+        self.recycle_endpoint_if_generation(generation, reason)
+            .await
+    }
+
     fn set_tunnel_blocked(&self, blocked: bool) {
         self.tunnel_blocked.store(blocked, Ordering::SeqCst);
     }
@@ -984,6 +1402,7 @@ pub async fn run_daemon(home: FabricHome, allow_shell: bool) -> Result<()> {
 }
 
 pub async fn run_daemon_with_options(home: FabricHome, options: DaemonOptions) -> Result<()> {
+    init_daemon_tracing(&home)?;
     FabricNode::start_with_daemon_options(home, options)
         .await?
         .wait()
@@ -1019,15 +1438,179 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
     tokio::select! {
         result = run_control_socket(control_listener, state.clone()) => result?,
         result = run_iroh_accept_loop(state.clone()) => result?,
+        result = run_network_rehome_loop(state.clone()) => result?,
+        result = run_endpoint_health_poll_loop(state.clone()) => result?,
+        result = run_endpoint_snapshot_loop(state.clone()) => result?,
         _ = state.cancel.cancelled() => {}
     }
 
     state.cancel.cancel();
-    state.endpoint.close().await;
+    state.current_endpoint().close().await;
     let _ = fs::remove_file(control_path);
     for socket in state.dial_sockets.lock().await.values() {
         let _ = fs::remove_file(&socket.path);
     }
+    Ok(())
+}
+
+async fn run_network_rehome_loop(state: Arc<DaemonState>) -> Result<()> {
+    let monitor = match netwatch::netmon::Monitor::new().await {
+        Ok(monitor) => monitor,
+        Err(error) => {
+            eprintln!("fabric: network monitor unavailable; roaming rehome disabled: {error:#}");
+            state.cancel.cancelled().await;
+            return Ok(());
+        }
+    };
+    let mut interfaces = monitor.interface_state();
+    let mut debouncer = NetworkChangeDebouncer::new(NETWORK_CHANGE_DEBOUNCE);
+
+    loop {
+        let due_at = debouncer.due_at();
+        tokio::select! {
+            _ = state.cancel.cancelled() => break,
+            _ = async {
+                if let Some(due_at) = due_at {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(due_at)).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                if let Some(event) = debouncer.take_due(Instant::now()) {
+                    info!(
+                        target: VALIDATION_LOG_TARGET,
+                        event = "netmon_debounce_fire",
+                        coalesced_events = event.coalesced_events,
+                        network_usable = event.network_usable,
+                        reason = %event.reason,
+                        quiet_ms = NETWORK_CHANGE_DEBOUNCE.as_millis() as u64,
+                        "network-change debounce quiet window elapsed"
+                    );
+                    state
+                        .rehome_after_network_change(&event.reason, event.network_usable)
+                        .await;
+                }
+            }
+            update = interfaces.updated() => {
+                let Ok(network_state) = update else {
+                    eprintln!("fabric: network monitor stopped; roaming rehome disabled");
+                    break;
+                };
+                let network_usable = network_state.default_route_interface.is_some()
+                    && (network_state.have_v4 || network_state.have_v6);
+                state.network_usable.store(network_usable, Ordering::SeqCst);
+                let reason = format!(
+                    "default_route={:?} have_v4={} have_v6={} unsuspend={}",
+                    network_state.default_route_interface,
+                    network_state.have_v4,
+                    network_state.have_v6,
+                    network_state.last_unsuspend.is_some()
+                );
+                info!(
+                    target: VALIDATION_LOG_TARGET,
+                    event = "netmon_raw",
+                    network_usable,
+                    reason = %reason,
+                    "raw network monitor update"
+                );
+                debouncer.record(reason.clone(), network_usable, Instant::now());
+                info!(
+                    target: VALIDATION_LOG_TARGET,
+                    event = "netmon_debounce_pending",
+                    coalesced_events = debouncer.pending_count(),
+                    network_usable,
+                    reason = %reason,
+                    quiet_ms = NETWORK_CHANGE_DEBOUNCE.as_millis() as u64,
+                    "network-change update queued for debounce"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_endpoint_snapshot_loop(state: Arc<DaemonState>) -> Result<()> {
+    if !tracing::dispatcher::has_been_set() {
+        state.cancel.cancelled().await;
+        return Ok(());
+    }
+
+    let mut interval = tokio::time::interval(ENDPOINT_DIAGNOSTIC_SNAPSHOT_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = state.cancel.cancelled() => break,
+            _ = interval.tick() => state.log_endpoint_snapshot().await,
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_endpoint_health_poll_loop(state: Arc<DaemonState>) -> Result<()> {
+    let mut interval = tokio::time::interval(ENDPOINT_HEALTH_POLL_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.tick().await;
+    let mut consecutive_failures = 0usize;
+
+    loop {
+        tokio::select! {
+            _ = state.cancel.cancelled() => break,
+            _ = interval.tick() => {
+                if !state.network_usable.load(Ordering::SeqCst) {
+                    consecutive_failures = 0;
+                    continue;
+                }
+
+                let endpoint = state.endpoint_handle();
+                if state
+                    .endpoint_health_recovered(endpoint.clone(), "periodic health poll")
+                    .await
+                {
+                    consecutive_failures = 0;
+                    continue;
+                }
+
+                if state.endpoint_handle().generation != endpoint.generation {
+                    consecutive_failures = 0;
+                    continue;
+                }
+
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                warn!(
+                    target: VALIDATION_LOG_TARGET,
+                    event = "endpoint_health_poll_failed",
+                    generation = endpoint.generation,
+                    consecutive_failures,
+                    recycle_after_failures = ENDPOINT_HEALTH_POLL_FAILURES_BEFORE_RECYCLE,
+                    "endpoint health poll failed"
+                );
+                eprintln!(
+                    "fabric: iroh endpoint generation {} failed health poll ({}/{})",
+                    endpoint.generation,
+                    consecutive_failures,
+                    ENDPOINT_HEALTH_POLL_FAILURES_BEFORE_RECYCLE,
+                );
+
+                if consecutive_failures >= ENDPOINT_HEALTH_POLL_FAILURES_BEFORE_RECYCLE {
+                    if let Err(error) = state
+                        .recycle_endpoint_if_generation(
+                            endpoint.generation,
+                            "periodic health poll did not recover",
+                        )
+                        .await
+                    {
+                        eprintln!("fabric: failed to recycle iroh endpoint after health poll: {error:#}");
+                    }
+                    consecutive_failures = 0;
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1168,6 +1751,10 @@ async fn process_control_request(
                 .await;
             ControlResponse::Ok
         }
+        ControlRequest::RecycleEndpoint => {
+            state.force_endpoint_recycle("debug request").await?;
+            ControlResponse::Ok
+        }
         ControlRequest::Restart { allow_shell } => {
             let restart = state.schedule_restart(allow_shell)?;
             ControlResponse::Restarting {
@@ -1184,10 +1771,12 @@ async fn process_control_request(
 }
 
 async fn run_iroh_accept_loop(state: Arc<DaemonState>) -> Result<()> {
+    let mut endpoint_rx = state.endpoint_rx();
     loop {
         if !state.incoming_failures.wait(&state.cancel).await {
             break;
         }
+        let endpoint = endpoint_rx.borrow().clone();
         let permit = tokio::select! {
             _ = state.cancel.cancelled() => break,
             permit = state.incoming_slots.clone().acquire_owned() => {
@@ -1196,8 +1785,17 @@ async fn run_iroh_accept_loop(state: Arc<DaemonState>) -> Result<()> {
         };
         tokio::select! {
             _ = state.cancel.cancelled() => break,
-            incoming = state.endpoint.accept() => {
+            changed = endpoint_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+            }
+            incoming = endpoint.endpoint.accept() => {
                 let Some(incoming) = incoming else {
+                    if endpoint_rx.has_changed().unwrap_or(false) {
+                        let _ = endpoint_rx.changed().await;
+                        continue;
+                    }
                     break;
                 };
                 tokio::spawn(handle_incoming_iroh(incoming, state.clone(), permit));
@@ -1228,11 +1826,13 @@ async fn process_incoming_iroh(incoming: Incoming, state: Arc<DaemonState>) -> R
     let alpn = accepting.alpn().await?;
     if alpn == BUILTIN_ECHO_ALPN {
         let connection = accepting.await?;
+        log_connection_paths("builtin_echo_accept", &connection);
         handle_builtin_echo(connection, state).await?;
         return Ok(());
     }
     if alpn == shell::SHELL_ALPN {
         let connection = accepting.await?;
+        log_connection_paths("builtin_shell_accept", &connection);
         handle_builtin_shell(connection, state).await?;
         return Ok(());
     }
@@ -1246,6 +1846,7 @@ async fn process_incoming_iroh(incoming: Incoming, state: Arc<DaemonState>) -> R
     };
 
     let connection = accepting.await?;
+    log_connection_paths("tunnel_accept", &connection);
     if state.tunnel_blocked.load(Ordering::SeqCst) {
         connection.close(0u32.into(), b"fabric tunnel blocked");
         return Ok(());
@@ -1298,6 +1899,82 @@ fn matches_reserved_alpn(alpn: &[u8]) -> bool {
     alpn == BUILTIN_ECHO_ALPN || alpn == shell::SHELL_ALPN
 }
 
+fn current_rss_bytes() -> Option<u64> {
+    current_rss_bytes_impl()
+}
+
+#[cfg(target_os = "linux")]
+fn current_rss_bytes_impl() -> Option<u64> {
+    let statm = fs::read_to_string("/proc/self/statm").ok()?;
+    let resident_pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
+    resident_pages.checked_mul(page_size as u64)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+fn current_rss_bytes_impl() -> Option<u64> {
+    use std::mem::{MaybeUninit, size_of};
+
+    let mut info = MaybeUninit::<libc::mach_task_basic_info_data_t>::uninit();
+    let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
+    let result = unsafe {
+        libc::task_info(
+            libc::mach_task_self(),
+            libc::MACH_TASK_BASIC_INFO,
+            info.as_mut_ptr().cast(),
+            &mut count,
+        )
+    };
+    if result != libc::KERN_SUCCESS {
+        return None;
+    }
+    if count < (size_of::<libc::mach_task_basic_info_data_t>() / size_of::<libc::natural_t>()) as _
+    {
+        return None;
+    }
+    Some(unsafe { info.assume_init().resident_size as u64 })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn current_rss_bytes_impl() -> Option<u64> {
+    None
+}
+
+fn connection_path_counts(connection: &Connection) -> (usize, usize, usize, usize) {
+    let paths = connection.paths();
+    let mut total = 0usize;
+    let mut selected = 0usize;
+    let mut ip = 0usize;
+    let mut relay = 0usize;
+
+    for path in paths.iter() {
+        total += 1;
+        selected += usize::from(path.is_selected());
+        ip += usize::from(path.is_ip());
+        relay += usize::from(path.is_relay());
+    }
+
+    (total, selected, ip, relay)
+}
+
+fn log_connection_paths(event: &'static str, connection: &Connection) {
+    let (paths_total, paths_selected, paths_ip, paths_relay) = connection_path_counts(connection);
+    info!(
+        target: VALIDATION_LOG_TARGET,
+        event,
+        remote = %connection.remote_id(),
+        paths_total,
+        paths_selected,
+        paths_ip,
+        paths_relay,
+        "connection path snapshot"
+    );
+}
+
 fn classify_connection_transport(connection: &Connection) -> Option<String> {
     let paths = connection.paths();
     let mut selected_ip = false;
@@ -1346,7 +2023,7 @@ fn classify_transport(has_ip: bool, has_relay: bool) -> Option<String> {
 
 async fn run_dial_socket(
     listener: UnixListener,
-    endpoint: Endpoint,
+    endpoint_rx: watch::Receiver<CurrentEndpoint>,
     home: FabricHome,
     peer: String,
     alpn: Vec<u8>,
@@ -1371,7 +2048,7 @@ async fn run_dial_socket(
                         permit
                     }
                 };
-                let endpoint = endpoint.clone();
+                let endpoint_rx = endpoint_rx.clone();
                 let home = home.clone();
                 let peer = peer.clone();
                 let alpn = alpn.clone();
@@ -1384,7 +2061,7 @@ async fn run_dial_socket(
                         return;
                     }
                     match
-                        tunnel::run_client_connection(local, endpoint, home, peer, alpn, cancel, drop_rx)
+                        tunnel::run_client_connection(local, endpoint_rx, home, peer, alpn, cancel, drop_rx)
                             .await
                     {
                         Ok(()) => dial_failures.record_success().await,
@@ -1402,7 +2079,7 @@ async fn run_dial_socket(
 
 async fn run_dial_tcp_listener(
     listener: TcpListener,
-    endpoint: Endpoint,
+    endpoint_rx: watch::Receiver<CurrentEndpoint>,
     home: FabricHome,
     peer: String,
     alpn: Vec<u8>,
@@ -1427,7 +2104,7 @@ async fn run_dial_tcp_listener(
                         permit
                     }
                 };
-                let endpoint = endpoint.clone();
+                let endpoint_rx = endpoint_rx.clone();
                 let home = home.clone();
                 let peer = peer.clone();
                 let alpn = alpn.clone();
@@ -1440,7 +2117,7 @@ async fn run_dial_tcp_listener(
                         return;
                     }
                     match
-                        tunnel::run_client_tcp_connection(local, endpoint, home, peer, alpn, cancel, drop_rx)
+                        tunnel::run_client_tcp_connection(local, endpoint_rx, home, peer, alpn, cancel, drop_rx)
                             .await
                     {
                         Ok(()) => dial_failures.record_success().await,
@@ -1458,7 +2135,7 @@ async fn run_dial_tcp_listener(
 
 async fn run_raw_dial_socket(
     listener: UnixListener,
-    endpoint: Endpoint,
+    endpoint_rx: watch::Receiver<CurrentEndpoint>,
     peer_addr: EndpointAddr,
     alpn: Vec<u8>,
     cancel: CancellationToken,
@@ -1481,7 +2158,7 @@ async fn run_raw_dial_socket(
                         permit
                     }
                 };
-                let endpoint = endpoint.clone();
+                let endpoint = endpoint_rx.borrow().endpoint.clone();
                 let peer_addr = peer_addr.clone();
                 let alpn = alpn.clone();
                 let cancel = cancel.clone();
@@ -1612,6 +2289,56 @@ mod tests {
             format!("{error:#}").contains("detached_ttl_secs must be greater than zero"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn network_change_debouncer_coalesces_burst_into_one_event() {
+        let mut debouncer = NetworkChangeDebouncer::new(Duration::from_secs(1));
+        let now = Instant::now();
+
+        debouncer.record(
+            "default_route=Some(en0) have_v4=true".to_string(),
+            true,
+            now,
+        );
+        debouncer.record(
+            "default_route=Some(en0) have_v4=false".to_string(),
+            false,
+            now + Duration::from_millis(250),
+        );
+        debouncer.record(
+            "default_route=Some(en0) have_v4=true have_v6=true".to_string(),
+            true,
+            now + Duration::from_millis(900),
+        );
+
+        assert_eq!(debouncer.pending_count(), 3);
+        assert!(
+            debouncer
+                .take_due(now + Duration::from_millis(1899))
+                .is_none(),
+            "quiet window should be extended by the last event"
+        );
+
+        let event = debouncer
+            .take_due(now + Duration::from_millis(1900))
+            .expect("debounced event should fire once after quiet window");
+        assert_eq!(event.coalesced_events, 3);
+        assert!(event.network_usable);
+        assert_eq!(
+            event.reason,
+            "default_route=Some(en0) have_v4=true have_v6=true"
+        );
+        assert!(debouncer.take_due(now + Duration::from_secs(3)).is_none());
+    }
+
+    #[test]
+    fn validation_logging_init_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = FabricHome::new(temp.path());
+
+        init_daemon_tracing(&home).unwrap();
+        init_daemon_tracing(&home).unwrap();
     }
 
     #[tokio::test]

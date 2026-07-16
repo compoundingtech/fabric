@@ -23,7 +23,10 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{FabricHome, PeerBook};
+use crate::{
+    config::{FabricHome, PeerBook},
+    daemon::CurrentEndpoint,
+};
 
 // Resumable byte tunnel used by generic `fabric dial` sockets. Each local Unix
 // connection gets one session id; reconnecting iroh attaches replay unacked
@@ -683,7 +686,7 @@ impl Backoff {
 
 pub async fn run_client_connection(
     local: UnixStream,
-    endpoint: Endpoint,
+    endpoint_rx: watch::Receiver<CurrentEndpoint>,
     home: FabricHome,
     peer: String,
     alpn: Vec<u8>,
@@ -694,7 +697,7 @@ pub async fn run_client_connection(
     run_client_connection_parts(
         Box::new(read),
         Box::new(write),
-        endpoint,
+        endpoint_rx,
         home,
         peer,
         alpn,
@@ -706,7 +709,7 @@ pub async fn run_client_connection(
 
 pub async fn run_client_tcp_connection(
     local: TcpStream,
-    endpoint: Endpoint,
+    endpoint_rx: watch::Receiver<CurrentEndpoint>,
     home: FabricHome,
     peer: String,
     alpn: Vec<u8>,
@@ -717,7 +720,7 @@ pub async fn run_client_tcp_connection(
     run_client_connection_parts(
         Box::new(read),
         Box::new(write),
-        endpoint,
+        endpoint_rx,
         home,
         peer,
         alpn,
@@ -730,7 +733,7 @@ pub async fn run_client_tcp_connection(
 async fn run_client_connection_parts(
     local_read: LocalRead,
     local_write: LocalWrite,
-    endpoint: Endpoint,
+    endpoint_rx: watch::Receiver<CurrentEndpoint>,
     home: FabricHome,
     peer: String,
     alpn: Vec<u8>,
@@ -742,8 +745,16 @@ async fn run_client_connection_parts(
     let (session, local_read) =
         TunnelSession::new_parts(session_id, peer_id, local_read, local_write);
     let reader = tokio::spawn(session.clone().run_local_reader(local_read));
-    let result =
-        run_client_attach_loop(session.clone(), endpoint, home, peer, alpn, cancel, drop_rx).await;
+    let result = run_client_attach_loop(
+        session.clone(),
+        endpoint_rx,
+        home,
+        peer,
+        alpn,
+        cancel,
+        drop_rx,
+    )
+    .await;
     reader.abort();
     let _ = reader.await;
     result
@@ -751,7 +762,7 @@ async fn run_client_connection_parts(
 
 async fn run_client_attach_loop(
     session: Arc<TunnelSession>,
-    endpoint: Endpoint,
+    mut endpoint_rx: watch::Receiver<CurrentEndpoint>,
     home: FabricHome,
     peer: String,
     alpn: Vec<u8>,
@@ -766,15 +777,10 @@ async fn run_client_attach_loop(
         }
 
         let peer_addr = resolve_peer_for_attempt(&home, &peer, session.peer_id()).await;
+        let endpoint = endpoint_rx.borrow().endpoint.clone();
         let attach_started = Instant::now();
-        let result = connect_and_attach(
-            session.clone(),
-            endpoint.clone(),
-            peer_addr,
-            &alpn,
-            drop_rx.clone(),
-        )
-        .await;
+        let result =
+            connect_and_attach(session.clone(), endpoint, peer_addr, &alpn, drop_rx.clone()).await;
 
         match result {
             Ok(()) if session.is_complete().await => return Ok(()),
@@ -801,6 +807,11 @@ async fn run_client_attach_loop(
             _ = cancel.cancelled() => return Ok(()),
             _ = session.done.cancelled() => return Ok(()),
             changed = drop_rx.changed() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+            }
+            changed = endpoint_rx.changed() => {
                 if changed.is_err() {
                     return Ok(());
                 }

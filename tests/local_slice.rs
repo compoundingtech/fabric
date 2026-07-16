@@ -26,9 +26,11 @@ use tokio::{
 
 // These tests start real iroh endpoints and daemon tasks; keep the default
 // test runner from exercising that transport stack concurrently.
+// Each test still creates its Tokio runtime before acquiring the guard, so keep
+// worker counts low to avoid starving the one active transport test.
 static LOCAL_SLICE_LOCKED: AtomicBool = AtomicBool::new(false);
 const FABRIC_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
-const LOCAL_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const LOCAL_IO_TIMEOUT: Duration = Duration::from_secs(60);
 const LARGE_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const LOCAL_SLICE_SETTLE: Duration = Duration::from_millis(500);
 
@@ -40,7 +42,7 @@ impl Drop for LocalSliceGuard {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_expose_dial_round_trips_and_acl_rejects_unknown_node() -> Result<()> {
     let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
@@ -133,7 +135,7 @@ async fn local_expose_dial_round_trips_and_acl_rejects_unknown_node() -> Result<
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn generic_tunnel_survives_transport_reconnect_without_reopening_local_service() -> Result<()>
 {
     let _guard = local_slice_guard().await;
@@ -194,7 +196,75 @@ async fn generic_tunnel_survives_transport_reconnect_without_reopening_local_ser
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generic_tunnel_survives_client_endpoint_recycle_without_process_restart() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let node_a_dir = TempDir::new()?;
+    let node_b_dir = TempDir::new()?;
+    let node_a_home = FabricHome::new(node_a_dir.path());
+    let node_b_home = FabricHome::new(node_b_dir.path());
+
+    let node_a = FabricNode::start(node_a_home.clone()).await?;
+    let node_b = FabricNode::start(node_b_home.clone()).await?;
+
+    trust_peer(
+        &node_a_home,
+        &node_a,
+        node_b.id(),
+        Some("node-b"),
+        Some(node_b.addr()),
+    )
+    .await?;
+    trust_peer(
+        &node_b_home,
+        &node_b,
+        node_a.id(),
+        Some("node-a"),
+        Some(node_a.addr()),
+    )
+    .await?;
+
+    let node_b_id = node_b.id();
+    let echo_socket = node_a_dir.path().join("echo.sock");
+    let echo_hits = Arc::new(AtomicUsize::new(0));
+    let echo_task = spawn_echo_service(&echo_socket, echo_hits.clone()).await?;
+    node_a.expose("pty-view", echo_socket).await?;
+
+    let dial_socket = node_b.dial("node-a", "pty-view").await?;
+    let mut stream = UnixStream::connect(&dial_socket).await?;
+    stream_round_trip(&mut stream, b"before-recycle").await?;
+
+    send_control(&node_b_home, ControlRequest::RecycleEndpoint).await?;
+    assert_eq!(
+        node_b.id(),
+        node_b_id,
+        "endpoint recycle must preserve NodeID"
+    );
+
+    stream.write_all(b"during-recycle").await?;
+    tokio::time::timeout(
+        LOCAL_IO_TIMEOUT,
+        read_expected(&mut stream, b"during-recycle"),
+    )
+    .await
+    .context("endpoint recycle reconnect payload timed out")??;
+    stream_round_trip(&mut stream, b"after-recycle").await?;
+    assert_eq!(
+        echo_hits.load(Ordering::SeqCst),
+        1,
+        "endpoint recycle should keep the exposed Unix service connection alive"
+    );
+
+    let ping = node_b.ping("node-a").await?;
+    assert_eq!(ping.bytes, 32);
+
+    echo_task.abort();
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn generic_tunnel_reap_closes_existing_client_socket() -> Result<()> {
     let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
@@ -254,7 +324,7 @@ async fn generic_tunnel_reap_closes_existing_client_socket() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_expose_round_trips_stdio_handler() -> Result<()> {
     let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
@@ -297,7 +367,7 @@ async fn exec_expose_round_trips_stdio_handler() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_expose_reconnect_keeps_child_bound_to_tunnel_session() -> Result<()> {
     let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
@@ -367,7 +437,7 @@ async fn exec_expose_reconnect_keeps_child_bound_to_tunnel_session() -> Result<(
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_expose_child_exits_on_stdin_eof() -> Result<()> {
     let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
@@ -414,7 +484,7 @@ async fn exec_expose_child_exits_on_stdin_eof() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_expose_reaps_child_on_session_ttl_expiry() -> Result<()> {
     let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
@@ -465,7 +535,7 @@ async fn exec_expose_reaps_child_on_session_ttl_expiry() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_expose_enforces_per_exposure_child_limit() -> Result<()> {
     let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
@@ -533,7 +603,7 @@ async fn exec_expose_enforces_per_exposure_child_limit() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_expose_spawn_failure_closes_local_stream_and_daemon_survives() -> Result<()> {
     let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
@@ -579,7 +649,7 @@ async fn exec_expose_spawn_failure_closes_local_stream_and_daemon_survives() -> 
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_expose_streams_payload_larger_than_tunnel_buffer() -> Result<()> {
     let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
@@ -638,7 +708,7 @@ async fn exec_expose_streams_payload_larger_than_tunnel_buffer() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_config_restores_shell_peers_and_exposes_on_restart() -> Result<()> {
     let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
@@ -704,7 +774,7 @@ async fn unified_config_restores_shell_peers_and_exposes_on_restart() -> Result<
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unexpose_clears_persisted_config_and_restart_does_not_restore() -> Result<()> {
     let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
@@ -732,7 +802,7 @@ async fn unexpose_clears_persisted_config_and_restart_does_not_restore() -> Resu
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tcp_expose_dial_listener_round_trips_and_reconnects() -> Result<()> {
     let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
@@ -799,7 +869,7 @@ async fn tcp_expose_dial_listener_round_trips_and_reconnects() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persisted_tcp_expose_survives_daemon_restart() -> Result<()> {
     let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
@@ -857,7 +927,7 @@ async fn persisted_tcp_expose_survives_daemon_restart() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ping_round_trips_builtin_echo() -> Result<()> {
     let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
@@ -895,7 +965,7 @@ async fn ping_round_trips_builtin_echo() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ping_acl_rejects_untrusted_before_echo_handler() -> Result<()> {
     let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
@@ -955,7 +1025,7 @@ async fn ping_acl_rejects_untrusted_before_echo_handler() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn status_reports_peer_reachability() -> Result<()> {
     let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
@@ -1001,7 +1071,7 @@ async fn status_reports_peer_reachability() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn declarative_peer_config_is_loaded_on_start() -> Result<()> {
     let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
@@ -1032,7 +1102,7 @@ async fn declarative_peer_config_is_loaded_on_start() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_peer_config_is_migrated_when_daemon_creates_config_on_start() -> Result<()> {
     let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;

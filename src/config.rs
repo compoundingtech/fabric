@@ -116,6 +116,14 @@ impl FabricHome {
         self.root.join("logs/daemon.log")
     }
 
+    pub fn validation_log_dir(&self) -> PathBuf {
+        self.root.join("logs")
+    }
+
+    pub fn validation_log_prefix(&self) -> &'static str {
+        "validation.log"
+    }
+
     pub fn restart_log_path(&self) -> PathBuf {
         self.root.join("logs/restart.log")
     }
