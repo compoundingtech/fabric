@@ -53,6 +53,8 @@ const MAX_INCOMING_HANDLERS: usize = 32;
 const MAX_DIAL_HANDLERS: usize = 32;
 const ENDPOINT_ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
 const ENDPOINT_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+const ENDPOINT_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const ENDPOINT_HEALTH_POLL_FAILURES_BEFORE_RECYCLE: usize = 2;
 
 #[derive(Debug)]
 struct FailureBackoff {
@@ -187,6 +189,7 @@ pub struct DaemonState {
     tunnel_sessions: tunnel::ServerSessionStore,
     tunnel_drop_tx: watch::Sender<u64>,
     tunnel_blocked: AtomicBool,
+    network_usable: AtomicBool,
     builtin_echo_hits: AtomicUsize,
     allow_shell: bool,
     incoming_failures: Arc<FailureBackoff>,
@@ -387,6 +390,7 @@ impl DaemonState {
             tunnel_sessions,
             tunnel_drop_tx,
             tunnel_blocked: AtomicBool::new(false),
+            network_usable: AtomicBool::new(true),
             builtin_echo_hits: AtomicUsize::new(0),
             allow_shell,
             incoming_failures: FailureBackoff::new(
@@ -924,7 +928,10 @@ impl DaemonState {
             return;
         }
 
-        if self.endpoint_health_recovered(endpoint.clone()).await {
+        if self
+            .endpoint_health_recovered(endpoint.clone(), "network change")
+            .await
+        {
             return;
         }
 
@@ -936,14 +943,14 @@ impl DaemonState {
         }
     }
 
-    async fn endpoint_health_recovered(&self, endpoint: CurrentEndpoint) -> bool {
+    async fn endpoint_health_recovered(&self, endpoint: CurrentEndpoint, context: &str) -> bool {
         if tokio::time::timeout(ENDPOINT_HEALTH_TIMEOUT, endpoint.endpoint.online())
             .await
             .is_ok()
         {
             eprintln!(
-                "fabric: iroh endpoint generation {} is online after network change",
-                endpoint.generation
+                "fabric: iroh endpoint generation {} is online during {context}",
+                endpoint.generation,
             );
             return true;
         }
@@ -954,13 +961,13 @@ impl DaemonState {
 
         tokio::time::timeout(
             ENDPOINT_HEALTH_TIMEOUT,
-            self.any_peer_reachable_on_endpoint(endpoint.endpoint),
+            self.any_peer_reachable_on_endpoint(endpoint.endpoint, context),
         )
         .await
         .unwrap_or(false)
     }
 
-    async fn any_peer_reachable_on_endpoint(&self, endpoint: Endpoint) -> bool {
+    async fn any_peer_reachable_on_endpoint(&self, endpoint: Endpoint, context: &str) -> bool {
         let peers = self.peer_book.read().await.peers().to_vec();
         for peer in peers {
             let addr = peer
@@ -974,7 +981,7 @@ impl DaemonState {
             )
             .await;
             if matches!(result, Ok(Ok(_))) {
-                eprintln!("fabric: peer {label:?} reachable after network change");
+                eprintln!("fabric: peer {label:?} reachable during {context}");
                 return true;
             }
         }
@@ -1183,6 +1190,7 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
         result = run_control_socket(control_listener, state.clone()) => result?,
         result = run_iroh_accept_loop(state.clone()) => result?,
         result = run_network_rehome_loop(state.clone()) => result?,
+        result = run_endpoint_health_poll_loop(state.clone()) => result?,
         _ = state.cancel.cancelled() => {}
     }
 
@@ -1216,6 +1224,7 @@ async fn run_network_rehome_loop(state: Arc<DaemonState>) -> Result<()> {
                 };
                 let network_usable = network_state.default_route_interface.is_some()
                     && (network_state.have_v4 || network_state.have_v6);
+                state.network_usable.store(network_usable, Ordering::SeqCst);
                 let reason = format!(
                     "default_route={:?} have_v4={} have_v6={} unsuspend={}",
                     network_state.default_route_interface,
@@ -1224,6 +1233,62 @@ async fn run_network_rehome_loop(state: Arc<DaemonState>) -> Result<()> {
                     network_state.last_unsuspend.is_some()
                 );
                 state.rehome_after_network_change(&reason, network_usable).await;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_endpoint_health_poll_loop(state: Arc<DaemonState>) -> Result<()> {
+    let mut interval = tokio::time::interval(ENDPOINT_HEALTH_POLL_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.tick().await;
+    let mut consecutive_failures = 0usize;
+
+    loop {
+        tokio::select! {
+            _ = state.cancel.cancelled() => break,
+            _ = interval.tick() => {
+                if !state.network_usable.load(Ordering::SeqCst) {
+                    consecutive_failures = 0;
+                    continue;
+                }
+
+                let endpoint = state.endpoint_handle();
+                if state
+                    .endpoint_health_recovered(endpoint.clone(), "periodic health poll")
+                    .await
+                {
+                    consecutive_failures = 0;
+                    continue;
+                }
+
+                if state.endpoint_handle().generation != endpoint.generation {
+                    consecutive_failures = 0;
+                    continue;
+                }
+
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                eprintln!(
+                    "fabric: iroh endpoint generation {} failed health poll ({}/{})",
+                    endpoint.generation,
+                    consecutive_failures,
+                    ENDPOINT_HEALTH_POLL_FAILURES_BEFORE_RECYCLE,
+                );
+
+                if consecutive_failures >= ENDPOINT_HEALTH_POLL_FAILURES_BEFORE_RECYCLE {
+                    if let Err(error) = state
+                        .recycle_endpoint_if_generation(
+                            endpoint.generation,
+                            "periodic health poll did not recover",
+                        )
+                        .await
+                    {
+                        eprintln!("fabric: failed to recycle iroh endpoint after health poll: {error:#}");
+                    }
+                    consecutive_failures = 0;
+                }
             }
         }
     }
