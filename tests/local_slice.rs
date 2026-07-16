@@ -195,6 +195,74 @@ async fn generic_tunnel_survives_transport_reconnect_without_reopening_local_ser
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn generic_tunnel_survives_client_endpoint_recycle_without_process_restart() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let node_a_dir = TempDir::new()?;
+    let node_b_dir = TempDir::new()?;
+    let node_a_home = FabricHome::new(node_a_dir.path());
+    let node_b_home = FabricHome::new(node_b_dir.path());
+
+    let node_a = FabricNode::start(node_a_home.clone()).await?;
+    let node_b = FabricNode::start(node_b_home.clone()).await?;
+
+    trust_peer(
+        &node_a_home,
+        &node_a,
+        node_b.id(),
+        Some("node-b"),
+        Some(node_b.addr()),
+    )
+    .await?;
+    trust_peer(
+        &node_b_home,
+        &node_b,
+        node_a.id(),
+        Some("node-a"),
+        Some(node_a.addr()),
+    )
+    .await?;
+
+    let node_b_id = node_b.id();
+    let echo_socket = node_a_dir.path().join("echo.sock");
+    let echo_hits = Arc::new(AtomicUsize::new(0));
+    let echo_task = spawn_echo_service(&echo_socket, echo_hits.clone()).await?;
+    node_a.expose("pty-view", echo_socket).await?;
+
+    let dial_socket = node_b.dial("node-a", "pty-view").await?;
+    let mut stream = UnixStream::connect(&dial_socket).await?;
+    stream_round_trip(&mut stream, b"before-recycle").await?;
+
+    send_control(&node_b_home, ControlRequest::RecycleEndpoint).await?;
+    assert_eq!(
+        node_b.id(),
+        node_b_id,
+        "endpoint recycle must preserve NodeID"
+    );
+
+    stream.write_all(b"during-recycle").await?;
+    tokio::time::timeout(
+        LOCAL_IO_TIMEOUT,
+        read_expected(&mut stream, b"during-recycle"),
+    )
+    .await
+    .context("endpoint recycle reconnect payload timed out")??;
+    stream_round_trip(&mut stream, b"after-recycle").await?;
+    assert_eq!(
+        echo_hits.load(Ordering::SeqCst),
+        1,
+        "endpoint recycle should keep the exposed Unix service connection alive"
+    );
+
+    let ping = node_b.ping("node-a").await?;
+    assert_eq!(ping.bytes, 32);
+
+    echo_task.abort();
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn generic_tunnel_reap_closes_existing_client_socket() -> Result<()> {
     let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;

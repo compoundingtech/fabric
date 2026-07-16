@@ -23,6 +23,7 @@ use iroh::{
         TransportAddrUsage, VarInt, presets,
     },
 };
+use n0_watcher::Watcher as _;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, UnixListener, UnixStream},
@@ -50,6 +51,8 @@ const DIAL_FAILURE_MAX_BACKOFF: Duration = Duration::from_secs(15);
 const FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_INCOMING_HANDLERS: usize = 32;
 const MAX_DIAL_HANDLERS: usize = 32;
+const ENDPOINT_ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
+const ENDPOINT_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 struct FailureBackoff {
@@ -174,7 +177,8 @@ impl EndpointHooks for AllowListHook {
 #[derive(Debug)]
 pub struct DaemonState {
     home: FabricHome,
-    endpoint: Endpoint,
+    endpoint_tx: watch::Sender<CurrentEndpoint>,
+    endpoint_recycle: Mutex<()>,
     peer_book: RwLock<PeerBook>,
     allowed: Arc<RwLock<HashSet<EndpointId>>>,
     exposures: RwLock<HashMap<Vec<u8>, Exposure>>,
@@ -190,6 +194,12 @@ pub struct DaemonState {
     incoming_slots: Arc<Semaphore>,
     dial_slots: Arc<Semaphore>,
     cancel: CancellationToken,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CurrentEndpoint {
+    pub(crate) generation: u64,
+    pub(crate) endpoint: Endpoint,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -322,6 +332,22 @@ fn resolve_server_session_settings(
     ))
 }
 
+async fn build_daemon_endpoint(
+    home: &FabricHome,
+    allowed: Arc<RwLock<HashSet<EndpointId>>>,
+    exposures: &HashMap<Vec<u8>, Exposure>,
+) -> Result<Endpoint> {
+    let secret_key = load_or_create_identity(home)?;
+    let endpoint = Endpoint::builder(presets::N0)
+        .secret_key(secret_key)
+        .alpns(accepted_alpns(exposures))
+        .hooks(AllowListHook { allowed })
+        .bind()
+        .await?;
+    let _ = tokio::time::timeout(ENDPOINT_ONLINE_TIMEOUT, endpoint.online()).await;
+    Ok(endpoint)
+}
+
 impl DaemonState {
     async fn new(
         home: FabricHome,
@@ -329,7 +355,6 @@ impl DaemonState {
         options: DaemonOptions,
     ) -> Result<Arc<Self>> {
         home.prepare()?;
-        let secret_key = load_or_create_identity(&home)?;
         if options.allow_shell {
             set_config_allow_shell(&home, true)?;
         }
@@ -340,16 +365,11 @@ impl DaemonState {
         let peer_book = PeerBook::load(&home)?;
         let exposures = load_persisted_exposures(&home)?;
         let allowed = Arc::new(RwLock::new(peer_book.trusted_ids()));
-        let endpoint = Endpoint::builder(presets::N0)
-            .secret_key(secret_key)
-            .alpns(accepted_alpns(&exposures))
-            .hooks(AllowListHook {
-                allowed: allowed.clone(),
-            })
-            .bind()
-            .await?;
-
-        let _ = tokio::time::timeout(Duration::from_secs(5), endpoint.online()).await;
+        let endpoint = build_daemon_endpoint(&home, allowed.clone(), &exposures).await?;
+        let (endpoint_tx, _) = watch::channel(CurrentEndpoint {
+            generation: 0,
+            endpoint,
+        });
         let (tunnel_drop_tx, _) = watch::channel(0);
         let tunnel_sessions =
             tunnel::ServerSessionStore::new(tunnel_session_limits, tunnel_session_detached_ttl);
@@ -357,7 +377,8 @@ impl DaemonState {
 
         Ok(Arc::new(Self {
             home,
-            endpoint,
+            endpoint_tx,
+            endpoint_recycle: Mutex::new(()),
             peer_book: RwLock::new(peer_book),
             allowed,
             exposures: RwLock::new(exposures),
@@ -384,12 +405,24 @@ impl DaemonState {
         }))
     }
 
+    fn endpoint_handle(&self) -> CurrentEndpoint {
+        self.endpoint_tx.borrow().clone()
+    }
+
+    fn current_endpoint(&self) -> Endpoint {
+        self.endpoint_handle().endpoint
+    }
+
+    fn endpoint_rx(&self) -> watch::Receiver<CurrentEndpoint> {
+        self.endpoint_tx.subscribe()
+    }
+
     pub fn id(&self) -> EndpointId {
-        self.endpoint.id()
+        self.current_endpoint().id()
     }
 
     pub fn addr(&self) -> EndpointAddr {
-        self.endpoint.addr()
+        self.current_endpoint().addr()
     }
 
     pub async fn reload_peers(&self) -> Result<()> {
@@ -423,7 +456,8 @@ impl DaemonState {
 
         let mut exposures = self.exposures.write().await;
         exposures.insert(alpn, Exposure::Socket(socket));
-        self.endpoint.set_alpns(accepted_alpns(&exposures));
+        self.current_endpoint()
+            .set_alpns(accepted_alpns(&exposures));
         Ok(())
     }
 
@@ -451,7 +485,8 @@ impl DaemonState {
 
         let mut exposures = self.exposures.write().await;
         exposures.insert(alpn, Exposure::Tcp { addr });
-        self.endpoint.set_alpns(accepted_alpns(&exposures));
+        self.current_endpoint()
+            .set_alpns(accepted_alpns(&exposures));
         Ok(())
     }
 
@@ -501,7 +536,8 @@ impl DaemonState {
                 limit: tunnel::ExecLimit::new(max_children),
             },
         );
-        self.endpoint.set_alpns(accepted_alpns(&exposures));
+        self.current_endpoint()
+            .set_alpns(accepted_alpns(&exposures));
         Ok(())
     }
 
@@ -536,7 +572,8 @@ impl DaemonState {
 
         let mut exposures = self.exposures.write().await;
         exposures.remove(&alpn);
-        self.endpoint.set_alpns(accepted_alpns(&exposures));
+        self.current_endpoint()
+            .set_alpns(accepted_alpns(&exposures));
         Ok(())
     }
 
@@ -550,10 +587,19 @@ impl DaemonState {
     }
 
     async fn ping_addr(&self, peer: &str, peer_addr: EndpointAddr) -> Result<PingOutcome> {
+        let endpoint = self.current_endpoint();
+        self.ping_addr_on_endpoint(endpoint, peer, peer_addr).await
+    }
+
+    async fn ping_addr_on_endpoint(
+        &self,
+        endpoint: Endpoint,
+        peer: &str,
+        peer_addr: EndpointAddr,
+    ) -> Result<PingOutcome> {
         let nonce = rand::random::<[u8; 32]>();
         let started = std::time::Instant::now();
-        let connection = self
-            .endpoint
+        let connection = endpoint
             .connect(peer_addr.clone(), BUILTIN_ECHO_ALPN)
             .await
             .with_context(|| format!("failed to connect to {peer:?} built-in echo"))?;
@@ -566,7 +612,7 @@ impl DaemonState {
         let round_trip = started.elapsed();
         let mut transport = classify_connection_transport(&connection);
         if transport.is_none()
-            && let Some(info) = self.endpoint.remote_info(peer_addr.id).await
+            && let Some(info) = endpoint.remote_info(peer_addr.id).await
         {
             transport = classify_remote_transport(&info);
         }
@@ -617,7 +663,7 @@ impl DaemonState {
 
         tokio::spawn(run_dial_tcp_listener(
             listener,
-            self.endpoint.clone(),
+            self.endpoint_rx(),
             self.home.clone(),
             peer.to_string(),
             alpn,
@@ -671,7 +717,7 @@ impl DaemonState {
         if alpn == shell::SHELL_ALPN {
             tokio::spawn(run_raw_dial_socket(
                 listener,
-                self.endpoint.clone(),
+                self.endpoint_rx(),
                 peer_addr,
                 alpn,
                 self.cancel.clone(),
@@ -681,7 +727,7 @@ impl DaemonState {
         } else {
             tokio::spawn(run_dial_socket(
                 listener,
-                self.endpoint.clone(),
+                self.endpoint_rx(),
                 self.home.clone(),
                 peer.to_string(),
                 alpn,
@@ -862,6 +908,123 @@ impl DaemonState {
         let _ = self.tunnel_drop_tx.send(current.wrapping_add(1));
     }
 
+    async fn rehome_after_network_change(&self, reason: &str, network_usable: bool) {
+        let endpoint = self.endpoint_handle();
+        eprintln!(
+            "fabric: network change detected ({reason}); notifying iroh endpoint generation {}",
+            endpoint.generation
+        );
+        endpoint.endpoint.network_change().await;
+        self.drop_tunnel_connections();
+
+        if !network_usable {
+            eprintln!(
+                "fabric: network has no usable default route yet; deferring endpoint health check"
+            );
+            return;
+        }
+
+        if self.endpoint_health_recovered(endpoint.clone()).await {
+            return;
+        }
+
+        if let Err(error) = self
+            .recycle_endpoint_if_generation(endpoint.generation, "network health did not recover")
+            .await
+        {
+            eprintln!("fabric: failed to recycle iroh endpoint after network change: {error:#}");
+        }
+    }
+
+    async fn endpoint_health_recovered(&self, endpoint: CurrentEndpoint) -> bool {
+        if tokio::time::timeout(ENDPOINT_HEALTH_TIMEOUT, endpoint.endpoint.online())
+            .await
+            .is_ok()
+        {
+            eprintln!(
+                "fabric: iroh endpoint generation {} is online after network change",
+                endpoint.generation
+            );
+            return true;
+        }
+
+        if self.endpoint_handle().generation != endpoint.generation {
+            return true;
+        }
+
+        tokio::time::timeout(
+            ENDPOINT_HEALTH_TIMEOUT,
+            self.any_peer_reachable_on_endpoint(endpoint.endpoint),
+        )
+        .await
+        .unwrap_or(false)
+    }
+
+    async fn any_peer_reachable_on_endpoint(&self, endpoint: Endpoint) -> bool {
+        let peers = self.peer_book.read().await.peers().to_vec();
+        for peer in peers {
+            let addr = peer
+                .addr
+                .clone()
+                .unwrap_or_else(|| EndpointAddr::new(peer.id));
+            let label = peer.name.clone().unwrap_or_else(|| peer.id.to_string());
+            let result = tokio::time::timeout(
+                REACHABILITY_TIMEOUT,
+                self.ping_addr_on_endpoint(endpoint.clone(), &label, addr),
+            )
+            .await;
+            if matches!(result, Ok(Ok(_))) {
+                eprintln!("fabric: peer {label:?} reachable after network change");
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn recycle_endpoint_if_generation(
+        &self,
+        expected_generation: u64,
+        reason: &str,
+    ) -> Result<()> {
+        let _guard = self.endpoint_recycle.lock().await;
+        let old = self.endpoint_handle();
+        if old.generation != expected_generation {
+            return Ok(());
+        }
+
+        let exposures = self.exposures.read().await;
+        let new_endpoint =
+            build_daemon_endpoint(&self.home, self.allowed.clone(), &exposures).await?;
+        drop(exposures);
+
+        if new_endpoint.id() != old.endpoint.id() {
+            bail!(
+                "rebuilt endpoint id {} did not match previous id {}",
+                new_endpoint.id(),
+                old.endpoint.id()
+            );
+        }
+
+        let new_generation = old.generation.wrapping_add(1);
+        self.endpoint_tx.send_replace(CurrentEndpoint {
+            generation: new_generation,
+            endpoint: new_endpoint,
+        });
+        self.drop_tunnel_connections();
+        old.endpoint.close().await;
+        eprintln!(
+            "fabric: recycled iroh endpoint generation {} -> {} ({reason})",
+            old.generation, new_generation
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn force_endpoint_recycle(&self, reason: &str) -> Result<()> {
+        let generation = self.endpoint_handle().generation;
+        self.recycle_endpoint_if_generation(generation, reason)
+            .await
+    }
+
     fn set_tunnel_blocked(&self, blocked: bool) {
         self.tunnel_blocked.store(blocked, Ordering::SeqCst);
     }
@@ -1019,15 +1182,52 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
     tokio::select! {
         result = run_control_socket(control_listener, state.clone()) => result?,
         result = run_iroh_accept_loop(state.clone()) => result?,
+        result = run_network_rehome_loop(state.clone()) => result?,
         _ = state.cancel.cancelled() => {}
     }
 
     state.cancel.cancel();
-    state.endpoint.close().await;
+    state.current_endpoint().close().await;
     let _ = fs::remove_file(control_path);
     for socket in state.dial_sockets.lock().await.values() {
         let _ = fs::remove_file(&socket.path);
     }
+    Ok(())
+}
+
+async fn run_network_rehome_loop(state: Arc<DaemonState>) -> Result<()> {
+    let monitor = match netwatch::netmon::Monitor::new().await {
+        Ok(monitor) => monitor,
+        Err(error) => {
+            eprintln!("fabric: network monitor unavailable; roaming rehome disabled: {error:#}");
+            state.cancel.cancelled().await;
+            return Ok(());
+        }
+    };
+    let mut interfaces = monitor.interface_state();
+
+    loop {
+        tokio::select! {
+            _ = state.cancel.cancelled() => break,
+            update = interfaces.updated() => {
+                let Ok(network_state) = update else {
+                    eprintln!("fabric: network monitor stopped; roaming rehome disabled");
+                    break;
+                };
+                let network_usable = network_state.default_route_interface.is_some()
+                    && (network_state.have_v4 || network_state.have_v6);
+                let reason = format!(
+                    "default_route={:?} have_v4={} have_v6={} unsuspend={}",
+                    network_state.default_route_interface,
+                    network_state.have_v4,
+                    network_state.have_v6,
+                    network_state.last_unsuspend.is_some()
+                );
+                state.rehome_after_network_change(&reason, network_usable).await;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1168,6 +1368,10 @@ async fn process_control_request(
                 .await;
             ControlResponse::Ok
         }
+        ControlRequest::RecycleEndpoint => {
+            state.force_endpoint_recycle("debug request").await?;
+            ControlResponse::Ok
+        }
         ControlRequest::Restart { allow_shell } => {
             let restart = state.schedule_restart(allow_shell)?;
             ControlResponse::Restarting {
@@ -1184,10 +1388,12 @@ async fn process_control_request(
 }
 
 async fn run_iroh_accept_loop(state: Arc<DaemonState>) -> Result<()> {
+    let mut endpoint_rx = state.endpoint_rx();
     loop {
         if !state.incoming_failures.wait(&state.cancel).await {
             break;
         }
+        let endpoint = endpoint_rx.borrow().clone();
         let permit = tokio::select! {
             _ = state.cancel.cancelled() => break,
             permit = state.incoming_slots.clone().acquire_owned() => {
@@ -1196,8 +1402,17 @@ async fn run_iroh_accept_loop(state: Arc<DaemonState>) -> Result<()> {
         };
         tokio::select! {
             _ = state.cancel.cancelled() => break,
-            incoming = state.endpoint.accept() => {
+            changed = endpoint_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+            }
+            incoming = endpoint.endpoint.accept() => {
                 let Some(incoming) = incoming else {
+                    if endpoint_rx.has_changed().unwrap_or(false) {
+                        let _ = endpoint_rx.changed().await;
+                        continue;
+                    }
                     break;
                 };
                 tokio::spawn(handle_incoming_iroh(incoming, state.clone(), permit));
@@ -1346,7 +1561,7 @@ fn classify_transport(has_ip: bool, has_relay: bool) -> Option<String> {
 
 async fn run_dial_socket(
     listener: UnixListener,
-    endpoint: Endpoint,
+    endpoint_rx: watch::Receiver<CurrentEndpoint>,
     home: FabricHome,
     peer: String,
     alpn: Vec<u8>,
@@ -1371,7 +1586,7 @@ async fn run_dial_socket(
                         permit
                     }
                 };
-                let endpoint = endpoint.clone();
+                let endpoint_rx = endpoint_rx.clone();
                 let home = home.clone();
                 let peer = peer.clone();
                 let alpn = alpn.clone();
@@ -1384,7 +1599,7 @@ async fn run_dial_socket(
                         return;
                     }
                     match
-                        tunnel::run_client_connection(local, endpoint, home, peer, alpn, cancel, drop_rx)
+                        tunnel::run_client_connection(local, endpoint_rx, home, peer, alpn, cancel, drop_rx)
                             .await
                     {
                         Ok(()) => dial_failures.record_success().await,
@@ -1402,7 +1617,7 @@ async fn run_dial_socket(
 
 async fn run_dial_tcp_listener(
     listener: TcpListener,
-    endpoint: Endpoint,
+    endpoint_rx: watch::Receiver<CurrentEndpoint>,
     home: FabricHome,
     peer: String,
     alpn: Vec<u8>,
@@ -1427,7 +1642,7 @@ async fn run_dial_tcp_listener(
                         permit
                     }
                 };
-                let endpoint = endpoint.clone();
+                let endpoint_rx = endpoint_rx.clone();
                 let home = home.clone();
                 let peer = peer.clone();
                 let alpn = alpn.clone();
@@ -1440,7 +1655,7 @@ async fn run_dial_tcp_listener(
                         return;
                     }
                     match
-                        tunnel::run_client_tcp_connection(local, endpoint, home, peer, alpn, cancel, drop_rx)
+                        tunnel::run_client_tcp_connection(local, endpoint_rx, home, peer, alpn, cancel, drop_rx)
                             .await
                     {
                         Ok(()) => dial_failures.record_success().await,
@@ -1458,7 +1673,7 @@ async fn run_dial_tcp_listener(
 
 async fn run_raw_dial_socket(
     listener: UnixListener,
-    endpoint: Endpoint,
+    endpoint_rx: watch::Receiver<CurrentEndpoint>,
     peer_addr: EndpointAddr,
     alpn: Vec<u8>,
     cancel: CancellationToken,
@@ -1481,7 +1696,7 @@ async fn run_raw_dial_socket(
                         permit
                     }
                 };
-                let endpoint = endpoint.clone();
+                let endpoint = endpoint_rx.borrow().endpoint.clone();
                 let peer_addr = peer_addr.clone();
                 let alpn = alpn.clone();
                 let cancel = cancel.clone();

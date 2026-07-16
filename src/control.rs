@@ -52,6 +52,7 @@ pub enum ControlRequest {
     ReapTunnelSessions {
         ttl_millis: u64,
     },
+    RecycleEndpoint,
     Restart {
         allow_shell: Option<bool>,
     },

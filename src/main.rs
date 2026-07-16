@@ -182,6 +182,8 @@ enum DebugCommands {
         #[arg(long, default_value_t = 0)]
         ttl_ms: u64,
     },
+    /// Rebuild the daemon's iroh endpoint in-process.
+    RecycleEndpoint,
     /// Run a foreground Unix-socket echo service.
     Echo {
         #[arg(long)]
@@ -427,6 +429,10 @@ async fn main() -> Result<()> {
                         )
                         .await?;
                         println!("reaped tunnel sessions");
+                    }
+                    DebugCommands::RecycleEndpoint => {
+                        send_control(&home, ControlRequest::RecycleEndpoint).await?;
+                        println!("recycled endpoint");
                     }
                     DebugCommands::Echo { socket } => {
                         run_debug_echo(socket).await?;
