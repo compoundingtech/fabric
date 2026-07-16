@@ -1233,6 +1233,11 @@ impl DaemonState {
         }
 
         let rss_bytes = current_rss_bytes();
+        let server_sessions = self.tunnel_sessions.stats().await;
+        let active_incoming_handlers =
+            MAX_INCOMING_HANDLERS.saturating_sub(self.incoming_slots.available_permits());
+        let active_dial_handlers =
+            MAX_DIAL_HANDLERS.saturating_sub(self.dial_slots.available_permits());
         info!(
             target: VALIDATION_LOG_TARGET,
             event = "endpoint_snapshot",
@@ -1256,6 +1261,21 @@ impl DaemonState {
             netwatch_loopback_addr_count = interfaces.netwatch_loopback_addr_count,
             netwatch_up_interfaces = %interfaces.up_interfaces,
             netwatch_regular_addrs = %interfaces.netwatch_regular_addrs,
+            tunnel_server_sessions_total = server_sessions.total_sessions,
+            tunnel_server_sessions_active = server_sessions.active_sessions,
+            tunnel_server_sessions_detached = server_sessions.detached_sessions,
+            tunnel_server_sessions_complete = server_sessions.complete_sessions,
+            tunnel_server_sessions_done = server_sessions.done_sessions,
+            tunnel_server_active_attaches = server_sessions.active_attaches,
+            tunnel_server_buffered_bytes = server_sessions.buffered_bytes,
+            tunnel_server_buffered_chunks = server_sessions.buffered_chunks,
+            tunnel_server_sessions_with_buffered_data = server_sessions.sessions_with_buffered_data,
+            tunnel_server_sessions_with_cleanup = server_sessions.sessions_with_cleanup,
+            tunnel_server_sessions_with_reconnect_error = server_sessions.sessions_with_reconnect_error,
+            tunnel_server_sessions_with_pending_remote_close = server_sessions.sessions_with_pending_remote_close,
+            tunnel_server_reconnect_attempts_total = server_sessions.reconnect_attempts_total,
+            active_incoming_handlers,
+            active_dial_handlers,
             "endpoint diagnostic snapshot"
         );
     }
@@ -1773,6 +1793,7 @@ async fn run_endpoint_rss_recycle_loop_with_sampler(
                     bytes_to_mib(threshold_bytes),
                 );
 
+                let server_sessions_before = state.tunnel_sessions.stats().await;
                 match state
                     .recycle_endpoint_if_generation(endpoint.generation, "rss threshold exceeded")
                     .await
@@ -1784,6 +1805,7 @@ async fn run_endpoint_rss_recycle_loop_with_sampler(
                         };
 
                         if rss_exceeds_recycle_threshold(settled_rss, threshold_bytes) {
+                            let server_sessions_after = state.tunnel_sessions.stats().await;
                             ineffective_recycles = ineffective_recycles.saturating_add(1);
                             let backoff = endpoint_rss_ineffective_backoff(
                                 ineffective_recycles,
@@ -1802,6 +1824,32 @@ async fn run_endpoint_rss_recycle_loop_with_sampler(
                                 settle_ms = settle_interval.as_millis() as u64,
                                 ineffective_recycles,
                                 backoff_ms = backoff.as_millis() as u64,
+                                tunnel_server_sessions_total_before = server_sessions_before.total_sessions,
+                                tunnel_server_sessions_total_after = server_sessions_after.total_sessions,
+                                tunnel_server_sessions_active_before = server_sessions_before.active_sessions,
+                                tunnel_server_sessions_active_after = server_sessions_after.active_sessions,
+                                tunnel_server_sessions_detached_before = server_sessions_before.detached_sessions,
+                                tunnel_server_sessions_detached_after = server_sessions_after.detached_sessions,
+                                tunnel_server_sessions_complete_before = server_sessions_before.complete_sessions,
+                                tunnel_server_sessions_complete_after = server_sessions_after.complete_sessions,
+                                tunnel_server_sessions_done_before = server_sessions_before.done_sessions,
+                                tunnel_server_sessions_done_after = server_sessions_after.done_sessions,
+                                tunnel_server_active_attaches_before = server_sessions_before.active_attaches,
+                                tunnel_server_active_attaches_after = server_sessions_after.active_attaches,
+                                tunnel_server_buffered_bytes_before = server_sessions_before.buffered_bytes,
+                                tunnel_server_buffered_bytes_after = server_sessions_after.buffered_bytes,
+                                tunnel_server_buffered_chunks_before = server_sessions_before.buffered_chunks,
+                                tunnel_server_buffered_chunks_after = server_sessions_after.buffered_chunks,
+                                tunnel_server_sessions_with_buffered_data_before = server_sessions_before.sessions_with_buffered_data,
+                                tunnel_server_sessions_with_buffered_data_after = server_sessions_after.sessions_with_buffered_data,
+                                tunnel_server_sessions_with_cleanup_before = server_sessions_before.sessions_with_cleanup,
+                                tunnel_server_sessions_with_cleanup_after = server_sessions_after.sessions_with_cleanup,
+                                tunnel_server_sessions_with_reconnect_error_before = server_sessions_before.sessions_with_reconnect_error,
+                                tunnel_server_sessions_with_reconnect_error_after = server_sessions_after.sessions_with_reconnect_error,
+                                tunnel_server_sessions_with_pending_remote_close_before = server_sessions_before.sessions_with_pending_remote_close,
+                                tunnel_server_sessions_with_pending_remote_close_after = server_sessions_after.sessions_with_pending_remote_close,
+                                tunnel_server_reconnect_attempts_total_before = server_sessions_before.reconnect_attempts_total,
+                                tunnel_server_reconnect_attempts_total_after = server_sessions_after.reconnect_attempts_total,
                                 "RSS-triggered endpoint recycle did not reduce RSS below threshold; backing off"
                             );
                             eprintln!(

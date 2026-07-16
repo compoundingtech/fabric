@@ -202,6 +202,37 @@ pub struct TunnelSession {
     done: CancellationToken,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ServerSessionStats {
+    pub total_sessions: usize,
+    pub active_sessions: usize,
+    pub detached_sessions: usize,
+    pub complete_sessions: usize,
+    pub done_sessions: usize,
+    pub active_attaches: usize,
+    pub buffered_bytes: usize,
+    pub buffered_chunks: usize,
+    pub sessions_with_buffered_data: usize,
+    pub sessions_with_cleanup: usize,
+    pub sessions_with_reconnect_error: usize,
+    pub sessions_with_pending_remote_close: usize,
+    pub reconnect_attempts_total: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TunnelSessionStats {
+    active_attaches: usize,
+    detached: bool,
+    complete: bool,
+    done: bool,
+    buffered_bytes: usize,
+    buffered_chunks: usize,
+    has_cleanup: bool,
+    reconnect_attempts: u64,
+    has_reconnect_error: bool,
+    has_pending_remote_close: bool,
+}
+
 #[derive(Debug)]
 struct SessionCleanup {
     kill: CancellationToken,
@@ -304,6 +335,36 @@ impl TunnelSession {
             && state.remote_closed
             && state.send_buffer.is_empty()
             && state.send_acked >= state.send_next
+    }
+
+    async fn stats(&self) -> TunnelSessionStats {
+        let state = self.state.lock().await;
+        let complete = state.send_closed.is_some()
+            && state.remote_closed
+            && state.send_buffer.is_empty()
+            && state.send_acked >= state.send_next;
+        let active_attaches = state.active_attaches;
+        let detached =
+            active_attaches == 0 && state.last_detached.is_some() && !self.done.is_cancelled();
+        let buffered_bytes = state.buffered_bytes;
+        let buffered_chunks = state.send_buffer.len();
+        let reconnect_attempts = state.reconnect_attempts;
+        let has_reconnect_error = state.last_error.is_some();
+        let has_pending_remote_close = state.pending_remote_close.is_some();
+        drop(state);
+
+        TunnelSessionStats {
+            active_attaches,
+            detached,
+            complete,
+            done: self.done.is_cancelled(),
+            buffered_bytes,
+            buffered_chunks,
+            has_cleanup: self.cleanup.lock().await.is_some(),
+            reconnect_attempts,
+            has_reconnect_error,
+            has_pending_remote_close,
+        }
     }
 
     async fn detached_at(&self) -> Option<Instant> {
@@ -1038,6 +1099,31 @@ impl ServerSessionStore {
         expired
     }
 
+    pub async fn stats(&self) -> ServerSessionStats {
+        let current: Vec<Arc<TunnelSession>> = self.inner.lock().await.values().cloned().collect();
+        let mut stats = ServerSessionStats {
+            total_sessions: current.len(),
+            ..ServerSessionStats::default()
+        };
+        for session in current {
+            let session_stats = session.stats().await;
+            stats.active_attaches += session_stats.active_attaches;
+            stats.active_sessions += usize::from(session_stats.active_attaches > 0);
+            stats.detached_sessions += usize::from(session_stats.detached);
+            stats.complete_sessions += usize::from(session_stats.complete);
+            stats.done_sessions += usize::from(session_stats.done);
+            stats.buffered_bytes += session_stats.buffered_bytes;
+            stats.buffered_chunks += session_stats.buffered_chunks;
+            stats.sessions_with_buffered_data += usize::from(session_stats.buffered_bytes > 0);
+            stats.sessions_with_cleanup += usize::from(session_stats.has_cleanup);
+            stats.sessions_with_reconnect_error += usize::from(session_stats.has_reconnect_error);
+            stats.sessions_with_pending_remote_close +=
+                usize::from(session_stats.has_pending_remote_close);
+            stats.reconnect_attempts_total += session_stats.reconnect_attempts;
+        }
+        stats
+    }
+
     #[cfg(test)]
     async fn len(&self) -> usize {
         self.inner.lock().await.len()
@@ -1475,6 +1561,39 @@ mod tests {
     async fn mark_detached(session: &TunnelSession) {
         session.begin_attach().await.unwrap();
         session.end_attach().await;
+    }
+
+    #[tokio::test]
+    async fn server_session_store_stats_counts_retained_session_state() {
+        let store = store(4, 4);
+        let peer = peer_id();
+
+        let active = test_session(session_id(1), peer);
+        active.begin_attach().await.unwrap();
+        active.push_local_data(vec![1, 2, 3, 4]).await;
+        active
+            .record_reconnect_attempt(Some("attach failed".to_string()))
+            .await;
+        store.insert_created(active).await.unwrap();
+
+        let kill = CancellationToken::new();
+        let detached = test_session_with_cleanup(session_id(2), peer, kill);
+        mark_detached(&detached).await;
+        detached.push_local_data(vec![5, 6]).await;
+        store.insert_created(detached).await.unwrap();
+
+        let stats = store.stats().await;
+
+        assert_eq!(stats.total_sessions, 2);
+        assert_eq!(stats.active_sessions, 1);
+        assert_eq!(stats.detached_sessions, 1);
+        assert_eq!(stats.active_attaches, 1);
+        assert_eq!(stats.buffered_bytes, 6);
+        assert_eq!(stats.buffered_chunks, 2);
+        assert_eq!(stats.sessions_with_buffered_data, 2);
+        assert_eq!(stats.sessions_with_cleanup, 1);
+        assert_eq!(stats.sessions_with_reconnect_error, 1);
+        assert_eq!(stats.reconnect_attempts_total, 1);
     }
 
     #[tokio::test]
