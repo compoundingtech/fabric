@@ -902,7 +902,7 @@ async fn connect_and_attach(
         .connect(peer_addr, alpn)
         .await
         .with_context(|| "failed to reconnect tunnel")?;
-    attach_drop_closer(connection.clone(), drop_rx);
+    attach_drop_closer(&connection, drop_rx);
     let (mut send, mut recv) = connection.open_bi().await?;
 
     write_frame(
@@ -1190,7 +1190,7 @@ pub async fn serve_connection(
     sessions: ServerSessionStore,
     drop_rx: watch::Receiver<u64>,
 ) -> Result<()> {
-    attach_drop_closer(connection, drop_rx);
+    attach_drop_closer(&connection, drop_rx);
     let Some(Frame::Hello {
         session_id,
         recv_next,
@@ -1207,14 +1207,7 @@ pub async fn serve_connection(
         Ok(admission) => admission,
         Err(error) => {
             let expired_resume = error.downcast_ref::<ExpiredResumeError>().is_some();
-            let _ = write_frame(
-                &mut send,
-                Frame::Error {
-                    message: format!("{error:#}"),
-                },
-            )
-            .await;
-            let _ = send.finish();
+            send_tunnel_error(&connection, &mut send, format!("{error:#}")).await;
             if expired_resume {
                 return Ok(());
             }
@@ -1259,6 +1252,19 @@ fn is_expected_detach(error: &anyhow::Error) -> bool {
     error.contains("connection lost: closed")
         || error.contains("tunnel attach stream closed")
         || error.contains("closed: closed")
+}
+
+async fn send_tunnel_error(connection: &Connection, send: &mut SendStream, message: String) {
+    if write_frame(send, Frame::Error { message }).await.is_err() {
+        return;
+    }
+    let _ = send.finish();
+    let stopped = send.stopped();
+    tokio::select! {
+        _ = stopped => {}
+        _ = connection.closed() => {}
+        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+    }
 }
 
 async fn create_server_session(
@@ -1384,10 +1390,19 @@ async fn log_child_stderr(session_id: TunnelSessionId, label: String, mut stderr
     }
 }
 
-fn attach_drop_closer(connection: Connection, mut drop_rx: watch::Receiver<u64>) {
+fn attach_drop_closer(connection: &Connection, mut drop_rx: watch::Receiver<u64>) {
+    let weak_connection = connection.weak_handle();
+    let closed = weak_connection.closed();
     tokio::spawn(async move {
-        if drop_rx.changed().await.is_ok() {
-            connection.close(0u32.into(), b"fabric tunnel drop requested");
+        tokio::select! {
+            _ = closed => {}
+            changed = drop_rx.changed() => {
+                if changed.is_ok()
+                    && let Some(connection) = weak_connection.upgrade()
+                {
+                    connection.close(0u32.into(), b"fabric tunnel drop requested");
+                }
+            }
         }
     });
 }
