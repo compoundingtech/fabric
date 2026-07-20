@@ -9,6 +9,61 @@ Consumer tools do not link to iroh, know NodeAddr formats, or open QUIC streams.
 They ask fabric for a local socket connected to a remote service, then speak their
 own protocol over that socket.
 
+## Adopt Fabric On Two Machines
+
+Install the same fabric release on both macOS or Linux machines:
+
+```sh
+curl -sSf https://raw.githubusercontent.com/compoundingtech/fabric/main/install.sh | sh
+fabric --version
+```
+
+The installer puts `fabric` in `~/.local/bin` by default. Add that directory to
+`PATH` if `fabric --version` is not found.
+
+On each machine, print its stable NodeID:
+
+```sh
+fabric id
+```
+
+Exchange those NodeIDs over a trusted channel. Trust machine B on machine A:
+
+```sh
+fabric add <machine-b-node-id> machine-b
+fabric up
+```
+
+Trust machine A on machine B:
+
+```sh
+fabric add <machine-a-node-id> machine-a
+fabric up
+```
+
+Trust is deliberately mutual: each daemon accepts connections only from NodeIDs
+in its own allow-list. Verify the connection from either machine:
+
+```sh
+fabric status
+fabric ping machine-b
+```
+
+Run `fabric ping machine-a` on machine B. A successful check prints `pong`, the
+round-trip latency, and the active transport path when iroh reports it. The two
+daemons are now connected and ready for `fabric expose`, `fabric dial`, or the
+explicitly enabled remote shell.
+
+For a daemon managed by systemd or launchd instead of the background process
+started by `fabric up`, run `fabric down` and then:
+
+```sh
+fabric service install
+fabric service status
+```
+
+See [Expose And Dial A Service](#expose-and-dial-a-service) for the next step.
+
 ## Build
 
 ```sh
@@ -23,7 +78,7 @@ The binary is `target/debug/fabric` during development.
 Fast path for macOS and Linux:
 
 ```sh
-curl -sSf https://raw.githubusercontent.com/myobie/fabric/main/install.sh | sh
+curl -sSf https://raw.githubusercontent.com/compoundingtech/fabric/main/install.sh | sh
 ```
 
 The remote installer downloads a matching prebuilt release binary into
@@ -35,13 +90,13 @@ The remote installer does not silently fall back to source builds. If no
 prebuilt binary matches your machine, run an explicit source install:
 
 ```sh
-curl -sSf https://raw.githubusercontent.com/myobie/fabric/main/install.sh | sh -s -- --from-source
+curl -sSf https://raw.githubusercontent.com/compoundingtech/fabric/main/install.sh | sh -s -- --from-source
 ```
 
 To pin a release:
 
 ```sh
-curl -sSf https://raw.githubusercontent.com/myobie/fabric/main/install.sh | sh -s -- --version v0.1.7
+curl -sSf https://raw.githubusercontent.com/compoundingtech/fabric/main/install.sh | sh -s -- --version v0.1.7
 ```
 
 From a cloned repo:
@@ -264,6 +319,27 @@ tunneled to the peer's exposed protocol over iroh. With `--tcp`, fabric listens
 on the local TCP address and forwards each accepted connection to the peer's
 exposed protocol.
 
+### Expose And Dial A Service
+
+For example, expose a service listening on TCP port 8080 on machine B:
+
+```sh
+fabric expose demo-http --tcp 127.0.0.1:8080
+```
+
+On machine A, create a local listener that forwards to it:
+
+```sh
+fabric dial machine-b demo-http --tcp 127.0.0.1:9080
+```
+
+Clients on machine A can now use `127.0.0.1:9080`. The exposure persists in
+fabric's config and returns when the daemon restarts; recreate the dial listener
+after restarting machine A's daemon. Run `fabric unexpose demo-http` on machine
+B when the exposure is no longer wanted.
+
+### Check Connectivity Or Open A Shell
+
 ```sh
 fabric ping <peer>
 ```
@@ -298,7 +374,7 @@ fabric service uninstall
 Install, inspect, or remove the OS user service. `install` starts/restarts the
 native service manager entry and enables it for future user sessions. `status`
 delegates to `systemctl --user status fabric.service --no-pager` on Linux and
-`launchctl print gui/$UID/com.myobie.fabric` on macOS. `uninstall` stops the
+`launchctl print gui/$UID/tech.compounding.fabric` on macOS. `uninstall` stops the
 managed service and removes only the systemd/launchd artifact; it leaves the
 fabric home, identity, peers, logs, and config in place. The default service
 memory ceiling is 1 GiB; use a lower `--memory-max-mb` only after validating

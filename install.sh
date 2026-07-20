@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-REPO="myobie/fabric"
+REPO="compoundingtech/fabric"
 REPO_URL="https://github.com/$REPO"
 INSTALL_DIR="${FABRIC_BIN_DIR:-${BIN_DIR:-${FABRIC_INSTALL_DIR:-$HOME/.local/bin}}}"
 REQUESTED_VERSION="${FABRIC_VERSION:-latest}"
