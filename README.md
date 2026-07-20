@@ -175,6 +175,47 @@ own `fabric shell`: it severs the only recovery path if the replacement fails.
 Build and verify the replacement first, keep a rollback binary, and schedule the
 swap for a window with independent machine access.
 
+## Upgrading Fabric Safely
+
+Upgrading the fabric binary under a running daemon — especially on a remote
+machine reached only over `fabric shell` — must be done lockout-safe: a botched
+restart can sever the only path back to the box. Follow this order.
+
+1. **Install the new binary atomically, at the path the daemon runs from.**
+   `install.sh` installs via a temp file plus a rename, so it can replace the
+   binary while the daemon is running: the daemon keeps executing the old inode
+   while the path points at the new one. Never `cp` over a running binary in
+   place (Linux fails with `ETXTBSY`, "text file busy"). Confirm the daemon's
+   binary path first (from its service unit or `ps`) and install there. Keep the
+   previous binary as a rollback before installing, e.g.
+   `cp ~/.local/bin/fabric ~/.local/bin/fabric.rollback`.
+
+2. **Restart through the daemon's supervisor** so the restart survives your
+   shell disconnecting. The command depends on how the daemon is supervised:
+   - **systemd user service** (`fabric service install`, or a custom unit such
+     as a keepalive unit): `systemctl --user restart <unit>`. systemd re-execs
+     the new binary at the unit's `ExecStart` path.
+   - **launchd (macOS LaunchAgent)**: `launchctl kickstart -k gui/$UID/<label>`.
+     launchd re-execs the new binary at the plist's program path.
+   - **Plain `fabric up` background daemon** (no OS supervisor): `fabric restart`.
+     A detached helper stops the old daemon and starts a fresh one and survives
+     the invoking shell disconnecting.
+
+   Do **not** use `fabric restart` under systemd or launchd supervision: a clean
+   exit can leave the supervised job stopped while an unmanaged daemon runs.
+   And **never** run a naked `fabric down` then `fabric up` over a remote shell —
+   if the shell drops in between, the daemon is down with no supervisor and you
+   are locked out.
+
+3. **Verify from a fresh shell** (not the one that drove the restart):
+   `fabric --version` matches the new release, `fabric status` shows trusted
+   peers still reachable, and `fabric sync ls` if sync is configured. If anything
+   is wrong, restore the rollback binary and restart again.
+
+For a coordinated multi-machine upgrade, stage the new binary on every machine
+first (install, then hold the restart), then restart them in one planned window
+to keep the transport blip to a single interval.
+
 ## State
 
 By default fabric stores local runtime state in:

@@ -94,6 +94,7 @@ restored, decommission via an edit) or `policy = "bus"` (adds tombstone deletes)
 ```sh
 fabric sync add <folder> --name <name> --peers "*" --policy catalog
 fabric sync ls
+fabric sync rm <name-or-folder>
 fabric sync reload
 ```
 
@@ -123,6 +124,19 @@ through that daemon's own `fabric shell`. Build and verify the replacement,
 preserve a rollback binary, and use a planned window with an independent
 recovery path. The service-manager swap restarts Fabric and severs its current
 remote shell.
+
+Upgrade the binary lockout-safe: install atomically (`install.sh` uses a temp
+file plus rename, so it swaps under a running daemon without `ETXTBSY`) at the
+exact path the daemon runs from, keep a `fabric.rollback` copy, then restart
+through the SUPERVISOR so the restart survives the shell dropping —
+`systemctl --user restart <unit>` for a systemd user service,
+`launchctl kickstart -k gui/$UID/<label>` for a macOS LaunchAgent, or
+`fabric restart` only for a plain `fabric up` daemon. Never use `fabric restart`
+under systemd/launchd (it orphans the daemon from the supervisor), and never a
+naked `fabric down` then `fabric up` over a remote shell (a dropped shell mid-swap
+is a lockout). Verify from a fresh shell: `fabric --version`, `fabric status`,
+`fabric sync ls`. See the README "Upgrading Fabric Safely" section for the full
+procedure.
 
 Keep remote shell disabled unless the user explicitly opts in. Enable it with
 `fabric up --allow-shell` or `fabric service install --allow-shell`. Every
