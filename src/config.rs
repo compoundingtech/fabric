@@ -77,6 +77,13 @@ impl FabricHome {
         self.peer_config_path.clone()
     }
 
+    /// Authoritative sync-entry file, a sibling of `peers.toml` in the same
+    /// config directory (`~/.config/fabric/syncs.toml` for the default home,
+    /// `<home>/syncs.toml` when `--home` or `FABRIC_HOME` is set).
+    pub fn syncs_path(&self) -> PathBuf {
+        self.peer_config_path.with_file_name("syncs.toml")
+    }
+
     pub fn config_path(&self) -> PathBuf {
         self.root.join("config.toml")
     }

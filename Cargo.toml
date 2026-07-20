@@ -7,10 +7,12 @@ repository = "https://github.com/compoundingtech/fabric"
 
 [dependencies]
 anyhow = "1"
+blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29.0"
 iroh = "1.0.2"
 libc = "0.2"
+notify = "8"
 netwatch = "0.19.1"
 n0-watcher = "1.0.0"
 portable-pty = "0.9.0"
@@ -25,4 +27,5 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+proptest = "1"
 tempfile = "3"
