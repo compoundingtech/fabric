@@ -8,6 +8,7 @@ use iroh::{
 pub mod config;
 pub mod control;
 pub mod daemon;
+pub mod pathwatch;
 pub mod service;
 pub mod shell;
 pub mod sync;

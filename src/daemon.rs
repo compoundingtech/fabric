@@ -41,7 +41,7 @@ use crate::{
         validate_server_session_config, validate_tcp_addr,
     },
     control::{ControlRequest, ControlResponse, PeerReachability, SyncEntryStatus},
-    shell,
+    pathwatch, shell,
     sync::{
         self,
         config::SyncPeers,
@@ -1450,6 +1450,8 @@ impl FabricNode {
             }
         });
 
+        spawn_path_probes(&state).await;
+
         let task = tokio::spawn(serve(state.clone()));
         Ok(Self { state, task })
     }
@@ -2363,6 +2365,46 @@ fn peer_ref(peer: &Peer) -> PeerRef {
 
 fn sync_author(id: EndpointId) -> SyncAuthor {
     SyncAuthor(*id.as_bytes())
+}
+
+/// Spawn a background path-quality probe per trusted peer when
+/// `FABRIC_PATHWATCH_SECS` is set (diagnostic instrumentation; default off). Each
+/// probe holds a long-lived echo connection and logs per-path RTT + selection to
+/// the validation log, so a degraded-but-connected direct path (the 5s-RTT
+/// repro) becomes visible instead of a blind spot.
+async fn spawn_path_probes(state: &Arc<DaemonState>) {
+    let Some(secs) = std::env::var("FABRIC_PATHWATCH_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+    else {
+        return;
+    };
+    let interval = Duration::from_secs(secs);
+    let peers = state.peer_book.read().await.peers().to_vec();
+    for peer in peers {
+        let label = peer.name.clone().unwrap_or_else(|| peer.id.to_string());
+        let addr = peer
+            .addr
+            .clone()
+            .unwrap_or_else(|| EndpointAddr::new(peer.id));
+        let endpoint_state = state.clone();
+        let cancel = state.cancel.clone();
+        info!(
+            target: VALIDATION_LOG_TARGET,
+            event = "pathwatch_started",
+            peer = %label,
+            interval_secs = secs,
+        );
+        tokio::spawn(pathwatch::probe_peer_paths(
+            move || Some(endpoint_state.current_endpoint()),
+            label,
+            addr,
+            BUILTIN_ECHO_ALPN.to_vec(),
+            interval,
+            cancel,
+        ));
+    }
 }
 
 fn current_rss_bytes() -> Option<u64> {
