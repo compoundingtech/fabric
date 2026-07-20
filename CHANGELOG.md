@@ -6,6 +6,8 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-20
+
 ### Added — `fabric sync` (generic file-sync primitive)
 
 fabric now owns file sync: a declarative, daemon-managed, fs-watched primitive
