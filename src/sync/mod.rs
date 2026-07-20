@@ -17,6 +17,7 @@ pub mod config;
 pub mod glob;
 pub mod manifest;
 pub mod node;
+pub mod wire;
 
 pub use config::{PolicyRules, SyncBook, SyncEntry, SyncPeers, SyncPolicy};
 pub use manifest::{FileMeta, Manifest, ManifestDiff};

@@ -185,6 +185,34 @@ impl SyncNode {
         wanted
     }
 
+    /// Adopt every entry from `remote` that wins over ours, returning the number
+    /// adopted. Content for any newly-present entry is fetched separately (over
+    /// the wire) or is already held; an entry with no available content simply
+    /// does not materialize until its bytes arrive.
+    pub fn adopt(&mut self, remote: &Manifest) -> usize {
+        let diff = self.manifest.diff_from(remote);
+        let adopted = diff.adopt.len();
+        for entry in diff.adopt {
+            self.manifest.insert(entry.path, entry.entry);
+        }
+        adopted
+    }
+
+    /// The content bytes this node holds for `hashes`, as `(hash, bytes)` pairs.
+    /// Hashes it lacks are silently skipped. Used to bundle content for a peer.
+    pub fn gather_content(&self, hashes: &[ContentHash]) -> Vec<(ContentHash, Vec<u8>)> {
+        hashes
+            .iter()
+            .filter_map(|hash| self.content.get(hash).map(|bytes| (*hash, bytes.clone())))
+            .collect()
+    }
+
+    /// The content hashes a peer will need if it adopts from us: the present
+    /// entries where our manifest wins over `remote`.
+    pub fn hashes_peer_needs(&self, remote: &Manifest) -> Vec<ContentHash> {
+        remote.diff_from(&self.manifest).wanted_hashes()
+    }
+
     /// Reconcile with `other`: both nodes adopt the merged manifest and exchange
     /// any content the other is missing. This is the in-process (loopback)
     /// backend; the on-wire backend performs the same exchange over a transport.
