@@ -6,7 +6,7 @@ use crate::config::{FabricConfig, FabricHome};
 
 #[cfg(target_os = "linux")]
 const SERVICE_NAME: &str = "fabric.service";
-const LAUNCHD_LABEL: &str = "tech.compounding.fabric";
+const LAUNCHD_LABEL: &str = "com.compoundingtech.fabric";
 pub const DEFAULT_MEMORY_MAX_MB: u64 = 1024;
 
 #[derive(Debug, Clone, Copy)]
@@ -453,7 +453,7 @@ mod tests {
 
         let plist = render_launch_agent_plist(&home, &spec)?;
 
-        assert!(plist.contains("<string>tech.compounding.fabric</string>"));
+        assert!(plist.contains("<string>com.compoundingtech.fabric</string>"));
         assert!(plist.contains("<string>/Users/nathan/.local/bin/fabric</string>"));
         assert!(plist.contains("<string>--home</string>"));
         assert!(plist.contains("<string>/Users/nathan/.local/share/fabric</string>"));

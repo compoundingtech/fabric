@@ -89,6 +89,12 @@ fabric service status
 Use `fabric service uninstall` to remove the service artifact without deleting
 identity, peer, config, or log data.
 
+Do not migrate a service-manager identity or replace a live managed daemon
+through that daemon's own `fabric shell`. Build and verify the replacement,
+preserve a rollback binary, and use a planned window with an independent
+recovery path. The service-manager swap restarts Fabric and severs its current
+remote shell.
+
 Keep remote shell disabled unless the user explicitly opts in. Enable it with
 `fabric up --allow-shell` or `fabric service install --allow-shell`. Every
 trusted peer can obtain a shell while it is enabled. Disable it with

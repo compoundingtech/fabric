@@ -165,6 +165,12 @@ The service uses the same fabric home, identity, persisted exposes, and trusted
 peer allow-list. It does not install SSH keys or change fabric's authorization
 model.
 
+Migrating an already-installed service across a launchd or systemd identity
+change restarts the daemon. Do not perform that switchover through the daemon's
+own `fabric shell`: it severs the only recovery path if the replacement fails.
+Build and verify the replacement first, keep a rollback binary, and schedule the
+swap for a window with independent machine access.
+
 ## State
 
 By default fabric stores local runtime state in:
@@ -374,7 +380,7 @@ fabric service uninstall
 Install, inspect, or remove the OS user service. `install` starts/restarts the
 native service manager entry and enables it for future user sessions. `status`
 delegates to `systemctl --user status fabric.service --no-pager` on Linux and
-`launchctl print gui/$UID/tech.compounding.fabric` on macOS. `uninstall` stops the
+`launchctl print gui/$UID/com.compoundingtech.fabric` on macOS. `uninstall` stops the
 managed service and removes only the systemd/launchd artifact; it leaves the
 fabric home, identity, peers, logs, and config in place. The default service
 memory ceiling is 1 GiB; use a lower `--memory-max-mb` only after validating
