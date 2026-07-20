@@ -6,7 +6,7 @@ use std::{
     path::PathBuf,
     process::{Command as ProcessCommand, Stdio},
     sync::{
-        Arc,
+        Arc, OnceLock, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -40,11 +40,20 @@ use crate::{
         PersistedExposeTarget, load_or_create_identity, validate_protocol,
         validate_server_session_config, validate_tcp_addr,
     },
-    control::{ControlRequest, ControlResponse, PeerReachability},
-    shell, tunnel,
+    control::{ControlRequest, ControlResponse, PeerReachability, SyncEntryStatus},
+    shell,
+    sync::{
+        self,
+        config::SyncPeers,
+        engine::{PeerRef, SyncEngine, SyncTransport},
+        manifest::Author as SyncAuthor,
+        node::SyncNode,
+    },
+    tunnel,
 };
 
 const BUILTIN_ECHO_ALPN: &[u8] = b"fabric/echo/0";
+const SYNC_ALPN: &[u8] = b"fabric/sync/1";
 const REACHABILITY_TIMEOUT: Duration = Duration::from_secs(3);
 const INCOMING_FAILURE_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const INCOMING_FAILURE_MAX_BACKOFF: Duration = Duration::from_secs(5);
@@ -209,6 +218,9 @@ pub struct DaemonState {
     incoming_slots: Arc<Semaphore>,
     dial_slots: Arc<Semaphore>,
     cancel: CancellationToken,
+    /// The file-sync engine, set once just after this state is constructed (it
+    /// needs a handle back to the state to dial peers).
+    sync_engine: OnceLock<Arc<SyncEngine<IrohSyncTransport>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -572,7 +584,12 @@ impl DaemonState {
             incoming_slots: Arc::new(Semaphore::new(MAX_INCOMING_HANDLERS)),
             dial_slots: Arc::new(Semaphore::new(MAX_DIAL_HANDLERS)),
             cancel,
+            sync_engine: OnceLock::new(),
         }))
+    }
+
+    fn sync_engine(&self) -> Option<Arc<SyncEngine<IrohSyncTransport>>> {
+        self.sync_engine.get().cloned()
     }
 
     fn endpoint_handle(&self) -> CurrentEndpoint {
@@ -1419,6 +1436,20 @@ impl FabricNode {
     ) -> Result<Self> {
         let cancel = CancellationToken::new();
         let state = DaemonState::new(home, cancel, options).await?;
+
+        // Build the file-sync engine with a weak handle back to the state (so it
+        // can dial peers) and start watching configured folders.
+        let author = sync_author(state.id());
+        let transport = IrohSyncTransport::new(Arc::downgrade(&state));
+        let engine =
+            SyncEngine::new(state.home.clone(), author, transport, state.cancel.clone()).await?;
+        let _ = state.sync_engine.set(engine.clone());
+        tokio::spawn(async move {
+            if let Err(error) = engine.run().await {
+                warn!(%error, "sync engine stopped");
+            }
+        });
+
         let task = tokio::spawn(serve(state.clone()));
         Ok(Self { state, task })
     }
@@ -2047,12 +2078,46 @@ async fn process_control_request(
                 allow_shell: restart.allow_shell,
             }
         }
+        ControlRequest::SyncReload => {
+            if let Some(engine) = state.sync_engine() {
+                engine.reload().await?;
+                for name in engine.names().await {
+                    let _ = engine.sync_once(&name).await;
+                }
+            }
+            ControlResponse::Ok
+        }
+        ControlRequest::SyncStatus => {
+            let entries = match state.sync_engine() {
+                Some(engine) => engine
+                    .status()
+                    .await
+                    .into_iter()
+                    .map(|status| SyncEntryStatus {
+                        name: status.name,
+                        folder: status.folder.display().to_string(),
+                        policy: status.policy.to_string(),
+                        peers: peers_display(&status.peers),
+                        files: status.files,
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
+            ControlResponse::SyncStatus { entries }
+        }
         ControlRequest::Shutdown => {
             state.cancel.cancel();
             ControlResponse::Ok
         }
     };
     Ok(response)
+}
+
+fn peers_display(peers: &SyncPeers) -> String {
+    match peers {
+        SyncPeers::Wildcard(_) => "*".to_string(),
+        SyncPeers::List(list) => list.join(","),
+    }
 }
 
 async fn run_iroh_accept_loop(state: Arc<DaemonState>) -> Result<()> {
@@ -2121,6 +2186,12 @@ async fn process_incoming_iroh(incoming: Incoming, state: Arc<DaemonState>) -> R
         handle_builtin_shell(connection, state).await?;
         return Ok(());
     }
+    if alpn == SYNC_ALPN {
+        let connection = accepting.await?;
+        log_connection_paths("sync_accept", &connection);
+        handle_sync(connection, state).await?;
+        return Ok(());
+    }
 
     let exposure = {
         let exposures = state.exposures.read().await;
@@ -2172,16 +2243,126 @@ async fn handle_builtin_shell(connection: Connection, state: Arc<DaemonState>) -
     Ok(())
 }
 
+/// Serve the accepting side of a `fabric/sync` reconcile: run the wire server
+/// against the engine's node for the requested sync, then materialize what the
+/// peer pushed us to disk.
+async fn handle_sync(connection: Connection, state: Arc<DaemonState>) -> Result<()> {
+    let Some(engine) = state.sync_engine() else {
+        connection.close(0u32.into(), b"sync not enabled");
+        return Ok(());
+    };
+    let (send, recv) = connection.accept_bi().await?;
+    let stream = tokio::io::join(recv, send);
+    let resolver_engine = engine.clone();
+    let outcome = sync::wire::run_server(stream, move |name| {
+        let engine = resolver_engine.clone();
+        async move { engine.node_for(&name).await }
+    })
+    .await;
+    match outcome {
+        Ok((name, stats)) => {
+            if !stats.is_noop() {
+                debug!(sync = %name, ?stats, "served sync reconcile");
+            }
+            // Persist and write what the peer pushed to disk.
+            if let Err(error) = engine.materialize_entry(&name).await {
+                debug!(sync = %name, %error, "sync materialize failed");
+            }
+        }
+        Err(error) => debug!(%error, "sync serve failed"),
+    }
+    connection.closed().await;
+    Ok(())
+}
+
 fn accepted_alpns(exposures: &HashMap<Vec<u8>, Exposure>) -> Vec<Vec<u8>> {
-    let mut alpns = Vec::with_capacity(exposures.len() + 2);
+    let mut alpns = Vec::with_capacity(exposures.len() + 3);
     alpns.push(BUILTIN_ECHO_ALPN.to_vec());
     alpns.push(shell::SHELL_ALPN.to_vec());
+    alpns.push(SYNC_ALPN.to_vec());
     alpns.extend(exposures.keys().cloned());
     alpns
 }
 
 fn matches_reserved_alpn(alpn: &[u8]) -> bool {
-    alpn == BUILTIN_ECHO_ALPN || alpn == shell::SHELL_ALPN
+    alpn == BUILTIN_ECHO_ALPN || alpn == shell::SHELL_ALPN || alpn == SYNC_ALPN
+}
+
+/// The iroh-backed sync transport: resolves peers from `peers.toml` and dials the
+/// `fabric/sync` ALPN over the daemon's current endpoint. Holds a weak handle to
+/// the daemon state to avoid a reference cycle (state -> engine -> transport).
+pub struct IrohSyncTransport {
+    state: Weak<DaemonState>,
+}
+
+impl IrohSyncTransport {
+    fn new(state: Weak<DaemonState>) -> Arc<Self> {
+        Arc::new(Self { state })
+    }
+}
+
+impl SyncTransport for IrohSyncTransport {
+    async fn peers_for(&self, peers: &SyncPeers) -> Vec<PeerRef> {
+        let Some(state) = self.state.upgrade() else {
+            return Vec::new();
+        };
+        let book = state.peer_book.read().await;
+        let mut refs = Vec::new();
+        match peers {
+            SyncPeers::Wildcard(_) => {
+                for peer in book.peers() {
+                    refs.push(peer_ref(peer));
+                }
+            }
+            SyncPeers::List(selectors) => {
+                for selector in selectors {
+                    if let Some(peer) = book.peers().iter().find(|p| {
+                        p.id.to_string() == *selector || p.name.as_deref() == Some(selector)
+                    }) {
+                        refs.push(peer_ref(peer));
+                    }
+                }
+            }
+        }
+        refs
+    }
+
+    async fn reconcile(
+        &self,
+        peer: PeerRef,
+        name: String,
+        node: Arc<Mutex<SyncNode>>,
+    ) -> Result<sync::Reconciled> {
+        let Some(state) = self.state.upgrade() else {
+            bail!("daemon is shutting down");
+        };
+        let Some(addr) = peer.addr.clone() else {
+            bail!("sync peer {} has no address", peer.id);
+        };
+        let endpoint = state.current_endpoint();
+        let connection = endpoint.connect(addr, SYNC_ALPN).await?;
+        let (send, recv) = connection.open_bi().await?;
+        let stream = tokio::io::join(recv, send);
+        let stats = sync::wire::run_client(stream, node, &name).await?;
+        connection.close(0u32.into(), b"done");
+        Ok(stats)
+    }
+}
+
+fn peer_ref(peer: &Peer) -> PeerRef {
+    let label = peer.name.clone().unwrap_or_else(|| peer.id.to_string());
+    let addr = peer
+        .addr
+        .clone()
+        .unwrap_or_else(|| EndpointAddr::new(peer.id));
+    PeerRef {
+        id: label,
+        addr: Some(addr),
+    }
+}
+
+fn sync_author(id: EndpointId) -> SyncAuthor {
+    SyncAuthor(*id.as_bytes())
 }
 
 fn current_rss_bytes() -> Option<u64> {

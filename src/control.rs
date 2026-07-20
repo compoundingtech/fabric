@@ -56,6 +56,10 @@ pub enum ControlRequest {
     Restart {
         allow_shell: Option<bool>,
     },
+    /// Re-read syncs.toml into the running daemon (mirrors ReloadPeers).
+    SyncReload,
+    /// Report the daemon's configured sync entries and their state.
+    SyncStatus,
     Shutdown,
 }
 
@@ -102,9 +106,22 @@ pub enum ControlResponse {
         round_trip_micros: u64,
         transport: Option<String>,
     },
+    SyncStatus {
+        entries: Vec<SyncEntryStatus>,
+    },
     Error {
         message: String,
     },
+}
+
+/// One configured sync entry's status, for `fabric sync ls`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncEntryStatus {
+    pub name: String,
+    pub folder: String,
+    pub policy: String,
+    pub peers: String,
+    pub files: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

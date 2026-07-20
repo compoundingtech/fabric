@@ -19,6 +19,7 @@ use fabric::{
     },
     service::{self, DEFAULT_MEMORY_MAX_MB, ServiceInstallOptions},
     shell::{self, ServerFrame},
+    sync::config::{SyncBook, SyncEntry, SyncPeers, SyncPolicy},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -132,6 +133,11 @@ enum Commands {
     Ping { peer: String },
     /// Open an interactive remote shell on a trusted peer.
     Shell { peer: String },
+    /// Manage declarative file-sync entries (syncs.toml).
+    Sync {
+        #[command(subcommand)]
+        command: SyncCommands,
+    },
     /// Install or remove fabric as a user-managed OS service.
     Service {
         #[command(subcommand)]
@@ -197,6 +203,33 @@ enum ServiceCommands {
     Status,
     /// Stop and remove only service-manager artifacts.
     Uninstall,
+}
+
+#[derive(Debug, Subcommand)]
+enum SyncCommands {
+    /// Add or update a sync entry in syncs.toml and reload the daemon.
+    Add {
+        /// Local folder to keep synced (absolute, or relative to the CWD).
+        folder: String,
+        /// Shared logical name — use the SAME name on every machine for this sync.
+        #[arg(long)]
+        name: String,
+        /// Peers to sync with: "*" (all trusted) or comma-separated names/ids.
+        #[arg(long, default_value = "*")]
+        peers: String,
+        /// Policy preset: catalog or bus.
+        #[arg(long, default_value = "catalog")]
+        policy: String,
+        /// Optional comma-separated include globs (default: sync all files).
+        #[arg(long)]
+        include: Option<String>,
+    },
+    /// List configured sync entries and their live state.
+    Ls,
+    /// Remove a sync entry by name or folder and reload the daemon.
+    Rm { name_or_folder: String },
+    /// Re-read syncs.toml into the running daemon (like reload-peers).
+    Reload,
 }
 
 #[derive(Debug, Subcommand)]
@@ -442,6 +475,7 @@ async fn main() -> Result<()> {
                     let code = run_shell_client(&socket).await?;
                     std::process::exit(code);
                 }
+                Commands::Sync { command } => run_sync(&home, command).await?,
                 Commands::Service { command } => match command {
                     ServiceCommands::Install {
                         allow_shell,
@@ -577,6 +611,102 @@ fn expose_request(
         socket,
         persist,
     })
+}
+
+async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
+    match command {
+        SyncCommands::Add {
+            folder,
+            name,
+            peers,
+            policy,
+            include,
+        } => {
+            let folder = absolutize(&folder)?;
+            let entry = SyncEntry {
+                name: name.clone(),
+                folder,
+                peers: parse_sync_peers(&peers),
+                policy: parse_sync_policy(&policy)?,
+                include: parse_include(include.as_deref()),
+            };
+            let mut book = SyncBook::load(home)?;
+            book.upsert(entry);
+            book.save(home)?;
+            // Apply live if the daemon is running; harmless if it is not.
+            let _ = send_control(home, ControlRequest::SyncReload).await;
+            println!("sync {name:?} written to {}", home.syncs_path().display());
+        }
+        SyncCommands::Ls => match send_control(home, ControlRequest::SyncStatus).await? {
+            ControlResponse::SyncStatus { entries } => {
+                if entries.is_empty() {
+                    println!("no sync entries");
+                }
+                for entry in entries {
+                    println!(
+                        "{}\t{}\t{}\tpeers={}\t{} files",
+                        entry.name, entry.folder, entry.policy, entry.peers, entry.files
+                    );
+                }
+            }
+            response => bail!("unexpected daemon response: {response:?}"),
+        },
+        SyncCommands::Rm { name_or_folder } => {
+            let mut book = SyncBook::load(home)?;
+            if !book.remove(&name_or_folder) {
+                bail!("no sync entry named or foldered {name_or_folder:?}");
+            }
+            book.save(home)?;
+            let _ = send_control(home, ControlRequest::SyncReload).await;
+            println!("removed sync {name_or_folder:?}");
+        }
+        SyncCommands::Reload => {
+            send_control(home, ControlRequest::SyncReload).await?;
+            println!("reloaded");
+        }
+    }
+    Ok(())
+}
+
+fn absolutize(folder: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(folder);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn parse_sync_peers(value: &str) -> SyncPeers {
+    if value.trim() == "*" {
+        SyncPeers::Wildcard("*".to_string())
+    } else {
+        SyncPeers::List(
+            value
+                .split(',')
+                .map(|part| part.trim().to_string())
+                .filter(|part| !part.is_empty())
+                .collect(),
+        )
+    }
+}
+
+fn parse_sync_policy(value: &str) -> Result<SyncPolicy> {
+    match value {
+        "catalog" => Ok(SyncPolicy::Catalog),
+        "bus" => Ok(SyncPolicy::Bus),
+        other => bail!("unknown sync policy {other:?}; use catalog or bus"),
+    }
+}
+
+fn parse_include(value: Option<&str>) -> Option<Vec<String>> {
+    let value = value?;
+    let globs: Vec<String> = value
+        .split(',')
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect();
+    if globs.is_empty() { None } else { Some(globs) }
 }
 
 fn print_status(
