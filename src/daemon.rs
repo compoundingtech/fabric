@@ -928,7 +928,11 @@ impl DaemonState {
         );
         drop(sockets);
 
-        if alpn == shell::SHELL_ALPN {
+        // Built-in shell and exec speak their own end-to-end framing over a raw
+        // stream — they must NOT go through the tunnel-session (mux) path, whose
+        // Hello frame would corrupt the first client frame. Every other protocol
+        // (exposed tunnels) uses the resumable tunnel path.
+        if alpn == shell::SHELL_ALPN || alpn == exec::EXEC_ALPN {
             tokio::spawn(run_raw_dial_socket(
                 listener,
                 self.endpoint_rx(),
