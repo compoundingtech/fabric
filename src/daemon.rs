@@ -74,6 +74,20 @@ const ENDPOINT_RSS_RECYCLE_SETTLE_INTERVAL: Duration = Duration::from_secs(5);
 const ENDPOINT_RSS_INEFFECTIVE_INITIAL_BACKOFF: Duration = Duration::from_secs(5 * 60);
 const ENDPOINT_RSS_INEFFECTIVE_MAX_BACKOFF: Duration = Duration::from_secs(15 * 60);
 const NETWORK_CHANGE_DEBOUNCE: Duration = Duration::from_millis(140);
+/// How often the daemon actively echo-probes each trusted peer, so a peer that has
+/// roamed (changed network / public IP) is detected even when THIS machine saw no
+/// local network change. `FABRIC_PEER_HEALTH_SECS` overrides; `0` disables.
+const PEER_HEALTH_PROBE_INTERVAL: Duration = Duration::from_secs(20);
+/// Consecutive failed peer probes before the daemon drives recovery for that peer.
+const PEER_HEALTH_FAILURES_BEFORE_RECOVER: usize = 3;
+/// Recovery attempts (cheap re-probe nudges) for a still-unreachable peer before
+/// escalating to a full endpoint recycle — the heavy hammer a manual restart used
+/// to require.
+const PEER_HEALTH_ATTEMPTS_BEFORE_RECYCLE: usize = 3;
+/// Escalating backoff between repeated recovery attempts for a still-unreachable
+/// peer, so a genuinely-down peer does not cause recovery thrash.
+const PEER_HEALTH_RECOVER_INITIAL_BACKOFF: Duration = Duration::from_secs(30);
+const PEER_HEALTH_RECOVER_MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
 const VALIDATION_LOG_TARGET: &str = "fabric::validation";
 
 #[derive(Debug)]
@@ -1141,6 +1155,52 @@ impl DaemonState {
         }
     }
 
+    /// Drive recovery for a peer our active liveness probe found unreachable, even
+    /// though no local network change fired (the roaming case). Cheap first: tell
+    /// iroh to re-discover + re-probe all paths and drop stale tunnels so a roamed
+    /// peer settles onto relay / its new direct address. Escalates to a full
+    /// endpoint recycle only after repeated nudges have not brought it back — the
+    /// same effect as the manual restart this replaces. `attempt` is the 1-based
+    /// recovery attempt since the peer last answered.
+    async fn recover_unreachable_peer(&self, label: &str, attempt: usize) {
+        let endpoint = self.endpoint_handle();
+        let escalate_recycle = attempt >= PEER_HEALTH_ATTEMPTS_BEFORE_RECYCLE;
+        warn!(
+            target: VALIDATION_LOG_TARGET,
+            event = "peer_health_recover",
+            peer = %label,
+            generation = endpoint.generation,
+            attempt,
+            escalate_recycle,
+            "peer unreachable; re-probing paths (drop tunnels + iroh network_change)"
+        );
+        eprintln!(
+            "fabric: peer {label:?} unreachable (recovery attempt {attempt}); re-probing paths{}",
+            if escalate_recycle {
+                " + recycling endpoint"
+            } else {
+                ""
+            }
+        );
+
+        endpoint.endpoint.network_change().await;
+        self.drop_tunnel_connections();
+
+        if escalate_recycle {
+            if let Err(error) = self
+                .recycle_endpoint_if_generation(
+                    endpoint.generation,
+                    "peer unreachable after repeated re-probes",
+                )
+                .await
+            {
+                eprintln!(
+                    "fabric: failed to recycle endpoint recovering peer {label:?}: {error:#}"
+                );
+            }
+        }
+    }
+
     async fn endpoint_health_recovered(&self, endpoint: CurrentEndpoint, context: &str) -> bool {
         if tokio::time::timeout(ENDPOINT_HEALTH_TIMEOUT, endpoint.endpoint.online())
             .await
@@ -1580,6 +1640,7 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
         result = run_network_rehome_loop(state.clone()) => result?,
         result = run_endpoint_health_poll_loop(state.clone()) => result?,
         result = run_endpoint_rss_recycle_loop(state.clone()) => result?,
+        result = run_peer_health_loop(state.clone()) => result?,
         result = run_endpoint_snapshot_loop(state.clone()) => result?,
         _ = state.cancel.cancelled() => {}
     }
@@ -1760,6 +1821,174 @@ async fn run_endpoint_health_poll_loop(state: Arc<DaemonState>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Actively probe each trusted peer's liveness on an interval and, when a peer
+/// stops answering (e.g. it roamed to a new network) with no local network change
+/// to trigger the netmon rehome path, drive recovery for it. This closes the gap
+/// where a roamed peer stayed unreachable both ways until a manual daemon restart.
+/// It also emits per-probe latency + transport (direct/relay) telemetry.
+///
+/// `FABRIC_PEER_HEALTH_SECS` overrides the probe interval; `0` disables the loop.
+async fn run_peer_health_loop(state: Arc<DaemonState>) -> Result<()> {
+    let probe_interval = match std::env::var("FABRIC_PEER_HEALTH_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        Some(0) => {
+            info!(
+                target: VALIDATION_LOG_TARGET,
+                event = "peer_health_disabled",
+                "peer liveness probe disabled via FABRIC_PEER_HEALTH_SECS=0"
+            );
+            state.cancel.cancelled().await;
+            return Ok(());
+        }
+        Some(secs) => Duration::from_secs(secs),
+        None => PEER_HEALTH_PROBE_INTERVAL,
+    };
+    run_peer_health_loop_with(
+        state,
+        probe_interval,
+        PEER_HEALTH_FAILURES_BEFORE_RECOVER,
+        PEER_HEALTH_RECOVER_INITIAL_BACKOFF,
+        PEER_HEALTH_RECOVER_MAX_BACKOFF,
+    )
+    .await
+}
+
+async fn run_peer_health_loop_with(
+    state: Arc<DaemonState>,
+    probe_interval: Duration,
+    failures_before_recover: usize,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+) -> Result<()> {
+    let mut interval = tokio::time::interval(probe_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.tick().await;
+    let mut tracker =
+        PeerHealthTracker::new(failures_before_recover, initial_backoff, max_backoff);
+
+    loop {
+        tokio::select! {
+            _ = state.cancel.cancelled() => break,
+            _ = interval.tick() => {
+                // A local network outage is not the peer's fault — the netmon rehome
+                // and endpoint health poll own that case. Skip so we don't false-trigger
+                // peer recovery for every peer whenever our own uplink blips.
+                if !state.network_usable.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let peers = state.peer_book.read().await.peers().to_vec();
+                for peer in peers {
+                    let peer_id = peer.id;
+                    let label = peer.name.clone().unwrap_or_else(|| peer_id.to_string());
+                    let health = state.check_peer_reachability(peer).await;
+                    info!(
+                        target: VALIDATION_LOG_TARGET,
+                        event = "peer_health_probe",
+                        peer = %label,
+                        reachable = health.reachable,
+                        rtt_us = health.round_trip_micros.unwrap_or(0),
+                        transport = health.transport.as_deref().unwrap_or("none"),
+                        "peer liveness probe"
+                    );
+                    if let PeerHealthAction::Recover { attempt } =
+                        tracker.on_probe(peer_id, health.reachable, Instant::now())
+                    {
+                        state.recover_unreachable_peer(&label, attempt).await;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Recovery decision for a single peer probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerHealthAction {
+    /// Peer is healthy or not yet past the failure threshold — do nothing.
+    None,
+    /// Drive recovery for this peer now. `attempt` is the 1-based recovery attempt
+    /// since the peer last answered, driving escalating backoff + recycle escalation.
+    Recover { attempt: usize },
+}
+
+/// Per-peer liveness bookkeeping feeding [`PeerHealthTracker`].
+#[derive(Debug, Default, Clone)]
+struct PeerHealthState {
+    consecutive_failures: usize,
+    recover_attempts: usize,
+    next_recover_at: Option<Instant>,
+}
+
+/// Pure state machine: turns a stream of per-peer probe results into recovery
+/// decisions. Kept clock-injected and free of any endpoint so the
+/// failure→recover→backoff→reset logic is unit-testable in isolation.
+struct PeerHealthTracker {
+    failures_before_recover: usize,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    peers: HashMap<EndpointId, PeerHealthState>,
+}
+
+impl PeerHealthTracker {
+    fn new(
+        failures_before_recover: usize,
+        initial_backoff: Duration,
+        max_backoff: Duration,
+    ) -> Self {
+        Self {
+            failures_before_recover: failures_before_recover.max(1),
+            initial_backoff,
+            max_backoff,
+            peers: HashMap::new(),
+        }
+    }
+
+    /// Record one probe result for `peer`. A reachable probe resets that peer's
+    /// state; a failure counts toward the threshold and, once reached, fires
+    /// `Recover` — then gates further fires behind an escalating backoff so a
+    /// genuinely-down peer is retried periodically instead of on every probe.
+    fn on_probe(&mut self, peer: EndpointId, reachable: bool, now: Instant) -> PeerHealthAction {
+        let state = self.peers.entry(peer).or_default();
+        if reachable {
+            *state = PeerHealthState::default();
+            return PeerHealthAction::None;
+        }
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        if state.consecutive_failures < self.failures_before_recover {
+            return PeerHealthAction::None;
+        }
+        if let Some(next) = state.next_recover_at
+            && now < next
+        {
+            return PeerHealthAction::None;
+        }
+        state.recover_attempts = state.recover_attempts.saturating_add(1);
+        let backoff = peer_recovery_backoff(
+            state.recover_attempts,
+            self.initial_backoff,
+            self.max_backoff,
+        );
+        state.next_recover_at = Some(now + backoff);
+        PeerHealthAction::Recover {
+            attempt: state.recover_attempts,
+        }
+    }
+}
+
+/// Escalating, capped backoff between repeated recovery attempts for a peer that
+/// stays unreachable: `initial * 2^(attempt-1)`, capped at `max`; zero for attempt 0.
+fn peer_recovery_backoff(attempt: usize, initial: Duration, max: Duration) -> Duration {
+    if attempt == 0 {
+        return Duration::ZERO;
+    }
+    let exponent = attempt.saturating_sub(1).min(8) as u32;
+    initial.saturating_mul(1u32 << exponent).min(max)
 }
 
 async fn run_endpoint_rss_recycle_loop(state: Arc<DaemonState>) -> Result<()> {
@@ -2780,6 +3009,97 @@ async fn pipe_unix_iroh(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_recovery_backoff_scales_and_caps() {
+        let initial = Duration::from_secs(30);
+        let max = Duration::from_secs(600);
+        assert_eq!(peer_recovery_backoff(0, initial, max), Duration::ZERO);
+        assert_eq!(peer_recovery_backoff(1, initial, max), Duration::from_secs(30));
+        assert_eq!(peer_recovery_backoff(2, initial, max), Duration::from_secs(60));
+        assert_eq!(peer_recovery_backoff(3, initial, max), Duration::from_secs(120));
+        assert_eq!(peer_recovery_backoff(4, initial, max), Duration::from_secs(240));
+        assert_eq!(peer_recovery_backoff(10, initial, max), max); // saturated + capped
+    }
+
+    // Fault-injection: feed a scripted fail/ok probe sequence into the pure
+    // recovery decision core and assert it fires at the failure threshold, backs
+    // off between repeated attempts while the peer stays down, and fully resets
+    // once the peer answers again.
+    #[test]
+    fn peer_health_tracker_fires_at_threshold_then_backs_off_then_resets() {
+        use iroh::SecretKey;
+        let peer = SecretKey::generate().public();
+        let t0 = Instant::now();
+        let mut tracker =
+            PeerHealthTracker::new(3, Duration::from_secs(30), Duration::from_secs(600));
+
+        // Below threshold: no recovery yet.
+        assert_eq!(tracker.on_probe(peer, false, t0), PeerHealthAction::None);
+        assert_eq!(tracker.on_probe(peer, false, t0), PeerHealthAction::None);
+        // Threshold (3 consecutive failures) reached: fire attempt 1.
+        assert_eq!(
+            tracker.on_probe(peer, false, t0),
+            PeerHealthAction::Recover { attempt: 1 }
+        );
+        // Still failing but inside the 30s backoff window: must NOT re-fire (no thrash).
+        assert_eq!(
+            tracker.on_probe(peer, false, t0 + Duration::from_secs(5)),
+            PeerHealthAction::None
+        );
+        assert_eq!(
+            tracker.on_probe(peer, false, t0 + Duration::from_secs(29)),
+            PeerHealthAction::None
+        );
+        // Backoff elapsed, still failing: fire attempt 2.
+        assert_eq!(
+            tracker.on_probe(peer, false, t0 + Duration::from_secs(31)),
+            PeerHealthAction::Recover { attempt: 2 }
+        );
+        // A reachable probe fully resets the peer.
+        assert_eq!(
+            tracker.on_probe(peer, true, t0 + Duration::from_secs(40)),
+            PeerHealthAction::None
+        );
+        // Fresh failures must re-climb the threshold from zero (attempt back to 1).
+        assert_eq!(
+            tracker.on_probe(peer, false, t0 + Duration::from_secs(50)),
+            PeerHealthAction::None
+        );
+        assert_eq!(
+            tracker.on_probe(peer, false, t0 + Duration::from_secs(50)),
+            PeerHealthAction::None
+        );
+        assert_eq!(
+            tracker.on_probe(peer, false, t0 + Duration::from_secs(50)),
+            PeerHealthAction::Recover { attempt: 1 }
+        );
+    }
+
+    // A failing peer must never trip recovery for a different, healthy peer.
+    #[test]
+    fn peer_health_tracker_isolates_peers() {
+        use iroh::SecretKey;
+        let a = SecretKey::generate().public();
+        let b = SecretKey::generate().public();
+        let t0 = Instant::now();
+        let mut tracker =
+            PeerHealthTracker::new(2, Duration::from_secs(30), Duration::from_secs(600));
+
+        assert_eq!(tracker.on_probe(a, false, t0), PeerHealthAction::None);
+        assert_eq!(tracker.on_probe(b, true, t0), PeerHealthAction::None);
+        // A reaches its threshold and recovers; B, interleaved, is unaffected.
+        assert_eq!(
+            tracker.on_probe(a, false, t0),
+            PeerHealthAction::Recover { attempt: 1 }
+        );
+        assert_eq!(tracker.on_probe(b, true, t0), PeerHealthAction::None);
+        assert_eq!(tracker.on_probe(b, false, t0), PeerHealthAction::None);
+        assert_eq!(
+            tracker.on_probe(b, false, t0),
+            PeerHealthAction::Recover { attempt: 1 }
+        );
+    }
 
     #[test]
     fn server_session_limit_options_override_config() {
