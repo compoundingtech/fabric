@@ -96,9 +96,15 @@ Design decisions (why, so they are not re-litigated):
    local two-node e2e test (allow + deny + stderr split + exit codes); that test
    caught a real bug — `dial_alpn` routed exec through the mux tunnel whose Hello
    frame corrupted the argv; exec now uses the raw dial path like shell.
-   **Combined deploy:** the roaming fix + exec ship together in ONE Nathan-gated
-   window (new binary on Mac AND hetz + `--allow-exec` on hetz so cos can
-   `fabric exec hetzner -- <cmd>`). Rollback: `~/.local/bin/fabric.prev` = 9f5391b.
+   **Combined deploy bundle (ONE Nathan-gated window):** roaming self-heal
+   (`298a593`) + `fabric exec` (`4d02a01`/`4fe8557`) + service-install idempotency
+   (`83a3614`) + dev/prod isolation pieces (`a9b336e`: service-install refuses a
+   non-default home, down/restart home-mismatch guard, README FABRIC_HOME-for-dev
+   convention). New binary on Mac AND hetz + `--allow-exec` on hetz so cos can
+   `fabric exec hetzner -- <cmd>`. Rollback: `~/.local/bin/fabric.prev` = 9f5391b.
+   Deferred: the `fabric dev` subcommand (env convention covers it), the Erlang
+   idle-skip probe refinement (low urgency), and `fabric cp`/discovery (await
+   Nathan's product prioritization). Design: `docs/dev-prod-isolation.md`.
 
 1. **Fleet redeploy before the hetz proof** (CoS-coordinated). The *installed*
    fabric binaries are stale/pre-sync (`~/.local/bin/fabric` was 0.1.7+940afd1).
