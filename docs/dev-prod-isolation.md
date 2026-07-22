@@ -84,6 +84,40 @@ Each tool exposes its own `*_HOME` env (`FABRIC_HOME`, `PTY_HOME`, …) and keep
 all per-instance state under it. fabric is the acute case because it's a live
 network dependency; the pattern generalizes directly.
 
+## Defense-in-depth: service `KillMode=process`
+
+Real incident, 2026-07-22 deploy: restarting hetz's fabric service SIGTERM'd the
+**entire agent fleet**, because a prior manual recovery had launched `convoy up`
+(and all agents) from inside a `fabric shell` — so those processes inherited
+fabric's systemd cgroup, and the unit's default `KillMode=control-group` kills the
+whole cgroup on stop/restart. (Primary fix was operational: the fleet was
+relaunched under its own `convoy-up.service` unit = isolated cgroup. And during
+the deploy we avoided the same class by having Nathan fire the hetz restart from
+ssh rather than from a `fabric shell` child.)
+
+Belt-and-suspenders for fabric itself: set the fabric service unit to
+**`KillMode=process`** so a restart kills only the daemon, never a neighbor that
+mistakenly landed in its cgroup.
+
+Owner assessment (recommend `KillMode=process`): fabric does **not** rely on
+cgroup-reaping to clean up its own children — every child it spawns
+self-terminates when the daemon closes its stdio: exec-expose children exit on
+stdin EOF (the locked `--exec` contract), `shell` PTY children get SIGHUP when the
+master closes, `exec` command children hit SIGPIPE/EOF. So the cgroup-kill buys
+little tidy-up and risks catastrophic collateral kills. The only downside of
+`process` is that a misbehaving child ignoring stdio-close would linger as an
+orphan (a minor leak) instead of being force-killed — an acceptable trade against
+killing unrelated neighbors. (`mixed` is not enough: it still SIGKILLs the whole
+cgroup at the end, so a stuck neighbor still dies.)
+
+Two places to apply it (fold into the isolation follow-up, currently doc-only):
+
+- fabric's **generated** unit — `render_systemd_user_unit` in `src/service.rs`
+  currently sets no `KillMode` (defaults to `control-group`); add
+  `KillMode=process` there (+ a unit-render test).
+- **hand-written** units like hetz's `fabric-keepalive.service` — an ops change,
+  not fabric code; flag to add `KillMode=process` when convenient.
+
 ## Scope note
 
 This is design only — no big change yet, per the gate. If approved I'll implement
