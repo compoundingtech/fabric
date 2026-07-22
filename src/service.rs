@@ -1,4 +1,10 @@
-use std::{env, fs, path::PathBuf, process::Command};
+use std::{
+    env, fs,
+    path::PathBuf,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 
@@ -7,6 +13,14 @@ use crate::config::{FabricConfig, FabricHome};
 #[cfg(target_os = "linux")]
 const SERVICE_NAME: &str = "fabric.service";
 const LAUNCHD_LABEL: &str = "com.compoundingtech.fabric";
+/// How long to wait for launchd to fully unload a booted-out service before
+/// bootstrapping the same label again — bootout is async, and bootstrapping a
+/// still-loaded label races into "Bootstrap failed: 5: Input/output error".
+const LAUNCHD_UNLOAD_TIMEOUT: Duration = Duration::from_secs(5);
+/// Poll interval while waiting for unload / between bootstrap retries.
+const LAUNCHD_RETRY_BACKOFF: Duration = Duration::from_millis(300);
+/// Bootstrap attempts before giving up — a re-install must be safe to re-run.
+const LAUNCHD_BOOTSTRAP_MAX_ATTEMPTS: usize = 5;
 pub const DEFAULT_MEMORY_MAX_MB: u64 = 1024;
 
 #[derive(Debug, Clone, Copy)]
@@ -205,14 +219,69 @@ fn install_launchd_user(home: &FabricHome, spec: &ServiceSpec) -> Result<()> {
     let plist = plist_path.display().to_string();
     let domain = launchd_domain();
     let target = launchd_service_target();
+    // Stop any existing instance, WAIT for launchd to fully unload it, then
+    // bootstrap with a bounded retry. Without the settle-and-retry, a re-install
+    // over a running managed daemon races bootout->bootstrap into
+    // "Bootstrap failed: 5: Input/output error" and leaves NO daemon running —
+    // which, for cos's only path to hetz, is an outage. A re-install must be
+    // idempotent and safe to re-run.
     let _ = Command::new("launchctl")
         .args(["bootout", &target])
         .status();
-    run_command("launchctl", &["bootstrap", &domain, &plist])?;
+    wait_for_launchd_unloaded(&target, LAUNCHD_UNLOAD_TIMEOUT);
+    bootstrap_launchd_with_retry(&domain, &plist, &target)?;
     run_command("launchctl", &["enable", &target])?;
     run_command("launchctl", &["kickstart", "-k", &target])?;
     println!("plist\t{}", plist_path.display());
     Ok(())
+}
+
+/// True if launchd currently has the service loaded in the domain.
+fn launchd_service_loaded(target: &str) -> bool {
+    Command::new("launchctl")
+        .args(["print", target])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Block until the service is no longer loaded, or the timeout elapses. `bootout`
+/// returns before launchd has finished unloading, so bootstrapping immediately
+/// can hit the loaded/unloading label and fail with EIO.
+fn wait_for_launchd_unloaded(target: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while launchd_service_loaded(target) && Instant::now() < deadline {
+        thread::sleep(LAUNCHD_RETRY_BACKOFF);
+    }
+}
+
+/// Bootstrap the service, retrying on transient failure. Treats "already loaded"
+/// (e.g. a concurrent bootstrap won the race) as success, so a re-install is
+/// idempotent and never leaves the daemon dead.
+fn bootstrap_launchd_with_retry(domain: &str, plist: &str, target: &str) -> Result<()> {
+    let mut last = String::new();
+    for attempt in 1..=LAUNCHD_BOOTSTRAP_MAX_ATTEMPTS {
+        let status = Command::new("launchctl")
+            .args(["bootstrap", domain, plist])
+            .status()
+            .with_context(|| "failed to run launchctl bootstrap")?;
+        if status.success() || launchd_service_loaded(target) {
+            return Ok(());
+        }
+        last = status.to_string();
+        if attempt < LAUNCHD_BOOTSTRAP_MAX_ATTEMPTS {
+            thread::sleep(LAUNCHD_RETRY_BACKOFF);
+            // A prior instance may still have been settling; re-wait before retry.
+            wait_for_launchd_unloaded(target, LAUNCHD_UNLOAD_TIMEOUT);
+        }
+    }
+    bail!(
+        "launchctl bootstrap {plist} failed after {LAUNCHD_BOOTSTRAP_MAX_ATTEMPTS} attempts \
+         (last {last}); the service may be in a stuck state — try `launchctl bootout {target}` \
+         then re-run"
+    )
 }
 
 #[cfg(target_os = "macos")]
