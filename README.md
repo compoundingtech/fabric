@@ -68,6 +68,75 @@ fabric service status
 
 See [Expose And Dial A Service](#expose-and-dial-a-service) for the next step.
 
+## Join An Existing Mesh (add a fresh machine)
+
+Adding a new machine — say a travel laptop — to a mesh that already has peers
+(say your desktop and a server) is the same mutual-trust step as above, done once
+per existing peer. There is **no auto-pairing/discovery of trust**: you exchange
+**NodeIDs by hand**. Trust is symmetric, so the new machine AND each existing peer
+must each `fabric add` the other. Nothing is copied between machines except NodeID
+strings — they are public keys, safe to paste anywhere. The new machine generates
+its own identity on first start; you do **not** copy any file (identity, peers,
+config) from an existing machine.
+
+Peers are found by NodeID over iroh discovery (relays), so **no address hints are
+needed** and a roaming laptop reconnects on its own as its network changes.
+
+### 1. On the NEW machine — install, start the managed daemon, print its NodeID
+
+```sh
+curl -sSf https://raw.githubusercontent.com/compoundingtech/fabric/main/install.sh | sh
+fabric --version
+fabric service install --allow-shell   # launchd/systemd daemon; survives reboot + sleep/wake
+fabric id                               # copy this — the NEW machine's NodeID
+```
+
+### 2. On the NEW machine — trust each existing peer
+
+Get each existing peer's NodeID by running `fabric id` on it (or ask whoever runs
+it). Then, on the new machine:
+
+```sh
+fabric add <DESKTOP_NODEID> desktop
+fabric add <SERVER_NODEID>  server
+fabric reload-peers
+```
+
+### 3. On EACH existing peer — trust the NEW machine
+
+Using the new machine's NodeID from step 1, run this **on the desktop and on every
+other existing peer**:
+
+```sh
+fabric add <NEW_NODEID> laptop
+fabric reload-peers
+```
+
+For a peer you can already reach through the mesh (e.g. a server), you can add the
+new machine to it **without SSH**, from any machine that already has exec access
+to it:
+
+```sh
+fabric exec server -- ~/.local/bin/fabric add <NEW_NODEID> laptop
+fabric exec server -- ~/.local/bin/fabric reload-peers
+```
+
+(`fabric exec` requires the server to have opted in with `--allow-exec`; otherwise
+`ssh` in and run the same two commands.)
+
+### 4. Verify from the new machine
+
+```sh
+fabric status                     # each peer should show as reachable
+fabric ping server                # prints pong + latency + transport (direct/relay)
+fabric exec server -- echo ok     # if that peer enabled --allow-exec; prints ok, exit 0
+```
+
+If `ping`/`status` shows a peer unreachable, the usual cause is one-sided trust —
+confirm BOTH the new machine and that peer ran `fabric add` **and**
+`fabric reload-peers`. Reachability may start on `relay` and upgrade to `direct`
+within a few seconds as iroh hole-punches.
+
 ## Build
 
 ```sh
@@ -163,6 +232,14 @@ To force it off in the persisted config:
 
 ```sh
 fabric service install --no-allow-shell
+```
+
+Non-interactive remote command execution (`fabric exec <peer> -- <cmd>`) is a
+separate opt-in, also default-deny; enable it on a peer that should run remote
+commands:
+
+```sh
+fabric service install --allow-exec
 ```
 
 The service uses the same fabric home, identity, persisted exposes, and trusted
