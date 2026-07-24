@@ -30,6 +30,23 @@ in-`--home` copy, leaving the daemon with zero peers on the dial path
 - **Holds LIFTED:** default-home `fabric add`/`remove` and `fabric restart` are
   safe again — the daemon reads the same `~/.config/fabric/peers.toml` as the CLI.
 
+## Recent work (2026-07-24)
+
+- **Marker env vars shipped** (main `93e0f59`): a `fabric shell`/`exec` runs in the
+  daemon's session, not the caller's, so the remote session now exports
+  `FABRIC_SHELL=1` / `FABRIC_EXEC=1` / `FABRIC_PEER=<connecting NodeID>`. Lets a
+  shell rc detect a fabric session and skip session-fragile startup. Unit + two-node
+  iroh tests; README has an rc-guard snippet. Not deployed — ships in the next binary.
+- **`fabric shell silber` hang — diagnosed, NOT the suspected commands.** Probing
+  the LIVE silber daemon's own session (via the harmless `fabric exec hetzner ->
+  fabric exec mac -> …` relay) showed the daemon is in an **Aqua (GUI) session** and
+  xcrun / xcode-select / `security show-keychain-info` / brew all return rc 0 (no
+  hang); xcode is fully usable in a fabric shell. So the hang was a prior daemon
+  state, not those four. Deterministic culprit-finder for Nathan: rc-timing
+  instrumentation (`set -x; PS4='+ ${EPOCHREALTIME} '`) on a fresh shell; or just
+  gate fragile rc on `[ -z "$FABRIC_SHELL" ]`.
+- **PR #16 (nix flake) MERGED** to main (`903d70f`) — `flake.nix` + nix CI now live.
+
 ## What fabric is
 
 A standalone Rust CLI + local daemon that hides iroh behind local Unix sockets.
