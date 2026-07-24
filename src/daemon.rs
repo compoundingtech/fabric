@@ -2494,9 +2494,10 @@ async fn handle_builtin_echo(connection: Connection, state: Arc<DaemonState>) ->
 }
 
 async fn handle_builtin_shell(connection: Connection, state: Arc<DaemonState>) -> Result<()> {
+    let peer = connection.remote_id().to_string();
     let (mut send, mut recv) = connection.accept_bi().await?;
     if state.allow_shell {
-        shell::serve_shell_session(&mut recv, &mut send).await?;
+        shell::serve_shell_session(&mut recv, &mut send, &peer).await?;
     } else {
         shell::serve_shell_disabled(&mut send).await?;
     }
@@ -2506,9 +2507,10 @@ async fn handle_builtin_shell(connection: Connection, state: Arc<DaemonState>) -
 }
 
 async fn handle_builtin_exec(connection: Connection, state: Arc<DaemonState>) -> Result<()> {
+    let peer = connection.remote_id().to_string();
     let (mut send, mut recv) = connection.accept_bi().await?;
     if state.allow_exec {
-        exec::serve_exec_session(&mut recv, &mut send).await?;
+        exec::serve_exec_session(&mut recv, &mut send, &peer).await?;
     } else {
         exec::serve_exec_disabled(&mut send).await?;
     }

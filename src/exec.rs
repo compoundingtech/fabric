@@ -60,7 +60,7 @@ where
 /// Server side of an exec session: read the argv, spawn the command with no tty
 /// and a null stdin, stream its stdout and stderr back as separate frames, then
 /// send the process's exit code.
-pub async fn serve_exec_session<R, W>(recv: &mut R, send: &mut W) -> Result<()>
+pub async fn serve_exec_session<R, W>(recv: &mut R, send: &mut W, peer: &str) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -77,6 +77,11 @@ where
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
+        // Markers so the spawned command (and any shell it sources) can tell it is
+        // running under fabric exec — in the daemon's session, not the caller's.
+        // FABRIC_PEER is the connecting peer's NodeID — who ran this command.
+        .env("FABRIC_EXEC", "1")
+        .env("FABRIC_PEER", peer)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -260,7 +265,7 @@ mod tests {
         write_client_argv(&mut client_to_server, &argv).await.unwrap();
 
         let mut server_to_client = Vec::new();
-        serve_exec_session(&mut client_to_server.as_slice(), &mut server_to_client)
+        serve_exec_session(&mut client_to_server.as_slice(), &mut server_to_client, "test-peer")
             .await
             .unwrap();
 
@@ -284,6 +289,36 @@ mod tests {
         assert_eq!(exit, Some(7));
     }
 
+    // The spawned command sees FABRIC_EXEC=1 and FABRIC_PEER=<connecting peer>, so
+    // a script/rc can detect it is running under fabric exec and who invoked it.
+    #[tokio::test]
+    async fn serve_exec_session_sets_marker_env() {
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf '%s:%s' \"$FABRIC_EXEC\" \"$FABRIC_PEER\"".to_string(),
+        ];
+        let mut client_to_server = Vec::new();
+        write_client_argv(&mut client_to_server, &argv).await.unwrap();
+
+        let mut server_to_client = Vec::new();
+        serve_exec_session(&mut client_to_server.as_slice(), &mut server_to_client, "peer-abc123")
+            .await
+            .unwrap();
+
+        let mut reader = server_to_client.as_slice();
+        let mut stdout = Vec::new();
+        while let Some(frame) = read_server_frame(&mut reader).await.unwrap() {
+            match frame {
+                ServerFrame::Stdout(b) => stdout.extend_from_slice(&b),
+                ServerFrame::Exit(_) => break,
+                ServerFrame::Error(msg) => panic!("unexpected error frame: {msg}"),
+                ServerFrame::Stderr(_) => {}
+            }
+        }
+        assert_eq!(stdout, b"1:peer-abc123");
+    }
+
     // A missing binary is reported as an error frame + non-zero exit, not a hang.
     #[tokio::test]
     async fn serve_exec_session_reports_spawn_failure() {
@@ -292,7 +327,7 @@ mod tests {
         write_client_argv(&mut client_to_server, &argv).await.unwrap();
 
         let mut server_to_client = Vec::new();
-        serve_exec_session(&mut client_to_server.as_slice(), &mut server_to_client)
+        serve_exec_session(&mut client_to_server.as_slice(), &mut server_to_client, "test-peer")
             .await
             .unwrap();
 

@@ -49,7 +49,7 @@ where
     write_server_frame(send, ServerFrame::Exit(126)).await
 }
 
-pub async fn serve_shell_session<R, W>(recv: &mut R, send: &mut W) -> Result<()>
+pub async fn serve_shell_session<R, W>(recv: &mut R, send: &mut W, peer: &str) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -57,7 +57,12 @@ where
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize::default())?;
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let command = CommandBuilder::new(shell);
+    let mut command = CommandBuilder::new(shell);
+    // Markers so a user's shell rc can tell it's inside a fabric shell (which runs
+    // in the daemon's session, not the caller's) and skip session-fragile startup.
+    // FABRIC_PEER is the connecting peer's NodeID — who opened this shell.
+    command.env("FABRIC_SHELL", "1");
+    command.env("FABRIC_PEER", peer);
     let mut child = pair.slave.spawn_command(command)?;
     let mut reader = pair.master.try_clone_reader()?;
     let mut writer = pair.master.take_writer()?;

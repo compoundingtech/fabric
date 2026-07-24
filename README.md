@@ -294,9 +294,19 @@ with no Keychain/`login` context. A shell-startup (`.bashrc`/`.zshrc`/prompt) th
 depends on the GUI login session — e.g. macOS `security show-keychain-info` on the
 login keychain, `ssh-add`, or anything that blocks waiting for a GUI unlock prompt
 — can **hang** the interactive shell (the connection is fine; the dotfiles are
-stuck). Guard such startup steps so they only run when a GUI login session is
-actually present (e.g. gate Keychain access on `launchctl managername` being
-`Aqua`, or make the step non-blocking) rather than unconditionally in your shell rc.
+stuck). To make this easy to guard, fabric sets **marker env vars** in the remote
+session: `FABRIC_SHELL=1` inside a `fabric shell`, `FABRIC_EXEC=1` under
+`fabric exec`, and `FABRIC_PEER=<nodeid>` (the connecting peer — who opened the
+session) in both. Gate fragile startup on them rather than running it
+unconditionally, e.g. near the top of your `.bashrc`/`.zshrc`:
+
+```sh
+# Skip GUI/login-session-dependent startup when invoked over fabric.
+if [ -n "$FABRIC_SHELL" ]; then
+  # keychain unlock, ssh-add, slow xcode/brew probes, etc. — skip or make non-blocking
+  return 2>/dev/null || true
+fi
+```
 
 The service uses the same fabric home, identity, persisted exposes, and trusted
 peer allow-list. It does not install SSH keys or change fabric's authorization

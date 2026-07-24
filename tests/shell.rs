@@ -183,6 +183,53 @@ async fn trusted_peer_with_allow_shell_runs_remote_shell_and_propagates_exit() -
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_shell_exposes_fabric_marker_env() -> Result<()> {
+    let node_a_dir = TempDir::new()?;
+    let node_b_dir = TempDir::new()?;
+    let node_a_home = FabricHome::new(node_a_dir.path());
+    let node_b_home = FabricHome::new(node_b_dir.path());
+
+    let node_a = FabricNode::start_with_options(node_a_home.clone(), true).await?;
+    let node_b = FabricNode::start(node_b_home.clone()).await?;
+    trust_peer(
+        &node_a_home,
+        &node_a,
+        node_b.id(),
+        Some("node-b"),
+        Some(node_b.addr()),
+    )
+    .await?;
+    trust_peer(
+        &node_b_home,
+        &node_b,
+        node_a.id(),
+        Some("node-a"),
+        Some(node_a.addr()),
+    )
+    .await?;
+    wait_for_cli_status(&node_b_home, false).await?;
+
+    // node_b shells into node_a, so inside node_a's shell FABRIC_SHELL=1 and
+    // FABRIC_PEER is node_b's NodeID (the connecting peer).
+    let output = run_shell(
+        &node_b_home,
+        "node-a",
+        "printf 'MARK=%s:%s\\n' \"$FABRIC_SHELL\" \"$FABRIC_PEER\"; exit 0\n",
+    )?;
+    assert_success(&output, "marker-env shell");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected = format!("MARK=1:{}", node_b.id());
+    assert!(
+        stdout.contains(&expected),
+        "expected {expected}, stdout was: {stdout}"
+    );
+
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn trusted_peer_without_allow_shell_is_refused() -> Result<()> {
     let node_a_dir = TempDir::new()?;
     let node_b_dir = TempDir::new()?;
