@@ -166,6 +166,17 @@ prebuilt binary matches your machine, run an explicit source install:
 curl -sSf https://raw.githubusercontent.com/compoundingtech/fabric/main/install.sh | sh -s -- --from-source
 ```
 
+**Prebuilt vs. from source.** The plain `curl … | sh` path above downloads a
+prebuilt release binary and needs **no toolchain** — the fast path for a fresh
+machine. Every *source* path (`--from-source`, a cloned-repo `./install.sh`,
+`make install`, `cargo install --path .`, or `cargo build`) instead compiles
+fabric locally and therefore requires a **Rust toolchain**; install one first via
+[rustup](https://rustup.rs):
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # then: source ~/.cargo/env
+```
+
 To pin a release:
 
 ```sh
