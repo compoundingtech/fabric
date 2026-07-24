@@ -5,3 +5,6 @@
 /DING-BUS.md
 /PERSONA.md
 /pty.toml
+
+# nix build output symlink
+/result
