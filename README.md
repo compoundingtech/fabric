@@ -695,6 +695,14 @@ sync only ever touches already-trusted peers — it adds no new trust surface.
 Conflicts resolve newer-wins by a logical version with a deterministic tie-break,
 not by filesystem mtime (which is unreliable across machines).
 
+Fabric stores each entry's internal recovery data under
+`<home>/sync/<sanitized-name>/`. `state.json` is the authoritative atomic record
+of both the converged manifest and the files last observed on local disk;
+`manifest.json` is only a compatibility and inspection projection. Do not edit
+either file independently. A rollback or downgrade must restore the entire
+per-entry state directory together with the matching Fabric binary and config,
+not only `manifest.json`.
+
 ### Sync Commands
 
 ```sh

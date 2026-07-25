@@ -25,6 +25,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use iroh::EndpointAddr;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -78,6 +79,16 @@ struct EntryState {
     /// A Present held only in the node is not evidence that a missing path was
     /// locally deleted; this receipt is what distinguishes those cases.
     observed: Arc<StdMutex<HashMap<String, ContentHash>>>,
+}
+
+/// Atomically persisted authoritative state for one sync entry. `manifest.json`
+/// remains a compatibility/inspection projection, but restart recovery reads
+/// this combined file so manifest transitions and their observed-disk receipt
+/// cannot be torn apart by a crash.
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedEntryState {
+    manifest: Manifest,
+    observed: HashMap<String, ContentHash>,
 }
 
 /// State captured immediately before an inbound merge. The operation guard
@@ -152,8 +163,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                     existing.observed.clone(),
                 ),
                 _ => {
-                    let node = self.load_node(cfg).await?;
-                    let observed = observed_from_disk(node.manifest(), cfg)?;
+                    let (node, observed) = self.load_node_and_observed(cfg).await?;
                     (
                         Arc::new(Mutex::new(node)),
                         Arc::new(Mutex::new(())),
@@ -176,12 +186,20 @@ impl<T: SyncTransport> SyncEngine<T> {
         Ok(())
     }
 
-    async fn load_node(&self, cfg: &SyncEntry) -> Result<SyncNode> {
+    async fn load_node_and_observed(
+        &self,
+        cfg: &SyncEntry,
+    ) -> Result<(SyncNode, HashMap<String, ContentHash>)> {
         let mut node = SyncNode::new(self.author);
+        if let Some(state) = self.read_state(&cfg.name)? {
+            node.adopt(&state.manifest);
+            return Ok((node, state.observed));
+        }
         if let Some(manifest) = self.read_manifest(&cfg.name)? {
             node.adopt(&manifest);
         }
-        Ok(node)
+        let observed = observed_from_disk(node.manifest(), cfg)?;
+        Ok((node, observed))
     }
 
     /// Resolve a sync name to its node (used by the daemon's inbound accept).
@@ -208,11 +226,11 @@ impl<T: SyncTransport> SyncEngine<T> {
             return Ok(None);
         };
         let operation = entry.operation.clone().lock_owned().await;
-        if self.scan_entry(&entry).await? {
-            // Persist the local intent before accepting remote state so a crash
-            // during the wire session cannot lose the tombstone either.
-            self.persist_entry(&entry).await?;
-        }
+        self.scan_entry(&entry).await?;
+        // Persist the receipt even when the manifest did not change: a legacy
+        // entry may not have state.json yet, and a crash during this first wire
+        // session must not lose knowledge of locally observed Present paths.
+        self.persist_entry(&entry).await?;
         let baseline = entry.observed.lock().unwrap().clone();
         Ok(Some(PreparedInbound {
             entry,
@@ -342,7 +360,11 @@ impl<T: SyncTransport> SyncEngine<T> {
 
     async fn persist_entry(&self, entry: &EntryState) -> Result<()> {
         let manifest = entry.node.lock().await.manifest().clone();
-        self.write_manifest(&entry.config.name, &manifest)
+        let observed = entry.observed.lock().unwrap().clone();
+        self.write_state(
+            &entry.config.name,
+            &PersistedEntryState { manifest, observed },
+        )
     }
 
     fn manifest_path(&self, name: &str) -> PathBuf {
@@ -351,6 +373,26 @@ impl<T: SyncTransport> SyncEngine<T> {
             .join("sync")
             .join(sanitize_name(name))
             .join("manifest.json")
+    }
+
+    fn state_path(&self, name: &str) -> PathBuf {
+        self.home
+            .root()
+            .join("sync")
+            .join(sanitize_name(name))
+            .join("state.json")
+    }
+
+    fn read_state(&self, name: &str) -> Result<Option<PersistedEntryState>> {
+        let path = self.state_path(name);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let state: PersistedEntryState = serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        Ok(Some(state))
     }
 
     fn read_manifest(&self, name: &str) -> Result<Option<Manifest>> {
@@ -372,6 +414,20 @@ impl<T: SyncTransport> SyncEngine<T> {
         }
         let raw = serde_json::to_string_pretty(manifest)?;
         write_atomic(&path, raw.as_bytes())
+    }
+
+    fn write_state(&self, name: &str, state: &PersistedEntryState) -> Result<()> {
+        let path = self.state_path(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let raw = serde_json::to_string_pretty(state)?;
+        // The combined state is authoritative and lands atomically first.
+        write_atomic(&path, raw.as_bytes())?;
+        // Keep the established manifest path current for operators and older
+        // Fabric binaries. A crash between these writes still recovers from the
+        // already-committed combined state above.
+        self.write_manifest(name, &state.manifest)
     }
 
     /// Start watching every configured entry's folder and syncing on change,
@@ -1305,6 +1361,78 @@ mod tests {
                 .get("inbox/remote-only.md"),
             Some(Entry::Present(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn inactive_entry_archive_uses_durable_observed_receipt_on_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(root.join("inbox")).unwrap();
+        std::fs::write(root.join("inbox/archived.md"), b"archive offline").unwrap();
+        write_bus_sync(dir.path(), &root);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+
+        // Disable the entry while its inbox Present is durably observed, then
+        // perform the archive while no watcher/entry can see the rename.
+        std::fs::write(dir.path().join("syncs.toml"), "").unwrap();
+        engine.load_from_config().await.unwrap();
+        assert!(engine.node_for("bus").await.is_none());
+        std::fs::create_dir_all(root.join("archive")).unwrap();
+        std::fs::rename(
+            root.join("inbox/archived.md"),
+            root.join("archive/archived.md"),
+        )
+        .unwrap();
+
+        // Cross an actual daemon/engine restart boundary while the entry is
+        // still disabled. Remove the compatibility projection as well, proving
+        // that the authoritative combined state is the only recovery source.
+        let state_path = engine.state_path("bus");
+        let manifest_path = engine.manifest_path("bus");
+        assert!(state_path.exists());
+        drop(engine);
+        std::fs::remove_file(&manifest_path).unwrap();
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(engine.node_for("bus").await.is_none());
+        assert!(!manifest_path.exists());
+
+        write_bus_sync(dir.path(), &root);
+        engine.load_from_config().await.unwrap();
+        engine.sync_once("bus").await.unwrap();
+
+        let node = engine.node_for("bus").await.unwrap();
+        let node = node.lock().await;
+        assert!(matches!(
+            node.manifest().get("inbox/archived.md"),
+            Some(Entry::Tombstone(_))
+        ));
+        assert!(matches!(
+            node.manifest().get("archive/archived.md"),
+            Some(Entry::Present(_))
+        ));
+        drop(node);
+        assert!(!root.join("inbox/archived.md").exists());
+        assert_eq!(
+            std::fs::read(root.join("archive/archived.md")).unwrap(),
+            b"archive offline"
+        );
     }
 
     #[tokio::test]

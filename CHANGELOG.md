@@ -35,7 +35,10 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   carry an explicit last-observed disk receipt across reconciliation, durably
   record local changes before merging, and guard final materialization. This
   preserves deletes in both pre-merge and post-scan races while still accepting
-  genuinely new remote files, without deadlocking simultaneous peer syncs.
+  genuinely new remote files, without deadlocking simultaneous peer syncs. The
+  manifest and observed-disk receipt are committed together in one authoritative
+  state file, so the same guarantee survives daemon restarts and time spent with
+  a sync entry disabled.
 
 - **Peer-config split when the daemon runs with `--home <default-root>`.** The
   managed service always launches the daemon as
