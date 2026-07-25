@@ -189,13 +189,14 @@ where
 }
 
 /// Run the accepting side of a reconcile against a peer stream. Returns the sync
-/// `name` the peer asked for (so the daemon can route to the right entry) and the
-/// reconcile stats.
-pub async fn run_server<S, F, Fut>(mut stream: S, resolve: F) -> Result<(String, Reconciled)>
+/// `name` the peer asked for (so the daemon can route to the right entry), the
+/// reconcile stats, and the resolver-provided context kept alive for the full
+/// session.
+pub async fn run_server<S, F, Fut, C>(mut stream: S, resolve: F) -> Result<(String, Reconciled, C)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     F: FnOnce(String) -> Fut,
-    Fut: std::future::Future<Output = Option<Arc<Mutex<SyncNode>>>>,
+    Fut: std::future::Future<Output = Result<Option<(Arc<Mutex<SyncNode>>, C)>>>,
 {
     // 1. Read Hello.
     let hello: HelloHeader = serde_json::from_slice(
@@ -204,7 +205,7 @@ where
             .context("reading sync hello header")?,
     )?;
 
-    let Some(node) = resolve(hello.name.clone()).await else {
+    let Some((node, context)) = resolve(hello.name.clone()).await? else {
         bail!("no local sync entry named {:?}", hello.name);
     };
 
@@ -250,6 +251,7 @@ where
             pushed,
             bytes: sent + received.bytes,
         },
+        context,
     ))
 }
 
@@ -293,12 +295,12 @@ mod tests {
         let server = tokio::spawn(async move {
             run_server(server_end, move |name| async move {
                 assert_eq!(name, "cat");
-                Some(b_for_server)
+                Ok(Some((b_for_server, ())))
             })
             .await
         });
         let client = run_client(client_end, a.clone(), "cat").await.unwrap();
-        let (name, _server_stats) = server.await.unwrap().unwrap();
+        let (name, _server_stats, ()) = server.await.unwrap().unwrap();
         assert_eq!(name, "cat");
         assert!(!client.is_noop());
 
@@ -318,8 +320,9 @@ mod tests {
         {
             let (c, s) = tokio::io::duplex(1 << 20);
             let b2 = b.clone();
-            let srv =
-                tokio::spawn(async move { run_server(s, move |_| async move { Some(b2) }).await });
+            let srv = tokio::spawn(async move {
+                run_server(s, move |_| async move { Ok(Some((b2, ()))) }).await
+            });
             run_client(c, a.clone(), "cat").await.unwrap();
             srv.await.unwrap().unwrap();
         }
@@ -327,7 +330,9 @@ mod tests {
         let (c, s) = tokio::io::duplex(1 << 20);
         let b2 = b.clone();
         let srv =
-            tokio::spawn(async move { run_server(s, move |_| async move { Some(b2) }).await });
+            tokio::spawn(
+                async move { run_server(s, move |_| async move { Ok(Some((b2, ()))) }).await },
+            );
         let stats = run_client(c, a.clone(), "cat").await.unwrap();
         srv.await.unwrap().unwrap();
         assert_eq!(
@@ -348,7 +353,9 @@ mod tests {
         let (c, s) = tokio::io::duplex(1 << 20);
         let b2 = b.clone();
         let srv =
-            tokio::spawn(async move { run_server(s, move |_| async move { Some(b2) }).await });
+            tokio::spawn(
+                async move { run_server(s, move |_| async move { Ok(Some((b2, ()))) }).await },
+            );
         run_client(c, a.clone(), "cat").await.unwrap();
         srv.await.unwrap().unwrap();
 

@@ -25,13 +25,13 @@ use std::{
 
 use anyhow::{Context, Result};
 use iroh::EndpointAddr;
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::FabricHome;
 
 use super::config::{PolicyRules, SyncBook, SyncEntry, SyncPeers};
-use super::manifest::{Author, Manifest};
+use super::manifest::{Author, ContentHash, Manifest};
 use super::node::{Reconciled, SyncNode, content_hash};
 
 /// How long to wait after a filesystem event settles before syncing, so a burst
@@ -70,6 +70,30 @@ struct EntryState {
     config: SyncEntry,
     policy: PolicyRules,
     node: Arc<Mutex<SyncNode>>,
+    /// Serialize filesystem scan/materialize phases for this entry. An inbound
+    /// transaction keeps an owned guard across the wire session; outbound
+    /// sessions release it while dialing to avoid distributed lock inversion.
+    operation: Arc<Mutex<()>>,
+    /// Last state the engine actually observed or materialized on local disk.
+    /// A Present held only in the node is not evidence that a missing path was
+    /// locally deleted; this receipt is what distinguishes those cases.
+    observed: Arc<StdMutex<HashMap<String, ContentHash>>>,
+}
+
+/// State captured immediately before an inbound merge. The operation guard
+/// keeps every engine-driven scan/materialize for this entry out of the middle
+/// of the wire session; `baseline` is the pre-merge observed-disk receipt that
+/// distinguishes local paths from genuinely new remote paths at completion.
+pub(crate) struct PreparedInbound {
+    entry: Arc<EntryState>,
+    baseline: HashMap<String, ContentHash>,
+    _operation: OwnedMutexGuard<()>,
+}
+
+impl PreparedInbound {
+    pub(crate) fn node(&self) -> Arc<Mutex<SyncNode>> {
+        self.entry.node.clone()
+    }
 }
 
 impl<T: SyncTransport> std::fmt::Debug for SyncEngine<T> {
@@ -121,9 +145,21 @@ impl<T: SyncTransport> SyncEngine<T> {
             let policy = cfg.policy.rules();
             // Reuse an existing node for an unchanged entry so in-memory content
             // survives a reload; otherwise start one from the persisted manifest.
-            let node = match entries.get(&cfg.name) {
-                Some(existing) if existing.config == *cfg => existing.node.clone(),
-                _ => Arc::new(Mutex::new(self.load_node(cfg).await?)),
+            let (node, operation, observed) = match entries.get(&cfg.name) {
+                Some(existing) if existing.config == *cfg => (
+                    existing.node.clone(),
+                    existing.operation.clone(),
+                    existing.observed.clone(),
+                ),
+                _ => {
+                    let node = self.load_node(cfg).await?;
+                    let observed = observed_from_disk(node.manifest(), cfg)?;
+                    (
+                        Arc::new(Mutex::new(node)),
+                        Arc::new(Mutex::new(())),
+                        Arc::new(StdMutex::new(observed)),
+                    )
+                }
             };
             next.insert(
                 cfg.name.clone(),
@@ -131,6 +167,8 @@ impl<T: SyncTransport> SyncEngine<T> {
                     config: cfg.clone(),
                     policy,
                     node,
+                    operation,
+                    observed,
                 }),
             );
         }
@@ -153,6 +191,49 @@ impl<T: SyncTransport> SyncEngine<T> {
             .await
             .get(name)
             .map(|entry| entry.node.clone())
+    }
+
+    /// Scan and durably record local filesystem changes before exposing an
+    /// entry's node to an inbound reconcile.
+    ///
+    /// This ordering is essential for delete-propagating policies: an atomic
+    /// local rename/delete may already express user intent while its watcher
+    /// event is still inside the debounce window. Letting a peer reconcile and
+    /// materialize first could restore the stale Present entry and erase the
+    /// only observable evidence of that local deletion. Scanning before merge
+    /// also avoids treating paths that are genuinely new on the remote as local
+    /// deletions, because they are not in the observed-disk receipt yet.
+    pub(crate) async fn prepare_inbound(&self, name: &str) -> Result<Option<PreparedInbound>> {
+        let Some(entry) = self.entries.read().await.get(name).cloned() else {
+            return Ok(None);
+        };
+        let operation = entry.operation.clone().lock_owned().await;
+        if self.scan_entry(&entry).await? {
+            // Persist the local intent before accepting remote state so a crash
+            // during the wire session cannot lose the tombstone either.
+            self.persist_entry(&entry).await?;
+        }
+        let baseline = entry.observed.lock().unwrap().clone();
+        Ok(Some(PreparedInbound {
+            entry,
+            baseline,
+            _operation: operation,
+        }))
+    }
+
+    /// Complete an inbound transaction while its entry operation guard is still
+    /// held. Disk changes that landed during the wire session are compared to
+    /// the pre-merge baseline: a vanished baseline Present is a local delete,
+    /// while a remote-only Present is materialized instead of tombstoned.
+    pub(crate) async fn complete_inbound(&self, prepared: PreparedInbound) -> Result<()> {
+        let PreparedInbound {
+            entry,
+            baseline,
+            _operation,
+        } = prepared;
+        self.scan_entry(&entry).await?;
+        self.materialize_entry_state(&entry, &baseline).await?;
+        self.persist_entry(&entry).await
     }
 
     /// The configured sync names.
@@ -187,9 +268,18 @@ impl<T: SyncTransport> SyncEngine<T> {
         let Some(entry) = self.entries.read().await.get(name).cloned() else {
             return Ok(());
         };
-
-        self.scan_entry(&entry).await?;
-        self.materialize_entry_state(&entry).await?;
+        // Never hold the local operation guard across a peer dial. If A and B
+        // initiate together, retaining A while awaiting B's inbound guard (and
+        // vice versa) is a distributed lock inversion. Carry a pre-merge
+        // baseline across the unlocked network step instead.
+        let baseline = {
+            let _operation = entry.operation.lock().await;
+            let protected = entry.observed.lock().unwrap().clone();
+            self.scan_entry(&entry).await?;
+            self.materialize_entry_state(&entry, &protected).await?;
+            self.persist_entry(&entry).await?;
+            entry.observed.lock().unwrap().clone()
+        };
 
         let peers = self.transport.peers_for(&entry.config.peers).await;
         for peer in peers {
@@ -212,18 +302,20 @@ impl<T: SyncTransport> SyncEngine<T> {
             }
         }
 
-        self.materialize_entry_state(&entry).await?;
-        self.persist_entry(&entry).await?;
-        Ok(())
+        let _operation = entry.operation.lock().await;
+        self.scan_entry(&entry).await?;
+        self.materialize_entry_state(&entry, &baseline).await?;
+        self.persist_entry(&entry).await
     }
 
-    /// Materialize just this entry to disk (used by the daemon after an inbound
-    /// reconcile writes into the node).
+    /// Materialize just this entry to disk.
     pub async fn materialize_entry(&self, name: &str) -> Result<()> {
         let Some(entry) = self.entries.read().await.get(name).cloned() else {
             return Ok(());
         };
-        self.materialize_entry_state(&entry).await?;
+        let _operation = entry.operation.lock().await;
+        let protected = entry.observed.lock().unwrap().clone();
+        self.materialize_entry_state(&entry, &protected).await?;
         self.persist_entry(&entry).await
     }
 
@@ -232,14 +324,20 @@ impl<T: SyncTransport> SyncEngine<T> {
         let cfg = entry.config.clone();
         let policy = entry.policy;
         let mut node = entry.node.lock().await;
-        scan_into_node(&mut node, &root, &cfg, policy)
+        let mut observed = entry.observed.lock().unwrap();
+        scan_into_node_observed(&mut node, &root, &cfg, policy, &mut observed)
     }
 
-    async fn materialize_entry_state(&self, entry: &EntryState) -> Result<()> {
+    async fn materialize_entry_state(
+        &self,
+        entry: &EntryState,
+        protected: &HashMap<String, ContentHash>,
+    ) -> Result<()> {
         let root = entry.config.folder.clone();
         let policy = entry.policy;
-        let node = entry.node.lock().await;
-        materialize(&node, &root, policy)
+        let mut node = entry.node.lock().await;
+        let mut observed = entry.observed.lock().unwrap();
+        materialize_tracked(&mut node, &root, policy, protected, &mut observed)
     }
 
     async fn persist_entry(&self, entry: &EntryState) -> Result<()> {
@@ -420,37 +518,95 @@ fn scan_folder(root: &Path, entry: &SyncEntry) -> Result<Vec<ScannedFile>> {
 /// Scan `root` into `node`: record every file, and treat files that vanished
 /// from disk per policy (catalog ignores; bus tombstones). Returns whether the
 /// manifest changed.
+#[cfg(test)]
 fn scan_into_node(
     node: &mut SyncNode,
     root: &Path,
     entry: &SyncEntry,
     policy: PolicyRules,
 ) -> Result<bool> {
-    let scanned = scan_folder(root, entry)?;
-    let mut changed = false;
-    let mut seen = HashSet::new();
-    for file in &scanned {
-        seen.insert(file.rel.clone());
-        if node.local_write(&file.rel, &file.bytes, file.mtime_secs, file.mtime_nanos) {
-            changed = true;
-        }
-    }
-    let present: Vec<String> = node
-        .manifest()
+    let mut observed = observed_from_manifest(node.manifest());
+    scan_into_node_observed(node, root, entry, policy, &mut observed)
+}
+
+#[cfg(test)]
+fn observed_from_manifest(manifest: &Manifest) -> HashMap<String, ContentHash> {
+    manifest
         .present_paths()
-        .map(|(path, _)| path.clone())
-        .collect();
-    let now = now_secs();
-    for path in present {
-        if !seen.contains(&path) && node.local_remove(&path, policy, now) {
+        .map(|(path, meta)| (path.clone(), meta.hash))
+        .collect()
+}
+
+/// Build the initial receipt from bytes that are actually on disk and still
+/// match the persisted manifest. A persisted remote Present with no local bytes
+/// was never materialized, so it must not be treated as deletion evidence after
+/// restart; a new or changed disk file is deliberately omitted so the first scan
+/// records it as a local write.
+fn observed_from_disk(
+    manifest: &Manifest,
+    entry: &SyncEntry,
+) -> Result<HashMap<String, ContentHash>> {
+    let mut observed = HashMap::new();
+    for file in scan_folder(&entry.folder, entry)? {
+        let hash = content_hash(&file.bytes);
+        if manifest
+            .get(&file.rel)
+            .and_then(|entry| entry.meta())
+            .is_some_and(|meta| meta.hash == hash)
+        {
+            observed.insert(file.rel, hash);
+        }
+    }
+    Ok(observed)
+}
+
+/// Scan against the last state actually observed on disk. Manifest-only Present
+/// entries may have arrived from a concurrent reconcile and must not become
+/// tombstones merely because they have not been materialized yet.
+fn scan_into_node_observed(
+    node: &mut SyncNode,
+    root: &Path,
+    entry: &SyncEntry,
+    policy: PolicyRules,
+    observed: &mut HashMap<String, ContentHash>,
+) -> Result<bool> {
+    let scanned = scan_folder(root, entry)?;
+    let previous = observed.clone();
+    let mut current = HashMap::new();
+    let mut changed = false;
+    for file in &scanned {
+        let hash = content_hash(&file.bytes);
+        current.insert(file.rel.clone(), hash);
+        if previous.get(&file.rel) == Some(&hash) {
+            // Refill content after restart only when the manifest still names
+            // these exact bytes. If a peer changed the entry while its old disk
+            // bytes remained, those bytes are stale rather than a local edit.
+            if node
+                .manifest()
+                .get(&file.rel)
+                .and_then(|entry| entry.meta())
+                .is_some_and(|meta| meta.hash == hash)
+            {
+                node.put_content(file.bytes.clone());
+            }
+        } else if node.local_write(&file.rel, &file.bytes, file.mtime_secs, file.mtime_nanos) {
             changed = true;
         }
     }
+
+    let now = now_secs();
+    for path in previous.keys() {
+        if !current.contains_key(path) && node.local_remove(path, policy, now) {
+            changed = true;
+        }
+    }
+    *observed = current;
     Ok(changed)
 }
 
 /// Write `node`'s present entries to disk (only where content differs) and, under
 /// a delete-propagating policy, remove tombstoned files.
+#[cfg(test)]
 fn materialize(node: &SyncNode, root: &Path, policy: PolicyRules) -> Result<()> {
     std::fs::create_dir_all(root)
         .with_context(|| format!("failed to create {}", root.display()))?;
@@ -474,6 +630,85 @@ fn materialize(node: &SyncNode, root: &Path, policy: PolicyRules) -> Result<()> 
         for (rel, entry) in node.manifest().entries() {
             if !entry.is_present() {
                 let _ = std::fs::remove_file(root.join(rel));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Materialize a reconcile result with a final local-delete guard.
+///
+/// The post-merge scan closes the broad wire-session window. This final
+/// existence check closes the narrower scan-to-write window: if a path that was
+/// locally Present before the merge vanished after the scan, record its
+/// tombstone instead of restoring it. A remote-only path is not in `protected`,
+/// so an absent destination is still materialized normally.
+fn materialize_tracked(
+    node: &mut SyncNode,
+    root: &Path,
+    policy: PolicyRules,
+    protected: &HashMap<String, ContentHash>,
+    observed: &mut HashMap<String, ContentHash>,
+) -> Result<()> {
+    std::fs::create_dir_all(root)
+        .with_context(|| format!("failed to create {}", root.display()))?;
+    let present: Vec<_> = node
+        .manifest()
+        .present_paths()
+        .map(|(rel, meta)| (rel.clone(), *meta))
+        .collect();
+    let now = now_secs();
+    for (rel, meta) in present {
+        let path = root.join(&rel);
+        let existing = std::fs::read(&path);
+        let protected_local_path = protected.contains_key(&rel);
+        if policy.propagate_deletes
+            && protected_local_path
+            && matches!(
+                &existing,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        {
+            node.local_remove(&rel, policy, now);
+            observed.remove(&rel);
+            continue;
+        }
+
+        let needs_write = match existing {
+            Ok(existing) => {
+                let existing_hash = content_hash(&existing);
+                if existing_hash == meta.hash {
+                    observed.insert(rel.clone(), meta.hash);
+                    false
+                } else if protected.get(&rel) != Some(&existing_hash) {
+                    // The bytes changed (or appeared) after the protected disk
+                    // receipt was captured. This is a concurrent local edit,
+                    // not stale content to overwrite with the remote Present.
+                    node.local_write(&rel, &existing, 0, 0);
+                    observed.insert(rel.clone(), existing_hash);
+                    false
+                } else {
+                    true
+                }
+            }
+            Err(_) => true,
+        };
+        if needs_write {
+            let Some(bytes) = node.get_content(&meta.hash) else {
+                continue; // content not held yet; a reconcile will fetch it
+            };
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            write_atomic(&path, bytes)?;
+            observed.insert(rel, meta.hash);
+        }
+    }
+    if policy.propagate_deletes {
+        for (rel, entry) in node.manifest().entries() {
+            if !entry.is_present() {
+                let _ = std::fs::remove_file(root.join(rel));
+                observed.remove(rel);
             }
         }
     }
@@ -555,7 +790,8 @@ fn spawn_watcher(root: &Path, tx: mpsc::UnboundedSender<()>) -> Option<notify::R
 mod tests {
     use super::*;
     use crate::sync::config::SyncPolicy;
-    use std::sync::Mutex as StdMutex;
+    use crate::sync::manifest::Entry;
+    use std::sync::{Mutex as StdMutex, Weak};
 
     fn catalog_entry(name: &str, folder: &Path) -> SyncEntry {
         SyncEntry {
@@ -686,7 +922,11 @@ mod tests {
             let server_name = name.clone();
             let server = tokio::spawn(async move {
                 crate::sync::wire::run_server(server_end, move |n| async move {
-                    if n == server_name { Some(target) } else { None }
+                    Ok(if n == server_name {
+                        Some((target, ()))
+                    } else {
+                        None
+                    })
                 })
                 .await
             });
@@ -696,11 +936,162 @@ mod tests {
         }
     }
 
+    struct EnginePeer {
+        id: String,
+        engine: Weak<SyncEngine<EngineLoopbackTransport>>,
+    }
+
+    /// Loopback transport that exercises the production inbound engine hooks,
+    /// including the entry operation guard, rather than routing straight to a
+    /// bare node like `LoopbackTransport`.
+    #[derive(Default)]
+    struct EngineLoopbackTransport {
+        peers: StdMutex<Vec<EnginePeer>>,
+    }
+
+    impl EngineLoopbackTransport {
+        fn add_peer(&self, id: &str, engine: &Arc<SyncEngine<Self>>) {
+            self.peers.lock().unwrap().push(EnginePeer {
+                id: id.to_string(),
+                engine: Arc::downgrade(engine),
+            });
+        }
+    }
+
+    impl SyncTransport for EngineLoopbackTransport {
+        async fn peers_for(&self, _peers: &SyncPeers) -> Vec<PeerRef> {
+            self.peers
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|peer| peer.engine.strong_count() > 0)
+                .map(|peer| PeerRef {
+                    id: peer.id.clone(),
+                    addr: None,
+                })
+                .collect()
+        }
+
+        async fn reconcile(
+            &self,
+            peer: PeerRef,
+            name: String,
+            node: Arc<Mutex<SyncNode>>,
+        ) -> Result<Reconciled> {
+            let target = {
+                let peers = self.peers.lock().unwrap();
+                peers
+                    .iter()
+                    .find(|candidate| candidate.id == peer.id)
+                    .and_then(|candidate| candidate.engine.upgrade())
+            };
+            let Some(target) = target else {
+                return Ok(Reconciled::default());
+            };
+
+            let (client_end, server_end) = tokio::io::duplex(1 << 20);
+            let resolver_target = target.clone();
+            let server = tokio::spawn(async move {
+                let (_, _, prepared) =
+                    crate::sync::wire::run_server(server_end, move |requested| {
+                        let engine = resolver_target.clone();
+                        async move {
+                            let prepared = engine.prepare_inbound(&requested).await?;
+                            Ok(prepared.map(|prepared| (prepared.node(), prepared)))
+                        }
+                    })
+                    .await?;
+                target.complete_inbound(prepared).await
+            });
+            let stats = crate::sync::wire::run_client(client_end, node, &name).await?;
+            server.await??;
+            Ok(stats)
+        }
+    }
+
     fn write_syncs(home: &Path, folder: &Path) {
         let toml = format!(
             "[[sync]]\nname = \"catalog\"\nfolder = {folder:?}\npeers = \"*\"\npolicy = \"catalog\"\n"
         );
         std::fs::write(home.join("syncs.toml"), toml).unwrap();
+    }
+
+    fn write_bus_sync(home: &Path, folder: &Path) {
+        let toml = format!(
+            "[[sync]]\nname = \"bus\"\nfolder = {folder:?}\npeers = \"*\"\npolicy = \"bus\"\n"
+        );
+        std::fs::write(home.join("syncs.toml"), toml).unwrap();
+    }
+
+    async fn archive_race_fixture() -> (
+        tempfile::TempDir,
+        PathBuf,
+        Arc<SyncEngine<LoopbackTransport>>,
+        Arc<Mutex<SyncNode>>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(root.join("inbox")).unwrap();
+        std::fs::write(root.join("inbox/archived.md"), b"archive me").unwrap();
+        write_bus_sync(dir.path(), &root);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+
+        // Start the remote from the exact same stale Present entry and content,
+        // then add one path that has never existed locally.
+        let local_node = engine.node_for("bus").await.unwrap();
+        let manifest = local_node.lock().await.manifest().clone();
+        let mut remote = SyncNode::new(Author([2; 32]));
+        remote.put_content(b"archive me".to_vec());
+        remote.adopt(&manifest);
+        remote.local_write("inbox/remote-new.md", b"new from peer", 0, 0);
+
+        (dir, root, engine, Arc::new(Mutex::new(remote)))
+    }
+
+    async fn assert_archive_outcome(engine: &SyncEngine<LoopbackTransport>, root: &Path) {
+        let node = engine.node_for("bus").await.unwrap();
+        let node = node.lock().await;
+        assert!(
+            matches!(
+                node.manifest().get("inbox/archived.md"),
+                Some(Entry::Tombstone(_))
+            ),
+            "the local inbox removal must become a tombstone before merge"
+        );
+        assert!(
+            matches!(
+                node.manifest().get("archive/archived.md"),
+                Some(Entry::Present(_))
+            ),
+            "the archive side of the local rename must remain present"
+        );
+        assert!(
+            matches!(
+                node.manifest().get("inbox/remote-new.md"),
+                Some(Entry::Present(_))
+            ),
+            "a genuinely new remote file must not be falsely tombstoned"
+        );
+        drop(node);
+
+        assert!(!root.join("inbox/archived.md").exists());
+        assert_eq!(
+            std::fs::read(root.join("archive/archived.md")).unwrap(),
+            b"archive me"
+        );
+        assert_eq!(
+            std::fs::read(root.join("inbox/remote-new.md")).unwrap(),
+            b"new from peer"
+        );
     }
 
     #[tokio::test]
@@ -758,5 +1149,295 @@ mod tests {
             std::fs::read(dir_a.path().join("catalog/job.toml")).is_ok(),
             "catalog delete must not remove the file on A"
         );
+    }
+
+    #[tokio::test]
+    async fn simultaneous_three_peer_syncs_do_not_deadlock() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let dir_c = tempfile::tempdir().unwrap();
+        let root_a = dir_a.path().join("resources");
+        let root_b = dir_b.path().join("resources");
+        let root_c = dir_c.path().join("resources");
+        write_bus_sync(dir_a.path(), &root_a);
+        write_bus_sync(dir_b.path(), &root_b);
+        write_bus_sync(dir_c.path(), &root_c);
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        std::fs::create_dir_all(&root_c).unwrap();
+        std::fs::write(root_a.join("a.md"), b"a").unwrap();
+        std::fs::write(root_b.join("b.md"), b"b").unwrap();
+        std::fs::write(root_c.join("c.md"), b"c").unwrap();
+
+        let transport_a = Arc::new(EngineLoopbackTransport::default());
+        let transport_b = Arc::new(EngineLoopbackTransport::default());
+        let transport_c = Arc::new(EngineLoopbackTransport::default());
+        let engine_a = SyncEngine::new(
+            FabricHome::new(dir_a.path()),
+            Author([1; 32]),
+            transport_a.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let engine_b = SyncEngine::new(
+            FabricHome::new(dir_b.path()),
+            Author([2; 32]),
+            transport_b.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let engine_c = SyncEngine::new(
+            FabricHome::new(dir_c.path()),
+            Author([3; 32]),
+            transport_c.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        transport_a.add_peer("b", &engine_b);
+        transport_a.add_peer("c", &engine_c);
+        transport_b.add_peer("a", &engine_a);
+        transport_b.add_peer("c", &engine_c);
+        transport_c.add_peer("a", &engine_a);
+        transport_c.add_peer("b", &engine_b);
+
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::try_join!(
+                    engine_a.sync_once("bus"),
+                    engine_b.sync_once("bus"),
+                    engine_c.sync_once("bus")
+                )
+            })
+            .await
+            .expect("simultaneous peer syncs deadlocked")
+            .unwrap();
+        }
+
+        for root in [&root_a, &root_b, &root_c] {
+            assert_eq!(std::fs::read(root.join("a.md")).unwrap(), b"a");
+            assert_eq!(std::fs::read(root.join("b.md")).unwrap(), b"b");
+            assert_eq!(std::fs::read(root.join("c.md")).unwrap(), b"c");
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_keeps_unmaterialized_remote_present_until_content_arrives() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        write_bus_sync(dir.path(), &root);
+
+        // Persist a remote Present without ever placing its bytes on disk. This
+        // models a reconcile that learned metadata but could not fetch content
+        // before the daemon restarted.
+        let seed_engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let mut remote = SyncNode::new(Author([2; 32]));
+        remote.local_write("inbox/remote-only.md", b"arrives later", 0, 0);
+        let manifest = remote.manifest().clone();
+        seed_engine.write_manifest("bus", &manifest).unwrap();
+        drop(seed_engine);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+        assert!(!root.join("inbox/remote-only.md").exists());
+        assert!(matches!(
+            engine
+                .node_for("bus")
+                .await
+                .unwrap()
+                .lock()
+                .await
+                .manifest()
+                .get("inbox/remote-only.md"),
+            Some(Entry::Present(_))
+        ));
+
+        // Once a peer supplies the referenced bytes, the same Present
+        // materializes rather than being superseded by a false tombstone.
+        let remote = Arc::new(Mutex::new(remote));
+        let (client_end, server_end) = tokio::io::duplex(1 << 20);
+        let resolver_engine = engine.clone();
+        let server = tokio::spawn(async move {
+            crate::sync::wire::run_server(server_end, move |name| {
+                let engine = resolver_engine.clone();
+                async move {
+                    let prepared = engine.prepare_inbound(&name).await?;
+                    Ok(prepared.map(|prepared| (prepared.node(), prepared)))
+                }
+            })
+            .await
+        });
+        crate::sync::wire::run_client(client_end, remote, "bus")
+            .await
+            .unwrap();
+        let (_, _, prepared) = server.await.unwrap().unwrap();
+        engine.complete_inbound(prepared).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(root.join("inbox/remote-only.md")).unwrap(),
+            b"arrives later"
+        );
+        assert!(matches!(
+            engine
+                .node_for("bus")
+                .await
+                .unwrap()
+                .lock()
+                .await
+                .manifest()
+                .get("inbox/remote-only.md"),
+            Some(Entry::Present(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_edit_after_post_merge_scan_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("shared.md"), b"original").unwrap();
+        write_bus_sync(dir.path(), &root);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+
+        let local_node = engine.node_for("bus").await.unwrap();
+        let manifest = local_node.lock().await.manifest().clone();
+        let mut remote = SyncNode::new(Author([2; 32]));
+        remote.put_content(b"original".to_vec());
+        remote.adopt(&manifest);
+        remote.local_write("shared.md", b"remote edit", 0, 0);
+        let remote = Arc::new(Mutex::new(remote));
+
+        let prepared = engine.prepare_inbound("bus").await.unwrap().unwrap();
+        let node = prepared.node();
+        let (client_end, server_end) = tokio::io::duplex(1 << 20);
+        let server = tokio::spawn(async move {
+            crate::sync::wire::run_server(server_end, move |name| async move {
+                assert_eq!(name, "bus");
+                Ok(Some((node, prepared)))
+            })
+            .await
+        });
+        crate::sync::wire::run_client(client_end, remote, "bus")
+            .await
+            .unwrap();
+        let (_, _, prepared) = server.await.unwrap().unwrap();
+
+        // Pause completion after its post-merge scan, then edit the file. Final
+        // materialization must version this local write above the remote edit.
+        let PreparedInbound {
+            entry,
+            baseline,
+            _operation,
+        } = prepared;
+        engine.scan_entry(&entry).await.unwrap();
+        std::fs::write(root.join("shared.md"), b"local after scan").unwrap();
+        engine
+            .materialize_entry_state(&entry, &baseline)
+            .await
+            .unwrap();
+        engine.persist_entry(&entry).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(root.join("shared.md")).unwrap(),
+            b"local after scan"
+        );
+        let node = engine.node_for("bus").await.unwrap();
+        let node = node.lock().await;
+        let meta = node.manifest().get("shared.md").unwrap().meta().unwrap();
+        assert_eq!(meta.hash, content_hash(b"local after scan"));
+        assert_eq!(meta.version, 3);
+    }
+
+    #[tokio::test]
+    async fn inbound_reconcile_preserves_local_archive_and_accepts_new_remote_file() {
+        let (_dir, root, engine, remote) = archive_race_fixture().await;
+
+        // st2 archive is one atomic rename inside the bus root. The watcher has
+        // not scanned it yet when an inbound reconcile begins.
+        std::fs::create_dir_all(root.join("archive")).unwrap();
+        std::fs::rename(
+            root.join("inbox/archived.md"),
+            root.join("archive/archived.md"),
+        )
+        .unwrap();
+
+        let (client_end, server_end) = tokio::io::duplex(1 << 20);
+        let resolver_engine = engine.clone();
+        let server = tokio::spawn(async move {
+            crate::sync::wire::run_server(server_end, move |name| {
+                let engine = resolver_engine.clone();
+                async move {
+                    let prepared = engine.prepare_inbound(&name).await?;
+                    Ok(prepared.map(|prepared| (prepared.node(), prepared)))
+                }
+            })
+            .await
+        });
+        crate::sync::wire::run_client(client_end, remote.clone(), "bus")
+            .await
+            .unwrap();
+        let (_, _, prepared) = server.await.unwrap().unwrap();
+        engine.complete_inbound(prepared).await.unwrap();
+
+        assert_archive_outcome(&engine, &root).await;
+    }
+
+    #[tokio::test]
+    async fn archive_after_inbound_prepare_wins_over_stale_remote_present() {
+        let (_dir, root, engine, remote) = archive_race_fixture().await;
+
+        // Deterministically pause the inbound transaction after its first scan.
+        // This is the post-scan/pre-merge window: the pre-merge baseline still
+        // says inbox/archived.md is Present when the atomic archive lands.
+        let prepared = engine.prepare_inbound("bus").await.unwrap().unwrap();
+        std::fs::create_dir_all(root.join("archive")).unwrap();
+        std::fs::rename(
+            root.join("inbox/archived.md"),
+            root.join("archive/archived.md"),
+        )
+        .unwrap();
+
+        let (client_end, server_end) = tokio::io::duplex(1 << 20);
+        let node = prepared.node();
+        let server = tokio::spawn(async move {
+            crate::sync::wire::run_server(server_end, move |name| async move {
+                assert_eq!(name, "bus");
+                Ok(Some((node, prepared)))
+            })
+            .await
+        });
+        crate::sync::wire::run_client(client_end, remote, "bus")
+            .await
+            .unwrap();
+        let (_, _, prepared) = server.await.unwrap().unwrap();
+        engine.complete_inbound(prepared).await.unwrap();
+
+        assert_archive_outcome(&engine, &root).await;
     }
 }

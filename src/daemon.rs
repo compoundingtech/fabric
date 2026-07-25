@@ -2532,17 +2532,21 @@ async fn handle_sync(connection: Connection, state: Arc<DaemonState>) -> Result<
     let resolver_engine = engine.clone();
     let outcome = sync::wire::run_server(stream, move |name| {
         let engine = resolver_engine.clone();
-        async move { engine.node_for(&name).await }
+        async move {
+            let prepared = engine.prepare_inbound(&name).await?;
+            Ok(prepared.map(|prepared| (prepared.node(), prepared)))
+        }
     })
     .await;
     match outcome {
-        Ok((name, stats)) => {
+        Ok((name, stats, prepared)) => {
             if !stats.is_noop() {
                 debug!(sync = %name, ?stats, "served sync reconcile");
             }
-            // Persist and write what the peer pushed to disk.
-            if let Err(error) = engine.materialize_entry(&name).await {
-                debug!(sync = %name, %error, "sync materialize failed");
+            // Re-scan changes that landed during the session, then persist and
+            // materialize while the inbound operation guard is still held.
+            if let Err(error) = engine.complete_inbound(prepared).await {
+                debug!(sync = %name, %error, "sync completion failed");
             }
         }
         Err(error) => debug!(%error, "sync serve failed"),

@@ -28,6 +28,15 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **Bus archive/delete intent lost to an inbound reconcile.** An atomic local
+  rename could remove an inbox file while Fabric's filesystem watcher was still
+  inside its 150 ms debounce window; an inbound sync in that gap could
+  materialize the stale Present entry and undo the archive. Inbound sessions now
+  carry an explicit last-observed disk receipt across reconciliation, durably
+  record local changes before merging, and guard final materialization. This
+  preserves deletes in both pre-merge and post-scan races while still accepting
+  genuinely new remote files, without deadlocking simultaneous peer syncs.
+
 - **Peer-config split when the daemon runs with `--home <default-root>`.** The
   managed service always launches the daemon as
   `--home ~/.local/share/fabric`, which made it read `peers.toml` from under that
