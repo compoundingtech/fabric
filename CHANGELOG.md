@@ -28,6 +28,13 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **Repeated `fabric exec`/`shell` calls exhausted daemon file descriptors.**
+  Replacing a command's deterministic local dial socket removed its pathname
+  but left the old listener task and file descriptor alive. The daemon now owns,
+  cancels, and joins each replaced accept loop while allowing already-accepted
+  sessions to finish, and deterministically closes all dial listeners on
+  shutdown.
+
 - **Bus archive/delete intent lost to an inbound reconcile.** An atomic local
   rename could remove an inbox file while Fabric's filesystem watcher was still
   inside its 150 ms debounce window; an inbound sync in that gap could

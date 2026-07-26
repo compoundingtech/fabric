@@ -220,6 +220,7 @@ pub struct DaemonState {
     allowed: Arc<RwLock<HashSet<EndpointId>>>,
     exposures: RwLock<HashMap<Vec<u8>, Exposure>>,
     dial_sockets: Mutex<HashMap<(String, String), DialSocket>>,
+    active_dial_listeners: Arc<AtomicUsize>,
     tcp_dials: Mutex<HashMap<(String, String, String), TcpDial>>,
     tunnel_sessions: tunnel::ServerSessionStore,
     tunnel_drop_tx: watch::Sender<u64>,
@@ -262,10 +263,49 @@ impl DaemonOptions {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct DialSocket {
     path: PathBuf,
     peer_addr: EndpointAddr,
+    listener_cancel: CancellationToken,
+    listener_task: Option<JoinHandle<()>>,
+}
+
+impl DialSocket {
+    async fn stop(mut self) {
+        self.listener_cancel.cancel();
+        if let Some(task) = self.listener_task.take() {
+            let _ = task.await;
+        }
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+impl Drop for DialSocket {
+    fn drop(&mut self) {
+        self.listener_cancel.cancel();
+        if let Some(task) = self.listener_task.take() {
+            task.abort();
+        }
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+struct DialListenerLease {
+    active: Arc<AtomicUsize>,
+}
+
+impl DialListenerLease {
+    fn new(active: Arc<AtomicUsize>) -> Self {
+        active.fetch_add(1, Ordering::SeqCst);
+        Self { active }
+    }
+}
+
+impl Drop for DialListenerLease {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -590,6 +630,7 @@ impl DaemonState {
             allowed,
             exposures: RwLock::new(exposures),
             dial_sockets: Mutex::new(HashMap::new()),
+            active_dial_listeners: Arc::new(AtomicUsize::new(0)),
             tcp_dials: Mutex::new(HashMap::new()),
             tunnel_sessions,
             tunnel_drop_tx,
@@ -905,13 +946,22 @@ impl DaemonState {
             && reuse_existing
             && existing.path.exists()
             && existing.peer_addr == peer_addr
+            && existing
+                .listener_task
+                .as_ref()
+                .is_some_and(|task| !task.is_finished())
         {
             return Ok(existing.path.clone());
         }
 
         let socket_path = self.home.dial_socket_path(peer_addr.id, protocol);
         if let Some(existing) = sockets.remove(&key) {
-            let _ = fs::remove_file(existing.path);
+            // Shell and exec deliberately replace their deterministic socket
+            // path for each command. Stop and join the previous accept loop
+            // before binding its replacement so its unlinked listener FD
+            // cannot accumulate for the daemon's lifetime. Accepted sessions
+            // have their own daemon-scoped lifetime and continue below.
+            existing.stop().await;
         }
         if socket_path.exists() {
             fs::remove_file(&socket_path)
@@ -919,29 +969,25 @@ impl DaemonState {
         }
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("failed to bind {}", socket_path.display()))?;
-        sockets.insert(
-            key,
-            DialSocket {
-                path: socket_path.clone(),
-                peer_addr: peer_addr.clone(),
-            },
-        );
-        drop(sockets);
+        let listener_cancel = CancellationToken::new();
+        let lease = DialListenerLease::new(self.active_dial_listeners.clone());
 
         // Built-in shell and exec speak their own end-to-end framing over a raw
         // stream — they must NOT go through the tunnel-session (mux) path, whose
         // Hello frame would corrupt the first client frame. Every other protocol
         // (exposed tunnels) uses the resumable tunnel path.
-        if alpn == shell::SHELL_ALPN || alpn == exec::EXEC_ALPN {
+        let listener_task = if alpn == shell::SHELL_ALPN || alpn == exec::EXEC_ALPN {
             tokio::spawn(run_raw_dial_socket(
                 listener,
                 self.endpoint_rx(),
-                peer_addr,
+                peer_addr.clone(),
                 alpn,
+                listener_cancel.clone(),
                 self.cancel.clone(),
                 self.dial_failures.clone(),
                 self.dial_slots.clone(),
-            ));
+                lease,
+            ))
         } else {
             tokio::spawn(run_dial_socket(
                 listener,
@@ -949,12 +995,24 @@ impl DaemonState {
                 self.home.clone(),
                 peer.to_string(),
                 alpn,
+                listener_cancel.clone(),
                 self.cancel.clone(),
                 self.tunnel_drop_rx(),
                 self.dial_failures.clone(),
                 self.dial_slots.clone(),
-            ));
-        }
+                lease,
+            ))
+        };
+        sockets.insert(
+            key,
+            DialSocket {
+                path: socket_path.clone(),
+                peer_addr: peer_addr.clone(),
+                listener_cancel,
+                listener_task: Some(listener_task),
+            },
+        );
+        drop(sockets);
 
         Ok(socket_path)
     }
@@ -1667,8 +1725,15 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
     state.cancel.cancel();
     state.current_endpoint().close().await;
     let _ = fs::remove_file(control_path);
-    for socket in state.dial_sockets.lock().await.values() {
-        let _ = fs::remove_file(&socket.path);
+    let dial_sockets: Vec<DialSocket> = state
+        .dial_sockets
+        .lock()
+        .await
+        .drain()
+        .map(|(_, socket)| socket)
+        .collect();
+    for socket in dial_sockets {
+        socket.stop().await;
     }
     Ok(())
 }
@@ -2872,20 +2937,26 @@ async fn run_dial_socket(
     home: FabricHome,
     peer: String,
     alpn: Vec<u8>,
-    cancel: CancellationToken,
+    listener_cancel: CancellationToken,
+    daemon_cancel: CancellationToken,
     drop_rx: watch::Receiver<u64>,
     dial_failures: Arc<FailureBackoff>,
     dial_slots: Arc<Semaphore>,
+    _lease: DialListenerLease,
 ) {
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => break,
+            biased;
+            _ = listener_cancel.cancelled() => break,
+            _ = daemon_cancel.cancelled() => break,
             accepted = listener.accept() => {
                 let Ok((local, _)) = accepted else {
                     break;
                 };
                 let permit = tokio::select! {
-                    _ = cancel.cancelled() => break,
+                    biased;
+                    _ = listener_cancel.cancelled() => break,
+                    _ = daemon_cancel.cancelled() => break,
                     permit = dial_slots.clone().acquire_owned() => {
                         let Ok(permit) = permit else {
                             break;
@@ -2897,7 +2968,7 @@ async fn run_dial_socket(
                 let home = home.clone();
                 let peer = peer.clone();
                 let alpn = alpn.clone();
-                let cancel = cancel.clone();
+                let cancel = daemon_cancel.clone();
                 let drop_rx = drop_rx.clone();
                 let dial_failures = dial_failures.clone();
                 tokio::spawn(async move {
@@ -2983,19 +3054,25 @@ async fn run_raw_dial_socket(
     endpoint_rx: watch::Receiver<CurrentEndpoint>,
     peer_addr: EndpointAddr,
     alpn: Vec<u8>,
-    cancel: CancellationToken,
+    listener_cancel: CancellationToken,
+    daemon_cancel: CancellationToken,
     dial_failures: Arc<FailureBackoff>,
     dial_slots: Arc<Semaphore>,
+    _lease: DialListenerLease,
 ) {
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => break,
+            biased;
+            _ = listener_cancel.cancelled() => break,
+            _ = daemon_cancel.cancelled() => break,
             accepted = listener.accept() => {
                 let Ok((local, _)) = accepted else {
                     break;
                 };
                 let permit = tokio::select! {
-                    _ = cancel.cancelled() => break,
+                    biased;
+                    _ = listener_cancel.cancelled() => break,
+                    _ = daemon_cancel.cancelled() => break,
                     permit = dial_slots.clone().acquire_owned() => {
                         let Ok(permit) = permit else {
                             break;
@@ -3006,7 +3083,7 @@ async fn run_raw_dial_socket(
                 let endpoint = endpoint_rx.borrow().endpoint.clone();
                 let peer_addr = peer_addr.clone();
                 let alpn = alpn.clone();
-                let cancel = cancel.clone();
+                let cancel = daemon_cancel.clone();
                 let dial_failures = dial_failures.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
@@ -3412,5 +3489,237 @@ mod tests {
         backoff.record_failure("test failure", &"boom").await;
         cancel.cancel();
         assert!(!backoff.wait(&cancel).await);
+    }
+
+    #[tokio::test]
+    async fn repeated_exec_and_shell_dials_keep_one_listener_per_path() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = FabricHome::new(temp.path());
+        let peer_a = iroh::SecretKey::generate().public();
+        let peer_b = iroh::SecretKey::generate().public();
+        let mut peers = PeerBook::default();
+        peers.add(peer_a, Some("peer-a".to_string()), None);
+        peers.add(peer_b, Some("peer-b".to_string()), None);
+        peers.save(&home)?;
+
+        let node = FabricNode::start(home.clone()).await?;
+        let state = node.state();
+        let cases = [
+            ("peer-a", exec::EXEC_PROTOCOL, exec::EXEC_ALPN),
+            ("peer-a", shell::SHELL_PROTOCOL, shell::SHELL_ALPN),
+            ("peer-b", exec::EXEC_PROTOCOL, exec::EXEC_ALPN),
+            ("peer-b", shell::SHELL_PROTOCOL, shell::SHELL_ALPN),
+        ];
+
+        // More replacements than the production macOS soft FD limit. The old
+        // implementation left every unlinked listener task alive and exhausted
+        // the process after this pattern repeated in long-running daemons.
+        for _ in 0..300 {
+            for (peer, protocol, alpn) in cases {
+                state
+                    .dial_alpn(peer, protocol, alpn.to_vec(), false)
+                    .await?;
+            }
+            assert_eq!(
+                state.active_dial_listeners.load(Ordering::SeqCst),
+                cases.len(),
+                "replacement leaked an accept loop"
+            );
+        }
+
+        let generic_path = state.dial("peer-a", "test/reused/1").await?;
+        let generic_key = (peer_a.to_string(), "test/reused/1".to_string());
+        let first_task = state
+            .dial_sockets
+            .lock()
+            .await
+            .get(&generic_key)
+            .and_then(|socket| socket.listener_task.as_ref())
+            .map(JoinHandle::id)
+            .expect("generic listener missing");
+        assert_eq!(state.dial("peer-a", "test/reused/1").await?, generic_path);
+        let second_task = state
+            .dial_sockets
+            .lock()
+            .await
+            .get(&generic_key)
+            .and_then(|socket| socket.listener_task.as_ref())
+            .map(JoinHandle::id)
+            .expect("reused generic listener missing");
+        assert_eq!(
+            first_task, second_task,
+            "reusable dial listener was replaced"
+        );
+
+        let stopped_task = state
+            .dial_sockets
+            .lock()
+            .await
+            .get_mut(&generic_key)
+            .and_then(|socket| socket.listener_task.take())
+            .expect("generic listener task missing before fault injection");
+        stopped_task.abort();
+        let _ = stopped_task.await;
+        assert_eq!(
+            state.active_dial_listeners.load(Ordering::SeqCst),
+            cases.len()
+        );
+        assert_eq!(state.dial("peer-a", "test/reused/1").await?, generic_path);
+        let replacement_task = state
+            .dial_sockets
+            .lock()
+            .await
+            .get(&generic_key)
+            .and_then(|socket| socket.listener_task.as_ref())
+            .map(JoinHandle::id)
+            .expect("dead reusable listener was not replaced");
+        assert_ne!(
+            replacement_task, first_task,
+            "finished reusable listener task was retained"
+        );
+        assert_eq!(
+            state.active_dial_listeners.load(Ordering::SeqCst),
+            cases.len() + 1
+        );
+
+        let paths: Vec<PathBuf> = state
+            .dial_sockets
+            .lock()
+            .await
+            .values()
+            .map(|socket| socket.path.clone())
+            .collect();
+        assert_eq!(paths.len(), cases.len() + 1);
+        assert!(paths.iter().all(|path| path.exists()));
+
+        node.shutdown().await?;
+        assert_eq!(state.active_dial_listeners.load(Ordering::SeqCst), 0);
+        assert!(
+            paths.iter().all(|path| !path.exists()),
+            "daemon teardown left dial socket paths behind"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacing_exec_listener_preserves_accepted_session() -> Result<()> {
+        let server_dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let server_home = FabricHome::new(server_dir.path());
+        let client_home = FabricHome::new(client_dir.path());
+        let server = FabricNode::start_with_daemon_options(
+            server_home.clone(),
+            DaemonOptions {
+                allow_exec: true,
+                ..DaemonOptions::default()
+            },
+        )
+        .await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+
+        trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+
+        let state = client.state();
+        let socket = state
+            .dial_alpn(
+                "server",
+                exec::EXEC_PROTOCOL,
+                exec::EXEC_ALPN.to_vec(),
+                false,
+            )
+            .await?;
+        let mut first = UnixStream::connect(&socket).await?;
+        let release = server_dir.path().join("release-exec");
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf ready; while [ ! -e \"$1\" ]; do sleep 0.01; done; printf done".to_string(),
+            "fabric-listener-test".to_string(),
+            release.display().to_string(),
+        ];
+        exec::write_client_argv(&mut first, &argv).await?;
+
+        let ready = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match exec::read_server_frame(&mut first).await? {
+                    Some(exec::ServerFrame::Stdout(bytes)) => break Ok(bytes),
+                    Some(exec::ServerFrame::Stderr(_)) => {}
+                    Some(exec::ServerFrame::Error(error)) => bail!("{error}"),
+                    Some(exec::ServerFrame::Exit(code)) => {
+                        bail!("exec exited before listener replacement: {code}")
+                    }
+                    None => bail!("exec closed before listener replacement"),
+                }
+            }
+        })
+        .await??;
+        assert_eq!(ready, b"ready");
+
+        let replacement = state
+            .dial_alpn(
+                "server",
+                exec::EXEC_PROTOCOL,
+                exec::EXEC_ALPN.to_vec(),
+                false,
+            )
+            .await?;
+        assert_eq!(replacement, socket);
+        assert_eq!(state.active_dial_listeners.load(Ordering::SeqCst), 1);
+
+        fs::write(&release, b"go")?;
+        let (stdout, exit) =
+            tokio::time::timeout(Duration::from_secs(10), collect_exec(&mut first)).await??;
+        assert_eq!(stdout, b"done");
+        assert_eq!(
+            exit, 0,
+            "accepted exec did not survive listener replacement"
+        );
+
+        let mut second = UnixStream::connect(&replacement).await?;
+        exec::write_client_argv(
+            &mut second,
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf replacement".to_string(),
+            ],
+        )
+        .await?;
+        let (stdout, exit) =
+            tokio::time::timeout(Duration::from_secs(10), collect_exec(&mut second)).await??;
+        assert_eq!(stdout, b"replacement");
+        assert_eq!(exit, 0);
+
+        server.shutdown().await?;
+        client.shutdown().await?;
+        assert_eq!(state.active_dial_listeners.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    async fn trust_test_peer(
+        home: &FabricHome,
+        node: &FabricNode,
+        id: EndpointId,
+        name: &str,
+        addr: EndpointAddr,
+    ) -> Result<()> {
+        let mut peers = PeerBook::load(home)?;
+        peers.add(id, Some(name.to_string()), Some(addr));
+        peers.save(home)?;
+        node.state().reload_peers().await
+    }
+
+    async fn collect_exec(stream: &mut UnixStream) -> Result<(Vec<u8>, i32)> {
+        let mut stdout = Vec::new();
+        loop {
+            match exec::read_server_frame(stream).await? {
+                Some(exec::ServerFrame::Stdout(bytes)) => stdout.extend_from_slice(&bytes),
+                Some(exec::ServerFrame::Stderr(_)) => {}
+                Some(exec::ServerFrame::Error(error)) => bail!("{error}"),
+                Some(exec::ServerFrame::Exit(code)) => return Ok((stdout, code)),
+                None => bail!("exec closed without an exit frame"),
+            }
+        }
     }
 }
