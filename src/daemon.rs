@@ -59,6 +59,7 @@ const INCOMING_FAILURE_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const INCOMING_FAILURE_MAX_BACKOFF: Duration = Duration::from_secs(5);
 const DIAL_FAILURE_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const DIAL_FAILURE_MAX_BACKOFF: Duration = Duration::from_secs(15);
+const DIAL_LISTENER_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_INCOMING_HANDLERS: usize = 32;
 const MAX_DIAL_HANDLERS: usize = 32;
@@ -272,12 +273,31 @@ struct DialSocket {
 }
 
 impl DialSocket {
-    async fn stop(mut self) {
+    async fn stop(self) {
+        self.stop_with_timeout(DIAL_LISTENER_STOP_TIMEOUT).await;
+    }
+
+    async fn stop_with_timeout(mut self, timeout: Duration) -> bool {
         self.listener_cancel.cancel();
-        if let Some(task) = self.listener_task.take() {
-            let _ = task.await;
-        }
+        let stopped_gracefully = if let Some(mut task) = self.listener_task.take() {
+            match tokio::time::timeout(timeout, &mut task).await {
+                Ok(_) => true,
+                Err(_) => {
+                    warn!(
+                        path = %self.path.display(),
+                        ?timeout,
+                        "dial listener did not stop after cancellation; aborting"
+                    );
+                    task.abort();
+                    let _ = task.await;
+                    false
+                }
+            }
+        } else {
+            true
+        };
         let _ = fs::remove_file(&self.path);
+        stopped_gracefully
     }
 }
 
@@ -3489,6 +3509,83 @@ mod tests {
         backoff.record_failure("test failure", &"boom").await;
         cancel.cancel();
         assert!(!backoff.wait(&cancel).await);
+    }
+
+    #[tokio::test]
+    async fn dial_listener_stop_joins_cancellation_and_bounds_a_wedged_task() -> Result<()> {
+        struct DropFlag(Arc<AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let temp = tempfile::tempdir()?;
+        let peer_addr = EndpointAddr::new(iroh::SecretKey::generate().public());
+
+        let graceful_path = temp.path().join("graceful.sock");
+        fs::write(&graceful_path, b"socket placeholder")?;
+        let graceful_cancel = CancellationToken::new();
+        let graceful_exited = Arc::new(AtomicBool::new(false));
+        let graceful_task = {
+            let cancel = graceful_cancel.clone();
+            let exited = graceful_exited.clone();
+            tokio::spawn(async move {
+                cancel.cancelled().await;
+                exited.store(true, Ordering::SeqCst);
+            })
+        };
+        let graceful = DialSocket {
+            path: graceful_path.clone(),
+            peer_addr: peer_addr.clone(),
+            listener_cancel: graceful_cancel,
+            listener_task: Some(graceful_task),
+        };
+
+        assert!(
+            graceful.stop_with_timeout(Duration::from_secs(1)).await,
+            "normal listener cancellation should join without timing out"
+        );
+        assert!(
+            graceful_exited.load(Ordering::SeqCst),
+            "stop returned before the canceled listener task terminated"
+        );
+        assert!(!graceful_path.exists());
+
+        let wedged_path = temp.path().join("wedged.sock");
+        fs::write(&wedged_path, b"socket placeholder")?;
+        let wedged_cancel = CancellationToken::new();
+        let wedged_dropped = Arc::new(AtomicBool::new(false));
+        let (wedged_started_tx, wedged_started_rx) = tokio::sync::oneshot::channel();
+        let wedged_task = {
+            let dropped = wedged_dropped.clone();
+            tokio::spawn(async move {
+                let _drop_flag = DropFlag(dropped);
+                let _ = wedged_started_tx.send(());
+                std::future::pending::<()>().await;
+            })
+        };
+        wedged_started_rx
+            .await
+            .expect("wedged listener task did not start");
+        let wedged = DialSocket {
+            path: wedged_path.clone(),
+            peer_addr,
+            listener_cancel: wedged_cancel,
+            listener_task: Some(wedged_task),
+        };
+
+        assert!(
+            !wedged.stop_with_timeout(Duration::from_millis(10)).await,
+            "wedged listener should take the timeout/abort path"
+        );
+        assert!(
+            wedged_dropped.load(Ordering::SeqCst),
+            "stop returned before the aborted listener task was joined"
+        );
+        assert!(!wedged_path.exists());
+        Ok(())
     }
 
     #[tokio::test]
