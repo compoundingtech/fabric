@@ -1809,6 +1809,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn three_node_2000_file_continuous_mutation_stays_bounded() {
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            run_three_node_2000_file_continuous_mutation_stress(),
+        )
+        .await
+        .expect("3-node/2,000-file continuous-mutation stress exceeded 60 seconds");
+    }
+
+    async fn run_three_node_2000_file_continuous_mutation_stress() {
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();
         let dir_c = tempfile::tempdir().unwrap();
