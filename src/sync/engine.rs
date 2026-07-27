@@ -849,14 +849,18 @@ mod tests {
     use crate::sync::manifest::Entry;
     use std::sync::{Mutex as StdMutex, Weak};
 
-    fn catalog_entry(name: &str, folder: &Path) -> SyncEntry {
+    fn entry_with_policy(name: &str, folder: &Path, policy: SyncPolicy) -> SyncEntry {
         SyncEntry {
             name: name.to_string(),
             folder: folder.to_path_buf(),
             peers: SyncPeers::Wildcard("*".into()),
-            policy: SyncPolicy::Catalog,
+            policy,
             include: None,
         }
+    }
+
+    fn catalog_entry(name: &str, folder: &Path) -> SyncEntry {
+        entry_with_policy(name, folder, SyncPolicy::Catalog)
     }
 
     #[test]
@@ -919,6 +923,78 @@ mod tests {
         // Materialize restores the file from the retained content.
         materialize(&node, root, policy).unwrap();
         assert_eq!(std::fs::read(root.join("keep.toml")).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn authoritative_tombstone_with_stale_observed_file_respects_policy() {
+        for (policy, file_survives) in [(SyncPolicy::Catalog, true), (SyncPolicy::Bus, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let path = root.join("retired.toml");
+            std::fs::write(&path, b"stale bytes").unwrap();
+            let entry = entry_with_policy("sync", root, policy);
+            let rules = policy.rules();
+
+            // Model an authoritative Tombstone/v2 received while the exact
+            // previously-observed bytes still physically exist.
+            let mut node = SyncNode::new(Author([1; 32]));
+            node.local_write("retired.toml", b"stale bytes", 0, 0);
+            node.local_remove("retired.toml", SyncPolicy::Bus.rules(), 10);
+            let stale_hash = content_hash(b"stale bytes");
+            let mut observed = HashMap::from([("retired.toml".to_string(), stale_hash)]);
+            let protected = observed.clone();
+
+            assert!(
+                !scan_into_node_observed(&mut node, root, &entry, rules, &mut observed).unwrap(),
+                "unchanged observed bytes must not resurrect a Tombstone under {policy:?}"
+            );
+            assert!(matches!(
+                node.manifest().get("retired.toml"),
+                Some(Entry::Tombstone(tombstone)) if tombstone.version == 2
+            ));
+            assert_eq!(observed.get("retired.toml"), Some(&stale_hash));
+
+            materialize_tracked(&mut node, root, rules, &protected, &mut observed).unwrap();
+            assert_eq!(path.exists(), file_survives, "policy {policy:?}");
+            assert_eq!(
+                observed.contains_key("retired.toml"),
+                file_survives,
+                "policy {policy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn changed_physical_file_after_tombstone_becomes_higher_present() {
+        for policy in [SyncPolicy::Catalog, SyncPolicy::Bus] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let path = root.join("retired.toml");
+            std::fs::write(&path, b"old").unwrap();
+            let entry = entry_with_policy("sync", root, policy);
+
+            let mut node = SyncNode::new(Author([1; 32]));
+            node.local_write("retired.toml", b"old", 0, 0);
+            node.local_remove("retired.toml", SyncPolicy::Bus.rules(), 10);
+            let mut observed = HashMap::from([("retired.toml".to_string(), content_hash(b"old"))]);
+
+            // A byte change is a new local intent, unlike the unchanged stale
+            // file above, and must advance causally beyond Tombstone/v2.
+            std::fs::write(&path, b"resurrected").unwrap();
+            assert!(
+                scan_into_node_observed(&mut node, root, &entry, policy.rules(), &mut observed,)
+                    .unwrap()
+            );
+            assert!(matches!(
+                node.manifest().get("retired.toml"),
+                Some(Entry::Present(meta))
+                    if meta.version == 3 && meta.hash == content_hash(b"resurrected")
+            ));
+            assert_eq!(
+                observed.get("retired.toml"),
+                Some(&content_hash(b"resurrected"))
+            );
+        }
     }
 
     // A loopback transport: each peer is a (id, sync-name, node) captured
@@ -1065,18 +1141,20 @@ mod tests {
         }
     }
 
-    fn write_syncs(home: &Path, folder: &Path) {
+    fn write_named_sync(home: &Path, name: &str, folder: &Path, policy: SyncPolicy) {
         let toml = format!(
-            "[[sync]]\nname = \"catalog\"\nfolder = {folder:?}\npeers = \"*\"\npolicy = \"catalog\"\n"
+            "[[sync]]\nname = {name:?}\nfolder = {folder:?}\npeers = \"*\"\npolicy = {:?}\n",
+            policy.as_str()
         );
         std::fs::write(home.join("syncs.toml"), toml).unwrap();
     }
 
+    fn write_syncs(home: &Path, folder: &Path) {
+        write_named_sync(home, "catalog", folder, SyncPolicy::Catalog);
+    }
+
     fn write_bus_sync(home: &Path, folder: &Path) {
-        let toml = format!(
-            "[[sync]]\nname = \"bus\"\nfolder = {folder:?}\npeers = \"*\"\npolicy = \"bus\"\n"
-        );
-        std::fs::write(home.join("syncs.toml"), toml).unwrap();
+        write_named_sync(home, "bus", folder, SyncPolicy::Bus);
     }
 
     async fn archive_race_fixture() -> (
@@ -1361,6 +1439,294 @@ mod tests {
                 .get("inbox/remote-only.md"),
             Some(Entry::Present(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn restart_prefers_atomic_state_pair_over_stale_projection_and_partial_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("retired.md"), b"old").unwrap();
+        write_bus_sync(dir.path(), &root);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+        let present_manifest = engine
+            .node_for("bus")
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .manifest()
+            .clone();
+
+        std::fs::remove_file(root.join("retired.md")).unwrap();
+        engine.sync_once("bus").await.unwrap();
+        let state_path = engine.state_path("bus");
+        let manifest_path = engine.manifest_path("bus");
+        let committed: PersistedEntryState =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert!(matches!(
+            committed.manifest.get("retired.md"),
+            Some(Entry::Tombstone(tombstone)) if tombstone.version == 2
+        ));
+        assert!(!committed.observed.contains_key("retired.md"));
+
+        // Model a crash after authoritative state.json committed but before its
+        // compatibility projection: manifest.json is stale and an incomplete
+        // state temp sibling remains. Restart must ignore both.
+        engine.write_manifest("bus", &present_manifest).unwrap();
+        let state_temp = state_path.with_extension("json.fabric-tmp");
+        std::fs::write(&state_temp, b"{\"manifest\":").unwrap();
+        drop(engine);
+
+        let restarted = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let entry = restarted.entries.read().await.get("bus").cloned().unwrap();
+        assert!(matches!(
+            entry.node.lock().await.manifest().get("retired.md"),
+            Some(Entry::Tombstone(tombstone)) if tombstone.version == 2
+        ));
+        assert!(!entry.observed.lock().unwrap().contains_key("retired.md"));
+        assert!(!root.join("retired.md").exists());
+
+        restarted.sync_once("bus").await.unwrap();
+        let replayed: PersistedEntryState =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(replayed.manifest, committed.manifest);
+        assert_eq!(replayed.observed, committed.observed);
+        assert!(matches!(
+            serde_json::from_slice::<Manifest>(&std::fs::read(&manifest_path).unwrap())
+                .unwrap()
+                .get("retired.md"),
+            Some(Entry::Tombstone(tombstone)) if tombstone.version == 2
+        ));
+    }
+
+    #[tokio::test]
+    async fn authoritative_state_survives_projection_write_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("retired.md"), b"old").unwrap();
+        write_bus_sync(dir.path(), &root);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+        let node = engine.node_for("bus").await.unwrap();
+        let tombstone_manifest = {
+            let mut node = node.lock().await;
+            assert!(node.local_remove("retired.md", SyncPolicy::Bus.rules(), 10));
+            node.manifest().clone()
+        };
+        let committed = PersistedEntryState {
+            manifest: tombstone_manifest,
+            observed: HashMap::new(),
+        };
+
+        // Block only manifest.json's atomic temp path. write_state must report
+        // the projection failure after the authoritative state pair committed.
+        let manifest_path = engine.manifest_path("bus");
+        std::fs::create_dir(manifest_path.with_extension("json.fabric-tmp")).unwrap();
+        assert!(engine.write_state("bus", &committed).is_err());
+
+        let on_disk: PersistedEntryState =
+            serde_json::from_slice(&std::fs::read(engine.state_path("bus")).unwrap()).unwrap();
+        assert_eq!(on_disk.manifest, committed.manifest);
+        assert_eq!(on_disk.observed, committed.observed);
+        assert!(matches!(
+            serde_json::from_slice::<Manifest>(&std::fs::read(&manifest_path).unwrap())
+                .unwrap()
+                .get("retired.md"),
+            Some(Entry::Present(meta)) if meta.version == 1
+        ));
+        drop(engine);
+
+        let restarted = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let entry = restarted.entries.read().await.get("bus").cloned().unwrap();
+        assert!(matches!(
+            entry.node.lock().await.manifest().get("retired.md"),
+            Some(Entry::Tombstone(tombstone)) if tombstone.version == 2
+        ));
+        assert!(entry.observed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_tombstone_stale_file_policy_and_observed_receipt_contract_matrix() {
+        struct Case {
+            label: &'static str,
+            observed: Option<&'static [u8]>,
+            disk: &'static [u8],
+            expected_present: bool,
+        }
+
+        // A matching receipt proves unchanged physical bytes are stale, so the
+        // authoritative Tombstone stays authoritative. An absent or mismatched
+        // receipt cannot distinguish those bytes from a new local write and
+        // therefore characterizes the current contract as a v3 resurrection.
+        // Actually edited bytes are likewise explicit new local intent.
+        let cases = [
+            Case {
+                label: "matching receipt and unchanged bytes",
+                observed: Some(b"old"),
+                disk: b"old",
+                expected_present: false,
+            },
+            Case {
+                label: "absent receipt and unchanged bytes",
+                observed: None,
+                disk: b"old",
+                expected_present: true,
+            },
+            Case {
+                label: "mismatched receipt and unchanged bytes",
+                observed: Some(b"different"),
+                disk: b"old",
+                expected_present: true,
+            },
+            Case {
+                label: "matching receipt and edited bytes",
+                observed: Some(b"old"),
+                disk: b"edited",
+                expected_present: true,
+            },
+        ];
+
+        for final_policy in [SyncPolicy::Catalog, SyncPolicy::Bus] {
+            for case in &cases {
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path().join("resources");
+                let path = root.join("retired.md");
+                std::fs::create_dir_all(&root).unwrap();
+                std::fs::write(&path, case.disk).unwrap();
+
+                // Seed the exact incident state under the delete-propagating
+                // policy: authoritative Tombstone/v2 plus the case's durable
+                // observed receipt and physical bytes.
+                write_named_sync(dir.path(), "contract", &root, SyncPolicy::Bus);
+                let seed = SyncEngine::new(
+                    FabricHome::new(dir.path()),
+                    Author([1; 32]),
+                    Arc::new(LoopbackTransport::default()),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+                let mut node = SyncNode::new(Author([1; 32]));
+                node.local_write("retired.md", b"old", 0, 0);
+                node.local_remove("retired.md", SyncPolicy::Bus.rules(), 10);
+                let observed = case
+                    .observed
+                    .map(|bytes| HashMap::from([("retired.md".to_string(), content_hash(bytes))]))
+                    .unwrap_or_default();
+                seed.write_state(
+                    "contract",
+                    &PersistedEntryState {
+                        manifest: node.manifest().clone(),
+                        observed,
+                    },
+                )
+                .unwrap();
+
+                // Restart either after bus -> catalog or with bus unchanged.
+                write_named_sync(dir.path(), "contract", &root, final_policy);
+                drop(seed);
+                let restarted = SyncEngine::new(
+                    FabricHome::new(dir.path()),
+                    Author([1; 32]),
+                    Arc::new(LoopbackTransport::default()),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+                restarted.sync_once("contract").await.unwrap();
+
+                let entry = restarted
+                    .entries
+                    .read()
+                    .await
+                    .get("contract")
+                    .cloned()
+                    .unwrap();
+                let manifest = entry.node.lock().await.manifest().clone();
+                let observed = entry.observed.lock().unwrap().clone();
+                let context = format!("{} under {final_policy:?}", case.label);
+                if case.expected_present {
+                    assert!(
+                        matches!(
+                            manifest.get("retired.md"),
+                            Some(Entry::Present(meta))
+                                if meta.version == 3 && meta.hash == content_hash(case.disk)
+                        ),
+                        "{context}"
+                    );
+                    assert_eq!(std::fs::read(&path).unwrap(), case.disk, "{context}");
+                    assert_eq!(
+                        observed.get("retired.md"),
+                        Some(&content_hash(case.disk)),
+                        "{context}"
+                    );
+                } else {
+                    assert!(
+                        matches!(
+                            manifest.get("retired.md"),
+                            Some(Entry::Tombstone(tombstone)) if tombstone.version == 2
+                        ),
+                        "{context}"
+                    );
+                    let file_survives = final_policy == SyncPolicy::Catalog;
+                    assert_eq!(path.exists(), file_survives, "{context}");
+                    assert_eq!(
+                        observed.contains_key("retired.md"),
+                        file_survives,
+                        "{context}"
+                    );
+                }
+
+                // A second replay must be stable under either final policy.
+                restarted.sync_once("contract").await.unwrap();
+                let replayed = restarted
+                    .entries
+                    .read()
+                    .await
+                    .get("contract")
+                    .cloned()
+                    .unwrap();
+                assert_eq!(
+                    replayed.node.lock().await.manifest(),
+                    &manifest,
+                    "{context}"
+                );
+                assert_eq!(&*replayed.observed.lock().unwrap(), &observed, "{context}");
+            }
+        }
     }
 
     #[tokio::test]

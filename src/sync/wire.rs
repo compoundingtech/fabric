@@ -365,4 +365,39 @@ mod tests {
             Some(&b"host=hetz"[..])
         );
     }
+
+    #[tokio::test]
+    async fn wire_propagates_tombstone_once_then_replay_is_a_noop() {
+        let a = Arc::new(Mutex::new(SyncNode::new(author(1))));
+        let b = Arc::new(Mutex::new(SyncNode::new(author(2))));
+        a.lock().await.local_write("retired", b"old", 0, 0);
+
+        let reconcile = |a: Arc<Mutex<SyncNode>>, b: Arc<Mutex<SyncNode>>| async move {
+            let (client, server) = tokio::io::duplex(1 << 20);
+            let task = tokio::spawn(async move {
+                run_server(server, move |_| async move { Ok(Some((b, ()))) }).await
+            });
+            let client_stats = run_client(client, a, "bus").await.unwrap();
+            let (_, server_stats, ()) = task.await.unwrap().unwrap();
+            (client_stats, server_stats)
+        };
+
+        reconcile(a.clone(), b.clone()).await;
+        let bus = crate::sync::config::PolicyRules {
+            propagate_deletes: true,
+            sweep_tombstones: true,
+        };
+        assert!(a.lock().await.local_remove("retired", bus, 10));
+
+        let (_, deleted) = reconcile(a.clone(), b.clone()).await;
+        assert!(!deleted.is_noop());
+        assert!(!a.lock().await.folder_state().contains_key("retired"));
+        assert!(!b.lock().await.folder_state().contains_key("retired"));
+
+        let (client_replay, server_replay) = reconcile(a, b).await;
+        assert!(
+            client_replay.is_noop() && server_replay.is_noop(),
+            "a converged Tombstone replay moved state: client={client_replay:?} server={server_replay:?}"
+        );
+    }
 }

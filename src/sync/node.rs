@@ -316,6 +316,12 @@ mod tests {
         SyncNode::new(Author([n; 32]))
     }
 
+    fn reconcile_pair(nodes: &mut [SyncNode], a: usize, b: usize) -> Reconciled {
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        let (left, right) = nodes.split_at_mut(hi);
+        left[lo].reconcile(&mut right[0])
+    }
+
     #[test]
     fn local_write_is_echo_safe_on_unchanged_content() {
         let mut a = node(1);
@@ -403,6 +409,98 @@ mod tests {
         a.reconcile(&mut b);
         assert!(!a.folder_state().contains_key("gone.txt"));
         assert!(!b.folder_state().contains_key("gone.txt"));
+    }
+
+    #[test]
+    fn higher_version_recreation_resurrects_a_tombstone_and_replay_is_noop() {
+        let mut a = node(1);
+        let mut b = node(2);
+        a.local_write("job", b"v1", 0, 0);
+        a.reconcile(&mut b);
+
+        assert!(a.local_remove("job", BUS, 10));
+        a.reconcile(&mut b);
+        assert!(matches!(
+            a.manifest().get("job"),
+            Some(Entry::Tombstone(tombstone)) if tombstone.version == 2
+        ));
+
+        // Re-creating the path after observing its deletion advances from the
+        // tombstone's version, so the new Present wins everywhere.
+        assert!(b.local_write("job", b"v3-resurrected", 20, 0));
+        assert!(matches!(
+            b.manifest().get("job"),
+            Some(Entry::Present(meta)) if meta.version == 3
+        ));
+        let first = a.reconcile(&mut b);
+        assert!(!first.is_noop());
+        assert_eq!(a.folder_state()["job"], b"v3-resurrected");
+        assert_eq!(b.folder_state()["job"], b"v3-resurrected");
+
+        let replay = a.reconcile(&mut b);
+        assert!(
+            replay.is_noop(),
+            "replaying a converged resurrection echoed state: {replay:?}"
+        );
+    }
+
+    #[test]
+    fn offline_peer_rejoins_delete_and_resurrection_in_different_orders() {
+        let schedules: &[&[(usize, usize)]] = &[
+            &[(0, 2), (1, 2)],
+            &[(1, 2), (0, 2)],
+            &[(0, 2), (0, 1), (1, 2)],
+        ];
+
+        for schedule in schedules {
+            let mut deleted = vec![node(1), node(2), node(3)];
+            deleted[0].local_write("shared", b"seed", 0, 0);
+            reconcile_to_fixpoint(&mut deleted);
+
+            // Peer 2 is offline while peers 0 and 1 adopt a Tombstone/v2.
+            assert!(deleted[0].local_remove("shared", BUS, 10));
+            reconcile_pair(&mut deleted, 0, 1);
+            for &(a, b) in *schedule {
+                reconcile_pair(&mut deleted, a, b);
+            }
+            reconcile_to_fixpoint(&mut deleted);
+            for peer in &deleted {
+                assert!(matches!(
+                    peer.manifest().get("shared"),
+                    Some(Entry::Tombstone(tombstone)) if tombstone.version == 2
+                ));
+                assert!(!peer.folder_state().contains_key("shared"));
+            }
+            for a in 0..deleted.len() {
+                for b in (a + 1)..deleted.len() {
+                    assert!(
+                        reconcile_pair(&mut deleted, a, b).is_noop(),
+                        "delete replay echoed after schedule {schedule:?}"
+                    );
+                }
+            }
+
+            let mut resurrected = vec![node(1), node(2), node(3)];
+            resurrected[0].local_write("shared", b"seed", 0, 0);
+            reconcile_to_fixpoint(&mut resurrected);
+            resurrected[0].local_remove("shared", BUS, 10);
+            reconcile_pair(&mut resurrected, 0, 1);
+
+            // Peer 1 recreates the file after seeing Tombstone/v2. Peer 2 is
+            // still offline with Present/v1; every rejoin order must choose v3.
+            resurrected[1].local_write("shared", b"revived", 20, 0);
+            for &(a, b) in *schedule {
+                reconcile_pair(&mut resurrected, a, b);
+            }
+            reconcile_to_fixpoint(&mut resurrected);
+            for peer in &resurrected {
+                assert!(matches!(
+                    peer.manifest().get("shared"),
+                    Some(Entry::Present(meta)) if meta.version == 3
+                ));
+                assert_eq!(peer.folder_state()["shared"], b"revived");
+            }
+        }
     }
 
     #[test]

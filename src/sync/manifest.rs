@@ -386,6 +386,37 @@ mod tests {
     }
 
     #[test]
+    fn present_and_tombstone_follow_one_total_version_author_kind_order() {
+        let cases = [
+            (
+                "newer present beats older tombstone",
+                present(4, 0, 1),
+                tomb(3, 9),
+            ),
+            (
+                "newer tombstone beats older present",
+                tomb(4, 0),
+                present(3, 9, 1),
+            ),
+            (
+                "author breaks a same-version cross-kind tie before kind",
+                present(4, 9, 1),
+                tomb(4, 8),
+            ),
+            (
+                "tombstone breaks an exact version-author tie",
+                tomb(4, 9),
+                present(4, 9, 1),
+            ),
+        ];
+
+        for (contract, winner, loser) in cases {
+            assert!(winner.wins_over(&loser), "{contract}");
+            assert!(!loser.wins_over(&winner), "{contract}");
+        }
+    }
+
+    #[test]
     fn diff_is_empty_between_equal_manifests() {
         let mut a = Manifest::new();
         a.insert("x".into(), present(1, 0, 0));
