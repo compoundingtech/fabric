@@ -23,6 +23,13 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Changed
 
+- **Sync publishers must stage outside the synced folder.** The file-sync
+  documentation now makes explicit that every watcher-visible path matched by
+  an entry is a durable logical key. Temporary, backup, and partial files must
+  be assembled outside the configured sync folder before only canonical final
+  paths are moved into place; a matching sibling temp name under `catalog`
+  policy is propagated and restored like any other catalog key.
+
 - **Equal-version sync conflicts preserve updates.** Higher logical versions
   still always win, but at the same version a Present update now wins over a
   Tombstone delete before deterministic author/content-hash tie-breaking. A

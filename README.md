@@ -751,6 +751,15 @@ sync only ever touches already-trusted peers — it adds no new trust surface.
   Peers that receive the tombstone remove the path. Tombstones are retained;
   automatic sweeping is not implemented.
 
+Publication tools must treat every watcher-visible, included path as a durable
+logical sync key. Stage temporary, backup, and partial files **outside the
+configured sync folder** (on the same filesystem when an atomic rename is
+required), then move only canonical final paths into the folder. Do not use a
+sibling temporary name inside the synced subtree: `catalog` will propagate that
+name as a real key and intentionally restore it after a later local deletion.
+Include globs scope which paths are keys; they do not make matching temporary
+paths ephemeral.
+
 Conflicts use logical versions, never filesystem mtime (which is unreliable
 across machines). A higher logical version always wins. At the same version, a
 Present update wins over a Tombstone delete, followed by deterministic
