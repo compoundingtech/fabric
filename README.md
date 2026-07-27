@@ -330,6 +330,58 @@ Upgrading the fabric binary under a running daemon — especially on a remote
 machine reached only over `fabric shell` — must be done lockout-safe: a botched
 restart can sever the only path back to the box. Follow this order.
 
+Download a release asset directly, verify it against the release's combined
+`SHA256SUMS` manifest, and stage both the old and new binaries with same-directory
+renames:
+
+```sh
+set -eu
+
+tag='v0.2.0+a0478a6'
+case "$(uname -s):$(uname -m)" in
+  Darwin:arm64) target='aarch64-apple-darwin' ;;
+  Linux:x86_64) target='x86_64-unknown-linux-gnu' ;;
+  Linux:aarch64|Linux:arm64) target='aarch64-unknown-linux-gnu' ;;
+  *) echo "unsupported release target: $(uname -s):$(uname -m)" >&2; exit 1 ;;
+esac
+
+asset="fabric-$target.tar.gz"
+release_url="https://github.com/compoundingtech/fabric/releases/download/$tag"
+download_dir="$(mktemp -d)"
+trap 'rm -rf "$download_dir"' EXIT
+
+curl --fail --location "$release_url/$asset" --output "$download_dir/$asset"
+curl --fail --location "$release_url/SHA256SUMS" --output "$download_dir/SHA256SUMS"
+
+expected="$(awk -v asset="$asset" '$2 == asset { print $1 }' "$download_dir/SHA256SUMS")"
+test -n "$expected"
+if command -v sha256sum >/dev/null 2>&1; then
+  actual="$(sha256sum "$download_dir/$asset" | awk '{ print $1 }')"
+else
+  actual="$(shasum -a 256 "$download_dir/$asset" | awk '{ print $1 }')"
+fi
+test "$actual" = "$expected"
+
+tar -xzf "$download_dir/$asset" -C "$download_dir"
+test "$("$download_dir/fabric" --version)" = "${tag#v}"
+
+# Confirm this is the exact path in launchd/systemd ExecStart before replacing it.
+fabric_path="${FABRIC_BIN_PATH:-$(command -v fabric)}"
+test -x "$fabric_path"
+rollback="$fabric_path.rollback-$(date -u +%Y%m%dT%H%M%SZ)"
+install -m 755 "$fabric_path" "$rollback.new.$$"
+mv -f "$rollback.new.$$" "$rollback"
+install -m 755 "$download_dir/fabric" "$fabric_path.new.$$"
+mv -f "$fabric_path.new.$$" "$fabric_path"
+echo "installed $("$fabric_path" --version); rollback: $rollback"
+```
+
+Set `tag` to the release being installed. `FABRIC_BIN_PATH` is only needed when
+the service's `ExecStart` binary is not the `fabric` found on the interactive
+shell's `PATH`. Do not compile a release through `fabric exec` on a managed
+target: the compiler inherits the daemon's service cgroup and can exhaust its
+memory limit, restarting the daemon that provides the connection.
+
 1. **Install the new binary atomically, at the path the daemon runs from.**
    `install.sh` installs via a temp file plus a rename, so it can replace the
    binary while the daemon is running: the daemon keeps executing the old inode
