@@ -63,6 +63,11 @@ const DIAL_LISTENER_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_INCOMING_HANDLERS: usize = 32;
 const MAX_DIAL_HANDLERS: usize = 32;
+/// Sync connections can arrive in large coalesced bursts. Keep the default
+/// validation log useful without making one path snapshot per connection a
+/// second source of disk pressure. Full detail remains available at debug.
+const SYNC_ACCEPT_INFO_SAMPLE_EVERY: usize = 128;
+static SYNC_ACCEPT_LOG_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 const ENDPOINT_ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
 const ENDPOINT_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 const ENDPOINT_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -2535,7 +2540,7 @@ async fn process_incoming_iroh(incoming: Incoming, state: Arc<DaemonState>) -> R
     }
     if alpn == SYNC_ALPN {
         let connection = accepting.await?;
-        log_connection_paths("sync_accept", &connection);
+        log_sync_connection_paths(&connection);
         handle_sync(connection, state).await?;
         return Ok(());
     }
@@ -2905,6 +2910,50 @@ fn log_connection_paths(event: &'static str, connection: &Connection) {
     );
 }
 
+fn sync_accept_is_info_sample(sequence: usize) -> bool {
+    sequence.is_multiple_of(SYNC_ACCEPT_INFO_SAMPLE_EVERY)
+}
+
+fn log_sync_connection_paths(connection: &Connection) {
+    let sequence = SYNC_ACCEPT_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let info_sample = sync_accept_is_info_sample(sequence);
+    if !info_sample
+        && !tracing::enabled!(target: VALIDATION_LOG_TARGET, tracing::Level::DEBUG)
+    {
+        return;
+    }
+    let (paths_total, paths_selected, paths_ip, paths_relay, path_local_addrs, path_remote_addrs) =
+        connection_path_summary(connection);
+    if info_sample {
+        info!(
+            target: VALIDATION_LOG_TARGET,
+            event = "sync_accept",
+            remote = %connection.remote_id(),
+            paths_total,
+            paths_selected,
+            paths_ip,
+            paths_relay,
+            path_local_addrs = %path_local_addrs,
+            path_remote_addrs = %path_remote_addrs,
+            sample_every = SYNC_ACCEPT_INFO_SAMPLE_EVERY,
+            "connection path snapshot"
+        );
+    } else {
+        debug!(
+            target: VALIDATION_LOG_TARGET,
+            event = "sync_accept",
+            remote = %connection.remote_id(),
+            paths_total,
+            paths_selected,
+            paths_ip,
+            paths_relay,
+            path_local_addrs = %path_local_addrs,
+            path_remote_addrs = %path_remote_addrs,
+            "connection path snapshot"
+        );
+    }
+}
+
 fn classify_connection_transport(connection: &Connection) -> Option<String> {
     let paths = connection.paths();
     let mut selected_ip = false;
@@ -3159,6 +3208,18 @@ async fn pipe_unix_iroh(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_accept_info_logging_is_bounded() {
+        let samples = (0..10_000)
+            .filter(|sequence| sync_accept_is_info_sample(*sequence))
+            .count();
+        assert_eq!(samples, 79);
+        assert!(sync_accept_is_info_sample(0));
+        assert!(sync_accept_is_info_sample(128));
+        assert!(!sync_accept_is_info_sample(127));
+        assert!(!sync_accept_is_info_sample(129));
+    }
 
     #[test]
     fn peer_recovery_backoff_scales_and_caps() {

@@ -45,6 +45,15 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **Linux file reads could self-trigger an unbounded sync storm.** Linux
+  inotify reports file opens as access events; treating every watcher event as
+  a mutation meant Fabric's own scans could wake all peers again. Watchers now
+  forward only create/modify/remove events, continuous write streams are
+  coalesced into bounded two-second windows, queued inbound no-op sessions
+  reuse a durable pre-merge scan, and sync-accept path snapshots are sampled
+  1-in-128 in the default validation log. A Linux read-vs-write regression and
+  a three-node, 2,000-file continuous-mutation stress gate cover the recovery.
+
 - **Repeated `fabric exec`/`shell` calls exhausted daemon file descriptors.**
   Replacing a command's deterministic local dial socket removed its pathname
   but left the old listener task and file descriptor alive. The daemon now owns,

@@ -19,7 +19,10 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -38,6 +41,10 @@ use super::node::{Reconciled, SyncNode, content_hash};
 /// How long to wait after a filesystem event settles before syncing, so a burst
 /// of writes coalesces into one reconcile.
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(150);
+/// A continuously mutating tree must still make progress, but it must not drive
+/// the engine at the debounce frequency forever. This caps watcher-driven
+/// reconciles at one per window while coalescing everything in between.
+const WATCH_MAX_COALESCE: Duration = Duration::from_secs(2);
 /// Safety-net periodic reconcile even without filesystem events (catches missed
 /// events and newly trusted peers).
 const PERIODIC_RESYNC: Duration = Duration::from_secs(30);
@@ -66,6 +73,75 @@ pub trait SyncTransport: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Reconciled>> + Send;
 }
 
+/// Per-entry work bookkeeping shared with the filesystem-watcher callback.
+///
+/// The mutation generation makes queued inbound sessions reusable only after a
+/// durable scan of the exact generation they can observe. The first inbound
+/// session always scans; sessions already queued behind it can skip the
+/// redundant pre-merge scan/persist when no mutating event occurred meanwhile.
+#[derive(Debug)]
+struct EntryWork {
+    mutation_generation: AtomicU64,
+    durable_generation: AtomicU64,
+    inbound_waiters: AtomicUsize,
+    #[cfg(test)]
+    scan_calls: AtomicUsize,
+    #[cfg(test)]
+    persist_calls: AtomicUsize,
+}
+
+impl EntryWork {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            // Generation one forces the first inbound session to scan even
+            // before the watcher observes its first event.
+            mutation_generation: AtomicU64::new(1),
+            durable_generation: AtomicU64::new(0),
+            inbound_waiters: AtomicUsize::new(0),
+            #[cfg(test)]
+            scan_calls: AtomicUsize::new(0),
+            #[cfg(test)]
+            persist_calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn record_mutation(&self) {
+        self.mutation_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn begin_inbound(self: &Arc<Self>) -> InboundWaiter {
+        let queued = self.inbound_waiters.fetch_add(1, Ordering::AcqRel) > 0;
+        InboundWaiter {
+            work: self.clone(),
+            queued,
+        }
+    }
+
+    fn may_reuse_durable_scan(&self, queued: bool) -> bool {
+        queued
+            && self.mutation_generation.load(Ordering::Acquire)
+                == self.durable_generation.load(Ordering::Acquire)
+    }
+
+    fn mark_generation_durable(&self, generation: u64) {
+        self.durable_generation
+            .fetch_max(generation, Ordering::AcqRel);
+    }
+}
+
+/// Cancellation-safe accounting for inbound sessions waiting on the entry
+/// operation guard.
+struct InboundWaiter {
+    work: Arc<EntryWork>,
+    queued: bool,
+}
+
+impl Drop for InboundWaiter {
+    fn drop(&mut self) {
+        self.work.inbound_waiters.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// One configured entry's live state.
 struct EntryState {
     config: SyncEntry,
@@ -79,6 +155,7 @@ struct EntryState {
     /// A Present held only in the node is not evidence that a missing path was
     /// locally deleted; this receipt is what distinguishes those cases.
     observed: Arc<StdMutex<HashMap<String, ContentHash>>>,
+    work: Arc<EntryWork>,
 }
 
 /// Atomically persisted authoritative state for one sync entry. `manifest.json`
@@ -98,6 +175,8 @@ struct PersistedEntryState {
 pub(crate) struct PreparedInbound {
     entry: Arc<EntryState>,
     baseline: HashMap<String, ContentHash>,
+    manifest: Manifest,
+    _waiter: InboundWaiter,
     _operation: OwnedMutexGuard<()>,
 }
 
@@ -154,6 +233,13 @@ impl<T: SyncTransport> SyncEngine<T> {
         let mut next: HashMap<String, Arc<EntryState>> = HashMap::new();
         for cfg in book.entries() {
             let policy = cfg.policy.rules();
+            // The existing watcher for a name survives reloads, so its shared
+            // mutation generation must survive too even when another config
+            // field changed and the node is rebuilt.
+            let work = entries
+                .get(&cfg.name)
+                .map(|existing| existing.work.clone())
+                .unwrap_or_else(EntryWork::new);
             // Reuse an existing node for an unchanged entry so in-memory content
             // survives a reload; otherwise start one from the persisted manifest.
             let (node, operation, observed) = match entries.get(&cfg.name) {
@@ -163,6 +249,8 @@ impl<T: SyncTransport> SyncEngine<T> {
                     existing.observed.clone(),
                 ),
                 _ => {
+                    work.durable_generation.store(0, Ordering::Release);
+                    work.record_mutation();
                     let (node, observed) = self.load_node_and_observed(cfg).await?;
                     (
                         Arc::new(Mutex::new(node)),
@@ -179,6 +267,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                     node,
                     operation,
                     observed,
+                    work,
                 }),
             );
         }
@@ -225,16 +314,36 @@ impl<T: SyncTransport> SyncEngine<T> {
         let Some(entry) = self.entries.read().await.get(name).cloned() else {
             return Ok(None);
         };
+        let waiter = entry.work.begin_inbound();
         let operation = entry.operation.clone().lock_owned().await;
-        self.scan_entry(&entry).await?;
-        // Persist the receipt even when the manifest did not change: a legacy
-        // entry may not have state.json yet, and a crash during this first wire
-        // session must not lose knowledge of locally observed Present paths.
-        self.persist_entry(&entry).await?;
+        let queued = waiter.queued;
+
+        if !entry.work.may_reuse_durable_scan(queued) {
+            let generation = entry.work.mutation_generation.load(Ordering::Acquire);
+            let before_manifest = entry.node.lock().await.manifest().clone();
+            let before_observed = entry.observed.lock().unwrap().clone();
+            self.scan_entry(&entry).await?;
+            let final_manifest = entry.node.lock().await.manifest().clone();
+            let final_observed = entry.observed.lock().unwrap().clone();
+            if entry.work.durable_generation.load(Ordering::Acquire) != generation
+                || final_manifest != before_manifest
+                || final_observed != before_observed
+                || !self.state_path(&entry.config.name).exists()
+            {
+                // A legacy entry may not have state.json yet, and a crash
+                // during this first wire session must not lose newly observed
+                // local intent. An already durable no-op scan needs no rewrite.
+                self.persist_entry(&entry).await?;
+            }
+            entry.work.mark_generation_durable(generation);
+        }
         let baseline = entry.observed.lock().unwrap().clone();
+        let manifest = entry.node.lock().await.manifest().clone();
         Ok(Some(PreparedInbound {
             entry,
             baseline,
+            manifest,
+            _waiter: waiter,
             _operation: operation,
         }))
     }
@@ -247,11 +356,20 @@ impl<T: SyncTransport> SyncEngine<T> {
         let PreparedInbound {
             entry,
             baseline,
+            manifest,
+            _waiter,
             _operation,
         } = prepared;
+        let generation = entry.work.mutation_generation.load(Ordering::Acquire);
         self.scan_entry(&entry).await?;
         self.materialize_entry_state(&entry, &baseline).await?;
-        self.persist_entry(&entry).await
+        let final_manifest = entry.node.lock().await.manifest().clone();
+        let final_observed = entry.observed.lock().unwrap().clone();
+        if final_manifest != manifest || final_observed != baseline {
+            self.persist_entry(&entry).await?;
+        }
+        entry.work.mark_generation_durable(generation);
+        Ok(())
     }
 
     /// The configured sync names.
@@ -290,13 +408,17 @@ impl<T: SyncTransport> SyncEngine<T> {
         // initiate together, retaining A while awaiting B's inbound guard (and
         // vice versa) is a distributed lock inversion. Carry a pre-merge
         // baseline across the unlocked network step instead.
-        let baseline = {
+        let (baseline, manifest) = {
             let _operation = entry.operation.lock().await;
             let protected = entry.observed.lock().unwrap().clone();
+            let generation = entry.work.mutation_generation.load(Ordering::Acquire);
             self.scan_entry(&entry).await?;
             self.materialize_entry_state(&entry, &protected).await?;
             self.persist_entry(&entry).await?;
-            entry.observed.lock().unwrap().clone()
+            entry.work.mark_generation_durable(generation);
+            let baseline = entry.observed.lock().unwrap().clone();
+            let manifest = entry.node.lock().await.manifest().clone();
+            (baseline, manifest)
         };
 
         let peers = self.transport.peers_for(&entry.config.peers).await;
@@ -323,7 +445,12 @@ impl<T: SyncTransport> SyncEngine<T> {
         let _operation = entry.operation.lock().await;
         self.scan_entry(&entry).await?;
         self.materialize_entry_state(&entry, &baseline).await?;
-        self.persist_entry(&entry).await
+        let final_manifest = entry.node.lock().await.manifest().clone();
+        let final_observed = entry.observed.lock().unwrap().clone();
+        if final_manifest != manifest || final_observed != baseline {
+            self.persist_entry(&entry).await?;
+        }
+        Ok(())
     }
 
     /// Materialize just this entry to disk.
@@ -338,6 +465,8 @@ impl<T: SyncTransport> SyncEngine<T> {
     }
 
     async fn scan_entry(&self, entry: &EntryState) -> Result<bool> {
+        #[cfg(test)]
+        entry.work.scan_calls.fetch_add(1, Ordering::Relaxed);
         let root = entry.config.folder.clone();
         let cfg = entry.config.clone();
         let policy = entry.policy;
@@ -359,6 +488,8 @@ impl<T: SyncTransport> SyncEngine<T> {
     }
 
     async fn persist_entry(&self, entry: &EntryState) -> Result<()> {
+        #[cfg(test)]
+        entry.work.persist_calls.fetch_add(1, Ordering::Relaxed);
         let manifest = entry.node.lock().await.manifest().clone();
         let observed = entry.observed.lock().unwrap().clone();
         self.write_state(
@@ -464,18 +595,22 @@ impl<T: SyncTransport> SyncEngine<T> {
     }
 
     async fn entry_loop(self: Arc<Self>, name: String) {
-        let root = match self.entries.read().await.get(&name) {
-            Some(entry) => entry.config.folder.clone(),
+        let entry = match self.entries.read().await.get(&name) {
+            Some(entry) => entry.clone(),
             None => return,
         };
+        let root = entry.config.folder.clone();
 
         // Best-effort initial sync.
         if let Err(error) = self.sync_once(&name).await {
             tracing::warn!(sync = %name, %error, "initial sync failed");
         }
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let _watcher = spawn_watcher(&root, tx);
+        // The channel is only an edge trigger. One pending signal is enough;
+        // keeping it bounded prevents an arbitrarily hot writer from building
+        // an in-memory event backlog while the current sync is running.
+        let (tx, mut rx) = mpsc::channel(1);
+        let _watcher = spawn_watcher(&root, tx, entry.work.clone());
 
         let mut ticker = tokio::time::interval(PERIODIC_RESYNC);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -491,9 +626,17 @@ impl<T: SyncTransport> SyncEngine<T> {
                 }
                 event = rx.recv() => {
                     if event.is_none() { break; }
-                    // Debounce: drain the burst before syncing.
-                    tokio::time::sleep(WATCH_DEBOUNCE).await;
-                    while rx.try_recv().is_ok() {}
+                    // Wait for a quiet edge, but cap the window so a
+                    // continuously mutating tree still makes bounded progress.
+                    if !coalesce_watch_events(
+                        &mut rx,
+                        WATCH_DEBOUNCE,
+                        WATCH_MAX_COALESCE,
+                    )
+                    .await
+                    {
+                        break;
+                    }
                     if let Err(error) = self.sync_once(&name).await {
                         tracing::debug!(sync = %name, %error, "watch sync failed");
                     }
@@ -501,6 +644,32 @@ impl<T: SyncTransport> SyncEngine<T> {
             }
         }
     }
+}
+
+/// Coalesce watcher events until the tree is quiet for [`WATCH_DEBOUNCE`], or
+/// until [`WATCH_MAX_COALESCE`] bounds a continuous mutation stream.
+///
+/// Returns false only when the watcher channel has closed.
+async fn coalesce_watch_events(
+    rx: &mut mpsc::Receiver<()>,
+    debounce: Duration,
+    max_coalesce: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + max_coalesce;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            next = tokio::time::timeout(debounce, rx.recv()) => {
+                match next {
+                    Ok(Some(())) => continue,
+                    Ok(None) => return false,
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+    while rx.try_recv().is_ok() {}
+    true
 }
 
 /// A one-line status for `fabric sync ls`.
@@ -818,13 +987,25 @@ fn sanitize_name(name: &str) -> String {
 
 /// Start a recursive filesystem watcher on `root`, forwarding a unit signal on
 /// every event. The returned watcher must be kept alive for events to flow.
-fn spawn_watcher(root: &Path, tx: mpsc::UnboundedSender<()>) -> Option<notify::RecommendedWatcher> {
+fn watcher_event_is_mutation(kind: notify::EventKind) -> bool {
+    matches!(
+        kind,
+        notify::EventKind::Create(_) | notify::EventKind::Modify(_) | notify::EventKind::Remove(_)
+    )
+}
+
+fn spawn_watcher(
+    root: &Path,
+    tx: mpsc::Sender<()>,
+    work: Arc<EntryWork>,
+) -> Option<notify::RecommendedWatcher> {
     use notify::{RecursiveMode, Watcher};
 
     let mut watcher =
         match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if res.is_ok() {
-                let _ = tx.send(());
+            if res.is_ok_and(|event| watcher_event_is_mutation(event.kind)) {
+                work.record_mutation();
+                let _ = tx.try_send(());
             }
         }) {
             Ok(watcher) => watcher,
@@ -861,6 +1042,90 @@ mod tests {
 
     fn catalog_entry(name: &str, folder: &Path) -> SyncEntry {
         entry_with_policy(name, folder, SyncPolicy::Catalog)
+    }
+
+    #[test]
+    fn watcher_wakes_only_for_mutations() {
+        use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind, RemoveKind};
+
+        assert!(!watcher_event_is_mutation(notify::EventKind::Access(
+            AccessKind::Open(AccessMode::Read)
+        )));
+        assert!(!watcher_event_is_mutation(notify::EventKind::Any));
+        assert!(!watcher_event_is_mutation(notify::EventKind::Other));
+        assert!(watcher_event_is_mutation(notify::EventKind::Create(
+            CreateKind::Any
+        )));
+        assert!(watcher_event_is_mutation(notify::EventKind::Modify(
+            ModifyKind::Any
+        )));
+        assert!(watcher_event_is_mutation(notify::EventKind::Remove(
+            RemoveKind::Any
+        )));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_file_reads_do_not_wake_watcher_but_writes_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("watched.txt");
+        std::fs::write(&path, b"seed").unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let work = EntryWork::new();
+        let _watcher = spawn_watcher(dir.path(), tx, work.clone()).unwrap();
+        let generation = work.mutation_generation.load(Ordering::Acquire);
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"seed");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), rx.recv())
+                .await
+                .is_err(),
+            "Linux OPEN/read access must not wake the sync watcher"
+        );
+        assert_eq!(
+            work.mutation_generation.load(Ordering::Acquire),
+            generation,
+            "access events must not advance the mutation generation"
+        );
+
+        std::fs::write(&path, b"changed").unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap(),
+            Some(()),
+            "a real write must wake the sync watcher"
+        );
+        assert!(
+            work.mutation_generation.load(Ordering::Acquire) > generation,
+            "a mutation must advance the generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn continuous_events_are_bounded_by_max_coalesce_window() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let sender = tokio::spawn(async move {
+            for _ in 0..40 {
+                let _ = tx.send(()).await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let started = tokio::time::Instant::now();
+        assert!(
+            coalesce_watch_events(
+                &mut rx,
+                Duration::from_millis(20),
+                Duration::from_millis(100),
+            )
+            .await
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(80) && elapsed < Duration::from_millis(250),
+            "continuous events escaped the bounded coalescer: {elapsed:?}"
+        );
+        sender.abort();
     }
 
     #[test]
@@ -1079,6 +1344,7 @@ mod tests {
     #[derive(Default)]
     struct EngineLoopbackTransport {
         peers: StdMutex<Vec<EnginePeer>>,
+        reconciles: AtomicUsize,
     }
 
     impl EngineLoopbackTransport {
@@ -1087,6 +1353,14 @@ mod tests {
                 id: id.to_string(),
                 engine: Arc::downgrade(engine),
             });
+        }
+
+        fn reset_reconciles(&self) {
+            self.reconciles.store(0, Ordering::Relaxed);
+        }
+
+        fn reconcile_count(&self) -> usize {
+            self.reconciles.load(Ordering::Relaxed)
         }
     }
 
@@ -1110,6 +1384,7 @@ mod tests {
             name: String,
             node: Arc<Mutex<SyncNode>>,
         ) -> Result<Reconciled> {
+            self.reconciles.fetch_add(1, Ordering::Relaxed);
             let target = {
                 let peers = self.peers.lock().unwrap();
                 peers
@@ -1225,6 +1500,65 @@ mod tests {
         assert_eq!(
             std::fs::read(root.join("inbox/remote-new.md")).unwrap(),
             b"new from peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_inbound_noops_reuse_one_durable_prepare_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("shared.md"), b"stable").unwrap();
+        write_bus_sync(dir.path(), &root);
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+        let entry = engine.entries.read().await.get("bus").cloned().unwrap();
+        entry.work.scan_calls.store(0, Ordering::Relaxed);
+        entry.work.persist_calls.store(0, Ordering::Relaxed);
+
+        let first = engine.prepare_inbound("bus").await.unwrap().unwrap();
+        let second_engine = engine.clone();
+        let second =
+            tokio::spawn(
+                async move { second_engine.prepare_inbound("bus").await.unwrap().unwrap() },
+            );
+        let third_engine = engine.clone();
+        let third =
+            tokio::spawn(
+                async move { third_engine.prepare_inbound("bus").await.unwrap().unwrap() },
+            );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while entry.work.inbound_waiters.load(Ordering::Acquire) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("inbound sessions did not queue behind the first operation");
+
+        engine.complete_inbound(first).await.unwrap();
+        engine
+            .complete_inbound(second.await.unwrap())
+            .await
+            .unwrap();
+        engine.complete_inbound(third.await.unwrap()).await.unwrap();
+
+        assert_eq!(
+            entry.work.scan_calls.load(Ordering::Relaxed),
+            4,
+            "first prepare + all three completion guards should scan; queued prepares should not"
+        );
+        assert_eq!(
+            entry.work.persist_calls.load(Ordering::Relaxed),
+            0,
+            "an already durable no-op generation must not rewrite state"
         );
     }
 
@@ -1471,6 +1805,252 @@ mod tests {
             assert_eq!(std::fs::read(root.join("b.md")).unwrap(), b"b");
             assert_eq!(std::fs::read(root.join("c.md")).unwrap(), b"c");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn three_node_2000_file_continuous_mutation_stays_bounded() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let dir_c = tempfile::tempdir().unwrap();
+        let root_a = dir_a.path().join("resources");
+        let root_b = dir_b.path().join("resources");
+        let root_c = dir_c.path().join("resources");
+        for (home, root) in [
+            (dir_a.path(), &root_a),
+            (dir_b.path(), &root_b),
+            (dir_c.path(), &root_c),
+        ] {
+            write_bus_sync(home, root);
+            std::fs::create_dir_all(root).unwrap();
+        }
+        for index in 0..1_999 {
+            std::fs::write(root_a.join(format!("file-{index:04}.txt")), b"seed").unwrap();
+        }
+        std::fs::write(root_a.join("hot.txt"), b"seed").unwrap();
+
+        let cancel = CancellationToken::new();
+        let transport_a = Arc::new(EngineLoopbackTransport::default());
+        let transport_b = Arc::new(EngineLoopbackTransport::default());
+        let transport_c = Arc::new(EngineLoopbackTransport::default());
+        let engine_a = SyncEngine::new(
+            FabricHome::new(dir_a.path()),
+            Author([1; 32]),
+            transport_a.clone(),
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+        let engine_b = SyncEngine::new(
+            FabricHome::new(dir_b.path()),
+            Author([2; 32]),
+            transport_b.clone(),
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+        let engine_c = SyncEngine::new(
+            FabricHome::new(dir_c.path()),
+            Author([3; 32]),
+            transport_c.clone(),
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+        transport_a.add_peer("b", &engine_b);
+        transport_a.add_peer("c", &engine_c);
+        transport_b.add_peer("a", &engine_a);
+        transport_b.add_peer("c", &engine_c);
+        transport_c.add_peer("a", &engine_a);
+        transport_c.add_peer("b", &engine_b);
+
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(15), async {
+                tokio::try_join!(
+                    engine_a.sync_once("bus"),
+                    engine_b.sync_once("bus"),
+                    engine_c.sync_once("bus")
+                )
+            })
+            .await
+            .expect("initial 2,000-file convergence timed out")
+            .unwrap();
+        }
+        for engine in [&engine_a, &engine_b, &engine_c] {
+            assert_eq!(
+                engine
+                    .node_for("bus")
+                    .await
+                    .unwrap()
+                    .lock()
+                    .await
+                    .manifest()
+                    .present_paths()
+                    .count(),
+                2_000
+            );
+        }
+        for transport in [&transport_a, &transport_b, &transport_c] {
+            transport.reset_reconciles();
+        }
+        for engine in [&engine_a, &engine_b, &engine_c] {
+            engine.ensure_watching().await;
+        }
+        // Wait until every newly spawned loop has dialed both peers for its one
+        // initial sync, then ensure each entry operation is idle before zeroing
+        // the stress counters.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if [&transport_a, &transport_b, &transport_c]
+                    .into_iter()
+                    .all(|transport| transport.reconcile_count() >= 2)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("watch loops did not finish their initial peer dials");
+        // Initial materialization may itself have queued one final mutation
+        // burst. Let that bounded window flush, then require all inbound work
+        // to drain before establishing the zero-work read baseline.
+        tokio::time::sleep(WATCH_MAX_COALESCE + Duration::from_millis(250)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut idle = true;
+                for engine in [&engine_a, &engine_b, &engine_c] {
+                    let entry = engine.entries.read().await.get("bus").cloned().unwrap();
+                    idle &= entry.work.inbound_waiters.load(Ordering::Acquire) == 0;
+                }
+                if idle {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial inbound work did not drain");
+        for engine in [&engine_a, &engine_b, &engine_c] {
+            let entry = engine.entries.read().await.get("bus").cloned().unwrap();
+            let _idle = entry.operation.lock().await;
+        }
+
+        for transport in [&transport_a, &transport_b, &transport_c] {
+            transport.reset_reconciles();
+        }
+        let mut entries = Vec::new();
+        for engine in [&engine_a, &engine_b, &engine_c] {
+            let entry = engine.entries.read().await.get("bus").cloned().unwrap();
+            entry.work.scan_calls.store(0, Ordering::Relaxed);
+            entry.work.persist_calls.store(0, Ordering::Relaxed);
+            entries.push(entry);
+        }
+
+        // Model the exact Linux incident trigger: opening every watched file
+        // must not schedule a reconcile or any additional scan/persist work.
+        for root in [&root_a, &root_b, &root_c] {
+            for index in 0..1_999 {
+                assert_eq!(
+                    std::fs::read(root.join(format!("file-{index:04}.txt"))).unwrap(),
+                    b"seed"
+                );
+            }
+            assert_eq!(std::fs::read(root.join("hot.txt")).unwrap(), b"seed");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            [&transport_a, &transport_b, &transport_c]
+                .into_iter()
+                .map(|transport| transport.reconcile_count())
+                .sum::<usize>(),
+            0,
+            "read/access events retriggered reconciliation"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.work.scan_calls.load(Ordering::Relaxed))
+                .sum::<usize>(),
+            0,
+            "read/access events retriggered folder scans"
+        );
+
+        // Keep all three roots continuously mutating for longer than the
+        // production coalescing cap. The cap must make progress without
+        // returning to the old 150 ms reconcile loop.
+        let started = tokio::time::Instant::now();
+        let writers = [
+            (root_a.clone(), "a"),
+            (root_b.clone(), "b"),
+            (root_c.clone(), "c"),
+        ]
+        .into_iter()
+        .map(|(root, label)| {
+            tokio::spawn(async move {
+                for revision in 0..220 {
+                    std::fs::write(
+                        root.join("hot.txt"),
+                        format!("{label}-{revision:03}").as_bytes(),
+                    )
+                    .unwrap();
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+        });
+        for writer in writers {
+            writer.await.unwrap();
+        }
+        tokio::time::sleep(WATCH_MAX_COALESCE + Duration::from_millis(500)).await;
+        let elapsed = started.elapsed();
+
+        let reconciles = [&transport_a, &transport_b, &transport_c]
+            .into_iter()
+            .map(|transport| transport.reconcile_count())
+            .sum::<usize>();
+        let scans = entries
+            .iter()
+            .map(|entry| entry.work.scan_calls.load(Ordering::Relaxed))
+            .sum::<usize>();
+        let persists = entries
+            .iter()
+            .map(|entry| entry.work.persist_calls.load(Ordering::Relaxed))
+            .sum::<usize>();
+        eprintln!(
+            "bounded 3-node/2,000-file stress: {reconciles} reconciles, {scans} scans, \
+             {persists} persists in {elapsed:?}"
+        );
+        assert!(
+            reconciles <= 36 && (reconciles as u128) * 1_000 <= (elapsed.as_millis().max(1)) * 4,
+            "continuous mutations caused {reconciles} reconciles, {scans} scans, and {persists} persists in {elapsed:?}"
+        );
+        // At two peers per node, the reconcile cap also bounds the local
+        // pre/post scans and the receiver-side prepare/complete scans.
+        assert!(
+            scans <= 112,
+            "continuous mutations caused {scans} full-folder scans in {elapsed:?}"
+        );
+        assert!(
+            persists <= 76,
+            "continuous mutations caused {persists} state persists in {elapsed:?}"
+        );
+
+        // The bounded watcher work must still converge the latest value.
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(15), async {
+                tokio::try_join!(
+                    engine_a.sync_once("bus"),
+                    engine_b.sync_once("bus"),
+                    engine_c.sync_once("bus")
+                )
+            })
+            .await
+            .expect("post-stress convergence timed out")
+            .unwrap();
+        }
+        let hot_a = std::fs::read(root_a.join("hot.txt")).unwrap();
+        assert_eq!(std::fs::read(root_b.join("hot.txt")).unwrap(), hot_a);
+        assert_eq!(std::fs::read(root_c.join("hot.txt")).unwrap(), hot_a);
+        cancel.cancel();
     }
 
     #[tokio::test]
@@ -1962,6 +2542,8 @@ mod tests {
         let PreparedInbound {
             entry,
             baseline,
+            manifest: _,
+            _waiter,
             _operation,
         } = prepared;
         engine.scan_entry(&entry).await.unwrap();

@@ -724,6 +724,13 @@ file lists sync *entries*; the running daemon watches each folder and syncs
 changes to peers near-instantly over fabric's own transport. A tool or a human
 just adds an entry and drops files in the folder.
 
+The watcher reacts only to filesystem mutations (create, modify, and remove);
+opening or reading files does not schedule sync work. Write bursts settle for
+150 ms, while a continuously changing tree is coalesced into at most one
+watcher-driven sync per two-second window. Inbound no-op sessions already queued
+for the same durable folder generation reuse its pre-merge scan, and routine
+sync-accept path snapshots are sampled in the default validation log.
+
 Entries live in an authoritative, hand-editable `syncs.toml` next to `peers.toml`
 (`~/.config/fabric/syncs.toml` for the default home, `<home>/syncs.toml` with
 `--home` or `FABRIC_HOME`):
