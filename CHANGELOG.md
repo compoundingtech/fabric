@@ -8,6 +8,11 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Added
 
+- **Deterministic CI stability gate.** Pull requests and main pushes now run
+  library/model tests, explicit two- and three-machine temp-folder simulation,
+  provisioning, real-iroh sync/restart, and the serial local multi-node daemon
+  slice under bounded timeouts.
+
 - **`fabric exec <peer> -- <cmd...>`** — non-interactive remote command
   execution: run a command on a trusted peer with no tty, stream its stdout and
   stderr back on separate streams, and exit with the remote command's exit code.
@@ -17,6 +22,11 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   allowing exec never implies shell. `fabric status` now reports `exec allowed`.
 
 ### Changed
+
+- **Equal-version sync conflicts preserve updates.** Higher logical versions
+  still always win, but at the same version a Present update now wins over a
+  Tombstone delete before deterministic author/content-hash tie-breaking. A
+  later delete advances its logical version and wins normally.
 
 - **Roaming self-heal.** The daemon now actively echo-probes each trusted peer
   (`FABRIC_PEER_HEALTH_SECS`, default 20s) and, on repeated failures, drives

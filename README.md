@@ -27,6 +27,12 @@ On each machine, print its stable NodeID:
 fabric id
 ```
 
+Installing Fabric creates a new local identity but trusts no remote machine.
+There is no account, central trust service, or automatic pairing: exchange the
+public NodeIDs over a channel you trust, and add each side to the other side's
+allow-list. Adding a peer authorizes that NodeID at Fabric's transport boundary;
+remote shell and exec remain separate, default-deny target-side capabilities.
+
 Exchange those NodeIDs over a trusted channel. Trust machine B on machine A:
 
 ```sh
@@ -689,19 +695,30 @@ sync only ever touches already-trusted peers — it adds no new trust surface.
   on any peer is present on all peers, and a local deletion is restored.
   Decommission a file by editing it (for example `retired = true`), never by
   deleting it. Safe for a job catalog.
-- `bus` — union, newer-wins, and propagates deletes via tombstones. (Tombstone
-  sweeping is not yet implemented.)
+- `bus` — newer-wins and propagates a local deletion as a versioned tombstone.
+  Peers that receive the tombstone remove the path. Tombstones are retained;
+  automatic sweeping is not implemented.
 
-Conflicts resolve newer-wins by a logical version with a deterministic tie-break,
-not by filesystem mtime (which is unreliable across machines).
+Conflicts use logical versions, never filesystem mtime (which is unreliable
+across machines). A higher logical version always wins. At the same version, a
+Present update wins over a Tombstone delete, followed by deterministic
+author/content-hash tie-breaks. For example, if two peers start from v1 while
+offline, then one edits the file and the other deletes it, both operations are
+v2 and the updated file intentionally reappears everywhere. If a peer deletes
+that winning update afterward, the delete advances to v3 and removes it
+everywhere under `bus`.
 
 Fabric stores each entry's internal recovery data under
 `<home>/sync/<sanitized-name>/`. `state.json` is the authoritative atomic record
-of both the converged manifest and the files last observed on local disk;
-`manifest.json` is only a compatibility and inspection projection. Do not edit
-either file independently. A rollback or downgrade must restore the entire
-per-entry state directory together with the matching Fabric binary and config,
-not only `manifest.json`.
+of both the converged manifest—including bus tombstones—and the files last
+observed on local disk; `manifest.json` is only a compatibility and inspection
+projection. Do not edit, delete, or restore either file independently: losing
+tombstones can resurrect deleted paths, while losing the observed-disk receipt
+can make old physical bytes look like a new local update. A deliberate rollback
+or downgrade must stop Fabric and restore the entire per-entry state directory
+together with the matching Fabric binary and config, not only `manifest.json`.
+A connected peer that still has a newer logical state can supersede that
+rollback on the next reconcile.
 
 ### Sync Commands
 
@@ -732,6 +749,13 @@ human-editable and can be provisioned before Fabric ever runs. Each
 
 NodeIDs and names must be unique. Normal cross-machine setup should omit
 `addr`; NodeID-based iroh discovery supplies the current addresses.
+
+Trust is local and based on NodeID, not alias: `name` is only a command-line
+label. Each machine must independently list the other NodeID. A trusted peer can
+reach built-in Fabric protocols and explicitly exposed services; if this daemon
+also enables the global `allow_shell` or `allow_exec` capability, every trusted
+peer can use that enabled capability. Fabric does not currently support
+per-peer shell or exec grants.
 
 The usual file contains only NodeIDs and optional names:
 

@@ -12,9 +12,11 @@
 //!   converges to one state.
 //! - **Echo/loop freedom**: once two manifests are equal, `merge` produces no
 //!   change, so a value synced A→B is never re-sent B→A as if new.
-//! - **Newer-wins**: conflicts resolve by a total order on `(version, author)`,
-//!   with `version` a Lamport-style logical counter (never a wall clock, which
-//!   is unreliable across machines) and `author` a deterministic tie-break.
+//! - **Newer-wins**: a higher Lamport-style logical `version` always wins
+//!   (never a wall clock, which is unreliable across machines). At the same
+//!   version, a present update wins over a tombstone so a concurrent edit is
+//!   not silently lost; author and content hash provide deterministic
+//!   tie-breaks within the same entry kind.
 //!
 //! Delete handling (tombstones) is modelled here so the wire format is stable,
 //! but *policy* — whether deletes are created/applied/swept — is decided one
@@ -111,14 +113,13 @@ impl Entry {
         }
     }
 
-    /// Rank so a present file and a tombstone at the *exact* same
-    /// `(version, author)` still order deterministically. A tombstone outranks a
-    /// present at an exact tie, so a concurrent delete+edit that somehow share a
-    /// version resolve the same way on every peer.
+    /// Rank equal logical versions before author/hash tie-breaking. A present
+    /// update outranks a tombstone at the same version so a concurrent
+    /// update/delete keeps the update; a later higher-version delete still wins.
     fn kind_rank(&self) -> u8 {
         match self {
-            Entry::Present(_) => 0,
-            Entry::Tombstone(_) => 1,
+            Entry::Present(_) => 1,
+            Entry::Tombstone(_) => 0,
         }
     }
 
@@ -130,13 +131,13 @@ impl Entry {
     }
 
     /// The total-order key. Higher wins. Ordering by `version` first gives
-    /// newer-wins; `author` then `kind_rank` then `hash` make it a *total*
+    /// newer-wins; `kind_rank`, `author`, and `hash` then make it a *total*
     /// order so merge is a well-defined join and convergence is guaranteed.
-    fn order_key(&self) -> (u64, [u8; 32], u8, [u8; 32]) {
+    fn order_key(&self) -> (u64, u8, [u8; 32], [u8; 32]) {
         (
             self.version(),
-            self.author().0,
             self.kind_rank(),
+            self.author().0,
             self.tiebreak_hash(),
         )
     }
@@ -372,11 +373,9 @@ mod tests {
     }
 
     #[test]
-    fn tombstone_outranks_present_at_exact_tie() {
-        // Same version and author: the deterministic kind rank decides, the same
-        // way on every peer.
-        assert!(tomb(3, 7).wins_over(&present(3, 7, 1)));
-        assert!(!present(3, 7, 1).wins_over(&tomb(3, 7)));
+    fn present_outranks_tombstone_at_equal_version_and_author() {
+        assert!(present(3, 7, 1).wins_over(&tomb(3, 7)));
+        assert!(!tomb(3, 7).wins_over(&present(3, 7, 1)));
     }
 
     #[test]
@@ -386,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn present_and_tombstone_follow_one_total_version_author_kind_order() {
+    fn entries_follow_version_then_present_then_author_hash_order() {
         let cases = [
             (
                 "newer present beats older tombstone",
@@ -399,13 +398,18 @@ mod tests {
                 present(3, 9, 1),
             ),
             (
-                "author breaks a same-version cross-kind tie before kind",
-                present(4, 9, 1),
-                tomb(4, 8),
+                "present beats tombstone at equal version before author",
+                present(4, 0, 1),
+                tomb(4, 9),
             ),
             (
-                "tombstone breaks an exact version-author tie",
-                tomb(4, 9),
+                "author breaks a same-version same-kind tie",
+                present(4, 9, 1),
+                present(4, 8, 9),
+            ),
+            (
+                "hash breaks an exact version-author-kind tie",
+                present(4, 9, 2),
                 present(4, 9, 1),
             ),
         ];

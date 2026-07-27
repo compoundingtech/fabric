@@ -1286,6 +1286,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn equal_version_update_beats_concurrent_delete_then_later_delete_wins_across_engines() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let root_a = dir_a.path().join("resources");
+        let root_b = dir_b.path().join("resources");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        write_bus_sync(dir_a.path(), &root_a);
+        write_bus_sync(dir_b.path(), &root_b);
+
+        let transport_a = Arc::new(EngineLoopbackTransport::default());
+        let transport_b = Arc::new(EngineLoopbackTransport::default());
+        // Give the deleting peer the higher author so this specifically proves
+        // equal-version Present precedence happens before author tie-breaking.
+        let engine_a = SyncEngine::new(
+            FabricHome::new(dir_a.path()),
+            Author([1; 32]),
+            transport_a.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let engine_b = SyncEngine::new(
+            FabricHome::new(dir_b.path()),
+            Author([2; 32]),
+            transport_b.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        transport_a.add_peer("b", &engine_b);
+        transport_b.add_peer("a", &engine_a);
+
+        let path_a = root_a.join("job.toml");
+        let path_b = root_b.join("job.toml");
+        std::fs::write(&path_a, b"seed").unwrap();
+        engine_a.sync_once("bus").await.unwrap();
+        engine_b.sync_once("bus").await.unwrap();
+        assert_eq!(std::fs::read(&path_b).unwrap(), b"seed");
+
+        // Make the two offline-style local intents from the same v1 baseline,
+        // then scan and persist both before allowing either engine to reconcile.
+        std::fs::write(&path_a, b"concurrent update").unwrap();
+        std::fs::remove_file(&path_b).unwrap();
+        for engine in [&engine_a, &engine_b] {
+            let entry = engine.entries.read().await.get("bus").cloned().unwrap();
+            let _operation = entry.operation.lock().await;
+            engine.scan_entry(&entry).await.unwrap();
+            engine.persist_entry(&entry).await.unwrap();
+        }
+        assert!(matches!(
+            engine_a
+                .node_for("bus")
+                .await
+                .unwrap()
+                .lock()
+                .await
+                .manifest()
+                .get("job.toml"),
+            Some(Entry::Present(meta)) if meta.version == 2 && meta.author == Author([1; 32])
+        ));
+        assert!(matches!(
+            engine_b
+                .node_for("bus")
+                .await
+                .unwrap()
+                .lock()
+                .await
+                .manifest()
+                .get("job.toml"),
+            Some(Entry::Tombstone(tombstone))
+                if tombstone.version == 2 && tombstone.author == Author([2; 32])
+        ));
+
+        engine_a.sync_once("bus").await.unwrap();
+        engine_b.sync_once("bus").await.unwrap();
+        assert_eq!(std::fs::read(&path_a).unwrap(), b"concurrent update");
+        assert_eq!(std::fs::read(&path_b).unwrap(), b"concurrent update");
+        for engine in [&engine_a, &engine_b] {
+            assert!(matches!(
+                engine
+                    .node_for("bus")
+                    .await
+                    .unwrap()
+                    .lock()
+                    .await
+                    .manifest()
+                    .get("job.toml"),
+                Some(Entry::Present(meta)) if meta.version == 2
+            ));
+        }
+
+        // B has now observed the winning update. Its later delete advances to
+        // v3 and therefore beats the older Present everywhere.
+        std::fs::remove_file(&path_b).unwrap();
+        engine_b.sync_once("bus").await.unwrap();
+        engine_a.sync_once("bus").await.unwrap();
+        assert!(!path_a.exists());
+        assert!(!path_b.exists());
+        for engine in [&engine_a, &engine_b] {
+            assert!(matches!(
+                engine
+                    .node_for("bus")
+                    .await
+                    .unwrap()
+                    .lock()
+                    .await
+                    .manifest()
+                    .get("job.toml"),
+                Some(Entry::Tombstone(tombstone)) if tombstone.version == 3
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn simultaneous_three_peer_syncs_do_not_deadlock() {
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();

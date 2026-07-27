@@ -1,0 +1,46 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deterministic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Library and model tests
+        run: timeout 10m cargo test --locked --lib
+
+      - name: Deterministic fake two-machine folder sync
+        run: >-
+          timeout 5m cargo test --locked --lib
+          sync::engine::tests::two_engines_sync_real_folders_over_loopback
+          -- --exact
+
+      - name: Deterministic fake three-machine simultaneous sync
+        run: >-
+          timeout 5m cargo test --locked --lib
+          sync::engine::tests::simultaneous_three_peer_syncs_do_not_deadlock
+          -- --exact
+
+      - name: Provisioning and CLI contract
+        run: timeout 5m cargo test --locked --test provisioning -- --test-threads=1
+
+      - name: Real iroh folder sync and restart
+        run: timeout 10m cargo test --locked --test sync_slice -- --test-threads=1
+
+      - name: Serial local multi-node daemon slice
+        run: timeout 15m cargo test --locked --test local_slice -- --test-threads=1
