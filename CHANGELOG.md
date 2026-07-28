@@ -8,6 +8,12 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Added
 
+- **Safe st2 catalog sync recipe.** The README now provides a copy-pasteable,
+  two-entry positive allow-list for declarations and bus data, with explicit
+  machine-local PTY/runtime exclusions and an ordinary resource/message
+  propagation check. A provisioning test executes and locks the documented CLI
+  and resulting policy/include semantics.
+
 - **Deterministic CI stability gate.** Pull requests and main pushes now run
   library/model tests, explicit two- and three-machine temp-folder simulation,
   provisioning, real-iroh sync/restart, and the serial local multi-node daemon

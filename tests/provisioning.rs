@@ -284,3 +284,147 @@ fn default_home_peer_file_overrides_embedded_config_peers() -> Result<()> {
     assert!(fs::read_to_string(config_dir.join("peers.toml"))?.contains("new-peer"));
     Ok(())
 }
+
+#[test]
+fn readme_st2_sync_recipe_is_copy_pasteable_and_scoped() -> Result<()> {
+    const RECIPE: &str = r#"ST2_CATALOG="${XDG_STATE_HOME:-$HOME/.local/state}/st2/default/catalog"
+
+fabric sync add "$ST2_CATALOG" --name st2-declarations-default --peers "*" --policy catalog --include "_templates/**,agents/**/agent.kdl,plans/**"
+fabric sync add "$ST2_CATALOG/agents" --name st2-bus-default --peers "*" --policy bus --include "**/resources/**,**/status""#;
+
+    let readme = include_str!("../README.md");
+    let (_, after_heading) = readme
+        .split_once("### Sync an st2 catalog safely")
+        .context("README is missing the st2 sync heading")?;
+    let (section, _) = after_heading
+        .split_once("\n## Declarative Peer Config")
+        .context("README st2 sync section has no end boundary")?;
+
+    assert!(
+        section.contains(RECIPE),
+        "README must contain the exact portable st2 recipe"
+    );
+    assert_eq!(
+        section.matches("fabric sync add ").count(),
+        2,
+        "st2 must use exactly two positive-list sync entries"
+    );
+    for required in [
+        "resources/inbox",
+        "resources/archive",
+        "resources/context",
+        "resources/links",
+        "MUST NEVER",
+        "$ST2_CATALOG/pty",
+        "sockets",
+        "PIDs",
+        "locks",
+        "exec runtime state",
+        "logs",
+        "temporary, backup, and partial files",
+        "Workspaces and hooks are provisioned separately",
+        "Never add a hidden `_syncproof` fixture",
+        "fabric sync reload",
+        "fabric sync ls",
+        "fabric status",
+        "fabric ping <peer-name>",
+        "st2 resource add",
+        "st2 message archive",
+    ] {
+        assert!(
+            section.contains(required),
+            "README st2 section is missing safety/verification contract {required:?}"
+        );
+    }
+    assert!(
+        !section.contains("--include \"_syncproof"),
+        "the retired hidden fixture must never be an include"
+    );
+
+    let temp = TempDir::new()?;
+    let fake_home = temp.path().join("home");
+    let xdg_state = temp.path().join("state");
+    let xdg_config = temp.path().join("config");
+    let catalog = xdg_state.join("st2/default/catalog");
+    fs::create_dir_all(catalog.join("agents"))?;
+
+    let bin_dir = std::path::Path::new(fabric_bin())
+        .parent()
+        .context("fabric test binary has no parent")?;
+    let path = std::env::join_paths(std::iter::once(bin_dir.to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))?;
+    stdout(
+        Command::new("sh")
+            .args(["-eu", "-c", RECIPE])
+            .env("HOME", &fake_home)
+            .env("XDG_STATE_HOME", &xdg_state)
+            .env("XDG_CONFIG_HOME", &xdg_config)
+            .env_remove("FABRIC_HOME")
+            .env("PATH", path)
+            .output()
+            .context("failed to execute README st2 sync recipe")?,
+    )?;
+
+    let raw = fs::read_to_string(xdg_config.join("fabric/syncs.toml"))?;
+    let parsed: toml::Value = toml::from_str(&raw)?;
+    let entries = parsed
+        .get("sync")
+        .and_then(toml::Value::as_array)
+        .context("generated syncs.toml has no sync entries")?;
+    assert_eq!(entries.len(), 2);
+
+    let declarations = entries
+        .iter()
+        .find(|entry| {
+            entry.get("name").and_then(toml::Value::as_str) == Some("st2-declarations-default")
+        })
+        .context("missing declarations entry")?;
+    assert_eq!(
+        declarations.get("folder").and_then(toml::Value::as_str),
+        catalog.to_str()
+    );
+    assert_eq!(
+        declarations.get("peers").and_then(toml::Value::as_str),
+        Some("*")
+    );
+    assert_eq!(
+        declarations.get("policy").and_then(toml::Value::as_str),
+        Some("catalog")
+    );
+    let declaration_includes = declarations
+        .get("include")
+        .and_then(toml::Value::as_array)
+        .context("declarations entry has no includes")?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .context("declarations include is not a string")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(
+        declaration_includes,
+        vec!["_templates/**", "agents/**/agent.kdl", "plans/**"]
+    );
+
+    let bus = entries
+        .iter()
+        .find(|entry| entry.get("name").and_then(toml::Value::as_str) == Some("st2-bus-default"))
+        .context("missing bus entry")?;
+    assert_eq!(
+        bus.get("folder").and_then(toml::Value::as_str),
+        catalog.join("agents").to_str()
+    );
+    assert_eq!(bus.get("peers").and_then(toml::Value::as_str), Some("*"));
+    assert_eq!(bus.get("policy").and_then(toml::Value::as_str), Some("bus"));
+    let bus_includes = bus
+        .get("include")
+        .and_then(toml::Value::as_array)
+        .context("bus entry has no includes")?
+        .iter()
+        .map(|value| value.as_str().context("bus include is not a string"))
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(bus_includes, vec!["**/resources/**", "**/status"]);
+    Ok(())
+}

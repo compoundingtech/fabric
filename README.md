@@ -809,6 +809,136 @@ the file to a running daemon, mirroring `reload-peers`. The daemon serves and
 dials sync over the reserved `fabric/sync/1` ALPN, gated by the same peer
 allow-list as every other fabric protocol.
 
+### Sync an st2 catalog safely
+
+An st2 catalog mixes declarative fleet data, durable bus data, and strictly
+machine-local runtime state. Do not make the catalog one broad sync entry.
+Instead, configure these two positive allow-lists on **every** host:
+
+```sh
+ST2_CATALOG="${XDG_STATE_HOME:-$HOME/.local/state}/st2/default/catalog"
+
+fabric sync add "$ST2_CATALOG" --name st2-declarations-default --peers "*" --policy catalog --include "_templates/**,agents/**/agent.kdl,plans/**"
+fabric sync add "$ST2_CATALOG/agents" --name st2-bus-default --peers "*" --policy bus --include "**/resources/**,**/status"
+```
+
+The shell resolves `ST2_CATALOG` to an absolute, machine-local path. The path may
+differ between hosts, but the logical names `st2-declarations-default` and
+`st2-bus-default` must be identical everywhere. `--peers "*"` means every peer
+already trusted by that host's `peers.toml`; to pin membership, replace it with
+a comma-separated local selector such as `--peers "workstation,server"` on each
+host. Peer aliases may differ between hosts even though the two sync names do
+not.
+
+The entries deliberately have different semantics:
+
+- `st2-declarations-default` syncs only templates, `agent.kdl` declarations, and
+  plans. It uses `catalog` policy because these files declare desired fleet
+  membership. Retire an agent by editing its declaration (for example, setting
+  its retirement field); do not express retirement by deleting the file.
+- `st2-bus-default` syncs agent status plus everything below
+  `resources/**`. That includes normal `resources/inbox`,
+  `resources/archive`, `resources/context`, and `resources/links` paths. It uses
+  `bus` policy so moves and deletions become tombstones and propagate instead
+  of stale inbox or resource files reappearing.
+
+> [!WARNING]
+> PTY registries and process state are strictly machine-local and **MUST NEVER
+> sync**. Never sync the entire st2 catalog. In particular, never include
+> `$ST2_CATALOG/pty`, sockets, PIDs, locks, exec runtime state, logs, or
+> temporary, backup, and partial files.
+> Workspaces and hooks are provisioned separately unless a future explicit
+> contract says otherwise. Never add a hidden `_syncproof` fixture; validate
+> sync with ordinary agent resources and messages instead.
+
+Positive includes are the safety boundary. When publishing an included file,
+stage it outside the synced folder and move only its canonical final path into
+place. A broader root, a catch-all include, or a watcher-visible sibling temp
+file turns machine-local or partial state into a durable logical key.
+
+After configuring every host, apply and check the live daemon:
+
+```sh
+fabric sync reload
+fabric sync ls
+fabric status
+fabric ping <peer-name>
+```
+
+`fabric sync ls` must show the same two logical names on every host, with the
+local catalog paths and intended peer selectors. `fabric status` and
+`fabric ping` must show the selected peers reachable.
+
+For the default Fabric home, inspect the effective include lists and fail if
+machine-local paths were added:
+
+```sh
+FABRIC_SYNCS="${XDG_CONFIG_HOME:-$HOME/.config}/fabric/syncs.toml"
+FABRIC_STATE="${FABRIC_HOME:-$HOME/.local/share/fabric}/sync"
+
+sed -n '1,200p' "$FABRIC_SYNCS"
+if grep -Eq '_syncproof|catalog/pty|\.sock|\.pid|events\.jsonl|/logs?/' "$FABRIC_SYNCS"; then
+  echo "unsafe st2 sync include in $FABRIC_SYNCS" >&2
+  exit 1
+fi
+
+for state in \
+  "$FABRIC_STATE/st2-bus-default/state.json" \
+  "$FABRIC_STATE/st2-bus-default/manifest.json" \
+  "$FABRIC_STATE/st2-declarations-default/state.json" \
+  "$FABRIC_STATE/st2-declarations-default/manifest.json"
+do
+  test -f "$state"
+  if grep -Eq '^[[:space:]]+"(pty|exec|run|logs?)/|\.sock"[[:space:]]*:|\.pid"[[:space:]]*:|events\.jsonl"[[:space:]]*:' "$state"; then
+    echo "machine-local runtime key found in $state" >&2
+    exit 1
+  fi
+done
+```
+
+No output from either failure branch is success. The state check intentionally
+matches a root `pty/` key; an agent identity such as
+`workstation/pty/resources/...` is ordinary allow-listed bus data, not the
+sibling `catalog/pty` registry.
+
+Use normal st2 operations for a harmless end-to-end check. On one host:
+
+```sh
+PROOF_IDENTITY="${ST_AGENT:?set ST_AGENT to the agent running this check}"
+resource_ref="$(st2 resource add "https://github.com/compoundingtech/fabric" --title "st2 sync check" --tag "sync-check" --relation verification)"
+message_file="$(st2 message send "$PROOF_IDENTITY" --subject "st2 sync check" -m "ordinary inbox item; verify on every host, then archive")"
+printf 'identity=%s resource=%s message=%s\n' "$PROOF_IDENTITY" "$resource_ref" "$message_file"
+```
+
+On every host, including the origin, verify the same resource, inbox item, and
+status:
+
+```sh
+st2 resource read "$PROOF_IDENTITY" "$resource_ref"
+st2 message ls "$PROOF_IDENTITY" | grep -F "$message_file"
+st2 status "$PROOF_IDENTITY"
+```
+
+Then archive the message once on the origin:
+
+```sh
+st2 message archive "$PROOF_IDENTITY" "$message_file"
+```
+
+On every host, the message must disappear from the inbox and appear once in the
+archive:
+
+```sh
+if st2 message ls "$PROOF_IDENTITY" | grep -F "$message_file"; then
+  echo "message still present in inbox" >&2
+  exit 1
+fi
+st2 message ls "$PROOF_IDENTITY" --archive | grep -F "$message_file"
+```
+
+If a check has not converged yet, confirm `fabric status`/`fabric ping` first
+and retry; do not weaken the include lists to make the proof pass.
+
 ## Declarative Peer Config
 
 `peers.toml` is Fabric's authorized-keys file. It is intentionally
