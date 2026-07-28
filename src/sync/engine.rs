@@ -379,18 +379,45 @@ impl<T: SyncTransport> SyncEngine<T> {
         names
     }
 
-    /// A one-line status per entry: name, folder, peer count, file count.
+    /// A stable snapshot of logical manifest state and the materialized-disk
+    /// receipt for every entry.
     pub async fn status(&self) -> Vec<SyncStatus> {
         let entries = self.entries.read().await;
         let mut out = Vec::new();
         for (name, entry) in entries.iter() {
+            let _operation = entry.operation.lock().await;
             let node = entry.node.lock().await;
+            let observed = entry.observed.lock().unwrap();
+            let manifest = node.manifest();
+            let present = manifest.present_paths().count();
+            let tombstones = manifest.len() - present;
+            let missing = manifest
+                .present_paths()
+                .filter(|(path, _)| !observed.contains_key(path.as_str()))
+                .count();
+            let unexpected = observed
+                .keys()
+                .filter(|path| !manifest.get(path).is_some_and(|item| item.is_present()))
+                .count();
+            let mismatched = manifest
+                .present_paths()
+                .filter(|(path, meta)| {
+                    observed
+                        .get(path.as_str())
+                        .is_some_and(|hash| hash != &meta.hash)
+                })
+                .count();
             out.push(SyncStatus {
                 name: name.clone(),
                 folder: entry.config.folder.clone(),
                 policy: entry.config.policy.as_str(),
                 peers: entry.config.peers.clone(),
-                files: node.manifest().present_paths().count(),
+                present,
+                tombstones,
+                observed: observed.len(),
+                missing,
+                unexpected,
+                mismatched,
             });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -672,14 +699,19 @@ async fn coalesce_watch_events(
     true
 }
 
-/// A one-line status for `fabric sync ls`.
+/// Logical manifest and materialized-disk receipt counts for `fabric sync ls`.
 #[derive(Debug, Clone)]
 pub struct SyncStatus {
     pub name: String,
     pub folder: PathBuf,
     pub policy: &'static str,
     pub peers: SyncPeers,
-    pub files: usize,
+    pub present: usize,
+    pub tombstones: usize,
+    pub observed: usize,
+    pub missing: usize,
+    pub unexpected: usize,
+    pub mismatched: usize,
 }
 
 // ---- filesystem scan / materialize (sync helpers, unit-testable) ----
@@ -803,6 +835,23 @@ fn scan_into_node_observed(
         let hash = content_hash(&file.bytes);
         current.insert(file.rel.clone(), hash);
         if previous.get(&file.rel) == Some(&hash) {
+            // Catalog is a union-of-presence policy. A Tombstone may still be
+            // inherited from an older bus configuration or a peer running an
+            // older policy. If unchanged physical bytes survive on any catalog
+            // node, advance them to a higher Present so the manifest, wire
+            // state, persisted state, and every materialized folder converge.
+            // Bus deliberately keeps the Tombstone authoritative instead.
+            if !policy.propagate_deletes
+                && node
+                    .manifest()
+                    .get(&file.rel)
+                    .is_some_and(|entry| !entry.is_present())
+            {
+                if node.local_write(&file.rel, &file.bytes, file.mtime_secs, file.mtime_nanos) {
+                    changed = true;
+                }
+                continue;
+            }
             // Refill content after restart only when the manifest still names
             // these exact bytes. If a peer changed the entry while its old disk
             // bytes remained, those bytes are stale rather than a local edit.
@@ -1192,7 +1241,7 @@ mod tests {
 
     #[test]
     fn authoritative_tombstone_with_stale_observed_file_respects_policy() {
-        for (policy, file_survives) in [(SyncPolicy::Catalog, true), (SyncPolicy::Bus, false)] {
+        for policy in [SyncPolicy::Catalog, SyncPolicy::Bus] {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
             let path = root.join("retired.toml");
@@ -1209,17 +1258,25 @@ mod tests {
             let mut observed = HashMap::from([("retired.toml".to_string(), stale_hash)]);
             let protected = observed.clone();
 
-            assert!(
-                !scan_into_node_observed(&mut node, root, &entry, rules, &mut observed).unwrap(),
-                "unchanged observed bytes must not resurrect a Tombstone under {policy:?}"
-            );
-            assert!(matches!(
-                node.manifest().get("retired.toml"),
-                Some(Entry::Tombstone(tombstone)) if tombstone.version == 2
-            ));
+            let changed =
+                scan_into_node_observed(&mut node, root, &entry, rules, &mut observed).unwrap();
+            assert_eq!(changed, policy == SyncPolicy::Catalog);
+            if policy == SyncPolicy::Catalog {
+                assert!(matches!(
+                    node.manifest().get("retired.toml"),
+                    Some(Entry::Present(meta))
+                        if meta.version == 3 && meta.hash == stale_hash
+                ));
+            } else {
+                assert!(matches!(
+                    node.manifest().get("retired.toml"),
+                    Some(Entry::Tombstone(tombstone)) if tombstone.version == 2
+                ));
+            }
             assert_eq!(observed.get("retired.toml"), Some(&stale_hash));
 
             materialize_tracked(&mut node, root, rules, &protected, &mut observed).unwrap();
+            let file_survives = policy == SyncPolicy::Catalog;
             assert_eq!(path.exists(), file_survives, "policy {policy:?}");
             assert_eq!(
                 observed.contains_key("retired.toml"),
@@ -1617,6 +1674,177 @@ mod tests {
             std::fs::read(dir_a.path().join("catalog/job.toml")).is_ok(),
             "catalog delete must not remove the file on A"
         );
+    }
+
+    #[tokio::test]
+    async fn catalog_recovers_shared_tombstone_from_one_surviving_copy_over_wire_and_restart() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let root_a = dir_a.path().join("catalog");
+        let root_b = dir_b.path().join("catalog");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        std::fs::write(root_a.join("agent.kdl"), b"role \"worker\"\n").unwrap();
+        write_syncs(dir_a.path(), &root_a);
+        write_syncs(dir_b.path(), &root_b);
+
+        // Seed the incident state on both nodes: one shared Tombstone/v2, but
+        // only A retains the exact previously observed physical bytes.
+        let mut tombstoned = SyncNode::new(Author([9; 32]));
+        tombstoned.local_write("agent.kdl", b"role \"worker\"\n", 0, 0);
+        tombstoned.local_remove("agent.kdl", SyncPolicy::Bus.rules(), 10);
+        let manifest = tombstoned.manifest().clone();
+        let stale_hash = content_hash(b"role \"worker\"\n");
+        for (home, observed) in [
+            (
+                dir_a.path(),
+                HashMap::from([("agent.kdl".to_string(), stale_hash)]),
+            ),
+            (dir_b.path(), HashMap::new()),
+        ] {
+            let seed = SyncEngine::new(
+                FabricHome::new(home),
+                Author([8; 32]),
+                Arc::new(LoopbackTransport::default()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            seed.write_state(
+                "catalog",
+                &PersistedEntryState {
+                    manifest: manifest.clone(),
+                    observed,
+                },
+            )
+            .unwrap();
+        }
+
+        let transport_a = Arc::new(LoopbackTransport::default());
+        let transport_b = Arc::new(LoopbackTransport::default());
+        let engine_a = SyncEngine::new(
+            FabricHome::new(dir_a.path()),
+            Author([1; 32]),
+            transport_a.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let engine_b = SyncEngine::new(
+            FabricHome::new(dir_b.path()),
+            Author([2; 32]),
+            transport_b.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        transport_a.add_peer("b", "catalog", engine_b.node_for("catalog").await.unwrap());
+        transport_b.add_peer("a", "catalog", engine_a.node_for("catalog").await.unwrap());
+
+        // A's catalog scan advances the surviving bytes to Present/v3, the wire
+        // transfers that winner and its content, and B materializes it.
+        engine_a.sync_once("catalog").await.unwrap();
+        engine_b.sync_once("catalog").await.unwrap();
+        engine_a.sync_once("catalog").await.unwrap();
+
+        let recovered = b"role \"worker\"\n";
+        assert_eq!(std::fs::read(root_a.join("agent.kdl")).unwrap(), recovered);
+        assert_eq!(std::fs::read(root_b.join("agent.kdl")).unwrap(), recovered);
+        for engine in [&engine_a, &engine_b] {
+            assert!(matches!(
+                engine
+                    .node_for("catalog")
+                    .await
+                    .unwrap()
+                    .lock()
+                    .await
+                    .manifest()
+                    .get("agent.kdl"),
+                Some(Entry::Present(meta))
+                    if meta.version == 3 && meta.hash == stale_hash
+            ));
+        }
+
+        // The same Present/v3 plus observed receipt is authoritative after a
+        // restart, and replaying the scan does not create another version.
+        drop(engine_a);
+        drop(engine_b);
+        for (home, root, author) in [
+            (dir_a.path(), &root_a, Author([1; 32])),
+            (dir_b.path(), &root_b, Author([2; 32])),
+        ] {
+            let restarted = SyncEngine::new(
+                FabricHome::new(home),
+                author,
+                Arc::new(LoopbackTransport::default()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            restarted.sync_once("catalog").await.unwrap();
+            let entry = restarted
+                .entries
+                .read()
+                .await
+                .get("catalog")
+                .cloned()
+                .unwrap();
+            assert!(matches!(
+                entry.node.lock().await.manifest().get("agent.kdl"),
+                Some(Entry::Present(meta))
+                    if meta.version == 3 && meta.hash == stale_hash
+            ));
+            assert_eq!(
+                entry.observed.lock().unwrap().get("agent.kdl"),
+                Some(&stale_hash)
+            );
+            assert_eq!(std::fs::read(root.join("agent.kdl")).unwrap(), recovered);
+        }
+    }
+
+    #[tokio::test]
+    async fn status_exposes_logical_observed_and_drift_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("catalog");
+        write_syncs(dir.path(), &root);
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let entry = engine.entries.read().await.get("catalog").cloned().unwrap();
+        let mut observed = HashMap::new();
+        {
+            let mut node = entry.node.lock().await;
+            for index in 0..40 {
+                let path = format!("agents/{index}/agent.kdl");
+                let bytes = format!("worker {index}").into_bytes();
+                node.local_write(&path, &bytes, 0, 0);
+                observed.insert(path, content_hash(&bytes));
+            }
+            for index in 0..3 {
+                let path = format!("retired/{index}.kdl");
+                let bytes = format!("retired {index}").into_bytes();
+                node.local_write(&path, &bytes, 0, 0);
+                node.local_remove(&path, SyncPolicy::Bus.rules(), 10);
+                if index < 2 {
+                    observed.insert(path, content_hash(&bytes));
+                }
+            }
+        }
+        *entry.observed.lock().unwrap() = observed;
+
+        let statuses = engine.status().await;
+        let status = statuses.first().unwrap();
+        assert_eq!(status.present, 40);
+        assert_eq!(status.tombstones, 3);
+        assert_eq!(status.observed, 42);
+        assert_eq!(status.missing, 0);
+        assert_eq!(status.unexpected, 2);
+        assert_eq!(status.mismatched, 0);
     }
 
     #[tokio::test]
@@ -2288,38 +2516,37 @@ mod tests {
             label: &'static str,
             observed: Option<&'static [u8]>,
             disk: &'static [u8],
-            expected_present: bool,
+            expected_bus_present: bool,
         }
 
-        // A matching receipt proves unchanged physical bytes are stale, so the
-        // authoritative Tombstone stays authoritative. An absent or mismatched
-        // receipt cannot distinguish those bytes from a new local write and
-        // therefore characterizes the current contract as a v3 resurrection.
-        // Actually edited bytes are likewise explicit new local intent.
+        // Catalog always recovers physical bytes into a higher Present because
+        // union-of-presence cannot retain a Tombstone while any copy survives.
+        // Bus keeps a matching unchanged receipt tombstoned; absent, mismatched,
+        // or edited bytes are new local intent and advance to Present/v3.
         let cases = [
             Case {
                 label: "matching receipt and unchanged bytes",
                 observed: Some(b"old"),
                 disk: b"old",
-                expected_present: false,
+                expected_bus_present: false,
             },
             Case {
                 label: "absent receipt and unchanged bytes",
                 observed: None,
                 disk: b"old",
-                expected_present: true,
+                expected_bus_present: true,
             },
             Case {
                 label: "mismatched receipt and unchanged bytes",
                 observed: Some(b"different"),
                 disk: b"old",
-                expected_present: true,
+                expected_bus_present: true,
             },
             Case {
                 label: "matching receipt and edited bytes",
                 observed: Some(b"old"),
                 disk: b"edited",
-                expected_present: true,
+                expected_bus_present: true,
             },
         ];
 
@@ -2382,7 +2609,9 @@ mod tests {
                 let manifest = entry.node.lock().await.manifest().clone();
                 let observed = entry.observed.lock().unwrap().clone();
                 let context = format!("{} under {final_policy:?}", case.label);
-                if case.expected_present {
+                let expected_present =
+                    final_policy == SyncPolicy::Catalog || case.expected_bus_present;
+                if expected_present {
                     assert!(
                         matches!(
                             manifest.get("retired.md"),

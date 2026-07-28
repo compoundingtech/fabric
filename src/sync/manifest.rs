@@ -201,7 +201,8 @@ impl Manifest {
     }
 
     /// Paths whose latest entry is a present file (the files that should exist
-    /// on disk under bus policy; under catalog, tombstones never appear).
+    /// on disk). Catalog never creates tombstones, but may temporarily retain
+    /// inherited ones until a surviving physical copy advances them.
     pub fn present_paths(&self) -> impl Iterator<Item = (&String, &FileMeta)> {
         self.entries.iter().filter_map(|(path, entry)| match entry {
             Entry::Present(meta) => Some((path, meta)),

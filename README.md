@@ -764,6 +764,16 @@ sync only ever touches already-trusted peers — it adds no new trust surface.
   Peers that receive the tombstone remove the path. Tombstones are retained;
   automatic sweeping is not implemented.
 
+Catalog never originates tombstones, but persisted or wire state may inherit one
+from an older bus configuration. Fabric migrates that state using
+union-of-presence: if unchanged in-scope bytes still exist on any catalog node,
+that node advances them to a higher logical Present version and publishes their
+content, so every catalog manifest and materialized folder converges. Bus keeps
+the same tombstone authoritative and removes the stale bytes. If no catalog
+node retains a copy, Fabric cannot reconstruct deleted content; the inherited
+tombstone remains visible in `fabric sync ls` until an operator deliberately
+recreates the canonical file.
+
 Publication tools must treat every watcher-visible, included path as a durable
 logical sync key. Stage temporary, backup, and partial files **outside the
 configured sync folder** (on the same filesystem when an atomic rename is
@@ -799,6 +809,7 @@ rollback on the next reconcile.
 ```sh
 fabric sync add <folder> --name <name> [--peers "*"|a,b] [--policy catalog|bus] [--include "*.toml"]
 fabric sync ls
+fabric sync ls --json
 fabric sync rm <name-or-folder>
 fabric sync reload
 ```
@@ -808,6 +819,15 @@ hand-edited or provisioned before the daemon runs. `fabric sync reload` applies
 the file to a running daemon, mirroring `reload-peers`. The daemon serves and
 dials sync over the reserved `fabric/sync/1` ALPN, gated by the same peer
 allow-list as every other fabric protocol.
+
+`fabric sync ls` reports `present` (logical files in the manifest),
+`tombstones` (retained logical deletions), and `observed` (included paths in the
+last durable local-disk receipt). `drift=clean` means the logical Present paths
+and observed bytes agree. A `drift=WARNING` names `missing` Present paths,
+`unexpected` observed paths whose manifest is tombstoned or absent, and
+`mismatched` paths whose observed content hash differs from the logical Present.
+`fabric sync ls --json` emits a stable array with those fields plus a Boolean
+`drift` for automation.
 
 ### Sync an st2 catalog safely
 
@@ -865,9 +885,11 @@ fabric status
 fabric ping <peer-name>
 ```
 
-`fabric sync ls` must show the same two logical names on every host, with the
-local catalog paths and intended peer selectors. `fabric status` and
-`fabric ping` must show the selected peers reachable.
+`fabric sync ls` must show the same two logical names and the same logical
+Present/Tombstone counts on every host, with the local catalog paths and
+intended peer selectors. In steady state `observed` equals `present` and
+`drift=clean`. `fabric status` and `fabric ping` must show the selected peers
+reachable.
 
 For the default Fabric home, inspect the effective include lists and fail if
 machine-local paths were added:

@@ -249,7 +249,11 @@ enum SyncCommands {
         include: Option<String>,
     },
     /// List configured sync entries and their live state.
-    Ls,
+    Ls {
+        /// Emit a stable JSON array for scripts.
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove a sync entry by name or folder and reload the daemon.
     Rm { name_or_folder: String },
     /// Re-read syncs.toml into the running daemon (like reload-peers).
@@ -690,16 +694,42 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
             let _ = send_control(home, ControlRequest::SyncReload).await;
             println!("sync {name:?} written to {}", home.syncs_path().display());
         }
-        SyncCommands::Ls => match send_control(home, ControlRequest::SyncStatus).await? {
+        SyncCommands::Ls { json } => match send_control(home, ControlRequest::SyncStatus).await? {
             ControlResponse::SyncStatus { entries } => {
+                if json {
+                    let entries: Vec<_> = entries.iter().map(SyncLsJsonEntry::from).collect();
+                    println!("{}", serde_json::to_string_pretty(&entries)?);
+                    return Ok(());
+                }
                 if entries.is_empty() {
                     println!("no sync entries");
                 }
                 for entry in entries {
-                    println!(
-                        "{}\t{}\t{}\tpeers={}\t{} files",
-                        entry.name, entry.folder, entry.policy, entry.peers, entry.files
-                    );
+                    let present = logical_present(&entry);
+                    if entry.missing == 0 && entry.unexpected == 0 && entry.mismatched == 0 {
+                        println!(
+                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean",
+                            entry.name,
+                            entry.folder,
+                            entry.policy,
+                            entry.peers,
+                            entry.tombstones,
+                            entry.observed,
+                        );
+                    } else {
+                        println!(
+                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}",
+                            entry.name,
+                            entry.folder,
+                            entry.policy,
+                            entry.peers,
+                            entry.tombstones,
+                            entry.observed,
+                            entry.missing,
+                            entry.unexpected,
+                            entry.mismatched,
+                        );
+                    }
                 }
             }
             response => bail!("unexpected daemon response: {response:?}"),
@@ -719,6 +749,98 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct SyncLsJsonEntry<'a> {
+    name: &'a str,
+    folder: &'a str,
+    policy: &'a str,
+    peers: &'a str,
+    present: usize,
+    tombstones: usize,
+    observed: usize,
+    drift: bool,
+    missing: usize,
+    unexpected: usize,
+    mismatched: usize,
+}
+
+impl<'a> From<&'a fabric::control::SyncEntryStatus> for SyncLsJsonEntry<'a> {
+    fn from(entry: &'a fabric::control::SyncEntryStatus) -> Self {
+        Self {
+            name: &entry.name,
+            folder: &entry.folder,
+            policy: &entry.policy,
+            peers: &entry.peers,
+            present: logical_present(entry),
+            tombstones: entry.tombstones,
+            observed: entry.observed,
+            drift: entry.missing != 0 || entry.unexpected != 0 || entry.mismatched != 0,
+            missing: entry.missing,
+            unexpected: entry.unexpected,
+            mismatched: entry.mismatched,
+        }
+    }
+}
+
+fn logical_present(entry: &fabric::control::SyncEntryStatus) -> usize {
+    if entry.present == 0 {
+        entry.files
+    } else {
+        entry.present
+    }
+}
+
+#[cfg(test)]
+mod sync_ls_tests {
+    use super::*;
+    use fabric::control::SyncEntryStatus;
+
+    fn status() -> SyncEntryStatus {
+        SyncEntryStatus {
+            name: "catalog".to_string(),
+            folder: "/catalog".to_string(),
+            policy: "catalog".to_string(),
+            peers: "*".to_string(),
+            files: 40,
+            present: 40,
+            tombstones: 3,
+            observed: 42,
+            missing: 0,
+            unexpected: 2,
+            mismatched: 0,
+        }
+    }
+
+    #[test]
+    fn sync_ls_json_schema_exposes_counts_and_drift() {
+        let status = status();
+        let json = serde_json::to_value(SyncLsJsonEntry::from(&status)).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "name": "catalog",
+                "folder": "/catalog",
+                "policy": "catalog",
+                "peers": "*",
+                "present": 40,
+                "tombstones": 3,
+                "observed": 42,
+                "drift": true,
+                "missing": 0,
+                "unexpected": 2,
+                "mismatched": 0
+            })
+        );
+    }
+
+    #[test]
+    fn sync_ls_accepts_legacy_control_present_count() {
+        let mut status = status();
+        status.present = 0;
+        assert_eq!(logical_present(&status), 40);
+    }
 }
 
 fn absolutize(folder: &str) -> Result<PathBuf> {

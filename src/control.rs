@@ -131,7 +131,21 @@ pub struct SyncEntryStatus {
     pub folder: String,
     pub policy: String,
     pub peers: String,
+    /// Legacy logical-Present count retained on the local control wire so an
+    /// older client can still decode a newer daemon response.
     pub files: usize,
+    #[serde(default)]
+    pub present: usize,
+    #[serde(default)]
+    pub tombstones: usize,
+    #[serde(default)]
+    pub observed: usize,
+    #[serde(default)]
+    pub missing: usize,
+    #[serde(default)]
+    pub unexpected: usize,
+    #[serde(default)]
+    pub mismatched: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

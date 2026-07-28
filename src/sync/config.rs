@@ -25,11 +25,12 @@ use crate::config::FabricHome;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncPolicy {
-    /// Union + newer-wins + NEVER delete on a peer + no sweep + no tombstones.
+    /// Union + newer-wins + NEVER originate a delete + no sweep.
     ///
     /// Safe for a job catalog: a file present on any peer is present on all
-    /// peers, and nothing ever removes a file. Decommissioning is expressed as
-    /// an edit (e.g. `retired = true`), never a file deletion.
+    /// peers, and nothing ever removes a file. An inherited tombstone is
+    /// superseded when any physical copy survives. Decommissioning is expressed
+    /// as an edit (e.g. `retired = true`), never a file deletion.
     Catalog,
     /// Union + newer-wins + no delete + tombstone sweep. Reserved for the
     /// smalltalk bus; not yet fully implemented (see [`PolicyRules`]).

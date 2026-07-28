@@ -8,6 +8,11 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Added
 
+- **Truthful sync status.** `fabric sync ls` now reports logical Present,
+  Tombstone, and observed-on-disk counts plus explicit missing, unexpected, and
+  content-mismatch drift. `fabric sync ls --json` provides the same state as a
+  stable machine-readable array.
+
 - **Safe st2 catalog sync recipe.** The README now provides a copy-pasteable,
   two-entry positive allow-list for declarations and bus data, with explicit
   machine-local PTY/runtime exclusions and an ordinary resource/message
@@ -54,6 +59,12 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   also emits latency + direct/relay telemetry.
 
 ### Fixed
+
+- **Inherited catalog tombstones no longer leave folders divergent.** Under
+  catalog policy, any surviving physical copy now advances an inherited
+  Tombstone to a higher Present version and supplies its content over the wire,
+  converging every materialized folder and persisted restart. Bus policy keeps
+  its existing delete semantics and removes the same stale bytes.
 
 - **macOS startup no longer blocks forever in CoreWLAN.** The optional Wi-Fi
   transmit-rate lookup is now bounded to 250 ms and cached per interface; a
