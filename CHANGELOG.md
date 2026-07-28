@@ -55,6 +55,14 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **macOS startup no longer blocks forever in CoreWLAN.** The optional Wi-Fi
+  transmit-rate lookup is now bounded to 250 ms and cached per interface; a
+  wedged synchronous CoreWLAN XPC request falls back to unknown speed without
+  preventing iroh or Fabric's control socket from binding. Repeated network
+  refreshes cannot spawn duplicate blocked workers. The launchd install path
+  also uses non-destructive `kickstart`, avoiding a readiness race that killed
+  the PID created moments earlier by `bootstrap`.
+
 - **Linux file reads could self-trigger an unbounded sync storm.** Linux
   inotify reports file opens as access events; treating every watcher event as
   a mutation meant Fabric's own scans could wake all peers again. Watchers now

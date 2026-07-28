@@ -256,9 +256,18 @@ fn install_launchd_user(home: &FabricHome, spec: &ServiceSpec) -> Result<()> {
     wait_for_launchd_unloaded(&target, LAUNCHD_UNLOAD_TIMEOUT);
     bootstrap_launchd_with_retry(&domain, &plist, &target)?;
     run_command("launchctl", &["enable", &target])?;
-    run_command("launchctl", &["kickstart", "-k", &target])?;
+    // `bootstrap` starts a RunAtLoad job. A plain kickstart covers a service
+    // that had previously been disabled without killing a process that is
+    // still binding its endpoint and control socket. `kickstart -k` here races
+    // readiness by terminating the PID that bootstrap just created.
+    run_command("launchctl", &launchd_kickstart_args(&target))?;
     println!("plist\t{}", plist_path.display());
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_kickstart_args(target: &str) -> [&str; 2] {
+    ["kickstart", target]
 }
 
 /// launchctl `bootout` fails when there is nothing to unload — a fresh install or
@@ -521,6 +530,14 @@ mod tests {
             "Boot-out failed: 5: Input/output error\n"
         ));
         assert!(!bootout_failure_is_ignorable(Some(1), "some other launchctl error\n"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_kickstart_does_not_kill_the_bootstrapped_process() {
+        let args = launchd_kickstart_args("gui/501/com.compoundingtech.fabric");
+        assert_eq!(args, ["kickstart", "gui/501/com.compoundingtech.fabric"]);
+        assert!(!args.contains(&"-k"));
     }
 
     #[test]

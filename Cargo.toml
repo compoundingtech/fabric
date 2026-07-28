@@ -26,6 +26,12 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[patch.crates-io]
+# netdev 0.45.0 performs an unbounded synchronous CoreWLAN XPC request while
+# iroh is binding its endpoint on macOS. Keep the upstream crate intact except
+# for a bounded, cached fallback around that optional transmit-rate metadata.
+netdev = { path = "vendor/netdev" }
+
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
