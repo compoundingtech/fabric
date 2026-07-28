@@ -332,7 +332,8 @@ restart can sever the only path back to the box. Follow this order.
 
 Download a release asset directly, verify it against the release's combined
 `SHA256SUMS` manifest, and stage both the old and new binaries with same-directory
-renames:
+renames. A release archive contains exactly one member named literal `fabric`
+(not `./fabric`); verify that shape before extracting:
 
 ```sh
 set -eu
@@ -362,6 +363,11 @@ else
 fi
 test "$actual" = "$expected"
 
+members="$(tar -tzf "$download_dir/$asset")"
+if [ "$members" != 'fabric' ]; then
+  printf 'unexpected release archive members:\n%s\n' "$members" >&2
+  exit 1
+fi
 tar -xzf "$download_dir/$asset" -C "$download_dir"
 test "$("$download_dir/fabric" --version)" = "${tag#v}"
 

@@ -49,11 +49,18 @@ jobs:
           mkdir -p dist/package
           cp "target/${{ matrix.target }}/release/fabric" dist/package/fabric
           chmod 755 dist/package/fabric
-          tar -czf "dist/fabric-${{ matrix.target }}.tar.gz" -C dist/package fabric
+          archive="dist/fabric-${{ matrix.target }}.tar.gz"
+          tar -czf "$archive" -C dist/package fabric
+          members="$(tar -tzf "$archive")"
+          if [[ "$members" != "fabric" ]]; then
+            echo "release archive must contain exactly one member named fabric" >&2
+            printf 'archive members:\n%s\n' "$members" >&2
+            exit 1
+          fi
           if command -v shasum >/dev/null 2>&1; then
-            shasum -a 256 "dist/fabric-${{ matrix.target }}.tar.gz" > "dist/fabric-${{ matrix.target }}.tar.gz.sha256"
+            shasum -a 256 "$archive" > "$archive.sha256"
           else
-            sha256sum "dist/fabric-${{ matrix.target }}.tar.gz" > "dist/fabric-${{ matrix.target }}.tar.gz.sha256"
+            sha256sum "$archive" > "$archive.sha256"
           fi
 
       - uses: actions/upload-artifact@v4

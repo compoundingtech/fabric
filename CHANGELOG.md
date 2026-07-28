@@ -23,6 +23,10 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Changed
 
+- **Release archives have an enforced one-file contract.** Each platform tarball
+  must contain exactly one member named literal `fabric` (not `./fabric`), and
+  the lockout-safe upgrade runbook verifies that shape before extraction.
+
 - **Sync publishers must stage outside the synced folder.** The file-sync
   documentation now makes explicit that every watcher-visible path matched by
   an entry is a durable logical key. Temporary, backup, and partial files must
