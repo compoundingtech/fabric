@@ -3,6 +3,7 @@ use std::{
     io::IsTerminal,
     path::PathBuf,
     process::{Command as ProcessCommand, Stdio},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -21,6 +22,7 @@ use fabric::{
     service::{self, DEFAULT_MEMORY_MAX_MB, ServiceInstallOptions},
     shell::{self, ServerFrame},
     sync::config::{SyncBook, SyncEntry, SyncPeers, SyncPolicy},
+    terminal::TerminalModeGuard,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1106,21 +1108,24 @@ async fn wait_for_daemon_ready(
 
 async fn run_shell_client(socket: &PathBuf) -> Result<i32> {
     let stream = tokio::net::UnixStream::connect(socket).await?;
-    let (mut read, mut write) = stream.into_split();
-    let _raw_mode = RawModeGuard::enable_if_terminal()?;
+    let (mut read, write) = stream.into_split();
+    let mut signals = ShellSignals::new()?;
+    let terminal = TerminalModeGuard::enable_if_terminal()?;
     let (cols, rows) = terminal_size();
-    shell::write_client_resize(&mut write, rows, cols).await?;
+    let write = Arc::new(tokio::sync::Mutex::new(write));
+    shell::write_client_resize(&mut *write.lock().await, rows, cols).await?;
 
+    let stdin_write = write.clone();
     let stdin_task = tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
         let mut buf = [0u8; 8192];
         loop {
             let read = stdin.read(&mut buf).await?;
             if read == 0 {
-                shell::write_client_eof(&mut write).await?;
+                shell::write_client_eof(&mut *stdin_write.lock().await).await?;
                 return Ok::<(), anyhow::Error>(());
             }
-            shell::write_client_stdin(&mut write, &buf[..read]).await?;
+            shell::write_client_stdin(&mut *stdin_write.lock().await, &buf[..read]).await?;
         }
     });
 
@@ -1128,26 +1133,58 @@ async fn run_shell_client(socket: &PathBuf) -> Result<i32> {
     let mut stderr = tokio::io::stderr();
     let mut exit_code = 1;
 
-    while let Some(frame) = shell::read_server_frame(&mut read).await? {
-        match frame {
-            ServerFrame::Output(bytes) => {
-                stdout.write_all(&bytes).await?;
-                stdout.flush().await?;
+    loop {
+        tokio::select! {
+            frame = shell::read_server_frame(&mut read) => {
+                let Some(frame) = frame? else {
+                    break;
+                };
+                match frame {
+                    ServerFrame::Output(bytes) => {
+                        stdout.write_all(&bytes).await?;
+                        stdout.flush().await?;
+                    }
+                    ServerFrame::Error(message) => {
+                        stderr.write_all(message.as_bytes()).await?;
+                        stderr.write_all(b"\n").await?;
+                        stderr.flush().await?;
+                    }
+                    ServerFrame::Status(message) => {
+                        stderr.write_all(message.as_bytes()).await?;
+                        stderr.write_all(b"\n").await?;
+                        stderr.flush().await?;
+                    }
+                    ServerFrame::Exit(code) => {
+                        exit_code = normalize_exit_code(code);
+                        break;
+                    }
+                }
             }
-            ServerFrame::Error(message) => {
-                stderr.write_all(message.as_bytes()).await?;
-                stderr.write_all(b"\n").await?;
-                stderr.flush().await?;
-            }
-            ServerFrame::Exit(code) => {
-                exit_code = normalize_exit_code(code);
-                break;
+            signal = signals.recv() => {
+                match signal {
+                    ShellSignal::Resize => {
+                        let (cols, rows) = terminal_size();
+                        shell::write_client_resize(&mut *write.lock().await, rows, cols).await?;
+                    }
+                    ShellSignal::Suspend => {
+                        terminal.restore()?;
+                        suspend_current_process();
+                        terminal.reenter_raw()?;
+                        let (cols, rows) = terminal_size();
+                        shell::write_client_resize(&mut *write.lock().await, rows, cols).await?;
+                    }
+                    ShellSignal::Terminate(signal) => {
+                        terminal.restore()?;
+                        terminate_with_signal(signal);
+                    }
+                }
             }
         }
     }
 
     stdin_task.abort();
     let _ = stdin_task.await;
+    terminal.restore()?;
     stdout.flush().await?;
     stderr.flush().await?;
     Ok(exit_code)
@@ -1280,10 +1317,6 @@ fn normalize_exit_code(code: i32) -> i32 {
     code.clamp(0, 255)
 }
 
-struct RawModeGuard {
-    enabled: bool,
-}
-
 struct SocketFileGuard(PathBuf);
 
 impl Drop for SocketFileGuard {
@@ -1292,23 +1325,91 @@ impl Drop for SocketFileGuard {
     }
 }
 
-impl RawModeGuard {
-    fn enable_if_terminal() -> Result<Self> {
-        if std::io::stdin().is_terminal() {
-            crossterm::terminal::enable_raw_mode()?;
-            Ok(Self { enabled: true })
-        } else {
-            Ok(Self { enabled: false })
+enum ShellSignal {
+    Resize,
+    Suspend,
+    Terminate(i32),
+}
+
+#[cfg(unix)]
+struct ShellSignals {
+    hangup: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+    quit: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+    suspend: tokio::signal::unix::Signal,
+    resize: tokio::signal::unix::Signal,
+}
+
+#[cfg(not(unix))]
+struct ShellSignals;
+
+#[cfg(unix)]
+impl ShellSignals {
+    fn new() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Ok(Self {
+            hangup: signal(SignalKind::hangup())?,
+            interrupt: signal(SignalKind::interrupt())?,
+            quit: signal(SignalKind::quit())?,
+            terminate: signal(SignalKind::terminate())?,
+            suspend: signal(SignalKind::from_raw(libc::SIGTSTP))?,
+            resize: signal(SignalKind::window_change())?,
+        })
+    }
+
+    async fn recv(&mut self) -> ShellSignal {
+        tokio::select! {
+            _ = self.hangup.recv() => ShellSignal::Terminate(libc::SIGHUP),
+            _ = self.interrupt.recv() => ShellSignal::Terminate(libc::SIGINT),
+            _ = self.quit.recv() => ShellSignal::Terminate(libc::SIGQUIT),
+            _ = self.terminate.recv() => ShellSignal::Terminate(libc::SIGTERM),
+            _ = self.suspend.recv() => ShellSignal::Suspend,
+            _ = self.resize.recv() => ShellSignal::Resize,
         }
     }
 }
 
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        if self.enabled {
-            let _ = crossterm::terminal::disable_raw_mode();
-        }
+#[cfg(not(unix))]
+impl ShellSignals {
+    fn new() -> Result<Self> {
+        Ok(Self)
     }
+
+    async fn recv(&mut self) -> ShellSignal {
+        std::future::pending().await
+    }
+}
+
+#[cfg(unix)]
+fn suspend_current_process() {
+    // SIGTSTP is intercepted above so we can restore the terminal first. SIGSTOP
+    // cannot be caught, which guarantees one real stop; execution resumes here
+    // after the process receives SIGCONT.
+    unsafe {
+        libc::raise(libc::SIGSTOP);
+    }
+}
+
+#[cfg(not(unix))]
+fn suspend_current_process() {}
+
+#[cfg(unix)]
+fn terminate_with_signal(signal: i32) -> ! {
+    // Tokio installed the process signal handler. Restore the default action
+    // after restoring termios, then re-raise so parents observe a signal exit
+    // instead of a fabricated numeric status.
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+        libc::_exit(128 + signal);
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_with_signal(_signal: i32) -> ! {
+    std::process::exit(1)
 }
 
 async fn spawn_daemon(home: &FabricHome, options: DaemonOptions) -> Result<()> {
