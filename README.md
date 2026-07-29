@@ -88,6 +88,31 @@ config) from an existing machine.
 Peers are found by NodeID over iroh discovery (relays), so **no address hints are
 needed** and a roaming laptop reconnects on its own as its network changes.
 
+### Presence, partitions, and local ownership
+
+Fabric reports shipped connection facts about each trusted peer by canonical
+NodeID: whether it is currently reachable and the connection/backoff state. An
+offline peer is not inherently unhealthy and may remain offline indefinitely;
+Fabric does not assign peer health types or act as a global availability
+authority. A durable `last_seen` status surface is a desired observability gap,
+not a current guarantee.
+
+The architecture MUST isolate network partitions from unrelated local work:
+each machine and its local processes continue from their last instructions
+while peers are unreachable, and failure of one remote path MUST NOT cascade
+into other local work. Existing sessions, routes, and sync state remain owned by
+the runtime that created them. Replicas may resume synchronization after
+reconnect, while each consumer remains responsible for safe and atomic
+application of received state.
+
+Whether an unavailable peer matters is decided by the active session, route,
+sync, or consuming workload—not by a fleet-wide Fabric health classification.
+Remote shell continuity across all detach cases and daemon sleep/wake
+self-healing remain open work in [issue #21](https://github.com/compoundingtech/fabric/issues/21)
+and [PR #22](https://github.com/compoundingtech/fabric/pull/22). A future remote
+st2 PTY attachment composes with this boundary: Fabric transports the stream,
+while st2/PTY owns the PTY child, terminal policy, and lifecycle/expiry.
+
 ### 1. On the NEW machine — install, start the managed daemon, print its NodeID
 
 ```sh
