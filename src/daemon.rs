@@ -13,6 +13,8 @@ use std::{
 };
 
 #[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, bail};
@@ -1703,11 +1705,58 @@ pub async fn run_daemon(home: FabricHome, allow_shell: bool) -> Result<()> {
 }
 
 pub async fn run_daemon_with_options(home: FabricHome, options: DaemonOptions) -> Result<()> {
+    let _lease = DaemonLease::acquire(&home)?;
     init_daemon_tracing(&home)?;
     FabricNode::start_with_daemon_options(home, options)
         .await?
         .wait()
         .await
+}
+
+struct DaemonLease {
+    _file: std::fs::File,
+}
+
+pub fn daemon_lock_available(home: &FabricHome) -> Result<bool> {
+    let path = home.root().join("run/daemon.lock");
+    home.prepare()?;
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+pub fn restart_down_decision(status_ok: bool, lease_available: bool) -> bool {
+    !status_ok && lease_available
+}
+
+impl DaemonLease {
+    fn acquire(home: &FabricHome) -> Result<Self> {
+        home.prepare()?;
+        let path = home.root().join("run/daemon.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        #[cfg(unix)]
+        {
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                bail!("fabric daemon lease is already held");
+            }
+        }
+        Ok(Self { _file: file })
+    }
 }
 
 pub async fn send_control(home: &FabricHome, request: ControlRequest) -> Result<ControlResponse> {
@@ -3885,5 +3934,29 @@ mod tests {
                 None => bail!("exec closed without an exit frame"),
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_lease_rejects_concurrent_owner_and_allows_stale_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = FabricHome::new(temp.path());
+        home.prepare().unwrap();
+        std::fs::write(home.root().join("run/daemon.lock"), b"stale-pid\n").unwrap();
+        let stale = DaemonLease::acquire(&home).unwrap();
+        drop(stale);
+        let first = DaemonLease::acquire(&home).unwrap();
+        assert!(!daemon_lock_available(&home).unwrap());
+        assert!(DaemonLease::acquire(&home).is_err());
+        drop(first);
+        assert!(daemon_lock_available(&home).unwrap());
+        assert!(DaemonLease::acquire(&home).is_ok());
+    }
+
+    #[test]
+    fn restart_down_decision_requires_status_failure_and_free_lease() {
+        assert!(!restart_down_decision(false, false));
+        assert!(restart_down_decision(false, true));
+        assert!(!restart_down_decision(true, true));
     }
 }

@@ -1060,7 +1060,11 @@ async fn run_restart_helper(home: &FabricHome, allow_shell: bool) -> Result<()> 
 async fn wait_for_daemon_down(home: &FabricHome, timeout: Duration) -> Result<()> {
     let started = Instant::now();
     loop {
-        if send_control(home, ControlRequest::Status).await.is_err() {
+        let status_ok = send_control(home, ControlRequest::Status).await.is_ok();
+        if fabric::daemon::restart_down_decision(
+            status_ok,
+            fabric::daemon::daemon_lock_available(home)?,
+        ) {
             return Ok(());
         }
         if started.elapsed() > timeout {
