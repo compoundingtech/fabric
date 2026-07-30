@@ -16,7 +16,7 @@
 //! versions stay monotonic across daemon restarts.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     path::{Path, PathBuf},
     sync::{
@@ -51,10 +51,138 @@ const PERIODIC_RESYNC: Duration = Duration::from_secs(30);
 /// Bounded safety scan for watcher events missed across sleep/wake or a
 /// transient watcher failure. Clean periodic ticks do not scan the tree.
 const MISSED_EVENT_RESYNC: Duration = Duration::from_secs(5 * 60);
+/// Watcher notifications can arrive after the materialization that caused
+/// them. Remember only a bounded number of exact post-write identities so a
+/// delayed daemon-owned event can be acknowledged without another tree scan.
+const MAX_DAEMON_WRITE_FINGERPRINTS: usize = 4_096;
 
 #[inline]
 fn periodic_scan_due(dirty: bool, safety_due: bool) -> bool {
     dirty || safety_due
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    hash: ContentHash,
+    len: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    ctime_secs: i64,
+    #[cfg(unix)]
+    ctime_nanos: i64,
+}
+
+impl FileFingerprint {
+    fn after_write(path: &Path, hash: ContentHash) -> std::io::Result<Self> {
+        let metadata = std::fs::metadata(path)?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "fingerprinted path is not a regular file",
+            ));
+        }
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            hash,
+            len: metadata.len(),
+            modified: metadata.modified()?,
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            ctime_secs: metadata.ctime(),
+            #[cfg(unix)]
+            ctime_nanos: metadata.ctime_nsec(),
+        })
+    }
+
+    fn read(path: &Path) -> std::io::Result<Self> {
+        let bytes = std::fs::read(path)?;
+        Self::after_write(path, content_hash(&bytes))
+    }
+}
+
+#[derive(Debug)]
+struct DaemonWriteFingerprint {
+    fingerprint: FileFingerprint,
+    generation: u64,
+    sequence: u64,
+    committed: bool,
+}
+
+#[derive(Debug, Default)]
+struct DaemonWriteJournal {
+    next_sequence: u64,
+    entries: HashMap<PathBuf, DaemonWriteFingerprint>,
+    order: VecDeque<(PathBuf, u64)>,
+}
+
+impl DaemonWriteJournal {
+    fn record(&mut self, path: PathBuf, fingerprint: FileFingerprint, generation: u64) {
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        let sequence = self.next_sequence;
+        self.entries.insert(
+            path.clone(),
+            DaemonWriteFingerprint {
+                fingerprint,
+                generation,
+                sequence,
+                committed: false,
+            },
+        );
+        self.order.push_back((path, sequence));
+        while self.order.len() > MAX_DAEMON_WRITE_FINGERPRINTS {
+            let Some((path, sequence)) = self.order.pop_front() else {
+                break;
+            };
+            if self
+                .entries
+                .get(&path)
+                .is_some_and(|entry| entry.sequence == sequence)
+            {
+                self.entries.remove(&path);
+            }
+        }
+    }
+
+    fn consume_batch(
+        &mut self,
+        paths: &[(PathBuf, FileFingerprint)],
+        first_event_generation: u64,
+    ) -> bool {
+        let matches = !paths.is_empty()
+            && paths.iter().all(|(path, fingerprint)| {
+                self.entries.get(path).is_some_and(|entry| {
+                    entry.committed
+                        && entry.generation.checked_add(1) == Some(first_event_generation)
+                        && entry.fingerprint == *fingerprint
+                })
+            });
+        // Whether this was the expected event or an external mismatch, never
+        // let an old identity suppress a later change to the same path.
+        for (path, _) in paths {
+            self.entries.remove(path);
+        }
+        matches
+    }
+
+    fn forget_paths<'a>(&mut self, paths: impl IntoIterator<Item = &'a PathBuf>) {
+        for path in paths {
+            self.entries.remove(path);
+        }
+    }
+
+    fn commit_all(&mut self) {
+        for entry in self.entries.values_mut() {
+            entry.committed = true;
+        }
+    }
 }
 
 /// A dialable peer for a reconcile: a display id and, for the iroh transport, its
@@ -92,6 +220,7 @@ struct EntryWork {
     mutation_generation: AtomicU64,
     durable_generation: AtomicU64,
     inbound_waiters: AtomicUsize,
+    daemon_writes: StdMutex<DaemonWriteJournal>,
     #[cfg(test)]
     scan_calls: AtomicUsize,
     #[cfg(test)]
@@ -106,6 +235,7 @@ impl EntryWork {
             mutation_generation: AtomicU64::new(1),
             durable_generation: AtomicU64::new(0),
             inbound_waiters: AtomicUsize::new(0),
+            daemon_writes: StdMutex::new(DaemonWriteJournal::default()),
             #[cfg(test)]
             scan_calls: AtomicUsize::new(0),
             #[cfg(test)]
@@ -113,8 +243,62 @@ impl EntryWork {
         })
     }
 
-    fn record_mutation(&self) {
-        self.mutation_generation.fetch_add(1, Ordering::AcqRel);
+    fn record_mutation(&self) -> u64 {
+        self.mutation_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
+    }
+
+    fn record_daemon_write(&self, path: &Path, hash: ContentHash, generation: u64) {
+        let Ok(fingerprint) = FileFingerprint::after_write(path, hash) else {
+            return;
+        };
+        self.daemon_writes
+            .lock()
+            .unwrap()
+            .record(path.to_path_buf(), fingerprint, generation);
+    }
+
+    fn commit_daemon_writes(&self) {
+        self.daemon_writes.lock().unwrap().commit_all();
+    }
+
+    fn acknowledge_daemon_write_batch(&self, batch: &WatchEventBatch) -> bool {
+        if !batch.daemon_write_candidate
+            || !batch.contiguous
+            || batch.paths.is_empty()
+            || self.mutation_generation.load(Ordering::Acquire) != batch.last_generation
+        {
+            self.daemon_writes
+                .lock()
+                .unwrap()
+                .forget_paths(&batch.paths);
+            return false;
+        }
+
+        let mut current = Vec::with_capacity(batch.paths.len());
+        for path in &batch.paths {
+            let Ok(fingerprint) = FileFingerprint::read(path) else {
+                self.daemon_writes
+                    .lock()
+                    .unwrap()
+                    .forget_paths(&batch.paths);
+                return false;
+            };
+            current.push((path.clone(), fingerprint));
+        }
+        let matches = self
+            .daemon_writes
+            .lock()
+            .unwrap()
+            .consume_batch(&current, batch.first_generation);
+        if matches {
+            // The callback already advanced the mutation generation before
+            // queuing this batch. Exact daemon-owned bytes are already durable,
+            // so acknowledge only the generations represented by this batch.
+            self.mark_generation_durable(batch.last_generation);
+        }
+        matches
     }
 
     fn begin_inbound(self: &Arc<Self>) -> InboundWaiter {
@@ -517,9 +701,17 @@ impl<T: SyncTransport> SyncEngine<T> {
     ) -> Result<()> {
         let root = entry.config.folder.clone();
         let policy = entry.policy;
+        let generation = entry.work.mutation_generation.load(Ordering::Acquire);
         let mut node = entry.node.lock().await;
         let mut observed = entry.observed.lock().unwrap();
-        materialize_tracked(&mut node, &root, policy, protected, &mut observed)
+        materialize_tracked(
+            &mut node,
+            &root,
+            policy,
+            protected,
+            &mut observed,
+            Some((&entry.work, generation)),
+        )
     }
 
     async fn persist_entry(&self, entry: &EntryState) -> Result<()> {
@@ -530,7 +722,9 @@ impl<T: SyncTransport> SyncEngine<T> {
         self.write_state(
             &entry.config.name,
             &PersistedEntryState { manifest, observed },
-        )
+        )?;
+        entry.work.commit_daemon_writes();
+        Ok(())
     }
 
     fn manifest_path(&self, name: &str) -> PathBuf {
@@ -644,7 +838,7 @@ impl<T: SyncTransport> SyncEngine<T> {
         // The channel is only an edge trigger. One pending signal is enough;
         // keeping it bounded prevents an arbitrarily hot writer from building
         // an in-memory event backlog while the current sync is running.
-        let (tx, mut rx) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::channel::<WatchEvent>(1);
         let _watcher = spawn_watcher(&root, tx, entry.work.clone());
 
         let mut ticker = tokio::time::interval(PERIODIC_RESYNC);
@@ -667,17 +861,28 @@ impl<T: SyncTransport> SyncEngine<T> {
                     }
                 }
                 event = rx.recv() => {
-                    if event.is_none() { break; }
+                    let Some(event) = event else { break; };
                     // Wait for a quiet edge, but cap the window so a
                     // continuously mutating tree still makes bounded progress.
-                    if !coalesce_watch_events(
+                    let Some(batch) = coalesce_watch_events(
+                        event,
                         &mut rx,
                         WATCH_DEBOUNCE,
                         WATCH_MAX_COALESCE,
                     )
                     .await
-                    {
+                    else {
                         break;
+                    };
+                    // Every materialization and its state persist hold this
+                    // guard. Do not acknowledge a delayed self-event before
+                    // the bytes it identifies are durably committed.
+                    let daemon_owned = {
+                        let _operation = entry.operation.lock().await;
+                        entry.work.acknowledge_daemon_write_batch(&batch)
+                    };
+                    if daemon_owned {
+                        continue;
                     }
                     if let Err(error) = self.sync_once(&name).await {
                         tracing::debug!(sync = %name, %error, "watch sync failed");
@@ -691,27 +896,34 @@ impl<T: SyncTransport> SyncEngine<T> {
 /// Coalesce watcher events until the tree is quiet for [`WATCH_DEBOUNCE`], or
 /// until [`WATCH_MAX_COALESCE`] bounds a continuous mutation stream.
 ///
-/// Returns false only when the watcher channel has closed.
+/// Returns `None` only when the watcher channel has closed.
 async fn coalesce_watch_events(
-    rx: &mut mpsc::Receiver<()>,
+    first: WatchEvent,
+    rx: &mut mpsc::Receiver<WatchEvent>,
     debounce: Duration,
     max_coalesce: Duration,
-) -> bool {
+) -> Option<WatchEventBatch> {
+    let mut batch = WatchEventBatch::new(first);
     let deadline = tokio::time::Instant::now() + max_coalesce;
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => break,
             next = tokio::time::timeout(debounce, rx.recv()) => {
                 match next {
-                    Ok(Some(())) => continue,
-                    Ok(None) => return false,
+                    Ok(Some(event)) => {
+                        batch.push(event);
+                        continue;
+                    }
+                    Ok(None) => return None,
                     Err(_) => break,
                 }
             }
         }
     }
-    while rx.try_recv().is_ok() {}
-    true
+    while let Ok(event) = rx.try_recv() {
+        batch.push(event);
+    }
+    Some(batch)
 }
 
 /// Logical manifest and materialized-disk receipt counts for `fabric sync ls`.
@@ -938,6 +1150,7 @@ fn materialize_tracked(
     policy: PolicyRules,
     protected: &HashMap<String, ContentHash>,
     observed: &mut HashMap<String, ContentHash>,
+    daemon_writes: Option<(&EntryWork, u64)>,
 ) -> Result<()> {
     std::fs::create_dir_all(root)
         .with_context(|| format!("failed to create {}", root.display()))?;
@@ -990,6 +1203,9 @@ fn materialize_tracked(
                 std::fs::create_dir_all(parent)?;
             }
             write_atomic(&path, bytes)?;
+            if let Some((work, generation)) = daemon_writes {
+                work.record_daemon_write(&path, meta.hash, generation);
+            }
             observed.insert(rel, meta.hash);
         }
     }
@@ -1051,25 +1267,78 @@ fn sanitize_name(name: &str) -> String {
 
 /// Start a recursive filesystem watcher on `root`, forwarding a unit signal on
 /// every event. The returned watcher must be kept alive for events to flow.
-fn watcher_event_is_mutation(kind: notify::EventKind) -> bool {
+fn watcher_event_is_mutation(kind: &notify::EventKind) -> bool {
     matches!(
         kind,
         notify::EventKind::Create(_) | notify::EventKind::Modify(_) | notify::EventKind::Remove(_)
     )
 }
 
+fn watcher_event_can_match_daemon_write(kind: &notify::EventKind) -> bool {
+    use notify::event::ModifyKind;
+
+    matches!(
+        kind,
+        notify::EventKind::Create(_)
+            | notify::EventKind::Modify(
+                ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Metadata(_) | ModifyKind::Other
+            )
+    )
+}
+
+#[derive(Debug)]
+struct WatchEvent {
+    paths: Vec<PathBuf>,
+    generation: u64,
+    daemon_write_candidate: bool,
+}
+
+#[derive(Debug)]
+struct WatchEventBatch {
+    paths: HashSet<PathBuf>,
+    first_generation: u64,
+    last_generation: u64,
+    contiguous: bool,
+    daemon_write_candidate: bool,
+}
+
+impl WatchEventBatch {
+    fn new(event: WatchEvent) -> Self {
+        Self {
+            paths: event.paths.into_iter().collect(),
+            first_generation: event.generation,
+            last_generation: event.generation,
+            contiguous: true,
+            daemon_write_candidate: event.daemon_write_candidate,
+        }
+    }
+
+    fn push(&mut self, event: WatchEvent) {
+        self.contiguous &= self.last_generation.checked_add(1) == Some(event.generation);
+        self.last_generation = event.generation;
+        self.daemon_write_candidate &= event.daemon_write_candidate;
+        self.paths.extend(event.paths);
+    }
+}
+
 fn spawn_watcher(
     root: &Path,
-    tx: mpsc::Sender<()>,
+    tx: mpsc::Sender<WatchEvent>,
     work: Arc<EntryWork>,
 ) -> Option<notify::RecommendedWatcher> {
     use notify::{RecursiveMode, Watcher};
 
     let mut watcher =
         match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if res.is_ok_and(|event| watcher_event_is_mutation(event.kind)) {
-                work.record_mutation();
-                let _ = tx.try_send(());
+            if let Ok(event) = res
+                && watcher_event_is_mutation(&event.kind)
+            {
+                let generation = work.record_mutation();
+                let _ = tx.try_send(WatchEvent {
+                    paths: event.paths,
+                    generation,
+                    daemon_write_candidate: watcher_event_can_match_daemon_write(&event.kind),
+                });
             }
         }) {
             Ok(watcher) => watcher,
@@ -1119,20 +1388,29 @@ mod tests {
     fn watcher_wakes_only_for_mutations() {
         use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind, RemoveKind};
 
-        assert!(!watcher_event_is_mutation(notify::EventKind::Access(
+        assert!(!watcher_event_is_mutation(&notify::EventKind::Access(
             AccessKind::Open(AccessMode::Read)
         )));
-        assert!(!watcher_event_is_mutation(notify::EventKind::Any));
-        assert!(!watcher_event_is_mutation(notify::EventKind::Other));
-        assert!(watcher_event_is_mutation(notify::EventKind::Create(
+        assert!(!watcher_event_is_mutation(&notify::EventKind::Any));
+        assert!(!watcher_event_is_mutation(&notify::EventKind::Other));
+        assert!(watcher_event_is_mutation(&notify::EventKind::Create(
             CreateKind::Any
         )));
-        assert!(watcher_event_is_mutation(notify::EventKind::Modify(
+        assert!(watcher_event_is_mutation(&notify::EventKind::Modify(
             ModifyKind::Any
         )));
-        assert!(watcher_event_is_mutation(notify::EventKind::Remove(
+        assert!(watcher_event_is_mutation(&notify::EventKind::Remove(
             RemoveKind::Any
         )));
+        assert!(watcher_event_can_match_daemon_write(
+            &notify::EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any))
+        ));
+        assert!(!watcher_event_can_match_daemon_write(
+            &notify::EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Any))
+        ));
+        assert!(!watcher_event_can_match_daemon_write(
+            &notify::EventKind::Remove(RemoveKind::Any)
+        ));
     }
 
     #[cfg(target_os = "linux")]
@@ -1141,7 +1419,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("watched.txt");
         std::fs::write(&path, b"seed").unwrap();
-        let (tx, mut rx) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::channel::<WatchEvent>(1);
         let work = EntryWork::new();
         let _watcher = spawn_watcher(dir.path(), tx, work.clone()).unwrap();
         let generation = work.mutation_generation.load(Ordering::Acquire);
@@ -1160,16 +1438,243 @@ mod tests {
         );
 
         std::fs::write(&path, b"changed").unwrap();
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(2), rx.recv())
-                .await
-                .unwrap(),
-            Some(()),
-            "a real write must wake the sync watcher"
-        );
+        let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a real write must wake the sync watcher")
+            .expect("watcher channel closed");
+        assert_eq!(event.paths, vec![path]);
         assert!(
             work.mutation_generation.load(Ordering::Acquire) > generation,
             "a mutation must advance the generation"
+        );
+    }
+
+    #[test]
+    fn delayed_daemon_materialization_event_is_acknowledged_without_rescan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = root.join("remote.md");
+        let mut node = SyncNode::new(Author([1; 32]));
+        node.local_write("remote.md", b"remote bytes", 0, 0);
+        let mut observed = HashMap::new();
+        let work = EntryWork::new();
+        let generation = work.mutation_generation.load(Ordering::Acquire);
+
+        materialize_tracked(
+            &mut node,
+            root,
+            SyncPolicy::Bus.rules(),
+            &HashMap::new(),
+            &mut observed,
+            Some((&work, generation)),
+        )
+        .unwrap();
+        work.commit_daemon_writes();
+        work.mark_generation_durable(generation);
+        assert_eq!(std::fs::read(&path).unwrap(), b"remote bytes");
+
+        // Model a notify event delivered after materialization and persistence.
+        // The callback has already advanced the mutation generation.
+        let first_event_generation = work.record_mutation();
+        let mut batch = WatchEventBatch::new(WatchEvent {
+            paths: vec![path.clone()],
+            generation: first_event_generation,
+            daemon_write_candidate: true,
+        });
+        let second_event_generation = work.record_mutation();
+        batch.push(WatchEvent {
+            paths: vec![path],
+            generation: second_event_generation,
+            daemon_write_candidate: true,
+        });
+        assert!(work.acknowledge_daemon_write_batch(&batch));
+        assert_eq!(
+            work.mutation_generation.load(Ordering::Acquire),
+            work.durable_generation.load(Ordering::Acquire),
+            "an exact delayed self-event must not leave periodic work dirty"
+        );
+        assert_eq!(
+            work.scan_calls.load(Ordering::Relaxed),
+            0,
+            "the delayed daemon-owned batch must not rescan the tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_path_external_mutation_after_materialization_stays_dirty_and_syncs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        let path = root.join("remote.md");
+        write_bus_sync(dir.path(), &root);
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let entry = engine.entries.read().await.get("bus").cloned().unwrap();
+        entry
+            .node
+            .lock()
+            .await
+            .local_write("remote.md", b"daemon bytes", 0, 0);
+        let generation = entry.work.mutation_generation.load(Ordering::Acquire);
+        engine
+            .materialize_entry_state(&entry, &HashMap::new())
+            .await
+            .unwrap();
+        engine.persist_entry(&entry).await.unwrap();
+        entry.work.mark_generation_durable(generation);
+        entry.work.scan_calls.store(0, Ordering::Relaxed);
+
+        // An external write lands before the delayed watcher event is handled.
+        // Its current identity no longer matches the daemon's post-write record.
+        std::fs::write(&path, b"external bytes").unwrap();
+        let event_generation = entry.work.record_mutation();
+        let batch = WatchEventBatch::new(WatchEvent {
+            paths: vec![path],
+            generation: event_generation,
+            daemon_write_candidate: true,
+        });
+        assert!(!entry.work.acknowledge_daemon_write_batch(&batch));
+        assert_ne!(
+            entry.work.mutation_generation.load(Ordering::Acquire),
+            entry.work.durable_generation.load(Ordering::Acquire),
+            "an immediate external mutation must still schedule a scan"
+        );
+        assert!(periodic_scan_due(true, false));
+        engine.sync_once("bus").await.unwrap();
+        assert!(
+            entry.work.scan_calls.load(Ordering::Relaxed) >= 2,
+            "the non-suppressed event must take the normal sync scan path"
+        );
+        let node = entry.node.lock().await;
+        assert_eq!(
+            node.manifest()
+                .get("remote.md")
+                .and_then(|entry| entry.meta())
+                .map(|meta| meta.hash),
+            Some(content_hash(b"external bytes"))
+        );
+    }
+
+    #[test]
+    fn dropped_watcher_generation_cannot_suppress_daemon_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remote.md");
+        std::fs::write(&path, b"daemon bytes").unwrap();
+        let work = EntryWork::new();
+        let generation = work.mutation_generation.load(Ordering::Acquire);
+        work.record_daemon_write(&path, content_hash(b"daemon bytes"), generation);
+        work.commit_daemon_writes();
+        work.mark_generation_durable(generation);
+
+        let delivered_generation = work.record_mutation();
+        let batch = WatchEventBatch::new(WatchEvent {
+            paths: vec![path],
+            generation: delivered_generation,
+            daemon_write_candidate: true,
+        });
+        let _dropped_generation = work.record_mutation();
+
+        assert!(!work.acknowledge_daemon_write_batch(&batch));
+        assert_ne!(
+            work.mutation_generation.load(Ordering::Acquire),
+            work.durable_generation.load(Ordering::Acquire),
+            "a generation dropped by the bounded channel must remain dirty"
+        );
+    }
+
+    #[test]
+    fn daemon_write_journal_overflow_fails_open_to_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oldest.md");
+        std::fs::write(&path, b"daemon bytes").unwrap();
+        let work = EntryWork::new();
+        let generation = work.mutation_generation.load(Ordering::Acquire);
+        let fingerprint = FileFingerprint::read(&path).unwrap();
+        {
+            let mut journal = work.daemon_writes.lock().unwrap();
+            journal.record(path.clone(), fingerprint.clone(), generation);
+            for index in 0..MAX_DAEMON_WRITE_FINGERPRINTS {
+                journal.record(
+                    dir.path().join(format!("newer-{index}.md")),
+                    fingerprint.clone(),
+                    generation,
+                );
+            }
+            assert_eq!(journal.order.len(), MAX_DAEMON_WRITE_FINGERPRINTS);
+            assert_eq!(journal.entries.len(), MAX_DAEMON_WRITE_FINGERPRINTS);
+            assert!(!journal.entries.contains_key(&path));
+        }
+        work.commit_daemon_writes();
+        work.mark_generation_durable(generation);
+
+        let event_generation = work.record_mutation();
+        let batch = WatchEventBatch::new(WatchEvent {
+            paths: vec![path],
+            generation: event_generation,
+            daemon_write_candidate: true,
+        });
+        assert!(!work.acknowledge_daemon_write_batch(&batch));
+        assert_ne!(
+            work.mutation_generation.load(Ordering::Acquire),
+            work.durable_generation.load(Ordering::Acquire)
+        );
+    }
+
+    #[test]
+    fn rename_remove_and_stat_failure_events_stay_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remote.md");
+        std::fs::write(&path, b"daemon bytes").unwrap();
+        let work = EntryWork::new();
+
+        let unsafe_kinds = [
+            notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::Any,
+            )),
+            notify::EventKind::Remove(notify::event::RemoveKind::Any),
+        ];
+        for kind in unsafe_kinds {
+            let daemon_write_candidate = watcher_event_can_match_daemon_write(&kind);
+            assert!(!daemon_write_candidate);
+            let generation = work.mutation_generation.load(Ordering::Acquire);
+            work.record_daemon_write(&path, content_hash(b"daemon bytes"), generation);
+            work.commit_daemon_writes();
+            work.mark_generation_durable(generation);
+            let event_generation = work.record_mutation();
+            let batch = WatchEventBatch::new(WatchEvent {
+                paths: vec![path.clone()],
+                generation: event_generation,
+                daemon_write_candidate,
+            });
+            assert!(!work.acknowledge_daemon_write_batch(&batch));
+            assert_ne!(
+                work.mutation_generation.load(Ordering::Acquire),
+                work.durable_generation.load(Ordering::Acquire)
+            );
+        }
+
+        let generation = work.mutation_generation.load(Ordering::Acquire);
+        work.record_daemon_write(&path, content_hash(b"daemon bytes"), generation);
+        work.commit_daemon_writes();
+        work.mark_generation_durable(generation);
+        std::fs::remove_file(&path).unwrap();
+        let event_generation = work.record_mutation();
+        let batch = WatchEventBatch::new(WatchEvent {
+            paths: vec![path],
+            generation: event_generation,
+            // Exercise the stat-failure branch independently of remove-kind
+            // classification.
+            daemon_write_candidate: true,
+        });
+        assert!(!work.acknowledge_daemon_write_batch(&batch));
+        assert_ne!(
+            work.mutation_generation.load(Ordering::Acquire),
+            work.durable_generation.load(Ordering::Acquire)
         );
     }
 
@@ -1177,19 +1682,27 @@ mod tests {
     async fn continuous_events_are_bounded_by_max_coalesce_window() {
         let (tx, mut rx) = mpsc::channel(1);
         let sender = tokio::spawn(async move {
-            for _ in 0..40 {
-                let _ = tx.send(()).await;
+            for generation in 1..=40 {
+                let _ = tx
+                    .send(WatchEvent {
+                        paths: Vec::new(),
+                        generation,
+                        daemon_write_candidate: false,
+                    })
+                    .await;
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         });
         let started = tokio::time::Instant::now();
         assert!(
             coalesce_watch_events(
+                rx.recv().await.unwrap(),
                 &mut rx,
                 Duration::from_millis(20),
                 Duration::from_millis(100),
             )
             .await
+            .is_some()
         );
         let elapsed = started.elapsed();
         assert!(
@@ -1297,7 +1810,7 @@ mod tests {
             }
             assert_eq!(observed.get("retired.toml"), Some(&stale_hash));
 
-            materialize_tracked(&mut node, root, rules, &protected, &mut observed).unwrap();
+            materialize_tracked(&mut node, root, rules, &protected, &mut observed, None).unwrap();
             let file_survives = policy == SyncPolicy::Catalog;
             assert_eq!(path.exists(), file_survives, "policy {policy:?}");
             assert_eq!(
