@@ -52,6 +52,11 @@ const PERIODIC_RESYNC: Duration = Duration::from_secs(30);
 /// transient watcher failure. Clean periodic ticks do not scan the tree.
 const MISSED_EVENT_RESYNC: Duration = Duration::from_secs(5 * 60);
 
+#[inline]
+fn periodic_scan_due(dirty: bool, safety_due: bool) -> bool {
+    dirty || safety_due
+}
+
 /// A dialable peer for a reconcile: a display id and, for the iroh transport, its
 /// address. The loopback transport routes by `id` alone.
 #[derive(Debug, Clone)]
@@ -654,7 +659,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                     let dirty = entry.work.mutation_generation.load(Ordering::Acquire)
                         != entry.work.durable_generation.load(Ordering::Acquire);
                     let safety_due = last_safety_scan.elapsed() >= MISSED_EVENT_RESYNC;
-                    if dirty || safety_due {
+                    if periodic_scan_due(dirty, safety_due) {
                         if safety_due { last_safety_scan = tokio::time::Instant::now(); }
                         if let Err(error) = self.sync_once(&name).await {
                             tracing::debug!(sync = %name, %error, "periodic sync failed");
@@ -1088,6 +1093,13 @@ mod tests {
     use crate::sync::config::SyncPolicy;
     use crate::sync::manifest::Entry;
     use std::sync::{Mutex as StdMutex, Weak};
+
+    #[test]
+    fn periodic_scan_decision_covers_clean_dirty_and_safety_paths() {
+        assert!(!periodic_scan_due(false, false));
+        assert!(periodic_scan_due(true, false));
+        assert!(periodic_scan_due(false, true));
+    }
 
     fn entry_with_policy(name: &str, folder: &Path, policy: SyncPolicy) -> SyncEntry {
         SyncEntry {
