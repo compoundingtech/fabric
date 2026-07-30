@@ -14,6 +14,7 @@ pub mod pathwatch;
 pub mod service;
 pub mod shell;
 pub mod sync;
+pub mod terminal;
 mod tunnel;
 
 const SPIKE_ALPN: &[u8] = b"fabric/spike/echo/0";

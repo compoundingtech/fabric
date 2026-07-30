@@ -9,6 +9,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::mpsc,
 };
+use tokio_util::sync::CancellationToken;
 
 pub const SHELL_ALPN: &[u8] = b"fabric/shell/0";
 pub const SHELL_PROTOCOL: &str = "fabric/shell/0";
@@ -20,6 +21,7 @@ const CLIENT_EOF: u8 = 3;
 const SERVER_OUTPUT: u8 = 17;
 const SERVER_EXIT: u8 = 18;
 const SERVER_ERROR: u8 = 19;
+const SERVER_STATUS: u8 = 20;
 
 #[derive(Debug)]
 pub enum ClientFrame {
@@ -33,6 +35,7 @@ pub enum ServerFrame {
     Output(Vec<u8>),
     Exit(i32),
     Error(String),
+    Status(String),
 }
 
 pub async fn serve_shell_disabled<W>(send: &mut W) -> Result<()>
@@ -54,6 +57,19 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    serve_shell_session_until(recv, send, peer, CancellationToken::new()).await
+}
+
+pub async fn serve_shell_session_until<R, W>(
+    recv: &mut R,
+    send: &mut W,
+    peer: &str,
+    cancel: CancellationToken,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize::default())?;
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
@@ -64,6 +80,7 @@ where
     command.env("FABRIC_SHELL", "1");
     command.env("FABRIC_PEER", peer);
     let mut child = pair.slave.spawn_command(command)?;
+    let mut child_killer = child.clone_killer();
     let mut reader = pair.master.try_clone_reader()?;
     let mut writer = pair.master.take_writer()?;
     let master = pair.master;
@@ -135,6 +152,14 @@ where
                 let code = status.exit_code().min(i32::MAX as u32) as i32;
                 exit_code = Some(code);
                 let _ = input_tx.send(None);
+            }
+            _ = cancel.cancelled() => {
+                let _ = tokio::task::spawn_blocking(move || child_killer.kill()).await;
+                let _ = input_tx.send(None);
+                let _ = wait_task.await;
+                let _ = reader_task.await;
+                let _ = writer_task.await;
+                return Ok(());
             }
         }
     }
@@ -209,8 +234,17 @@ where
             ]))))
         }
         SERVER_ERROR => Ok(Some(ServerFrame::Error(String::from_utf8(payload)?))),
+        SERVER_STATUS => Ok(Some(ServerFrame::Status(String::from_utf8(payload)?))),
         _ => bail!("unknown shell server frame {kind}"),
     }
+}
+
+pub fn encode_server_status(message: &str) -> Result<Vec<u8>> {
+    encode_frame(SERVER_STATUS, message.as_bytes())
+}
+
+pub fn encode_server_error(message: &str) -> Result<Vec<u8>> {
+    encode_frame(SERVER_ERROR, message.as_bytes())
 }
 
 async fn write_server_frame<W>(write: &mut W, frame: ServerFrame) -> Result<()>
@@ -221,6 +255,7 @@ where
         ServerFrame::Output(bytes) => write_frame(write, SERVER_OUTPUT, &bytes).await,
         ServerFrame::Exit(code) => write_frame(write, SERVER_EXIT, &code.to_be_bytes()).await,
         ServerFrame::Error(message) => write_frame(write, SERVER_ERROR, message.as_bytes()).await,
+        ServerFrame::Status(message) => write_frame(write, SERVER_STATUS, message.as_bytes()).await,
     }
 }
 
@@ -250,14 +285,33 @@ async fn write_frame<W>(write: &mut W, kind: u8, payload: &[u8]) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
+    write.write_all(&encode_frame(kind, payload)?).await?;
+    Ok(())
+}
+
+fn encode_frame(kind: u8, payload: &[u8]) -> Result<Vec<u8>> {
     if payload.len() > MAX_FRAME_LEN {
         bail!("shell frame too large: {} bytes", payload.len());
     }
 
-    let mut header = [0u8; 5];
-    header[0] = kind;
-    header[1..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
-    write.write_all(&header).await?;
-    write.write_all(payload).await?;
-    Ok(())
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(kind);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    Ok(frame)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ServerFrame, encode_server_status, read_server_frame};
+
+    #[tokio::test]
+    async fn reconnect_status_frame_round_trips() {
+        let bytes = encode_server_status("reconnected").unwrap();
+        let mut read = &bytes[..];
+        assert!(matches!(
+            read_server_frame(&mut read).await.unwrap(),
+            Some(ServerFrame::Status(message)) if message == "reconnected"
+        ));
+    }
 }

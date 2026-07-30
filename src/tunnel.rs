@@ -26,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     config::{FabricHome, PeerBook},
     daemon::CurrentEndpoint,
+    shell,
 };
 
 // Resumable byte tunnel used by generic `fabric dial` sockets. Each local Unix
@@ -62,6 +63,46 @@ pub enum ServerTarget {
         argv: Vec<String>,
         limit: Arc<ExecLimit>,
     },
+    Shell {
+        allowed: bool,
+    },
+}
+
+#[derive(Debug)]
+pub enum ClientConnectionEvent {
+    Reconnecting {
+        attempt: u64,
+        delay: Duration,
+        error: String,
+    },
+    Resumed,
+    Failed {
+        error: String,
+    },
+}
+
+type NoticeEncoder =
+    dyn Fn(&ClientConnectionEvent) -> Option<Vec<u8>> + Send + Sync + 'static;
+
+#[derive(Clone)]
+pub struct ClientConnectionNotices {
+    encode: Arc<NoticeEncoder>,
+}
+
+impl ClientConnectionNotices {
+    pub fn new(
+        encode: impl Fn(&ClientConnectionEvent) -> Option<Vec<u8>> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            encode: Arc::new(encode),
+        }
+    }
+
+    async fn emit(&self, session: &TunnelSession, event: ClientConnectionEvent) {
+        if let Some(bytes) = (self.encode)(&event) {
+            let _ = session.write_local_notice(&bytes).await;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -384,6 +425,16 @@ impl TunnelSession {
 
     pub async fn clear_reconnect_error(&self) {
         self.state.lock().await.last_error = None;
+    }
+
+    async fn write_local_notice(&self, bytes: &[u8]) -> Result<()> {
+        let mut write = self.local_write.lock().await;
+        let Some(write) = write.as_mut() else {
+            bail!("tunnel {} local write is closed", self.id);
+        };
+        write.write_all(bytes).await?;
+        write.flush().await?;
+        Ok(())
     }
 
     async fn begin_attach(&self) -> Result<()> {
@@ -753,6 +804,7 @@ pub async fn run_client_connection(
     alpn: Vec<u8>,
     cancel: CancellationToken,
     drop_rx: watch::Receiver<u64>,
+    notices: Option<ClientConnectionNotices>,
 ) -> Result<()> {
     let (read, write) = local.into_split();
     run_client_connection_parts(
@@ -764,6 +816,7 @@ pub async fn run_client_connection(
         alpn,
         cancel,
         drop_rx,
+        notices,
     )
     .await
 }
@@ -787,6 +840,7 @@ pub async fn run_client_tcp_connection(
         alpn,
         cancel,
         drop_rx,
+        None,
     )
     .await
 }
@@ -800,6 +854,7 @@ async fn run_client_connection_parts(
     alpn: Vec<u8>,
     cancel: CancellationToken,
     drop_rx: watch::Receiver<u64>,
+    notices: Option<ClientConnectionNotices>,
 ) -> Result<()> {
     let peer_id = PeerBook::load(&home)?.resolve(&peer)?.id;
     let session_id = TunnelSessionId::random();
@@ -814,6 +869,7 @@ async fn run_client_connection_parts(
         alpn,
         cancel,
         drop_rx,
+        notices,
     )
     .await;
     reader.abort();
@@ -829,6 +885,7 @@ async fn run_client_attach_loop(
     alpn: Vec<u8>,
     cancel: CancellationToken,
     mut drop_rx: watch::Receiver<u64>,
+    notices: Option<ClientConnectionNotices>,
 ) -> Result<()> {
     let mut backoff = Backoff::new();
 
@@ -840,44 +897,122 @@ async fn run_client_attach_loop(
         let peer_addr = resolve_peer_for_attempt(&home, &peer, session.peer_id()).await;
         let endpoint = endpoint_rx.borrow().endpoint.clone();
         let attach_started = Instant::now();
-        let result =
-            connect_and_attach(session.clone(), endpoint, peer_addr, &alpn, drop_rx.clone()).await;
-
-        match result {
-            Ok(()) if session.is_complete().await => return Ok(()),
-            Ok(()) => {
-                session
-                    .record_reconnect_attempt(Some("tunnel attach ended".to_string()))
-                    .await;
-            }
-            Err(error) => {
-                session
-                    .record_reconnect_attempt(Some(format!("{error:#}")))
-                    .await;
-            }
-        }
+        let result = connect_and_attach(
+            session.clone(),
+            endpoint,
+            peer_addr,
+            &alpn,
+            drop_rx.clone(),
+            notices.as_ref(),
+        )
+        .await;
 
         if attach_started.elapsed() >= ATTACH_STABLE_AFTER {
             backoff.reset();
             session.clear_reconnect_error().await;
         }
 
-        let delay = backoff.next_delay();
-        tokio::select! {
-            _ = tokio::time::sleep(delay) => {}
-            _ = cancel.cancelled() => return Ok(()),
-            _ = session.done.cancelled() => return Ok(()),
-            changed = drop_rx.changed() => {
-                if changed.is_err() {
+        match result {
+            Ok(()) if session.is_complete().await => return Ok(()),
+            Ok(()) => {
+                let attempt = session
+                    .record_reconnect_attempt(Some("tunnel attach ended".to_string()))
+                    .await;
+                let delay = backoff.next_delay();
+                if let Some(notices) = notices.as_ref() {
+                    notices
+                        .emit(
+                            &session,
+                            ClientConnectionEvent::Reconnecting {
+                                attempt,
+                                delay,
+                                error: "transport attach ended".to_string(),
+                            },
+                        )
+                        .await;
+                }
+                if !wait_for_reconnect(
+                    delay,
+                    &cancel,
+                    &session,
+                    &mut drop_rx,
+                    &mut endpoint_rx,
+                )
+                .await
+                {
                     return Ok(());
                 }
+                continue;
             }
-            changed = endpoint_rx.changed() => {
-                if changed.is_err() {
+            Err(error) => {
+                let message = format!("{error:#}");
+                // An endpoint-level local rejection is a permanent trust/auth
+                // failure for this session, not a transient transport drop.
+                // Retrying it forever makes default-deny shell/exec requests
+                // hang instead of returning the refusal to the caller.
+                let permanently_rejected = error.downcast_ref::<ServerRejected>().is_some()
+                    || message.contains("code 403")
+                    || message.contains("node is not in fabric allow-list");
+                if permanently_rejected {
+                    if let Some(notices) = notices.as_ref() {
+                        notices
+                            .emit(
+                                &session,
+                                ClientConnectionEvent::Failed {
+                                    error: message.clone(),
+                                },
+                            )
+                            .await;
+                    }
+                    session.abort_local().await?;
+                    return Err(error);
+                }
+                let attempt = session
+                    .record_reconnect_attempt(Some(message.clone()))
+                    .await;
+                let delay = backoff.next_delay();
+                if let Some(notices) = notices.as_ref() {
+                    notices
+                        .emit(
+                            &session,
+                            ClientConnectionEvent::Reconnecting {
+                                attempt,
+                                delay,
+                                error: message,
+                            },
+                        )
+                        .await;
+                }
+                if !wait_for_reconnect(
+                    delay,
+                    &cancel,
+                    &session,
+                    &mut drop_rx,
+                    &mut endpoint_rx,
+                )
+                .await
+                {
                     return Ok(());
                 }
+                continue;
             }
         }
+    }
+}
+
+async fn wait_for_reconnect(
+    delay: Duration,
+    cancel: &CancellationToken,
+    session: &TunnelSession,
+    drop_rx: &mut watch::Receiver<u64>,
+    endpoint_rx: &mut watch::Receiver<CurrentEndpoint>,
+) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => true,
+        _ = cancel.cancelled() => false,
+        _ = session.done.cancelled() => false,
+        changed = drop_rx.changed() => changed.is_ok(),
+        changed = endpoint_rx.changed() => changed.is_ok(),
     }
 }
 
@@ -897,6 +1032,7 @@ async fn connect_and_attach(
     peer_addr: EndpointAddr,
     alpn: &[u8],
     drop_rx: watch::Receiver<u64>,
+    notices: Option<&ClientConnectionNotices>,
 ) -> Result<()> {
     let connection = endpoint
         .connect(peer_addr, alpn)
@@ -905,12 +1041,13 @@ async fn connect_and_attach(
     attach_drop_closer(&connection, drop_rx);
     let (mut send, mut recv) = connection.open_bi().await?;
 
+    let resume = session.has_attached().await;
     write_frame(
         &mut send,
         Frame::Hello {
             session_id: session.id(),
             recv_next: session.recv_next().await,
-            resume: session.has_attached().await,
+            resume,
         },
     )
     .await?;
@@ -922,17 +1059,34 @@ async fn connect_and_attach(
             ..
         }) => (session_id, recv_next),
         Some(Frame::Error { message }) => {
-            session.abort_local().await?;
-            bail!("tunnel server rejected session: {message}");
+            return Err(ServerRejected(message).into());
         }
         Some(_) | None => bail!("tunnel server did not send hello"),
     };
     if session_id != session.id() {
         bail!("tunnel server replied with wrong session id {session_id}");
     }
+    if resume
+        && let Some(notices) = notices
+    {
+        notices
+            .emit(&session, ClientConnectionEvent::Resumed)
+            .await;
+    }
 
     session.run_attach(send, recv, recv_next).await
 }
+
+#[derive(Debug)]
+struct ServerRejected(String);
+
+impl fmt::Display for ServerRejected {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "tunnel server rejected session: {}", self.0)
+    }
+}
+
+impl std::error::Error for ServerRejected {}
 
 #[derive(Debug, Clone)]
 pub struct ServerSessionStore {
@@ -1297,7 +1451,49 @@ async fn create_server_session(
         ServerTarget::Exec { argv, limit } => {
             spawn_exec_session(session_id, peer_id, argv, limit).await
         }
+        ServerTarget::Shell { allowed } => {
+            spawn_shell_session(session_id, peer_id, allowed).await
+        }
     }
+}
+
+async fn spawn_shell_session(
+    session_id: TunnelSessionId,
+    peer_id: EndpointId,
+    allowed: bool,
+) -> Result<(Arc<TunnelSession>, LocalRead)> {
+    let (service, tunnel) = tokio::io::duplex(64 * 1024);
+    let (service_read, service_write) = tokio::io::split(service);
+    let (tunnel_read, tunnel_write) = tokio::io::split(tunnel);
+    let kill = CancellationToken::new();
+    let shell_kill = kill.clone();
+    tokio::spawn(async move {
+        let mut read = service_read;
+        let mut write = service_write;
+        let result = if allowed {
+            shell::serve_shell_session_until(
+                &mut read,
+                &mut write,
+                &peer_id.to_string(),
+                shell_kill,
+            )
+            .await
+        } else {
+            shell::serve_shell_disabled(&mut write).await
+        };
+        if let Err(error) = result {
+            eprintln!("fabric: shell session {session_id} failed: {error:#}");
+        }
+        let _ = write.shutdown().await;
+    });
+
+    Ok(TunnelSession::new_parts_with_cleanup(
+        session_id,
+        peer_id,
+        Box::new(tunnel_read),
+        Box::new(tunnel_write),
+        Some(SessionCleanup { kill }),
+    ))
 }
 
 async fn spawn_exec_session(

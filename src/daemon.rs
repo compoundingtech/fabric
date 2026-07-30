@@ -999,11 +999,10 @@ impl DaemonState {
         let listener_cancel = CancellationToken::new();
         let lease = DialListenerLease::new(self.active_dial_listeners.clone());
 
-        // Built-in shell and exec speak their own end-to-end framing over a raw
-        // stream — they must NOT go through the tunnel-session (mux) path, whose
-        // Hello frame would corrupt the first client frame. Every other protocol
-        // (exposed tunnels) uses the resumable tunnel path.
-        let listener_task = if alpn == shell::SHELL_ALPN || alpn == exec::EXEC_ALPN {
+        // Built-in exec remains a one-shot raw framed stream. Built-in shell
+        // rides the resumable tunnel path so its PTY outlives transient iroh
+        // attaches; local reconnect notices are encoded as shell status frames.
+        let listener_task = if alpn == exec::EXEC_ALPN {
             tokio::spawn(run_raw_dial_socket(
                 listener,
                 self.endpoint_rx(),
@@ -1016,6 +1015,7 @@ impl DaemonState {
                 lease,
             ))
         } else {
+            let notices = (alpn == shell::SHELL_ALPN).then(shell_client_notices);
             tokio::spawn(run_dial_socket(
                 listener,
                 self.endpoint_rx(),
@@ -1028,6 +1028,7 @@ impl DaemonState {
                 self.dial_failures.clone(),
                 self.dial_slots.clone(),
                 lease,
+                notices,
             ))
         };
         sockets.insert(
@@ -2639,16 +2640,20 @@ async fn handle_builtin_echo(connection: Connection, state: Arc<DaemonState>) ->
 }
 
 async fn handle_builtin_shell(connection: Connection, state: Arc<DaemonState>) -> Result<()> {
-    let peer = connection.remote_id().to_string();
-    let (mut send, mut recv) = connection.accept_bi().await?;
-    if state.allow_shell {
-        shell::serve_shell_session(&mut recv, &mut send, &peer).await?;
-    } else {
-        shell::serve_shell_disabled(&mut send).await?;
-    }
-    send.finish()?;
-    connection.closed().await;
-    Ok(())
+    let peer_id = connection.remote_id();
+    let (send, recv) = connection.accept_bi().await?;
+    tunnel::serve_connection(
+        connection,
+        send,
+        recv,
+        peer_id,
+        tunnel::ServerTarget::Shell {
+            allowed: state.allow_shell,
+        },
+        state.tunnel_sessions.clone(),
+        state.tunnel_drop_rx(),
+    )
+    .await
 }
 
 async fn handle_builtin_exec(connection: Connection, state: Arc<DaemonState>) -> Result<()> {
@@ -3067,6 +3072,7 @@ async fn run_dial_socket(
     dial_failures: Arc<FailureBackoff>,
     dial_slots: Arc<Semaphore>,
     _lease: DialListenerLease,
+    notices: Option<tunnel::ClientConnectionNotices>,
 ) {
     loop {
         tokio::select! {
@@ -3095,13 +3101,23 @@ async fn run_dial_socket(
                 let cancel = daemon_cancel.clone();
                 let drop_rx = drop_rx.clone();
                 let dial_failures = dial_failures.clone();
+                let notices = notices.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     if !dial_failures.wait(&cancel).await {
                         return;
                     }
                     match
-                        tunnel::run_client_connection(local, endpoint_rx, home, peer, alpn, cancel, drop_rx)
+                        tunnel::run_client_connection(
+                            local,
+                            endpoint_rx,
+                            home,
+                            peer,
+                            alpn,
+                            cancel,
+                            drop_rx,
+                            notices,
+                        )
                             .await
                     {
                         Ok(()) => dial_failures.record_success().await,
@@ -3115,6 +3131,28 @@ async fn run_dial_socket(
             }
         }
     }
+}
+
+fn shell_client_notices() -> tunnel::ClientConnectionNotices {
+    tunnel::ClientConnectionNotices::new(|event| {
+        let encoded = match event {
+            tunnel::ClientConnectionEvent::Reconnecting {
+                attempt,
+                delay,
+                error,
+            } => shell::encode_server_status(&format!(
+                "connection lost ({error}); reconnecting attempt {attempt} in {:.1}s",
+                delay.as_secs_f32()
+            )),
+            tunnel::ClientConnectionEvent::Resumed => {
+                shell::encode_server_status("connection restored; remote shell session resumed")
+            }
+            tunnel::ClientConnectionEvent::Failed { error } => {
+                shell::encode_server_error(&format!("remote shell could not resume: {error}"))
+            }
+        };
+        encoded.ok()
+    })
 }
 
 async fn run_dial_tcp_listener(
