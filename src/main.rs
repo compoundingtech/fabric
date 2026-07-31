@@ -710,17 +710,20 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                     let present = logical_present(&entry);
                     if entry.missing == 0 && entry.unexpected == 0 && entry.mismatched == 0 {
                         println!(
-                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean",
+                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}",
                             entry.name,
                             entry.folder,
                             entry.policy,
                             entry.peers,
                             entry.tombstones,
                             entry.observed,
+                            entry.full_scans,
+                            entry.inbound_noop_transactions,
+                            entry.inbound_guarded_transactions,
                         );
                     } else {
                         println!(
-                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}",
+                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}",
                             entry.name,
                             entry.folder,
                             entry.policy,
@@ -730,6 +733,9 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                             entry.missing,
                             entry.unexpected,
                             entry.mismatched,
+                            entry.full_scans,
+                            entry.inbound_noop_transactions,
+                            entry.inbound_guarded_transactions,
                         );
                     }
                 }
@@ -766,6 +772,9 @@ struct SyncLsJsonEntry<'a> {
     missing: usize,
     unexpected: usize,
     mismatched: usize,
+    full_scans: u64,
+    inbound_noop_transactions: u64,
+    inbound_guarded_transactions: u64,
 }
 
 impl<'a> From<&'a fabric::control::SyncEntryStatus> for SyncLsJsonEntry<'a> {
@@ -782,6 +791,9 @@ impl<'a> From<&'a fabric::control::SyncEntryStatus> for SyncLsJsonEntry<'a> {
             missing: entry.missing,
             unexpected: entry.unexpected,
             mismatched: entry.mismatched,
+            full_scans: entry.full_scans,
+            inbound_noop_transactions: entry.inbound_noop_transactions,
+            inbound_guarded_transactions: entry.inbound_guarded_transactions,
         }
     }
 }
@@ -812,6 +824,9 @@ mod sync_ls_tests {
             missing: 0,
             unexpected: 2,
             mismatched: 0,
+            full_scans: 17,
+            inbound_noop_transactions: 11,
+            inbound_guarded_transactions: 3,
         }
     }
 
@@ -832,7 +847,10 @@ mod sync_ls_tests {
                 "drift": true,
                 "missing": 0,
                 "unexpected": 2,
-                "mismatched": 0
+                "mismatched": 0,
+                "full_scans": 17,
+                "inbound_noop_transactions": 11,
+                "inbound_guarded_transactions": 3
             })
         );
     }
@@ -842,6 +860,27 @@ mod sync_ls_tests {
         let mut status = status();
         status.present = 0;
         assert_eq!(logical_present(&status), 40);
+    }
+
+    #[test]
+    fn sync_ls_accepts_legacy_status_without_observability_counters() {
+        let status: SyncEntryStatus = serde_json::from_value(serde_json::json!({
+            "name": "catalog",
+            "folder": "/catalog",
+            "policy": "catalog",
+            "peers": "*",
+            "files": 40,
+            "present": 40,
+            "tombstones": 3,
+            "observed": 40,
+            "missing": 0,
+            "unexpected": 0,
+            "mismatched": 0
+        }))
+        .unwrap();
+        assert_eq!(status.full_scans, 0);
+        assert_eq!(status.inbound_noop_transactions, 0);
+        assert_eq!(status.inbound_guarded_transactions, 0);
     }
 }
 

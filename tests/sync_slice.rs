@@ -9,7 +9,7 @@ use std::{path::Path, time::Duration};
 use anyhow::Result;
 use fabric::{
     config::{FabricHome, PeerBook},
-    control::ControlRequest,
+    control::{ControlRequest, ControlResponse, SyncEntryStatus},
     daemon::{FabricNode, send_control},
 };
 use tempfile::TempDir;
@@ -57,6 +57,18 @@ async fn reload_sync(home: &FabricHome) -> Result<()> {
     }
     send_control(home, ControlRequest::SyncReload).await?;
     Ok(())
+}
+
+async fn sync_status(home: &FabricHome, name: &str) -> Result<SyncEntryStatus> {
+    let ControlResponse::SyncStatus { entries } =
+        send_control(home, ControlRequest::SyncStatus).await?
+    else {
+        anyhow::bail!("unexpected sync status response");
+    };
+    entries
+        .into_iter()
+        .find(|entry| entry.name == name)
+        .ok_or_else(|| anyhow::anyhow!("sync status did not include {name:?}"))
 }
 
 async fn wait_for_missing(path: &Path) -> bool {
@@ -209,6 +221,67 @@ async fn bus_update_beats_equal_version_delete_then_archive_survives_restart() -
     );
     assert_stays_missing(&a_inbox).await;
     assert_stays_missing(&b_inbox).await;
+
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn production_status_exposes_exact_inbound_scan_ledger() -> Result<()> {
+    let _guard = SYNC_SLICE_LOCK.lock().await;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let a_home = FabricHome::new(a_dir.path());
+    let b_home = FabricHome::new(b_dir.path());
+    let a_bus = a_dir.path().join("bus");
+    let b_bus = b_dir.path().join("bus");
+    std::fs::create_dir_all(&a_bus)?;
+    std::fs::create_dir_all(&b_bus)?;
+    write_sync(a_dir.path(), &a_bus, "bus");
+    write_sync(b_dir.path(), &b_bus, "bus");
+
+    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_b = FabricNode::start(b_home.clone()).await?;
+    trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
+    trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
+
+    let a_file = a_bus.join("ledger.txt");
+    let b_file = b_bus.join("ledger.txt");
+    std::fs::write(&a_file, b"seed")?;
+    reload_sync(&a_home).await?;
+    assert!(
+        wait_for_file(&b_file, b"seed").await,
+        "ledger seed did not converge"
+    );
+    reload_sync(&b_home).await?;
+    let baseline = sync_status(&b_home, "shared").await?;
+
+    reload_sync(&a_home).await?;
+    reload_sync(&a_home).await?;
+    let converged = sync_status(&b_home, "shared").await?;
+    assert_eq!(converged.full_scans, baseline.full_scans);
+    assert_eq!(
+        converged.inbound_noop_transactions,
+        baseline.inbound_noop_transactions + 2
+    );
+    assert_eq!(
+        converged.inbound_guarded_transactions,
+        baseline.inbound_guarded_transactions
+    );
+
+    std::fs::write(&a_file, b"remote mutation")?;
+    reload_sync(&a_home).await?;
+    assert!(
+        wait_for_file(&b_file, b"remote mutation").await,
+        "ledger mutation did not converge"
+    );
+    let mutated = sync_status(&b_home, "shared").await?;
+    assert_eq!(mutated.full_scans, converged.full_scans + 2);
+    assert_eq!(
+        mutated.inbound_guarded_transactions,
+        converged.inbound_guarded_transactions + 1
+    );
 
     node_b.shutdown().await?;
     node_a.shutdown().await?;
