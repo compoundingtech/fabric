@@ -817,6 +817,34 @@ pub async fn run_client_connection(
         cancel,
         drop_rx,
         notices,
+        None,
+    )
+    .await
+}
+
+pub async fn run_client_connection_with_initial(
+    local: UnixStream,
+    endpoint_rx: watch::Receiver<CurrentEndpoint>,
+    home: FabricHome,
+    peer: String,
+    alpn: Vec<u8>,
+    cancel: CancellationToken,
+    drop_rx: watch::Receiver<u64>,
+    notices: Option<ClientConnectionNotices>,
+    initial_connection: Connection,
+) -> Result<()> {
+    let (read, write) = local.into_split();
+    run_client_connection_parts(
+        Box::new(read),
+        Box::new(write),
+        endpoint_rx,
+        home,
+        peer,
+        alpn,
+        cancel,
+        drop_rx,
+        notices,
+        Some(initial_connection),
     )
     .await
 }
@@ -841,6 +869,7 @@ pub async fn run_client_tcp_connection(
         cancel,
         drop_rx,
         None,
+        None,
     )
     .await
 }
@@ -855,6 +884,7 @@ async fn run_client_connection_parts(
     cancel: CancellationToken,
     drop_rx: watch::Receiver<u64>,
     notices: Option<ClientConnectionNotices>,
+    initial_connection: Option<Connection>,
 ) -> Result<()> {
     let peer_id = PeerBook::load(&home)?.resolve(&peer)?.id;
     let session_id = TunnelSessionId::random();
@@ -870,6 +900,7 @@ async fn run_client_connection_parts(
         cancel,
         drop_rx,
         notices,
+        initial_connection,
     )
     .await;
     reader.abort();
@@ -886,6 +917,7 @@ async fn run_client_attach_loop(
     cancel: CancellationToken,
     mut drop_rx: watch::Receiver<u64>,
     notices: Option<ClientConnectionNotices>,
+    mut initial_connection: Option<Connection>,
 ) -> Result<()> {
     let mut backoff = Backoff::new();
 
@@ -894,18 +926,28 @@ async fn run_client_attach_loop(
             return Ok(());
         }
 
-        let peer_addr = resolve_peer_for_attempt(&home, &peer, session.peer_id()).await;
-        let endpoint = endpoint_rx.borrow().endpoint.clone();
         let attach_started = Instant::now();
-        let result = connect_and_attach(
-            session.clone(),
-            endpoint,
-            peer_addr,
-            &alpn,
-            drop_rx.clone(),
-            notices.as_ref(),
-        )
-        .await;
+        let result = if let Some(connection) = initial_connection.take() {
+            attach_connection(
+                session.clone(),
+                connection,
+                drop_rx.clone(),
+                notices.as_ref(),
+            )
+            .await
+        } else {
+            let peer_addr = resolve_peer_for_attempt(&home, &peer, session.peer_id()).await;
+            let endpoint = endpoint_rx.borrow().endpoint.clone();
+            connect_and_attach(
+                session.clone(),
+                endpoint,
+                peer_addr,
+                &alpn,
+                drop_rx.clone(),
+                notices.as_ref(),
+            )
+            .await
+        };
 
         if attach_started.elapsed() >= ATTACH_STABLE_AFTER {
             backoff.reset();
@@ -1038,6 +1080,15 @@ async fn connect_and_attach(
         .connect(peer_addr, alpn)
         .await
         .with_context(|| "failed to reconnect tunnel")?;
+    attach_connection(session, connection, drop_rx, notices).await
+}
+
+async fn attach_connection(
+    session: Arc<TunnelSession>,
+    connection: Connection,
+    drop_rx: watch::Receiver<u64>,
+    notices: Option<&ClientConnectionNotices>,
+) -> Result<()> {
     attach_drop_closer(&connection, drop_rx);
     let (mut send, mut recv) = connection.open_bi().await?;
 

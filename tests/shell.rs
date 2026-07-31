@@ -10,8 +10,17 @@ use anyhow::{Context, Result, bail};
 use fabric::{
     config::{FabricHome, PeerBook},
     daemon::FabricNode,
+    shell::{self, ServerFrame},
 };
+use iroh::{
+    Endpoint,
+    endpoint::{Connection, presets},
+    protocol::{AcceptError, ProtocolHandler, Router},
+};
+#[cfg(unix)]
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tempfile::TempDir;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 fn fabric_bin() -> &'static str {
     env!("CARGO_BIN_EXE_fabric")
@@ -36,6 +45,338 @@ fn run_shell(home: &FabricHome, peer: &str, input: &str) -> Result<Output> {
         .write_all(input.as_bytes())?;
 
     child.wait_with_output().context("fabric shell failed")
+}
+
+#[derive(Debug, Clone)]
+struct LegacyRawShell;
+
+impl ProtocolHandler for LegacyRawShell {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let peer = connection.remote_id().to_string();
+        let (mut send, mut recv) = connection.accept_bi().await?;
+        shell::serve_shell_session(&mut recv, &mut send, &peer)
+            .await
+            .map_err(|error| AcceptError::from_boxed(error.into_boxed_dyn_error()))?;
+        send.finish()?;
+        connection.closed().await;
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn new_client_falls_back_to_legacy_raw_shell_zero() -> Result<()> {
+    let legacy_endpoint = Endpoint::bind(presets::N0).await?;
+    let legacy = Router::builder(legacy_endpoint)
+        .accept(shell::SHELL_ALPN, LegacyRawShell)
+        .spawn();
+    legacy.endpoint().online().await;
+
+    let client_dir = TempDir::new()?;
+    let client_home = FabricHome::new(client_dir.path());
+    let client = FabricNode::start(client_home.clone()).await?;
+    trust_peer(
+        &client_home,
+        &client,
+        legacy.endpoint().id(),
+        Some("legacy"),
+        Some(legacy.endpoint().addr()),
+    )
+    .await?;
+
+    let output = run_shell(
+        &client_home,
+        "legacy",
+        "printf 'legacy-shell-zero-ok\\n'; exit 0\n",
+    )?;
+    assert_success(&output, "legacy shell/0 fallback");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("legacy-shell-zero-ok"),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("unknown tunnel frame"),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    client.shutdown().await?;
+    legacy.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unavailable_old_peer_later_falls_back_to_raw_shell_zero() -> Result<()> {
+    let legacy_secret = iroh::SecretKey::generate();
+    let legacy_id = legacy_secret.public();
+    let client_dir = TempDir::new()?;
+    let client_home = FabricHome::new(client_dir.path());
+    let client = FabricNode::start(client_home.clone()).await?;
+    trust_peer(
+        &client_home,
+        &client,
+        legacy_id,
+        Some("legacy-later"),
+        Some(iroh::EndpointAddr::new(legacy_id)),
+    )
+    .await?;
+
+    let mut shell_child = tokio::process::Command::new(fabric_bin())
+        .arg("--home")
+        .arg(client_home.root())
+        .arg("shell")
+        .arg("legacy-later")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn shell for unavailable legacy peer")?;
+    let mut stdin = shell_child.stdin.take().context("shell stdin missing")?;
+    let mut stdout = shell_child.stdout.take().context("shell stdout missing")?;
+    let mut stderr = shell_child.stderr.take().context("shell stderr missing")?;
+    stdin
+        .write_all(b"printf '%s-%s\\n' legacy later; exit 0\n")
+        .await?;
+
+    // Do not start the old endpoint until the client has observed a real
+    // transient pre-attach failure. The command is already buffered on the
+    // local socket, proving protocol selection has not consumed or reframed it.
+    let mut stderr_output =
+        read_until_marker(&mut stderr, b"probing remote shell protocol again").await?;
+
+    let legacy_endpoint = Endpoint::builder(presets::N0)
+        .secret_key(legacy_secret)
+        .bind()
+        .await?;
+    let legacy = Router::builder(legacy_endpoint)
+        .accept(shell::SHELL_ALPN, LegacyRawShell)
+        .spawn();
+    legacy.endpoint().online().await;
+    trust_peer(
+        &client_home,
+        &client,
+        legacy_id,
+        Some("legacy-later"),
+        Some(legacy.endpoint().addr()),
+    )
+    .await?;
+
+    let output = read_until_marker(&mut stdout, b"legacy-later").await?;
+    drop(stdin);
+    let status = tokio::time::timeout(Duration::from_secs(30), shell_child.wait())
+        .await
+        .context("legacy fallback shell did not exit")??;
+    stderr.read_to_end(&mut stderr_output).await?;
+
+    assert_eq!(status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&output).contains("legacy-later"),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        !String::from_utf8_lossy(&stderr_output).contains("unknown tunnel frame"),
+        "stderr was: {}",
+        String::from_utf8_lossy(&stderr_output)
+    );
+
+    client.shutdown().await?;
+    legacy.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_raw_shell_zero_client_talks_to_new_server() -> Result<()> {
+    let server_dir = TempDir::new()?;
+    let server_home = FabricHome::new(server_dir.path());
+    let server = FabricNode::start_with_options(server_home.clone(), true).await?;
+    let legacy_client = Endpoint::bind(presets::N0).await?;
+    trust_peer(
+        &server_home,
+        &server,
+        legacy_client.id(),
+        Some("legacy-client"),
+        Some(legacy_client.addr()),
+    )
+    .await?;
+
+    let connection = legacy_client
+        .connect(server.addr(), shell::SHELL_ALPN)
+        .await?;
+    let (mut send, mut recv) = connection.open_bi().await?;
+    shell::write_client_stdin(&mut send, b"printf 'new-server-shell-zero-ok\\n'; exit 0\n").await?;
+    shell::write_client_eof(&mut send).await?;
+
+    let mut output = Vec::new();
+    let mut exit = None;
+    while let Some(frame) = shell::read_server_frame(&mut recv).await? {
+        match frame {
+            ServerFrame::Output(bytes) => output.extend_from_slice(&bytes),
+            ServerFrame::Exit(code) => {
+                exit = Some(code);
+                break;
+            }
+            ServerFrame::Error(error) => bail!("legacy shell/0 server error: {error}"),
+            ServerFrame::Status(status) => {
+                bail!("legacy shell/0 unexpectedly emitted resumable status: {status}")
+            }
+        }
+    }
+
+    assert_eq!(exit, Some(0));
+    assert!(
+        String::from_utf8_lossy(&output).contains("new-server-shell-zero-ok"),
+        "output was: {}",
+        String::from_utf8_lossy(&output)
+    );
+
+    connection.close(0u32.into(), b"done");
+    legacy_client.close().await;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resumable_shell_one_survives_transport_drop() -> Result<()> {
+    let server_dir = TempDir::new()?;
+    let client_dir = TempDir::new()?;
+    let server_home = FabricHome::new(server_dir.path());
+    let client_home = FabricHome::new(client_dir.path());
+    let server = FabricNode::start_with_options(server_home.clone(), true).await?;
+    let client = FabricNode::start(client_home.clone()).await?;
+    trust_peer(
+        &server_home,
+        &server,
+        client.id(),
+        Some("client"),
+        Some(client.addr()),
+    )
+    .await?;
+    trust_peer(
+        &client_home,
+        &client,
+        server.id(),
+        Some("server"),
+        Some(server.addr()),
+    )
+    .await?;
+
+    let mut shell_child = tokio::process::Command::new(fabric_bin())
+        .arg("--home")
+        .arg(client_home.root())
+        .arg("shell")
+        .arg("server")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn resumable fabric shell")?;
+    let mut stdin = shell_child.stdin.take().context("shell stdin missing")?;
+    let mut stdout = shell_child.stdout.take().context("shell stdout missing")?;
+
+    stdin.write_all(b"printf '%s-%s\\n' before drop\n").await?;
+    read_until_marker(&mut stdout, b"before-drop").await?;
+
+    let blocked = fabric_output(&server_home, &["debug", "block-tunnels"])?;
+    assert_success(&blocked, "block shell tunnels");
+    let dropped = fabric_output(&server_home, &["debug", "drop-tunnels"])?;
+    assert_success(&dropped, "drop shell tunnel connection");
+    stdin.write_all(b"printf '%s-%s\\n' during drop\n").await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let unblocked = fabric_output(&server_home, &["debug", "unblock-tunnels"])?;
+    assert_success(&unblocked, "unblock shell tunnels");
+
+    read_until_marker(&mut stdout, b"during-drop").await?;
+    stdin
+        .write_all(b"printf '%s-%s\\n' after drop; exit 0\n")
+        .await?;
+    read_until_marker(&mut stdout, b"after-drop").await?;
+    drop(stdin);
+
+    let status = tokio::time::timeout(Duration::from_secs(30), shell_child.wait())
+        .await
+        .context("resumable shell did not exit")??;
+    assert_eq!(status.code(), Some(0));
+
+    client.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shell_sigterm_restores_exact_terminal_mode() -> Result<()> {
+    let server_dir = TempDir::new()?;
+    let client_dir = TempDir::new()?;
+    let server_home = FabricHome::new(server_dir.path());
+    let client_home = FabricHome::new(client_dir.path());
+    let server = FabricNode::start_with_options(server_home.clone(), true).await?;
+    let client = FabricNode::start(client_home.clone()).await?;
+    trust_peer(
+        &server_home,
+        &server,
+        client.id(),
+        Some("client"),
+        Some(client.addr()),
+    )
+    .await?;
+    trust_peer(
+        &client_home,
+        &client,
+        server.id(),
+        Some("server"),
+        Some(server.addr()),
+    )
+    .await?;
+
+    let pair = native_pty_system().openpty(PtySize::default())?;
+    let terminal_fd = pair
+        .master
+        .as_raw_fd()
+        .context("pseudo-terminal did not expose a raw fd")?;
+    let before = terminal_snapshot(terminal_fd)?;
+    let mut command = CommandBuilder::new(fabric_bin());
+    command.arg("--home");
+    command.arg(client_home.root());
+    command.arg("shell");
+    command.arg("server");
+    let mut child = pair.slave.spawn_command(command)?;
+    drop(pair.slave);
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if terminal_snapshot(terminal_fd)? != before {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .context("fabric shell never entered raw terminal mode")??;
+
+    let pid = child
+        .process_id()
+        .context("shell child has no process id")?;
+    let killed = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if killed == -1 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || child.wait()),
+    )
+    .await
+    .context("fabric shell did not terminate after SIGTERM")???;
+
+    let after = terminal_snapshot(terminal_fd)?;
+    assert_eq!(
+        after, before,
+        "fabric shell did not restore the exact pre-existing terminal mode"
+    );
+
+    client.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -433,6 +774,60 @@ async fn wait_for_restart_complete(home: &FabricHome) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+async fn read_until_marker<R: AsyncRead + Unpin>(read: &mut R, marker: &[u8]) -> Result<Vec<u8>> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut output = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let count = read.read(&mut chunk).await?;
+            if count == 0 {
+                bail!(
+                    "shell output closed before marker {:?}; output={}",
+                    String::from_utf8_lossy(marker),
+                    String::from_utf8_lossy(&output)
+                );
+            }
+            output.extend_from_slice(&chunk[..count]);
+            if output.windows(marker.len()).any(|window| window == marker) {
+                return Ok(output);
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for shell output marker")?
+}
+
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+struct TerminalSnapshot {
+    input: libc::tcflag_t,
+    output: libc::tcflag_t,
+    control: libc::tcflag_t,
+    local: libc::tcflag_t,
+    characters: Vec<libc::cc_t>,
+    input_speed: libc::speed_t,
+    output_speed: libc::speed_t,
+}
+
+#[cfg(unix)]
+fn terminal_snapshot(fd: std::os::fd::RawFd) -> Result<TerminalSnapshot> {
+    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+    let result = unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let termios = unsafe { termios.assume_init() };
+    Ok(TerminalSnapshot {
+        input: termios.c_iflag,
+        output: termios.c_oflag,
+        control: termios.c_cflag,
+        local: termios.c_lflag,
+        characters: termios.c_cc.to_vec(),
+        input_speed: unsafe { libc::cfgetispeed(&termios) },
+        output_speed: unsafe { libc::cfgetospeed(&termios) },
+    })
 }
 
 fn sh_quote(value: &str) -> String {

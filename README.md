@@ -694,7 +694,10 @@ fabric shell <peer>
 Open an interactive remote shell on a trusted peer over fabric. The server side
 must have been started with `fabric up --allow-shell`; a default `fabric up`
 refuses shell requests. The shell runs as the remote daemon's user and uses the
-remote user's `$SHELL`.
+remote user's `$SHELL`. Current peers negotiate resumable `fabric/shell/1`, so
+the same remote PTY survives a transient transport drop. A new client
+automatically falls back to the byte-compatible one-shot `fabric/shell/0`
+protocol when the peer is running an older Fabric release.
 
 Enabling shell is a security-sensitive opt-in: every trusted peer in
 `peers.toml` can obtain a remote shell while `--allow-shell` is active. Keep the

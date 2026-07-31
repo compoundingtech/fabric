@@ -60,6 +60,19 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **Remote shell upgrades remain mixed-version compatible.** Resumable shell
+  sessions now use their own `fabric/shell/1` ALPN. The established
+  `fabric/shell/0` ALPN keeps its original raw shell framing in both directions,
+  and new clients explicitly fall back to it when an older peer does not
+  advertise `shell/1`. Transport reconnect still resumes the same remote PTY,
+  and signal exits restore the caller's exact terminal settings.
+
+- **Converged periodic syncs no longer hash the full tree twice.** An inbound
+  peer whose manifest exactly matches the local node can bypass both folder
+  scans when the local content store is complete. Differing manifests, missing
+  content, and every potentially mutating reconcile retain the guarded
+  pre-merge and completion scans that protect local archive/delete intent.
+
 - **Inherited catalog tombstones no longer leave folders divergent.** Under
   catalog policy, any surviving physical copy now advances an inherited
   Tombstone to a higher Present version and supplies its content over the wire,

@@ -11,8 +11,12 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+/// Legacy one-shot shell framing. This ALPN is wire-compatible with every
+/// released Fabric shell and must never carry generic tunnel frames.
 pub const SHELL_ALPN: &[u8] = b"fabric/shell/0";
 pub const SHELL_PROTOCOL: &str = "fabric/shell/0";
+/// Resumable shell framing carried by the generic tunnel session protocol.
+pub const RESUMABLE_SHELL_ALPN: &[u8] = b"fabric/shell/1";
 
 const MAX_FRAME_LEN: usize = 1024 * 1024;
 const CLIENT_STDIN: u8 = 1;

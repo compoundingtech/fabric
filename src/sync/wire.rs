@@ -195,18 +195,23 @@ where
 pub async fn run_server<S, F, Fut, C>(mut stream: S, resolve: F) -> Result<(String, Reconciled, C)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
-    F: FnOnce(String) -> Fut,
+    F: FnOnce(String, Arc<Manifest>) -> Fut,
     Fut: std::future::Future<Output = Result<Option<(Arc<Mutex<SyncNode>>, C)>>>,
 {
     // 1. Read Hello.
-    let hello: HelloHeader = serde_json::from_slice(
+    let HelloHeader {
+        name,
+        manifest,
+        wanted,
+    } = serde_json::from_slice(
         &read_len_bytes(&mut stream, MAX_JSON_FRAME)
             .await
             .context("reading sync hello header")?,
     )?;
+    let manifest = Arc::new(manifest);
 
-    let Some((node, context)) = resolve(hello.name.clone()).await? else {
-        bail!("no local sync entry named {:?}", hello.name);
+    let Some((node, context)) = resolve(name.clone(), manifest.clone()).await? else {
+        bail!("no local sync entry named {name:?}");
     };
 
     // 2. Snapshot BEFORE adopting so the client still pushes the content we need,
@@ -216,14 +221,14 @@ where
         let server_manifest = node.manifest().clone();
         // Content the client should adopt from us (present entries where we win)
         // plus anything the client explicitly reported missing.
-        let mut client_needs = node.hashes_peer_needs(&hello.manifest);
-        for hash in &hello.wanted {
+        let mut client_needs = node.hashes_peer_needs(&manifest);
+        for hash in &wanted {
             if !client_needs.contains(hash) {
                 client_needs.push(*hash);
             }
         }
         let blobs = node.gather_content(&client_needs);
-        let pushed = node.adopt(&hello.manifest);
+        let pushed = node.adopt(&manifest);
         // The reply advertises what WE are still missing so the client repairs us.
         let reply = ReplyHeader {
             manifest: server_manifest,
@@ -245,7 +250,7 @@ where
 
     let sent: usize = blobs_for_client.iter().map(|(_, b)| b.len()).sum();
     Ok((
-        hello.name,
+        name,
         Reconciled {
             pulled: received.blobs,
             pushed,
@@ -293,7 +298,7 @@ mod tests {
         let (client_end, server_end) = tokio::io::duplex(1 << 20);
         let b_for_server = b.clone();
         let server = tokio::spawn(async move {
-            run_server(server_end, move |name| async move {
+            run_server(server_end, move |name, _| async move {
                 assert_eq!(name, "cat");
                 Ok(Some((b_for_server, ())))
             })
@@ -321,7 +326,7 @@ mod tests {
             let (c, s) = tokio::io::duplex(1 << 20);
             let b2 = b.clone();
             let srv = tokio::spawn(async move {
-                run_server(s, move |_| async move { Ok(Some((b2, ()))) }).await
+                run_server(s, move |_, _| async move { Ok(Some((b2, ()))) }).await
             });
             run_client(c, a.clone(), "cat").await.unwrap();
             srv.await.unwrap().unwrap();
@@ -329,10 +334,9 @@ mod tests {
         // Second session after convergence transfers no content.
         let (c, s) = tokio::io::duplex(1 << 20);
         let b2 = b.clone();
-        let srv =
-            tokio::spawn(
-                async move { run_server(s, move |_| async move { Ok(Some((b2, ()))) }).await },
-            );
+        let srv = tokio::spawn(async move {
+            run_server(s, move |_, _| async move { Ok(Some((b2, ()))) }).await
+        });
         let stats = run_client(c, a.clone(), "cat").await.unwrap();
         srv.await.unwrap().unwrap();
         assert_eq!(
@@ -352,10 +356,9 @@ mod tests {
 
         let (c, s) = tokio::io::duplex(1 << 20);
         let b2 = b.clone();
-        let srv =
-            tokio::spawn(
-                async move { run_server(s, move |_| async move { Ok(Some((b2, ()))) }).await },
-            );
+        let srv = tokio::spawn(async move {
+            run_server(s, move |_, _| async move { Ok(Some((b2, ()))) }).await
+        });
         run_client(c, a.clone(), "cat").await.unwrap();
         srv.await.unwrap().unwrap();
 
@@ -375,7 +378,7 @@ mod tests {
         let reconcile = |a: Arc<Mutex<SyncNode>>, b: Arc<Mutex<SyncNode>>| async move {
             let (client, server) = tokio::io::duplex(1 << 20);
             let task = tokio::spawn(async move {
-                run_server(server, move |_| async move { Ok(Some((b, ()))) }).await
+                run_server(server, move |_, _| async move { Ok(Some((b, ()))) }).await
             });
             let client_stats = run_client(client, a, "bus").await.unwrap();
             let (_, server_stats, ()) = task.await.unwrap().unwrap();

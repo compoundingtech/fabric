@@ -360,16 +360,27 @@ struct PersistedEntryState {
     observed: HashMap<String, ContentHash>,
 }
 
-/// State captured immediately before an inbound merge. The operation guard
-/// keeps every engine-driven scan/materialize for this entry out of the middle
-/// of the wire session; `baseline` is the pre-merge observed-disk receipt that
-/// distinguishes local paths from genuinely new remote paths at completion.
+/// State retained across an inbound merge.
+///
+/// An exactly converged peer can use `Noop`: its manifest cannot change our
+/// node, and a complete local content store means the session cannot repair
+/// anything locally. Every other reconcile uses `Guarded`; its operation guard
+/// keeps engine-driven scan/materialize work out of the middle of the wire
+/// session, and `baseline` distinguishes local paths from remote-only paths at
+/// completion.
 pub(crate) struct PreparedInbound {
     entry: Arc<EntryState>,
-    baseline: HashMap<String, ContentHash>,
-    manifest: Manifest,
-    _waiter: InboundWaiter,
-    _operation: OwnedMutexGuard<()>,
+    mode: PreparedInboundMode,
+}
+
+enum PreparedInboundMode {
+    Noop,
+    Guarded {
+        baseline: HashMap<String, ContentHash>,
+        manifest: Manifest,
+        _waiter: InboundWaiter,
+        _operation: OwnedMutexGuard<()>,
+    },
 }
 
 impl PreparedInbound {
@@ -492,8 +503,37 @@ impl<T: SyncTransport> SyncEngine<T> {
             .map(|entry| entry.node.clone())
     }
 
+    /// Expose an entry's node to an inbound reconcile, bypassing folder scans
+    /// only when the peer is exactly converged and our content store is
+    /// complete.
+    ///
+    /// An unobserved local filesystem change is safe in this exact no-op case:
+    /// the peer's manifest cannot win or cause local materialization, so the
+    /// watcher can record the local intent normally. Any differing manifest or
+    /// missing local content takes the guarded path below.
+    pub(crate) async fn prepare_inbound_for_manifest(
+        &self,
+        name: &str,
+        remote_manifest: &Manifest,
+    ) -> Result<Option<PreparedInbound>> {
+        let Some(entry) = self.entries.read().await.get(name).cloned() else {
+            return Ok(None);
+        };
+        let is_complete_noop = {
+            let node = entry.node.lock().await;
+            node.manifest() == remote_manifest && node.missing_content_hashes().is_empty()
+        };
+        if is_complete_noop {
+            return Ok(Some(PreparedInbound {
+                entry,
+                mode: PreparedInboundMode::Noop,
+            }));
+        }
+        self.prepare_inbound_entry(entry).await.map(Some)
+    }
+
     /// Scan and durably record local filesystem changes before exposing an
-    /// entry's node to an inbound reconcile.
+    /// entry's node to a potentially mutating inbound reconcile.
     ///
     /// This ordering is essential for delete-propagating policies: an atomic
     /// local rename/delete may already express user intent while its watcher
@@ -502,10 +542,15 @@ impl<T: SyncTransport> SyncEngine<T> {
     /// only observable evidence of that local deletion. Scanning before merge
     /// also avoids treating paths that are genuinely new on the remote as local
     /// deletions, because they are not in the observed-disk receipt yet.
+    #[cfg(test)]
     pub(crate) async fn prepare_inbound(&self, name: &str) -> Result<Option<PreparedInbound>> {
         let Some(entry) = self.entries.read().await.get(name).cloned() else {
             return Ok(None);
         };
+        self.prepare_inbound_entry(entry).await.map(Some)
+    }
+
+    async fn prepare_inbound_entry(&self, entry: Arc<EntryState>) -> Result<PreparedInbound> {
         let waiter = entry.work.begin_inbound();
         let operation = entry.operation.clone().lock_owned().await;
         let queued = waiter.queued;
@@ -531,13 +576,15 @@ impl<T: SyncTransport> SyncEngine<T> {
         }
         let baseline = entry.observed.lock().unwrap().clone();
         let manifest = entry.node.lock().await.manifest().clone();
-        Ok(Some(PreparedInbound {
+        Ok(PreparedInbound {
             entry,
-            baseline,
-            manifest,
-            _waiter: waiter,
-            _operation: operation,
-        }))
+            mode: PreparedInboundMode::Guarded {
+                baseline,
+                manifest,
+                _waiter: waiter,
+                _operation: operation,
+            },
+        })
     }
 
     /// Complete an inbound transaction while its entry operation guard is still
@@ -545,13 +592,16 @@ impl<T: SyncTransport> SyncEngine<T> {
     /// the pre-merge baseline: a vanished baseline Present is a local delete,
     /// while a remote-only Present is materialized instead of tombstoned.
     pub(crate) async fn complete_inbound(&self, prepared: PreparedInbound) -> Result<()> {
-        let PreparedInbound {
-            entry,
+        let PreparedInbound { entry, mode } = prepared;
+        let PreparedInboundMode::Guarded {
             baseline,
             manifest,
             _waiter,
             _operation,
-        } = prepared;
+        } = mode
+        else {
+            return Ok(());
+        };
         let generation = entry.work.mutation_generation.load(Ordering::Acquire);
         self.scan_entry(&entry).await?;
         self.materialize_entry_state(&entry, &baseline).await?;
@@ -1910,7 +1960,7 @@ mod tests {
             let (client_end, server_end) = tokio::io::duplex(1 << 20);
             let server_name = name.clone();
             let server = tokio::spawn(async move {
-                crate::sync::wire::run_server(server_end, move |n| async move {
+                crate::sync::wire::run_server(server_end, move |n, _| async move {
                     Ok(if n == server_name {
                         Some((target, ()))
                     } else {
@@ -1992,10 +2042,12 @@ mod tests {
             let resolver_target = target.clone();
             let server = tokio::spawn(async move {
                 let (_, _, prepared) =
-                    crate::sync::wire::run_server(server_end, move |requested| {
+                    crate::sync::wire::run_server(server_end, move |requested, remote_manifest| {
                         let engine = resolver_target.clone();
                         async move {
-                            let prepared = engine.prepare_inbound(&requested).await?;
+                            let prepared = engine
+                                .prepare_inbound_for_manifest(&requested, &remote_manifest)
+                                .await?;
                             Ok(prepared.map(|prepared| (prepared.node(), prepared)))
                         }
                     })
@@ -2022,6 +2074,33 @@ mod tests {
 
     fn write_bus_sync(home: &Path, folder: &Path) {
         write_named_sync(home, "bus", folder, SyncPolicy::Bus);
+    }
+
+    async fn run_inbound_wire_reconcile(
+        engine: Arc<SyncEngine<LoopbackTransport>>,
+        remote: Arc<Mutex<SyncNode>>,
+    ) -> Reconciled {
+        let (client_end, server_end) = tokio::io::duplex(1 << 20);
+        let resolver_engine = engine.clone();
+        let server = tokio::spawn(async move {
+            let (_, stats, prepared) =
+                crate::sync::wire::run_server(server_end, move |name, remote_manifest| {
+                    let engine = resolver_engine.clone();
+                    async move {
+                        let prepared = engine
+                            .prepare_inbound_for_manifest(&name, &remote_manifest)
+                            .await?;
+                        Ok(prepared.map(|prepared| (prepared.node(), prepared)))
+                    }
+                })
+                .await?;
+            engine.complete_inbound(prepared).await?;
+            Ok::<_, anyhow::Error>(stats)
+        });
+        crate::sync::wire::run_client(client_end, remote, "bus")
+            .await
+            .unwrap();
+        server.await.unwrap().unwrap()
     }
 
     async fn archive_race_fixture() -> (
@@ -2151,6 +2230,166 @@ mod tests {
             entry.work.persist_calls.load(Ordering::Relaxed),
             0,
             "an already durable no-op generation must not rewrite state"
+        );
+    }
+
+    #[tokio::test]
+    async fn serial_converged_inbound_noops_do_not_rescan_clean_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("shared.md"), b"stable").unwrap();
+        write_bus_sync(dir.path(), &root);
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+        let entry = engine.entries.read().await.get("bus").cloned().unwrap();
+        let manifest = entry.node.lock().await.manifest().clone();
+        let mut remote = SyncNode::new(Author([2; 32]));
+        remote.put_content(b"stable".to_vec());
+        remote.adopt(&manifest);
+        let remote = Arc::new(Mutex::new(remote));
+        entry.work.scan_calls.store(0, Ordering::Relaxed);
+        entry.work.persist_calls.store(0, Ordering::Relaxed);
+
+        for _ in 0..2 {
+            let stats = run_inbound_wire_reconcile(engine.clone(), remote.clone()).await;
+            assert!(stats.is_noop());
+        }
+
+        assert_eq!(
+            entry.work.scan_calls.load(Ordering::Relaxed),
+            0,
+            "serial converged inbound no-ops must not rescan an unchanged tree"
+        );
+        assert_eq!(
+            entry.work.persist_calls.load(Ordering::Relaxed),
+            0,
+            "serial converged inbound no-ops must not rewrite durable state"
+        );
+    }
+
+    #[tokio::test]
+    async fn converged_inbound_noop_never_overwrites_unobserved_local_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("shared.md"), b"stable").unwrap();
+        write_bus_sync(dir.path(), &root);
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+        let entry = engine.entries.read().await.get("bus").cloned().unwrap();
+        let manifest = entry.node.lock().await.manifest().clone();
+        let mut remote = SyncNode::new(Author([2; 32]));
+        remote.put_content(b"stable".to_vec());
+        remote.adopt(&manifest);
+
+        // Model a write that has reached disk but whose watcher callback has
+        // not run yet. An exact remote manifest cannot cause materialization,
+        // so the fast path must leave these bytes alone for the normal watcher
+        // scan to version afterward.
+        std::fs::write(root.join("shared.md"), b"local edit").unwrap();
+        entry.work.scan_calls.store(0, Ordering::Relaxed);
+        let stats = run_inbound_wire_reconcile(engine.clone(), Arc::new(Mutex::new(remote))).await;
+
+        assert!(stats.is_noop());
+        assert_eq!(entry.work.scan_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            std::fs::read(root.join("shared.md")).unwrap(),
+            b"local edit"
+        );
+
+        engine.sync_once("bus").await.unwrap();
+        let node = entry.node.lock().await;
+        let meta = node.manifest().get("shared.md").unwrap().meta().unwrap();
+        assert_eq!(meta.hash, content_hash(b"local edit"));
+        assert_eq!(meta.version, 2);
+    }
+
+    #[tokio::test]
+    async fn changed_inbound_manifest_keeps_guarded_scans() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("shared.md"), b"stable").unwrap();
+        write_bus_sync(dir.path(), &root);
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+        let entry = engine.entries.read().await.get("bus").cloned().unwrap();
+        let manifest = entry.node.lock().await.manifest().clone();
+        let mut remote = SyncNode::new(Author([2; 32]));
+        remote.put_content(b"stable".to_vec());
+        remote.adopt(&manifest);
+        remote.local_write("shared.md", b"remote edit", 0, 0);
+        entry.work.scan_calls.store(0, Ordering::Relaxed);
+
+        let stats = run_inbound_wire_reconcile(engine.clone(), Arc::new(Mutex::new(remote))).await;
+
+        assert!(!stats.is_noop());
+        assert_eq!(
+            entry.work.scan_calls.load(Ordering::Relaxed),
+            2,
+            "a differing manifest must retain pre-merge and completion scans"
+        );
+        assert_eq!(
+            std::fs::read(root.join("shared.md")).unwrap(),
+            b"remote edit"
+        );
+    }
+
+    #[tokio::test]
+    async fn converged_manifest_with_missing_local_content_keeps_guarded_scans() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        write_bus_sync(dir.path(), &root);
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+        let entry = engine.entries.read().await.get("bus").cloned().unwrap();
+        let mut remote = SyncNode::new(Author([2; 32]));
+        remote.local_write("remote-only.md", b"repair me", 0, 0);
+        entry.node.lock().await.adopt(remote.manifest());
+        assert_eq!(entry.node.lock().await.missing_content_hashes().len(), 1);
+        entry.work.scan_calls.store(0, Ordering::Relaxed);
+
+        let stats = run_inbound_wire_reconcile(engine.clone(), Arc::new(Mutex::new(remote))).await;
+
+        assert!(!stats.is_noop());
+        assert_eq!(
+            entry.work.scan_calls.load(Ordering::Relaxed),
+            2,
+            "missing local content must retain pre-merge and completion scans"
+        );
+        assert_eq!(
+            std::fs::read(root.join("remote-only.md")).unwrap(),
+            b"repair me"
         );
     }
 
@@ -2876,7 +3115,7 @@ mod tests {
         let (client_end, server_end) = tokio::io::duplex(1 << 20);
         let resolver_engine = engine.clone();
         let server = tokio::spawn(async move {
-            crate::sync::wire::run_server(server_end, move |name| {
+            crate::sync::wire::run_server(server_end, move |name, _| {
                 let engine = resolver_engine.clone();
                 async move {
                     let prepared = engine.prepare_inbound(&name).await?;
@@ -3299,7 +3538,7 @@ mod tests {
         let node = prepared.node();
         let (client_end, server_end) = tokio::io::duplex(1 << 20);
         let server = tokio::spawn(async move {
-            crate::sync::wire::run_server(server_end, move |name| async move {
+            crate::sync::wire::run_server(server_end, move |name, _| async move {
                 assert_eq!(name, "bus");
                 Ok(Some((node, prepared)))
             })
@@ -3312,13 +3551,16 @@ mod tests {
 
         // Pause completion after its post-merge scan, then edit the file. Final
         // materialization must version this local write above the remote edit.
-        let PreparedInbound {
-            entry,
+        let PreparedInbound { entry, mode } = prepared;
+        let PreparedInboundMode::Guarded {
             baseline,
             manifest: _,
             _waiter,
             _operation,
-        } = prepared;
+        } = mode
+        else {
+            panic!("a differing remote manifest must use guarded inbound");
+        };
         engine.scan_entry(&entry).await.unwrap();
         std::fs::write(root.join("shared.md"), b"local after scan").unwrap();
         engine
@@ -3341,6 +3583,8 @@ mod tests {
     #[tokio::test]
     async fn inbound_reconcile_preserves_local_archive_and_accepts_new_remote_file() {
         let (_dir, root, engine, remote) = archive_race_fixture().await;
+        let entry = engine.entries.read().await.get("bus").cloned().unwrap();
+        entry.work.scan_calls.store(0, Ordering::Relaxed);
 
         // st2 archive is one atomic rename inside the bus root. The watcher has
         // not scanned it yet when an inbound reconcile begins.
@@ -3351,25 +3595,14 @@ mod tests {
         )
         .unwrap();
 
-        let (client_end, server_end) = tokio::io::duplex(1 << 20);
-        let resolver_engine = engine.clone();
-        let server = tokio::spawn(async move {
-            crate::sync::wire::run_server(server_end, move |name| {
-                let engine = resolver_engine.clone();
-                async move {
-                    let prepared = engine.prepare_inbound(&name).await?;
-                    Ok(prepared.map(|prepared| (prepared.node(), prepared)))
-                }
-            })
-            .await
-        });
-        crate::sync::wire::run_client(client_end, remote.clone(), "bus")
-            .await
-            .unwrap();
-        let (_, _, prepared) = server.await.unwrap().unwrap();
-        engine.complete_inbound(prepared).await.unwrap();
+        run_inbound_wire_reconcile(engine.clone(), remote.clone()).await;
 
         assert_archive_outcome(&engine, &root).await;
+        assert_eq!(
+            entry.work.scan_calls.load(Ordering::Relaxed),
+            2,
+            "a remote manifest change must keep both archive-protecting scans"
+        );
     }
 
     #[tokio::test]
@@ -3379,7 +3612,12 @@ mod tests {
         // Deterministically pause the inbound transaction after its first scan.
         // This is the post-scan/pre-merge window: the pre-merge baseline still
         // says inbox/archived.md is Present when the atomic archive lands.
-        let prepared = engine.prepare_inbound("bus").await.unwrap().unwrap();
+        let remote_manifest = remote.lock().await.manifest().clone();
+        let prepared = engine
+            .prepare_inbound_for_manifest("bus", &remote_manifest)
+            .await
+            .unwrap()
+            .unwrap();
         std::fs::create_dir_all(root.join("archive")).unwrap();
         std::fs::rename(
             root.join("inbox/archived.md"),
@@ -3390,7 +3628,7 @@ mod tests {
         let (client_end, server_end) = tokio::io::duplex(1 << 20);
         let node = prepared.node();
         let server = tokio::spawn(async move {
-            crate::sync::wire::run_server(server_end, move |name| async move {
+            crate::sync::wire::run_server(server_end, move |name, _| async move {
                 assert_eq!(name, "bus");
                 Ok(Some((node, prepared)))
             })
