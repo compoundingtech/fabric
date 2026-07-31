@@ -8,6 +8,12 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Added
 
+- **Production sync scan ledger.** `fabric sync ls` and its JSON form now expose
+  per-entry monotonic full-scan, exact-noop inbound, and guarded-inbound
+  transaction counters. Operators can prove scan-free convergence and the
+  expected guarded scan transaction without relying on test-only instrumentation
+  or CPU inference.
+
 - **Truthful sync status.** `fabric sync ls` now reports logical Present,
   Tombstone, and observed-on-disk counts plus explicit missing, unexpected, and
   content-mismatch drift. `fabric sync ls --json` provides the same state as a

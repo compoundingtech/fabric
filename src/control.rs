@@ -146,6 +146,15 @@ pub struct SyncEntryStatus {
     pub unexpected: usize,
     #[serde(default)]
     pub mismatched: usize,
+    /// Monotonic full-folder scan attempts for this entry instance.
+    #[serde(default)]
+    pub full_scans: u64,
+    /// Monotonic exact-manifest, complete-content inbound fast paths.
+    #[serde(default)]
+    pub inbound_noop_transactions: u64,
+    /// Monotonic inbound transactions that selected guarded reconciliation.
+    #[serde(default)]
+    pub inbound_guarded_transactions: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

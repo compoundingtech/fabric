@@ -221,8 +221,15 @@ struct EntryWork {
     durable_generation: AtomicU64,
     inbound_waiters: AtomicUsize,
     daemon_writes: StdMutex<DaemonWriteJournal>,
-    #[cfg(test)]
-    scan_calls: AtomicUsize,
+    /// Monotonic while this name remains continuously configured in the same
+    /// daemon. Exposed through `fabric sync ls` so production can prove whether
+    /// an inbound transaction walked the tree.
+    full_scans: AtomicU64,
+    /// Exact-manifest, complete-content inbound transactions that bypassed the
+    /// guarded scan/materialize path.
+    inbound_noop_transactions: AtomicU64,
+    /// Inbound transactions that selected the guarded scan/materialize path.
+    inbound_guarded_transactions: AtomicU64,
     #[cfg(test)]
     persist_calls: AtomicUsize,
 }
@@ -236,8 +243,9 @@ impl EntryWork {
             durable_generation: AtomicU64::new(0),
             inbound_waiters: AtomicUsize::new(0),
             daemon_writes: StdMutex::new(DaemonWriteJournal::default()),
-            #[cfg(test)]
-            scan_calls: AtomicUsize::new(0),
+            full_scans: AtomicU64::new(0),
+            inbound_noop_transactions: AtomicU64::new(0),
+            inbound_guarded_transactions: AtomicU64::new(0),
             #[cfg(test)]
             persist_calls: AtomicUsize::new(0),
         })
@@ -524,6 +532,10 @@ impl<T: SyncTransport> SyncEngine<T> {
             node.manifest() == remote_manifest && node.missing_content_hashes().is_empty()
         };
         if is_complete_noop {
+            entry
+                .work
+                .inbound_noop_transactions
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(Some(PreparedInbound {
                 entry,
                 mode: PreparedInboundMode::Noop,
@@ -574,6 +586,10 @@ impl<T: SyncTransport> SyncEngine<T> {
             }
             entry.work.mark_generation_durable(generation);
         }
+        entry
+            .work
+            .inbound_guarded_transactions
+            .fetch_add(1, Ordering::Relaxed);
         let baseline = entry.observed.lock().unwrap().clone();
         let manifest = entry.node.lock().await.manifest().clone();
         Ok(PreparedInbound {
@@ -660,6 +676,15 @@ impl<T: SyncTransport> SyncEngine<T> {
                 missing,
                 unexpected,
                 mismatched,
+                full_scans: entry.work.full_scans.load(Ordering::Relaxed),
+                inbound_noop_transactions: entry
+                    .work
+                    .inbound_noop_transactions
+                    .load(Ordering::Relaxed),
+                inbound_guarded_transactions: entry
+                    .work
+                    .inbound_guarded_transactions
+                    .load(Ordering::Relaxed),
             });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -734,8 +759,7 @@ impl<T: SyncTransport> SyncEngine<T> {
     }
 
     async fn scan_entry(&self, entry: &EntryState) -> Result<bool> {
-        #[cfg(test)]
-        entry.work.scan_calls.fetch_add(1, Ordering::Relaxed);
+        entry.work.full_scans.fetch_add(1, Ordering::Relaxed);
         let root = entry.config.folder.clone();
         let cfg = entry.config.clone();
         let policy = entry.policy;
@@ -989,6 +1013,15 @@ pub struct SyncStatus {
     pub missing: usize,
     pub unexpected: usize,
     pub mismatched: usize,
+    /// Completed or attempted full folder scans since this entry instance was
+    /// loaded. Monotonic while the name remains continuously configured in the
+    /// same daemon.
+    pub full_scans: u64,
+    /// Exact-manifest, complete-content inbound transactions that took the
+    /// production no-scan fast path.
+    pub inbound_noop_transactions: u64,
+    /// Inbound transactions that selected the guarded scan/materialize path.
+    pub inbound_guarded_transactions: u64,
 }
 
 // ---- filesystem scan / materialize (sync helpers, unit-testable) ----
@@ -1544,7 +1577,7 @@ mod tests {
             "an exact delayed self-event must not leave periodic work dirty"
         );
         assert_eq!(
-            work.scan_calls.load(Ordering::Relaxed),
+            work.full_scans.load(Ordering::Relaxed),
             0,
             "the delayed daemon-owned batch must not rescan the tree"
         );
@@ -1577,7 +1610,7 @@ mod tests {
             .unwrap();
         engine.persist_entry(&entry).await.unwrap();
         entry.work.mark_generation_durable(generation);
-        entry.work.scan_calls.store(0, Ordering::Relaxed);
+        entry.work.full_scans.store(0, Ordering::Relaxed);
 
         // An external write lands before the delayed watcher event is handled.
         // Its current identity no longer matches the daemon's post-write record.
@@ -1597,7 +1630,7 @@ mod tests {
         assert!(periodic_scan_due(true, false));
         engine.sync_once("bus").await.unwrap();
         assert!(
-            entry.work.scan_calls.load(Ordering::Relaxed) >= 2,
+            entry.work.full_scans.load(Ordering::Relaxed) >= 2,
             "the non-suppressed event must take the normal sync scan path"
         );
         let node = entry.node.lock().await;
@@ -2191,7 +2224,7 @@ mod tests {
         .unwrap();
         engine.sync_once("bus").await.unwrap();
         let entry = engine.entries.read().await.get("bus").cloned().unwrap();
-        entry.work.scan_calls.store(0, Ordering::Relaxed);
+        entry.work.full_scans.store(0, Ordering::Relaxed);
         entry.work.persist_calls.store(0, Ordering::Relaxed);
 
         let first = engine.prepare_inbound("bus").await.unwrap().unwrap();
@@ -2222,7 +2255,7 @@ mod tests {
         engine.complete_inbound(third.await.unwrap()).await.unwrap();
 
         assert_eq!(
-            entry.work.scan_calls.load(Ordering::Relaxed),
+            entry.work.full_scans.load(Ordering::Relaxed),
             4,
             "first prepare + all three completion guards should scan; queued prepares should not"
         );
@@ -2255,7 +2288,15 @@ mod tests {
         remote.put_content(b"stable".to_vec());
         remote.adopt(&manifest);
         let remote = Arc::new(Mutex::new(remote));
-        entry.work.scan_calls.store(0, Ordering::Relaxed);
+        entry.work.full_scans.store(0, Ordering::Relaxed);
+        entry
+            .work
+            .inbound_noop_transactions
+            .store(0, Ordering::Relaxed);
+        entry
+            .work
+            .inbound_guarded_transactions
+            .store(0, Ordering::Relaxed);
         entry.work.persist_calls.store(0, Ordering::Relaxed);
 
         for _ in 0..2 {
@@ -2264,7 +2305,7 @@ mod tests {
         }
 
         assert_eq!(
-            entry.work.scan_calls.load(Ordering::Relaxed),
+            entry.work.full_scans.load(Ordering::Relaxed),
             0,
             "serial converged inbound no-ops must not rescan an unchanged tree"
         );
@@ -2273,6 +2314,18 @@ mod tests {
             0,
             "serial converged inbound no-ops must not rewrite durable state"
         );
+        let status = engine.status().await;
+        let status = status.iter().find(|status| status.name == "bus").unwrap();
+        assert_eq!(status.full_scans, 0);
+        assert_eq!(status.inbound_noop_transactions, 2);
+        assert_eq!(status.inbound_guarded_transactions, 0);
+
+        engine.load_from_config().await.unwrap();
+        let status = engine.status().await;
+        let status = status.iter().find(|status| status.name == "bus").unwrap();
+        assert_eq!(status.full_scans, 0);
+        assert_eq!(status.inbound_noop_transactions, 2);
+        assert_eq!(status.inbound_guarded_transactions, 0);
     }
 
     #[tokio::test]
@@ -2302,11 +2355,11 @@ mod tests {
         // so the fast path must leave these bytes alone for the normal watcher
         // scan to version afterward.
         std::fs::write(root.join("shared.md"), b"local edit").unwrap();
-        entry.work.scan_calls.store(0, Ordering::Relaxed);
+        entry.work.full_scans.store(0, Ordering::Relaxed);
         let stats = run_inbound_wire_reconcile(engine.clone(), Arc::new(Mutex::new(remote))).await;
 
         assert!(stats.is_noop());
-        assert_eq!(entry.work.scan_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(entry.work.full_scans.load(Ordering::Relaxed), 0);
         assert_eq!(
             std::fs::read(root.join("shared.md")).unwrap(),
             b"local edit"
@@ -2341,13 +2394,21 @@ mod tests {
         remote.put_content(b"stable".to_vec());
         remote.adopt(&manifest);
         remote.local_write("shared.md", b"remote edit", 0, 0);
-        entry.work.scan_calls.store(0, Ordering::Relaxed);
+        entry.work.full_scans.store(0, Ordering::Relaxed);
+        entry
+            .work
+            .inbound_noop_transactions
+            .store(0, Ordering::Relaxed);
+        entry
+            .work
+            .inbound_guarded_transactions
+            .store(0, Ordering::Relaxed);
 
         let stats = run_inbound_wire_reconcile(engine.clone(), Arc::new(Mutex::new(remote))).await;
 
         assert!(!stats.is_noop());
         assert_eq!(
-            entry.work.scan_calls.load(Ordering::Relaxed),
+            entry.work.full_scans.load(Ordering::Relaxed),
             2,
             "a differing manifest must retain pre-merge and completion scans"
         );
@@ -2355,6 +2416,11 @@ mod tests {
             std::fs::read(root.join("shared.md")).unwrap(),
             b"remote edit"
         );
+        let status = engine.status().await;
+        let status = status.iter().find(|status| status.name == "bus").unwrap();
+        assert_eq!(status.full_scans, 2);
+        assert_eq!(status.inbound_noop_transactions, 0);
+        assert_eq!(status.inbound_guarded_transactions, 1);
     }
 
     #[tokio::test]
@@ -2377,13 +2443,13 @@ mod tests {
         remote.local_write("remote-only.md", b"repair me", 0, 0);
         entry.node.lock().await.adopt(remote.manifest());
         assert_eq!(entry.node.lock().await.missing_content_hashes().len(), 1);
-        entry.work.scan_calls.store(0, Ordering::Relaxed);
+        entry.work.full_scans.store(0, Ordering::Relaxed);
 
         let stats = run_inbound_wire_reconcile(engine.clone(), Arc::new(Mutex::new(remote))).await;
 
         assert!(!stats.is_noop());
         assert_eq!(
-            entry.work.scan_calls.load(Ordering::Relaxed),
+            entry.work.full_scans.load(Ordering::Relaxed),
             2,
             "missing local content must retain pre-merge and completion scans"
         );
@@ -2952,7 +3018,7 @@ mod tests {
         let mut entries = Vec::new();
         for engine in [&engine_a, &engine_b, &engine_c] {
             let entry = engine.entries.read().await.get("bus").cloned().unwrap();
-            entry.work.scan_calls.store(0, Ordering::Relaxed);
+            entry.work.full_scans.store(0, Ordering::Relaxed);
             entry.work.persist_calls.store(0, Ordering::Relaxed);
             entries.push(entry);
         }
@@ -2980,8 +3046,8 @@ mod tests {
         assert_eq!(
             entries
                 .iter()
-                .map(|entry| entry.work.scan_calls.load(Ordering::Relaxed))
-                .sum::<usize>(),
+                .map(|entry| entry.work.full_scans.load(Ordering::Relaxed))
+                .sum::<u64>(),
             0,
             "read/access events retriggered folder scans"
         );
@@ -3020,8 +3086,8 @@ mod tests {
             .sum::<usize>();
         let scans = entries
             .iter()
-            .map(|entry| entry.work.scan_calls.load(Ordering::Relaxed))
-            .sum::<usize>();
+            .map(|entry| entry.work.full_scans.load(Ordering::Relaxed))
+            .sum::<u64>();
         let persists = entries
             .iter()
             .map(|entry| entry.work.persist_calls.load(Ordering::Relaxed))
@@ -3584,7 +3650,7 @@ mod tests {
     async fn inbound_reconcile_preserves_local_archive_and_accepts_new_remote_file() {
         let (_dir, root, engine, remote) = archive_race_fixture().await;
         let entry = engine.entries.read().await.get("bus").cloned().unwrap();
-        entry.work.scan_calls.store(0, Ordering::Relaxed);
+        entry.work.full_scans.store(0, Ordering::Relaxed);
 
         // st2 archive is one atomic rename inside the bus root. The watcher has
         // not scanned it yet when an inbound reconcile begins.
@@ -3599,7 +3665,7 @@ mod tests {
 
         assert_archive_outcome(&engine, &root).await;
         assert_eq!(
-            entry.work.scan_calls.load(Ordering::Relaxed),
+            entry.work.full_scans.load(Ordering::Relaxed),
             2,
             "a remote manifest change must keep both archive-protecting scans"
         );

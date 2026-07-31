@@ -854,8 +854,14 @@ last durable local-disk receipt). `drift=clean` means the logical Present paths
 and observed bytes agree. A `drift=WARNING` names `missing` Present paths,
 `unexpected` observed paths whose manifest is tombstoned or absent, and
 `mismatched` paths whose observed content hash differs from the logical Present.
-`fabric sync ls --json` emits a stable array with those fields plus a Boolean
-`drift` for automation.
+The per-entry `full_scans`, `inbound_noop_transactions`, and
+`inbound_guarded_transactions` counters are monotonic while that name remains
+continuously configured in the same daemon process. They let operators measure
+whether inbound reconciliation selected the exact-manifest no-scan path or the
+guarded scan/materialize path. Ordinary reloads preserve the counters; a daemon
+restart or removing and later re-adding the name starts a new counter epoch.
+`fabric sync ls --json` emits a stable array with all of those fields plus a
+Boolean `drift` for automation.
 
 ### Sync an st2 catalog safely
 
