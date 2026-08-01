@@ -1005,10 +1005,10 @@ impl DaemonState {
         let listener_cancel = CancellationToken::new();
         let lease = DialListenerLease::new(self.active_dial_listeners.clone());
 
-        // Built-in exec remains a one-shot raw framed stream. Built-in shell
-        // rides the resumable tunnel path so its PTY outlives transient iroh
-        // attaches; local reconnect notices are encoded as shell status frames.
-        let listener_task = if alpn == exec::EXEC_ALPN {
+        // Built-in exec and legacy shell/0 remain one-shot raw framed streams.
+        // Resumable shell/1 negotiates its own tunnel path and falls back to
+        // shell/0 when the peer does not advertise the new ALPN.
+        let listener_task = if alpn == exec::EXEC_ALPN || alpn == shell::SHELL_ALPN {
             tokio::spawn(run_raw_dial_socket(
                 listener,
                 self.endpoint_rx(),
@@ -1020,9 +1020,21 @@ impl DaemonState {
                 self.dial_slots.clone(),
                 lease,
             ))
+        } else if alpn == shell::RESUMABLE_SHELL_ALPN {
+            tokio::spawn(run_shell_dial_socket(
+                listener,
+                self.endpoint_rx(),
+                self.home.clone(),
+                peer.to_string(),
+                peer_addr.clone(),
+                listener_cancel.clone(),
+                self.cancel.clone(),
+                self.tunnel_drop_rx(),
+                self.dial_failures.clone(),
+                self.dial_slots.clone(),
+                lease,
+            ))
         } else {
-            let notices = (alpn == shell::SHELL_ALPN)
-                .then(|| shell_client_notices(peer.to_string(), self.endpoint_handle().generation));
             tokio::spawn(run_dial_socket(
                 listener,
                 self.endpoint_rx(),
@@ -1035,7 +1047,7 @@ impl DaemonState {
                 self.dial_failures.clone(),
                 self.dial_slots.clone(),
                 lease,
-                notices,
+                None,
             ))
         };
         sockets.insert(
@@ -2424,7 +2436,7 @@ async fn process_control_request(
                 .dial_alpn(
                     &peer,
                     shell::SHELL_PROTOCOL,
-                    shell::SHELL_ALPN.to_vec(),
+                    shell::RESUMABLE_SHELL_ALPN.to_vec(),
                     false,
                 )
                 .await?;
@@ -2571,8 +2583,14 @@ async fn process_incoming_iroh(incoming: Incoming, state: Arc<DaemonState>) -> R
     }
     if alpn == shell::SHELL_ALPN {
         let connection = accepting.await?;
-        log_connection_paths("builtin_shell_accept", &connection);
-        handle_builtin_shell(connection, state).await?;
+        log_connection_paths("builtin_legacy_shell_accept", &connection);
+        handle_builtin_legacy_shell(connection, state).await?;
+        return Ok(());
+    }
+    if alpn == shell::RESUMABLE_SHELL_ALPN {
+        let connection = accepting.await?;
+        log_connection_paths("builtin_resumable_shell_accept", &connection);
+        handle_builtin_resumable_shell(connection, state).await?;
         return Ok(());
     }
     if alpn == exec::EXEC_ALPN {
@@ -2626,7 +2644,26 @@ async fn handle_builtin_echo(connection: Connection, state: Arc<DaemonState>) ->
     Ok(())
 }
 
-async fn handle_builtin_shell(connection: Connection, state: Arc<DaemonState>) -> Result<()> {
+async fn handle_builtin_legacy_shell(
+    connection: Connection,
+    state: Arc<DaemonState>,
+) -> Result<()> {
+    let peer = connection.remote_id().to_string();
+    let (mut send, mut recv) = connection.accept_bi().await?;
+    if state.allow_shell {
+        shell::serve_shell_session(&mut recv, &mut send, &peer).await?;
+    } else {
+        shell::serve_shell_disabled(&mut send).await?;
+    }
+    send.finish()?;
+    connection.closed().await;
+    Ok(())
+}
+
+async fn handle_builtin_resumable_shell(
+    connection: Connection,
+    state: Arc<DaemonState>,
+) -> Result<()> {
     let peer_id = connection.remote_id();
     let (send, recv) = connection.accept_bi().await?;
     tunnel::serve_connection(
@@ -2693,9 +2730,10 @@ async fn handle_sync(connection: Connection, state: Arc<DaemonState>) -> Result<
 }
 
 fn accepted_alpns(exposures: &HashMap<Vec<u8>, Exposure>) -> Vec<Vec<u8>> {
-    let mut alpns = Vec::with_capacity(exposures.len() + 4);
+    let mut alpns = Vec::with_capacity(exposures.len() + 5);
     alpns.push(BUILTIN_ECHO_ALPN.to_vec());
     alpns.push(shell::SHELL_ALPN.to_vec());
+    alpns.push(shell::RESUMABLE_SHELL_ALPN.to_vec());
     alpns.push(exec::EXEC_ALPN.to_vec());
     alpns.push(SYNC_ALPN.to_vec());
     alpns.extend(exposures.keys().cloned());
@@ -2705,6 +2743,7 @@ fn accepted_alpns(exposures: &HashMap<Vec<u8>, Exposure>) -> Vec<Vec<u8>> {
 fn matches_reserved_alpn(alpn: &[u8]) -> bool {
     alpn == BUILTIN_ECHO_ALPN
         || alpn == shell::SHELL_ALPN
+        || alpn == shell::RESUMABLE_SHELL_ALPN
         || alpn == exec::EXEC_ALPN
         || alpn == SYNC_ALPN
 }
@@ -3094,6 +3133,248 @@ async fn run_dial_socket(
             }
         }
     }
+}
+
+async fn run_shell_dial_socket(
+    listener: UnixListener,
+    endpoint_rx: watch::Receiver<CurrentEndpoint>,
+    home: FabricHome,
+    peer: String,
+    peer_addr: EndpointAddr,
+    listener_cancel: CancellationToken,
+    daemon_cancel: CancellationToken,
+    drop_rx: watch::Receiver<u64>,
+    dial_failures: Arc<FailureBackoff>,
+    dial_slots: Arc<Semaphore>,
+    _lease: DialListenerLease,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = listener_cancel.cancelled() => break,
+            _ = daemon_cancel.cancelled() => break,
+            accepted = listener.accept() => {
+                let Ok((local, _)) = accepted else {
+                    break;
+                };
+                let permit = tokio::select! {
+                    biased;
+                    _ = listener_cancel.cancelled() => break,
+                    _ = daemon_cancel.cancelled() => break,
+                    permit = dial_slots.clone().acquire_owned() => {
+                        let Ok(permit) = permit else {
+                            break;
+                        };
+                        permit
+                    }
+                };
+                let endpoint_rx = endpoint_rx.clone();
+                let home = home.clone();
+                let peer = peer.clone();
+                let peer_addr = peer_addr.clone();
+                let cancel = daemon_cancel.clone();
+                let drop_rx = drop_rx.clone();
+                let dial_failures = dial_failures.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if !dial_failures.wait(&cancel).await {
+                        return;
+                    }
+                    match handle_shell_dial_socket_connection(
+                        local,
+                        endpoint_rx,
+                        home,
+                        peer,
+                        peer_addr,
+                        cancel,
+                        drop_rx,
+                    )
+                    .await
+                    {
+                        Ok(()) => dial_failures.record_success().await,
+                        Err(error) => {
+                            dial_failures
+                                .record_failure("shell dial socket connection failed", &error)
+                                .await;
+                        }
+                    }
+                });
+            }
+        }
+    }
+}
+
+async fn handle_shell_dial_socket_connection(
+    mut local: UnixStream,
+    mut endpoint_rx: watch::Receiver<CurrentEndpoint>,
+    home: FabricHome,
+    peer: String,
+    peer_addr: EndpointAddr,
+    cancel: CancellationToken,
+    drop_rx: watch::Receiver<u64>,
+) -> Result<()> {
+    let mut attempt = 0usize;
+    loop {
+        let current_peer_addr = PeerBook::load(&home)
+            .and_then(|book| book.resolve(&peer))
+            .unwrap_or_else(|_| peer_addr.clone());
+        let (endpoint, generation) = {
+            let current = endpoint_rx.borrow();
+            (current.endpoint.clone(), current.generation)
+        };
+        let connected = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(()),
+            changed = endpoint_rx.changed() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+                continue;
+            }
+            connected = endpoint.connect(
+                current_peer_addr.clone(),
+                shell::RESUMABLE_SHELL_ALPN,
+            ) => connected,
+        };
+        match connected {
+            Ok(connection) => {
+                // Protocol selection ends here. Once shell/1 has attached, its
+                // reconnect loop must remain shell/1 so it resumes this exact
+                // remote PTY rather than starting a legacy replacement.
+                let notices = shell_client_notices(peer.clone(), generation);
+                return tunnel::run_client_connection_with_initial(
+                    local,
+                    endpoint_rx,
+                    home,
+                    peer,
+                    shell::RESUMABLE_SHELL_ALPN.to_vec(),
+                    cancel,
+                    drop_rx,
+                    Some(notices),
+                    connection,
+                )
+                .await;
+            }
+            Err(error) => {
+                let error = anyhow::Error::new(error);
+                if shell_resumable_alpn_unsupported(&error) {
+                    write_shell_protocol_status(
+                        &mut local,
+                        "peer does not support resumable shell; using legacy shell/0",
+                    )
+                    .await?;
+                    return run_legacy_shell_after_selection(
+                        local,
+                        endpoint_rx,
+                        home,
+                        peer,
+                        current_peer_addr,
+                        cancel,
+                    )
+                    .await;
+                }
+                attempt = attempt.saturating_add(1);
+                let delay = shell_protocol_probe_delay(attempt);
+                write_shell_protocol_status(
+                    &mut local,
+                    &format!(
+                        "connection unavailable ({error:#}); probing remote shell protocol again in {:.1}s",
+                        delay.as_secs_f32()
+                    ),
+                )
+                .await?;
+                if !wait_for_shell_protocol_retry(delay, &cancel, &mut endpoint_rx).await {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+async fn run_legacy_shell_after_selection(
+    mut local: UnixStream,
+    mut endpoint_rx: watch::Receiver<CurrentEndpoint>,
+    home: FabricHome,
+    peer: String,
+    peer_addr: EndpointAddr,
+    cancel: CancellationToken,
+) -> Result<()> {
+    let mut attempt = 0usize;
+    loop {
+        let current_peer_addr = PeerBook::load(&home)
+            .and_then(|book| book.resolve(&peer))
+            .unwrap_or_else(|_| peer_addr.clone());
+        let endpoint = endpoint_rx.borrow().endpoint.clone();
+        let connected = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(()),
+            changed = endpoint_rx.changed() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+                continue;
+            }
+            connected = endpoint.connect(current_peer_addr, shell::SHELL_ALPN) => connected,
+        };
+        match connected {
+            Ok(connection) => {
+                let (send, recv) = connection.open_bi().await?;
+                return pipe_unix_iroh(local, send, recv).await;
+            }
+            Err(error) => {
+                let error = anyhow::Error::new(error);
+                if shell_resumable_alpn_unsupported(&error) {
+                    return Err(error.context("peer supports neither shell/1 nor shell/0"));
+                }
+                attempt = attempt.saturating_add(1);
+                let delay = shell_protocol_probe_delay(attempt);
+                write_shell_protocol_status(
+                    &mut local,
+                    &format!(
+                        "legacy shell unavailable ({error:#}); retrying before session start in {:.1}s",
+                        delay.as_secs_f32()
+                    ),
+                )
+                .await?;
+                if !wait_for_shell_protocol_retry(delay, &cancel, &mut endpoint_rx).await {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+async fn write_shell_protocol_status(local: &mut UnixStream, message: &str) -> Result<()> {
+    local
+        .write_all(&shell::encode_server_status(message)?)
+        .await?;
+    Ok(())
+}
+
+fn shell_protocol_probe_delay(attempt: usize) -> Duration {
+    const STEPS_MS: &[u64] = &[100, 250, 500, 1_000, 2_000, 5_000, 10_000, 15_000];
+    Duration::from_millis(STEPS_MS[attempt.saturating_sub(1).min(STEPS_MS.len() - 1)])
+}
+
+async fn wait_for_shell_protocol_retry(
+    delay: Duration,
+    cancel: &CancellationToken,
+    endpoint_rx: &mut watch::Receiver<CurrentEndpoint>,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => false,
+        changed = endpoint_rx.changed() => changed.is_ok(),
+        _ = tokio::time::sleep(delay) => true,
+    }
+}
+
+fn shell_resumable_alpn_unsupported(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string().to_ascii_lowercase();
+        message.contains("peer doesn't support any known protocol")
+            || message.contains("no application protocol")
+    })
 }
 
 /// Shell connection notices, rendered twice on purpose.
@@ -3798,9 +4079,9 @@ mod tests {
         let state = node.state();
         let cases = [
             ("peer-a", exec::EXEC_PROTOCOL, exec::EXEC_ALPN),
-            ("peer-a", shell::SHELL_PROTOCOL, shell::SHELL_ALPN),
+            ("peer-a", shell::SHELL_PROTOCOL, shell::RESUMABLE_SHELL_ALPN),
             ("peer-b", exec::EXEC_PROTOCOL, exec::EXEC_ALPN),
-            ("peer-b", shell::SHELL_PROTOCOL, shell::SHELL_ALPN),
+            ("peer-b", shell::SHELL_PROTOCOL, shell::RESUMABLE_SHELL_ALPN),
         ];
 
         // More replacements than the production macOS soft FD limit. The old
