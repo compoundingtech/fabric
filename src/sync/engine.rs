@@ -126,9 +126,12 @@ impl EntryWork {
     }
 
     fn may_reuse_durable_scan(&self, queued: bool) -> bool {
-        queued
-            && self.mutation_generation.load(Ordering::Acquire)
-                == self.durable_generation.load(Ordering::Acquire)
+        queued && self.is_clean()
+    }
+
+    fn is_clean(&self) -> bool {
+        self.mutation_generation.load(Ordering::Acquire)
+            == self.durable_generation.load(Ordering::Acquire)
     }
 
     fn mark_generation_durable(&self, generation: u64) {
@@ -369,6 +372,11 @@ impl<T: SyncTransport> SyncEngine<T> {
             _operation,
         } = prepared;
         let generation = entry.work.mutation_generation.load(Ordering::Acquire);
+        // This scan is not optional: it catches disk changes that landed during
+        // the wire session, whose watcher events may still be inside the
+        // debounce window, so the mutation generation cannot stand in for it.
+        // It is cheap now because scan_folder reuses recorded hashes for files
+        // whose size and mtime are unchanged.
         self.scan_entry(&entry).await?;
         self.materialize_entry_state(&entry, &baseline).await?;
         let final_manifest = entry.node.lock().await.manifest().clone();
@@ -733,14 +741,31 @@ pub struct SyncStatus {
 
 struct ScannedFile {
     rel: String,
-    bytes: Vec<u8>,
+    path: PathBuf,
+    /// Content, read only when the file is new or changed. An unchanged file
+    /// keeps this `None` and reuses its recorded hash, which is the difference
+    /// between hashing the whole tree every scan and hashing only what moved.
+    bytes: Option<Vec<u8>>,
+    hash: ContentHash,
     mtime_secs: i64,
     mtime_nanos: u32,
 }
 
+impl ScannedFile {
+    /// Content for the rare paths that need bytes for a file we did not re-read:
+    /// reviving an inherited tombstone, or backfilling content the node lost.
+    fn read_bytes(&self) -> Result<Vec<u8>> {
+        match &self.bytes {
+            Some(bytes) => Ok(bytes.clone()),
+            None => std::fs::read(&self.path)
+                .with_context(|| format!("failed to read {}", self.path.display())),
+        }
+    }
+}
+
 /// Walk `root` recursively, returning in-scope regular files (symlinks skipped,
 /// include globs applied, paths normalized).
-fn scan_folder(root: &Path, entry: &SyncEntry) -> Result<Vec<ScannedFile>> {
+fn scan_folder(root: &Path, entry: &SyncEntry, known: &Manifest) -> Result<Vec<ScannedFile>> {
     let mut out = Vec::new();
     if !root.exists() {
         return Ok(out);
@@ -773,12 +798,33 @@ fn scan_folder(root: &Path, entry: &SyncEntry) -> Result<Vec<ScannedFile>> {
             if !entry.includes(&norm) {
                 continue;
             }
-            let bytes = std::fs::read(&path)
-                .with_context(|| format!("failed to read {}", path.display()))?;
             let (mtime_secs, mtime_nanos) = mtime_of(&child);
+            let size = child.metadata().map(|meta| meta.len()).unwrap_or(u64::MAX);
+            // Reuse the recorded hash when size and both mtime components are
+            // byte-identical to what the manifest already saw. Anything that
+            // differs, or is unknown, is read and hashed as before.
+            let known = known
+                .get(&norm)
+                .and_then(|entry| entry.meta())
+                .filter(|meta| {
+                    meta.size == size
+                        && meta.mtime_secs == mtime_secs
+                        && meta.mtime_nanos == mtime_nanos
+                });
+            let (bytes, hash) = match known {
+                Some(meta) => (None, meta.hash),
+                None => {
+                    let bytes = std::fs::read(&path)
+                        .with_context(|| format!("failed to read {}", path.display()))?;
+                    let hash = content_hash(&bytes);
+                    (Some(bytes), hash)
+                }
+            };
             out.push(ScannedFile {
                 rel: norm,
+                path,
                 bytes,
+                hash,
                 mtime_secs,
                 mtime_nanos,
             });
@@ -819,8 +865,8 @@ fn observed_from_disk(
     entry: &SyncEntry,
 ) -> Result<HashMap<String, ContentHash>> {
     let mut observed = HashMap::new();
-    for file in scan_folder(&entry.folder, entry)? {
-        let hash = content_hash(&file.bytes);
+    for file in scan_folder(&entry.folder, entry, manifest)? {
+        let hash = file.hash;
         if manifest
             .get(&file.rel)
             .and_then(|entry| entry.meta())
@@ -842,12 +888,12 @@ fn scan_into_node_observed(
     policy: PolicyRules,
     observed: &mut HashMap<String, ContentHash>,
 ) -> Result<bool> {
-    let scanned = scan_folder(root, entry)?;
+    let scanned = scan_folder(root, entry, node.manifest())?;
     let previous = observed.clone();
     let mut current = HashMap::new();
     let mut changed = false;
     for file in &scanned {
-        let hash = content_hash(&file.bytes);
+        let hash = file.hash;
         current.insert(file.rel.clone(), hash);
         if previous.get(&file.rel) == Some(&hash) {
             // Catalog is a union-of-presence policy. A Tombstone may still be
@@ -862,7 +908,12 @@ fn scan_into_node_observed(
                     .get(&file.rel)
                     .is_some_and(|entry| !entry.is_present())
             {
-                if node.local_write(&file.rel, &file.bytes, file.mtime_secs, file.mtime_nanos) {
+                if node.local_write(
+                    &file.rel,
+                    &file.read_bytes()?,
+                    file.mtime_secs,
+                    file.mtime_nanos,
+                ) {
                     changed = true;
                 }
                 continue;
@@ -876,9 +927,14 @@ fn scan_into_node_observed(
                 .and_then(|entry| entry.meta())
                 .is_some_and(|meta| meta.hash == hash)
             {
-                node.put_content(file.bytes.clone());
+                node.put_content(file.read_bytes()?);
             }
-        } else if node.local_write(&file.rel, &file.bytes, file.mtime_secs, file.mtime_nanos) {
+        } else if node.local_write(
+            &file.rel,
+            &file.read_bytes()?,
+            file.mtime_secs,
+            file.mtime_nanos,
+        ) {
             changed = true;
         }
     }
@@ -1093,6 +1149,71 @@ mod tests {
     use crate::sync::config::SyncPolicy;
     use crate::sync::manifest::Entry;
     use std::sync::{Mutex as StdMutex, Weak};
+
+    #[test]
+    fn converged_rescan_reuses_recorded_hashes_instead_of_rereading() -> Result<()> {
+        // The inbound completion scan is mandatory for correctness, so the cost
+        // of a converged rescan is what matters. A profile of the live daemon
+        // put BLAKE3 at the top of the on-CPU work, because every scan re-read
+        // and re-hashed the whole tree. An unchanged file must now be recognised
+        // by size and mtime alone and carry no bytes.
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        std::fs::write(root.join("a.txt"), b"alpha")?;
+        std::fs::write(root.join("b.txt"), b"beta")?;
+        let entry = entry_with_policy("bus", root, SyncPolicy::Bus);
+
+        let first = scan_folder(root, &entry, &Manifest::default())?;
+        assert_eq!(first.len(), 2);
+        assert!(
+            first.iter().all(|file| file.bytes.is_some()),
+            "an unknown file must be read and hashed"
+        );
+
+        // Record what that scan learned, the way a real reconcile would.
+        let mut node = SyncNode::new(Author([7u8; 32]));
+        for file in &first {
+            node.local_write(
+                &file.rel,
+                file.bytes.as_ref().expect("first scan reads bytes"),
+                file.mtime_secs,
+                file.mtime_nanos,
+            );
+        }
+
+        let second = scan_folder(root, &entry, node.manifest())?;
+        assert_eq!(second.len(), 2);
+        assert!(
+            second.iter().all(|file| file.bytes.is_none()),
+            "a converged rescan must not re-read unchanged files"
+        );
+        let before: HashMap<_, _> = first.iter().map(|f| (f.rel.clone(), f.hash)).collect();
+        let after: HashMap<_, _> = second.iter().map(|f| (f.rel.clone(), f.hash)).collect();
+        assert_eq!(before, after, "reused hashes must match what was recorded");
+
+        // A changed file is read and hashed again.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(root.join("a.txt"), b"different content")?;
+        let third = scan_folder(root, &entry, node.manifest())?;
+        let changed = third
+            .iter()
+            .find(|file| file.rel == "a.txt")
+            .expect("a.txt is still in scope");
+        assert!(
+            changed.bytes.is_some(),
+            "a changed file must be re-read and re-hashed"
+        );
+        assert_eq!(changed.hash, content_hash(b"different content"));
+        let untouched = third
+            .iter()
+            .find(|file| file.rel == "b.txt")
+            .expect("b.txt is still in scope");
+        assert!(
+            untouched.bytes.is_none(),
+            "one changed file must not force its neighbours to be re-read"
+        );
+        Ok(())
+    }
 
     #[test]
     fn periodic_scan_decision_covers_clean_dirty_and_safety_paths() {
