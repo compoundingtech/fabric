@@ -21,13 +21,14 @@ const LAUNCHD_UNLOAD_TIMEOUT: Duration = Duration::from_secs(5);
 const LAUNCHD_RETRY_BACKOFF: Duration = Duration::from_millis(300);
 /// Bootstrap attempts before giving up — a re-install must be safe to re-run.
 const LAUNCHD_BOOTSTRAP_MAX_ATTEMPTS: usize = 5;
-pub const DEFAULT_MEMORY_MAX_MB: u64 = 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ServiceInstallOptions {
     pub allow_shell: Option<bool>,
     pub allow_exec: Option<bool>,
-    pub memory_max_mb: u64,
+    /// Operator-declared memory ceiling. `None` means no ceiling is written into
+    /// the generated unit or plist at all.
+    pub memory_max_mb: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,7 +37,7 @@ pub struct ServiceSpec {
     home: PathBuf,
     allow_shell: bool,
     allow_exec: bool,
-    memory_max_mb: u64,
+    memory_max_mb: Option<u64>,
 }
 
 impl ServiceSpec {
@@ -45,9 +46,9 @@ impl ServiceSpec {
         home: impl Into<PathBuf>,
         allow_shell: bool,
         allow_exec: bool,
-        memory_max_mb: u64,
+        memory_max_mb: Option<u64>,
     ) -> Result<Self> {
-        if memory_max_mb == 0 {
+        if memory_max_mb == Some(0) {
             bail!("--memory-max-mb must be greater than zero");
         }
         Ok(Self {
@@ -63,7 +64,7 @@ impl ServiceSpec {
         home: &FabricHome,
         allow_shell: bool,
         allow_exec: bool,
-        memory_max_mb: u64,
+        memory_max_mb: Option<u64>,
     ) -> Result<Self> {
         let exe = env::current_exe().context("failed to resolve current fabric executable")?;
         Self::new(exe, home.root(), allow_shell, allow_exec, memory_max_mb)
@@ -118,7 +119,13 @@ pub fn install(home: &FabricHome, options: ServiceInstallOptions) -> Result<()> 
     println!("home\t{}", home.root().display());
     println!("allow-shell\t{allow_shell}");
     println!("allow-exec\t{allow_exec}");
-    println!("memory-max-mb\t{}", options.memory_max_mb);
+    println!(
+        "memory-max-mb\t{}",
+        options
+            .memory_max_mb
+            .map(|mb| mb.to_string())
+            .unwrap_or_else(|| "unset".to_string())
+    );
     Ok(())
 }
 
@@ -402,22 +409,44 @@ Type=simple\n\
 ExecStart={exec_start}\n\
 Restart=on-failure\n\
 RestartSec=5s\n\
-MemoryMax={}M\n\
-WorkingDirectory={}\n\
+{memory_max}WorkingDirectory={}\n\
 \n\
 [Install]\n\
 WantedBy=default.target\n",
-        spec.memory_max_mb,
-        systemd_quote_arg(&spec.home.display().to_string())
+        systemd_quote_arg(&spec.home.display().to_string()),
+        memory_max = spec
+            .memory_max_mb
+            .map(|mb| format!("MemoryMax={mb}M\n"))
+            .unwrap_or_default()
     )
 }
 
 pub fn render_launch_agent_plist(home: &FabricHome, spec: &ServiceSpec) -> Result<String> {
-    let rss_bytes = spec
-        .memory_max_mb
-        .checked_mul(1024)
-        .and_then(|value| value.checked_mul(1024))
-        .context("--memory-max-mb is too large")?;
+    // A resident-set ceiling is written only when the operator asked for one.
+    // launchd treats ResidentSetSize as a reclaim preference rather than a kill,
+    // but it is still a fixed number, and shipping one by default declares a
+    // healthy working set nobody has measured yet.
+    let resource_limits = match spec.memory_max_mb {
+        None => String::new(),
+        Some(mb) => {
+            let rss_bytes = mb
+                .checked_mul(1024)
+                .and_then(|value| value.checked_mul(1024))
+                .context("--memory-max-mb is too large")?;
+            format!(
+                "    <key>SoftResourceLimits</key>\n\
+    <dict>\n\
+        <key>ResidentSetSize</key>\n\
+        <integer>{rss_bytes}</integer>\n\
+    </dict>\n\
+    <key>HardResourceLimits</key>\n\
+    <dict>\n\
+        <key>ResidentSetSize</key>\n\
+        <integer>{rss_bytes}</integer>\n\
+    </dict>\n"
+            )
+        }
+    };
     let stdout_path = home.root().join("logs/service.out.log");
     let stderr_path = home.root().join("logs/service.err.log");
     let args = spec
@@ -450,16 +479,7 @@ pub fn render_launch_agent_plist(home: &FabricHome, spec: &ServiceSpec) -> Resul
     <string>{}</string>\n\
     <key>StandardErrorPath</key>\n\
     <string>{}</string>\n\
-    <key>SoftResourceLimits</key>\n\
-    <dict>\n\
-        <key>ResidentSetSize</key>\n\
-        <integer>{rss_bytes}</integer>\n\
-    </dict>\n\
-    <key>HardResourceLimits</key>\n\
-    <dict>\n\
-        <key>ResidentSetSize</key>\n\
-        <integer>{rss_bytes}</integer>\n\
-    </dict>\n\
+{resource_limits}\
 </dict>\n\
 </plist>\n",
         xml_escape(LAUNCHD_LABEL),
@@ -541,19 +561,28 @@ mod tests {
     }
 
     #[test]
-    fn default_systemd_unit_uses_one_gib_memory_headroom() -> Result<()> {
+    fn service_declares_no_memory_ceiling_unless_the_operator_sets_one() -> Result<()> {
+        // Nathan's rule: no fixed product memory policy while a healthy working
+        // set is unmeasured. An install with no --memory-max-mb must emit neither
+        // a systemd MemoryMax nor launchd resident-set limits.
+        let home = FabricHome::new(std::path::Path::new("/home/nathan/.local/share/fabric"));
         let spec = ServiceSpec::new(
             "/usr/local/bin/fabric",
-            "/home/nathan/.local/share/fabric",
-            false,
-            false,
-            DEFAULT_MEMORY_MAX_MB,
+            home.root(),
+            true,
+            true,
+            None,
         )?;
 
         let unit = render_systemd_user_unit(&spec);
+        assert!(!unit.contains("MemoryMax"));
+        assert!(unit.contains("Restart=on-failure"));
 
-        assert_eq!(DEFAULT_MEMORY_MAX_MB, 1024);
-        assert!(unit.contains("MemoryMax=1024M"));
+        let plist = render_launch_agent_plist(&home, &spec)?;
+        assert!(!plist.contains("ResidentSetSize"));
+        assert!(!plist.contains("SoftResourceLimits"));
+        assert!(!plist.contains("HardResourceLimits"));
+        assert!(plist.contains("<key>KeepAlive</key>"));
         Ok(())
     }
 
@@ -564,7 +593,7 @@ mod tests {
             "/home/nathan/.local/share/fabric",
             true,
             true,
-            512,
+            Some(512),
         )?;
 
         let unit = render_systemd_user_unit(&spec);
@@ -584,7 +613,7 @@ mod tests {
             "/Users/nathan/Fabric 100%",
             false,
             false,
-            256,
+            Some(256),
         )?;
 
         let unit = render_systemd_user_unit(&spec);
@@ -602,12 +631,11 @@ mod tests {
             home.root(),
             false,
             false,
-            DEFAULT_MEMORY_MAX_MB,
+            Some(1024),
         )?;
 
         let plist = render_launch_agent_plist(&home, &spec)?;
 
-        assert_eq!(DEFAULT_MEMORY_MAX_MB, 1024);
         assert!(plist.contains("<integer>1073741824</integer>"));
         Ok(())
     }
@@ -616,7 +644,7 @@ mod tests {
     fn launch_agent_runs_foreground_daemon_with_keepalive_and_memory_limit() -> Result<()> {
         let home = FabricHome::new("/Users/nathan/.local/share/fabric");
         let spec =
-            ServiceSpec::new("/Users/nathan/.local/bin/fabric", home.root(), true, true, 512)?;
+            ServiceSpec::new("/Users/nathan/.local/bin/fabric", home.root(), true, true, Some(512))?;
 
         let plist = render_launch_agent_plist(&home, &spec)?;
 
@@ -637,7 +665,7 @@ mod tests {
     #[test]
     fn launch_agent_xml_escapes_paths() -> Result<()> {
         let home = FabricHome::new("/Users/nathan/Fabric & Test");
-        let spec = ServiceSpec::new("/tmp/fabric<dev>", home.root(), false, false, 128)?;
+        let spec = ServiceSpec::new("/tmp/fabric<dev>", home.root(), false, false, Some(128))?;
 
         let plist = render_launch_agent_plist(&home, &spec)?;
 

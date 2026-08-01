@@ -19,7 +19,7 @@ use fabric::{
         DaemonOptions, FabricNode, init_daemon_tracing, run_daemon_with_options, send_control,
     },
     exec,
-    service::{self, DEFAULT_MEMORY_MAX_MB, ServiceInstallOptions},
+    service::{self, ServiceInstallOptions},
     shell::{self, ServerFrame},
     sync::config::{SyncBook, SyncEntry, SyncPeers, SyncPolicy},
     terminal::TerminalModeGuard,
@@ -221,9 +221,11 @@ enum ServiceCommands {
         /// Persist remote exec serving as disabled for the managed daemon.
         #[arg(long)]
         no_allow_exec: bool,
-        /// Memory ceiling applied by systemd/launchd, in MiB.
-        #[arg(long, default_value_t = DEFAULT_MEMORY_MAX_MB)]
-        memory_max_mb: u64,
+        /// Memory ceiling applied by systemd/launchd, in MiB. Unset by default:
+        /// a healthy working set depends on how much this node syncs, so Fabric
+        /// declares no ceiling unless an operator measures one and asks for it.
+        #[arg(long)]
+        memory_max_mb: Option<u64>,
     },
     /// Show native service-manager status.
     Status,
