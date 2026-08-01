@@ -921,11 +921,18 @@ fn scan_into_node_observed(
             // Refill content after restart only when the manifest still names
             // these exact bytes. If a peer changed the entry while its old disk
             // bytes remained, those bytes are stale rather than a local edit.
-            if node
-                .manifest()
-                .get(&file.rel)
-                .and_then(|entry| entry.meta())
-                .is_some_and(|meta| meta.hash == hash)
+            //
+            // "After restart" is the whole point: content the node already holds
+            // must not be read and re-hashed again. Without the get_content
+            // check this refill re-read every unchanged file on every scan,
+            // which kept BLAKE3 at the top of the profile even once scan_folder
+            // stopped hashing, because read_bytes here undid that saving.
+            if node.get_content(&hash).is_none()
+                && node
+                    .manifest()
+                    .get(&file.rel)
+                    .and_then(|entry| entry.meta())
+                    .is_some_and(|meta| meta.hash == hash)
             {
                 node.put_content(file.read_bytes()?);
             }
@@ -968,7 +975,7 @@ fn materialize(node: &SyncNode, root: &Path, policy: PolicyRules) -> Result<()> 
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            write_atomic(&path, bytes)?;
+            write_atomic_with_mtime(&path, bytes, Some((meta.mtime_secs, meta.mtime_nanos)))?;
         }
     }
     if policy.propagate_deletes {
@@ -1045,7 +1052,7 @@ fn materialize_tracked(
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            write_atomic(&path, bytes)?;
+            write_atomic_with_mtime(&path, bytes, Some((meta.mtime_secs, meta.mtime_nanos)))?;
             observed.insert(rel, meta.hash);
         }
     }
@@ -1062,13 +1069,54 @@ fn materialize_tracked(
 
 /// Write bytes atomically: to a temp sibling, then rename over the target.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic_with_mtime(path, bytes, None)
+}
+
+/// Write `bytes` to `path` atomically, optionally stamping the file with the
+/// modification time the manifest records for it.
+///
+/// Stamping matters for more than tidiness. The scan cache treats a file as
+/// unchanged when its size and mtime match the recorded metadata, and a
+/// materialized file carries the sender's mtime in the manifest. Without
+/// stamping, the local filesystem assigns its own mtime at write time, so every
+/// file this node ever received from a peer misses the cache forever and is
+/// re-read and re-hashed on every scan.
+fn write_atomic_with_mtime(path: &Path, bytes: &[u8], mtime: Option<(i64, u32)>) -> Result<()> {
     let tmp = path.with_extension(format!(
         "{}.fabric-tmp",
         path.extension().and_then(|e| e.to_str()).unwrap_or("")
     ));
     std::fs::write(&tmp, bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
+    if let Some((secs, nanos)) = mtime {
+        set_file_mtime(&tmp, secs, nanos)
+            .with_context(|| format!("failed to stamp mtime on {}", tmp.display()))?;
+    }
     std::fs::rename(&tmp, path)
         .with_context(|| format!("failed to rename into {}", path.display()))?;
+    Ok(())
+}
+
+/// Set a file's modification time, leaving its access time alone.
+fn set_file_mtime(path: &Path, secs: i64, nanos: u32) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("path is not a valid C string: {}", path.display()))?;
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        libc::timespec {
+            tv_sec: secs as libc::time_t,
+            tv_nsec: nanos as libc::c_long,
+        },
+    ];
+    // SAFETY: c_path is a valid NUL-terminated path and times is a two-element
+    // timespec array, which is exactly what utimensat expects.
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
     Ok(())
 }
 
@@ -1149,6 +1197,55 @@ mod tests {
     use crate::sync::config::SyncPolicy;
     use crate::sync::manifest::Entry;
     use std::sync::{Mutex as StdMutex, Weak};
+
+    #[test]
+    fn materialized_file_is_recognised_as_unchanged_on_the_next_scan() -> Result<()> {
+        // The live miss the synthetic test could not see: a file received from a
+        // peer carries the SENDER's mtime in the manifest, while the local
+        // filesystem stamps its own at write time. Without restoring the
+        // recorded mtime, every file this node ever received misses the scan
+        // cache forever and is re-read and re-hashed on every scan.
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        let entry = entry_with_policy("bus", root, SyncPolicy::Bus);
+
+        // A remote-authored Present whose mtime is deliberately not "now".
+        let remote_mtime_secs = 1_600_000_000i64;
+        let remote_mtime_nanos = 123_456_789u32;
+        let mut node = SyncNode::new(Author([9u8; 32]));
+        node.local_write(
+            "from-peer.md",
+            b"content that arrived over the wire",
+            remote_mtime_secs,
+            remote_mtime_nanos,
+        );
+
+        let mut observed = HashMap::new();
+        materialize_tracked(
+            &mut node,
+            root,
+            entry.policy.rules(),
+            &HashMap::new(),
+            &mut observed,
+        )?;
+        assert!(root.join("from-peer.md").exists(), "file was materialized");
+
+        let scanned = scan_folder(root, &entry, node.manifest())?;
+        let file = scanned
+            .iter()
+            .find(|f| f.rel == "from-peer.md")
+            .expect("materialized file is in scope");
+        assert_eq!(
+            (file.mtime_secs, file.mtime_nanos),
+            (remote_mtime_secs, remote_mtime_nanos),
+            "materialize must stamp the recorded mtime onto the file"
+        );
+        assert!(
+            file.bytes.is_none(),
+            "a freshly materialized file must not be re-read on the next scan"
+        );
+        Ok(())
+    }
 
     #[test]
     fn converged_rescan_reuses_recorded_hashes_instead_of_rereading() -> Result<()> {
