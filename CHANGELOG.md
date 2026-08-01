@@ -32,6 +32,25 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   `up`/`daemon`/`service install`), under a separate ALPN (`fabric/exec/0`) so
   allowing exec never implies shell. `fabric status` now reports `exec allowed`.
 
+### Removed
+
+- **The fixed 300 MiB endpoint-recycle limit.** The daemon used to recycle its
+  iroh endpoint whenever RSS crossed 300 MiB. The memory was never in the
+  endpoint, so recycling did not reclaim it and simply ran again: one machine
+  logged 1,206 threshold crossings, 645 recycles, and 599 that its own follow-up
+  sample recorded as ineffective. Every recycle tore down live shell and tunnel
+  sessions, which is how a held remote shell died mid-session. RSS is now
+  observed and reported on each new peak, and nothing interrupts the daemon for
+  memory alone. A fixed number also cannot know a healthy working set for a
+  given network size; if memory grows, that is now an operator's call.
+
+- **The default memory ceiling in generated services.** `--memory-max-mb` is
+  unset by default, so a generated systemd unit carries no `MemoryMax` and a
+  generated launchd plist carries no resident-set limits. On Linux `MemoryMax`
+  is a hard kill and on macOS `ResidentSetSize` biases the kernel to reclaim
+  from Fabric first, and neither was justified while a healthy working set is
+  unmeasured. An operator who has measured one can still declare it.
+
 ### Changed
 
 - **Release archives have an enforced one-file contract.** Each platform tarball
@@ -59,6 +78,30 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   also emits latency + direct/relay telemetry.
 
 ### Fixed
+
+- **Mixed-version shells no longer fail on the first frame.** `fabric/shell/0`
+  is a wire contract with every released Fabric and carries one-shot raw
+  framing only; the resumable shell moved to its own `fabric/shell/1` ALPN.
+  Previously the resumable path reused the legacy ALPN, so an older peer met
+  tunnel framing it could not parse, rejected the first `SERVER_OUTPUT` frame as
+  an unknown tunnel frame, and reconnected forever. A client that cannot
+  negotiate shell/1 now falls back to shell/0, so upgrading one host at a time
+  works.
+
+- **One absent peer no longer recycles the shared endpoint.** Peer health probes
+  the whole round before recovering anything, so a roaming peer that is simply
+  away neither drops everyone's tunnels nor escalates to a global endpoint
+  recycle while other peers are answering.
+
+- **Endpoint recycles no longer kill live sessions.** A recycle is refused while
+  shell or tunnel sessions are attached; a session dying mid-command is worse
+  than whatever prompted the recycle. Detached-but-resumable sessions do not
+  pin the endpoint.
+
+- **Shell recovery is visible in the daemon log.** Connection loss, reconnect
+  attempt with its delay, and resume or failure are logged with the peer and
+  endpoint generation. The log previously showed the drop and nothing about
+  getting the session back.
 
 - **Inherited catalog tombstones no longer leave folders divergent.** Under
   catalog policy, any surviving physical copy now advances an inherited
