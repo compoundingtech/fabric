@@ -76,11 +76,10 @@ const ENDPOINT_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const ENDPOINT_HEALTH_POLL_FAILURES_BEFORE_RECYCLE: usize = 2;
 const ENDPOINT_DIAGNOSTIC_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
 const ENDPOINT_RECYCLE_MIN_INTERVAL: Duration = Duration::from_secs(60);
-const ENDPOINT_RSS_RECYCLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
-const ENDPOINT_RSS_RECYCLE_THRESHOLD_BYTES: u64 = 300 * 1024 * 1024;
-const ENDPOINT_RSS_RECYCLE_SETTLE_INTERVAL: Duration = Duration::from_secs(5);
-const ENDPOINT_RSS_INEFFECTIVE_INITIAL_BACKOFF: Duration = Duration::from_secs(5 * 60);
-const ENDPOINT_RSS_INEFFECTIVE_MAX_BACKOFF: Duration = Duration::from_secs(15 * 60);
+const ENDPOINT_RSS_OBSERVE_POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// Report a new RSS peak only after it grows by a whole step, so the operator sees
+/// growth without a per-sample stream. Reporting never interrupts the daemon.
+const ENDPOINT_RSS_REPORT_STEP_BYTES: u64 = 128 * 1024 * 1024;
 const NETWORK_CHANGE_DEBOUNCE: Duration = Duration::from_millis(140);
 /// How often the daemon actively echo-probes each trusted peer, so a peer that has
 /// roamed (changed network / public IP) is detected even when THIS machine saw no
@@ -428,7 +427,14 @@ struct RestartPlan {
 enum EndpointRecycleOutcome {
     Recycled,
     StaleGeneration,
-    RateLimited { retry_after: Duration },
+    RateLimited {
+        retry_after: Duration,
+    },
+    /// Live shell or tunnel sessions are attached and this caller did not promise
+    /// to preserve them, so the endpoint was left alone.
+    SessionsAttached {
+        active_sessions: usize,
+    },
 }
 
 type RssSampler = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
@@ -1015,7 +1021,8 @@ impl DaemonState {
                 lease,
             ))
         } else {
-            let notices = (alpn == shell::SHELL_ALPN).then(shell_client_notices);
+            let notices = (alpn == shell::SHELL_ALPN)
+                .then(|| shell_client_notices(peer.to_string(), self.endpoint_handle().generation));
             tokio::spawn(run_dial_socket(
                 listener,
                 self.endpoint_rx(),
@@ -1267,31 +1274,47 @@ impl DaemonState {
     /// endpoint recycle only after repeated nudges have not brought it back — the
     /// same effect as the manual restart this replaces. `attempt` is the 1-based
     /// recovery attempt since the peer last answered.
-    async fn recover_unreachable_peer(&self, label: &str, attempt: usize) {
+    /// Recover one unreachable peer. `healthy_elsewhere` is how many OTHER peers
+    /// answered in the same probe round: if any did, the endpoint is demonstrably
+    /// working and this peer is simply away, so recovery stays cheap and local
+    /// instead of recycling the endpoint out from under everyone else.
+    async fn recover_unreachable_peer(
+        &self,
+        label: &str,
+        attempt: usize,
+        healthy_elsewhere: usize,
+    ) {
         let endpoint = self.endpoint_handle();
-        let escalate_recycle = attempt >= PEER_HEALTH_ATTEMPTS_BEFORE_RECYCLE;
+        let attempts_exhausted = attempt >= PEER_HEALTH_ATTEMPTS_BEFORE_RECYCLE;
+        let escalate_recycle = attempts_exhausted && healthy_elsewhere == 0;
         warn!(
             target: VALIDATION_LOG_TARGET,
             event = "peer_health_recover",
             peer = %label,
             generation = endpoint.generation,
             attempt,
+            healthy_elsewhere,
+            attempts_exhausted,
             escalate_recycle,
-            "peer unreachable; re-probing paths (drop tunnels + iroh network_change)"
+            "peer unreachable; re-probing paths"
         );
         eprintln!(
-            "fabric: peer {label:?} unreachable (recovery attempt {attempt}); re-probing paths{}",
+            "fabric: peer {label:?} unreachable (recovery attempt {attempt}, {healthy_elsewhere} other peers healthy); re-probing paths{}",
             if escalate_recycle {
                 " + recycling endpoint"
+            } else if attempts_exhausted {
+                " (endpoint left alone: other peers are reachable)"
             } else {
                 ""
             }
         );
 
         endpoint.endpoint.network_change().await;
-        self.drop_tunnel_connections();
 
         if escalate_recycle {
+            // Only tear down live tunnels when the endpoint itself is suspect. One
+            // roaming peer being away is no reason to drop everyone's sessions.
+            self.drop_tunnel_connections();
             if let Err(error) = self
                 .recycle_endpoint_if_generation(
                     endpoint.generation,
@@ -1474,6 +1497,30 @@ impl DaemonState {
         reason: &str,
     ) -> Result<EndpointRecycleOutcome> {
         let _guard = self.endpoint_recycle.lock().await;
+
+        // Never tear the transport out from under a user. Recycling drops every
+        // attached shell and tunnel session, and a session that dies mid-command
+        // is a worse outcome than whatever condition prompted the recycle. A
+        // caller that genuinely preserves sessions uses the _preserving variant.
+        let sessions = self.tunnel_sessions.stats().await;
+        if let Some(attached) = recycle_blocked_by_sessions(&sessions) {
+            warn!(
+                target: VALIDATION_LOG_TARGET,
+                event = "endpoint_recycle_skipped_sessions_attached",
+                generation = self.endpoint_handle().generation,
+                reason,
+                active_sessions = sessions.active_sessions,
+                active_attaches = sessions.active_attaches,
+                "endpoint recycle skipped to preserve live sessions"
+            );
+            eprintln!(
+                "fabric: not recycling endpoint ({reason}): {attached} live session(s) attached; leaving the transport up",
+            );
+            return Ok(EndpointRecycleOutcome::SessionsAttached {
+                active_sessions: attached,
+            });
+        }
+
         let old = self.endpoint_handle();
         if old.generation != expected_generation {
             debug!(
@@ -1791,7 +1838,7 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
         result = run_iroh_accept_loop(state.clone()) => result?,
         result = run_network_rehome_loop(state.clone()) => result?,
         result = run_endpoint_health_poll_loop(state.clone()) => result?,
-        result = run_endpoint_rss_recycle_loop(state.clone()) => result?,
+        result = run_endpoint_rss_observe_loop(state.clone()) => result?,
         result = run_peer_health_loop(state.clone()) => result?,
         result = run_endpoint_snapshot_loop(state.clone()) => result?,
         _ = state.cancel.cancelled() => {}
@@ -2026,8 +2073,7 @@ async fn run_peer_health_loop_with(
     let mut interval = tokio::time::interval(probe_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     interval.tick().await;
-    let mut tracker =
-        PeerHealthTracker::new(failures_before_recover, initial_backoff, max_backoff);
+    let mut tracker = PeerHealthTracker::new(failures_before_recover, initial_backoff, max_backoff);
 
     loop {
         tokio::select! {
@@ -2040,6 +2086,12 @@ async fn run_peer_health_loop_with(
                     continue;
                 }
                 let peers = state.peer_book.read().await.peers().to_vec();
+                // Probe the whole round before recovering anything. A single absent
+                // roaming peer must not be able to order a global endpoint recycle
+                // while other peers are answering fine, so the recovery decision
+                // needs to know how the rest of the network looked this round.
+                let mut round = Vec::with_capacity(peers.len());
+                let mut reachable_peers = 0usize;
                 for peer in peers {
                     let peer_id = peer.id;
                     let label = peer.name.clone().unwrap_or_else(|| peer_id.to_string());
@@ -2053,10 +2105,23 @@ async fn run_peer_health_loop_with(
                         transport = health.transport.as_deref().unwrap_or("none"),
                         "peer liveness probe"
                     );
+                    if health.reachable {
+                        reachable_peers += 1;
+                    }
+                    round.push((peer_id, label, health.reachable));
+                }
+                for (peer_id, label, reachable) in round {
                     if let PeerHealthAction::Recover { attempt } =
-                        tracker.on_probe(peer_id, health.reachable, Instant::now())
+                        tracker.on_probe(peer_id, reachable, Instant::now())
                     {
-                        state.recover_unreachable_peer(&label, attempt).await;
+                        let healthy_elsewhere = if reachable {
+                            reachable_peers.saturating_sub(1)
+                        } else {
+                            reachable_peers
+                        };
+                        state
+                            .recover_unreachable_peer(&label, attempt, healthy_elsewhere)
+                            .await;
                     }
                 }
             }
@@ -2150,33 +2215,50 @@ fn peer_recovery_backoff(attempt: usize, initial: Duration, max: Duration) -> Du
     initial.saturating_mul(1u32 << exponent).min(max)
 }
 
-async fn run_endpoint_rss_recycle_loop(state: Arc<DaemonState>) -> Result<()> {
-    run_endpoint_rss_recycle_loop_with_sampler(
+/// How many live sessions block an endpoint recycle, if any.
+///
+/// Both counters matter: `active_sessions` covers a session whose PTY is alive,
+/// and `active_attaches` covers a client currently attached to one. Recycling
+/// with either non-zero drops a user's shell mid-command.
+fn recycle_blocked_by_sessions(stats: &tunnel::ServerSessionStats) -> Option<usize> {
+    let attached = stats.active_sessions + stats.active_attaches;
+    (attached > 0).then_some(attached)
+}
+
+fn bytes_to_mib(bytes: u64) -> u64 {
+    bytes / (1024 * 1024)
+}
+
+async fn run_endpoint_rss_observe_loop(state: Arc<DaemonState>) -> Result<()> {
+    run_endpoint_rss_observe_loop_with_sampler(
         state,
-        ENDPOINT_RSS_RECYCLE_POLL_INTERVAL,
-        ENDPOINT_RSS_RECYCLE_THRESHOLD_BYTES,
-        ENDPOINT_RSS_RECYCLE_SETTLE_INTERVAL,
-        ENDPOINT_RSS_INEFFECTIVE_INITIAL_BACKOFF,
-        ENDPOINT_RSS_INEFFECTIVE_MAX_BACKOFF,
+        ENDPOINT_RSS_OBSERVE_POLL_INTERVAL,
+        ENDPOINT_RSS_REPORT_STEP_BYTES,
         Arc::new(current_rss_bytes),
     )
     .await
 }
 
-async fn run_endpoint_rss_recycle_loop_with_sampler(
+/// Watch RSS and report it. Nothing here interrupts the daemon.
+///
+/// This loop used to recycle the iroh endpoint whenever RSS crossed a fixed
+/// 300 MiB threshold. That was actively harmful: the memory does not live in the
+/// endpoint, so recycling never reclaimed it — this daemon logged 599 recycles
+/// that its own follow-up sample proved ineffective — while every recycle tore
+/// down live shell and tunnel sessions and forced every peer to re-handshake.
+/// A fixed limit also has no idea what a healthy working set is for a given
+/// network size. Memory growth is now reported for an operator to judge, and only
+/// an operator stops the daemon.
+async fn run_endpoint_rss_observe_loop_with_sampler(
     state: Arc<DaemonState>,
     poll_interval: Duration,
-    threshold_bytes: u64,
-    settle_interval: Duration,
-    ineffective_initial_backoff: Duration,
-    ineffective_max_backoff: Duration,
+    report_step_bytes: u64,
     sample_rss: RssSampler,
 ) -> Result<()> {
     let mut interval = tokio::time::interval(poll_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     interval.tick().await;
-    let mut next_recycle_attempt = Instant::now();
-    let mut ineffective_recycles = 0usize;
+    let mut peak_reported_bytes = 0u64;
 
     loop {
         tokio::select! {
@@ -2187,131 +2269,36 @@ async fn run_endpoint_rss_recycle_loop_with_sampler(
                         target: VALIDATION_LOG_TARGET,
                         event = "endpoint_rss_monitor",
                         rss_known = false,
-                        threshold_bytes,
-                        poll_interval_ms = poll_interval.as_millis() as u64,
-                        "endpoint RSS monitor could not read current RSS"
+                        "RSS monitor could not read current RSS"
                     );
                     continue;
                 };
 
-                if !rss_exceeds_recycle_threshold(Some(rss_bytes), threshold_bytes) {
-                    next_recycle_attempt = Instant::now();
-                    ineffective_recycles = 0;
-                    continue;
-                }
-
-                let now = Instant::now();
-                if now < next_recycle_attempt {
-                    debug!(
-                        target: VALIDATION_LOG_TARGET,
-                        event = "endpoint_rss_recycle_deferred",
-                        rss_bytes,
-                        threshold_bytes,
-                        ineffective_recycles,
-                        retry_after_ms = next_recycle_attempt.saturating_duration_since(now).as_millis() as u64,
-                        "endpoint RSS remains over threshold; waiting before next recycle attempt"
-                    );
-                    continue;
-                }
-
-                let endpoint = state.endpoint_handle();
-                warn!(
+                let generation = state.endpoint_handle().generation;
+                debug!(
                     target: VALIDATION_LOG_TARGET,
-                    event = "endpoint_rss_recycle_trigger",
-                    generation = endpoint.generation,
+                    event = "endpoint_rss_observed",
+                    generation,
                     rss_bytes,
-                    threshold_bytes,
                     poll_interval_ms = poll_interval.as_millis() as u64,
-                    "endpoint RSS threshold exceeded; recycling endpoint"
-                );
-                eprintln!(
-                    "fabric: iroh endpoint generation {} RSS {} MiB exceeded {} MiB; recycling",
-                    endpoint.generation,
-                    bytes_to_mib(rss_bytes),
-                    bytes_to_mib(threshold_bytes),
+                    "endpoint RSS sample"
                 );
 
-                let server_sessions_before = state.tunnel_sessions.stats().await;
-                match state
-                    .recycle_endpoint_if_generation(endpoint.generation, "rss threshold exceeded")
-                    .await
-                {
-                    Ok(EndpointRecycleOutcome::Recycled) => {
-                        let settled_rss = tokio::select! {
-                            _ = state.cancel.cancelled() => break,
-                            _ = tokio::time::sleep(settle_interval) => sample_rss(),
-                        };
-
-                        if rss_exceeds_recycle_threshold(settled_rss, threshold_bytes) {
-                            let server_sessions_after = state.tunnel_sessions.stats().await;
-                            ineffective_recycles = ineffective_recycles.saturating_add(1);
-                            let backoff = endpoint_rss_ineffective_backoff(
-                                ineffective_recycles,
-                                ineffective_initial_backoff,
-                                ineffective_max_backoff,
-                            );
-                            warn!(
-                                target: VALIDATION_LOG_TARGET,
-                                event = "rss_recycle_ineffective",
-                                old_generation = endpoint.generation,
-                                current_generation = state.endpoint_handle().generation,
-                                rss_before_bytes = rss_bytes,
-                                rss_after_settle_known = settled_rss.is_some(),
-                                rss_after_settle_bytes = settled_rss.unwrap_or(0),
-                                threshold_bytes,
-                                settle_ms = settle_interval.as_millis() as u64,
-                                ineffective_recycles,
-                                backoff_ms = backoff.as_millis() as u64,
-                                tunnel_server_sessions_total_before = server_sessions_before.total_sessions,
-                                tunnel_server_sessions_total_after = server_sessions_after.total_sessions,
-                                tunnel_server_sessions_active_before = server_sessions_before.active_sessions,
-                                tunnel_server_sessions_active_after = server_sessions_after.active_sessions,
-                                tunnel_server_sessions_detached_before = server_sessions_before.detached_sessions,
-                                tunnel_server_sessions_detached_after = server_sessions_after.detached_sessions,
-                                tunnel_server_sessions_complete_before = server_sessions_before.complete_sessions,
-                                tunnel_server_sessions_complete_after = server_sessions_after.complete_sessions,
-                                tunnel_server_sessions_done_before = server_sessions_before.done_sessions,
-                                tunnel_server_sessions_done_after = server_sessions_after.done_sessions,
-                                tunnel_server_active_attaches_before = server_sessions_before.active_attaches,
-                                tunnel_server_active_attaches_after = server_sessions_after.active_attaches,
-                                tunnel_server_buffered_bytes_before = server_sessions_before.buffered_bytes,
-                                tunnel_server_buffered_bytes_after = server_sessions_after.buffered_bytes,
-                                tunnel_server_buffered_chunks_before = server_sessions_before.buffered_chunks,
-                                tunnel_server_buffered_chunks_after = server_sessions_after.buffered_chunks,
-                                tunnel_server_sessions_with_buffered_data_before = server_sessions_before.sessions_with_buffered_data,
-                                tunnel_server_sessions_with_buffered_data_after = server_sessions_after.sessions_with_buffered_data,
-                                tunnel_server_sessions_with_cleanup_before = server_sessions_before.sessions_with_cleanup,
-                                tunnel_server_sessions_with_cleanup_after = server_sessions_after.sessions_with_cleanup,
-                                tunnel_server_sessions_with_reconnect_error_before = server_sessions_before.sessions_with_reconnect_error,
-                                tunnel_server_sessions_with_reconnect_error_after = server_sessions_after.sessions_with_reconnect_error,
-                                tunnel_server_sessions_with_pending_remote_close_before = server_sessions_before.sessions_with_pending_remote_close,
-                                tunnel_server_sessions_with_pending_remote_close_after = server_sessions_after.sessions_with_pending_remote_close,
-                                tunnel_server_reconnect_attempts_total_before = server_sessions_before.reconnect_attempts_total,
-                                tunnel_server_reconnect_attempts_total_after = server_sessions_after.reconnect_attempts_total,
-                                "RSS-triggered endpoint recycle did not reduce RSS below threshold; backing off"
-                            );
-                            eprintln!(
-                                "fabric: RSS stayed over {} MiB after endpoint recycle ({} MiB); backing off RSS recycles for {}s",
-                                bytes_to_mib(threshold_bytes),
-                                bytes_to_mib(settled_rss.unwrap_or(0)),
-                                backoff.as_secs(),
-                            );
-                            next_recycle_attempt = Instant::now() + backoff;
-                        } else {
-                            ineffective_recycles = 0;
-                            next_recycle_attempt = Instant::now() + ENDPOINT_RECYCLE_MIN_INTERVAL;
-                        }
-                    }
-                    Ok(EndpointRecycleOutcome::RateLimited { retry_after }) => {
-                        next_recycle_attempt = Instant::now() + retry_after;
-                    }
-                    Ok(EndpointRecycleOutcome::StaleGeneration) => {
-                        next_recycle_attempt = Instant::now();
-                    }
-                    Err(error) => {
-                        eprintln!("fabric: failed to recycle iroh endpoint after RSS threshold: {error:#}");
-                        next_recycle_attempt = Instant::now() + ENDPOINT_RSS_RECYCLE_POLL_INTERVAL;
-                    }
+                // Report each new peak once it clears the previous report by a
+                // whole step, so growth is visible without a per-sample stream.
+                if rss_bytes >= peak_reported_bytes.saturating_add(report_step_bytes) {
+                    peak_reported_bytes = rss_bytes;
+                    warn!(
+                        target: VALIDATION_LOG_TARGET,
+                        event = "endpoint_rss_growth",
+                        generation,
+                        rss_bytes,
+                        "daemon RSS reached a new reported peak"
+                    );
+                    eprintln!(
+                        "fabric: memory in use {} MiB (new peak, endpoint generation {generation}); reporting only, no action taken",
+                        bytes_to_mib(rss_bytes),
+                    );
                 }
             }
         }
@@ -2860,28 +2847,6 @@ fn trim_process_allocator() -> AllocatorTrimResult {
     }
 }
 
-fn rss_exceeds_recycle_threshold(rss_bytes: Option<u64>, threshold_bytes: u64) -> bool {
-    matches!(rss_bytes, Some(rss_bytes) if rss_bytes >= threshold_bytes)
-}
-
-fn bytes_to_mib(bytes: u64) -> u64 {
-    bytes / (1024 * 1024)
-}
-
-fn endpoint_rss_ineffective_backoff(
-    ineffective_recycles: usize,
-    initial_backoff: Duration,
-    max_backoff: Duration,
-) -> Duration {
-    if ineffective_recycles == 0 {
-        return Duration::ZERO;
-    }
-    let exponent = ineffective_recycles.saturating_sub(1).min(8) as u32;
-    initial_backoff
-        .saturating_mul(1u32 << exponent)
-        .min(max_backoff)
-}
-
 #[cfg(target_os = "linux")]
 fn current_rss_bytes_impl() -> Option<u64> {
     let statm = fs::read_to_string("/proc/self/statm").ok()?;
@@ -2977,9 +2942,7 @@ fn sync_accept_is_info_sample(sequence: usize) -> bool {
 fn log_sync_connection_paths(connection: &Connection) {
     let sequence = SYNC_ACCEPT_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let info_sample = sync_accept_is_info_sample(sequence);
-    if !info_sample
-        && !tracing::enabled!(target: VALIDATION_LOG_TARGET, tracing::Level::DEBUG)
-    {
+    if !info_sample && !tracing::enabled!(target: VALIDATION_LOG_TARGET, tracing::Level::DEBUG) {
         return;
     }
     let (paths_total, paths_selected, paths_ip, paths_relay, path_local_addrs, path_remote_addrs) =
@@ -3133,21 +3096,66 @@ async fn run_dial_socket(
     }
 }
 
-fn shell_client_notices() -> tunnel::ClientConnectionNotices {
-    tunnel::ClientConnectionNotices::new(|event| {
+/// Shell connection notices, rendered twice on purpose.
+///
+/// The shell client sees a status frame in its terminal, and the daemon log gets
+/// the same event in a line an operator can read. Before this, a dropped session
+/// left one failure line in the service log and nothing about the attempt to get
+/// it back, so "did my shell recover" was unanswerable from the log. Each line
+/// names the peer and the endpoint generation, which is the route context that
+/// distinguishes a peer roaming from this endpoint being rebuilt underneath it.
+fn shell_client_notices(peer: String, generation: u64) -> tunnel::ClientConnectionNotices {
+    tunnel::ClientConnectionNotices::new(move |event| {
         let encoded = match event {
             tunnel::ClientConnectionEvent::Reconnecting {
                 attempt,
                 delay,
                 error,
-            } => shell::encode_server_status(&format!(
-                "connection lost ({error}); reconnecting attempt {attempt} in {:.1}s",
-                delay.as_secs_f32()
-            )),
+            } => {
+                warn!(
+                    target: VALIDATION_LOG_TARGET,
+                    event = "shell_session_reconnecting",
+                    peer = %peer,
+                    generation,
+                    attempt,
+                    delay_ms = delay.as_millis() as u64,
+                    error = %error,
+                    "shell session lost its transport; reconnecting"
+                );
+                eprintln!(
+                    "fabric: shell session to {peer:?} lost connection ({error}); reconnect attempt {attempt} in {:.1}s (endpoint generation {generation})",
+                    delay.as_secs_f32()
+                );
+                shell::encode_server_status(&format!(
+                    "connection lost ({error}); reconnecting attempt {attempt} in {:.1}s",
+                    delay.as_secs_f32()
+                ))
+            }
             tunnel::ClientConnectionEvent::Resumed => {
+                info!(
+                    target: VALIDATION_LOG_TARGET,
+                    event = "shell_session_resumed",
+                    peer = %peer,
+                    generation,
+                    "shell session resumed after reconnect"
+                );
+                eprintln!(
+                    "fabric: shell session to {peer:?} resumed (endpoint generation {generation})"
+                );
                 shell::encode_server_status("connection restored; remote shell session resumed")
             }
             tunnel::ClientConnectionEvent::Failed { error } => {
+                warn!(
+                    target: VALIDATION_LOG_TARGET,
+                    event = "shell_session_resume_failed",
+                    peer = %peer,
+                    generation,
+                    error = %error,
+                    "shell session could not resume"
+                );
+                eprintln!(
+                    "fabric: shell session to {peer:?} could NOT resume: {error} (endpoint generation {generation})"
+                );
                 shell::encode_server_error(&format!("remote shell could not resume: {error}"))
             }
         };
@@ -3319,10 +3327,22 @@ mod tests {
         let initial = Duration::from_secs(30);
         let max = Duration::from_secs(600);
         assert_eq!(peer_recovery_backoff(0, initial, max), Duration::ZERO);
-        assert_eq!(peer_recovery_backoff(1, initial, max), Duration::from_secs(30));
-        assert_eq!(peer_recovery_backoff(2, initial, max), Duration::from_secs(60));
-        assert_eq!(peer_recovery_backoff(3, initial, max), Duration::from_secs(120));
-        assert_eq!(peer_recovery_backoff(4, initial, max), Duration::from_secs(240));
+        assert_eq!(
+            peer_recovery_backoff(1, initial, max),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            peer_recovery_backoff(2, initial, max),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            peer_recovery_backoff(3, initial, max),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            peer_recovery_backoff(4, initial, max),
+            Duration::from_secs(240)
+        );
         assert_eq!(peer_recovery_backoff(10, initial, max), max); // saturated + capped
     }
 
@@ -3520,84 +3540,105 @@ mod tests {
     }
 
     #[test]
-    fn rss_recycle_threshold_triggers_at_300_mib() {
-        assert_eq!(ENDPOINT_RSS_RECYCLE_THRESHOLD_BYTES, 300 * 1024 * 1024);
-        assert!(!rss_exceeds_recycle_threshold(
-            None,
-            ENDPOINT_RSS_RECYCLE_THRESHOLD_BYTES
-        ));
-        assert!(!rss_exceeds_recycle_threshold(
-            Some(ENDPOINT_RSS_RECYCLE_THRESHOLD_BYTES - 1),
-            ENDPOINT_RSS_RECYCLE_THRESHOLD_BYTES
-        ));
-        assert!(rss_exceeds_recycle_threshold(
-            Some(ENDPOINT_RSS_RECYCLE_THRESHOLD_BYTES),
-            ENDPOINT_RSS_RECYCLE_THRESHOLD_BYTES
-        ));
-        assert!(rss_exceeds_recycle_threshold(
-            Some(550 * 1024 * 1024),
-            ENDPOINT_RSS_RECYCLE_THRESHOLD_BYTES
-        ));
-    }
+    fn live_sessions_block_an_endpoint_recycle() {
+        let idle = tunnel::ServerSessionStats::default();
+        assert_eq!(recycle_blocked_by_sessions(&idle), None);
 
-    #[test]
-    fn ineffective_rss_recycle_backoff_scales_and_caps() {
-        let initial = Duration::from_secs(5 * 60);
-        let max = Duration::from_secs(15 * 60);
+        let with_session = tunnel::ServerSessionStats {
+            active_sessions: 1,
+            ..Default::default()
+        };
+        assert_eq!(recycle_blocked_by_sessions(&with_session), Some(1));
 
-        assert_eq!(
-            endpoint_rss_ineffective_backoff(0, initial, max),
-            Duration::ZERO
-        );
-        assert_eq!(
-            endpoint_rss_ineffective_backoff(1, initial, max),
-            Duration::from_secs(5 * 60)
-        );
-        assert_eq!(
-            endpoint_rss_ineffective_backoff(2, initial, max),
-            Duration::from_secs(10 * 60)
-        );
-        assert_eq!(
-            endpoint_rss_ineffective_backoff(3, initial, max),
-            Duration::from_secs(15 * 60)
-        );
-        assert_eq!(
-            endpoint_rss_ineffective_backoff(12, initial, max),
-            Duration::from_secs(15 * 60)
-        );
+        let with_attach = tunnel::ServerSessionStats {
+            active_attaches: 2,
+            ..Default::default()
+        };
+        assert_eq!(recycle_blocked_by_sessions(&with_attach), Some(2));
+
+        let both = tunnel::ServerSessionStats {
+            active_sessions: 1,
+            active_attaches: 3,
+            ..Default::default()
+        };
+        assert_eq!(recycle_blocked_by_sessions(&both), Some(4));
+
+        // A detached-but-resumable session is not an attached one; it must not
+        // pin the endpoint forever.
+        let detached_only = tunnel::ServerSessionStats {
+            detached_sessions: 5,
+            ..Default::default()
+        };
+        assert_eq!(recycle_blocked_by_sessions(&detached_only), None);
     }
 
     #[tokio::test]
-    async fn rss_recycle_threshold_recycles_even_when_endpoint_online() -> Result<()> {
+    async fn one_absent_peer_does_not_recycle_while_others_are_healthy() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let node = FabricNode::start(FabricHome::new(temp.path())).await?;
+        let state = node.state();
+        let before = state.endpoint_handle().generation;
+
+        // Attempts exhausted, but another peer answered this round: the endpoint is
+        // demonstrably working, so the roaming peer must not take it down.
+        state
+            .recover_unreachable_peer("bluey", PEER_HEALTH_ATTEMPTS_BEFORE_RECYCLE, 1)
+            .await;
+        assert_eq!(
+            state.endpoint_handle().generation,
+            before,
+            "a healthy peer elsewhere must protect the endpoint"
+        );
+
+        // Below the escalation threshold with nobody else healthy: still no recycle.
+        state.recover_unreachable_peer("bluey", 1, 0).await;
+        assert_eq!(state.endpoint_handle().generation, before);
+
+        node.shutdown().await?;
+        Ok(())
+    }
+
+    #[test]
+    fn no_fixed_rss_threshold_exists_in_the_daemon() {
+        // Nathan's rule: Fabric must not enforce a fixed RSS recycle or kill limit
+        // before healthy working sets are measured. This pins the absence of one:
+        // the source may observe and report RSS, but must not act on a constant.
+        // Needles are split so this assertion does not match itself.
+        let source = include_str!("daemon.rs");
+        for needle in [
+            concat!("ENDPOINT_RSS_RECYCLE", "_THRESHOLD_BYTES"),
+            concat!("rss threshold", " exceeded"),
+            concat!("rss_exceeds", "_recycle_threshold"),
+        ] {
+            assert!(!source.contains(needle), "{needle} is back in the daemon");
+        }
+    }
+
+    #[tokio::test]
+    async fn high_rss_reports_growth_and_never_recycles_the_endpoint() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let node = FabricNode::start(FabricHome::new(temp.path())).await?;
         let state = node.state();
         let initial = state.endpoint_handle();
         tokio::time::timeout(ENDPOINT_HEALTH_TIMEOUT, initial.endpoint.online()).await?;
 
-        let rss_monitor = tokio::spawn(run_endpoint_rss_recycle_loop_with_sampler(
+        // Ten gigabytes, far above any threshold this daemon used to enforce.
+        let observer = tokio::spawn(run_endpoint_rss_observe_loop_with_sampler(
             state.clone(),
-            Duration::from_millis(10),
-            ENDPOINT_RSS_RECYCLE_THRESHOLD_BYTES,
-            Duration::ZERO,
-            Duration::from_secs(60),
-            Duration::from_secs(60),
-            Arc::new(|| Some(ENDPOINT_RSS_RECYCLE_THRESHOLD_BYTES)),
+            Duration::from_millis(20),
+            ENDPOINT_RSS_REPORT_STEP_BYTES,
+            Arc::new(|| Some(10 * 1024 * 1024 * 1024)),
         ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if state.endpoint_handle().generation > initial.generation {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await?;
-
+        assert_eq!(
+            state.endpoint_handle().generation,
+            initial.generation,
+            "sustained high RSS must not recycle the endpoint"
+        );
         state.cancel.cancel();
+        observer.await??;
         node.shutdown().await?;
-        rss_monitor.await??;
         Ok(())
     }
 
