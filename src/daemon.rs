@@ -195,6 +195,41 @@ impl FailureBackoff {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeOutcome {
+    Supported,
+    Unsupported,
+    Unreachable,
+    Timeout,
+}
+
+impl ProbeOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::Unsupported => "unsupported",
+            Self::Unreachable => "unreachable",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+impl fmt::Display for ProbeOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug)]
+struct ServiceProbe {
+    peer: String,
+    peer_id: String,
+    outcome: ProbeOutcome,
+    round_trip: Option<Duration>,
+    transport: Option<String>,
+    error: Option<String>,
+}
+
 #[derive(Debug)]
 struct AllowListHook {
     allowed: Arc<RwLock<HashSet<EndpointId>>>,
@@ -1177,6 +1212,73 @@ impl DaemonState {
             statuses.push(self.check_peer_reachability(peer).await);
         }
         statuses
+    }
+
+    /// One real ALPN connect against a peer, then close. This is a probe, not a
+    /// dial: it creates no listener and no dial socket, keeps no state, never
+    /// retries, and deliberately does not consult `dial_failures`, because a
+    /// probe that inherited the shared backoff could not answer the question it
+    /// is asked. The caller's deadline bounds it, and so does this side, so a
+    /// slow peer cannot leave a connect pending after the answer is returned.
+    async fn probe_service(
+        &self,
+        peer: &str,
+        protocol: &str,
+        timeout: Duration,
+    ) -> Result<ServiceProbe> {
+        let addr = self.peer_book.read().await.resolve(peer)?;
+        let peer_id = addr.id.to_string();
+        let endpoint = self.current_endpoint();
+        let alpn = protocol.as_bytes().to_vec();
+
+        let started = Instant::now();
+        let attempt = tokio::time::timeout(timeout, endpoint.connect(addr, &alpn)).await;
+        let (outcome, round_trip, transport, error) = match attempt {
+            Err(_elapsed) => (
+                ProbeOutcome::Timeout,
+                None,
+                None,
+                Some(format!("no answer within {:?}", timeout)),
+            ),
+            Ok(Ok(connection)) => {
+                let elapsed = started.elapsed();
+                let transport = classify_connection_transport(&connection);
+                connection.close(0u32.into(), b"probe complete");
+                (ProbeOutcome::Supported, Some(elapsed), transport, None)
+            }
+            Ok(Err(error)) => {
+                let error = anyhow::Error::new(error);
+                if shell_resumable_alpn_unsupported(&error) {
+                    (ProbeOutcome::Unsupported, None, None, None)
+                } else {
+                    (
+                        ProbeOutcome::Unreachable,
+                        None,
+                        None,
+                        Some(format!("{error:#}")),
+                    )
+                }
+            }
+        };
+
+        info!(
+            target: VALIDATION_LOG_TARGET,
+            event = "service_probe",
+            peer,
+            protocol,
+            outcome = outcome.as_str(),
+            timeout_ms = timeout.as_millis() as u64,
+            "one-shot service probe"
+        );
+
+        Ok(ServiceProbe {
+            peer: peer.to_string(),
+            peer_id,
+            outcome,
+            round_trip,
+            transport,
+            error,
+        })
     }
 
     async fn check_peer_reachability(&self, peer: Peer) -> PeerReachability {
@@ -2429,6 +2531,26 @@ async fn process_control_request(
                 bytes: pong.bytes,
                 round_trip_micros: pong.round_trip.as_micros().try_into().unwrap_or(u64::MAX),
                 transport: pong.transport,
+            }
+        }
+        ControlRequest::Probe {
+            peer,
+            protocol,
+            timeout_ms,
+        } => {
+            let outcome = state
+                .probe_service(&peer, &protocol, Duration::from_millis(timeout_ms))
+                .await?;
+            ControlResponse::ProbeResult {
+                peer: outcome.peer,
+                peer_id: outcome.peer_id,
+                protocol,
+                outcome: outcome.outcome.to_string(),
+                round_trip_micros: outcome
+                    .round_trip
+                    .map(|rt| rt.as_micros().try_into().unwrap_or(u64::MAX)),
+                transport: outcome.transport,
+                error: outcome.error,
             }
         }
         ControlRequest::Shell { peer } => {
@@ -3879,6 +4001,107 @@ mod tests {
         Ok(())
     }
 
+    /// A probe answers a question about a peer. These pin the four answers and,
+    /// just as importantly, that asking never changes local state.
+    #[tokio::test]
+    async fn probe_reports_supported_for_a_served_protocol() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (server, client, server_home, client_home) = probe_pair(temp.path()).await?;
+        let _ = (&server_home, &client_home);
+
+        let probe = client
+            .state()
+            .probe_service("server", "fabric/echo/0", Duration::from_secs(5))
+            .await?;
+        assert_eq!(probe.outcome, ProbeOutcome::Supported, "{probe:?}");
+        assert!(probe.round_trip.is_some());
+        assert!(probe.error.is_none());
+
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn probe_reports_unsupported_for_a_protocol_the_peer_does_not_serve() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (server, client, server_home, client_home) = probe_pair(temp.path()).await?;
+        let _ = (&server_home, &client_home);
+
+        // The literal PTY uses today, so this test also pins that exact string.
+        let probe = client
+            .state()
+            .probe_service("server", "pty-remote", Duration::from_secs(5))
+            .await?;
+        assert_eq!(probe.outcome, ProbeOutcome::Unsupported, "{probe:?}");
+        assert!(probe.round_trip.is_none());
+
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn probe_reports_timeout_when_the_deadline_is_shorter_than_the_attempt() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = FabricHome::new(temp.path());
+        let client = FabricNode::start(home.clone()).await?;
+        let absent = unroutable_peer(&home, &client, "absent").await?;
+
+        let probe = client
+            .state()
+            .probe_service(&absent, "fabric/echo/0", Duration::from_millis(50))
+            .await?;
+        assert_eq!(probe.outcome, ProbeOutcome::Timeout, "{probe:?}");
+        assert!(probe.error.is_some());
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn probe_creates_no_listener_and_never_touches_dial_backoff() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = FabricHome::new(temp.path());
+        let client = FabricNode::start(home.clone()).await?;
+        let state = client.state();
+        let absent = unroutable_peer(&home, &client, "absent").await?;
+
+        let listeners_before = state.active_dial_listeners.load(Ordering::SeqCst);
+        let (failures_before, not_before_before) = {
+            let backoff = state.dial_failures.state.lock().await;
+            (backoff.consecutive_failures, backoff.not_before)
+        };
+
+        // A failing probe is the interesting case: a dial here would have
+        // recorded a failure and parked every other peer's next attempt.
+        let probe = state
+            .probe_service(&absent, "fabric/echo/0", Duration::from_millis(80))
+            .await?;
+        assert_ne!(probe.outcome, ProbeOutcome::Supported);
+
+        assert_eq!(
+            state.active_dial_listeners.load(Ordering::SeqCst),
+            listeners_before,
+            "a probe must not install a dial listener"
+        );
+        let (failures_after, not_before_after) = {
+            let backoff = state.dial_failures.state.lock().await;
+            (backoff.consecutive_failures, backoff.not_before)
+        };
+        assert_eq!(
+            failures_after, failures_before,
+            "a probe must not advance the shared dial backoff"
+        );
+        assert_eq!(
+            not_before_after, not_before_before,
+            "a probe must not park other dials"
+        );
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
     #[test]
     fn no_fixed_rss_threshold_exists_in_the_daemon() {
         // Nathan's rule: Fabric must not enforce a fixed RSS recycle or kill limit
@@ -4268,6 +4491,33 @@ mod tests {
         client.shutdown().await?;
         assert_eq!(state.active_dial_listeners.load(Ordering::SeqCst), 0);
         Ok(())
+    }
+
+    /// Two mutually trusting nodes, the shape every probe test needs.
+    async fn probe_pair(
+        root: &std::path::Path,
+    ) -> Result<(FabricNode, FabricNode, FabricHome, FabricHome)> {
+        let server_home = FabricHome::new(root.join("server"));
+        let client_home = FabricHome::new(root.join("client"));
+        let server = FabricNode::start(server_home.clone()).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+        Ok((server, client, server_home, client_home))
+    }
+
+    /// A trusted peer id that resolves but can never be reached, so a probe has
+    /// to fall through to its deadline rather than answering quickly.
+    async fn unroutable_peer(home: &FabricHome, node: &FabricNode, name: &str) -> Result<String> {
+        let mut peers = PeerBook::load(home)?;
+        peers.add(
+            iroh::SecretKey::generate().public(),
+            Some(name.to_string()),
+            None,
+        );
+        peers.save(home)?;
+        node.state().reload_peers().await?;
+        Ok(name.to_string())
     }
 
     async fn trust_test_peer(

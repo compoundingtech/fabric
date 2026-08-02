@@ -138,6 +138,23 @@ enum Commands {
     },
     /// Round-trip a random nonce through a peer's built-in echo protocol.
     Ping { peer: String },
+    /// Test whether a peer serves one protocol, right now, with a single connect.
+    ///
+    /// Not a dial: it installs no listener, keeps no state, never retries, and
+    /// never waits on the shared dial backoff. Exit code is the answer:
+    /// 0 supported, 1 unsupported, 2 unreachable, 3 timeout.
+    Probe {
+        /// Peer name or node id.
+        peer: String,
+        /// Exact ALPN to test, for example fabric/shell/1 or pty-remote.
+        protocol: String,
+        /// Caller deadline in seconds.
+        #[arg(long, default_value = "3")]
+        timeout: f64,
+        /// Emit one JSON object instead of a human line.
+        #[arg(long)]
+        json: bool,
+    },
     /// Open an interactive remote shell on a trusted peer.
     Shell { peer: String },
     /// Run a command on a trusted peer non-interactively: stream its stdout and
@@ -423,15 +440,14 @@ async fn main() -> Result<()> {
                     no_allow_shell,
                 } => {
                     let allow_shell = allow_override(allow_shell, no_allow_shell);
-                    let response = match send_control(&home, ControlRequest::Restart { allow_shell })
-                        .await
-                    {
-                        Ok(response) => response,
-                        Err(error) => {
-                            warn_home_daemon_mismatch(&home).await;
-                            return Err(error);
-                        }
-                    };
+                    let response =
+                        match send_control(&home, ControlRequest::Restart { allow_shell }).await {
+                            Ok(response) => response,
+                            Err(error) => {
+                                warn_home_daemon_mismatch(&home).await;
+                                return Err(error);
+                            }
+                        };
                     match response {
                         ControlResponse::Restarting { log, allow_shell } => {
                             println!("restart scheduled");
@@ -513,6 +529,90 @@ async fn main() -> Result<()> {
                             }
                         }
                         response => bail!("unexpected daemon response: {response:?}"),
+                    }
+                }
+                Commands::Probe {
+                    peer,
+                    protocol,
+                    timeout,
+                    json,
+                } => {
+                    if !(timeout.is_finite() && timeout > 0.0) {
+                        eprintln!("fabric: --timeout must be a positive number of seconds");
+                        std::process::exit(PROBE_EXIT_UNANSWERABLE);
+                    }
+                    if protocol.is_empty() {
+                        eprintln!("fabric: PROTOCOL must be a non-empty ALPN string");
+                        std::process::exit(PROBE_EXIT_UNANSWERABLE);
+                    }
+                    let timeout_ms = ((timeout * 1000.0).round() as u64).max(1);
+                    // Exit 1 means "the peer does not serve this protocol". A local
+                    // failure -- no daemon, a daemon too old to know `probe`, an
+                    // unknown peer name -- must never land on that code, or a
+                    // caller cannot tell a real answer from a broken question.
+                    let response = match send_control(
+                        &home,
+                        ControlRequest::Probe {
+                            peer,
+                            protocol,
+                            timeout_ms,
+                        },
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(error) => {
+                            eprintln!("fabric: probe could not be answered: {error:#}");
+                            std::process::exit(PROBE_EXIT_UNANSWERABLE);
+                        }
+                    };
+                    match response {
+                        ControlResponse::ProbeResult {
+                            peer,
+                            peer_id,
+                            protocol,
+                            outcome,
+                            round_trip_micros,
+                            transport,
+                            error,
+                        } => {
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::json!({
+                                        "peer": peer,
+                                        "peer_id": peer_id,
+                                        "protocol": protocol,
+                                        "outcome": outcome,
+                                        "round_trip_micros": round_trip_micros,
+                                        "transport": transport,
+                                        "error": error,
+                                    })
+                                );
+                            } else {
+                                print_probe_line(
+                                    &peer,
+                                    &protocol,
+                                    &outcome,
+                                    round_trip_micros,
+                                    transport.as_deref(),
+                                    error.as_deref(),
+                                );
+                            }
+                            // The exit code is the machine-readable answer, so a
+                            // caller can branch without parsing anything.
+                            std::process::exit(match outcome.as_str() {
+                                "supported" => PROBE_EXIT_SUPPORTED,
+                                "unsupported" => PROBE_EXIT_UNSUPPORTED,
+                                "unreachable" => PROBE_EXIT_UNREACHABLE,
+                                "timeout" => PROBE_EXIT_TIMEOUT,
+                                _ => PROBE_EXIT_UNANSWERABLE,
+                            });
+                        }
+                        response => {
+                            eprintln!("fabric: unexpected daemon response: {response:?}");
+                            std::process::exit(PROBE_EXIT_UNANSWERABLE);
+                        }
                     }
                 }
                 Commands::Shell { peer } => {
@@ -912,10 +1012,7 @@ fn print_status(
         "shell\t{}",
         if allow_shell { "allowed" } else { "disabled" }
     );
-    println!(
-        "exec\t{}",
-        if allow_exec { "allowed" } else { "disabled" }
-    );
+    println!("exec\t{}", if allow_exec { "allowed" } else { "disabled" });
     print_peer_reachability(peers);
     Ok(())
 }
@@ -987,6 +1084,43 @@ fn allow_override(enable: bool, disable: bool) -> Option<bool> {
         Some(false)
     } else {
         None
+    }
+}
+
+/// Probe exit codes are the machine-readable answer. 0 through 3 are answers
+/// about the PEER; anything else means the question could not be asked, which a
+/// caller must not confuse with "unsupported".
+const PROBE_EXIT_SUPPORTED: i32 = 0;
+const PROBE_EXIT_UNSUPPORTED: i32 = 1;
+const PROBE_EXIT_UNREACHABLE: i32 = 2;
+const PROBE_EXIT_TIMEOUT: i32 = 3;
+const PROBE_EXIT_UNANSWERABLE: i32 = 64;
+
+/// One human line per probe outcome. Machine callers use --json or the exit code.
+fn print_probe_line(
+    peer: &str,
+    protocol: &str,
+    outcome: &str,
+    round_trip_micros: Option<u64>,
+    transport: Option<&str>,
+    error: Option<&str>,
+) {
+    match outcome {
+        "supported" => {
+            let millis = round_trip_micros.unwrap_or(0) as f64 / 1000.0;
+            match transport {
+                Some(transport) => {
+                    println!("{peer} supports {protocol} ({millis:.3} ms via {transport})")
+                }
+                None => println!("{peer} supports {protocol} ({millis:.3} ms)"),
+            }
+        }
+        "unsupported" => println!("{peer} does not support {protocol}"),
+        "timeout" => println!("{peer} did not answer for {protocol} before the deadline"),
+        _ => match error {
+            Some(error) => println!("{peer} is unreachable for {protocol}: {error}"),
+            None => println!("{peer} is unreachable for {protocol}"),
+        },
     }
 }
 

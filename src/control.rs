@@ -42,6 +42,14 @@ pub enum ControlRequest {
     Ping {
         peer: String,
     },
+    /// One-shot service probe: a single ALPN connect against a peer, bounded by
+    /// the caller's own deadline. Deliberately not a dial: it installs no
+    /// listener, keeps no state, and never consults the shared dial backoff.
+    Probe {
+        peer: String,
+        protocol: String,
+        timeout_ms: u64,
+    },
     Shell {
         peer: String,
     },
@@ -115,6 +123,16 @@ pub enum ControlResponse {
         bytes: usize,
         round_trip_micros: u64,
         transport: Option<String>,
+    },
+    ProbeResult {
+        peer: String,
+        peer_id: String,
+        protocol: String,
+        /// supported | unsupported | unreachable | timeout
+        outcome: String,
+        round_trip_micros: Option<u64>,
+        transport: Option<String>,
+        error: Option<String>,
     },
     SyncStatus {
         entries: Vec<SyncEntryStatus>,
