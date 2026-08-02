@@ -8,6 +8,12 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Added
 
+- **Production sync scan ledger.** `fabric sync ls` and its JSON form now expose
+  per-entry monotonic full-scan, exact-noop inbound, and guarded-inbound
+  transaction counters. Operators can prove scan-free convergence and the
+  expected guarded scan transaction without relying on test-only instrumentation
+  or CPU inference.
+
 - **Truthful sync status.** `fabric sync ls` now reports logical Present,
   Tombstone, and observed-on-disk counts plus explicit missing, unexpected, and
   content-mismatch drift. `fabric sync ls --json` provides the same state as a
@@ -86,7 +92,7 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   tunnel framing it could not parse, rejected the first `SERVER_OUTPUT` frame as
   an unknown tunnel frame, and reconnected forever. A client that cannot
   negotiate shell/1 now falls back to shell/0, so upgrading one host at a time
-  works.
+  works. Signal exits restore the caller's exact terminal settings.
 
 - **One absent peer no longer recycles the shared endpoint.** Peer health probes
   the whole round before recovering anything, so a roaming peer that is simply
@@ -102,6 +108,12 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   attempt with its delay, and resume or failure are logged with the peer and
   endpoint generation. The log previously showed the drop and nothing about
   getting the session back.
+- **Converged periodic syncs no longer hash the full tree twice.** An inbound
+  peer whose manifest exactly matches the local node can bypass both folder
+  scans when the local content store is complete. Differing manifests, missing
+  content, and every potentially mutating reconcile retain the guarded
+  pre-merge and completion scans that protect local archive/delete intent.
+
 
 - **Inherited catalog tombstones no longer leave folders divergent.** Under
   catalog policy, any surviving physical copy now advances an inherited

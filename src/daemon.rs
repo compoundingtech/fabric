@@ -2622,6 +2622,9 @@ async fn process_control_request(
                         missing: status.missing,
                         unexpected: status.unexpected,
                         mismatched: status.mismatched,
+                        full_scans: status.full_scans,
+                        inbound_noop_transactions: status.inbound_noop_transactions,
+                        inbound_guarded_transactions: status.inbound_guarded_transactions,
                     })
                     .collect(),
                 None => Vec::new(),
@@ -2826,10 +2829,12 @@ async fn handle_sync(connection: Connection, state: Arc<DaemonState>) -> Result<
     let (send, recv) = connection.accept_bi().await?;
     let stream = tokio::io::join(recv, send);
     let resolver_engine = engine.clone();
-    let outcome = sync::wire::run_server(stream, move |name| {
+    let outcome = sync::wire::run_server(stream, move |name, remote_manifest| {
         let engine = resolver_engine.clone();
         async move {
-            let prepared = engine.prepare_inbound(&name).await?;
+            let prepared = engine
+                .prepare_inbound_for_manifest(&name, &remote_manifest)
+                .await?;
             Ok(prepared.map(|prepared| (prepared.node(), prepared)))
         }
     })
