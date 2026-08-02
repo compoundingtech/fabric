@@ -233,48 +233,176 @@ fn uninstall_systemd_user() -> Result<()> {
 #[cfg(target_os = "macos")]
 fn install_launchd_user(home: &FabricHome, spec: &ServiceSpec) -> Result<()> {
     let plist_path = launch_agent_path()?;
+    let domain = launchd_domain();
+    let target = launchd_service_target();
+
+    // Check the domain BEFORE writing anything. A LaunchAgent lives in the gui
+    // domain, which only exists for a uid with an active login session, so
+    // installing over ssh cannot work and launchctl reports it as an opaque
+    // "Bootstrap failed: 5: Input/output error". Say what is actually wrong, and
+    // leave the filesystem untouched rather than depositing a plist for a
+    // service that was never registered.
+    if !launchd_domain_available(&domain) {
+        bail!("{}", launchd_domain_unavailable_message(&domain));
+    }
+
     if let Some(parent) = plist_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
+    // Anything that fails from here leaves the host as it was found: the plist
+    // back to its previous bytes or absent, and the label back to whatever
+    // enable/disable state launchd had for it. Installing should not be able to
+    // half-change a machine.
+    let previously_disabled = launchd_label_disabled(&domain);
+    let previous = fs::read(&plist_path).ok();
     fs::write(&plist_path, render_launch_agent_plist(home, spec)?)
         .with_context(|| format!("failed to write {}", plist_path.display()))?;
-
-    let plist = plist_path.display().to_string();
-    let domain = launchd_domain();
-    let target = launchd_service_target();
-    // Stop any existing instance, WAIT for launchd to fully unload it, then
-    // bootstrap with a bounded retry. Without the settle-and-retry, a re-install
-    // over a running managed daemon races bootout->bootstrap into
-    // "Bootstrap failed: 5: Input/output error" and leaves NO daemon running —
-    // which, for cos's only path to hetz, is an outage. A re-install must be
-    // idempotent and safe to re-run.
-    // On a FRESH install there is nothing to unload, and launchctl exits non-zero
-    // with "Boot-out failed: 3: No such process" — harmless and confusing. Capture
-    // its output and swallow that case; only surface a REAL bootout failure.
-    if let Ok(output) = Command::new("launchctl").args(["bootout", &target]).output()
-        && !output.status.success()
-    {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !bootout_failure_is_ignorable(output.status.code(), &stderr) {
-            eprint!("{stderr}");
+    let result = bootstrap_and_start(&plist_path, &domain, &target);
+    if result.is_err() {
+        restore_plist(&plist_path, previous.as_deref());
+        if previously_disabled == Some(true) {
+            let _ = Command::new("launchctl")
+                .args(["disable", &target])
+                .status();
         }
+        return result;
     }
-    wait_for_launchd_unloaded(&target, LAUNCHD_UNLOAD_TIMEOUT);
-    bootstrap_launchd_with_retry(&domain, &plist, &target)?;
-    run_command("launchctl", &["enable", &target])?;
-    // `bootstrap` starts a RunAtLoad job. A plain kickstart covers a service
-    // that had previously been disabled without killing a process that is
-    // still binding its endpoint and control socket. `kickstart -k` here races
-    // readiness by terminating the PID that bootstrap just created.
-    run_command("launchctl", &launchd_kickstart_args(&target))?;
+
     println!("plist\t{}", plist_path.display());
     Ok(())
 }
 
+/// Restore a plist to what it was before a failed install: its previous bytes,
+/// or absent if there was no file to begin with.
+fn restore_plist(path: &std::path::Path, previous: Option<&[u8]>) {
+    let restored = match previous {
+        Some(bytes) => fs::write(path, bytes),
+        None => fs::remove_file(path).or_else(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }),
+    };
+    if let Err(error) = restored {
+        eprintln!(
+            "fabric: install failed and {} could not be restored: {error}",
+            path.display()
+        );
+    }
+}
+
+/// Whether launchd holds a persistent disable override for our label, or None
+/// when that cannot be determined. `fabric service uninstall` sets this, and it
+/// outlives the plist, so install both clears it and restores it on failure.
+fn launchd_label_disabled(domain: &str) -> Option<bool> {
+    let output = Command::new("launchctl")
+        .args(["print-disabled", domain])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let line = listing.lines().find(|line| line.contains(LAUNCHD_LABEL))?;
+    Some(line.contains("true") || line.contains("disabled"))
+}
+
+/// True when launchd can address this domain from the current session.
+fn launchd_domain_available(domain: &str) -> bool {
+    Command::new("launchctl")
+        .args(["print", domain])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn launchd_domain_unavailable_message(domain: &str) -> String {
+    format!(
+        "launchd domain {domain} is not available from this session, so the managed service \
+         cannot be registered.\n\
+         A LaunchAgent lives in the gui domain, which exists only while that user has an active \
+         login session, so `fabric service install` cannot work over ssh or from a headless \
+         context.\n\
+         Either run it from a terminal in a graphical session on that machine, or run the daemon \
+         unmanaged with `fabric up` if the host has no login session to attach to.\n\
+         Nothing was written; the previous service state is unchanged."
+    )
+}
+
 #[cfg(target_os = "macos")]
-fn launchd_kickstart_args(target: &str) -> [&str; 2] {
-    ["kickstart", target]
+fn bootstrap_and_start(plist_path: &std::path::Path, domain: &str, target: &str) -> Result<()> {
+    let plist = plist_path.display().to_string();
+    launchd_register(&plist, domain, target, &mut real_launchctl)
+}
+
+/// What `launchctl` did, so a test can assert the order rather than the source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LaunchctlStep {
+    Bootout,
+    Enable,
+    Bootstrap,
+    Kickstart,
+}
+
+fn real_launchctl(step: LaunchctlStep, args: &[&str]) -> Result<()> {
+    match step {
+        LaunchctlStep::Bootout => {
+            // On a FRESH install there is nothing to unload, and launchctl exits
+            // non-zero with "Boot-out failed: 3: No such process" — harmless and
+            // confusing. Swallow that case; surface a REAL bootout failure.
+            if let Ok(output) = Command::new("launchctl").args(args).output()
+                && !output.status.success()
+            {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !bootout_failure_is_ignorable(output.status.code(), &stderr) {
+                    eprint!("{stderr}");
+                }
+            }
+            Ok(())
+        }
+        LaunchctlStep::Bootstrap => {
+            // args are ["bootstrap", domain, plist]; the loaded-check target is
+            // domain/label, which the caller passes as the fourth element.
+            bootstrap_launchd_with_retry(args[1], args[2], args[3])
+        }
+        _ => run_command("launchctl", args),
+    }
+}
+
+/// Register the service with launchd, in the one order that works from any prior
+/// state.
+///
+/// `fabric service uninstall` runs `launchctl disable`, and that override
+/// persists in launchd's per-user database across reboots and plist rewrites. A
+/// disabled label cannot be bootstrapped, so enabling AFTER bootstrap meant an
+/// uninstall permanently poisoned every later install: bootstrap failed with an
+/// opaque "Input/output error" and never reached the enable that would have
+/// fixed it. Enable first and install is idempotent from any prior state.
+fn launchd_register(
+    plist: &str,
+    domain: &str,
+    target: &str,
+    run: &mut dyn FnMut(LaunchctlStep, &[&str]) -> Result<()>,
+) -> Result<()> {
+    // Stop any existing instance and WAIT for launchd to fully unload it, so a
+    // re-install over a running managed daemon does not race bootout->bootstrap.
+    run(LaunchctlStep::Bootout, &["bootout", target])?;
+    wait_for_launchd_unloaded(target, LAUNCHD_UNLOAD_TIMEOUT);
+    run(LaunchctlStep::Enable, &["enable", target])?;
+    run(
+        LaunchctlStep::Bootstrap,
+        &["bootstrap", domain, plist, target],
+    )?;
+    // `bootstrap` starts a RunAtLoad job. A plain kickstart covers a service that
+    // had previously been disabled without killing a process still binding its
+    // endpoint and control socket; `kickstart -k` would race readiness.
+    run(LaunchctlStep::Kickstart, &["kickstart", target])?;
+    Ok(())
 }
 
 /// launchctl `bootout` fails when there is nothing to unload — a fresh install or
@@ -328,8 +456,12 @@ fn bootstrap_launchd_with_retry(domain: &str, plist: &str, target: &str) -> Resu
     }
     bail!(
         "launchctl bootstrap {plist} failed after {LAUNCHD_BOOTSTRAP_MAX_ATTEMPTS} attempts \
-         (last {last}); the service may be in a stuck state — try `launchctl bootout {target}` \
-         then re-run"
+         (last {last}).\n\
+         A persistent launchd override is the usual cause: check \
+         `launchctl print-disabled {domain} | grep fabric`. A label left disabled by a previous \
+         `fabric service uninstall` cannot be bootstrapped, and launchctl reports it as an \
+         opaque I/O error. This install enables the label first, so if you still see this, \
+         capture `launchctl print {target}` before re-running."
     )
 }
 
@@ -549,15 +681,106 @@ mod tests {
             Some(5),
             "Boot-out failed: 5: Input/output error\n"
         ));
-        assert!(!bootout_failure_is_ignorable(Some(1), "some other launchctl error\n"));
+        assert!(!bootout_failure_is_ignorable(
+            Some(1),
+            "some other launchctl error\n"
+        ));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn launchd_kickstart_does_not_kill_the_bootstrapped_process() {
-        let args = launchd_kickstart_args("gui/501/com.compoundingtech.fabric");
-        assert_eq!(args, ["kickstart", "gui/501/com.compoundingtech.fabric"]);
-        assert!(!args.contains(&"-k"));
+        // `kickstart -k` would terminate the PID bootstrap just created and race
+        // readiness; the plain form only covers a previously disabled service.
+        let mut kickstart_args = Vec::new();
+        let _ = launchd_register(
+            "/tmp/x.plist",
+            "gui/501",
+            "gui/501/com.compoundingtech.fabric",
+            &mut |step, args| {
+                if step == LaunchctlStep::Kickstart {
+                    kickstart_args = args.iter().map(|a| a.to_string()).collect();
+                }
+                Ok(())
+            },
+        );
+        assert_eq!(
+            kickstart_args,
+            ["kickstart", "gui/501/com.compoundingtech.fabric"]
+        );
+        assert!(!kickstart_args.iter().any(|a| a == "-k"));
+    }
+
+    #[test]
+    fn install_enables_the_label_before_bootstrapping_it() {
+        // The Bluey incident: `fabric service uninstall` runs `launchctl disable`,
+        // that override persists, and a disabled label cannot be bootstrapped.
+        // Enabling only after bootstrap made an uninstall poison every later
+        // install with an opaque I/O error. This fake refuses to bootstrap while
+        // the label is disabled, exactly as launchd does, so the test fails if the
+        // order regresses.
+        let mut disabled = true;
+        let mut steps = Vec::new();
+        let result = launchd_register(
+            "/tmp/com.compoundingtech.fabric.plist",
+            "gui/502",
+            "gui/502/com.compoundingtech.fabric",
+            &mut |step, args| {
+                steps.push(step.clone());
+                match step {
+                    LaunchctlStep::Enable => {
+                        assert_eq!(args[0], "enable");
+                        disabled = false;
+                        Ok(())
+                    }
+                    LaunchctlStep::Bootstrap if disabled => {
+                        bail!("Bootstrap failed: 5: Input/output error")
+                    }
+                    _ => Ok(()),
+                }
+            },
+        );
+
+        assert!(result.is_ok(), "install must succeed from a disabled label");
+        let enable = steps
+            .iter()
+            .position(|step| *step == LaunchctlStep::Enable)
+            .expect("enable ran");
+        let bootstrap = steps
+            .iter()
+            .position(|step| *step == LaunchctlStep::Bootstrap)
+            .expect("bootstrap ran");
+        assert!(
+            enable < bootstrap,
+            "enable must precede bootstrap, got {steps:?}"
+        );
+        assert_eq!(steps.first(), Some(&LaunchctlStep::Bootout));
+        assert_eq!(steps.last(), Some(&LaunchctlStep::Kickstart));
+    }
+
+    #[test]
+    fn a_failed_install_leaves_no_plist_behind() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("com.compoundingtech.fabric.plist");
+
+        // Nothing there before: a failure must leave nothing there after.
+        std::fs::write(&path, b"written by a failing install").expect("write");
+        restore_plist(&path, None);
+        assert!(
+            !path.exists(),
+            "a failed fresh install must remove its plist"
+        );
+
+        // Something there before: a failure must put the original bytes back.
+        let original = b"<plist>previous</plist>";
+        std::fs::write(&path, original).expect("write");
+        std::fs::write(&path, b"half-written replacement").expect("overwrite");
+        restore_plist(&path, Some(original));
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            original,
+            "a failed re-install must restore the previous plist"
+        );
     }
 
     #[test]
@@ -566,13 +789,7 @@ mod tests {
         // set is unmeasured. An install with no --memory-max-mb must emit neither
         // a systemd MemoryMax nor launchd resident-set limits.
         let home = FabricHome::new(std::path::Path::new("/home/nathan/.local/share/fabric"));
-        let spec = ServiceSpec::new(
-            "/usr/local/bin/fabric",
-            home.root(),
-            true,
-            true,
-            None,
-        )?;
+        let spec = ServiceSpec::new("/usr/local/bin/fabric", home.root(), true, true, None)?;
 
         let unit = render_systemd_user_unit(&spec);
         assert!(!unit.contains("MemoryMax"));
@@ -643,8 +860,13 @@ mod tests {
     #[test]
     fn launch_agent_runs_foreground_daemon_with_keepalive_and_memory_limit() -> Result<()> {
         let home = FabricHome::new("/Users/nathan/.local/share/fabric");
-        let spec =
-            ServiceSpec::new("/Users/nathan/.local/bin/fabric", home.root(), true, true, Some(512))?;
+        let spec = ServiceSpec::new(
+            "/Users/nathan/.local/bin/fabric",
+            home.root(),
+            true,
+            true,
+            Some(512),
+        )?;
 
         let plist = render_launch_agent_plist(&home, &spec)?;
 
