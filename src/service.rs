@@ -19,6 +19,10 @@ const LAUNCHD_LABEL: &str = "com.compoundingtech.fabric";
 const LAUNCHD_UNLOAD_TIMEOUT: Duration = Duration::from_secs(5);
 /// Poll interval while waiting for unload / between bootstrap retries.
 const LAUNCHD_RETRY_BACKOFF: Duration = Duration::from_millis(300);
+/// How long install waits for the freshly started daemon to accept on its
+/// control socket before reporting that it did not come up.
+const CONTROL_READY_TIMEOUT: Duration = Duration::from_secs(15);
+const CONTROL_READY_POLL: Duration = Duration::from_millis(100);
 /// Bootstrap attempts before giving up — a re-install must be safe to re-run.
 const LAUNCHD_BOOTSTRAP_MAX_ATTEMPTS: usize = 5;
 
@@ -115,6 +119,14 @@ pub fn install(home: &FabricHome, options: ServiceInstallOptions) -> Result<()> 
         #[cfg(target_os = "macos")]
         ServiceManager::LaunchdUser => install_launchd_user(home, &spec)?,
     }
+
+    // The service manager returns once it has STARTED the process, not once the
+    // daemon can answer. Between those two moments `fabric status` gets
+    // connection refused, which reads as a failed install and is really a race
+    // against the daemon binding its control socket. Wait for the socket to
+    // actually accept before claiming success, so a script can install and then
+    // immediately use the thing it installed.
+    let ready = wait_for_control_socket(home, CONTROL_READY_TIMEOUT);
     println!("installed");
     println!("home\t{}", home.root().display());
     println!("allow-shell\t{allow_shell}");
@@ -126,7 +138,39 @@ pub fn install(home: &FabricHome, options: ServiceInstallOptions) -> Result<()> 
             .map(|mb| mb.to_string())
             .unwrap_or_else(|| "unset".to_string())
     );
+    if !ready {
+        bail!(
+            "the service is registered and {} reports it started, but its control socket at {} \
+             did not accept a connection within {:?}.\n\
+             The install itself succeeded; the daemon is either still coming up or failing at \
+             startup. Check `fabric service status` and the daemon log at {} before re-running \
+             install, which would only restart it.",
+            "the service manager",
+            home.control_socket_path().display(),
+            CONTROL_READY_TIMEOUT,
+            home.root().join("logs/service.err.log").display(),
+        );
+    }
+    println!("control-socket\tready");
     Ok(())
+}
+
+/// Poll the daemon's control socket until it accepts, or the deadline passes.
+///
+/// Connect-and-drop is the honest check: the socket file appears before the
+/// daemon is listening on it, so existence proves nothing.
+fn wait_for_control_socket(home: &FabricHome, timeout: Duration) -> bool {
+    let path = home.control_socket_path();
+    let deadline = Instant::now() + timeout;
+    loop {
+        if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(CONTROL_READY_POLL);
+    }
 }
 
 pub fn status() -> Result<()> {
@@ -709,6 +753,39 @@ mod tests {
             ["kickstart", "gui/501/com.compoundingtech.fabric"]
         );
         assert!(!kickstart_args.iter().any(|a| a == "-k"));
+    }
+
+    #[test]
+    fn control_socket_wait_returns_false_when_nothing_is_listening() {
+        // A service manager returns once it has STARTED the daemon, not once the
+        // daemon can answer, so install waits for a real accept. The socket file
+        // appears before anything listens on it, which is why the check connects
+        // rather than checking existence.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = FabricHome::new(temp.path());
+        std::fs::create_dir_all(temp.path().join("run")).expect("run dir");
+        std::fs::write(home.control_socket_path(), b"not a socket").expect("decoy");
+        assert!(home.control_socket_path().exists());
+
+        let started = Instant::now();
+        assert!(
+            !wait_for_control_socket(&home, Duration::from_millis(250)),
+            "a path that exists but does not accept must not count as ready"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "must wait the full deadline"
+        );
+    }
+
+    #[test]
+    fn control_socket_wait_returns_true_once_something_accepts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = FabricHome::new(temp.path());
+        std::fs::create_dir_all(temp.path().join("run")).expect("run dir");
+        let _listener = std::os::unix::net::UnixListener::bind(home.control_socket_path())
+            .expect("bind control socket");
+        assert!(wait_for_control_socket(&home, Duration::from_secs(2)));
     }
 
     #[test]
