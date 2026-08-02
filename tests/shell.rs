@@ -322,6 +322,99 @@ async fn resumable_shell_one_survives_transport_drop() -> Result<()> {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shell_beyond_detached_ttl_hangs_instead_of_reporting_known_gap() -> Result<()> {
+    // KNOWN GAP, issue #21. The daily-use question: a MacBook sleeps longer than
+    // the 60s detached TTL, the server reaps the PTY, and the client wakes up.
+    //
+    // The good news this pins: the client does NOT silently attach to a fresh
+    // shell, which would let a user type into a different session believing it
+    // is theirs.
+    //
+    // The gap it also pins: the client does not notice the reap either. It
+    // treats the rejected resume as a transient attach failure and retries
+    // indefinitely, so the shell hangs with no error and no exit. When that is
+    // fixed, invert this test: assert a prompt non-zero exit and a message
+    // naming the expired session.
+    let server_dir = TempDir::new()?;
+    let client_dir = TempDir::new()?;
+    let server_home = FabricHome::new(server_dir.path());
+    let client_home = FabricHome::new(client_dir.path());
+    let server = FabricNode::start_with_options(server_home.clone(), true).await?;
+    let client = FabricNode::start(client_home.clone()).await?;
+    trust_peer(
+        &server_home,
+        &server,
+        client.id(),
+        Some("client"),
+        Some(client.addr()),
+    )
+    .await?;
+    trust_peer(
+        &client_home,
+        &client,
+        server.id(),
+        Some("server"),
+        Some(server.addr()),
+    )
+    .await?;
+
+    let mut shell_child = tokio::process::Command::new(fabric_bin())
+        .arg("--home")
+        .arg(client_home.root())
+        .arg("shell")
+        .arg("server")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn resumable fabric shell")?;
+    let mut stdin = shell_child.stdin.take().context("shell stdin missing")?;
+    let mut stdout = shell_child.stdout.take().context("shell stdout missing")?;
+
+    // Mark the session, then prove the marker is unique to this PTY.
+    stdin
+        .write_all(b"MARK=original; printf '%s-%s\n' before sleep\n")
+        .await?;
+    read_until_marker(&mut stdout, b"before-sleep").await?;
+
+    // Detach the client, then expire the detached session as a long sleep would.
+    assert_success(
+        &fabric_output(&server_home, &["debug", "block-tunnels"])?,
+        "block shell tunnels",
+    );
+    assert_success(
+        &fabric_output(&server_home, &["debug", "drop-tunnels"])?,
+        "drop shell tunnel connection",
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_success(
+        &fabric_output(&server_home, &["debug", "reap-tunnels", "--ttl-ms", "0"])?,
+        "expire the detached session",
+    );
+    assert_success(
+        &fabric_output(&server_home, &["debug", "unblock-tunnels"])?,
+        "unblock shell tunnels",
+    );
+
+    // Current behaviour: still running, having reported only the loss and one
+    // reconnect attempt. Ten seconds is far longer than a resume needs when the
+    // session still exists, which the drop test above completes in well under a
+    // second.
+    let waited = tokio::time::timeout(Duration::from_secs(10), shell_child.wait()).await;
+    assert!(
+        waited.is_err(),
+        "client exited on its own; the #21 gap may be fixed, so invert this test"
+    );
+    let _ = shell_child.kill().await;
+    let _ = shell_child.wait().await;
+
+    client.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shell_sigterm_restores_exact_terminal_mode() -> Result<()> {
     let server_dir = TempDir::new()?;
     let client_dir = TempDir::new()?;

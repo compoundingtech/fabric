@@ -1291,7 +1291,20 @@ can be replayed after a real iroh attach loss while the local Unix socket stays
 open. On the expose side, the Unix socket connection or exec child is bound to
 that tunnel session, not to each transient iroh attach, so a reconnect resumes
 the same local endpoint. If a detached session exceeds the server TTL, fabric
-removes the session and kills/reaps its exec child. Built-in `fabric shell`
-remains on its raw one-shot stream protocol; a resilient shell should be built
-above generic fabric transport, for example by running a long-lived `pty` session
-over `fabric dial`.
+removes the session and kills/reaps its exec child.
+
+Built-in `fabric shell` rides this resumable transport. It negotiates
+`fabric/shell/1` and falls back to the legacy one-shot `fabric/shell/0` when the
+peer does not offer it, so a mixed-version pair still works and only the newer
+pair gets resumption. A shell that loses its transport briefly — a network blip,
+a roaming peer, an endpoint recycle — reconnects to the *same* remote PTY and
+replays unacked bytes, and the client prints a status line for the loss, each
+reconnect attempt, and the resume.
+
+The limit worth knowing before relying on it: resumption only survives an
+outage shorter than the server's detached-session TTL, which defaults to 60
+seconds (`--server-session-detached-ttl-secs`). Past that the server reaps the
+PTY. A laptop asleep for more than a minute is past it. Today the client does
+not notice the reap and keeps retrying instead of exiting, so the shell appears
+to hang rather than telling you the session is gone; that gap is tracked in
+issue #21.
