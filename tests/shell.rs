@@ -322,19 +322,28 @@ async fn resumable_shell_one_survives_transport_drop() -> Result<()> {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn shell_beyond_detached_ttl_hangs_instead_of_reporting_known_gap() -> Result<()> {
-    // KNOWN GAP, issue #21. The daily-use question: a MacBook sleeps longer than
-    // the 60s detached TTL, the server reaps the PTY, and the client wakes up.
+async fn shell_past_detached_ttl_reports_the_session_is_gone() -> Result<()> {
+    // Issue #21, the daily-use question: a MacBook sleeps longer than the 60s
+    // detached TTL, the server reaps the PTY, and the client wakes up.
     //
-    // The good news this pins: the client does NOT silently attach to a fresh
-    // shell, which would let a user type into a different session believing it
-    // is theirs.
+    // Expiry has to be forced deterministically, or this test proves nothing,
+    // and two obvious ways to force it do not work. Dropping the tunnel and
+    // reaping shortly after does not: `debug block-tunnels` is only consulted
+    // on the generic exposure accept path, not on the builtin resumable-shell
+    // one, so the client reattaches inside the gap and the reap skips a session
+    // that still has an attach. SIGSTOP on the `fabric shell` process does not
+    // either: the tunnel client lives in the local daemon, not in the CLI, so
+    // freezing the CLI leaves the daemon reconnecting and resuming on its own.
     //
-    // The gap it also pins: the client does not notice the reap either. It
-    // treats the rejected resume as a transient attach failure and retries
-    // indefinitely, so the shell hangs with no error and no exit. When that is
-    // fixed, invert this test: assert a prompt non-zero exit and a message
-    // naming the expired session.
+    // Restarting the server daemon is deterministic and needs no timing at all.
+    // The session store is in memory, so the restarted daemon cannot know any
+    // session id, which is the same rejection an expired session produces and
+    // the same thing a laptop finds after sleeping past the TTL.
+    //
+    // What this pins is that the client treats that rejection as terminal. It
+    // does not silently attach to a fresh shell, which would let someone type
+    // into a session that is not theirs, and it does not retry a session the
+    // server has already refused, which would hang with no error and no exit.
     let server_dir = TempDir::new()?;
     let client_dir = TempDir::new()?;
     let server_home = FabricHome::new(server_dir.path());
@@ -377,36 +386,52 @@ async fn shell_beyond_detached_ttl_hangs_instead_of_reporting_known_gap() -> Res
         .await?;
     read_until_marker(&mut stdout, b"before-sleep").await?;
 
-    // Detach the client, then expire the detached session as a long sleep would.
-    assert_success(
-        &fabric_output(&server_home, &["debug", "block-tunnels"])?,
-        "block shell tunnels",
-    );
-    assert_success(
-        &fabric_output(&server_home, &["debug", "drop-tunnels"])?,
-        "drop shell tunnel connection",
-    );
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_success(
-        &fabric_output(&server_home, &["debug", "reap-tunnels", "--ttl-ms", "0"])?,
-        "expire the detached session",
-    );
-    assert_success(
-        &fabric_output(&server_home, &["debug", "unblock-tunnels"])?,
-        "unblock shell tunnels",
-    );
+    // Lose the session for real: the restarted daemon keeps its identity and
+    // its allow-list, and has no memory of any session.
+    server.shutdown().await?;
+    let server = FabricNode::start_with_options(server_home.clone(), true).await?;
+    trust_peer(
+        &client_home,
+        &client,
+        server.id(),
+        Some("server"),
+        Some(server.addr()),
+    )
+    .await?;
 
-    // Current behaviour: still running, having reported only the loss and one
-    // reconnect attempt. Ten seconds is far longer than a resume needs when the
-    // session still exists, which the drop test above completes in well under a
-    // second.
-    let waited = tokio::time::timeout(Duration::from_secs(10), shell_child.wait()).await;
+    let mut stderr = shell_child.stderr.take().context("shell stderr missing")?;
+    let reader = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(30), stderr.read_to_end(&mut buf)).await;
+        buf
+    });
+    let waited = tokio::time::timeout(Duration::from_secs(30), shell_child.wait()).await;
+    let reported = String::from_utf8_lossy(&reader.await.unwrap_or_default()).into_owned();
+
+    let Ok(status) = waited else {
+        let _ = shell_child.kill().await;
+        let _ = shell_child.wait().await;
+        bail!("shell never exited after its session was lost; it reported:\n{reported}");
+    };
+    let status = status.context("failed to wait for shell")?;
+
+    // A resume cannot legitimately succeed against a daemon that just lost its
+    // session store, so seeing one means the test measured the wrong thing.
     assert!(
-        waited.is_err(),
-        "client exited on its own; the #21 gap may be fixed, so invert this test"
+        !reported.contains("session resumed"),
+        "session was not actually lost; the client resumed it:\n{reported}"
     );
-    let _ = shell_child.kill().await;
-    let _ = shell_child.wait().await;
+    assert_ne!(
+        status.code(),
+        Some(0),
+        "shell exited cleanly despite losing its remote session:\n{reported}"
+    );
+    // The message has to name the session and say it is not coming back.
+    // "reconnecting" with no resolution is the failure this pins against.
+    assert!(
+        reported.contains("remote shell could not resume") && reported.contains("expired"),
+        "shell exited without reporting that the remote session is gone:\n{reported}"
+    );
 
     client.shutdown().await?;
     server.shutdown().await?;
