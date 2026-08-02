@@ -1304,7 +1304,10 @@ reconnect attempt, and the resume.
 The limit worth knowing before relying on it: resumption only survives an
 outage shorter than the server's detached-session TTL, which defaults to 60
 seconds (`--server-session-detached-ttl-secs`). Past that the server reaps the
-PTY. A laptop asleep for more than a minute is past it. Today the client does
-not notice the reap and keeps retrying instead of exiting, so the shell appears
-to hang rather than telling you the session is gone; that gap is tracked in
-issue #21.
+PTY, and a laptop asleep for more than a minute is past it. The client does not
+retry a session the server has already refused: it reports `remote shell could
+not resume`, names the expired session, and exits non-zero, so a dead session
+ends promptly instead of hanging. Restarting the remote daemon has the same
+effect, because the session store is in memory. What is lost in both cases is
+the PTY and its scrollback, not just the connection; only the shorter outages
+resume in place.
