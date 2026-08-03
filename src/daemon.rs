@@ -6155,33 +6155,55 @@ mod tests {
     /// The cause was never a slow path. A dropped socket reads as a clean EOF on
     /// macOS and as an error on Linux, and only the EOF branch recorded the send
     /// close that makes the writer emit `Frame::Close`. With no such frame the
-    /// server waited for bytes that could never arrive. On Linux this assertion
-    /// fails without that fix; on macOS it passes either way, because macOS took
-    /// the branch that already worked.
+    /// server waits for bytes that can never arrive.
+    ///
+    /// **The exposed service must stay silent, and that is the whole design of
+    /// this test.** A first version used a shell and passed on Linux even with
+    /// the defect present, which made it worthless as a guard. A shell streams
+    /// output back, so the dropped local socket fails on the next WRITE and
+    /// tears the session down by a second route that hides the missing frame.
+    /// The original trace was a quiet tunnel, and only a quiet tunnel isolates
+    /// the defect: with nothing to write back, the missing close frame is the
+    /// only thing that could end the session.
+    ///
+    /// On macOS this passes either way, because macOS always took the branch
+    /// that worked. Linux is where it earns its place.
     #[tokio::test]
-    async fn a_dropped_local_end_detaches_the_session_on_the_server_too() -> Result<()> {
+    async fn a_dropped_local_end_detaches_a_quiet_session_on_the_server_too() -> Result<()> {
         let server_dir = tempfile::tempdir()?;
         let client_dir = tempfile::tempdir()?;
         let server_home = FabricHome::new(server_dir.path());
         let client_home = FabricHome::new(client_dir.path());
-        let server = FabricNode::start_with_options(server_home.clone(), true).await?;
+        let server = FabricNode::start(server_home.clone()).await?;
         let client = FabricNode::start(client_home.clone()).await?;
         trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
         trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
 
+        // A sink: it reads and never writes back. Anything it echoed would give
+        // the teardown a second route and mask exactly what this test isolates.
+        let sink_socket = server_dir.path().join("sink.sock");
+        let sink_listener = UnixListener::bind(&sink_socket)?;
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = sink_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    while let Ok(read) = stream.read(&mut buf).await {
+                        if read == 0 {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        server.expose("audit/sink", sink_socket.clone()).await?;
+
         let client_state = client.state();
         let server_state = server.state();
         let socket = client_state
-            .dial_alpn(
-                "server",
-                shell::SHELL_PROTOCOL,
-                shell::RESUMABLE_SHELL_ALPN.to_vec(),
-                false,
-            )
+            .dial_alpn("server", "audit/sink", b"audit/sink".to_vec(), false)
             .await?;
-        let mut shell_stream = UnixStream::connect(&socket).await?;
-        shell::write_client_stdin(&mut shell_stream, b"printf '%s-%s\n' server side\n").await?;
-        read_shell_marker(&mut shell_stream, b"server-side").await?;
+        let mut dial = UnixStream::connect(&socket).await?;
+        dial.write_all(b"open-the-session").await?;
 
         // POSITIVE CONTROL. Prove the server really is holding an attach before
         // asserting that it lets one go, or a server that never counted the
@@ -6197,11 +6219,11 @@ mod tests {
         .await;
         assert!(
             attached.is_ok(),
-            "the server never counted the live shell as attached, so this test \
+            "the server never counted the quiet session as attached, so this test \
              could not observe it detaching either"
         );
 
-        drop(shell_stream);
+        drop(dial);
 
         // Bounded well under the 40s stall and well over the ~53ms healthy case,
         // so this fails on the defect and does not flake on a slow machine.
