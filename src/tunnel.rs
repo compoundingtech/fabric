@@ -535,15 +535,25 @@ impl TunnelSession {
                 Err(error) => {
                     // An abrupt local close ends local input just as surely as a
                     // clean EOF does: no further bytes can arrive on this session.
-                    // Release the recycle guard so a stalled remote teardown cannot
-                    // pin the endpoint. Deliberately ONLY the guard — send_closed
-                    // and every other teardown semantic stay exactly as they were,
-                    // because this error path is not the place to change them.
+                    // So end the send side the same way, which both releases the
+                    // recycle guard and records the final offset.
                     //
-                    // This path is why the first version of the fix was incomplete.
+                    // Recording the offset is the part that matters remotely. Only
+                    // a recorded close makes the writer emit `Frame::Close`, and
+                    // only that frame lets the server stop counting this session
+                    // as attached. Without it the server waits for bytes that can
+                    // never arrive.
+                    //
                     // Dropping a local socket yields a clean zero-length read on
-                    // macOS and an error on Linux, so releasing on clean EOF alone
-                    // left the Linux case pinned and the CI failure unchanged.
+                    // macOS and an error on Linux, so this path used to run only
+                    // on Linux. That is the whole of the platform difference: the
+                    // 40-second stall in issue 32 was never a slow path, it was a
+                    // message the server never received.
+                    //
+                    // Only the send side closes. This session may still be writing
+                    // queued remote output, and a half-close is not a close.
+                    // DIAGNOSTIC ONLY: the pre-fix behaviour, to prove the
+                    // tests below actually catch the defect on Linux.
                     self.release_attach_gauge().await;
                     return Err(error.into());
                 }
@@ -2074,5 +2084,96 @@ mod tests {
         session.close_for_eviction().await;
 
         assert!(kill.is_cancelled());
+    }
+
+    /// A local reader that hands over `bytes`, then ends the way the test asks.
+    ///
+    /// This is the whole platform difference in issue 32, made explicit. Dropping
+    /// a local socket gives a clean zero-length read on macOS and an error on
+    /// Linux. Injecting the ending directly turns a Linux-only, racy, 40-second
+    /// CI failure into a decision this test makes on any operating system.
+    struct EndingReader {
+        bytes: Vec<u8>,
+        fail_at_end: bool,
+    }
+
+    impl AsyncRead for EndingReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if !self.bytes.is_empty() {
+                let take = self.bytes.len().min(buf.remaining());
+                let chunk: Vec<u8> = self.bytes.drain(..take).collect();
+                buf.put_slice(&chunk);
+                return std::task::Poll::Ready(Ok(()));
+            }
+            if self.fail_at_end {
+                // What Linux reports when the local peer drops the socket.
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "connection reset by peer",
+                )));
+            }
+            // What macOS reports for the same event: a clean EOF.
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn session_after_local_input_ends(fail_at_end: bool) -> Arc<TunnelSession> {
+        let (_write_peer, write) = duplex(64);
+        let reader = EndingReader {
+            bytes: b"hello".to_vec(),
+            fail_at_end,
+        };
+        let (session, local_read) =
+            TunnelSession::new_parts(session_id(9), peer_id(), Box::new(reader), Box::new(write));
+        // Returns Ok on EOF and Err on an abrupt close. Either way the local
+        // input is over, which is the only thing that matters here.
+        let _ = session.clone().run_local_reader(local_read).await;
+        session
+    }
+
+    /// Both endings must tell the remote that local input is over.
+    ///
+    /// Only a recorded `send_closed` makes the writer emit `Frame::Close`, and
+    /// only that frame lets the server stop counting the session as attached.
+    /// Without it the server waits for bytes that can never arrive, which is the
+    /// 40-second Linux stall in issue 32: not a slow path, a missing message.
+    #[tokio::test]
+    async fn an_abrupt_local_close_reports_the_end_just_like_a_clean_eof() {
+        let clean = session_after_local_input_ends(false).await;
+        let abrupt = session_after_local_input_ends(true).await;
+
+        let clean_closed = clean.state.lock().await.send_closed;
+        let abrupt_closed = abrupt.state.lock().await.send_closed;
+
+        assert_eq!(
+            clean_closed,
+            Some(5),
+            "a clean EOF must close the send side after the 5 bytes it read"
+        );
+        assert_eq!(
+            abrupt_closed, clean_closed,
+            "an abrupt local close must end the send side exactly like a clean EOF; \
+             leaving it open is what makes the server hold the session attached"
+        );
+    }
+
+    /// The recycle guard must come off on both endings too.
+    ///
+    /// This part already worked. It is asserted beside the case above so a later
+    /// change cannot fix one ending and quietly regress the other.
+    #[tokio::test]
+    async fn both_endings_release_the_recycle_guard() {
+        for fail_at_end in [false, true] {
+            let session = session_after_local_input_ends(fail_at_end).await;
+            assert!(
+                session.state.lock().await.attach_gauge.is_none(),
+                "the recycle guard must be released when local input ends \
+                 (fail_at_end={fail_at_end})"
+            );
+        }
     }
 }

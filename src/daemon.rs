@@ -6143,4 +6143,85 @@ mod tests {
         server.shutdown().await?;
         Ok(())
     }
+
+    /// The SERVER must stop counting a session as attached once the client's
+    /// local end goes away. Issue 32.
+    ///
+    /// The test above proves the client releases its own gauge. It says nothing
+    /// about the far end, and the far end was the stall: a forced trace showed
+    /// the server still reporting one active attach 40 seconds after the client
+    /// dropped its socket, while macOS detached in about 53 milliseconds.
+    ///
+    /// The cause was never a slow path. A dropped socket reads as a clean EOF on
+    /// macOS and as an error on Linux, and only the EOF branch recorded the send
+    /// close that makes the writer emit `Frame::Close`. With no such frame the
+    /// server waited for bytes that could never arrive. On Linux this assertion
+    /// fails without that fix; on macOS it passes either way, because macOS took
+    /// the branch that already worked.
+    #[tokio::test]
+    async fn a_dropped_local_end_detaches_the_session_on_the_server_too() -> Result<()> {
+        let server_dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let server_home = FabricHome::new(server_dir.path());
+        let client_home = FabricHome::new(client_dir.path());
+        let server = FabricNode::start_with_options(server_home.clone(), true).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+
+        let client_state = client.state();
+        let server_state = server.state();
+        let socket = client_state
+            .dial_alpn(
+                "server",
+                shell::SHELL_PROTOCOL,
+                shell::RESUMABLE_SHELL_ALPN.to_vec(),
+                false,
+            )
+            .await?;
+        let mut shell_stream = UnixStream::connect(&socket).await?;
+        shell::write_client_stdin(&mut shell_stream, b"printf '%s-%s\n' server side\n").await?;
+        read_shell_marker(&mut shell_stream, b"server-side").await?;
+
+        // POSITIVE CONTROL. Prove the server really is holding an attach before
+        // asserting that it lets one go, or a server that never counted the
+        // session would pass the real check for the wrong reason.
+        let attached = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if server_state.tunnel_sessions.stats().await.active_attaches > 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(
+            attached.is_ok(),
+            "the server never counted the live shell as attached, so this test \
+             could not observe it detaching either"
+        );
+
+        drop(shell_stream);
+
+        // Bounded well under the 40s stall and well over the ~53ms healthy case,
+        // so this fails on the defect and does not flake on a slow machine.
+        let detached = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if server_state.tunnel_sessions.stats().await.active_attaches == 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(
+            detached.is_ok(),
+            "the server still counts the session as attached 20s after the client \
+             dropped its local end; a finished session pins the server's endpoint"
+        );
+
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
 }
