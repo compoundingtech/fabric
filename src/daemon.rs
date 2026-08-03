@@ -4110,7 +4110,7 @@ mod tests {
             [server_sessions]
             max_total = 64
             max_per_peer = 16
-            detached_ttl_secs = 60
+            detached_ttl_secs = 120
             "#,
         )
         .unwrap();

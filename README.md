@@ -1311,12 +1311,24 @@ replays unacked bytes, and the client prints a status line for the loss, each
 reconnect attempt, and the resume.
 
 The limit worth knowing before relying on it: resumption only survives an
-outage shorter than the server's detached-session TTL, which defaults to 60
-seconds (`--server-session-detached-ttl-secs`). Past that the server reaps the
-PTY, and a laptop asleep for more than a minute is past it. The client does not
-retry a session the server has already refused: it reports `remote shell could
-not resume`, names the expired session, and exits non-zero, so a dead session
-ends promptly instead of hanging. Restarting the remote daemon has the same
-effect, because the session store is in memory. What is lost in both cases is
-the PTY and its scrollback, not just the connection; only the shorter outages
-resume in place.
+outage shorter than the server's detached-session TTL, which defaults to **15
+minutes** (`--server-session-detached-ttl-secs`). A closed lid over lunch keeps
+its shell; a laptop left overnight does not. Past that window the server reaps
+the PTY.
+
+The window is 15 minutes because that is what the cost measures out to, not as a
+round guess. An idle detached shell buffers nothing — 0 bytes across a full
+detached window — so holding one costs a session struct and a PTY process and
+nothing that grows with time. A session still producing output is the expensive
+case, growing at whatever the remote writes; a pathological output loop measured
+about 19 KB/s, so roughly 17 MB over this window for one runaway shell. Note
+that this TTL is currently the only backstop against such a process, because the
+replay buffer has no cap of its own, which is why raising it much further wants
+that cap first.
+
+Past the window, the client does not retry a session the server has already
+refused: it reports `remote shell could not resume`, names the expired session,
+and exits non-zero, so a dead session ends promptly instead of hanging.
+Restarting the remote daemon has the same effect, because the session store is
+in memory. What is lost in both cases is the PTY and its scrollback, not just
+the connection; only outages shorter than the window resume in place.

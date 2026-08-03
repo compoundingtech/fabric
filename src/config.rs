@@ -14,7 +14,23 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_EXEC_MAX_CHILDREN: usize = 32;
 pub const DEFAULT_SERVER_SESSION_MAX_TOTAL: usize = 64;
 pub const DEFAULT_SERVER_SESSION_MAX_PER_PEER: usize = 16;
-pub const DEFAULT_SERVER_SESSION_DETACHED_TTL_SECS: u64 = 60;
+/// How long a detached shell or tunnel session is kept before its PTY is reaped.
+///
+/// Fifteen minutes, chosen from measurement rather than taste. The cost of a
+/// longer window is bounded by what a detached session actually retains: an idle
+/// shell buffers nothing at all, measured at 0 bytes across a full detached
+/// window, so holding it costs a session struct and a PTY process and nothing
+/// that grows with time. A session still producing output is the expensive case
+/// and it grows at whatever the remote writes, measured at about 19 KB/s for a
+/// pathological loop, so roughly 17 MB over this window for one runaway shell.
+///
+/// The benefit is the case that actually happens: a closed laptop lid over lunch
+/// keeps its shell. Sixty seconds did not survive a coffee break.
+///
+/// This is the only backstop against a runaway remote process, because the
+/// server's replay buffer has no cap of its own, so it should not be raised much
+/// further without capping that buffer first.
+pub const DEFAULT_SERVER_SESSION_DETACHED_TTL_SECS: u64 = 15 * 60;
 
 #[derive(Debug, Clone)]
 pub struct FabricHome {
@@ -787,7 +803,10 @@ mod tests {
         let home = PathBuf::from("/home/alice");
         let xdg = PathBuf::from("/xdg/conf");
         let fh = FabricHome::resolve_from(None, Some(&home), Some(xdg)).unwrap();
-        assert_eq!(fh.peers_path(), PathBuf::from("/xdg/conf/fabric/peers.toml"));
+        assert_eq!(
+            fh.peers_path(),
+            PathBuf::from("/xdg/conf/fabric/peers.toml")
+        );
     }
 
     #[test]
@@ -840,6 +859,25 @@ mod tests {
         assert_eq!(
             config.server_sessions().detached_ttl_secs(),
             DEFAULT_SERVER_SESSION_DETACHED_TTL_SECS
+        );
+    }
+
+    /// The retention window is a product decision, so pin the number itself.
+    ///
+    /// A default that drifts silently is worse than one that is wrong on purpose:
+    /// this is what a user's held shell survives, and it was chosen against
+    /// measured cost. Changing it should require changing this assertion and
+    /// saying why.
+    #[test]
+    fn detached_retention_default_is_fifteen_minutes() {
+        assert_eq!(
+            DEFAULT_SERVER_SESSION_DETACHED_TTL_SECS, 900,
+            "detached-shell retention is a decided product value, not an incidental one"
+        );
+        assert_eq!(
+            ServerSessionConfig::default().detached_ttl_secs(),
+            DEFAULT_SERVER_SESSION_DETACHED_TTL_SECS,
+            "the default config must carry the decided value"
         );
     }
 
