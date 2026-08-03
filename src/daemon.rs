@@ -1349,9 +1349,24 @@ impl DaemonState {
             "fabric: network change detected ({reason}); notifying iroh endpoint generation {}",
             endpoint.generation
         );
+        // Tell iroh to re-probe its paths, and leave working tunnels alone.
+        //
+        // This used to drop every tunnel connection unconditionally, on the
+        // theory that a network change invalidates existing paths. In practice
+        // the notice fires constantly on an idle healthy machine — 449 times in
+        // one day on the author's laptop, every one of them reporting the exact
+        // same unchanged state — and each drop tore down live sessions that
+        // were working. A resumable shell reattached within about 76 seconds of
+        // the previous one, forever. iroh already migrates or re-probes paths on
+        // `network_change`, and a tunnel whose transport really is dead notices
+        // and reconnects on its own, so the drop bought nothing and cost a
+        // visible interruption every time.
+        //
+        // The recovery paths that genuinely need a teardown still do it
+        // explicitly: `recover_unreachable_peer` when the endpoint itself is
+        // suspect, `recycle_endpoint_if_generation` when the endpoint is
+        // replaced, and the `debug drop-tunnels` control request.
         endpoint.endpoint.network_change().await;
-        self.drop_tunnel_connections();
-
         if !network_usable {
             info!(
                 target: VALIDATION_LOG_TARGET,
@@ -4573,5 +4588,140 @@ mod tests {
         assert!(!restart_down_decision(false, false));
         assert!(restart_down_decision(false, true));
         assert!(!restart_down_decision(true, true));
+    }
+
+    /// A network-change notice on a healthy machine must not disturb a working
+    /// shell.
+    ///
+    /// The regression this pins was live and visible: the notice fires
+    /// constantly on an idle laptop, 449 times in one day with an identical
+    /// unchanged reason each time, and the handler used to drop every tunnel
+    /// connection on every one of them. A held remote shell was therefore
+    /// interrupted about every 76 seconds indefinitely, resuming each time and
+    /// so looking like a flaky network rather than self-inflicted churn.
+    #[tokio::test]
+    async fn repeated_network_changes_do_not_disturb_a_live_resumable_shell() -> Result<()> {
+        let server_dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let server_home = FabricHome::new(server_dir.path());
+        let client_home = FabricHome::new(client_dir.path());
+        let server = FabricNode::start_with_options(server_home.clone(), true).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+
+        let state = client.state();
+        let socket = state
+            .dial_alpn(
+                "server",
+                shell::SHELL_PROTOCOL,
+                shell::RESUMABLE_SHELL_ALPN.to_vec(),
+                false,
+            )
+            .await?;
+        let mut shell_stream = UnixStream::connect(&socket).await?;
+
+        // Mark this PTY, so a silently replaced session is detectable.
+        shell::write_client_stdin(
+            &mut shell_stream,
+            b"MARK=original; printf '%s-%s\n' before change\n",
+        )
+        .await?;
+        read_shell_marker(&mut shell_stream, b"before-change").await?;
+
+        let drops_before = *state.tunnel_drop_tx.borrow();
+        for _ in 0..5 {
+            state
+                .rehome_after_network_change("test: healthy no-op notice", true)
+                .await;
+        }
+        let drops_after = *state.tunnel_drop_tx.borrow();
+        assert_eq!(
+            drops_before, drops_after,
+            "a healthy network-change notice must not close working tunnels"
+        );
+
+        // The same PTY is still there, still holding the shell variable it set
+        // before the notices, so nothing was torn down and re-established.
+        shell::write_client_stdin(&mut shell_stream, b"printf '%s-%s\n' $MARK survived\n").await?;
+        read_shell_marker(&mut shell_stream, b"original-survived").await?;
+
+        // Positive control. The check above is an equality, which would also
+        // hold if the counter simply could not move here — a watch send with no
+        // receivers is silently a no-op. Prove the probe works before trusting
+        // what it did not observe.
+        state.drop_tunnel_connections();
+        assert!(
+            *state.tunnel_drop_tx.borrow() > drops_after,
+            "the tunnel-drop probe never moves, so the check above proved nothing"
+        );
+
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// The recovery path that genuinely needs a teardown must keep doing it.
+    /// Not dropping tunnels on a noisy notice is only safe if a suspect endpoint
+    /// still gets an explicit close.
+    #[tokio::test]
+    async fn endpoint_recovery_still_closes_tunnels_explicitly() -> Result<()> {
+        let home_dir = tempfile::tempdir()?;
+        let home = FabricHome::new(home_dir.path());
+        let node = FabricNode::start(home.clone()).await?;
+        let state = node.state();
+
+        // Stand in for a live tunnel. The drop signal is a watch channel, and a
+        // send with no receivers fails and leaves the value untouched, so
+        // without this subscription the probe below could never move and the
+        // test would fail for the wrong reason.
+        let _tunnel = state.tunnel_drop_rx();
+
+        // A peer that stayed unreachable with no other peer answering: the
+        // endpoint itself is suspect, which is what escalation means.
+        let drops_before = *state.tunnel_drop_tx.borrow();
+        state
+            .recover_unreachable_peer("absent-peer", PEER_HEALTH_ATTEMPTS_BEFORE_RECYCLE, 0)
+            .await;
+        let drops_after = *state.tunnel_drop_tx.borrow();
+        assert!(
+            drops_after > drops_before,
+            "an escalated endpoint recovery must still close tunnels explicitly"
+        );
+
+        node.shutdown().await?;
+        Ok(())
+    }
+
+    /// Read framed shell output until `marker` appears.
+    async fn read_shell_marker(stream: &mut UnixStream, marker: &[u8]) -> Result<()> {
+        let mut seen = Vec::new();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match shell::read_server_frame(stream).await? {
+                    Some(shell::ServerFrame::Output(bytes)) => {
+                        seen.extend_from_slice(&bytes);
+                        if seen.windows(marker.len()).any(|window| window == marker) {
+                            return Ok(());
+                        }
+                    }
+                    Some(shell::ServerFrame::Status(_)) => {}
+                    Some(shell::ServerFrame::Error(error)) => bail!("shell error: {error}"),
+                    Some(shell::ServerFrame::Exit(code)) => bail!("shell exited: {code}"),
+                    None => bail!(
+                        "shell stream closed before {:?}; saw {:?}",
+                        String::from_utf8_lossy(marker),
+                        String::from_utf8_lossy(&seen)
+                    ),
+                }
+            }
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "timed out waiting for {:?}",
+                String::from_utf8_lossy(marker)
+            )
+        })?
     }
 }

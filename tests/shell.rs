@@ -146,6 +146,10 @@ async fn unavailable_old_peer_later_falls_back_to_raw_shell_zero() -> Result<()>
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // Reap the child on any abnormal exit. A panicking assertion unwinds
+        // past the explicit kill, and a leaked `fabric shell` would keep a
+        // tunnel session alive on the server for the rest of the run.
+        .kill_on_drop(true)
         .spawn()
         .context("failed to spawn shell for unavailable legacy peer")?;
     let mut stdin = shell_child.stdin.take().context("shell stdin missing")?;
@@ -286,6 +290,10 @@ async fn resumable_shell_one_survives_transport_drop() -> Result<()> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // Reap the child on any abnormal exit. A panicking assertion unwinds
+        // past the explicit kill, and a leaked `fabric shell` would keep a
+        // tunnel session alive on the server for the rest of the run.
+        .kill_on_drop(true)
         .spawn()
         .context("failed to spawn resumable fabric shell")?;
     let mut stdin = shell_child.stdin.take().context("shell stdin missing")?;
@@ -375,6 +383,10 @@ async fn shell_past_detached_ttl_reports_the_session_is_gone() -> Result<()> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // Reap the child on any abnormal exit. A panicking assertion unwinds
+        // past the explicit kill, and a leaked `fabric shell` would keep a
+        // tunnel session alive on the server for the rest of the run.
+        .kill_on_drop(true)
         .spawn()
         .context("failed to spawn resumable fabric shell")?;
     let mut stdin = shell_child.stdin.take().context("shell stdin missing")?;
