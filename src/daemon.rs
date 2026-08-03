@@ -5049,6 +5049,144 @@ mod tests {
         })?
     }
 
+    /// The whole audit in one place: two peers, two concurrent sessions of
+    /// different kinds, and every notice class fired at them.
+    ///
+    /// Each disruption was found and fixed separately, so this exists to catch a
+    /// future one that only shows up with more than one peer or more than one
+    /// session in flight — the shape none of the single-session tests can see.
+    #[tokio::test]
+    async fn concurrent_sessions_survive_every_healthy_notice() -> Result<()> {
+        let client_dir = tempfile::tempdir()?;
+        let shell_dir = tempfile::tempdir()?;
+        let echo_dir = tempfile::tempdir()?;
+        let client_home = FabricHome::new(client_dir.path());
+        let shell_home = FabricHome::new(shell_dir.path());
+        let echo_home = FabricHome::new(echo_dir.path());
+        let client = FabricNode::start(client_home.clone()).await?;
+        let shell_peer = FabricNode::start_with_options(shell_home.clone(), true).await?;
+        let echo_peer = FabricNode::start(echo_home.clone()).await?;
+
+        for (home, node, name) in [
+            (&shell_home, &shell_peer, "shell-peer"),
+            (&echo_home, &echo_peer, "echo-peer"),
+        ] {
+            trust_test_peer(home, node, client.id(), "client", client.addr()).await?;
+            trust_test_peer(&client_home, &client, node.id(), name, node.addr()).await?;
+        }
+
+        // Session one: a resumable shell to the first peer.
+        let state = client.state();
+        let shell_socket = state
+            .dial_alpn(
+                "shell-peer",
+                shell::SHELL_PROTOCOL,
+                shell::RESUMABLE_SHELL_ALPN.to_vec(),
+                false,
+            )
+            .await?;
+        let mut shell_stream = UnixStream::connect(&shell_socket).await?;
+        shell::write_client_stdin(
+            &mut shell_stream,
+            b"MARK=session-one; printf '%s-%s\n' shell up\n",
+        )
+        .await?;
+        read_shell_marker(&mut shell_stream, b"shell-up").await?;
+
+        // Session two: a generic dial to a different peer, carrying raw bytes.
+        let echo_socket_path = echo_dir.path().join("echo.sock");
+        let echo_listener = UnixListener::bind(&echo_socket_path)?;
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = echo_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if stream.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        echo_peer.expose("audit/echo", echo_socket_path).await?;
+        let dial_socket = state
+            .dial_alpn("echo-peer", "audit/echo", b"audit/echo".to_vec(), false)
+            .await?;
+        let mut dial = UnixStream::connect(&dial_socket).await?;
+        dial.write_all(b"dial-up-").await?;
+        let mut echoed = [0u8; 8];
+        tokio::time::timeout(Duration::from_secs(20), dial.read_exact(&mut echoed)).await??;
+        assert_eq!(&echoed, b"dial-up-");
+
+        assert_eq!(
+            state.client_attaches.attached(),
+            2,
+            "both concurrent sessions must be counted"
+        );
+        let drops_before = *state.tunnel_drop_tx.borrow();
+        let generation_before = state.endpoint_handle().generation;
+
+        // Every notice class, in turn, none of which describes a broken endpoint.
+        for _ in 0..3 {
+            state
+                .rehome_after_network_change("audit: healthy no-op notice", true)
+                .await;
+        }
+        state
+            .rehome_after_network_change("audit: route update", true)
+            .await;
+        // One peer away while the other answers: cheap recovery, no teardown.
+        state
+            .recover_unreachable_peer("absent", PEER_HEALTH_ATTEMPTS_BEFORE_RECYCLE, 1)
+            .await;
+        // And a recycle attempt, which is what a failed health poll ends in.
+        let outcome = state
+            .recycle_endpoint_if_generation(generation_before, "audit: health poll")
+            .await?;
+        assert!(
+            matches!(outcome, EndpointRecycleOutcome::SessionsAttached { .. }),
+            "live sessions must hold off the recycle, got {outcome:?}"
+        );
+
+        assert_eq!(
+            *state.tunnel_drop_tx.borrow(),
+            drops_before,
+            "no healthy notice may close a tunnel"
+        );
+        assert_eq!(
+            state.endpoint_handle().generation,
+            generation_before,
+            "no healthy notice may rebuild the endpoint"
+        );
+
+        // Both sessions are the same sessions, not fresh replacements.
+        shell::write_client_stdin(&mut shell_stream, b"printf '%s-%s\n' $MARK alive\n").await?;
+        read_shell_marker(&mut shell_stream, b"session-one-alive").await?;
+        dial.write_all(b"still-ok").await?;
+        tokio::time::timeout(Duration::from_secs(20), dial.read_exact(&mut echoed)).await??;
+        assert_eq!(
+            &echoed, b"still-ok",
+            "the generic dial must still carry exact bytes"
+        );
+
+        // POSITIVE CONTROL: the drop probe used above can actually move.
+        state.drop_tunnel_connections();
+        assert!(
+            *state.tunnel_drop_tx.borrow() > drops_before,
+            "the tunnel-drop probe never moves, so the checks above proved nothing"
+        );
+
+        client.shutdown().await?;
+        shell_peer.shutdown().await?;
+        echo_peer.shutdown().await?;
+        Ok(())
+    }
+
     /// A generic dial's reconnect telemetry must reach the log and nothing else.
     ///
     /// The event names are the contract an operator greps for, so pin them here
