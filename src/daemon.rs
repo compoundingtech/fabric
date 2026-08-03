@@ -97,9 +97,39 @@ const PEER_HEALTH_RECOVER_INITIAL_BACKOFF: Duration = Duration::from_secs(30);
 const PEER_HEALTH_RECOVER_MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
 const VALIDATION_LOG_TARGET: &str = "fabric::validation";
 
+/// What a backoff record is about.
+///
+/// Failures have to be attributed, or they get charged to whoever dials next. A
+/// dial keys on the peer and the ALPN, because "hetz is unreachable" says nothing
+/// about droppy, and "droppy does not speak fabric/exec/0" says nothing about its
+/// shell. The accept loop keys on itself: it throttles before any connection
+/// exists, so there is no peer to attribute an accept failure to.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct BackoffKey {
+    peer: String,
+    alpn: String,
+}
+
+impl BackoffKey {
+    fn dial(peer: &str, alpn: &[u8]) -> Self {
+        Self {
+            peer: peer.to_string(),
+            alpn: String::from_utf8_lossy(alpn).to_string(),
+        }
+    }
+
+    /// The single record for the inbound accept loop.
+    fn accept_loop() -> Self {
+        Self {
+            peer: String::new(),
+            alpn: String::new(),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct FailureBackoff {
-    state: Mutex<FailureBackoffState>,
+    states: Mutex<HashMap<BackoffKey, FailureBackoffState>>,
     initial_delay: Duration,
     max_delay: Duration,
     log_interval: Duration,
@@ -109,30 +139,62 @@ struct FailureBackoff {
 struct FailureBackoffState {
     consecutive_failures: usize,
     not_before: Instant,
+    last_delay: Duration,
     last_log: Option<Instant>,
     suppressed: usize,
+}
+
+impl FailureBackoffState {
+    fn new(now: Instant) -> Self {
+        Self {
+            consecutive_failures: 0,
+            not_before: now,
+            last_delay: Duration::ZERO,
+            last_log: None,
+            suppressed: 0,
+        }
+    }
+
+    /// Nothing worth remembering.
+    ///
+    /// A streak is only meaningful while somebody is still retrying it. Once the
+    /// backoff window has been served and a further window of the same length has
+    /// passed with no new failure, whoever owned this key stopped dialling, and
+    /// keeping the streak would charge a stale escalation to their next attempt.
+    /// The grace period is derived from the delay this record itself produced, so
+    /// there is no separate number to tune.
+    fn is_idle(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.not_before) >= self.last_delay
+    }
 }
 
 impl FailureBackoff {
     fn new(initial_delay: Duration, max_delay: Duration, log_interval: Duration) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(FailureBackoffState {
-                consecutive_failures: 0,
-                not_before: Instant::now(),
-                last_log: None,
-                suppressed: 0,
-            }),
+            states: Mutex::new(HashMap::new()),
             initial_delay,
             max_delay,
             log_interval,
         })
     }
 
-    async fn wait(&self, cancel: &CancellationToken) -> bool {
+    /// Drop records that carry no streak and no remaining delay. The live key
+    /// space is bounded by trusted peers times ALPNs, both of which come from
+    /// config, so this needs no cap of its own.
+    fn prune(states: &mut HashMap<BackoffKey, FailureBackoffState>, now: Instant) {
+        states.retain(|_, state| !state.is_idle(now));
+    }
+
+    async fn wait(&self, key: &BackoffKey, cancel: &CancellationToken) -> bool {
         loop {
             let delay = {
-                let state = self.state.lock().await;
-                state.not_before.saturating_duration_since(Instant::now())
+                let now = Instant::now();
+                let mut states = self.states.lock().await;
+                Self::prune(&mut states, now);
+                states
+                    .get(key)
+                    .map(|state| state.not_before.saturating_duration_since(now))
+                    .unwrap_or_default()
             };
             if delay.is_zero() {
                 return true;
@@ -144,20 +206,29 @@ impl FailureBackoff {
         }
     }
 
-    async fn record_success(&self) {
-        let mut state = self.state.lock().await;
-        state.consecutive_failures = 0;
-        state.not_before = Instant::now();
-        state.suppressed = 0;
+    async fn record_success(&self, key: &BackoffKey) {
+        let now = Instant::now();
+        let mut states = self.states.lock().await;
+        states.remove(key);
+        Self::prune(&mut states, now);
     }
 
-    async fn record_failure(&self, label: &str, error: &(dyn fmt::Display + Sync)) {
+    async fn record_failure(
+        &self,
+        key: &BackoffKey,
+        label: &str,
+        error: &(dyn fmt::Display + Sync),
+    ) {
         let (delay, consecutive_failures, suppressed, should_log) = {
             let now = Instant::now();
-            let mut state = self.state.lock().await;
+            let mut states = self.states.lock().await;
+            let state = states
+                .entry(key.clone())
+                .or_insert_with(|| FailureBackoffState::new(now));
             state.consecutive_failures = state.consecutive_failures.saturating_add(1);
             let delay = self.delay_for_step(state.consecutive_failures);
             state.not_before = now + delay;
+            state.last_delay = delay;
 
             let should_log = state
                 .last_log
@@ -1092,8 +1163,10 @@ impl DaemonState {
                 // event: a generic dial carries raw bytes, and injecting a
                 // status frame into someone's stream would corrupt it. The
                 // logging half of this lands separately.
-                Some(tunnel::ClientConnectionNotices::new(|_| None)
-                    .with_gauge(self.client_attaches.clone())),
+                Some(
+                    tunnel::ClientConnectionNotices::new(|_| None)
+                        .with_gauge(self.client_attaches.clone()),
+                ),
             ))
         };
         sockets.insert(
@@ -2680,7 +2753,12 @@ fn peers_display(peers: &SyncPeers) -> String {
 async fn run_iroh_accept_loop(state: Arc<DaemonState>) -> Result<()> {
     let mut endpoint_rx = state.endpoint_rx();
     loop {
-        if !state.incoming_failures.wait(&state.cancel).await {
+        let accept_key = BackoffKey::accept_loop();
+        if !state
+            .incoming_failures
+            .wait(&accept_key, &state.cancel)
+            .await
+        {
             break;
         }
         let endpoint = endpoint_rx.borrow().clone();
@@ -2718,11 +2796,20 @@ async fn handle_incoming_iroh(
     _permit: OwnedSemaphorePermit,
 ) {
     match process_incoming_iroh(incoming, state.clone()).await {
-        Ok(()) => state.incoming_failures.record_success().await,
+        Ok(()) => {
+            state
+                .incoming_failures
+                .record_success(&BackoffKey::accept_loop())
+                .await
+        }
         Err(error) => {
             state
                 .incoming_failures
-                .record_failure("incoming iroh connection failed", &error)
+                .record_failure(
+                    &BackoffKey::accept_loop(),
+                    "incoming iroh connection failed",
+                    &error,
+                )
                 .await;
         }
     }
@@ -3234,6 +3321,7 @@ async fn run_dial_socket(
     _lease: DialListenerLease,
     notices: Option<tunnel::ClientConnectionNotices>,
 ) {
+    let backoff_key = BackoffKey::dial(&peer, &alpn);
     loop {
         tokio::select! {
             biased;
@@ -3261,10 +3349,11 @@ async fn run_dial_socket(
                 let cancel = daemon_cancel.clone();
                 let drop_rx = drop_rx.clone();
                 let dial_failures = dial_failures.clone();
+                let backoff_key = backoff_key.clone();
                 let notices = notices.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if !dial_failures.wait(&cancel).await {
+                    if !dial_failures.wait(&backoff_key, &cancel).await {
                         return;
                     }
                     match
@@ -3280,10 +3369,10 @@ async fn run_dial_socket(
                         )
                             .await
                     {
-                        Ok(()) => dial_failures.record_success().await,
+                        Ok(()) => dial_failures.record_success(&backoff_key).await,
                         Err(error) => {
                             dial_failures
-                                .record_failure("dial socket connection failed", &error)
+                                .record_failure(&backoff_key, "dial socket connection failed", &error)
                                 .await;
                         }
                     }
@@ -3307,6 +3396,7 @@ async fn run_shell_dial_socket(
     _lease: DialListenerLease,
     gauge: Arc<tunnel::ClientAttachGauge>,
 ) {
+    let backoff_key = BackoffKey::dial(&peer, shell::RESUMABLE_SHELL_ALPN);
     loop {
         tokio::select! {
             biased;
@@ -3334,10 +3424,11 @@ async fn run_shell_dial_socket(
                 let cancel = daemon_cancel.clone();
                 let drop_rx = drop_rx.clone();
                 let dial_failures = dial_failures.clone();
+                let backoff_key = backoff_key.clone();
                 let gauge = gauge.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if !dial_failures.wait(&cancel).await {
+                    if !dial_failures.wait(&backoff_key, &cancel).await {
                         return;
                     }
                     match handle_shell_dial_socket_connection(
@@ -3352,10 +3443,10 @@ async fn run_shell_dial_socket(
                     )
                     .await
                     {
-                        Ok(()) => dial_failures.record_success().await,
+                        Ok(()) => dial_failures.record_success(&backoff_key).await,
                         Err(error) => {
                             dial_failures
-                                .record_failure("shell dial socket connection failed", &error)
+                                .record_failure(&backoff_key, "shell dial socket connection failed", &error)
                                 .await;
                         }
                     }
@@ -3625,6 +3716,7 @@ async fn run_dial_tcp_listener(
     dial_slots: Arc<Semaphore>,
     gauge: Arc<tunnel::ClientAttachGauge>,
 ) {
+    let backoff_key = BackoffKey::dial(&peer, &alpn);
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -3648,22 +3740,23 @@ async fn run_dial_tcp_listener(
                 let cancel = cancel.clone();
                 let drop_rx = drop_rx.clone();
                 let dial_failures = dial_failures.clone();
+                let backoff_key = backoff_key.clone();
                 let notices = Some(
                     tunnel::ClientConnectionNotices::new(|_| None).with_gauge(gauge.clone()),
                 );
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if !dial_failures.wait(&cancel).await {
+                    if !dial_failures.wait(&backoff_key, &cancel).await {
                         return;
                     }
                     match
                         tunnel::run_client_tcp_connection(local, endpoint_rx, home, peer, alpn, cancel, drop_rx, notices)
                             .await
                     {
-                        Ok(()) => dial_failures.record_success().await,
+                        Ok(()) => dial_failures.record_success(&backoff_key).await,
                         Err(error) => {
                             dial_failures
-                                .record_failure("dial tcp connection failed", &error)
+                                .record_failure(&backoff_key, "dial tcp connection failed", &error)
                                 .await;
                         }
                     }
@@ -3684,6 +3777,7 @@ async fn run_raw_dial_socket(
     dial_slots: Arc<Semaphore>,
     _lease: DialListenerLease,
 ) {
+    let backoff_key = BackoffKey::dial(&peer_addr.id.to_string(), &alpn);
     loop {
         tokio::select! {
             biased;
@@ -3709,16 +3803,17 @@ async fn run_raw_dial_socket(
                 let alpn = alpn.clone();
                 let cancel = daemon_cancel.clone();
                 let dial_failures = dial_failures.clone();
+                let backoff_key = backoff_key.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if !dial_failures.wait(&cancel).await {
+                    if !dial_failures.wait(&backoff_key, &cancel).await {
                         return;
                     }
                     match handle_raw_dial_socket_connection(local, endpoint, peer_addr, alpn).await {
-                        Ok(()) => dial_failures.record_success().await,
+                        Ok(()) => dial_failures.record_success(&backoff_key).await,
                         Err(error) => {
                             dial_failures
-                                .record_failure("dial socket connection failed", &error)
+                                .record_failure(&backoff_key, "dial socket connection failed", &error)
                                 .await;
                         }
                     }
@@ -3993,6 +4088,151 @@ mod tests {
         assert!(debouncer.take_due(now + Duration::from_secs(3)).is_none());
     }
 
+    /// One unreachable peer must not delay dials to a healthy one.
+    ///
+    /// The dial backoff used to be a single shared record for every peer and
+    /// every ALPN. Measured on that version: after six failures dialling one
+    /// peer, an unrelated healthy dial waited 3.2 seconds, on its way to the 15
+    /// second ceiling. The coupling
+    /// also ran the other way — one success on any peer wiped the absent peer's
+    /// streak entirely, so the backoff stopped protecting anything.
+    // Real time, deliberately: this backoff measures with std::time::Instant, so
+    // a paused tokio clock would not move it and would only make the waits spin.
+    #[tokio::test]
+    async fn one_absent_peer_does_not_delay_or_reset_another() {
+        let backoff = FailureBackoff::new(
+            DIAL_FAILURE_INITIAL_BACKOFF,
+            DIAL_FAILURE_MAX_BACKOFF,
+            FAILURE_LOG_INTERVAL,
+        );
+        let cancel = CancellationToken::new();
+        let absent = BackoffKey::dial("peer-a", shell::RESUMABLE_SHELL_ALPN);
+        let healthy = BackoffKey::dial("peer-b", shell::RESUMABLE_SHELL_ALPN);
+
+        for _ in 0..6 {
+            backoff
+                .record_failure(&absent, "dial to peer-a", &"peer-a is unreachable")
+                .await;
+        }
+
+        // The healthy peer is not charged for it. Asserted on the record set
+        // rather than on a stopwatch: under a paused clock a wait of zero still
+        // reads as a few microseconds, and "no record" is the real claim.
+        assert!(
+            !backoff.states.lock().await.contains_key(&healthy),
+            "a healthy peer must not acquire a backoff record from another peer's failures"
+        );
+        let started = Instant::now();
+        assert!(backoff.wait(&healthy, &cancel).await);
+        assert!(
+            started.elapsed() < DIAL_FAILURE_INITIAL_BACKOFF,
+            "a healthy peer must not wait behind another peer's failures"
+        );
+
+        // POSITIVE CONTROL: the absent peer really is still backed off, so the
+        // check above is about attribution and not about a backoff that stopped
+        // working altogether.
+        assert_eq!(
+            backoff
+                .states
+                .lock()
+                .await
+                .get(&absent)
+                .map(|state| state.consecutive_failures),
+            Some(6),
+            "the absent peer must carry its own streak"
+        );
+        let started = Instant::now();
+        assert!(backoff.wait(&absent, &cancel).await);
+        assert!(
+            started.elapsed() >= DIAL_FAILURE_INITIAL_BACKOFF,
+            "the absent peer must still be serving its own backoff"
+        );
+
+        // And success on the healthy peer does not wipe the absent peer's streak.
+        backoff.record_success(&healthy).await;
+        backoff
+            .record_failure(&absent, "dial to peer-a", &"peer-a is still unreachable")
+            .await;
+        let started = Instant::now();
+        assert!(backoff.wait(&absent, &cancel).await);
+        assert!(
+            started.elapsed() > DIAL_FAILURE_INITIAL_BACKOFF,
+            "an unrelated success must not reset another peer's escalation"
+        );
+    }
+
+    /// The same ALPN distinction: a peer that does not offer one protocol must
+    /// not make its other protocols look unreachable.
+    // Real time, deliberately: this backoff measures with std::time::Instant, so
+    // a paused tokio clock would not move it and would only make the waits spin.
+    #[tokio::test]
+    async fn one_refused_protocol_does_not_delay_another_on_the_same_peer() {
+        let backoff = FailureBackoff::new(
+            DIAL_FAILURE_INITIAL_BACKOFF,
+            DIAL_FAILURE_MAX_BACKOFF,
+            FAILURE_LOG_INTERVAL,
+        );
+        let cancel = CancellationToken::new();
+        let exec = BackoffKey::dial("peer-a", exec::EXEC_ALPN);
+        let shell = BackoffKey::dial("peer-a", shell::RESUMABLE_SHELL_ALPN);
+
+        for _ in 0..4 {
+            backoff
+                .record_failure(&exec, "dial exec", &"exec is not allowed on peer-a")
+                .await;
+        }
+
+        assert!(
+            !backoff.states.lock().await.contains_key(&shell),
+            "a refused exec must not create a backoff record for the shell"
+        );
+        let started = Instant::now();
+        assert!(backoff.wait(&shell, &cancel).await);
+        assert!(
+            started.elapsed() < DIAL_FAILURE_INITIAL_BACKOFF,
+            "a refused exec must not delay a shell to the same peer"
+        );
+    }
+
+    /// Records must not accumulate for peers that are fine.
+    // Real time, deliberately: this backoff measures with std::time::Instant, so
+    // a paused tokio clock would not move it and would only make the waits spin.
+    #[tokio::test]
+    async fn recovered_and_idle_backoff_records_are_dropped() {
+        let backoff = FailureBackoff::new(
+            DIAL_FAILURE_INITIAL_BACKOFF,
+            DIAL_FAILURE_MAX_BACKOFF,
+            FAILURE_LOG_INTERVAL,
+        );
+        let cancel = CancellationToken::new();
+        let key = BackoffKey::dial("peer-a", shell::RESUMABLE_SHELL_ALPN);
+
+        backoff.record_failure(&key, "dial", &"boom").await;
+        assert_eq!(backoff.states.lock().await.len(), 1);
+
+        // A success drops its own record.
+        backoff.record_success(&key).await;
+        assert_eq!(backoff.states.lock().await.len(), 0);
+
+        // A record whose owner served its window and then stopped dialling ages
+        // out, so a stale streak cannot be charged to some later attempt.
+        backoff.record_failure(&key, "dial", &"boom").await;
+        assert!(backoff.wait(&key, &cancel).await);
+        assert_eq!(
+            backoff.states.lock().await.len(),
+            1,
+            "the record must survive its own backoff window"
+        );
+        tokio::time::sleep(DIAL_FAILURE_INITIAL_BACKOFF * 2).await;
+        assert!(backoff.wait(&key, &cancel).await);
+        assert_eq!(
+            backoff.states.lock().await.len(),
+            0,
+            "an aged-out record must not be retained"
+        );
+    }
+
     #[test]
     fn live_sessions_block_an_endpoint_recycle() {
         let idle = tunnel::ServerSessionStats::default();
@@ -4126,10 +4366,7 @@ mod tests {
         let absent = unroutable_peer(&home, &client, "absent").await?;
 
         let listeners_before = state.active_dial_listeners.load(Ordering::SeqCst);
-        let (failures_before, not_before_before) = {
-            let backoff = state.dial_failures.state.lock().await;
-            (backoff.consecutive_failures, backoff.not_before)
-        };
+        let records_before = state.dial_failures.states.lock().await.len();
 
         // A failing probe is the interesting case: a dial here would have
         // recorded a failure and parked every other peer's next attempt.
@@ -4143,17 +4380,14 @@ mod tests {
             listeners_before,
             "a probe must not install a dial listener"
         );
-        let (failures_after, not_before_after) = {
-            let backoff = state.dial_failures.state.lock().await;
-            (backoff.consecutive_failures, backoff.not_before)
-        };
+        let records_after = state.dial_failures.states.lock().await.len();
         assert_eq!(
-            failures_after, failures_before,
-            "a probe must not advance the shared dial backoff"
+            records_after, records_before,
+            "a probe must not record a dial failure for anyone"
         );
         assert_eq!(
-            not_before_after, not_before_before,
-            "a probe must not park other dials"
+            records_after, 0,
+            "a probe must leave no backoff record at all, so it cannot park any dial"
         );
 
         client.shutdown().await?;
@@ -4222,15 +4456,16 @@ mod tests {
         );
         let cancel = CancellationToken::new();
 
-        backoff.record_failure("test failure", &"boom").await;
+        let key = BackoffKey::dial("peer", b"fabric/echo/0");
+        backoff.record_failure(&key, "test failure", &"boom").await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(5), backoff.wait(&cancel))
+            tokio::time::timeout(Duration::from_millis(5), backoff.wait(&key, &cancel))
                 .await
                 .is_err(),
             "failed work should be parked instead of immediately retried"
         );
         assert!(
-            tokio::time::timeout(Duration::from_millis(250), backoff.wait(&cancel))
+            tokio::time::timeout(Duration::from_millis(250), backoff.wait(&key, &cancel))
                 .await
                 .expect("backoff did not clear")
         );
@@ -4245,10 +4480,11 @@ mod tests {
         );
         let cancel = CancellationToken::new();
 
-        backoff.record_failure("test failure", &"boom").await;
-        backoff.record_success().await;
+        let key = BackoffKey::dial("peer", b"fabric/echo/0");
+        backoff.record_failure(&key, "test failure", &"boom").await;
+        backoff.record_success(&key).await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(5), backoff.wait(&cancel))
+            tokio::time::timeout(Duration::from_millis(5), backoff.wait(&key, &cancel))
                 .await
                 .expect("success should clear backoff")
         );
@@ -4263,9 +4499,10 @@ mod tests {
         );
         let cancel = CancellationToken::new();
 
-        backoff.record_failure("test failure", &"boom").await;
+        let key = BackoffKey::dial("peer", b"fabric/echo/0");
+        backoff.record_failure(&key, "test failure", &"boom").await;
         cancel.cancel();
-        assert!(!backoff.wait(&cancel).await);
+        assert!(!backoff.wait(&key, &cancel).await);
     }
 
     #[tokio::test]
