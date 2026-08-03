@@ -108,8 +108,14 @@ impl ClientAttachGauge {
     }
 }
 
-/// Holds the gauge up for exactly as long as an attach lives, including when the
-/// attach ends by unwinding.
+/// Holds the gauge up while an attach is live AND its local input is still open.
+///
+/// Dropped by whichever comes first: the attach ending, or the local input
+/// reaching EOF. The second case is the one that matters. A remote teardown can
+/// stall — measured at over 40 seconds on Linux while the server still reported
+/// the session attached — and the endpoint-recycle guard must not be pinned for
+/// that whole time by a client that has stopped sending.
+#[derive(Debug)]
 struct ClientAttachGuard(Arc<ClientAttachGauge>);
 
 impl ClientAttachGuard {
@@ -283,6 +289,9 @@ struct TunnelState {
     local_write_closed: bool,
     pending_remote_close: Option<u64>,
     active_attaches: usize,
+    /// Live while this session's attach is up and its local input is still open.
+    /// Released early on local-input EOF; see ClientAttachGuard.
+    attach_gauge: Option<ClientAttachGuard>,
     last_detached: Option<Instant>,
     reconnect_attempts: u64,
     last_error: Option<String>,
@@ -399,6 +408,7 @@ impl TunnelSession {
                 local_write_closed: false,
                 pending_remote_close: None,
                 active_attaches: 0,
+                attach_gauge: None,
                 last_detached: None,
                 reconnect_attempts: 0,
                 last_error: None,
@@ -559,8 +569,30 @@ impl TunnelSession {
         if state.send_closed.is_none() {
             state.send_closed = Some(state.send_next);
         }
+        // The local side will send nothing further, so this session must stop
+        // holding off an endpoint recycle. It may still be READING queued remote
+        // output — a half-close is not a close — and that keeps working: only the
+        // recycle guard is released here, the session and its replay are untouched.
+        state.attach_gauge = None;
         drop(state);
         self.notify.notify_waiters();
+    }
+
+    /// Hold the recycle guard for this attach, unless the local input has already
+    /// finished, in which case there is nothing left to protect from a recycle.
+    async fn hold_attach_gauge(&self, gauge: Option<Arc<ClientAttachGauge>>) {
+        let Some(gauge) = gauge else {
+            return;
+        };
+        let mut state = self.state.lock().await;
+        if state.send_closed.is_none() {
+            state.attach_gauge = Some(ClientAttachGuard::new(gauge));
+        }
+    }
+
+    async fn release_attach_gauge(&self) {
+        let mut state = self.state.lock().await;
+        state.attach_gauge = None;
     }
 
     async fn apply_peer_ack(&self, recv_next: u64) {
@@ -1167,12 +1199,17 @@ async fn attach_connection(
         notices.emit(&session, ClientConnectionEvent::Resumed).await;
     }
 
-    // Held for the attached period only: the handshake above has succeeded, so
-    // this session is genuinely on a transport and a recycle would interrupt it.
-    let _attached = notices
-        .and_then(|notices| notices.gauge.clone())
-        .map(ClientAttachGuard::new);
-    session.run_attach(send, recv, recv_next).await
+    // Held for the attached period, and dropped earlier if the local input
+    // finishes first. Stored on the session so local-input EOF can release it
+    // without waiting for this attach to return.
+    session
+        .hold_attach_gauge(notices.and_then(|notices| notices.gauge.clone()))
+        .await;
+    let result = session.clone().run_attach(send, recv, recv_next).await;
+    // Between attaches nothing is held: a reconnecting session must not block a
+    // recycle, since a recycle may be exactly what lets it reconnect.
+    session.release_attach_gauge().await;
+    result
 }
 
 #[derive(Debug)]

@@ -5098,7 +5098,10 @@ mod tests {
     }
 
     /// Read framed shell output until `marker` appears.
-    async fn read_shell_marker(stream: &mut UnixStream, marker: &[u8]) -> Result<()> {
+    async fn read_shell_marker<R>(stream: &mut R, marker: &[u8]) -> Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
         let mut seen = Vec::new();
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
@@ -5184,6 +5187,208 @@ mod tests {
         good.shutdown().await?;
         server.shutdown().await?;
         Ok(())
+    }
+
+    /// A reconnecting session must not block the recycle that could restore it.
+    ///
+    /// This is the deadlock direction of the same guard: if a session whose
+    /// transport is down still pinned the endpoint, then the endpoint could never
+    /// be rebuilt, and rebuilding it may be exactly what lets that session
+    /// reconnect. The guard is therefore held per-attach, not per-session.
+    #[tokio::test]
+    async fn a_reconnecting_session_does_not_block_the_recycle() -> Result<()> {
+        let server_dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let server_home = FabricHome::new(server_dir.path());
+        let client_home = FabricHome::new(client_dir.path());
+        let server = FabricNode::start_with_options(server_home.clone(), true).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+
+        let state = client.state();
+        let socket = state
+            .dial_alpn(
+                "server",
+                shell::SHELL_PROTOCOL,
+                shell::RESUMABLE_SHELL_ALPN.to_vec(),
+                false,
+            )
+            .await?;
+        let mut shell_stream = UnixStream::connect(&socket).await?;
+        shell::write_client_stdin(&mut shell_stream, b"printf '%s-%s\n' recon up\n").await?;
+        read_shell_marker(&mut shell_stream, b"recon-up").await?;
+        assert_eq!(state.client_attaches.attached(), 1);
+
+        // Take the transport away and keep it away, so the session is genuinely
+        // between attaches rather than momentarily so. Stopping the peer is the
+        // deterministic way to do that: dropping the tunnel alone lets the client
+        // reattach within about 100ms and the window would be a race.
+        server.shutdown().await?;
+
+        // While it is reconnecting, the guard must be down.
+        let unheld = tokio::time::timeout(Duration::from_secs(20), async {
+            while state.client_attaches.attached() > 0 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        assert!(
+            unheld.is_ok(),
+            "a session between attaches must not hold the recycle guard"
+        );
+
+        // And the recycle it might need is therefore allowed.
+        let generation = state.endpoint_handle().generation;
+        let outcome = state
+            .recycle_endpoint_if_generation(generation, "reconnecting session")
+            .await?;
+        assert!(
+            matches!(outcome, EndpointRecycleOutcome::Recycled),
+            "a reconnecting session must not block the recycle, got {outcome:?}"
+        );
+
+        drop(shell_stream);
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    /// A half-closed local input releases the recycle guard, and the session
+    /// still delivers its remaining remote output across the recycle that
+    /// releasing allowed.
+    ///
+    /// This is the correction to a wrong assumption of mine. I first released the
+    /// guard when the whole attach returned, on the reasoning that a closed local
+    /// socket meant no user was left to protect. Two things were wrong with that.
+    /// The attach can stay up for a long time after the local side is done —
+    /// measured at over 40 seconds on Linux, with the server still reporting the
+    /// session attached, which pinned the endpoint-recycle guard for that whole
+    /// window and made endpoint repair impossible. And a client that has finished
+    /// SENDING may still be READING: a half-close is not a close, so the session
+    /// must keep working after the guard is released.
+    #[tokio::test]
+    async fn half_closed_local_input_releases_guard_and_still_delivers_output() -> Result<()> {
+        let server_dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let server_home = FabricHome::new(server_dir.path());
+        let client_home = FabricHome::new(client_dir.path());
+        let server = FabricNode::start_with_options(server_home.clone(), true).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+
+        let state = client.state();
+        let socket = state
+            .dial_alpn(
+                "server",
+                shell::SHELL_PROTOCOL,
+                shell::RESUMABLE_SHELL_ALPN.to_vec(),
+                false,
+            )
+            .await?;
+        let shell_stream = UnixStream::connect(&socket).await?;
+        let (mut read_half, mut write_half) = shell_stream.into_split();
+
+        shell::write_client_stdin(&mut write_half, b"printf '%s-%s\n' shell up\n").await?;
+        read_shell_marker(&mut read_half, b"shell-up").await?;
+
+        // PROOF 1: a live bidirectional local client blocks the recycle.
+        assert_eq!(state.client_attaches.attached(), 1);
+        let generation = state.endpoint_handle().generation;
+        let outcome = state
+            .recycle_endpoint_if_generation(generation, "half-close: still bidirectional")
+            .await?;
+        assert!(
+            matches!(outcome, EndpointRecycleOutcome::SessionsAttached { .. }),
+            "a live bidirectional local client must block the recycle, got {outcome:?}"
+        );
+
+        // Queue work whose output arrives AFTER the local input is finished, then
+        // half-close: stop sending, keep reading.
+        shell::write_client_stdin(
+            &mut write_half,
+            b"sleep 1; printf '%s-%s\n' delayed output\n",
+        )
+        .await?;
+        write_half.shutdown().await?;
+        drop(write_half);
+
+        // PROOF 2: local input EOF releases the guard, without waiting for the
+        // remote teardown that on Linux may not have happened at all.
+        //
+        // The bound is deliberately far below the remote's completion time. The
+        // queued command sleeps for a second before it prints, so the session
+        // cannot possibly have finished tearing down inside this window, and a
+        // release observed here can only have come from local-input EOF. Without
+        // that reasoning the check is not load-bearing at all: on macOS the remote
+        // tears down in about 300ms, so a generous timeout passes either way, which
+        // is exactly how I first failed to notice this assertion proved nothing.
+        let release_bound = Duration::from_millis(500);
+        let release_started = Instant::now();
+        let released = tokio::time::timeout(release_bound, async {
+            while state.client_attaches.attached() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "local input EOF must release the recycle guard within {release_bound:?} \
+             regardless of remote teardown; still held after {:?}",
+            release_started.elapsed()
+        );
+
+        // The recycle that releasing allowed now proceeds.
+        let outcome = state
+            .recycle_endpoint_if_generation(generation, "half-close: input finished")
+            .await?;
+        assert!(
+            matches!(outcome, EndpointRecycleOutcome::Recycled),
+            "with local input finished the recycle must proceed, got {outcome:?}"
+        );
+
+        // PROOF 3: the half-closed reader still receives the delayed output, and
+        // receives it exactly once, across the recycle it just permitted.
+        let mut seen = Vec::new();
+        let read_result = tokio::time::timeout(Duration::from_secs(45), async {
+            loop {
+                match shell::read_server_frame(&mut read_half).await {
+                    Ok(Some(shell::ServerFrame::Output(bytes))) => seen.extend_from_slice(&bytes),
+                    Ok(Some(shell::ServerFrame::Exit(_))) | Ok(None) => return Ok(()),
+                    Ok(Some(shell::ServerFrame::Status(_))) => {}
+                    Ok(Some(shell::ServerFrame::Error(error))) => {
+                        return Err(anyhow::anyhow!("shell error: {error}"));
+                    }
+                    Err(error) => return Err(error),
+                }
+                if count_occurrences(&seen, b"delayed-output") > 0 {
+                    // Keep draining briefly to catch a duplicate rather than
+                    // returning at the first sighting.
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        })
+        .await;
+        let text = String::from_utf8_lossy(&seen).into_owned();
+        let occurrences = count_occurrences(&seen, b"delayed-output");
+        assert_eq!(
+            occurrences, 1,
+            "delayed output must arrive exactly once across the recycle, saw {occurrences} in {text:?} (read result: {read_result:?})"
+        );
+
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+        if needle.is_empty() || haystack.len() < needle.len() {
+            return 0;
+        }
+        haystack
+            .windows(needle.len())
+            .filter(|w| *w == needle)
+            .count()
     }
 
     /// One peer's success must not clear another peer's failure record on the
