@@ -483,6 +483,35 @@ Older default-home installs may have peer entries in
 Fabric migrates those entries to `~/.config/fabric/peers.toml`; an existing
 canonical `peers.toml` wins.
 
+Connection counters live in `<home>/telemetry.json`. They are counters, not
+state the product depends on, so an unreadable file starts the counts over and
+says so rather than stopping the daemon. Delete the file to reset the counts.
+
+### Did my session actually come back?
+
+`fabric status` answers this from counters that survive a daemon restart:
+
+```text
+sessions
+  hetz	lost=4 resumed=4 failed=0 attempts=7 reconnect_p50=2.0s reconnect_max=4.5s
+    lost_on=direct=3,relay=1 resumed_on=direct=2,relay=2
+```
+
+Read the pair, not either number alone: 4 resumed out of 4 lost and 4 out of 40
+are very different systems. `attempts` counts every retry, so it exceeds `lost`
+whenever a break needed more than one try. `reconnect_p50` is the measured time
+from the loss to the resume, which is not the retry backoff delay the log line
+reports. The percentiles come from bounded histogram buckets, so they are
+approximate and never exceed the largest sample seen; `reconnect_max` is exact.
+
+The path breakdown answers "came back how". A session lost on `direct` that
+resumes on `relay` is fabric falling back correctly. If that becomes the normal
+outcome for a peer, the direct path to it is unhealthy even though the peer
+still reports reachable.
+
+A peer with no recorded loss is omitted, and `sessions no losses recorded`
+means nothing has dropped since the counters were last reset.
+
 ## Developing Fabric (dev vs prod)
 
 A production fabric daemon is often load-bearing (it may be your only path to a

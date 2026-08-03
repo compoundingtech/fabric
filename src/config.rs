@@ -147,6 +147,12 @@ impl FabricHome {
         self.root.join("config.toml")
     }
 
+    /// Durable connection counters. State, not config, so this lives under the
+    /// state root and never under the config dir that `peers.toml` uses.
+    pub fn telemetry_path(&self) -> PathBuf {
+        self.root.join("telemetry.json")
+    }
+
     fn existing_peers_path(&self) -> Option<PathBuf> {
         if self.peer_config_path.exists() {
             return Some(self.peer_config_path.clone());

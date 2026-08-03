@@ -14,6 +14,7 @@ pub mod pathwatch;
 pub mod service;
 pub mod shell;
 pub mod sync;
+pub mod telemetry;
 pub mod terminal;
 mod tunnel;
 

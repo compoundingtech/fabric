@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+use crate::telemetry::PeerTelemetry;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -101,6 +104,10 @@ pub enum ControlResponse {
         #[serde(default)]
         allow_exec: bool,
         peers: Vec<PeerReachability>,
+        /// Durable loss/resume counters, keyed by peer label. Defaulted so an
+        /// older client still decodes a newer daemon's reply.
+        #[serde(default)]
+        connection_telemetry: BTreeMap<String, PeerTelemetry>,
     },
     Restarting {
         log: PathBuf,

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, OpenOptions},
     io::IsTerminal,
     path::PathBuf,
@@ -22,6 +23,7 @@ use fabric::{
     service::{self, ServiceInstallOptions},
     shell::{self, ServerFrame},
     sync::config::{SyncBook, SyncEntry, SyncPeers, SyncPolicy},
+    telemetry::PeerTelemetry,
     terminal::TerminalModeGuard,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -354,6 +356,7 @@ async fn main() -> Result<()> {
                             allow_shell,
                             allow_exec,
                             peers,
+                            connection_telemetry,
                         } => {
                             print_status(
                                 &version,
@@ -364,6 +367,7 @@ async fn main() -> Result<()> {
                                 allow_shell,
                                 allow_exec,
                                 &peers,
+                                &connection_telemetry,
                             )?;
                         }
                         response => bail!("unexpected daemon response: {response:?}"),
@@ -909,6 +913,89 @@ fn logical_present(entry: &fabric::control::SyncEntryStatus) -> usize {
 }
 
 #[cfg(test)]
+mod connection_telemetry_tests {
+    use super::*;
+    use fabric::telemetry::LatencySummary;
+
+    fn peer_with_losses() -> PeerTelemetry {
+        let mut reconnect = LatencySummary::default();
+        reconnect.record(1_500_000);
+        reconnect.record(1_900_000);
+        reconnect.record(4_500_000);
+        reconnect.record(1_800_000);
+        PeerTelemetry {
+            losses: 4,
+            resumes: 4,
+            resume_failures: 0,
+            reconnect_attempts: 7,
+            reconnect,
+            losses_by_path: BTreeMap::from([("direct".to_string(), 3), ("relay".to_string(), 1)]),
+            resumes_by_path: BTreeMap::from([("direct".to_string(), 2), ("relay".to_string(), 2)]),
+            ..PeerTelemetry::default()
+        }
+    }
+
+    /// The README shows this shape and tells an operator how to read it, so a
+    /// silent rename here would make the documentation wrong.
+    #[test]
+    fn the_rendered_shape_matches_the_documented_one() {
+        let telemetry = BTreeMap::from([("hetz".to_string(), peer_with_losses())]);
+        let lines = connection_telemetry_lines(&telemetry);
+        assert_eq!(lines[0], "sessions");
+        assert_eq!(
+            lines[1],
+            // p50 is a bucket bound, because a histogram cannot report better
+            // than its bucket. The max is the exact largest sample seen.
+            "  hetz\tlost=4 resumed=4 failed=0 attempts=7 reconnect_p50=2.0s reconnect_max=4.5s"
+        );
+        assert_eq!(
+            lines[2],
+            "    lost_on=direct=3,relay=1 resumed_on=direct=2,relay=2"
+        );
+    }
+
+    /// A peer that never dropped must not appear, or a healthy mesh reads as a
+    /// wall of zeroes and the peers that did drop stop standing out.
+    #[test]
+    fn a_peer_with_no_loss_is_omitted() {
+        let telemetry = BTreeMap::from([
+            ("quiet".to_string(), PeerTelemetry::default()),
+            ("hetz".to_string(), peer_with_losses()),
+        ]);
+        let lines = connection_telemetry_lines(&telemetry);
+        assert!(lines.iter().all(|line| !line.contains("quiet")));
+        assert!(lines.iter().any(|line| line.contains("hetz")));
+    }
+
+    #[test]
+    fn no_losses_at_all_says_so_rather_than_printing_an_empty_heading() {
+        let lines = connection_telemetry_lines(&BTreeMap::new());
+        assert_eq!(lines, vec!["sessions\tno losses recorded".to_string()]);
+    }
+
+    /// A loss that never came back has no duration, and a dash is honest where
+    /// `0.0s` would read as an instant recovery.
+    #[test]
+    fn an_unfinished_reconnect_reports_a_dash_not_zero() {
+        let telemetry = BTreeMap::from([(
+            "bluey".to_string(),
+            PeerTelemetry {
+                losses: 1,
+                resume_failures: 1,
+                reconnect_attempts: 3,
+                ..PeerTelemetry::default()
+            },
+        )]);
+        let lines = connection_telemetry_lines(&telemetry);
+        assert!(
+            lines[1].contains("reconnect_p50=- reconnect_max=-"),
+            "unexpected line: {}",
+            lines[1]
+        );
+    }
+}
+
+#[cfg(test)]
 mod sync_ls_tests {
     use super::*;
     use fabric::control::SyncEntryStatus;
@@ -1037,6 +1124,7 @@ fn print_status(
     allow_shell: bool,
     allow_exec: bool,
     peers: &[PeerReachability],
+    connection_telemetry: &BTreeMap<String, PeerTelemetry>,
 ) -> Result<()> {
     println!("version\t{version}");
     println!("node\t{node_id}");
@@ -1053,7 +1141,71 @@ fn print_status(
     );
     println!("exec\t{}", if allow_exec { "allowed" } else { "disabled" });
     print_peer_reachability(peers);
+    print_connection_telemetry(connection_telemetry);
     Ok(())
+}
+
+/// Report what the counters know about losing and regaining a transport.
+///
+/// The point of the line is the pair: a resume count on its own cannot say
+/// whether resumption works, because 9 resumes out of 10 losses and 9 out of 90
+/// are very different systems. The path breakdown answers "came back how", and
+/// the measured median answers "came back how fast".
+fn print_connection_telemetry(telemetry: &BTreeMap<String, PeerTelemetry>) {
+    for line in connection_telemetry_lines(telemetry) {
+        println!("{line}");
+    }
+}
+
+fn connection_telemetry_lines(telemetry: &BTreeMap<String, PeerTelemetry>) -> Vec<String> {
+    let recorded: Vec<_> = telemetry
+        .iter()
+        .filter(|(_, stats)| stats.losses > 0 || stats.resumes > 0 || stats.resume_failures > 0)
+        .collect();
+    if recorded.is_empty() {
+        return vec!["sessions\tno losses recorded".to_string()];
+    }
+
+    let mut lines = vec!["sessions".to_string()];
+    for (peer, stats) in recorded {
+        let median = stats
+            .reconnect
+            .quantile_micros(0.5)
+            .map(format_seconds)
+            .unwrap_or_else(|| "-".to_string());
+        let worst = if stats.reconnect.samples > 0 {
+            format_seconds(stats.reconnect.max_micros)
+        } else {
+            "-".to_string()
+        };
+        lines.push(format!(
+            "  {peer}\tlost={} resumed={} failed={} attempts={} reconnect_p50={median} reconnect_max={worst}",
+            stats.losses, stats.resumes, stats.resume_failures, stats.reconnect_attempts
+        ));
+        if !stats.losses_by_path.is_empty() || !stats.resumes_by_path.is_empty() {
+            lines.push(format!(
+                "    lost_on={} resumed_on={}",
+                format_path_counts(&stats.losses_by_path),
+                format_path_counts(&stats.resumes_by_path)
+            ));
+        }
+    }
+    lines
+}
+
+fn format_seconds(micros: u64) -> String {
+    format!("{:.1}s", micros as f64 / 1_000_000.0)
+}
+
+fn format_path_counts(counts: &BTreeMap<String, u64>) -> String {
+    if counts.is_empty() {
+        return "-".to_string();
+    }
+    counts
+        .iter()
+        .map(|(path, count)| format!("{path}={count}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 async fn print_daemon_reachability(home: &FabricHome) -> Result<()> {
