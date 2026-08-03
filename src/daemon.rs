@@ -213,11 +213,35 @@ impl FailureBackoff {
         Self::prune(&mut states, now);
     }
 
+    /// Record a failure that also delays this key's next attempt.
     async fn record_failure(
         &self,
         key: &BackoffKey,
         label: &str,
         error: &(dyn fmt::Display + Sync),
+    ) {
+        self.record_failure_inner(key, label, error, true).await
+    }
+
+    /// Record a failure for the rate-limited log only.
+    ///
+    /// Inbound connections use this: their outcome must not gate the next accept,
+    /// so saying "backing off" would describe a delay that does not happen.
+    async fn record_failure_for_diagnostics(
+        &self,
+        key: &BackoffKey,
+        label: &str,
+        error: &(dyn fmt::Display + Sync),
+    ) {
+        self.record_failure_inner(key, label, error, false).await
+    }
+
+    async fn record_failure_inner(
+        &self,
+        key: &BackoffKey,
+        label: &str,
+        error: &(dyn fmt::Display + Sync),
+        delays_next_attempt: bool,
     ) {
         let (delay, consecutive_failures, suppressed, should_log) = {
             let now = Instant::now();
@@ -245,13 +269,18 @@ impl FailureBackoff {
         };
 
         if should_log {
+            let consequence = if delays_next_attempt {
+                format!("backing off for {delay:?}")
+            } else {
+                "not delaying anything else".to_string()
+            };
             if suppressed > 0 {
                 eprintln!(
-                    "fabric: {label}: {error}; backing off for {delay:?} after {consecutive_failures} consecutive failures ({suppressed} similar failures suppressed)"
+                    "fabric: {label}: {error}; {consequence} after {consecutive_failures} consecutive failures ({suppressed} similar failures suppressed)"
                 );
             } else {
                 eprintln!(
-                    "fabric: {label}: {error}; backing off for {delay:?} after {consecutive_failures} consecutive failures"
+                    "fabric: {label}: {error}; {consequence} after {consecutive_failures} consecutive failures"
                 );
             }
         }
@@ -2745,14 +2774,14 @@ fn peers_display(peers: &SyncPeers) -> String {
 async fn run_iroh_accept_loop(state: Arc<DaemonState>) -> Result<()> {
     let mut endpoint_rx = state.endpoint_rx();
     loop {
-        let accept_key = BackoffKey::accept_loop();
-        if !state
-            .incoming_failures
-            .wait(&accept_key, &state.cancel)
-            .await
-        {
-            break;
-        }
+        // Deliberately no failure gate here. One peer's rejected handshake is not
+        // a reason to stop accepting from everyone else, and a shared gate made
+        // that escalate: the more one peer failed, the longer every healthy peer
+        // waited to be let in. Concurrency is bounded by the permit acquired just
+        // below and held for the handler's life, so a flood of failing
+        // connections is capped by handler slots rather than by a delay. The real
+        // stop conditions are still below: a closed accept stream and
+        // cancellation.
         let endpoint = endpoint_rx.borrow().clone();
         let permit = tokio::select! {
             _ = state.cancel.cancelled() => break,
@@ -2787,18 +2816,22 @@ async fn handle_incoming_iroh(
     state: Arc<DaemonState>,
     _permit: OwnedSemaphorePermit,
 ) {
-    match process_incoming_iroh(incoming, state.clone()).await {
+    let mut identity = IncomingIdentity::default();
+    match process_incoming_iroh(incoming, state.clone(), &mut identity).await {
         Ok(()) => {
             state
                 .incoming_failures
-                .record_success(&BackoffKey::accept_loop())
+                .record_success(&identity.backoff_key())
                 .await
         }
         Err(error) => {
+            // Recorded for the rate-limited log only. Nothing waits on inbound
+            // records, which is what keeps an unidentified connection from
+            // throttling anything: there is no gate left for it to hold.
             state
                 .incoming_failures
-                .record_failure(
-                    &BackoffKey::accept_loop(),
+                .record_failure_for_diagnostics(
+                    &identity.backoff_key(),
                     "incoming iroh connection failed",
                     &error,
                 )
@@ -2807,9 +2840,40 @@ async fn handle_incoming_iroh(
     }
 }
 
-async fn process_incoming_iroh(incoming: Incoming, state: Arc<DaemonState>) -> Result<()> {
+/// What we know about an inbound connection, as we learn it.
+///
+/// A connection can fail before its ALPN is readable, and its peer id is only
+/// known once the handshake completes, so diagnostics have to work with partial
+/// identity rather than waiting for all of it.
+#[derive(Debug, Default)]
+struct IncomingIdentity {
+    alpn: Option<String>,
+    peer: Option<String>,
+}
+
+impl IncomingIdentity {
+    fn backoff_key(&self) -> BackoffKey {
+        BackoffKey {
+            peer: self
+                .peer
+                .clone()
+                .unwrap_or_else(|| "<unidentified>".to_string()),
+            alpn: self
+                .alpn
+                .clone()
+                .unwrap_or_else(|| "<unnegotiated>".to_string()),
+        }
+    }
+}
+
+async fn process_incoming_iroh(
+    incoming: Incoming,
+    state: Arc<DaemonState>,
+    identity: &mut IncomingIdentity,
+) -> Result<()> {
     let mut accepting = incoming.accept()?;
     let alpn = accepting.alpn().await?;
+    identity.alpn = Some(String::from_utf8_lossy(&alpn).to_string());
     if alpn == BUILTIN_ECHO_ALPN {
         let connection = accepting.await?;
         log_connection_paths("builtin_echo_accept", &connection);
@@ -5047,6 +5111,120 @@ mod tests {
                 String::from_utf8_lossy(marker)
             )
         })?
+    }
+
+    /// One peer's rejected handshakes must not delay accepting a healthy peer.
+    ///
+    /// The accept loop used to wait on a single shared failure record before it
+    /// called accept at all, and every handler charged that same record. So an
+    /// untrusted peer hammering the door escalated a delay that healthy peers
+    /// then queued behind. Per-connection outcomes now bound nothing but their own
+    /// diagnostics.
+    #[tokio::test]
+    async fn rejected_inbound_connections_do_not_delay_a_healthy_peer() -> Result<()> {
+        let server_dir = tempfile::tempdir()?;
+        let good_dir = tempfile::tempdir()?;
+        let server_home = FabricHome::new(server_dir.path());
+        let good_home = FabricHome::new(good_dir.path());
+        let server = FabricNode::start(server_home.clone()).await?;
+        let good = FabricNode::start(good_home.clone()).await?;
+        trust_test_peer(&server_home, &server, good.id(), "good", good.addr()).await?;
+        trust_test_peer(&good_home, &good, server.id(), "server", server.addr()).await?;
+
+        // Baseline the healthy path before adding pressure. The assertion below is
+        // relative to this, because any gate on the accept loop must add at least
+        // one whole backoff step on top of a normal accept.
+        good.state().ping("server").await?;
+        let started = Instant::now();
+        good.state().ping("server").await?;
+        let baseline = started.elapsed();
+
+        // An untrusted endpoint: its handshakes are genuinely rejected by the
+        // allow-list, so these are real inbound failures and not simulated ones.
+        let intruder = Endpoint::bind(iroh::endpoint::presets::N0).await?;
+        intruder.online().await;
+        for _ in 0..6 {
+            // Drive each rejection to completion, so any escalation the old code
+            // would have recorded has definitely been recorded before we measure.
+            let attempt = intruder.connect(server.addr(), BUILTIN_ECHO_ALPN).await;
+            if let Ok(connection) = attempt {
+                let _ = connection.open_bi().await;
+                connection.close(0u32.into(), b"done");
+            }
+        }
+
+        // The healthy peer is let in without queueing behind that.
+        let started = Instant::now();
+        good.state().ping("server").await?;
+        let waited = started.elapsed();
+        assert!(
+            waited < baseline + INCOMING_FAILURE_INITIAL_BACKOFF,
+            "a healthy peer waited {waited:?} behind another peer's rejected handshakes, \
+             against a {baseline:?} baseline; a gate on the accept loop would add at \
+             least one {INCOMING_FAILURE_INITIAL_BACKOFF:?} step"
+        );
+
+        intruder.close().await;
+        good.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// Sustained inbound failure must stay bounded in both concurrency and log
+    /// volume.
+    ///
+    /// Removing the accept gate must not trade a delay for an unbounded spin, so
+    /// this is the control for that: handlers stay inside the semaphore's capacity
+    /// and the failure log keeps suppressing instead of emitting a line each time.
+    #[tokio::test]
+    async fn sustained_inbound_failure_stays_bounded() -> Result<()> {
+        let server_dir = tempfile::tempdir()?;
+        let server_home = FabricHome::new(server_dir.path());
+        let server = FabricNode::start(server_home.clone()).await?;
+        let state = server.state();
+
+        let intruder = Endpoint::bind(iroh::endpoint::presets::N0).await?;
+        intruder.online().await;
+
+        let mut peak_in_flight = 0usize;
+        for _ in 0..24 {
+            let attempt = intruder.connect(server.addr(), BUILTIN_ECHO_ALPN).await;
+            if let Ok(connection) = attempt {
+                let _ = connection.open_bi().await;
+                connection.close(0u32.into(), b"done");
+            }
+            peak_in_flight = peak_in_flight.max(
+                MAX_INCOMING_HANDLERS.saturating_sub(state.incoming_slots.available_permits()),
+            );
+        }
+
+        assert!(
+            peak_in_flight <= MAX_INCOMING_HANDLERS,
+            "in-flight handlers {peak_in_flight} exceeded the semaphore capacity"
+        );
+
+        // Log pressure: the suppression window is doing its job rather than
+        // emitting one line per rejection.
+        let records = state.incoming_failures.states.lock().await;
+        let logged_and_suppressed: Vec<_> = records
+            .values()
+            .map(|record| (record.consecutive_failures, record.suppressed))
+            .collect();
+        drop(records);
+        if let Some((failures, suppressed)) = logged_and_suppressed
+            .iter()
+            .copied()
+            .max_by_key(|(failures, _)| *failures)
+        {
+            assert!(
+                failures <= 1 || suppressed > 0,
+                "repeated inbound failures must be rate-limited: {failures} failures, {suppressed} suppressed"
+            );
+        }
+
+        intruder.close().await;
+        server.shutdown().await?;
+        Ok(())
     }
 
     /// The whole audit in one place: two peers, two concurrent sessions of
