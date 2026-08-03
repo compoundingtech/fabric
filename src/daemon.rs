@@ -5809,14 +5809,19 @@ mod tests {
             &server_state,
         )
         .await;
-        eprintln!(
-            "DIAG outcome released={} elapsed_ms={}",
+        let srv_after = server_state.tunnel_sessions.stats().await;
+        // Deliberate failure so the numbers reach the CI log: cargo only shows a
+        // test's captured output when it fails, and the previous Linux run passed,
+        // which hid the very timing this branch exists to measure.
+        panic!(
+            "DIAG-FORCED released={} elapsed_ms={} client_gauge={} srv_active_attaches={} srv_detached={} srv_complete={} srv_done={}",
             released.is_ok(),
-            release_started.elapsed().as_millis()
-        );
-        assert!(
-            released.is_ok(),
-            "the gauge must release when an outbound session ends, or a recycle can never run again"
+            release_started.elapsed().as_millis(),
+            state.client_attaches.attached(),
+            srv_after.active_attaches,
+            srv_after.detached_sessions,
+            srv_after.complete_sessions,
+            srv_after.done_sessions,
         );
         let outcome = state
             .recycle_endpoint_if_generation(generation, "audit: no outbound session")
