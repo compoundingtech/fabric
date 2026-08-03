@@ -6145,31 +6145,30 @@ mod tests {
     }
 
     /// The SERVER must stop counting a session as attached once the client's
-    /// local end goes away. Issue 32.
+    /// local end goes away.
     ///
     /// The test above proves the client releases its own gauge. It says nothing
-    /// about the far end, and the far end was the stall: a forced trace showed
-    /// the server still reporting one active attach 40 seconds after the client
-    /// dropped its socket, while macOS detached in about 53 milliseconds.
+    /// about the far end, and the far end is what pins the server's endpoint.
+    /// This asserts the far end, on a quiet tunnel so no remote output can end
+    /// the session by a second route.
     ///
-    /// The cause was never a slow path. A dropped socket reads as a clean EOF on
-    /// macOS and as an error on Linux, and only the EOF branch recorded the send
-    /// close that makes the writer emit `Frame::Close`. With no such frame the
-    /// server waits for bytes that can never arrive.
+    /// **This is NOT a regression guard for issue 32, and it was wrong to
+    /// present it as one.** Issue 32 lives in the branch where the local read
+    /// returns an ERROR, and dropping a `UnixStream` in-process closes it
+    /// cleanly, so both platforms take the EOF branch here. I confirmed that on
+    /// Linux CI twice: with the pre-fix teardown restored, this test passed,
+    /// first with a shell and then with this quiet tunnel. Reaching the error
+    /// branch needs an abrupt close such as a killed process or an RST, which is
+    /// how the original trace produced it.
     ///
-    /// **The exposed service must stay silent, and that is the whole design of
-    /// this test.** A first version used a shell and passed on Linux even with
-    /// the defect present, which made it worthless as a guard. A shell streams
-    /// output back, so the dropped local socket fails on the next WRITE and
-    /// tears the session down by a second route that hides the missing frame.
-    /// The original trace was a quiet tunnel, and only a quiet tunnel isolates
-    /// the defect: with nothing to write back, the missing close frame is the
-    /// only thing that could end the session.
-    ///
-    /// On macOS this passes either way, because macOS always took the branch
-    /// that worked. Linux is where it earns its place.
+    /// The real guard for issue 32 is
+    /// `tunnel::tests::an_abrupt_local_close_reports_the_end_just_like_a_clean_eof`,
+    /// which injects the ending directly and therefore fails on every platform
+    /// when the defect is present. What this test still earns is the healthy
+    /// path: a clean local close must detach the session on the server promptly,
+    /// and that must not regress.
     #[tokio::test]
-    async fn a_dropped_local_end_detaches_a_quiet_session_on_the_server_too() -> Result<()> {
+    async fn a_clean_local_close_detaches_a_quiet_session_on_the_server_too() -> Result<()> {
         let server_dir = tempfile::tempdir()?;
         let client_dir = tempfile::tempdir()?;
         let server_home = FabricHome::new(server_dir.path());
