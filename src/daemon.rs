@@ -2866,6 +2866,22 @@ impl IncomingIdentity {
     }
 }
 
+/// Complete the handshake and record who it turned out to be.
+///
+/// The peer id only exists once the handshake completes, so this is the single
+/// seam where an inbound connection stops being anonymous. Every branch below
+/// goes through it, because a diagnostic record keyed on an unknown peer is
+/// shared with every other unknown peer on the same ALPN — which means one
+/// peer's success would clear another's failure record.
+async fn handshake_and_identify(
+    accepting: iroh::endpoint::Accepting,
+    identity: &mut IncomingIdentity,
+) -> Result<Connection> {
+    let connection = accepting.await?;
+    identity.peer = Some(connection.remote_id().to_string());
+    Ok(connection)
+}
+
 async fn process_incoming_iroh(
     incoming: Incoming,
     state: Arc<DaemonState>,
@@ -2875,31 +2891,31 @@ async fn process_incoming_iroh(
     let alpn = accepting.alpn().await?;
     identity.alpn = Some(String::from_utf8_lossy(&alpn).to_string());
     if alpn == BUILTIN_ECHO_ALPN {
-        let connection = accepting.await?;
+        let connection = handshake_and_identify(accepting, identity).await?;
         log_connection_paths("builtin_echo_accept", &connection);
         handle_builtin_echo(connection, state).await?;
         return Ok(());
     }
     if alpn == shell::SHELL_ALPN {
-        let connection = accepting.await?;
+        let connection = handshake_and_identify(accepting, identity).await?;
         log_connection_paths("builtin_legacy_shell_accept", &connection);
         handle_builtin_legacy_shell(connection, state).await?;
         return Ok(());
     }
     if alpn == shell::RESUMABLE_SHELL_ALPN {
-        let connection = accepting.await?;
+        let connection = handshake_and_identify(accepting, identity).await?;
         log_connection_paths("builtin_resumable_shell_accept", &connection);
         handle_builtin_resumable_shell(connection, state).await?;
         return Ok(());
     }
     if alpn == exec::EXEC_ALPN {
-        let connection = accepting.await?;
+        let connection = handshake_and_identify(accepting, identity).await?;
         log_connection_paths("builtin_exec_accept", &connection);
         handle_builtin_exec(connection, state).await?;
         return Ok(());
     }
     if alpn == SYNC_ALPN {
-        let connection = accepting.await?;
+        let connection = handshake_and_identify(accepting, identity).await?;
         log_sync_connection_paths(&connection);
         handle_sync(connection, state).await?;
         return Ok(());
@@ -2913,7 +2929,7 @@ async fn process_incoming_iroh(
         return Ok(());
     };
 
-    let connection = accepting.await?;
+    let connection = handshake_and_identify(accepting, identity).await?;
     log_connection_paths("tunnel_accept", &connection);
     if state.tunnel_blocked.load(Ordering::SeqCst) {
         connection.close(0u32.into(), b"fabric tunnel blocked");
@@ -5166,6 +5182,110 @@ mod tests {
 
         intruder.close().await;
         good.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// Two peers using the same ALPN must keep independent diagnostic records.
+    ///
+    /// This exists because the first version of this work recorded the ALPN but
+    /// never the peer, so every inbound record keyed on <unidentified> and one
+    /// peer's success cleared another's failure record for the same protocol.
+    ///
+    /// The load-bearing assertion is that a TRUSTED peer whose handler fails after
+    /// a completed handshake produces a record keyed on its real endpoint id. An
+    /// earlier draft of this test only checked that an untrusted peer's failures
+    /// were not charged to a known peer, which passed with the bug still in place:
+    /// with no identity recorded the known peer simply never appeared anywhere.
+    #[tokio::test]
+    async fn two_peers_on_one_alpn_keep_independent_inbound_records() -> Result<()> {
+        let server_dir = tempfile::tempdir()?;
+        let server_home = FabricHome::new(server_dir.path());
+        let server = FabricNode::start(server_home.clone()).await?;
+        let state = server.state();
+
+        // A TRUSTED endpoint, so its handshake completes and its identity is
+        // knowable, which then fails its handler by opening a sync stream and
+        // closing without a hello.
+        let trusted = Endpoint::bind(iroh::endpoint::presets::N0).await?;
+        trusted.online().await;
+        trust_test_peer(
+            &server_home,
+            &server,
+            trusted.id(),
+            "trusted-raw",
+            trusted.addr(),
+        )
+        .await?;
+
+        // The echo handler propagates its errors, unlike sync which logs and
+        // returns Ok, so closing before opening a stream makes accept_bi fail and
+        // that failure is attributable.
+        for _ in 0..3 {
+            if let Ok(connection) = trusted.connect(server.addr(), BUILTIN_ECHO_ALPN).await {
+                connection.close(0u32.into(), b"no stream");
+                connection.closed().await;
+            }
+        }
+
+        // THE ASSERTION THAT MATTERS: the record names the peer that failed.
+        let recorded: Vec<BackoffKey> = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let keys: Vec<BackoffKey> = state
+                    .incoming_failures
+                    .states
+                    .lock()
+                    .await
+                    .keys()
+                    .cloned()
+                    .collect();
+                if !keys.is_empty() {
+                    return keys;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .context("no inbound failure was ever recorded")?;
+
+        let expected_peer = trusted.id().to_string();
+        assert!(
+            recorded.iter().any(|key| key.peer == expected_peer),
+            "a failure after a completed handshake must be attributed to its peer; \
+             recorded {recorded:?}, expected peer {expected_peer}"
+        );
+        assert!(
+            recorded
+                .iter()
+                .all(|key| key.peer != "<unidentified>" || key.peer == expected_peer),
+            "an identified peer's failure must not land on the unidentified key: {recorded:?}"
+        );
+
+        // An untrusted peer on the SAME ALPN cannot complete a handshake, so it is
+        // recorded separately and cannot clear the trusted peer's record.
+        let intruder = Endpoint::bind(iroh::endpoint::presets::N0).await?;
+        intruder.online().await;
+        for _ in 0..3 {
+            if let Ok(connection) = intruder.connect(server.addr(), BUILTIN_ECHO_ALPN).await {
+                let _ = connection.open_bi().await;
+                connection.close(0u32.into(), b"done");
+            }
+        }
+        let after: Vec<BackoffKey> = state
+            .incoming_failures
+            .states
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect();
+        assert!(
+            after.iter().any(|key| key.peer == expected_peer),
+            "an unidentified peer's traffic must not clear an identified peer's record: {after:?}"
+        );
+
+        intruder.close().await;
+        trusted.close().await;
         server.shutdown().await?;
         Ok(())
     }
