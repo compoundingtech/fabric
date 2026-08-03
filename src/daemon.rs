@@ -5186,50 +5186,68 @@ mod tests {
         Ok(())
     }
 
-    /// Two peers using the same ALPN must keep independent diagnostic records.
+    /// One peer's success must not clear another peer's failure record on the
+    /// same ALPN.
     ///
-    /// This exists because the first version of this work recorded the ALPN but
-    /// never the peer, so every inbound record keyed on <unidentified> and one
-    /// peer's success cleared another's failure record for the same protocol.
+    /// record_success removes a key, so if inbound records are not keyed per peer
+    /// then any peer completing a connection wipes every other peer's diagnostic
+    /// history for that protocol. That is what happened before identity.peer was
+    /// assigned: every record landed on <unidentified> and they all shared one
+    /// entry.
     ///
-    /// The load-bearing assertion is that a TRUSTED peer whose handler fails after
-    /// a completed handshake produces a record keyed on its real endpoint id. An
-    /// earlier draft of this test only checked that an untrusted peer's failures
-    /// were not charged to a known peer, which passed with the bug still in place:
-    /// with no identity recorded the known peer simply never appeared anywhere.
+    /// Both endpoints here are TRUSTED and use the same ALPN, because that is the
+    /// only arrangement that exercises the clearing path. An earlier version of
+    /// this test used a failing untrusted peer as the second party, which never
+    /// calls record_success and so never tested the boundary it claimed to.
     #[tokio::test]
-    async fn two_peers_on_one_alpn_keep_independent_inbound_records() -> Result<()> {
+    async fn one_peers_success_does_not_clear_another_peers_inbound_record() -> Result<()> {
         let server_dir = tempfile::tempdir()?;
         let server_home = FabricHome::new(server_dir.path());
         let server = FabricNode::start(server_home.clone()).await?;
         let state = server.state();
 
-        // A TRUSTED endpoint, so its handshake completes and its identity is
-        // knowable, which then fails its handler by opening a sync stream and
-        // closing without a hello.
-        let trusted = Endpoint::bind(iroh::endpoint::presets::N0).await?;
-        trusted.online().await;
+        let failing = Endpoint::bind(iroh::endpoint::presets::N0).await?;
+        let succeeding = Endpoint::bind(iroh::endpoint::presets::N0).await?;
+        failing.online().await;
+        succeeding.online().await;
         trust_test_peer(
             &server_home,
             &server,
-            trusted.id(),
-            "trusted-raw",
-            trusted.addr(),
+            failing.id(),
+            "peer-failing",
+            failing.addr(),
+        )
+        .await?;
+        trust_test_peer(
+            &server_home,
+            &server,
+            succeeding.id(),
+            "peer-succeeding",
+            succeeding.addr(),
         )
         .await?;
 
-        // The echo handler propagates its errors, unlike sync which logs and
-        // returns Ok, so closing before opening a stream makes accept_bi fail and
-        // that failure is attributable.
+        let failing_key = BackoffKey {
+            peer: failing.id().to_string(),
+            alpn: String::from_utf8_lossy(BUILTIN_ECHO_ALPN).to_string(),
+        };
+        let succeeding_key = BackoffKey {
+            peer: succeeding.id().to_string(),
+            alpn: String::from_utf8_lossy(BUILTIN_ECHO_ALPN).to_string(),
+        };
+
+        // Peer A fails after a completed handshake. The echo handler propagates
+        // its errors, so closing before opening a stream fails accept_bi.
         for _ in 0..3 {
-            if let Ok(connection) = trusted.connect(server.addr(), BUILTIN_ECHO_ALPN).await {
+            if let Ok(connection) = failing.connect(server.addr(), BUILTIN_ECHO_ALPN).await {
                 connection.close(0u32.into(), b"no stream");
                 connection.closed().await;
             }
         }
 
-        // THE ASSERTION THAT MATTERS: the record names the peer that failed.
-        let recorded: Vec<BackoffKey> = tokio::time::timeout(Duration::from_secs(20), async {
+        // A's record exists and is keyed on A. This is also the check that fails
+        // when identity.peer is not assigned, printing <unidentified>.
+        let recorded = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 let keys: Vec<BackoffKey> = state
                     .incoming_failures
@@ -5247,30 +5265,42 @@ mod tests {
         })
         .await
         .context("no inbound failure was ever recorded")?;
-
-        let expected_peer = trusted.id().to_string();
         assert!(
-            recorded.iter().any(|key| key.peer == expected_peer),
-            "a failure after a completed handshake must be attributed to its peer; \
-             recorded {recorded:?}, expected peer {expected_peer}"
-        );
-        assert!(
-            recorded
-                .iter()
-                .all(|key| key.peer != "<unidentified>" || key.peer == expected_peer),
-            "an identified peer's failure must not land on the unidentified key: {recorded:?}"
+            recorded.contains(&failing_key),
+            "a failure after a completed handshake must be keyed on its peer; \
+             recorded {recorded:?}, expected {failing_key:?}"
         );
 
-        // An untrusted peer on the SAME ALPN cannot complete a handshake, so it is
-        // recorded separately and cannot clear the trusted peer's record.
-        let intruder = Endpoint::bind(iroh::endpoint::presets::N0).await?;
-        intruder.online().await;
-        for _ in 0..3 {
-            if let Ok(connection) = intruder.connect(server.addr(), BUILTIN_ECHO_ALPN).await {
-                let _ = connection.open_bi().await;
-                connection.close(0u32.into(), b"done");
+        // Peer B now completes a full echo round trip, which is the success that
+        // used to wipe A's record.
+        let handled_before = state.builtin_echo_hits();
+        let nonce = [7u8; 32];
+        let connection = succeeding.connect(server.addr(), BUILTIN_ECHO_ALPN).await?;
+        let (mut send, mut recv) = connection.open_bi().await?;
+        send.write_all(&nonce).await?;
+        send.finish()?;
+        let echoed = recv.read_to_end(nonce.len() + 1).await?;
+        assert_eq!(echoed, nonce, "peer B's echo must actually have succeeded");
+        connection.close(0u32.into(), b"done");
+        connection.closed().await;
+
+        // Wait for the server to have actually run B's handler. A success leaves
+        // no record of its own, so there is nothing in the record set to wait on:
+        // an earlier draft waited for "B has no record", which was true before B
+        // was ever processed and made this whole check vacuous. The echo counter
+        // is the observable that B's handler ran.
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while state.builtin_echo_hits() <= handled_before {
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-        }
+        })
+        .await
+        .context("peer B's echo was never handled by the server")?;
+        // Then let the success be recorded, which happens after the handler
+        // returns.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // THE BOUNDARY: B succeeded, and A's record is untouched.
         let after: Vec<BackoffKey> = state
             .incoming_failures
             .states
@@ -5280,12 +5310,16 @@ mod tests {
             .cloned()
             .collect();
         assert!(
-            after.iter().any(|key| key.peer == expected_peer),
-            "an unidentified peer's traffic must not clear an identified peer's record: {after:?}"
+            after.contains(&failing_key),
+            "peer B's success cleared peer A's record: {after:?}"
+        );
+        assert!(
+            !after.contains(&succeeding_key),
+            "peer B succeeded, so it must hold no failure record: {after:?}"
         );
 
-        intruder.close().await;
-        trusted.close().await;
+        succeeding.close().await;
+        failing.close().await;
         server.shutdown().await?;
         Ok(())
     }
