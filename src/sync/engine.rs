@@ -3331,7 +3331,63 @@ mod tests {
         );
 
         // The bounded watcher work must still converge the latest value.
+        //
+        // DIAGNOSTICS BRANCH ONLY, DO NOT MERGE. This convergence check fails
+        // intermittently on Linux with two nodes holding different content for the
+        // same key, and a light standalone reproduction did not work: with no
+        // reconcile happening during the burst it reported version=1 and converged
+        // in one round, which exercised none of the behaviour under test. So the
+        // instrumentation goes here, in the real scenario.
+        //
+        // Three observables per node separate the candidate causes:
+        //   manifests still differ                  -> propagation incomplete
+        //   manifests agree, holds_bytes false      -> content fetch incomplete,
+        //                                              disk stale while logical
+        //                                              state has converged
+        //   manifests agree, bytes held, disk stale -> materialization defect
+        // And whether extra rounds fix it separates an oracle defect (2 rounds too
+        // few) from an engine defect (never converges).
+        let nodes: [(&str, &SyncEngine<EngineLoopbackTransport>, &std::path::Path); 3] = [
+            ("a", &engine_a, root_a.as_path()),
+            ("b", &engine_b, root_b.as_path()),
+            ("c", &engine_c, root_c.as_path()),
+        ];
+        async fn snapshot(
+            label: &str,
+            engine: &SyncEngine<EngineLoopbackTransport>,
+            root: &std::path::Path,
+            round: usize,
+        ) -> Vec<u8> {
+            let disk = std::fs::read(root.join("hot.txt")).unwrap_or_default();
+            let entry = engine.entries.read().await.get("bus").cloned().unwrap();
+            let node = entry.node.lock().await;
+            let winner = node.manifest().get("hot.txt").copied();
+            let (version, author, hash, holds) = match winner {
+                Some(Entry::Present(meta)) => (
+                    meta.version,
+                    meta.author.0[0],
+                    Some(
+                        meta.hash.0[..4]
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>(),
+                    ),
+                    node.has_content(&meta.hash),
+                ),
+                _ => (0, 0, None, false),
+            };
+            drop(node);
+            eprintln!(
+                "DISCRIMINATE round={round} node={label} disk={:?} version={version} author={author} hash={hash:?} holds_bytes={holds}",
+                String::from_utf8_lossy(&disk)
+            );
+            disk
+        }
+
+        let mut round = 0usize;
+        let mut disks: Vec<Vec<u8>> = Vec::new();
         for _ in 0..2 {
+            round += 1;
             tokio::time::timeout(Duration::from_secs(15), async {
                 tokio::try_join!(
                     engine_a.sync_once("bus"),
@@ -3342,7 +3398,50 @@ mod tests {
             .await
             .expect("post-stress convergence timed out")
             .unwrap();
+            disks.clear();
+            for (label, engine, root) in nodes {
+                disks.push(snapshot(label, engine, root, round).await);
+            }
         }
+
+        if disks.windows(2).all(|w| w[0] == w[1]) {
+            eprintln!("DISCRIMINATE outcome=converged_in_2_rounds");
+        } else {
+            eprintln!(
+                "DISCRIMINATE outcome=DIVERGED_after_2_rounds; continuing to test round sufficiency"
+            );
+            let mut converged_at = None;
+            for _ in 0..10 {
+                round += 1;
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    tokio::try_join!(
+                        engine_a.sync_once("bus"),
+                        engine_b.sync_once("bus"),
+                        engine_c.sync_once("bus")
+                    )
+                })
+                .await
+                .expect("extra convergence round timed out")
+                .unwrap();
+                disks.clear();
+                for (label, engine, root) in nodes {
+                    disks.push(snapshot(label, engine, root, round).await);
+                }
+                if disks.windows(2).all(|w| w[0] == w[1]) {
+                    converged_at = Some(round);
+                    break;
+                }
+            }
+            match converged_at {
+                Some(at) => panic!(
+                    "DISCRIMINATE VERDICT=ORACLE diverged after 2 rounds but converged at round {at}: the fixed 2 rounds are too few"
+                ),
+                None => panic!(
+                    "DISCRIMINATE VERDICT=ENGINE never converged within {round} rounds: read the DISCRIMINATE lines for which link failed"
+                ),
+            }
+        }
+
         let hot_a = std::fs::read(root_a.join("hot.txt")).unwrap();
         assert_eq!(std::fs::read(root_b.join("hot.txt")).unwrap(), hot_a);
         assert_eq!(std::fs::read(root_c.join("hot.txt")).unwrap(), hot_a);
