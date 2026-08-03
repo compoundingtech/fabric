@@ -6,7 +6,7 @@ use std::{
     path::PathBuf,
     process::{Command as ProcessCommand, Stdio},
     sync::{
-        Arc, OnceLock, Weak,
+        Arc, OnceLock, RwLock as StdRwLock, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -51,6 +51,7 @@ use crate::{
         manifest::Author as SyncAuthor,
         node::SyncNode,
     },
+    telemetry::TelemetryStore,
     tunnel,
 };
 
@@ -378,6 +379,20 @@ pub struct DaemonState {
     incoming_slots: Arc<Semaphore>,
     dial_slots: Arc<Semaphore>,
     cancel: CancellationToken,
+    /// Durable loss/resume counters. Survives a restart, unlike the log lines
+    /// that were previously the only record.
+    telemetry: Arc<TelemetryStore>,
+    /// The last path the liveness probe saw for each peer, keyed by peer label.
+    ///
+    /// A session-loss notice fires when the transport is already gone, so asking
+    /// the endpoint for the path at that moment answers "none" and tells nobody
+    /// which path just failed. The probe samples every peer on an interval, so
+    /// its most recent answer is the honest one for "what were we on".
+    ///
+    /// A std lock, not the tokio one used elsewhere here, because the connection
+    /// notices that read it are synchronous callbacks and cannot await. The
+    /// critical section is one map lookup.
+    last_probe_transport: Arc<StdRwLock<HashMap<String, String>>>,
     /// The file-sync engine, set once just after this state is constructed (it
     /// needs a handle back to the state to dial peers).
     sync_engine: OnceLock<Arc<SyncEngine<IrohSyncTransport>>>,
@@ -790,6 +805,7 @@ impl DaemonState {
         let tunnel_sessions =
             tunnel::ServerSessionStore::new(tunnel_session_limits, tunnel_session_detached_ttl);
         tunnel::spawn_server_session_reaper(tunnel_sessions.clone(), cancel.clone());
+        let telemetry = Arc::new(TelemetryStore::load(home.telemetry_path()));
 
         Ok(Arc::new(Self {
             home,
@@ -823,8 +839,18 @@ impl DaemonState {
             incoming_slots: Arc::new(Semaphore::new(MAX_INCOMING_HANDLERS)),
             dial_slots: Arc::new(Semaphore::new(MAX_DIAL_HANDLERS)),
             cancel,
+            telemetry,
+            last_probe_transport: Arc::new(StdRwLock::new(HashMap::new())),
             sync_engine: OnceLock::new(),
         }))
+    }
+
+    pub(crate) fn telemetry(&self) -> Arc<TelemetryStore> {
+        self.telemetry.clone()
+    }
+
+    fn connection_recorder(&self) -> ConnectionRecorder {
+        ConnectionRecorder::new(self.telemetry.clone(), self.last_probe_transport.clone())
     }
 
     fn sync_engine(&self) -> Option<Arc<SyncEngine<IrohSyncTransport>>> {
@@ -1098,6 +1124,7 @@ impl DaemonState {
             self.dial_failures.clone(),
             self.dial_slots.clone(),
             self.client_attaches.clone(),
+            self.connection_recorder(),
         ));
 
         Ok(addr)
@@ -1173,6 +1200,7 @@ impl DaemonState {
                 self.dial_slots.clone(),
                 lease,
                 self.client_attaches.clone(),
+                self.connection_recorder(),
             ))
         } else {
             tokio::spawn(run_dial_socket(
@@ -1188,6 +1216,7 @@ impl DaemonState {
                 self.dial_slots.clone(),
                 lease,
                 self.client_attaches.clone(),
+                self.connection_recorder(),
             ))
         };
         sockets.insert(
@@ -1255,6 +1284,7 @@ impl DaemonState {
             allow_shell: self.allow_shell,
             allow_exec: self.allow_exec,
             peers,
+            connection_telemetry: self.telemetry.snapshot().peers,
         })
     }
 
@@ -2341,6 +2371,21 @@ async fn run_peer_health_loop_with(
                         transport = health.transport.as_deref().unwrap_or("none"),
                         "peer liveness probe"
                     );
+                    // Keep what the probe measured. Before this it computed a
+                    // round trip time and a path and discarded both, so the only
+                    // way to compare direct against relay was to parse days of
+                    // log text.
+                    state.telemetry.record_probe(
+                        &label,
+                        health.reachable,
+                        health.transport.as_deref(),
+                        health.round_trip_micros.map(Duration::from_micros),
+                    );
+                    if let Some(transport) = health.transport.as_deref()
+                        && let Ok(mut seen) = state.last_probe_transport.write()
+                    {
+                        seen.insert(label.clone(), transport.to_string());
+                    }
                     if health.reachable {
                         reachable_peers += 1;
                     }
@@ -3392,6 +3437,7 @@ async fn run_dial_socket(
     dial_slots: Arc<Semaphore>,
     _lease: DialListenerLease,
     gauge: Arc<tunnel::ClientAttachGauge>,
+    recorder: ConnectionRecorder,
 ) {
     let backoff_key = BackoffKey::dial(&peer, &alpn);
     loop {
@@ -3426,6 +3472,7 @@ async fn run_dial_socket(
                     peer.clone(),
                     String::from_utf8_lossy(&alpn).to_string(),
                     gauge.clone(),
+                    recorder.clone(),
                 ));
                 tokio::spawn(async move {
                     let _permit = permit;
@@ -3471,6 +3518,7 @@ async fn run_shell_dial_socket(
     dial_slots: Arc<Semaphore>,
     _lease: DialListenerLease,
     gauge: Arc<tunnel::ClientAttachGauge>,
+    recorder: ConnectionRecorder,
 ) {
     let backoff_key = BackoffKey::dial(&peer, shell::RESUMABLE_SHELL_ALPN);
     loop {
@@ -3502,6 +3550,7 @@ async fn run_shell_dial_socket(
                 let dial_failures = dial_failures.clone();
                 let backoff_key = backoff_key.clone();
                 let gauge = gauge.clone();
+                let recorder = recorder.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     if !dial_failures.wait(&backoff_key, &cancel).await {
@@ -3516,6 +3565,7 @@ async fn run_shell_dial_socket(
                         cancel,
                         drop_rx,
                         gauge,
+                        recorder,
                     )
                     .await
                     {
@@ -3542,6 +3592,7 @@ async fn handle_shell_dial_socket_connection(
     cancel: CancellationToken,
     drop_rx: watch::Receiver<u64>,
     gauge: Arc<tunnel::ClientAttachGauge>,
+    recorder: ConnectionRecorder,
 ) -> Result<()> {
     let mut attempt = 0usize;
     loop {
@@ -3571,7 +3622,8 @@ async fn handle_shell_dial_socket_connection(
                 // Protocol selection ends here. Once shell/1 has attached, its
                 // reconnect loop must remain shell/1 so it resumes this exact
                 // remote PTY rather than starting a legacy replacement.
-                let notices = shell_client_notices(peer.clone(), generation, gauge.clone());
+                let notices =
+                    shell_client_notices(peer.clone(), generation, gauge.clone(), recorder.clone());
                 return tunnel::run_client_connection_with_initial(
                     local,
                     endpoint_rx,
@@ -3707,6 +3759,55 @@ fn shell_resumable_alpn_unsupported(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Turns a connection notice into a durable count.
+///
+/// The notices are synchronous callbacks, so this holds only what it can read
+/// without awaiting: the counter store and the last path the liveness probe
+/// saw. Both are cheap locks over small maps.
+#[derive(Clone)]
+pub(crate) struct ConnectionRecorder {
+    telemetry: Arc<TelemetryStore>,
+    last_probe_transport: Arc<StdRwLock<HashMap<String, String>>>,
+}
+
+impl ConnectionRecorder {
+    fn new(
+        telemetry: Arc<TelemetryStore>,
+        last_probe_transport: Arc<StdRwLock<HashMap<String, String>>>,
+    ) -> Self {
+        Self {
+            telemetry,
+            last_probe_transport,
+        }
+    }
+
+    /// The path this peer was last seen on, or `None` when it has never been
+    /// probed. `None` is recorded as unknown rather than guessed.
+    fn path_for(&self, peer: &str) -> Option<String> {
+        self.last_probe_transport
+            .read()
+            .ok()
+            .and_then(|seen| seen.get(peer).cloned())
+    }
+
+    fn record(&self, peer: &str, event: &tunnel::ClientConnectionEvent) {
+        let path = self.path_for(peer);
+        match event {
+            tunnel::ClientConnectionEvent::Reconnecting { attempt, .. } => {
+                self.telemetry
+                    .record_loss(peer, path.as_deref(), *attempt, Instant::now());
+            }
+            tunnel::ClientConnectionEvent::Resumed => {
+                self.telemetry
+                    .record_resume(peer, path.as_deref(), Instant::now());
+            }
+            tunnel::ClientConnectionEvent::Failed { .. } => {
+                self.telemetry.record_resume_failure(peer);
+            }
+        }
+    }
+}
+
 /// Shell connection notices, rendered twice on purpose.
 ///
 /// The shell client sees a status frame in its terminal, and the daemon log gets
@@ -3727,8 +3828,10 @@ fn generic_dial_notices(
     peer: String,
     protocol: String,
     gauge: Arc<tunnel::ClientAttachGauge>,
+    recorder: ConnectionRecorder,
 ) -> tunnel::ClientConnectionNotices {
     tunnel::ClientConnectionNotices::new(move |event| {
+        recorder.record(&peer, event);
         match event {
             tunnel::ClientConnectionEvent::Reconnecting {
                 attempt,
@@ -3770,8 +3873,10 @@ fn shell_client_notices(
     peer: String,
     generation: u64,
     gauge: Arc<tunnel::ClientAttachGauge>,
+    recorder: ConnectionRecorder,
 ) -> tunnel::ClientConnectionNotices {
     tunnel::ClientConnectionNotices::new(move |event| {
+        recorder.record(&peer, event);
         let encoded = match event {
             tunnel::ClientConnectionEvent::Reconnecting {
                 attempt,
@@ -3842,6 +3947,7 @@ async fn run_dial_tcp_listener(
     dial_failures: Arc<FailureBackoff>,
     dial_slots: Arc<Semaphore>,
     gauge: Arc<tunnel::ClientAttachGauge>,
+    recorder: ConnectionRecorder,
 ) {
     let backoff_key = BackoffKey::dial(&peer, &alpn);
     loop {
@@ -3872,6 +3978,7 @@ async fn run_dial_tcp_listener(
                     peer.clone(),
                     String::from_utf8_lossy(&alpn).to_string(),
                     gauge.clone(),
+                    recorder.clone(),
                 ));
                 tokio::spawn(async move {
                     let _permit = permit;
@@ -5065,6 +5172,113 @@ mod tests {
         Ok(())
     }
 
+    /// The counters must move because the real notice path ran.
+    ///
+    /// The store has its own unit tests, and they prove only that the store
+    /// counts what it is told. They cannot catch the failure that matters here:
+    /// a daemon that never calls it. So this drives a real shell over two real
+    /// daemons, takes its transport away, and reads the counters back through
+    /// the same control response an operator would use.
+    #[tokio::test]
+    async fn a_real_shell_loss_and_resume_moves_the_durable_counters() -> Result<()> {
+        let server_dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let server_home = FabricHome::new(server_dir.path());
+        let client_home = FabricHome::new(client_dir.path());
+        let server = FabricNode::start_with_options(server_home.clone(), true).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+
+        let state = client.state();
+        let telemetry = state.telemetry();
+        let socket = state
+            .dial_alpn(
+                "server",
+                shell::SHELL_PROTOCOL,
+                shell::RESUMABLE_SHELL_ALPN.to_vec(),
+                false,
+            )
+            .await?;
+        let mut shell_stream = UnixStream::connect(&socket).await?;
+        shell::write_client_stdin(
+            &mut shell_stream,
+            b"MARK=original; printf '%s-%s\n' before drop\n",
+        )
+        .await?;
+        read_shell_marker(&mut shell_stream, b"before-drop").await?;
+
+        // The negative control, and it runs BEFORE the loss on purpose. A
+        // counter that was already at 1 would make the assertion below pass
+        // without the drop having done anything.
+        assert!(
+            telemetry
+                .peer("server")
+                .is_none_or(|stats| stats.losses == 0),
+            "a healthy shell must record no loss; the later count would prove nothing"
+        );
+
+        state.drop_tunnel_connections();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let recorded = loop {
+            if let Some(stats) = telemetry.peer("server")
+                && stats.resumes >= 1
+            {
+                break stats;
+            }
+            if Instant::now() >= deadline {
+                let seen = telemetry.peer("server");
+                panic!("the shell never recorded a resume within 30s; counters: {seen:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+
+        assert_eq!(
+            recorded.losses, 1,
+            "one dropped transport is one loss, however many retries it took"
+        );
+        assert_eq!(recorded.resumes, 1);
+        assert!(
+            recorded.reconnect_attempts >= 1,
+            "a loss that resumed must have taken at least one attempt"
+        );
+        assert_eq!(
+            recorded.reconnect.samples, 1,
+            "the reconnect must be measured, not merely counted"
+        );
+        assert!(
+            recorded.reconnect.max_micros > 0,
+            "a measured reconnect cannot take zero time"
+        );
+
+        // The same PTY, so this counted a genuine resume of the original
+        // session rather than a silent replacement that would also look like
+        // a resume from the outside.
+        shell::write_client_stdin(&mut shell_stream, b"printf '%s-%s\n' $MARK survived\n").await?;
+        read_shell_marker(&mut shell_stream, b"original-survived").await?;
+
+        // And the operator-facing read carries it, not just the in-process store.
+        let response = state.reachability_status_response().await?;
+        match response {
+            ControlResponse::ReachabilityStatus {
+                connection_telemetry,
+                ..
+            } => {
+                let reported = connection_telemetry
+                    .get("server")
+                    .expect("the control response must carry the peer's counters");
+                assert_eq!(reported.losses, 1);
+                assert_eq!(reported.resumes, 1);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
     /// The recovery path that genuinely needs a teardown must keep doing it.
     /// Not dropping tunnels on a noisy notice is only safe if a suspect endpoint
     /// still gets an explicit close.
@@ -5734,6 +5948,10 @@ mod tests {
             "peer-a".to_string(),
             "pty-remote".to_string(),
             tunnel::ClientAttachGauge::new(),
+            ConnectionRecorder::new(
+                Arc::new(TelemetryStore::ephemeral()),
+                Arc::new(StdRwLock::new(HashMap::new())),
+            ),
         );
         for event in [
             tunnel::ClientConnectionEvent::Reconnecting {

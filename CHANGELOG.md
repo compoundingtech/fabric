@@ -8,6 +8,27 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Added
 
+- **Durable connection telemetry.** `fabric status` now reports, per peer, how
+  many times a session lost its transport, how many came back, how many gave
+  up, and how long the reconnect took. The counters persist in
+  `<state>/telemetry.json`, so they survive a daemon restart.
+
+  Fabric already logged a line for each loss, reconnect attempt, and resume. A
+  line reconstructs one incident by hand and cannot answer whether resumption
+  works in daily use, because the answer needed a grep over megabytes of log
+  and died at the next rotation. Three things the log could not report are now
+  recorded: a durable count, the measured total reconnect time (the log carried
+  the backoff delay before the next attempt, which is a different number), and
+  the path in use beside each loss and each resume. "It came back" and "it came
+  back on the relay" are different outcomes.
+
+  The liveness probe also keeps what it measures. It computed a round trip time
+  and a path on every probe and discarded both, so comparing the direct path
+  against the relay meant parsing days of log text. Latency is now summarized
+  per peer and per path in bounded histogram buckets, which keeps the cost flat
+  on a daemon that runs for weeks. Nothing reads these numbers to make a
+  routing decision yet; this change only stops throwing them away.
+
 - **Production sync scan ledger.** `fabric sync ls` and its JSON form now expose
   per-entry monotonic full-scan, exact-noop inbound, and guarded-inbound
   transaction counters. Operators can prove scan-free convergence and the
