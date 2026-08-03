@@ -5186,6 +5186,68 @@ mod tests {
         Ok(())
     }
 
+    /// DIAGNOSTICS BRANCH ONLY. Control for the instrumentation itself.
+    ///
+    /// The trace in the test above polls the client gauge and the server session
+    /// stats in a loop. If that polling were itself ending the session — by
+    /// touching a lock, or by keeping something alive, or by observing state into
+    /// existence — the trace would be measuring its own side effects. This holds a
+    /// live outbound session, runs the same polling for a bounded window, and
+    /// proves the gauge does NOT move.
+    #[tokio::test]
+    async fn diag_instrumentation_does_not_itself_release_the_gauge() -> Result<()> {
+        let server_dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let server_home = FabricHome::new(server_dir.path());
+        let client_home = FabricHome::new(client_dir.path());
+        let server = FabricNode::start_with_options(server_home.clone(), true).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+
+        let state = client.state();
+        let server_state = server.state();
+        let socket = state
+            .dial_alpn(
+                "server",
+                shell::SHELL_PROTOCOL,
+                shell::RESUMABLE_SHELL_ALPN.to_vec(),
+                false,
+            )
+            .await?;
+        let mut shell_stream = UnixStream::connect(&socket).await?;
+        shell::write_client_stdin(&mut shell_stream, b"printf '%s-%s\n' diag control\n").await?;
+        read_shell_marker(&mut shell_stream, b"diag-control").await?;
+        assert_eq!(state.client_attaches.attached(), 1);
+
+        // Same polling shape as the instrumented test, same duration order of
+        // magnitude, with the session deliberately left alive.
+        let started = Instant::now();
+        for _ in 0..12 {
+            let srv = server_state.tunnel_sessions.stats().await;
+            eprintln!(
+                "DIAG control t_ms={} client_gauge={} srv_active_attaches={}",
+                started.elapsed().as_millis(),
+                state.client_attaches.attached(),
+                srv.active_attaches,
+            );
+            assert_eq!(
+                state.client_attaches.attached(),
+                1,
+                "the instrumentation must not release the gauge on its own"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        // Still the same session afterwards.
+        shell::write_client_stdin(&mut shell_stream, b"printf '%s-%s\n' diag intact\n").await?;
+        read_shell_marker(&mut shell_stream, b"diag-intact").await?;
+
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
     /// One peer's success must not clear another peer's failure record on the
     /// same ALPN.
     ///
@@ -5697,13 +5759,61 @@ mod tests {
 
         // NEGATIVE CONTROL. Drop the local end so the outbound session goes away,
         // then prove the endpoint is recyclable again.
+        //
+        // DIAGNOSTICS BRANCH ONLY. This releases in ~53ms on macOS and did not
+        // release within 20s on Linux CI, so the series below locates which link
+        // of the teardown chain stalls: local EOF, client send-close, remote PTY
+        // child exit, server close, client observing remote-close, attach return,
+        // gauge decrement. The server-side session stats are the observable for
+        // the middle of that chain; the client gauge is the observable for its end.
+        let server_state = server.state();
+        async fn diag(
+            label: &str,
+            at: Duration,
+            client: &Arc<DaemonState>,
+            server: &Arc<DaemonState>,
+        ) {
+            let srv = server.tunnel_sessions.stats().await;
+            eprintln!(
+                "DIAG {label} t_ms={} client_gauge={} srv_total={} srv_active_sessions={} srv_active_attaches={} srv_detached={} srv_complete={} srv_done={} srv_buffered={}",
+                at.as_millis(),
+                client.client_attaches.attached(),
+                srv.total_sessions,
+                srv.active_sessions,
+                srv.active_attaches,
+                srv.detached_sessions,
+                srv.complete_sessions,
+                srv.done_sessions,
+                srv.buffered_bytes,
+            );
+        }
+        diag("before_drop", Duration::ZERO, &state, &server_state).await;
         drop(shell_stream);
-        let released = tokio::time::timeout(Duration::from_secs(20), async {
-            while state.client_attaches.attached() > 0 {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+        let release_started = Instant::now();
+        // Observe for far longer than the 20s that failed, so a slow-but-working
+        // release is distinguishable from a permanent stall.
+        let released = tokio::time::timeout(Duration::from_secs(40), async {
+            loop {
+                if state.client_attaches.attached() == 0 {
+                    return;
+                }
+                diag("waiting", release_started.elapsed(), &state, &server_state).await;
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
         })
         .await;
+        diag(
+            "after_wait",
+            release_started.elapsed(),
+            &state,
+            &server_state,
+        )
+        .await;
+        eprintln!(
+            "DIAG outcome released={} elapsed_ms={}",
+            released.is_ok(),
+            release_started.elapsed().as_millis()
+        );
         assert!(
             released.is_ok(),
             "the gauge must release when an outbound session ends, or a recycle can never run again"
