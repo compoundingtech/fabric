@@ -141,6 +141,12 @@ impl ClientConnectionNotices {
         }
     }
 
+    /// What this connection would write into the local stream for `event`, so a
+    /// caller that must not inject bytes can prove it does not.
+    pub fn encode_for_test(&self, event: &ClientConnectionEvent) -> Option<Vec<u8>> {
+        (self.encode)(event)
+    }
+
     /// Count this connection's attaches so the endpoint-recycle guard can see
     /// outbound sessions.
     pub fn with_gauge(mut self, gauge: Arc<ClientAttachGauge>) -> Self {

@@ -1158,15 +1158,7 @@ impl DaemonState {
                 self.dial_failures.clone(),
                 self.dial_slots.clone(),
                 lease,
-                // Count attaches so a live generic dial blocks an endpoint
-                // recycle too. The encoder deliberately returns None for every
-                // event: a generic dial carries raw bytes, and injecting a
-                // status frame into someone's stream would corrupt it. The
-                // logging half of this lands separately.
-                Some(
-                    tunnel::ClientConnectionNotices::new(|_| None)
-                        .with_gauge(self.client_attaches.clone()),
-                ),
+                self.client_attaches.clone(),
             ))
         };
         sockets.insert(
@@ -3319,7 +3311,7 @@ async fn run_dial_socket(
     dial_failures: Arc<FailureBackoff>,
     dial_slots: Arc<Semaphore>,
     _lease: DialListenerLease,
-    notices: Option<tunnel::ClientConnectionNotices>,
+    gauge: Arc<tunnel::ClientAttachGauge>,
 ) {
     let backoff_key = BackoffKey::dial(&peer, &alpn);
     loop {
@@ -3350,7 +3342,11 @@ async fn run_dial_socket(
                 let drop_rx = drop_rx.clone();
                 let dial_failures = dial_failures.clone();
                 let backoff_key = backoff_key.clone();
-                let notices = notices.clone();
+                let notices = Some(generic_dial_notices(
+                    peer.clone(),
+                    String::from_utf8_lossy(&alpn).to_string(),
+                    gauge.clone(),
+                ));
                 tokio::spawn(async move {
                     let _permit = permit;
                     if !dial_failures.wait(&backoff_key, &cancel).await {
@@ -3639,6 +3635,57 @@ fn shell_resumable_alpn_unsupported(error: &anyhow::Error) -> bool {
 /// it back, so "did my shell recover" was unanswerable from the log. Each line
 /// names the peer and the endpoint generation, which is the route context that
 /// distinguishes a peer roaming from this endpoint being rebuilt underneath it.
+/// Connection notices for a generic dial: logged, never written to the stream.
+///
+/// A generic dial carries raw bytes for somebody else's protocol, so the status
+/// frames the shell path renders into its terminal would corrupt it. The encoder
+/// therefore returns None for every event and only the log records it. Without
+/// this, a pty-remote or st sync tunnel lost and resumed its transport with no
+/// trace anywhere, which made "did my tunnel drop" unanswerable for exactly the
+/// consumers most likely to be long-lived.
+fn generic_dial_notices(
+    peer: String,
+    protocol: String,
+    gauge: Arc<tunnel::ClientAttachGauge>,
+) -> tunnel::ClientConnectionNotices {
+    tunnel::ClientConnectionNotices::new(move |event| {
+        match event {
+            tunnel::ClientConnectionEvent::Reconnecting {
+                attempt,
+                delay,
+                error,
+            } => warn!(
+                target: VALIDATION_LOG_TARGET,
+                event = "dial_session_reconnecting",
+                peer = %peer,
+                protocol = %protocol,
+                attempt,
+                delay_ms = delay.as_millis() as u64,
+                error = %error,
+                "generic dial lost its transport; reconnecting"
+            ),
+            tunnel::ClientConnectionEvent::Resumed => info!(
+                target: VALIDATION_LOG_TARGET,
+                event = "dial_session_resumed",
+                peer = %peer,
+                protocol = %protocol,
+                "generic dial resumed after reconnect"
+            ),
+            tunnel::ClientConnectionEvent::Failed { error } => warn!(
+                target: VALIDATION_LOG_TARGET,
+                event = "dial_session_resume_failed",
+                peer = %peer,
+                protocol = %protocol,
+                error = %error,
+                "generic dial could not resume"
+            ),
+        }
+        // Never any bytes: this stream belongs to another protocol.
+        None
+    })
+    .with_gauge(gauge)
+}
+
 fn shell_client_notices(
     peer: String,
     generation: u64,
@@ -3741,9 +3788,11 @@ async fn run_dial_tcp_listener(
                 let drop_rx = drop_rx.clone();
                 let dial_failures = dial_failures.clone();
                 let backoff_key = backoff_key.clone();
-                let notices = Some(
-                    tunnel::ClientConnectionNotices::new(|_| None).with_gauge(gauge.clone()),
-                );
+                let notices = Some(generic_dial_notices(
+                    peer.clone(),
+                    String::from_utf8_lossy(&alpn).to_string(),
+                    gauge.clone(),
+                ));
                 tokio::spawn(async move {
                     let _permit = permit;
                     if !dial_failures.wait(&backoff_key, &cancel).await {
@@ -4998,6 +5047,35 @@ mod tests {
                 String::from_utf8_lossy(marker)
             )
         })?
+    }
+
+    /// A generic dial's reconnect telemetry must reach the log and nothing else.
+    ///
+    /// The event names are the contract an operator greps for, so pin them here
+    /// rather than discovering they changed while reading a live incident.
+    #[test]
+    fn generic_dial_notices_log_every_event_and_encode_nothing() {
+        let notices = generic_dial_notices(
+            "peer-a".to_string(),
+            "pty-remote".to_string(),
+            tunnel::ClientAttachGauge::new(),
+        );
+        for event in [
+            tunnel::ClientConnectionEvent::Reconnecting {
+                attempt: 3,
+                delay: Duration::from_millis(250),
+                error: "connection lost".to_string(),
+            },
+            tunnel::ClientConnectionEvent::Resumed,
+            tunnel::ClientConnectionEvent::Failed {
+                error: "session expired".to_string(),
+            },
+        ] {
+            assert!(
+                notices.encode_for_test(&event).is_none(),
+                "a generic dial must never have bytes written into its stream"
+            );
+        }
     }
 
     /// A live GENERIC dial must block a recycle too, and must receive no
