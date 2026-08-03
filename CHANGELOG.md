@@ -59,6 +59,19 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Changed
 
+- **Detached shells are retained for 15 minutes, not 60 seconds.** A held remote
+  shell now survives a closed lid over lunch; previously it did not survive a
+  coffee break. The number comes from measured cost rather than taste: an idle
+  detached session buffers 0 bytes across a full window, so holding one costs a
+  session struct and a PTY process and nothing that grows with time, while a
+  session still producing output grows at whatever the remote writes — about
+  19 KB/s for a pathological loop, roughly 17 MB over this window. Past the
+  window the behaviour is unchanged and already proven: the client reports
+  `remote shell could not resume`, names the expired session, and exits
+  non-zero. This TTL remains the only backstop against a runaway remote process,
+  because the replay buffer has no cap of its own, so raising it much further
+  wants that cap first.
+
 - **Release archives have an enforced one-file contract.** Each platform tarball
   must contain exactly one member named literal `fabric` (not `./fabric`), and
   the lockout-safe upgrade runbook verifies that shape before extraction.

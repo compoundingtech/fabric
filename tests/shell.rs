@@ -332,7 +332,9 @@ async fn resumable_shell_one_survives_transport_drop() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shell_past_detached_ttl_reports_the_session_is_gone() -> Result<()> {
     // Issue #21, the daily-use question: a MacBook sleeps longer than the 60s
-    // detached TTL, the server reaps the PTY, and the client wakes up.
+    // detached TTL, now 15 minutes, the server reaps the PTY, and the client
+    // wakes up. This test forces expiry rather than waiting for it, so the
+    // retention value does not affect what it proves.
     //
     // Expiry has to be forced deterministically, or this test proves nothing,
     // and two obvious ways to force it do not work. Dropping the tunnel and
