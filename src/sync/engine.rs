@@ -1270,7 +1270,28 @@ fn materialize(node: &SyncNode, root: &Path, policy: PolicyRules) -> Result<()> 
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            write_atomic_with_mtime(&path, bytes, Some((meta.mtime_secs, meta.mtime_nanos)))?;
+            // Do NOT stamp the origin's mtime here.
+            //
+            // Stamping it was an optimisation so scan_folder's size-and-mtime cache
+            // would hit on materialized files. It made mtime a value SHARED across
+            // nodes instead of a local write timestamp, and that broke the cache's
+            // core assumption. Two nodes contending on one key can produce entries
+            // with identical size and identical mtime but different content, and the
+            // scan then reuses the recorded hash and reports content the file does
+            // not hold. The republish branch reads the real bytes, sees a different
+            // hash, concludes the user edited the file, and republishes under local
+            // authorship. Both sides do it and the versions leapfrog forever.
+            //
+            // Measured on Linux CI run 30814462024 attempt 4: twenty-four
+            // consecutive republishes alternating between two nodes, every one with
+            // prior manifest hash equal to the scanned hash yet a different hash
+            // after, from v44 to v67 with no convergence.
+            //
+            // A materialized file now carries the local write time, so the cache
+            // misses on it and the next scan reads and hashes the real bytes. The
+            // cache still hits for genuinely untouched local files, which is where
+            // its benefit actually was.
+            write_atomic(&path, bytes)?;
         }
     }
     if policy.propagate_deletes {
@@ -1348,7 +1369,28 @@ fn materialize_tracked(
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            write_atomic_with_mtime(&path, bytes, Some((meta.mtime_secs, meta.mtime_nanos)))?;
+            // Do NOT stamp the origin's mtime here.
+            //
+            // Stamping it was an optimisation so scan_folder's size-and-mtime cache
+            // would hit on materialized files. It made mtime a value SHARED across
+            // nodes instead of a local write timestamp, and that broke the cache's
+            // core assumption. Two nodes contending on one key can produce entries
+            // with identical size and identical mtime but different content, and the
+            // scan then reuses the recorded hash and reports content the file does
+            // not hold. The republish branch reads the real bytes, sees a different
+            // hash, concludes the user edited the file, and republishes under local
+            // authorship. Both sides do it and the versions leapfrog forever.
+            //
+            // Measured on Linux CI run 30814462024 attempt 4: twenty-four
+            // consecutive republishes alternating between two nodes, every one with
+            // prior manifest hash equal to the scanned hash yet a different hash
+            // after, from v44 to v67 with no convergence.
+            //
+            // A materialized file now carries the local write time, so the cache
+            // misses on it and the next scan reads and hashes the real bytes. The
+            // cache still hits for genuinely untouched local files, which is where
+            // its benefit actually was.
+            write_atomic(&path, bytes)?;
             if let Some((work, generation)) = daemon_writes {
                 work.record_daemon_write(&path, meta.hash, generation);
             }
@@ -1551,7 +1593,7 @@ mod tests {
     use std::sync::{Mutex as StdMutex, Weak};
 
     #[test]
-    fn materialized_file_is_recognised_as_unchanged_on_the_next_scan() -> Result<()> {
+    fn materialized_file_is_re_read_once_on_the_next_scan() -> Result<()> {
         // The live miss the synthetic test could not see: a file received from a
         // peer carries the SENDER's mtime in the manifest, while the local
         // filesystem stamps its own at write time. Without restoring the
@@ -1588,14 +1630,26 @@ mod tests {
             .iter()
             .find(|f| f.rel == "from-peer.md")
             .expect("materialized file is in scope");
-        assert_eq!(
+        // This test previously asserted the opposite, and that assertion was the
+        // optimisation that caused a permanent three-node divergence. Stamping the
+        // origin's mtime made the scan cache hit on materialized files, but it also
+        // made mtime a value shared across nodes, so two contending entries of equal
+        // size could collide on size and mtime with different content and the cache
+        // would report bytes the file did not hold.
+        //
+        // The deliberate cost of correctness, and the performance evidence for it: a
+        // materialized file carries the LOCAL write time, so it is read and hashed
+        // once on the next scan. Genuinely untouched local files still hit the cache,
+        // which is where its benefit actually was.
+        assert_ne!(
             (file.mtime_secs, file.mtime_nanos),
             (remote_mtime_secs, remote_mtime_nanos),
-            "materialize must stamp the recorded mtime onto the file"
+            "materialize must NOT stamp the origin mtime"
         );
         assert!(
-            file.bytes.is_none(),
-            "a freshly materialized file must not be re-read on the next scan"
+            file.bytes.is_some(),
+            "a freshly materialized file is re-read once; that is the cost of not \
+             trusting a shared mtime"
         );
         Ok(())
     }
@@ -3102,6 +3156,178 @@ mod tests {
         )
         .await
         .expect("3-node/2,000-file continuous-mutation stress exceeded 60 seconds");
+    }
+
+    /// Read a path's mtime as the manifest records it. `mtime_of` takes a DirEntry.
+    fn mtime_of_path(path: &Path) -> (i64, u32) {
+        let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+        match modified.duration_since(UNIX_EPOCH) {
+            Ok(dur) => (dur.as_secs() as i64, dur.subsec_nanos()),
+            Err(err) => (-(err.duration().as_secs() as i64), 0),
+        }
+    }
+
+    /// Materialization must not stamp the origin's mtime, because doing so is what
+    /// manufactured equal-size, equal-mtime collisions between two nodes' entries.
+    /// Also documents, by assertion, the residual risk the fix does not close.
+    ///
+    /// This is the defect that made three nodes diverge permanently. The cache
+    /// reuses a recorded hash when size and both mtime components match, and
+    /// materialization used to stamp the ORIGIN's mtime onto the file so that cache
+    /// would hit. That made mtime a value shared across nodes rather than a local
+    /// write timestamp, so two contending entries of equal size could carry equal
+    /// mtimes with different content. The scan then reported the wrong hash, the
+    /// republish branch read the real bytes, saw a mismatch, and republished stale
+    /// content under local authorship. Measured on Linux CI run 30814462024
+    /// attempt 4: twenty-four alternating republishes from v44 to v67, never
+    /// converging.
+    ///
+    /// Constructed deliberately rather than raced: same size, same recorded mtime,
+    /// different bytes.
+    #[test]
+    fn materialization_does_not_manufacture_an_mtime_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        let entry = entry_with_policy("bus", &root, SyncPolicy::Bus);
+
+        // A manifest that records FIRST at a specific size and mtime.
+        let first = b"c-167";
+        let second = b"c-219";
+        assert_eq!(first.len(), second.len(), "the collision needs equal size");
+        let shared_secs = 1_700_000_000i64;
+        let shared_nanos = 123_456_789u32;
+
+        let mut node = SyncNode::new(Author([9u8; 32]));
+        node.local_write("hot.txt", first, shared_secs, shared_nanos);
+        let recorded = node
+            .manifest()
+            .get("hot.txt")
+            .and_then(|e| e.meta())
+            .copied()
+            .unwrap();
+        assert_eq!(recorded.hash, content_hash(first));
+
+        // Put the OTHER content on disk wearing the recorded size and mtime. This is
+        // exactly the state the old mtime stamping could produce.
+        let path = root.join("hot.txt");
+        std::fs::write(&path, second).unwrap();
+        set_file_mtime(&path, shared_secs, shared_nanos).unwrap();
+        let (disk_secs, disk_nanos) = mtime_of_path(&path);
+        assert_eq!(
+            (disk_secs, disk_nanos),
+            (recorded.mtime_secs, recorded.mtime_nanos),
+            "the test must actually reproduce the mtime collision"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            recorded.size,
+            "the test must actually reproduce the size collision"
+        );
+
+        // With the collision present, the cache DOES still report the recorded
+        // hash rather than the real bytes. That is deliberately asserted here
+        // rather than hidden, because it is the residual risk the approved fix
+        // does not close: the fix removes the mechanism that manufactured these
+        // collisions, it does not make the cache robust to one that arrives some
+        // other way, and closing that would need the content-identity mechanism
+        // that was explicitly deferred.
+        let scanned = scan_folder(&root, &entry, node.manifest()).unwrap();
+        let file = scanned.iter().find(|f| f.rel == "hot.txt").unwrap();
+        assert_eq!(
+            file.hash,
+            content_hash(first),
+            "documented residual risk: the size-and-mtime cache trusts a collision"
+        );
+
+        // What the fix guarantees is that materialization no longer manufactures
+        // one. A materialized file carries the LOCAL write time, so its mtime does
+        // not equal the origin's recorded mtime and the cache misses on it.
+        let mut peer = SyncNode::new(Author([3u8; 32]));
+        peer.local_write("materialized.txt", second, shared_secs, shared_nanos);
+        let mut observed = HashMap::new();
+        materialize_tracked(
+            &mut peer,
+            &root,
+            entry.policy.rules(),
+            &HashMap::new(),
+            &mut observed,
+            None,
+        )
+        .unwrap();
+        let (written_secs, written_nanos) = mtime_of_path(&root.join("materialized.txt"));
+        assert_ne!(
+            (written_secs, written_nanos),
+            (shared_secs, shared_nanos),
+            "materialization must not stamp the origin mtime; stamping it is what \
+             made two nodes' entries collide on size and mtime"
+        );
+    }
+
+    /// The cache must still hit for a genuinely untouched local file, which is the
+    /// whole reason it exists.
+    #[test]
+    fn scan_still_reuses_the_recorded_hash_for_an_untouched_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        let entry = entry_with_policy("bus", &root, SyncPolicy::Bus);
+
+        let bytes = b"untouched bytes";
+        let path = root.join("still.txt");
+        std::fs::write(&path, bytes).unwrap();
+        let (secs, nanos) = mtime_of_path(&path);
+
+        let mut node = SyncNode::new(Author([4u8; 32]));
+        node.local_write("still.txt", bytes, secs, nanos);
+
+        let scanned = scan_folder(&root, &entry, node.manifest()).unwrap();
+        let file = scanned.iter().find(|f| f.rel == "still.txt").unwrap();
+        assert_eq!(file.hash, content_hash(bytes));
+        assert!(
+            file.bytes.is_none(),
+            "an untouched file must not be re-read; the cache is the point"
+        );
+    }
+
+    /// And a real user edit must still be republished with local authorship and a
+    /// higher version. Not suppressing stale content must not become suppressing
+    /// genuine edits.
+    #[test]
+    fn a_real_user_edit_still_republishes_with_local_authorship() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        let entry = entry_with_policy("bus", &root, SyncPolicy::Bus);
+
+        let path = root.join("edited.txt");
+        std::fs::write(&path, b"original").unwrap();
+        let (secs, nanos) = mtime_of_path(&path);
+        let mine = Author([7u8; 32]);
+        let mut node = SyncNode::new(mine);
+        node.local_write("edited.txt", b"original", secs, nanos);
+        let before = node.manifest().get("edited.txt").unwrap().version();
+
+        // A genuine user edit.
+        std::fs::write(&path, b"user edited this").unwrap();
+        let changed = scan_into_node(&mut node, &root, &entry, SyncPolicy::Bus.rules()).unwrap();
+
+        assert!(changed, "a real user edit must be recorded");
+        let after = node
+            .manifest()
+            .get("edited.txt")
+            .and_then(|e| e.meta())
+            .copied()
+            .unwrap();
+        assert_eq!(after.hash, content_hash(b"user edited this"));
+        assert_eq!(
+            after.author, mine,
+            "a user edit must carry local authorship"
+        );
+        assert!(
+            after.version > before,
+            "a user edit must outrank what it replaced"
+        );
     }
 
     async fn run_three_node_2000_file_continuous_mutation_stress() {
