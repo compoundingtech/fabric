@@ -530,7 +530,24 @@ impl TunnelSession {
         let mut buf = [0; LOCAL_READ_BUF];
         loop {
             self.wait_for_buffer_space().await;
-            let read = read.read(&mut buf).await?;
+            let read = match read.read(&mut buf).await {
+                Ok(read) => read,
+                Err(error) => {
+                    // An abrupt local close ends local input just as surely as a
+                    // clean EOF does: no further bytes can arrive on this session.
+                    // Release the recycle guard so a stalled remote teardown cannot
+                    // pin the endpoint. Deliberately ONLY the guard — send_closed
+                    // and every other teardown semantic stay exactly as they were,
+                    // because this error path is not the place to change them.
+                    //
+                    // This path is why the first version of the fix was incomplete.
+                    // Dropping a local socket yields a clean zero-length read on
+                    // macOS and an error on Linux, so releasing on clean EOF alone
+                    // left the Linux case pinned and the CI failure unchanged.
+                    self.release_attach_gauge().await;
+                    return Err(error.into());
+                }
+            };
             if read == 0 {
                 self.mark_send_closed().await;
                 return Ok(());
