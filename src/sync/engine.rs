@@ -267,6 +267,21 @@ impl EntryWork {
             .record(path.to_path_buf(), fingerprint, generation);
     }
 
+    /// DIAGNOSTICS ONLY. Does the journal recognise this path's current bytes as
+    /// something the engine itself wrote, and had that record been committed?
+    fn diag_journal_state(&self, path: &Path) -> (bool, bool) {
+        let journal = self.daemon_writes.lock().unwrap();
+        match journal.entries.get(path) {
+            Some(recorded) => {
+                let matches = FileFingerprint::read(path)
+                    .map(|current| recorded.fingerprint == current)
+                    .unwrap_or(false);
+                (matches, recorded.committed)
+            }
+            None => (false, false),
+        }
+    }
+
     fn commit_daemon_writes(&self) {
         self.daemon_writes.lock().unwrap().commit_all();
     }
@@ -773,7 +788,14 @@ impl<T: SyncTransport> SyncEngine<T> {
         let policy = entry.policy;
         let mut node = entry.node.lock().await;
         let mut observed = entry.observed.lock().unwrap();
-        scan_into_node_observed(&mut node, &root, &cfg, policy, &mut observed)
+        scan_into_node_observed(
+            &mut node,
+            &root,
+            &cfg,
+            policy,
+            &mut observed,
+            Some(&entry.work),
+        )
     }
 
     async fn materialize_entry_state(
@@ -1139,7 +1161,7 @@ fn scan_into_node(
     policy: PolicyRules,
 ) -> Result<bool> {
     let mut observed = observed_from_manifest(node.manifest());
-    scan_into_node_observed(node, root, entry, policy, &mut observed)
+    scan_into_node_observed(node, root, entry, policy, &mut observed, None)
 }
 
 #[cfg(test)]
@@ -1182,6 +1204,10 @@ fn scan_into_node_observed(
     entry: &SyncEntry,
     policy: PolicyRules,
     observed: &mut HashMap<String, ContentHash>,
+    // DIAGNOSTICS ONLY. The scan path has no knowledge of the daemon-write
+    // journal in production, which is precisely why it cannot tell bytes the
+    // engine wrote from bytes a user wrote. Passed in here only to observe that.
+    diag_work: Option<&EntryWork>,
 ) -> Result<bool> {
     let scanned = scan_folder(root, entry, node.manifest())?;
     let previous = observed.clone();
@@ -1231,13 +1257,50 @@ fn scan_into_node_observed(
             {
                 node.put_content(file.read_bytes()?);
             }
-        } else if node.local_write(
-            &file.rel,
-            &file.read_bytes()?,
-            file.mtime_secs,
-            file.mtime_nanos,
-        ) {
-            changed = true;
+        } else {
+            // DIAGNOSTICS ONLY. Capture the exact comparison and authorship
+            // transition at the one site that can republish stale disk bytes.
+            let prior = node.manifest().get(&file.rel).copied();
+            let republished = node.local_write(
+                &file.rel,
+                &file.read_bytes()?,
+                file.mtime_secs,
+                file.mtime_nanos,
+            );
+            if republished && file.rel == "hot.txt" {
+                let (journal_match, journal_committed) = diag_work
+                    .map(|work| work.diag_journal_state(&file.path))
+                    .unwrap_or((false, false));
+                let after = node.manifest().get(&file.rel).copied();
+                let describe = |entry: Option<crate::sync::manifest::Entry>| match entry {
+                    Some(crate::sync::manifest::Entry::Present(meta)) => format!(
+                        "v{} author{} hash{}",
+                        meta.version,
+                        meta.author.0[0],
+                        meta.hash.0[..4]
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>()
+                    ),
+                    Some(crate::sync::manifest::Entry::Tombstone(t)) => {
+                        format!("tombstone v{}", t.version)
+                    }
+                    None => "absent".to_string(),
+                };
+                eprintln!(
+                    "REPUBLISH path={} prior=[{}] disk_hash={} after=[{}] journal_match={journal_match} journal_committed={journal_committed}",
+                    file.rel,
+                    describe(prior),
+                    hash.0[..4]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>(),
+                    describe(after),
+                );
+            }
+            if republished {
+                changed = true;
+            }
         }
     }
 
@@ -2096,7 +2159,8 @@ mod tests {
             let protected = observed.clone();
 
             let changed =
-                scan_into_node_observed(&mut node, root, &entry, rules, &mut observed).unwrap();
+                scan_into_node_observed(&mut node, root, &entry, rules, &mut observed, None)
+                    .unwrap();
             assert_eq!(changed, policy == SyncPolicy::Catalog);
             if policy == SyncPolicy::Catalog {
                 assert!(matches!(
@@ -2141,8 +2205,15 @@ mod tests {
             // file above, and must advance causally beyond Tombstone/v2.
             std::fs::write(&path, b"resurrected").unwrap();
             assert!(
-                scan_into_node_observed(&mut node, root, &entry, policy.rules(), &mut observed,)
-                    .unwrap()
+                scan_into_node_observed(
+                    &mut node,
+                    root,
+                    &entry,
+                    policy.rules(),
+                    &mut observed,
+                    None
+                )
+                .unwrap()
             );
             assert!(matches!(
                 node.manifest().get("retired.toml"),
