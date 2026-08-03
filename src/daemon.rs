@@ -6143,4 +6143,106 @@ mod tests {
         server.shutdown().await?;
         Ok(())
     }
+
+    /// The SERVER must stop counting a session as attached once the client's
+    /// local end goes away.
+    ///
+    /// The test above proves the client releases its own gauge. It says nothing
+    /// about the far end, and the far end is what pins the server's endpoint.
+    /// This asserts the far end, on a quiet tunnel so no remote output can end
+    /// the session by a second route.
+    ///
+    /// **This is NOT a regression guard for issue 32, and it was wrong to
+    /// present it as one.** Issue 32 lives in the branch where the local read
+    /// returns an ERROR, and dropping a `UnixStream` in-process closes it
+    /// cleanly, so both platforms take the EOF branch here. I confirmed that on
+    /// Linux CI twice: with the pre-fix teardown restored, this test passed,
+    /// first with a shell and then with this quiet tunnel. Reaching the error
+    /// branch needs an abrupt close such as a killed process or an RST, which is
+    /// how the original trace produced it.
+    ///
+    /// The real guard for issue 32 is
+    /// `tunnel::tests::an_abrupt_local_close_reports_the_end_just_like_a_clean_eof`,
+    /// which injects the ending directly and therefore fails on every platform
+    /// when the defect is present. What this test still earns is the healthy
+    /// path: a clean local close must detach the session on the server promptly,
+    /// and that must not regress.
+    #[tokio::test]
+    async fn a_clean_local_close_detaches_a_quiet_session_on_the_server_too() -> Result<()> {
+        let server_dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let server_home = FabricHome::new(server_dir.path());
+        let client_home = FabricHome::new(client_dir.path());
+        let server = FabricNode::start(server_home.clone()).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+
+        // A sink: it reads and never writes back. Anything it echoed would give
+        // the teardown a second route and mask exactly what this test isolates.
+        let sink_socket = server_dir.path().join("sink.sock");
+        let sink_listener = UnixListener::bind(&sink_socket)?;
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = sink_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    while let Ok(read) = stream.read(&mut buf).await {
+                        if read == 0 {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        server.expose("audit/sink", sink_socket.clone()).await?;
+
+        let client_state = client.state();
+        let server_state = server.state();
+        let socket = client_state
+            .dial_alpn("server", "audit/sink", b"audit/sink".to_vec(), false)
+            .await?;
+        let mut dial = UnixStream::connect(&socket).await?;
+        dial.write_all(b"open-the-session").await?;
+
+        // POSITIVE CONTROL. Prove the server really is holding an attach before
+        // asserting that it lets one go, or a server that never counted the
+        // session would pass the real check for the wrong reason.
+        let attached = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if server_state.tunnel_sessions.stats().await.active_attaches > 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(
+            attached.is_ok(),
+            "the server never counted the quiet session as attached, so this test \
+             could not observe it detaching either"
+        );
+
+        drop(dial);
+
+        // Bounded well under the 40s stall and well over the ~53ms healthy case,
+        // so this fails on the defect and does not flake on a slow machine.
+        let detached = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if server_state.tunnel_sessions.stats().await.active_attaches == 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(
+            detached.is_ok(),
+            "the server still counts the session as attached 20s after the client \
+             dropped its local end; a finished session pins the server's endpoint"
+        );
+
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
 }
