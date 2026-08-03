@@ -265,6 +265,8 @@ pub struct DaemonState {
     active_dial_listeners: Arc<AtomicUsize>,
     tcp_dials: Mutex<HashMap<(String, String, String), TcpDial>>,
     tunnel_sessions: tunnel::ServerSessionStore,
+    /// Attached OUTBOUND sessions. `tunnel_sessions` only knows what we serve.
+    client_attaches: Arc<tunnel::ClientAttachGauge>,
     tunnel_drop_tx: watch::Sender<u64>,
     tunnel_blocked: AtomicBool,
     network_usable: AtomicBool,
@@ -701,6 +703,7 @@ impl DaemonState {
             active_dial_listeners: Arc::new(AtomicUsize::new(0)),
             tcp_dials: Mutex::new(HashMap::new()),
             tunnel_sessions,
+            client_attaches: tunnel::ClientAttachGauge::new(),
             tunnel_drop_tx,
             tunnel_blocked: AtomicBool::new(false),
             network_usable: AtomicBool::new(true),
@@ -994,6 +997,7 @@ impl DaemonState {
             self.tunnel_drop_rx(),
             self.dial_failures.clone(),
             self.dial_slots.clone(),
+            self.client_attaches.clone(),
         ));
 
         Ok(addr)
@@ -1068,6 +1072,7 @@ impl DaemonState {
                 self.dial_failures.clone(),
                 self.dial_slots.clone(),
                 lease,
+                self.client_attaches.clone(),
             ))
         } else {
             tokio::spawn(run_dial_socket(
@@ -1082,7 +1087,13 @@ impl DaemonState {
                 self.dial_failures.clone(),
                 self.dial_slots.clone(),
                 lease,
-                None,
+                // Count attaches so a live generic dial blocks an endpoint
+                // recycle too. The encoder deliberately returns None for every
+                // event: a generic dial carries raw bytes, and injecting a
+                // status frame into someone's stream would corrupt it. The
+                // logging half of this lands separately.
+                Some(tunnel::ClientConnectionNotices::new(|_| None)
+                    .with_gauge(self.client_attaches.clone())),
             ))
         };
         sockets.insert(
@@ -1632,7 +1643,8 @@ impl DaemonState {
         // is a worse outcome than whatever condition prompted the recycle. A
         // caller that genuinely preserves sessions uses the _preserving variant.
         let sessions = self.tunnel_sessions.stats().await;
-        if let Some(attached) = recycle_blocked_by_sessions(&sessions) {
+        let outbound_attaches = self.client_attaches.attached();
+        if let Some(attached) = recycle_blocked_by_sessions(&sessions, outbound_attaches) {
             warn!(
                 target: VALIDATION_LOG_TARGET,
                 event = "endpoint_recycle_skipped_sessions_attached",
@@ -1640,6 +1652,7 @@ impl DaemonState {
                 reason,
                 active_sessions = sessions.active_sessions,
                 active_attaches = sessions.active_attaches,
+                outbound_attaches,
                 "endpoint recycle skipped to preserve live sessions"
             );
             eprintln!(
@@ -2349,8 +2362,11 @@ fn peer_recovery_backoff(attempt: usize, initial: Duration, max: Duration) -> Du
 /// Both counters matter: `active_sessions` covers a session whose PTY is alive,
 /// and `active_attaches` covers a client currently attached to one. Recycling
 /// with either non-zero drops a user's shell mid-command.
-fn recycle_blocked_by_sessions(stats: &tunnel::ServerSessionStats) -> Option<usize> {
-    let attached = stats.active_sessions + stats.active_attaches;
+fn recycle_blocked_by_sessions(
+    stats: &tunnel::ServerSessionStats,
+    outbound_attaches: usize,
+) -> Option<usize> {
+    let attached = stats.active_sessions + stats.active_attaches + outbound_attaches;
     (attached > 0).then_some(attached)
 }
 
@@ -3289,6 +3305,7 @@ async fn run_shell_dial_socket(
     dial_failures: Arc<FailureBackoff>,
     dial_slots: Arc<Semaphore>,
     _lease: DialListenerLease,
+    gauge: Arc<tunnel::ClientAttachGauge>,
 ) {
     loop {
         tokio::select! {
@@ -3317,6 +3334,7 @@ async fn run_shell_dial_socket(
                 let cancel = daemon_cancel.clone();
                 let drop_rx = drop_rx.clone();
                 let dial_failures = dial_failures.clone();
+                let gauge = gauge.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     if !dial_failures.wait(&cancel).await {
@@ -3330,6 +3348,7 @@ async fn run_shell_dial_socket(
                         peer_addr,
                         cancel,
                         drop_rx,
+                        gauge,
                     )
                     .await
                     {
@@ -3346,6 +3365,7 @@ async fn run_shell_dial_socket(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_shell_dial_socket_connection(
     mut local: UnixStream,
     mut endpoint_rx: watch::Receiver<CurrentEndpoint>,
@@ -3354,6 +3374,7 @@ async fn handle_shell_dial_socket_connection(
     peer_addr: EndpointAddr,
     cancel: CancellationToken,
     drop_rx: watch::Receiver<u64>,
+    gauge: Arc<tunnel::ClientAttachGauge>,
 ) -> Result<()> {
     let mut attempt = 0usize;
     loop {
@@ -3383,7 +3404,7 @@ async fn handle_shell_dial_socket_connection(
                 // Protocol selection ends here. Once shell/1 has attached, its
                 // reconnect loop must remain shell/1 so it resumes this exact
                 // remote PTY rather than starting a legacy replacement.
-                let notices = shell_client_notices(peer.clone(), generation);
+                let notices = shell_client_notices(peer.clone(), generation, gauge.clone());
                 return tunnel::run_client_connection_with_initial(
                     local,
                     endpoint_rx,
@@ -3527,7 +3548,11 @@ fn shell_resumable_alpn_unsupported(error: &anyhow::Error) -> bool {
 /// it back, so "did my shell recover" was unanswerable from the log. Each line
 /// names the peer and the endpoint generation, which is the route context that
 /// distinguishes a peer roaming from this endpoint being rebuilt underneath it.
-fn shell_client_notices(peer: String, generation: u64) -> tunnel::ClientConnectionNotices {
+fn shell_client_notices(
+    peer: String,
+    generation: u64,
+    gauge: Arc<tunnel::ClientAttachGauge>,
+) -> tunnel::ClientConnectionNotices {
     tunnel::ClientConnectionNotices::new(move |event| {
         let encoded = match event {
             tunnel::ClientConnectionEvent::Reconnecting {
@@ -3584,8 +3609,10 @@ fn shell_client_notices(peer: String, generation: u64) -> tunnel::ClientConnecti
         };
         encoded.ok()
     })
+    .with_gauge(gauge)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_dial_tcp_listener(
     listener: TcpListener,
     endpoint_rx: watch::Receiver<CurrentEndpoint>,
@@ -3596,6 +3623,7 @@ async fn run_dial_tcp_listener(
     drop_rx: watch::Receiver<u64>,
     dial_failures: Arc<FailureBackoff>,
     dial_slots: Arc<Semaphore>,
+    gauge: Arc<tunnel::ClientAttachGauge>,
 ) {
     loop {
         tokio::select! {
@@ -3620,13 +3648,16 @@ async fn run_dial_tcp_listener(
                 let cancel = cancel.clone();
                 let drop_rx = drop_rx.clone();
                 let dial_failures = dial_failures.clone();
+                let notices = Some(
+                    tunnel::ClientConnectionNotices::new(|_| None).with_gauge(gauge.clone()),
+                );
                 tokio::spawn(async move {
                     let _permit = permit;
                     if !dial_failures.wait(&cancel).await {
                         return;
                     }
                     match
-                        tunnel::run_client_tcp_connection(local, endpoint_rx, home, peer, alpn, cancel, drop_rx)
+                        tunnel::run_client_tcp_connection(local, endpoint_rx, home, peer, alpn, cancel, drop_rx, notices)
                             .await
                     {
                         Ok(()) => dial_failures.record_success().await,
@@ -3965,26 +3996,26 @@ mod tests {
     #[test]
     fn live_sessions_block_an_endpoint_recycle() {
         let idle = tunnel::ServerSessionStats::default();
-        assert_eq!(recycle_blocked_by_sessions(&idle), None);
+        assert_eq!(recycle_blocked_by_sessions(&idle, 0), None);
 
         let with_session = tunnel::ServerSessionStats {
             active_sessions: 1,
             ..Default::default()
         };
-        assert_eq!(recycle_blocked_by_sessions(&with_session), Some(1));
+        assert_eq!(recycle_blocked_by_sessions(&with_session, 0), Some(1));
 
         let with_attach = tunnel::ServerSessionStats {
             active_attaches: 2,
             ..Default::default()
         };
-        assert_eq!(recycle_blocked_by_sessions(&with_attach), Some(2));
+        assert_eq!(recycle_blocked_by_sessions(&with_attach, 0), Some(2));
 
         let both = tunnel::ServerSessionStats {
             active_sessions: 1,
             active_attaches: 3,
             ..Default::default()
         };
-        assert_eq!(recycle_blocked_by_sessions(&both), Some(4));
+        assert_eq!(recycle_blocked_by_sessions(&both, 0), Some(4));
 
         // A detached-but-resumable session is not an attached one; it must not
         // pin the endpoint forever.
@@ -3992,7 +4023,14 @@ mod tests {
             detached_sessions: 5,
             ..Default::default()
         };
-        assert_eq!(recycle_blocked_by_sessions(&detached_only), None);
+        assert_eq!(recycle_blocked_by_sessions(&detached_only, 0), None);
+
+        // An OUTBOUND attach counts too. Nothing we serve is attached here, which
+        // is exactly the state that used to read as "idle" while a user held a
+        // working shell out to a peer.
+        assert_eq!(recycle_blocked_by_sessions(&idle, 1), Some(1));
+        assert_eq!(recycle_blocked_by_sessions(&detached_only, 2), Some(2));
+        assert_eq!(recycle_blocked_by_sessions(&both, 2), Some(6));
     }
 
     #[tokio::test]
@@ -4723,5 +4761,178 @@ mod tests {
                 String::from_utf8_lossy(marker)
             )
         })?
+    }
+
+    /// A live GENERIC dial must block a recycle too, and must receive no
+    /// injected bytes while doing so.
+    ///
+    /// The gauge rides the notices mechanism, which on the shell path also writes
+    /// status frames into the local stream. A generic dial carries raw bytes for
+    /// somebody else's protocol, so the same mechanism must stay silent here or
+    /// it corrupts the stream it is trying to describe.
+    #[tokio::test]
+    async fn live_generic_dial_blocks_recycle_without_injecting_bytes() -> Result<()> {
+        let server_dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let server_home = FabricHome::new(server_dir.path());
+        let client_home = FabricHome::new(client_dir.path());
+        let server = FabricNode::start(server_home.clone()).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+
+        // An echo service behind a plain exposure: raw bytes, no framing.
+        let echo_socket = server_dir.path().join("echo.sock");
+        let echo_listener = UnixListener::bind(&echo_socket)?;
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = echo_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if stream.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        server.expose("audit/echo", echo_socket.clone()).await?;
+
+        let state = client.state();
+        let socket = state
+            .dial_alpn("server", "audit/echo", b"audit/echo".to_vec(), false)
+            .await?;
+        let mut dial = UnixStream::connect(&socket).await?;
+        dial.write_all(b"ping-one").await?;
+        let mut echoed = [0u8; 8];
+        tokio::time::timeout(Duration::from_secs(20), dial.read_exact(&mut echoed)).await??;
+        assert_eq!(
+            &echoed, b"ping-one",
+            "the generic dial must round-trip raw bytes untouched"
+        );
+
+        assert_eq!(
+            state.client_attaches.attached(),
+            1,
+            "a live generic dial must register an attach"
+        );
+        let generation = state.endpoint_handle().generation;
+        let outcome = state
+            .recycle_endpoint_if_generation(generation, "audit: live generic dial")
+            .await?;
+        assert!(
+            matches!(outcome, EndpointRecycleOutcome::SessionsAttached { .. }),
+            "a live generic dial must block the recycle, got {outcome:?}"
+        );
+
+        // Still raw, still exact: the notices mechanism wrote nothing into it.
+        dial.write_all(b"ping-two").await?;
+        tokio::time::timeout(Duration::from_secs(20), dial.read_exact(&mut echoed)).await??;
+        assert_eq!(
+            &echoed, b"ping-two",
+            "a generic dial must never receive injected status bytes"
+        );
+
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// An attached OUTBOUND session must block an endpoint recycle, and a
+    /// session that is not attached must not.
+    ///
+    /// The guard reads the store of sessions we SERVE, so before the gauge it saw
+    /// nothing at all while this machine held a working shell out to a peer:
+    /// measured as served sessions=0, attaches=0, verdict None, and the recycle
+    /// went ahead and bumped the generation from 0 to 1 underneath a live shell.
+    /// That is the common case on a laptop, where every shell is outbound.
+    ///
+    /// The negative control matters as much as the positive one. A session stuck
+    /// reconnecting because the local endpoint is broken must not hold off the
+    /// recycle that would repair it, or a disruption bug becomes a deadlock.
+    #[tokio::test]
+    async fn attached_outbound_session_blocks_recycle_and_a_dead_one_does_not() -> Result<()> {
+        let server_dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let server_home = FabricHome::new(server_dir.path());
+        let client_home = FabricHome::new(client_dir.path());
+        let server = FabricNode::start_with_options(server_home.clone(), true).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+
+        let state = client.state();
+        let socket = state
+            .dial_alpn(
+                "server",
+                shell::SHELL_PROTOCOL,
+                shell::RESUMABLE_SHELL_ALPN.to_vec(),
+                false,
+            )
+            .await?;
+        let mut shell_stream = UnixStream::connect(&socket).await?;
+        shell::write_client_stdin(&mut shell_stream, b"printf '%s-%s\n' out bound\n").await?;
+        read_shell_marker(&mut shell_stream, b"out-bound").await?;
+
+        // POSITIVE CONTROL. Nothing is served here, so this is entirely the
+        // outbound gauge doing the work.
+        let served = state.tunnel_sessions.stats().await;
+        assert_eq!(
+            served.active_sessions + served.active_attaches,
+            0,
+            "the client serves nothing; this test must exercise the outbound path"
+        );
+        assert_eq!(
+            state.client_attaches.attached(),
+            1,
+            "a live outbound shell must register exactly one attach"
+        );
+        let generation = state.endpoint_handle().generation;
+        let outcome = state
+            .recycle_endpoint_if_generation(generation, "audit: attached outbound session")
+            .await?;
+        assert!(
+            matches!(outcome, EndpointRecycleOutcome::SessionsAttached { .. }),
+            "an attached outbound session must block the recycle, got {outcome:?}"
+        );
+        assert_eq!(
+            state.endpoint_handle().generation,
+            generation,
+            "a blocked recycle must not bump the endpoint generation"
+        );
+
+        // The shell is untouched by the refused recycle.
+        shell::write_client_stdin(&mut shell_stream, b"printf '%s-%s\n' still here\n").await?;
+        read_shell_marker(&mut shell_stream, b"still-here").await?;
+
+        // NEGATIVE CONTROL. Drop the local end so the outbound session goes away,
+        // then prove the endpoint is recyclable again.
+        drop(shell_stream);
+        let released = tokio::time::timeout(Duration::from_secs(20), async {
+            while state.client_attaches.attached() > 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "the gauge must release when an outbound session ends, or a recycle can never run again"
+        );
+        let outcome = state
+            .recycle_endpoint_if_generation(generation, "audit: no outbound session")
+            .await?;
+        assert!(
+            matches!(outcome, EndpointRecycleOutcome::Recycled),
+            "with nothing attached the recycle must proceed, got {outcome:?}"
+        );
+
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
     }
 }

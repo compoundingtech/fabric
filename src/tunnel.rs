@@ -83,9 +83,52 @@ pub enum ClientConnectionEvent {
 
 type NoticeEncoder = dyn Fn(&ClientConnectionEvent) -> Option<Vec<u8>> + Send + Sync + 'static;
 
+/// How many outbound tunnel sessions are attached to a transport right now.
+///
+/// Sessions this daemon SERVES live in a store that can be counted directly.
+/// Sessions it holds OUT do not: they live in the client attach loop and are
+/// owned by whoever called it. Without this gauge the endpoint-recycle guard is
+/// blind to exactly the sessions a user is most likely to notice, their own, and
+/// a recycle tears down a working shell while the guard reports nothing attached.
+///
+/// This counts ATTACHED, not merely alive. A session stuck reconnecting because
+/// the local endpoint is broken must NOT hold off the recycle that would fix it.
+#[derive(Debug, Default)]
+pub struct ClientAttachGauge {
+    attached: AtomicUsize,
+}
+
+impl ClientAttachGauge {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn attached(&self) -> usize {
+        self.attached.load(Ordering::SeqCst)
+    }
+}
+
+/// Holds the gauge up for exactly as long as an attach lives, including when the
+/// attach ends by unwinding.
+struct ClientAttachGuard(Arc<ClientAttachGauge>);
+
+impl ClientAttachGuard {
+    fn new(gauge: Arc<ClientAttachGauge>) -> Self {
+        gauge.attached.fetch_add(1, Ordering::SeqCst);
+        Self(gauge)
+    }
+}
+
+impl Drop for ClientAttachGuard {
+    fn drop(&mut self) {
+        self.0.attached.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 #[derive(Clone)]
 pub struct ClientConnectionNotices {
     encode: Arc<NoticeEncoder>,
+    gauge: Option<Arc<ClientAttachGauge>>,
 }
 
 impl ClientConnectionNotices {
@@ -94,7 +137,15 @@ impl ClientConnectionNotices {
     ) -> Self {
         Self {
             encode: Arc::new(encode),
+            gauge: None,
         }
+    }
+
+    /// Count this connection's attaches so the endpoint-recycle guard can see
+    /// outbound sessions.
+    pub fn with_gauge(mut self, gauge: Arc<ClientAttachGauge>) -> Self {
+        self.gauge = Some(gauge);
+        self
     }
 
     async fn emit(&self, session: &TunnelSession, event: ClientConnectionEvent) {
@@ -848,6 +899,7 @@ pub async fn run_client_connection_with_initial(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_client_tcp_connection(
     local: TcpStream,
     endpoint_rx: watch::Receiver<CurrentEndpoint>,
@@ -856,6 +908,7 @@ pub async fn run_client_tcp_connection(
     alpn: Vec<u8>,
     cancel: CancellationToken,
     drop_rx: watch::Receiver<u64>,
+    notices: Option<ClientConnectionNotices>,
 ) -> Result<()> {
     let (read, write) = local.into_split();
     run_client_connection_parts(
@@ -867,7 +920,7 @@ pub async fn run_client_tcp_connection(
         alpn,
         cancel,
         drop_rx,
-        None,
+        notices,
         None,
     )
     .await
@@ -1108,6 +1161,11 @@ async fn attach_connection(
         notices.emit(&session, ClientConnectionEvent::Resumed).await;
     }
 
+    // Held for the attached period only: the handshake above has succeeded, so
+    // this session is genuinely on a transport and a recycle would interrupt it.
+    let _attached = notices
+        .and_then(|notices| notices.gauge.clone())
+        .map(ClientAttachGuard::new);
     session.run_attach(send, recv, recv_next).await
 }
 
