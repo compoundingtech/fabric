@@ -548,6 +548,11 @@ The same pattern applies to any per-instance daemon: per-instance
 home/socket/identity, prod is the one service, dev is a manual run on a distinct
 home.
 
+Three branches on `origin` are neither merged into `main` nor known to be
+obsolete, so `git branch --merged` will never retire them. Before you tidy them
+away, read [docs/unresolved-branches.md](docs/unresolved-branches.md) — it says
+what is known, what is not, and why deleting them on a guess is the wrong trade.
+
 ## Commands
 
 ```sh
