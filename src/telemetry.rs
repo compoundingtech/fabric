@@ -214,16 +214,35 @@ pub struct TelemetryStore {
 }
 
 impl TelemetryStore {
-    /// Load from disk, or start empty when the file is absent or unreadable.
+    /// Load from disk, or start empty when the file is absent, unreadable, or
+    /// written by a different layout.
     ///
     /// A corrupt telemetry file must never stop a daemon from starting. These
     /// are counters, not state the product depends on, so a bad read restarts
     /// the counts and says so.
+    ///
+    /// The version check is not ceremony. A bucket holds a COUNT, and its
+    /// meaning lives entirely in [`LATENCY_BUCKET_BOUNDS_MICROS`], which is not
+    /// stored beside it. Change those bounds and every historical count is
+    /// silently reattributed: 100 probes recorded at 64ms sit in the bucket
+    /// whose bound is 100ms, and under a plausible refinement that same index
+    /// means 60ms, so the daemon would report a latency that never happened.
+    /// Nothing errors, because a same-length change never triggers a resize.
+    /// Refusing a foreign version is what keeps that from being silent.
     pub fn load(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         let peers = match std::fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<TelemetrySnapshot>(&bytes) {
-                Ok(snapshot) => snapshot.peers,
+                Ok(snapshot) if snapshot.version == SNAPSHOT_VERSION => snapshot.peers,
+                Ok(snapshot) => {
+                    eprintln!(
+                        "fabric: telemetry at {} is version {}, expected {}; starting the counts over rather than misreading its latency buckets",
+                        path.display(),
+                        snapshot.version,
+                        SNAPSHOT_VERSION
+                    );
+                    BTreeMap::new()
+                }
                 Err(error) => {
                     eprintln!(
                         "fabric: ignoring unreadable telemetry at {}: {error}",
@@ -556,6 +575,95 @@ mod tests {
         assert_eq!(
             peer.reconnect.samples, 0,
             "a duration measured across a restart would be fiction"
+        );
+    }
+
+    /// Changing the bucket bounds MUST bump the snapshot version.
+    ///
+    /// This pins both together on purpose, because the coupling is otherwise
+    /// invisible. A bucket stores only a count; its meaning lives in the bounds,
+    /// and the bounds are not written to the file. Change them without bumping
+    /// the version and every historical count is silently reattributed — a
+    /// same-length change does not even trigger a resize, so nothing errors and
+    /// the daemon reports latencies that never occurred.
+    ///
+    /// If this test fails you changed one of the two. Change the other.
+    #[test]
+    fn changing_the_latency_buckets_requires_a_new_snapshot_version() {
+        assert_eq!(
+            LATENCY_BUCKET_BOUNDS_MICROS,
+            [
+                1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000, 500_000, 1_000_000,
+                2_000_000, 5_000_000, 10_000_000, 30_000_000, 60_000_000
+            ],
+            "the latency buckets changed; bump SNAPSHOT_VERSION so old files are \
+             discarded instead of silently reinterpreted, then update this test"
+        );
+        assert_eq!(
+            SNAPSHOT_VERSION, 1,
+            "the snapshot version changed; confirm the bucket bounds above still \
+             match what that version means"
+        );
+    }
+
+    /// A file from another layout is discarded, not misread.
+    #[test]
+    fn a_foreign_version_starts_clean_rather_than_reinterpreting_buckets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("telemetry.json");
+
+        // A well-formed file that a future layout could plausibly have written:
+        // the counts are real, but the bounds that gave them meaning are gone.
+        let store = TelemetryStore::load(&path);
+        store.record_probe(
+            "droppy",
+            true,
+            Some("relay"),
+            Some(Duration::from_millis(64)),
+        );
+        let mut snapshot = store.snapshot();
+        snapshot.version = SNAPSHOT_VERSION + 1;
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+        let reloaded = TelemetryStore::load(&path);
+        assert!(
+            reloaded.peer("droppy").is_none(),
+            "counts from an unknown layout must be dropped; keeping them would \
+             report latencies computed against bounds that never applied"
+        );
+
+        // And it still records normally afterwards, rather than staying broken.
+        reloaded.record_probe(
+            "droppy",
+            true,
+            Some("relay"),
+            Some(Duration::from_millis(70)),
+        );
+        assert_eq!(
+            reloaded.peer("droppy").unwrap().probe_latency["relay"].samples,
+            1
+        );
+    }
+
+    #[test]
+    fn a_matching_version_is_kept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("telemetry.json");
+        {
+            let store = TelemetryStore::load(&path);
+            store.record_probe(
+                "hetz",
+                true,
+                Some("direct"),
+                Some(Duration::from_millis(64)),
+            );
+        }
+        let reloaded = TelemetryStore::load(&path);
+        assert_eq!(
+            reloaded.peer("hetz").map(|p| p.probes_reachable),
+            Some(1),
+            "the current version must survive a reload, or the check is too strict \
+             and quietly discards every restart"
         );
     }
 
