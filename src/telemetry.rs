@@ -71,8 +71,14 @@ pub const PATH_UNKNOWN: &str = "unknown";
 pub struct LatencySummary {
     #[serde(default)]
     pub samples: u64,
+    /// Sum of every sample, in microseconds.
+    ///
+    /// `u64`, NOT `u128`, and the difference is load-bearing. The control
+    /// protocol is JSON, which cannot carry a `u128`, so a `u128` here made
+    /// `fabric status` fail with "u128 is not supported" as soon as any peer had
+    /// been probed. `u64` microseconds overflows after roughly 584,000 years.
     #[serde(default)]
-    pub total_micros: u128,
+    pub total_micros: u64,
     #[serde(default)]
     pub max_micros: u64,
     /// Counts aligned with [`LATENCY_BUCKET_BOUNDS_MICROS`], plus one final
@@ -93,7 +99,7 @@ impl LatencySummary {
             .unwrap_or(LATENCY_BUCKET_BOUNDS_MICROS.len());
         self.buckets[index] += 1;
         self.samples += 1;
-        self.total_micros += u128::from(micros);
+        self.total_micros = self.total_micros.saturating_add(micros);
         self.max_micros = self.max_micros.max(micros);
     }
 
@@ -101,7 +107,7 @@ impl LatencySummary {
         if self.samples == 0 {
             return None;
         }
-        Some((self.total_micros / u128::from(self.samples)) as u64)
+        Some(self.total_micros / self.samples)
     }
 
     /// Approximate quantile, reported as the upper bound of the bucket the
@@ -631,6 +637,48 @@ mod tests {
         let summary = LatencySummary::default();
         assert_eq!(summary.mean_micros(), None);
         assert_eq!(summary.quantile_micros(0.5), None);
+    }
+
+    /// A populated snapshot must round-trip as plain JSON.
+    ///
+    /// Necessary but NOT sufficient: this passed while `fabric status` was
+    /// broken, because the real wire type wraps this in an internally tagged
+    /// enum. The test that actually catches that lives in `control`, and this
+    /// one is kept only to pin the inner shape.
+    #[test]
+    fn a_populated_snapshot_survives_plain_json() {
+        let store = TelemetryStore::ephemeral();
+        let base = Instant::now();
+        store.record_loss("droppy", Some("direct"), 1, base);
+        store.record_resume("droppy", Some("relay"), base + Duration::from_millis(1_500));
+        store.record_probe(
+            "droppy",
+            true,
+            Some("relay"),
+            Some(Duration::from_millis(64)),
+        );
+        let snapshot = store.snapshot();
+        assert!(
+            !snapshot.peers.is_empty(),
+            "an empty snapshot is the case that never broke; this must be populated"
+        );
+
+        let bytes = serde_json::to_vec(&snapshot).expect("a snapshot must be serializable");
+        let decoded: TelemetrySnapshot =
+            serde_json::from_slice(&bytes).expect("a snapshot must round-trip");
+        assert_eq!(
+            decoded, snapshot,
+            "every counter must survive the control protocol unchanged"
+        );
+
+        let peer = &decoded.peers["droppy"];
+        assert_eq!(peer.losses, 1);
+        assert_eq!(peer.reconnect.samples, 1);
+        assert!(
+            peer.reconnect.total_micros > 0,
+            "the measured total must cross the wire, not just its sample count"
+        );
+        assert_eq!(peer.probe_latency["relay"].samples, 1);
     }
 
     /// The file size must be a product of peers and paths, not of uptime.
