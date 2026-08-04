@@ -358,6 +358,8 @@ struct EntryState {
     /// A Present held only in the node is not evidence that a missing path was
     /// locally deleted; this receipt is what distinguishes those cases.
     observed: Arc<StdMutex<HashMap<String, ContentHash>>>,
+    /// Local hash cache, keyed on this machine's own disk facts. Never sent.
+    scan_cache: Arc<StdMutex<HashMap<String, ScanCacheEntry>>>,
     work: Arc<EntryWork>,
 }
 
@@ -369,6 +371,35 @@ struct EntryState {
 struct PersistedEntryState {
     manifest: Manifest,
     observed: HashMap<String, ContentHash>,
+    /// Local hash cache. Absent in files written before it existed, in which
+    /// case the first scan re-hashes once and warms it.
+    #[serde(default)]
+    scan_cache: HashMap<String, ScanCacheEntry>,
+}
+
+/// What the LOCAL disk looked like when this path was last hashed.
+///
+/// Deliberately separate from `observed`, and the separation is the point.
+/// `observed` decides whether a missing path becomes a tombstone, and a
+/// tombstone crosses the wire; loading a performance concern onto it would put
+/// a cache inside the structure that decides correctness.
+///
+/// It is equally deliberate that this never crosses the wire. The previous
+/// version of this cache read its key from the REPLICATED manifest, so a local
+/// caching decision was made from a value another machine chose. Two contending
+/// entries of equal size could then collide on size plus mtime, the cache
+/// reported content the file did not hold, and versions leapfrogged forever.
+/// Keyed locally, that collision cannot be manufactured: these numbers describe
+/// this machine's own disk and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct ScanCacheEntry {
+    size: u64,
+    /// The mtime as READ BACK from disk, never the value that was requested.
+    /// A filesystem with coarser precision truncates a stamp, so the requested
+    /// value may never be observable again and the cache would miss forever.
+    mtime_secs: i64,
+    mtime_nanos: u32,
+    hash: ContentHash,
 }
 
 /// State retained across an inbound merge.
@@ -456,20 +487,22 @@ impl<T: SyncTransport> SyncEngine<T> {
                 .unwrap_or_else(EntryWork::new);
             // Reuse an existing node for an unchanged entry so in-memory content
             // survives a reload; otherwise start one from the persisted manifest.
-            let (node, operation, observed) = match entries.get(&cfg.name) {
+            let (node, operation, observed, scan_cache) = match entries.get(&cfg.name) {
                 Some(existing) if existing.config == *cfg => (
                     existing.node.clone(),
                     existing.operation.clone(),
                     existing.observed.clone(),
+                    existing.scan_cache.clone(),
                 ),
                 _ => {
                     work.durable_generation.store(0, Ordering::Release);
                     work.record_mutation();
-                    let (node, observed) = self.load_node_and_observed(cfg).await?;
+                    let (node, observed, scan_cache) = self.load_node_and_observed(cfg).await?;
                     (
                         Arc::new(Mutex::new(node)),
                         Arc::new(Mutex::new(())),
                         Arc::new(StdMutex::new(observed)),
+                        Arc::new(StdMutex::new(scan_cache)),
                     )
                 }
             };
@@ -481,6 +514,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                     node,
                     operation,
                     observed,
+                    scan_cache,
                     work,
                 }),
             );
@@ -492,17 +526,25 @@ impl<T: SyncTransport> SyncEngine<T> {
     async fn load_node_and_observed(
         &self,
         cfg: &SyncEntry,
-    ) -> Result<(SyncNode, HashMap<String, ContentHash>)> {
+    ) -> Result<(
+        SyncNode,
+        HashMap<String, ContentHash>,
+        HashMap<String, ScanCacheEntry>,
+    )> {
         let mut node = SyncNode::new(self.author);
         if let Some(state) = self.read_state(&cfg.name)? {
             node.adopt(&state.manifest);
-            return Ok((node, state.observed));
+            // The cache is absent in a file written before it existed. An empty
+            // one is correct, not a fault: the next scan re-hashes once and
+            // warms it.
+            return Ok((node, state.observed, state.scan_cache));
         }
         if let Some(manifest) = self.read_manifest(&cfg.name)? {
             node.adopt(&manifest);
         }
-        let observed = observed_from_disk(node.manifest(), cfg)?;
-        Ok((node, observed))
+        let mut scan_cache = HashMap::new();
+        let observed = observed_from_disk(node.manifest(), cfg, &mut scan_cache)?;
+        Ok((node, observed, scan_cache))
     }
 
     /// Resolve a sync name to its node (used by the daemon's inbound accept).
@@ -773,7 +815,8 @@ impl<T: SyncTransport> SyncEngine<T> {
         let policy = entry.policy;
         let mut node = entry.node.lock().await;
         let mut observed = entry.observed.lock().unwrap();
-        scan_into_node_observed(&mut node, &root, &cfg, policy, &mut observed)
+        let mut cache = entry.scan_cache.lock().unwrap();
+        scan_into_node_observed(&mut node, &root, &cfg, policy, &mut observed, &mut cache)
     }
 
     async fn materialize_entry_state(
@@ -801,9 +844,14 @@ impl<T: SyncTransport> SyncEngine<T> {
         entry.work.persist_calls.fetch_add(1, Ordering::Relaxed);
         let manifest = entry.node.lock().await.manifest().clone();
         let observed = entry.observed.lock().unwrap().clone();
+        let scan_cache = entry.scan_cache.lock().unwrap().clone();
         self.write_state(
             &entry.config.name,
-            &PersistedEntryState { manifest, observed },
+            &PersistedEntryState {
+                manifest,
+                observed,
+                scan_cache,
+            },
         )?;
         entry.work.commit_daemon_writes();
         Ok(())
@@ -1044,6 +1092,10 @@ struct ScannedFile {
     hash: ContentHash,
     mtime_secs: i64,
     mtime_nanos: u32,
+    size: u64,
+    /// The executable bit as read from local disk, the one permission git
+    /// tracks and therefore the one fabric replicates.
+    executable: bool,
 }
 
 impl ScannedFile {
@@ -1060,7 +1112,30 @@ impl ScannedFile {
 
 /// Walk `root` recursively, returning in-scope regular files (symlinks skipped,
 /// include globs applied, paths normalized).
-fn scan_folder(root: &Path, entry: &SyncEntry, known: &Manifest) -> Result<Vec<ScannedFile>> {
+impl ScannedFile {
+    fn cache_entry(&self) -> ScanCacheEntry {
+        ScanCacheEntry {
+            size: self.size,
+            mtime_secs: self.mtime_secs,
+            mtime_nanos: self.mtime_nanos,
+            hash: self.hash,
+        }
+    }
+}
+
+/// Scan `root`, reusing a recorded hash when this machine's own disk facts are
+/// unchanged.
+///
+/// The cache is keyed on `cache`, a LOCAL record, and never on the replicated
+/// manifest. That distinction is the whole fix for the three-node divergence:
+/// keying it on the manifest made a local caching decision from a value another
+/// machine chose, so two contending entries of equal size could collide on size
+/// plus mtime and the cache then reported content the file did not hold.
+fn scan_folder(
+    root: &Path,
+    entry: &SyncEntry,
+    cache: &HashMap<String, ScanCacheEntry>,
+) -> Result<Vec<ScannedFile>> {
     let mut out = Vec::new();
     if !root.exists() {
         return Ok(out);
@@ -1074,6 +1149,14 @@ fn scan_folder(root: &Path, entry: &SyncEntry, known: &Manifest) -> Result<Vec<S
             let file_type = child.file_type()?;
             let path = child.path();
             if file_type.is_symlink() {
+                // Git tracks a symlink as a first-class object; fabric does not
+                // yet, because a symlink is a different KIND of manifest entry
+                // rather than a file with a flag. Skipping in silence was the
+                // problem: whoever hits it should see the gap named.
+                eprintln!(
+                    "fabric: skipping symlink {} — fabric does not sync symlinks, git does",
+                    path.display()
+                );
                 continue; // never follow symlinks out of the folder
             }
             if file_type.is_dir() {
@@ -1094,20 +1177,19 @@ fn scan_folder(root: &Path, entry: &SyncEntry, known: &Manifest) -> Result<Vec<S
                 continue;
             }
             let (mtime_secs, mtime_nanos) = mtime_of(&child);
-            let size = child.metadata().map(|meta| meta.len()).unwrap_or(u64::MAX);
+            let disk = child.metadata().ok();
+            let size = disk.as_ref().map(|meta| meta.len()).unwrap_or(u64::MAX);
+            let executable = disk.as_ref().is_some_and(is_executable);
             // Reuse the recorded hash when size and both mtime components are
-            // byte-identical to what the manifest already saw. Anything that
+            // byte-identical to what THIS MACHINE last observed. Anything that
             // differs, or is unknown, is read and hashed as before.
-            let known = known
-                .get(&norm)
-                .and_then(|entry| entry.meta())
-                .filter(|meta| {
-                    meta.size == size
-                        && meta.mtime_secs == mtime_secs
-                        && meta.mtime_nanos == mtime_nanos
-                });
+            let known = cache.get(&norm).filter(|seen| {
+                seen.size == size
+                    && seen.mtime_secs == mtime_secs
+                    && seen.mtime_nanos == mtime_nanos
+            });
             let (bytes, hash) = match known {
-                Some(meta) => (None, meta.hash),
+                Some(seen) => (None, seen.hash),
                 None => {
                     let bytes = std::fs::read(&path)
                         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -1122,6 +1204,8 @@ fn scan_folder(root: &Path, entry: &SyncEntry, known: &Manifest) -> Result<Vec<S
                 hash,
                 mtime_secs,
                 mtime_nanos,
+                size,
+                executable,
             });
         }
     }
@@ -1139,7 +1223,8 @@ fn scan_into_node(
     policy: PolicyRules,
 ) -> Result<bool> {
     let mut observed = observed_from_manifest(node.manifest());
-    scan_into_node_observed(node, root, entry, policy, &mut observed)
+    let mut cache = HashMap::new();
+    scan_into_node_observed(node, root, entry, policy, &mut observed, &mut cache)
 }
 
 #[cfg(test)]
@@ -1158,10 +1243,12 @@ fn observed_from_manifest(manifest: &Manifest) -> HashMap<String, ContentHash> {
 fn observed_from_disk(
     manifest: &Manifest,
     entry: &SyncEntry,
+    cache: &mut HashMap<String, ScanCacheEntry>,
 ) -> Result<HashMap<String, ContentHash>> {
     let mut observed = HashMap::new();
-    for file in scan_folder(&entry.folder, entry, manifest)? {
+    for file in scan_folder(&entry.folder, entry, cache)? {
         let hash = file.hash;
+        cache.insert(file.rel.clone(), file.cache_entry());
         if manifest
             .get(&file.rel)
             .and_then(|entry| entry.meta())
@@ -1182,8 +1269,16 @@ fn scan_into_node_observed(
     entry: &SyncEntry,
     policy: PolicyRules,
     observed: &mut HashMap<String, ContentHash>,
+    cache: &mut HashMap<String, ScanCacheEntry>,
 ) -> Result<bool> {
-    let scanned = scan_folder(root, entry, node.manifest())?;
+    let scanned = scan_folder(root, entry, cache)?;
+    // Refresh the cache from what this scan actually saw, so the next scan of an
+    // untouched file is free. Rebuilt rather than merged, so a vanished path
+    // does not leak an entry forever.
+    *cache = scanned
+        .iter()
+        .map(|file| (file.rel.clone(), file.cache_entry()))
+        .collect();
     let previous = observed.clone();
     let mut current = HashMap::new();
     let mut changed = false;
@@ -1203,11 +1298,12 @@ fn scan_into_node_observed(
                     .get(&file.rel)
                     .is_some_and(|entry| !entry.is_present())
             {
-                if node.local_write(
+                if node.local_write_with_mode(
                     &file.rel,
                     &file.read_bytes()?,
                     file.mtime_secs,
                     file.mtime_nanos,
+                    file.executable,
                 ) {
                     changed = true;
                 }
@@ -1231,11 +1327,12 @@ fn scan_into_node_observed(
             {
                 node.put_content(file.read_bytes()?);
             }
-        } else if node.local_write(
+        } else if node.local_write_with_mode(
             &file.rel,
             &file.read_bytes()?,
             file.mtime_secs,
             file.mtime_nanos,
+            file.executable,
         ) {
             changed = true;
         }
@@ -1270,28 +1367,22 @@ fn materialize(node: &SyncNode, root: &Path, policy: PolicyRules) -> Result<()> 
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            // Do NOT stamp the origin's mtime here.
+            // Stamp the origin's mtime. Safe now, and it was not before.
             //
-            // Stamping it was an optimisation so scan_folder's size-and-mtime cache
-            // would hit on materialized files. It made mtime a value SHARED across
-            // nodes instead of a local write timestamp, and that broke the cache's
-            // core assumption. Two nodes contending on one key can produce entries
-            // with identical size and identical mtime but different content, and the
-            // scan then reuses the recorded hash and reports content the file does
-            // not hold. The republish branch reads the real bytes, sees a different
-            // hash, concludes the user edited the file, and republishes under local
-            // authorship. Both sides do it and the versions leapfrog forever.
+            // Stamping once fed scan_folder's cache, whose key came from the
+            // REPLICATED manifest. That made a local caching decision from a
+            // value another machine chose: two nodes contending on one key could
+            // produce entries with identical size and identical mtime but
+            // different content, the scan reused the recorded hash and reported
+            // content the file did not hold, and the versions leapfrogged
+            // forever. Measured on Linux CI run 30814462024 attempt 4:
+            // twenty-four consecutive republishes from v44 to v67, no
+            // convergence.
             //
-            // Measured on Linux CI run 30814462024 attempt 4: twenty-four
-            // consecutive republishes alternating between two nodes, every one with
-            // prior manifest hash equal to the scanned hash yet a different hash
-            // after, from v44 to v67 with no convergence.
-            //
-            // A materialized file now carries the local write time, so the cache
-            // misses on it and the next scan reads and hashes the real bytes. The
-            // cache still hits for genuinely untouched local files, which is where
-            // its benefit actually was.
-            write_atomic(&path, bytes)?;
+            // The cache is now keyed on this machine's own observed disk facts,
+            // so a peer's mtime cannot collide into it. Stamping is once again
+            // just metadata preservation, which is what FileMeta always claimed.
+            write_atomic_with_mode(&path, bytes, meta.executable)?;
         }
     }
     if policy.propagate_deletes {
@@ -1353,7 +1444,10 @@ fn materialize_tracked(
                     // The bytes changed (or appeared) after the protected disk
                     // receipt was captured. This is a concurrent local edit,
                     // not stale content to overwrite with the remote Present.
-                    node.local_write(&rel, &existing, 0, 0);
+                    let executable = std::fs::metadata(&path)
+                        .ok()
+                        .is_some_and(|meta| is_executable(&meta));
+                    node.local_write_with_mode(&rel, &existing, 0, 0, executable);
                     observed.insert(rel.clone(), existing_hash);
                     false
                 } else {
@@ -1369,28 +1463,22 @@ fn materialize_tracked(
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            // Do NOT stamp the origin's mtime here.
+            // Stamp the origin's mtime. Safe now, and it was not before.
             //
-            // Stamping it was an optimisation so scan_folder's size-and-mtime cache
-            // would hit on materialized files. It made mtime a value SHARED across
-            // nodes instead of a local write timestamp, and that broke the cache's
-            // core assumption. Two nodes contending on one key can produce entries
-            // with identical size and identical mtime but different content, and the
-            // scan then reuses the recorded hash and reports content the file does
-            // not hold. The republish branch reads the real bytes, sees a different
-            // hash, concludes the user edited the file, and republishes under local
-            // authorship. Both sides do it and the versions leapfrog forever.
+            // Stamping once fed scan_folder's cache, whose key came from the
+            // REPLICATED manifest. That made a local caching decision from a
+            // value another machine chose: two nodes contending on one key could
+            // produce entries with identical size and identical mtime but
+            // different content, the scan reused the recorded hash and reported
+            // content the file did not hold, and the versions leapfrogged
+            // forever. Measured on Linux CI run 30814462024 attempt 4:
+            // twenty-four consecutive republishes from v44 to v67, no
+            // convergence.
             //
-            // Measured on Linux CI run 30814462024 attempt 4: twenty-four
-            // consecutive republishes alternating between two nodes, every one with
-            // prior manifest hash equal to the scanned hash yet a different hash
-            // after, from v44 to v67 with no convergence.
-            //
-            // A materialized file now carries the local write time, so the cache
-            // misses on it and the next scan reads and hashes the real bytes. The
-            // cache still hits for genuinely untouched local files, which is where
-            // its benefit actually was.
-            write_atomic(&path, bytes)?;
+            // The cache is now keyed on this machine's own observed disk facts,
+            // so a peer's mtime cannot collide into it. Stamping is once again
+            // just metadata preservation, which is what FileMeta always claimed.
+            write_atomic_with_mode(&path, bytes, meta.executable)?;
             if let Some((work, generation)) = daemon_writes {
                 work.record_daemon_write(&path, meta.hash, generation);
             }
@@ -1408,30 +1496,71 @@ fn materialize_tracked(
     Ok(())
 }
 
-/// Write bytes atomically: to a temp sibling, then rename over the target.
+/// Fabric cannot propagate a metadata-only change. ONE CAUSE, TWO SYMPTOMS.
 ///
-/// A materialized file keeps the receiver's own write time. It is NOT stamped
-/// with the sender's mtime, and that is deliberate.
+/// `SyncNode::local_write` returns early when the content hash is unchanged and
+/// discards whatever metadata came with that write. That early return is what
+/// makes applying a peer's content echo-free, so it is load-bearing rather than
+/// an oversight. The consequence is that any change which alters no bytes never
+/// advances a logical version, and a change that does not advance a version
+/// never crosses the wire.
 ///
-/// Stamping used to happen here, and it caused a permanent three-node
-/// divergence. The scan cache treats a file as unchanged when its size and mtime
-/// match the recorded metadata. Stamping made mtime a cross-node value, so two
-/// contending entries of equal size could collide on size plus mtime, and the
-/// cache then reported content the file did not actually hold. Versions
-/// leapfrogged and never converged. Commit 62a30b8 removed the stamping; the
-/// cost is one re-read per materialized file, which is the cheap side of that
-/// trade.
+/// Both known symptoms are this one cause. Fix it and you fix both; fix either
+/// symptom alone and you have not touched the cause:
 ///
-/// The consequence is that fabric does not replicate an mtime at all today, so a
-/// consumer must not read a replica's mtime as an activity signal. See issue 27:
-/// st2 derived agent liveness that way and reported live remote agents as
-/// unknown.
+/// 1. **A heartbeat is invisible.** Rewriting the same bytes with a new mtime
+///    does not propagate, so a replica keeps the older timestamp. Issue 27: st2
+///    derived agent liveness from a replica's mtime and reported live remote
+///    agents as unknown.
+/// 2. **A chmod is invisible.** `chmod +x` on an already-synced file changes no
+///    bytes, so the new mode does not propagate. A NEW file carries its mode
+///    correctly, which is the case that actually bites, but an existing one does
+///    not change.
+///
+/// Symptom 2 is a DIVERGENCE FROM GIT, not merely a limitation, now that a
+/// catalog is meant to be carriable by either transport. Git propagates a chmod:
+/// a mode change rewrites the tree object, so it is a real commit with real
+/// content. Fabric does not.
+///
+/// Closing this needs a local metadata-only change to advance a version while a
+/// received one stays inert, which puts an asymmetry into the exact mechanism
+/// that prevents infinite echo. That is a core engine change and it is not
+/// authorized.
+pub(crate) const METADATA_ONLY_CHANGES_DO_NOT_PROPAGATE: () = ();
+
+/// Write bytes atomically, applying the executable bit fabric replicates.
+///
+/// A materialized file does NOT receive the origin's modification time. Fabric
+/// syncs the attributes git syncs, and git deliberately does not track mtime.
+/// `FileMeta` still carries one, but it is informational only: see the note on
+/// that field, and on [`METADATA_ONLY_CHANGES_DO_NOT_PROPAGATE`].
+fn write_atomic_with_mode(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
+    write_atomic_inner(path, bytes, executable)
+}
+
+/// Write bytes atomically, for fabric's own state files, which are never
+/// executable.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic_inner(path, bytes, false)
+}
+
+fn write_atomic_inner(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
     let tmp = path.with_extension(format!(
         "{}.fabric-tmp",
         path.extension().and_then(|e| e.to_str()).unwrap_or("")
     ));
     std::fs::write(&tmp, bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
+    // Set the mode on the temp file, before the rename, so the file never
+    // appears at its final path with the wrong permissions.
+    if executable && let Err(error) = set_executable(&tmp) {
+        // A failed chmod must not fail the write. The content is what the sync
+        // is for, and a non-executable copy is recoverable by hand; a lost file
+        // is not.
+        eprintln!(
+            "fabric: could not set the executable bit on {}: {error:#}",
+            tmp.display()
+        );
+    }
     std::fs::rename(&tmp, path)
         .with_context(|| format!("failed to rename into {}", path.display()))?;
     Ok(())
@@ -1439,11 +1568,26 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Set a file's modification time, leaving its access time alone.
 ///
-/// Test-only since 62a30b8 removed mtime stamping from materialization. The
-/// production path deliberately never sets an mtime, so the only caller left is
-/// the test that reconstructs the size-plus-mtime collision that stamping used
-/// to manufacture.
-#[cfg(test)]
+/// Mark a file executable, mirroring git's 755. Only the executable bits are
+/// touched; fabric replicates no other permission bit, because git does not.
+fn set_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)
+        .with_context(|| format!("failed to stat {}", path.display()))?
+        .permissions();
+    let mode = perms.mode();
+    perms.set_mode(mode | 0o111);
+    std::fs::set_permissions(path, perms)
+        .with_context(|| format!("failed to set the executable bit on {}", path.display()))?;
+    Ok(())
+}
+
+/// Read whether a file is executable, the way git decides it.
+fn is_executable(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o111 != 0
+}
+
 fn set_file_mtime(path: &Path, secs: i64, nanos: u32) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
@@ -1631,31 +1775,42 @@ mod tests {
         )?;
         assert!(root.join("from-peer.md").exists(), "file was materialized");
 
-        let scanned = scan_folder(root, &entry, node.manifest())?;
+        let scanned = scan_folder(root, &entry, &HashMap::new())?;
         let file = scanned
             .iter()
             .find(|f| f.rel == "from-peer.md")
             .expect("materialized file is in scope");
-        // This test previously asserted the opposite, and that assertion was the
-        // optimisation that caused a permanent three-node divergence. Stamping the
-        // origin's mtime made the scan cache hit on materialized files, but it also
-        // made mtime a value shared across nodes, so two contending entries of equal
-        // size could collide on size and mtime with different content and the cache
-        // would report bytes the file did not hold.
-        //
-        // The deliberate cost of correctness, and the performance evidence for it: a
-        // materialized file carries the LOCAL write time, so it is read and hashed
-        // once on the next scan. Genuinely untouched local files still hit the cache,
-        // which is where its benefit actually was.
+        // The peer's mtime is NOT applied. Fabric syncs what git syncs, and git
+        // does not track mtime, so a replica carries its own write time.
         assert_ne!(
             (file.mtime_secs, file.mtime_nanos),
             (remote_mtime_secs, remote_mtime_nanos),
-            "materialize must NOT stamp the origin mtime"
+            "materialization must not apply the origin mtime; git does not track it"
         );
+        // It is still read once here, because this scan runs with a COLD cache.
+        // The cache is only ever filled from real disk observations, never from
+        // the value that was requested, so a filesystem that truncates a stamp
+        // cannot make it miss forever.
         assert!(
             file.bytes.is_some(),
-            "a freshly materialized file is re-read once; that is the cost of not \
-             trusting a shared mtime"
+            "a cold cache must read the file rather than assume its hash"
+        );
+
+        // Warm the cache the way a real scan does, from what was OBSERVED, and
+        // the next scan is free.
+        let cache: HashMap<String, ScanCacheEntry> = scanned
+            .iter()
+            .map(|f| (f.rel.clone(), f.cache_entry()))
+            .collect();
+        let again = scan_folder(root, &entry, &cache)?;
+        let file = again
+            .iter()
+            .find(|f| f.rel == "from-peer.md")
+            .expect("still in scope");
+        assert!(
+            file.bytes.is_none(),
+            "a materialized file must hit the cache on the next scan; before this \
+             change it missed forever"
         );
         Ok(())
     }
@@ -1673,14 +1828,15 @@ mod tests {
         std::fs::write(root.join("b.txt"), b"beta")?;
         let entry = entry_with_policy("bus", root, SyncPolicy::Bus);
 
-        let first = scan_folder(root, &entry, &Manifest::default())?;
+        let first = scan_folder(root, &entry, &HashMap::new())?;
         assert_eq!(first.len(), 2);
         assert!(
             first.iter().all(|file| file.bytes.is_some()),
             "an unknown file must be read and hashed"
         );
 
-        // Record what that scan learned, the way a real reconcile would.
+        // Record what that scan learned, the way a real reconcile would. The
+        // cache is built from what was OBSERVED on disk, never from a manifest.
         let mut node = SyncNode::new(Author([7u8; 32]));
         for file in &first {
             node.local_write(
@@ -1690,8 +1846,12 @@ mod tests {
                 file.mtime_nanos,
             );
         }
+        let cache: HashMap<String, ScanCacheEntry> = first
+            .iter()
+            .map(|f| (f.rel.clone(), f.cache_entry()))
+            .collect();
 
-        let second = scan_folder(root, &entry, node.manifest())?;
+        let second = scan_folder(root, &entry, &cache)?;
         assert_eq!(second.len(), 2);
         assert!(
             second.iter().all(|file| file.bytes.is_none()),
@@ -1704,7 +1864,7 @@ mod tests {
         // A changed file is read and hashed again.
         std::thread::sleep(Duration::from_millis(20));
         std::fs::write(root.join("a.txt"), b"different content")?;
-        let third = scan_folder(root, &entry, node.manifest())?;
+        let third = scan_folder(root, &entry, &cache)?;
         let changed = third
             .iter()
             .find(|file| file.rel == "a.txt")
@@ -2155,8 +2315,15 @@ mod tests {
             let mut observed = HashMap::from([("retired.toml".to_string(), stale_hash)]);
             let protected = observed.clone();
 
-            let changed =
-                scan_into_node_observed(&mut node, root, &entry, rules, &mut observed).unwrap();
+            let changed = scan_into_node_observed(
+                &mut node,
+                root,
+                &entry,
+                rules,
+                &mut observed,
+                &mut HashMap::new(),
+            )
+            .unwrap();
             assert_eq!(changed, policy == SyncPolicy::Catalog);
             if policy == SyncPolicy::Catalog {
                 assert!(matches!(
@@ -2201,8 +2368,15 @@ mod tests {
             // file above, and must advance causally beyond Tombstone/v2.
             std::fs::write(&path, b"resurrected").unwrap();
             assert!(
-                scan_into_node_observed(&mut node, root, &entry, policy.rules(), &mut observed,)
-                    .unwrap()
+                scan_into_node_observed(
+                    &mut node,
+                    root,
+                    &entry,
+                    policy.rules(),
+                    &mut observed,
+                    &mut HashMap::new()
+                )
+                .unwrap()
             );
             assert!(matches!(
                 node.manifest().get("retired.toml"),
@@ -2834,6 +3008,7 @@ mod tests {
                 &PersistedEntryState {
                     manifest: manifest.clone(),
                     observed,
+                    scan_cache: HashMap::new(),
                 },
             )
             .unwrap();
@@ -3231,24 +3406,48 @@ mod tests {
             "the test must actually reproduce the size collision"
         );
 
-        // With the collision present, the cache DOES still report the recorded
-        // hash rather than the real bytes. That is deliberately asserted here
-        // rather than hidden, because it is the residual risk the approved fix
-        // does not close: the fix removes the mechanism that manufactured these
-        // collisions, it does not make the cache robust to one that arrives some
-        // other way, and closing that would need the content-identity mechanism
-        // that was explicitly deferred.
-        let scanned = scan_folder(&root, &entry, node.manifest()).unwrap();
+        // THE POINT OF THE FIX. The MANIFEST holds the colliding size and mtime,
+        // and the manifest is replicated, so a peer chose those numbers. The scan
+        // no longer consults it, so the collision cannot reach the cache and the
+        // scan reports the REAL bytes on disk.
+        //
+        // This is what a peer could previously manufacture: stamping made the
+        // origin's mtime a local fact, so two nodes contending on one key could
+        // produce identical size and mtime with different content.
+        let scanned = scan_folder(&root, &entry, &HashMap::new()).unwrap();
+        let file = scanned.iter().find(|f| f.rel == "hot.txt").unwrap();
+        assert_eq!(
+            file.hash,
+            content_hash(second),
+            "the scan must report the bytes actually on disk; a replicated \
+             manifest must never decide a local cache hit"
+        );
+
+        // The residual risk did not vanish, it moved out of reach of a peer. A
+        // LOCAL cache entry claiming this size and mtime is still trusted, which
+        // is what makes the cache a cache. The difference that matters is that
+        // only this machine can create such an entry, by observing its own disk,
+        // so no peer can manufacture one.
+        let mut local_cache = HashMap::new();
+        local_cache.insert(
+            "hot.txt".to_string(),
+            ScanCacheEntry {
+                size: recorded.size,
+                mtime_secs: shared_secs,
+                mtime_nanos: shared_nanos,
+                hash: content_hash(first),
+            },
+        );
+        let scanned = scan_folder(&root, &entry, &local_cache).unwrap();
         let file = scanned.iter().find(|f| f.rel == "hot.txt").unwrap();
         assert_eq!(
             file.hash,
             content_hash(first),
-            "documented residual risk: the size-and-mtime cache trusts a collision"
+            "a local cache entry is trusted by design; only its ORIGIN changed"
         );
 
-        // What the fix guarantees is that materialization no longer manufactures
-        // one. A materialized file carries the LOCAL write time, so its mtime does
-        // not equal the origin's recorded mtime and the cache misses on it.
+        // And materialization still does NOT apply the origin mtime, because git
+        // does not track one. What changed is only where the cache gets its key.
         let mut peer = SyncNode::new(Author([3u8; 32]));
         peer.local_write("materialized.txt", second, shared_secs, shared_nanos);
         let mut observed = HashMap::new();
@@ -3265,8 +3464,239 @@ mod tests {
         assert_ne!(
             (written_secs, written_nanos),
             (shared_secs, shared_nanos),
-            "materialization must not stamp the origin mtime; stamping it is what \
-             made two nodes' entries collide on size and mtime"
+            "materialization must not apply the origin mtime"
+        );
+    }
+
+    /// The executable bit is replicated, because git tracks it.
+    ///
+    /// The live case that motivated this: the synced catalog holds fabric
+    /// binaries, and before this they arrived without the bit and could not be
+    /// run.
+    #[test]
+    fn a_materialized_file_carries_the_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        let entry = entry_with_policy("bus", &root, SyncPolicy::Bus);
+
+        let mut peer = SyncNode::new(Author([2u8; 32]));
+        peer.local_write_with_mode("tool", b"#!/bin/sh\necho hi\n", 0, 0, true);
+        peer.local_write_with_mode("notes.md", b"just text\n", 0, 0, false);
+        let mut observed = HashMap::new();
+        materialize_tracked(
+            &mut peer,
+            &root,
+            entry.policy.rules(),
+            &HashMap::new(),
+            &mut observed,
+            None,
+        )
+        .unwrap();
+
+        let tool = std::fs::metadata(root.join("tool")).unwrap();
+        assert!(
+            tool.permissions().mode() & 0o111 != 0,
+            "an executable file must arrive executable, or a synced binary \
+             cannot be run without a manual chmod"
+        );
+        let notes = std::fs::metadata(root.join("notes.md")).unwrap();
+        assert!(
+            notes.permissions().mode() & 0o111 == 0,
+            "a plain file must not be made executable"
+        );
+    }
+
+    /// A scan records the executable bit from local disk.
+    #[test]
+    fn a_scan_records_the_executable_bit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        let entry = entry_with_policy("bus", &root, SyncPolicy::Bus);
+
+        std::fs::write(root.join("plain.txt"), b"text").unwrap();
+        std::fs::write(root.join("run.sh"), b"#!/bin/sh\n").unwrap();
+        set_executable(&root.join("run.sh")).unwrap();
+
+        let scanned = scan_folder(&root, &entry, &HashMap::new()).unwrap();
+        let run = scanned.iter().find(|f| f.rel == "run.sh").unwrap();
+        let plain = scanned.iter().find(|f| f.rel == "plain.txt").unwrap();
+        assert!(run.executable, "an executable file must be recorded as one");
+        assert!(!plain.executable, "a plain file must not be");
+    }
+
+    /// A chmod on an ALREADY SYNCED file does not propagate. DIVERGENCE FROM GIT.
+    ///
+    /// Git propagates a chmod: a mode change rewrites the tree object, so it is
+    /// a real commit. Fabric does not, because a chmod alters no bytes and
+    /// `local_write` returns early on unchanged content. That early return is
+    /// what makes applying a peer's content echo-free.
+    ///
+    /// Pinned so nobody reads the executable-bit support above as complete. It
+    /// is correct for a NEW file, which is the case that bites, and not for a
+    /// mode change on an existing one. Same cause as the invisible heartbeat:
+    /// see `METADATA_ONLY_CHANGES_DO_NOT_PROPAGATE`.
+    #[test]
+    fn a_chmod_on_an_already_synced_file_does_not_propagate() {
+        let mut node = SyncNode::new(Author([6u8; 32]));
+        assert!(node.local_write_with_mode("tool", b"#!/bin/sh\n", 0, 0, false));
+        assert_eq!(node.manifest().get("tool").unwrap().version(), 1);
+
+        // chmod +x: same bytes, new mode.
+        assert!(
+            !node.local_write_with_mode("tool", b"#!/bin/sh\n", 0, 0, true),
+            "a chmod alters no bytes, so it is a no-op; that no-op is echo-freedom"
+        );
+        let meta = node.manifest().get("tool").and_then(|e| e.meta()).unwrap();
+        assert_eq!(meta.version, 1, "no version advance means nothing to send");
+        assert!(
+            !meta.executable,
+            "the manifest keeps the OLD mode, so a peer never learns of the chmod"
+        );
+    }
+
+    /// Every component of the key must be compared, including nanoseconds.
+    ///
+    /// Two writes inside the same second are ordinary, so a key that ignored
+    /// nanoseconds would report the old hash for genuinely new bytes. That is
+    /// the corruption class this whole change exists to prevent, so weakening
+    /// the key must fail loudly rather than silently.
+    #[test]
+    fn a_changed_file_sharing_size_and_whole_seconds_is_still_re_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        let entry = entry_with_policy("bus", &root, SyncPolicy::Bus);
+
+        let before = b"aaaaa";
+        let after = b"bbbbb";
+        assert_eq!(before.len(), after.len(), "size must be identical");
+        let path = root.join("same-second.txt");
+        std::fs::write(&path, before).unwrap();
+        let secs = 1_690_000_000i64;
+        set_file_mtime(&path, secs, 111_000_000).unwrap();
+        let cached = scan_folder(&root, &entry, &HashMap::new()).unwrap();
+        let cache: HashMap<String, ScanCacheEntry> = cached
+            .iter()
+            .map(|f| (f.rel.clone(), f.cache_entry()))
+            .collect();
+
+        // Same size, same whole second, different nanoseconds, different bytes.
+        std::fs::write(&path, after).unwrap();
+        set_file_mtime(&path, secs, 222_000_000).unwrap();
+        let (disk_secs, _) = mtime_of_path(&path);
+        assert_eq!(disk_secs, secs, "the test needs the seconds to match");
+
+        let scanned = scan_folder(&root, &entry, &cache).unwrap();
+        let file = scanned.iter().find(|f| f.rel == "same-second.txt").unwrap();
+        assert_eq!(
+            file.hash,
+            content_hash(after),
+            "a sub-second change must not be masked by a coarse cache key"
+        );
+        assert!(file.bytes.is_some(), "changed bytes must be re-read");
+    }
+
+    /// A truncating filesystem must not make the cache miss forever.
+    ///
+    /// The cache is only ever filled from what was OBSERVED on disk, never from
+    /// the value that was requested. So if a filesystem rounds a stamp away, the
+    /// recorded key is the rounded value the next scan will also read, and the
+    /// cache still hits. Storing the requested value instead would miss every
+    /// time, on every file, permanently.
+    #[test]
+    fn the_cache_records_the_observed_mtime_not_the_requested_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        let entry = entry_with_policy("bus", &root, SyncPolicy::Bus);
+
+        // Nanoseconds a coarse filesystem would round. Whatever it does, the
+        // scan reads back the truth and caches that.
+        let requested_secs = 1_650_000_000i64;
+        let requested_nanos = 999_999_999u32;
+        let mut peer = SyncNode::new(Author([5u8; 32]));
+        peer.local_write("stamped.txt", b"bytes", requested_secs, requested_nanos);
+        let mut observed = HashMap::new();
+        materialize_tracked(
+            &mut peer,
+            &root,
+            entry.policy.rules(),
+            &HashMap::new(),
+            &mut observed,
+            None,
+        )
+        .unwrap();
+
+        let first = scan_folder(&root, &entry, &HashMap::new()).unwrap();
+        let cache: HashMap<String, ScanCacheEntry> = first
+            .iter()
+            .map(|f| (f.rel.clone(), f.cache_entry()))
+            .collect();
+        let cached = cache.get("stamped.txt").expect("cached");
+        let (disk_secs, disk_nanos) = mtime_of_path(&root.join("stamped.txt"));
+        assert_eq!(
+            (cached.mtime_secs, cached.mtime_nanos),
+            (disk_secs, disk_nanos),
+            "the cache must hold what the disk reports, whatever the stamp did"
+        );
+
+        let second = scan_folder(&root, &entry, &cache).unwrap();
+        let file = second.iter().find(|f| f.rel == "stamped.txt").unwrap();
+        assert!(
+            file.bytes.is_none(),
+            "the cache must hit even if the filesystem rounded the stamp away"
+        );
+    }
+
+    /// A state file written before the cache existed must load and warm.
+    #[test]
+    fn a_state_file_without_a_scan_cache_loads_and_warms() {
+        let legacy = serde_json::json!({
+            "manifest": { "entries": {} },
+            "observed": {}
+        });
+        let state: PersistedEntryState =
+            serde_json::from_value(legacy).expect("a pre-cache state file must still load");
+        assert!(
+            state.scan_cache.is_empty(),
+            "an absent cache is empty, not a parse failure"
+        );
+    }
+
+    /// A same-content rewrite still does NOT propagate, and that is not an
+    /// oversight.
+    ///
+    /// `local_write` returns false and discards the new mtime when the content
+    /// hash is unchanged, which is what makes applying a peer's content
+    /// echo-free. So a metadata-only change never advances a version and never
+    /// crosses the wire.
+    ///
+    /// This is pinned so nobody reads the mtime stamping above as having fixed
+    /// presence. It did not. Issue 27's heartbeat is a same-byte rewrite, and a
+    /// replica still keeps the older timestamp.
+    #[test]
+    fn a_same_content_mtime_change_still_does_not_propagate() {
+        let mut node = SyncNode::new(Author([7u8; 32]));
+        assert!(node.local_write("status", b"available\n", 100, 0));
+        assert_eq!(node.manifest().get("status").unwrap().version(), 1);
+
+        // The heartbeat: identical bytes, later clock.
+        assert!(
+            !node.local_write("status", b"available\n", 900, 0),
+            "a same-byte rewrite must remain a no-op; that no-op is echo-freedom"
+        );
+        let meta = node
+            .manifest()
+            .get("status")
+            .and_then(|e| e.meta())
+            .unwrap();
+        assert_eq!(meta.version, 1, "no version advance means nothing to send");
+        assert_eq!(
+            meta.mtime_secs, 100,
+            "the manifest keeps the OLD mtime, so a peer cannot learn the new one"
         );
     }
 
@@ -3284,10 +3714,20 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         let (secs, nanos) = mtime_of_path(&path);
 
-        let mut node = SyncNode::new(Author([4u8; 32]));
-        node.local_write("still.txt", bytes, secs, nanos);
+        // A LOCAL receipt of what this machine observed, which is the only thing
+        // that may decide a cache hit.
+        let mut cache = HashMap::new();
+        cache.insert(
+            "still.txt".to_string(),
+            ScanCacheEntry {
+                size: bytes.len() as u64,
+                mtime_secs: secs,
+                mtime_nanos: nanos,
+                hash: content_hash(bytes),
+            },
+        );
 
-        let scanned = scan_folder(&root, &entry, node.manifest()).unwrap();
+        let scanned = scan_folder(&root, &entry, &cache).unwrap();
         let file = scanned.iter().find(|f| f.rel == "still.txt").unwrap();
         assert_eq!(file.hash, content_hash(bytes));
         assert!(
@@ -3779,6 +4219,7 @@ mod tests {
         let committed = PersistedEntryState {
             manifest: tombstone_manifest,
             observed: HashMap::new(),
+            scan_cache: HashMap::new(),
         };
 
         // Block only manifest.json's atomic temp path. write_state must report
@@ -3887,6 +4328,7 @@ mod tests {
                     &PersistedEntryState {
                         manifest: node.manifest().clone(),
                         observed,
+                        scan_cache: HashMap::new(),
                     },
                 )
                 .unwrap();

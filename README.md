@@ -850,6 +850,37 @@ stop the daemon, and it does not affect the built-in `fabric shell` ALPN.
 
 ## File Sync
 
+### What fabric syncs, and where it differs from git
+
+A catalog should be carriable by either fabric or git, so the two must agree
+about what a catalog *is*. Fabric syncs the attributes git tracks:
+
+| | git | fabric |
+| --- | --- | --- |
+| file content | yes | yes |
+| executable bit | yes | yes |
+| symlinks | yes | **no** — skipped, and logged when skipped |
+| modification time | no | recorded but never applied |
+| other permission bits | no | no |
+
+Two differences are worth knowing before you rely on either transport.
+
+**A `chmod` on an already-synced file does not propagate.** Git propagates one:
+a mode change rewrites the tree object and is a real commit. Fabric does not,
+because a chmod alters no bytes — see the limitation below. A **new** file
+carries its mode correctly.
+
+**A same-content rewrite does not propagate at all.** Rewriting a file with
+identical bytes and a new timestamp changes nothing fabric will send, so a
+replica keeps its older mtime. **Do not read a replica's mtime as an activity
+signal** — if you need a heartbeat, put the time in the file's bytes.
+
+Both are the same limitation: fabric cannot propagate a metadata-only change,
+because a change that alters no bytes never advances a logical version, and that
+early return is what keeps applying a peer's content free of echo loops.
+
+
+
 `fabric sync` keeps a folder converged with trusted peers. A declarative config
 file lists sync *entries*; the running daemon watches each folder and syncs
 changes to peers near-instantly over fabric's own transport. A tool or a human
