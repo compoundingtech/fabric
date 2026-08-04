@@ -192,3 +192,76 @@ pub struct PeerReachability {
     pub transport: Option<String>,
     pub error: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telemetry::{LatencySummary, PeerTelemetry};
+
+    fn populated_peer() -> PeerTelemetry {
+        let mut reconnect = LatencySummary::default();
+        reconnect.record(1_500_000);
+        let mut probe = LatencySummary::default();
+        probe.record(64_000);
+        PeerTelemetry {
+            losses: 1,
+            resumes: 1,
+            reconnect_attempts: 2,
+            reconnect,
+            probe_latency: BTreeMap::from([("relay".to_string(), probe)]),
+            probes_reachable: 80,
+            ..PeerTelemetry::default()
+        }
+    }
+
+    /// `fabric status` must survive the control protocol with telemetry present.
+    ///
+    /// This is the test whose absence shipped a broken `fabric status`. The
+    /// counters were fine as plain JSON, and a test proving that passed while
+    /// the command was broken in production. `ControlResponse` is an
+    /// INTERNALLY TAGGED enum, so serde routes it through its `Content` buffer,
+    /// and that buffer has no `u128`. A `u128` field therefore failed with
+    /// "u128 is not supported" only once a peer had been probed and the map was
+    /// no longer empty.
+    ///
+    /// Two things make this catch what the earlier test missed: it serializes
+    /// the real `ControlResponse`, not the inner struct, and it starts from a
+    /// POPULATED map, because an empty one is exactly the case that always
+    /// worked and that a fresh-node hand check exercises.
+    #[test]
+    fn a_reachability_status_carrying_telemetry_round_trips() {
+        let response = ControlResponse::ReachabilityStatus {
+            version: "0.2.0+test".to_string(),
+            node_id: "node".to_string(),
+            endpoint_addr: serde_json::json!({"id": "node"}),
+            exposed_protocols: vec!["audit/echo".to_string()],
+            dial_sockets: vec![PathBuf::from("/tmp/dial.sock")],
+            allow_shell: true,
+            allow_exec: false,
+            peers: Vec::new(),
+            connection_telemetry: BTreeMap::from([("droppy".to_string(), populated_peer())]),
+        };
+
+        let bytes = serde_json::to_vec(&response)
+            .expect("the status response must serialize with telemetry present");
+        let decoded: ControlResponse =
+            serde_json::from_slice(&bytes).expect("the status response must decode");
+
+        match decoded {
+            ControlResponse::ReachabilityStatus {
+                connection_telemetry,
+                ..
+            } => {
+                let peer = &connection_telemetry["droppy"];
+                assert_eq!(peer.losses, 1);
+                assert_eq!(peer.probes_reachable, 80);
+                assert!(
+                    peer.reconnect.total_micros > 0,
+                    "the measured total must cross the wire, not just its count"
+                );
+                assert_eq!(peer.probe_latency["relay"].samples, 1);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+}
