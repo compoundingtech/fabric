@@ -512,6 +512,33 @@ still reports reachable.
 A peer with no recorded loss is omitted, and `sessions no losses recorded`
 means nothing has dropped since the counters were last reset.
 
+### Fabric deletes its own old logs
+
+The daemon writes one validation log per day to `<home>/logs/` and **keeps the
+most recent 45, deleting older ones**. Say this out loud rather than let someone
+find it out: a log from more than 45 days ago is gone, and an empty directory is
+a bad way to learn that.
+
+Forty-five days is chosen from the job the logs do, not rounded for looks. It has
+to outlast a month away from the machine, so a fault in the first week is still
+readable on return, with margin for the gap before anyone looks. At the observed
+rate of 8.8–10.3 MB per day that is roughly 420 MB.
+
+`FABRIC_LOG_RETENTION_DAYS` overrides the count. **`0` disables deletion
+entirely** and restores unbounded growth, which is the right trade only if you
+would rather spend disk than lose history. An unparseable value falls back to the
+default rather than to unbounded, because failing open on an unattended machine
+is the worst outcome. The daemon records the value it resolved in the
+`diagnostic_logging_init` line, so the running config is checkable.
+
+This bounds the **number of files**, which is what stops indefinite growth. It
+does not bound bytes: one noisy day has reached 587 MB, so a bad run still costs
+far more than the daily average suggests. Capping that is a question about log
+volume, not retention.
+
+Fabric does not reclaim logs written before this bound existed. Deleting those is
+an operator's call.
+
 ## Developing Fabric (dev vs prod)
 
 A production fabric daemon is often load-bearing (it may be your only path to a

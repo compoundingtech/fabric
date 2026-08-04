@@ -637,10 +637,54 @@ async fn build_daemon_endpoint(
     Ok(endpoint)
 }
 
+/// How many daily validation logs to keep before the oldest is deleted.
+///
+/// Derived from the job the logs have to do, not rounded to look tidy. The
+/// principal travels for about a month and is the only person who investigates
+/// an incident, so retention has to outlast a trip: a fault in week one must
+/// still be readable when he gets home. That sets a floor of about 31 days.
+/// Two more weeks of margin covers the gap between returning and looking.
+///
+/// Measured cost at the observed rate of 8.8 to 10.3 MB per day: roughly 420 MB.
+/// Before this bound existed nothing was ever deleted, and one machine had
+/// accumulated 2.4 GB across 20 days.
+///
+/// This bounds the FILE COUNT, which is what stops indefinite growth. It does
+/// not bound bytes: a single noisy day has reached 587 MB, so a bad run can
+/// still cost far more than the daily average suggests. Capping that is a
+/// question about log volume, not retention, and it is not what this solves.
+pub const DEFAULT_LOG_RETENTION_DAYS: usize = 45;
+
+/// Resolve the retention window, honouring `FABRIC_LOG_RETENTION_DAYS`.
+///
+/// `0` disables deletion and restores the old unbounded behaviour, for an
+/// operator who would rather spend disk than lose history.
+fn resolve_log_retention_days(raw: Option<&str>) -> Option<usize> {
+    match raw.map(str::trim) {
+        None | Some("") => Some(DEFAULT_LOG_RETENTION_DAYS),
+        Some(value) => match value.parse::<usize>() {
+            Ok(0) => None,
+            Ok(days) => Some(days),
+            // An unparseable override must not silently disable the bound; the
+            // whole point is that nobody is watching this machine.
+            Err(_) => Some(DEFAULT_LOG_RETENTION_DAYS),
+        },
+    }
+}
+
 pub fn init_daemon_tracing(home: &FabricHome) -> Result<()> {
     home.prepare()?;
-    let appender =
-        tracing_appender::rolling::daily(home.validation_log_dir(), home.validation_log_prefix());
+    let retention =
+        resolve_log_retention_days(env::var("FABRIC_LOG_RETENTION_DAYS").ok().as_deref());
+    let mut builder = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix(home.validation_log_prefix());
+    if let Some(days) = retention {
+        builder = builder.max_log_files(days);
+    }
+    let appender = builder
+        .build(home.validation_log_dir())
+        .context("failed to build the validation log appender")?;
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
         .with_env_filter(validation_log_filter())
@@ -653,6 +697,7 @@ pub fn init_daemon_tracing(home: &FabricHome) -> Result<()> {
             target: VALIDATION_LOG_TARGET,
             event = "diagnostic_logging_init",
             iroh_path_trace = env::var_os("FABRIC_IROH_PATH_TRACE").is_some(),
+            log_retention_days = retention.unwrap_or(0),
             "fabric validation logging initialized"
         );
     }
@@ -5170,6 +5215,51 @@ mod tests {
         client.shutdown().await?;
         server.shutdown().await?;
         Ok(())
+    }
+
+    /// The retention default is a decided value, so pin it.
+    ///
+    /// It is derived from the job: retention must outlast a month-long trip so a
+    /// fault in week one is still readable on return, plus margin for the gap
+    /// before anyone looks. Changing it should require changing this assertion
+    /// and saying why.
+    #[test]
+    fn log_retention_default_outlasts_a_month_long_trip() {
+        assert_eq!(DEFAULT_LOG_RETENTION_DAYS, 45);
+        assert!(
+            DEFAULT_LOG_RETENTION_DAYS > 31,
+            "retention must exceed a month-long trip or an early fault is deleted \
+             before the only person who investigates it gets home"
+        );
+        assert_eq!(resolve_log_retention_days(None), Some(45));
+    }
+
+    /// An explicit 0 restores the old unbounded behaviour, on purpose.
+    #[test]
+    fn zero_days_disables_deletion() {
+        assert_eq!(resolve_log_retention_days(Some("0")), None);
+    }
+
+    #[test]
+    fn an_override_is_honoured() {
+        assert_eq!(resolve_log_retention_days(Some("7")), Some(7));
+        assert_eq!(resolve_log_retention_days(Some("  7  ")), Some(7));
+    }
+
+    /// A typo must not silently restore unbounded growth.
+    ///
+    /// Failing open here would be the worst outcome: nobody is at this machine's
+    /// keyboard, so the defect would return unnoticed and look like the fix
+    /// never worked.
+    #[test]
+    fn an_unparseable_override_falls_back_to_the_bound_not_to_unbounded() {
+        for bad in ["", "  ", "lots", "-1", "9999999999999999999999", "7d"] {
+            assert_eq!(
+                resolve_log_retention_days(Some(bad)),
+                Some(DEFAULT_LOG_RETENTION_DAYS),
+                "{bad:?} must fall back to the bound, never to unbounded"
+            );
+        }
     }
 
     /// The counters must move because the real notice path ran.

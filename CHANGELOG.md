@@ -6,6 +6,31 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ## [Unreleased]
 
+### Added
+
+- **Fabric deletes its own old logs.** The daemon wrote one validation log per
+  day and never removed any of them, so the directory grew without limit for as
+  long as the daemon ran. One machine had accumulated **2.4 GB across 20 daily
+  files**, with a single noisy day reaching 587 MB. Nothing in the tree
+  implemented retention, pruning, or a maximum age.
+
+  The most recent **45** daily logs are now kept and older ones are deleted.
+  Forty-five is derived from the job rather than rounded: retention has to
+  outlast a month away from the machine so a fault in the first week is still
+  readable on return, plus margin for the gap before anyone looks. At the
+  observed 8.8–10.3 MB per day that is roughly 420 MB.
+
+  `FABRIC_LOG_RETENTION_DAYS` overrides the count; `0` disables deletion and
+  restores the old unbounded behaviour. An unparseable value falls back to the
+  default rather than to unbounded, because failing open on an unattended
+  machine is the worst outcome. The resolved value is recorded in the
+  `diagnostic_logging_init` line.
+
+  This bounds the file count, which is what stops indefinite growth. It does not
+  bound bytes — a single day has reached 587 MB — and capping that is a question
+  about log volume, not retention. Logs written before this bound are not
+  reclaimed; that is an operator's call.
+
 ### Fixed documentation
 
 - **The detached replay buffer is capped, and the retention docs said it was
