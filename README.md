@@ -512,6 +512,42 @@ still reports reachable.
 A peer with no recorded loss is omitted, and `sessions no losses recorded`
 means nothing has dropped since the counters were last reset.
 
+### Which path is this peer actually using?
+
+The peer table above shows one instantaneous ping. `fabric status` also reports
+what every probe since daemon start has measured, split by path:
+
+```text
+paths
+  droppy	reachable 252/252
+    relay 	78%	n=196	mean=83.0ms	max=316.0ms
+    direct	22%	n=56	mean=84.7ms	max=680.8ms
+  hetz	reachable 252/252
+    direct	99%	n=250	mean=64.8ms	max=335.3ms
+    relay 	1%	n=2	mean=74.6ms	max=76.6ms
+```
+
+The busiest path is listed first, because which path a peer spends its time on
+is usually the finding. Compare the two rows for one peer, not one peer against
+another.
+
+Read the example: `hetz` holds a direct path 99% of the time at 64.8ms — a
+stable address. `droppy` sits on the **relay** 78% of the time, and when it does
+get a direct path that path is no better on average and far worse at the tail,
+680.8ms against 316.0ms. That is what a peer behind a moving address looks like.
+
+Unlike the reconnect percentiles above, these are **exact**: `mean` and `max`
+are stored precisely rather than bucketed. Percentiles are deliberately not
+reported here — the latency buckets double in width, so around 50–200ms two
+genuinely different paths fall into the same bucket and print identical
+percentiles, hiding the difference this table exists to show.
+
+This reports facts and reaches no verdict. Nothing here labels a path degraded,
+and nothing changes routing based on it.
+
+A peer is listed on probe evidence alone, so a healthy peer that has never
+dropped a session still shows its paths.
+
 ### Fabric deletes its own old logs
 
 The daemon writes one validation log per day to `<home>/logs/` and **keeps the

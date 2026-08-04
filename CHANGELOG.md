@@ -8,6 +8,31 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Added
 
+- **`fabric status` reports per-path probe latency.** The daemon had measured a
+  round trip and a path class on every liveness probe since the connection
+  telemetry landed, and there was no way to read it but to parse
+  `telemetry.json` by hand — the exact grepping those counters exist to end.
+
+  A new `paths` block reports, per peer and per path, the share of probes, the
+  sample count, and the exact mean and maximum. The busiest path is listed
+  first, because which path a peer spends its time on is usually the finding.
+  On a real mesh this makes the roaming signature legible at a glance: a peer
+  with a stable address holds a direct path 99% of the time, while a peer behind
+  a moving address sits on the relay 78% of the time and its direct path is no
+  better on average and more than twice as bad at the tail.
+
+  A peer is listed on probe evidence alone, so a healthy peer that has never
+  dropped a session still shows its paths — unlike the `sessions` block, which
+  is keyed off losses.
+
+  `mean` and `max` are exact rather than bucketed, and percentiles are
+  deliberately not reported: the latency buckets double in width, so around
+  50–200ms two genuinely different paths fall in the same bucket and print
+  identical percentiles, hiding the difference the table exists to show.
+
+  This reports facts and reaches no verdict. Nothing labels a path degraded and
+  nothing changes routing.
+
 - **Fabric deletes its own old logs.** The daemon wrote one validation log per
   day and never removed any of them, so the directory grew without limit for as
   long as the daemon ran. One machine had accumulated **2.4 GB across 20 daily
