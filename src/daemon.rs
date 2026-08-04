@@ -639,11 +639,11 @@ async fn build_daemon_endpoint(
 
 /// How many daily validation logs to keep before the oldest is deleted.
 ///
-/// Derived from the job the logs have to do, not rounded to look tidy. The
-/// principal travels for about a month and is the only person who investigates
-/// an incident, so retention has to outlast a trip: a fault in week one must
-/// still be readable when he gets home. That sets a floor of about 31 days.
-/// Two more weeks of margin covers the gap between returning and looking.
+/// Derived from the job the logs have to do, not rounded to look tidy. An
+/// operator may be away from a machine for a month, so retention has to outlast
+/// a trip: a fault in week one must still be readable on return. That sets a
+/// floor of about 31 days. Two more weeks of margin covers the gap between
+/// getting back and actually looking.
 ///
 /// Measured cost at the observed rate of 8.8 to 10.3 MB per day: roughly 420 MB.
 /// Before this bound existed nothing was ever deleted, and one machine had
@@ -5229,7 +5229,7 @@ mod tests {
         assert!(
             DEFAULT_LOG_RETENTION_DAYS > 31,
             "retention must exceed a month-long trip or an early fault is deleted \
-             before the only person who investigates it gets home"
+             before anyone returns to the machine to investigate it"
         );
         assert_eq!(resolve_log_retention_days(None), Some(45));
     }
