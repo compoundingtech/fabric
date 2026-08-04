@@ -6,6 +6,27 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ## [Unreleased]
 
+### Fixed documentation
+
+- **The detached replay buffer is capped, and the retention docs said it was
+  not.** They claimed the buffer had no cap of its own, that a runaway remote
+  shell would retain roughly 17 MB across a 15 minute window, and that the
+  detached TTL was therefore the only backstop against such a process. Measured
+  directly, all three were wrong.
+
+  A detached session is never acknowledged, so its reader waits for buffer space
+  that never frees and stops at `MAX_BUFFERED_BYTES`, currently 4 MiB. A runaway
+  producer pins at exactly 4 MiB and stays there while the remote process blocks
+  writing to its own PTY. Retention is bounded per session no matter how long
+  the window is, and in aggregate by the server session cap — 256 MiB at the
+  default of 64 sessions.
+
+  Backpressure is the backstop against a runaway remote process; the TTL bounds
+  how long a session lives, not how much it holds. This matters beyond accuracy:
+  the "no cap" claim was the stated reason not to raise the detached TTL
+  further, and that reason does not hold. A test now pins the bound so the claim
+  cannot drift back.
+
 ### Added
 
 - **Durable connection telemetry.** `fabric status` now reports, per peer, how
@@ -84,14 +105,11 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   shell now survives a closed lid over lunch; previously it did not survive a
   coffee break. The number comes from measured cost rather than taste: an idle
   detached session buffers 0 bytes across a full window, so holding one costs a
-  session struct and a PTY process and nothing that grows with time, while a
-  session still producing output grows at whatever the remote writes — about
-  19 KB/s for a pathological loop, roughly 17 MB over this window. Past the
-  window the behaviour is unchanged and already proven: the client reports
-  `remote shell could not resume`, names the expired session, and exits
-  non-zero. This TTL remains the only backstop against a runaway remote process,
-  because the replay buffer has no cap of its own, so raising it much further
-  wants that cap first.
+  session struct and a PTY process and nothing that grows with time. A session
+  still producing output is bounded too: the replay buffer stops at 4 MiB, so
+  retention does not grow with the length of the window. Past the window the
+  behaviour is unchanged and already proven: the client reports `remote shell
+  could not resume`, names the expired session, and exits non-zero.
 
 - **Release archives have an enforced one-file contract.** Each platform tarball
   must contain exactly one member named literal `fabric` (not `./fabric`), and

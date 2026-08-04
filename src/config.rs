@@ -20,16 +20,25 @@ pub const DEFAULT_SERVER_SESSION_MAX_PER_PEER: usize = 16;
 /// longer window is bounded by what a detached session actually retains: an idle
 /// shell buffers nothing at all, measured at 0 bytes across a full detached
 /// window, so holding it costs a session struct and a PTY process and nothing
-/// that grows with time. A session still producing output is the expensive case
-/// and it grows at whatever the remote writes, measured at about 19 KB/s for a
-/// pathological loop, so roughly 17 MB over this window for one runaway shell.
+/// that grows with time.
 ///
 /// The benefit is the case that actually happens: a closed laptop lid over lunch
 /// keeps its shell. Sixty seconds did not survive a coffee break.
 ///
-/// This is the only backstop against a runaway remote process, because the
-/// server's replay buffer has no cap of its own, so it should not be raised much
-/// further without capping that buffer first.
+/// A session still producing output is the expensive case, and it is bounded
+/// too. The tunnel replay buffer stops at its own cap, currently 4 MiB:
+/// nothing ACKs a detached session, the reader waits for buffer space
+/// that never frees, and the remote process then blocks on its own PTY write.
+/// Measured directly, a runaway producer pins at exactly 4 MiB and stays there.
+/// So retention is bounded per session no matter how long this window is, and in
+/// aggregate by `DEFAULT_SERVER_SESSION_MAX_TOTAL`, which is 256 MiB at the
+/// defaults.
+///
+/// This doc previously said the buffer had no cap, that a runaway shell would
+/// reach roughly 17 MB across this window, and that this TTL was the only
+/// backstop. All three were wrong, and the first was the stated reason not to
+/// raise this value further. Backpressure is the backstop against a runaway
+/// process; this TTL bounds how long a session lives, not how much it holds.
 pub const DEFAULT_SERVER_SESSION_DETACHED_TTL_SECS: u64 = 15 * 60;
 
 #[derive(Debug, Clone)]

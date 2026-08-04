@@ -1348,12 +1348,23 @@ the PTY.
 The window is 15 minutes because that is what the cost measures out to, not as a
 round guess. An idle detached shell buffers nothing — 0 bytes across a full
 detached window — so holding one costs a session struct and a PTY process and
-nothing that grows with time. A session still producing output is the expensive
-case, growing at whatever the remote writes; a pathological output loop measured
-about 19 KB/s, so roughly 17 MB over this window for one runaway shell. Note
-that this TTL is currently the only backstop against such a process, because the
-replay buffer has no cap of its own, which is why raising it much further wants
-that cap first.
+nothing that grows with time.
+
+A session still producing output is the expensive case, and it is bounded too.
+The replay buffer stops at 4 MiB. Nothing acknowledges a detached session, so
+the reader waits for buffer space that never frees and the remote process then
+blocks writing to its own PTY. Measured directly, a runaway producer pins at
+exactly 4 MiB and stays there. Retention is therefore bounded per session
+regardless of how long this window is, and in aggregate by the server session
+cap — 256 MiB at the default of 64 sessions.
+
+Backpressure, not this TTL, is what bounds a runaway remote process. The TTL
+bounds how long a session lives, not how much it holds.
+
+> An earlier version of this section said the replay buffer had no cap, that a
+> runaway shell would reach roughly 17 MB across this window, and that the TTL
+> was the only backstop. All three were wrong. The "no cap" claim was also the
+> stated reason not to raise the TTL further, so that reason no longer applies.
 
 Past the window, the client does not retry a session the server has already
 refused: it reports `remote shell could not resume`, names the expired session,
