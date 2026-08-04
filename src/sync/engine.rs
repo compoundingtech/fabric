@@ -1409,35 +1409,41 @@ fn materialize_tracked(
 }
 
 /// Write bytes atomically: to a temp sibling, then rename over the target.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    write_atomic_with_mtime(path, bytes, None)
-}
-
-/// Write `bytes` to `path` atomically, optionally stamping the file with the
-/// modification time the manifest records for it.
 ///
-/// Stamping matters for more than tidiness. The scan cache treats a file as
-/// unchanged when its size and mtime match the recorded metadata, and a
-/// materialized file carries the sender's mtime in the manifest. Without
-/// stamping, the local filesystem assigns its own mtime at write time, so every
-/// file this node ever received from a peer misses the cache forever and is
-/// re-read and re-hashed on every scan.
-fn write_atomic_with_mtime(path: &Path, bytes: &[u8], mtime: Option<(i64, u32)>) -> Result<()> {
+/// A materialized file keeps the receiver's own write time. It is NOT stamped
+/// with the sender's mtime, and that is deliberate.
+///
+/// Stamping used to happen here, and it caused a permanent three-node
+/// divergence. The scan cache treats a file as unchanged when its size and mtime
+/// match the recorded metadata. Stamping made mtime a cross-node value, so two
+/// contending entries of equal size could collide on size plus mtime, and the
+/// cache then reported content the file did not actually hold. Versions
+/// leapfrogged and never converged. Commit 62a30b8 removed the stamping; the
+/// cost is one re-read per materialized file, which is the cheap side of that
+/// trade.
+///
+/// The consequence is that fabric does not replicate an mtime at all today, so a
+/// consumer must not read a replica's mtime as an activity signal. See issue 27:
+/// st2 derived agent liveness that way and reported live remote agents as
+/// unknown.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension(format!(
         "{}.fabric-tmp",
         path.extension().and_then(|e| e.to_str()).unwrap_or("")
     ));
     std::fs::write(&tmp, bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
-    if let Some((secs, nanos)) = mtime {
-        set_file_mtime(&tmp, secs, nanos)
-            .with_context(|| format!("failed to stamp mtime on {}", tmp.display()))?;
-    }
     std::fs::rename(&tmp, path)
         .with_context(|| format!("failed to rename into {}", path.display()))?;
     Ok(())
 }
 
 /// Set a file's modification time, leaving its access time alone.
+///
+/// Test-only since 62a30b8 removed mtime stamping from materialization. The
+/// production path deliberately never sets an mtime, so the only caller left is
+/// the test that reconstructs the size-plus-mtime collision that stamping used
+/// to manufacture.
+#[cfg(test)]
 fn set_file_mtime(path: &Path, secs: i64, nanos: u32) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
