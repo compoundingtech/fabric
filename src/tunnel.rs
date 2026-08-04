@@ -2084,6 +2084,72 @@ mod tests {
         assert!(kill.is_cancelled());
     }
 
+    /// A producer that never stops, standing in for a runaway remote process.
+    struct EndlessProducer;
+
+    impl AsyncRead for EndlessProducer {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let n = buf.remaining().min(8192);
+            buf.put_slice(&vec![b'x'; n]);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A detached session's replay buffer is bounded, and the bound is the real
+    /// backstop against a runaway remote process.
+    ///
+    /// The retention docs used to say this buffer had no cap of its own, that a
+    /// runaway shell would reach roughly 17 MB across a 15 minute window, and
+    /// that the detached TTL was therefore the only backstop. Measured, all
+    /// three are wrong. The reader waits for buffer space, nothing ACKs a
+    /// detached session, so it stops at exactly MAX_BUFFERED_BYTES and the
+    /// remote process blocks on its own PTY write instead. Backpressure is the
+    /// backstop; the TTL bounds how long a session lives, not how much it holds.
+    ///
+    /// This matters beyond tidiness: "no cap" was the stated reason not to raise
+    /// the detached TTL further.
+    #[tokio::test]
+    async fn a_detached_replay_buffer_stops_at_the_cap_instead_of_growing() {
+        let (_write_peer, write) = duplex(64);
+        let (session, local_read) = TunnelSession::new_parts(
+            session_id(77),
+            peer_id(),
+            Box::new(EndlessProducer),
+            Box::new(write),
+        );
+        // Never attached, so nothing ever ACKs. That is the worst case for
+        // retention and exactly the detached-session case being bounded here.
+        tokio::spawn(session.clone().run_local_reader(local_read));
+
+        let mut samples = Vec::new();
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            samples.push(session.state.lock().await.buffered_bytes);
+        }
+
+        // POSITIVE CONTROL. A producer that silently produced nothing would
+        // satisfy every bound below while proving nothing at all.
+        assert!(
+            samples[0] > 0,
+            "the producer never produced, so this test measured nothing"
+        );
+        for (index, bytes) in samples.iter().enumerate() {
+            assert!(
+                *bytes <= MAX_BUFFERED_BYTES,
+                "sample {index} held {bytes} bytes, past the {MAX_BUFFERED_BYTES} byte cap"
+            );
+        }
+        assert_eq!(
+            samples.last(),
+            samples.first(),
+            "the buffer must settle at the cap rather than keep growing: {samples:?}"
+        );
+    }
+
     /// A local reader that hands over `bytes`, then ends the way the test asks.
     ///
     /// This is the whole platform difference in issue 32, made explicit. Dropping
