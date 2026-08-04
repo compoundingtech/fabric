@@ -105,6 +105,22 @@ impl SyncNode {
         mtime_secs: i64,
         mtime_nanos: u32,
     ) -> bool {
+        self.local_write_with_mode(path, bytes, mtime_secs, mtime_nanos, false)
+    }
+
+    /// Record a local file write, carrying the executable bit git would track.
+    ///
+    /// The early return on unchanged content applies here too, so a chmod that
+    /// alters no bytes does NOT advance a version and does not propagate. See
+    /// `engine::METADATA_ONLY_CHANGES_DO_NOT_PROPAGATE`.
+    pub fn local_write_with_mode(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        mtime_secs: i64,
+        mtime_nanos: u32,
+        executable: bool,
+    ) -> bool {
         let hash = content_hash(bytes);
         if let Some(Entry::Present(meta)) = self.manifest.get(path)
             && meta.hash == hash
@@ -120,6 +136,7 @@ impl SyncNode {
             path.to_string(),
             Entry::Present(FileMeta {
                 hash,
+                executable,
                 size: bytes.len() as u64,
                 mtime_secs,
                 mtime_nanos,

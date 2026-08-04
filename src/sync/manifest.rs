@@ -56,8 +56,30 @@ pub struct FileMeta {
     pub hash: ContentHash,
     /// File size in bytes (informational; the hash is the identity).
     pub size: u64,
-    /// Preserved modification time, carried as metadata. **Not** used for
-    /// ordering — see `version`.
+    /// Whether the file is executable, the way git tracks it: a file is either
+    /// mode 644 or 755, and no other permission bit is replicated.
+    ///
+    /// Defaulted so a peer that predates this field still parses. Note the
+    /// asymmetry: adding a field with a default is safe, removing one is not.
+    ///
+    /// A chmod on an ALREADY SYNCED file does not propagate. See
+    /// [`crate::sync::engine::METADATA_ONLY_CHANGES_DO_NOT_PROPAGATE`].
+    #[serde(default)]
+    pub executable: bool,
+    /// The origin's modification time. **Informational only.**
+    ///
+    /// It is recorded, it crosses the wire, and it is NEVER applied to a
+    /// materialized file. Fabric syncs the attributes git syncs, and git
+    /// deliberately does not track mtime. A replica therefore carries its own
+    /// local write time.
+    ///
+    /// So a consumer must NOT read a replica's mtime as an activity signal.
+    /// Issue 27 is exactly that mistake. Not used for ordering either — see
+    /// `version`.
+    ///
+    /// Retained rather than removed because removal is a breaking wire change:
+    /// these fields have no default, so a peer on an older build fails to parse
+    /// a manifest that omits them.
     pub mtime_secs: i64,
     pub mtime_nanos: u32,
     /// Lamport-style logical version. A local edit sets this to
@@ -330,6 +352,7 @@ mod tests {
     fn present(version: u64, author_n: u8, hash_n: u8) -> Entry {
         Entry::Present(FileMeta {
             hash: hash(hash_n),
+            executable: false,
             size: hash_n as u64,
             mtime_secs: 0,
             mtime_nanos: 0,

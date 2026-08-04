@@ -8,6 +8,66 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Added
 
+- **The executable bit is replicated.** Fabric now syncs the attributes git
+  syncs. A file arrives executable if it was executable at its origin, applied
+  before the atomic rename so it is never briefly visible with the wrong mode.
+
+  The live case: the synced catalog holds fabric binaries, and they arrived
+  without the bit and could not be run until somebody chmod-ed them by hand.
+
+  **Divergence from git:** a `chmod` on an ALREADY SYNCED file does not
+  propagate. Git propagates one, because a mode change rewrites the tree object
+  and is a real commit. Fabric does not, for the reason below. A NEW file
+  carries its mode correctly, which is the case that actually bites.
+
+- **Symlinks are skipped out loud.** A skipped symlink now says so, and says
+  that git tracks symlinks and fabric does not yet. Previously it was skipped in
+  silence. Fabric still does not sync them: a symlink is a different kind of
+  manifest entry rather than a file with a flag.
+
+### Known limitation
+
+- **Fabric cannot propagate a metadata-only change. One cause, two symptoms.**
+  `SyncNode::local_write` returns early when the content hash is unchanged, and
+  that early return is what makes applying a peer's content echo-free. So any
+  change that alters no bytes never advances a logical version, and a change
+  that does not advance a version never crosses the wire.
+
+  1. *A heartbeat is invisible.* Rewriting the same bytes with a new mtime does
+     not propagate, so a replica keeps the older timestamp. A consumer must not
+     read a replica's mtime as an activity signal.
+  2. *A chmod is invisible.* `chmod +x` on an already-synced file changes no
+     bytes, so the new mode does not propagate.
+
+  Both are the same defect. Fixing either symptom alone does not touch the
+  cause. Closing it needs a local metadata-only change to advance a version
+  while a received one stays inert, which puts an asymmetry into the exact
+  mechanism that prevents infinite echo — a core engine change.
+
+### Changed
+
+- **The scan cache is keyed on local disk facts, not on the replicated
+  manifest.** The cache reused a recorded hash when size and mtime matched what
+  the *manifest* held — but the manifest crosses the wire, so a local caching
+  decision was made from a value another machine chose. Two contending entries
+  of equal size could collide on size plus mtime, and the cache then reported
+  content the file did not hold. That was the permanent three-node divergence.
+
+  A separate, never-transmitted `scan_cache` now records what this machine
+  observed on its own disk. It is deliberately not merged into the `observed`
+  receipt: that receipt decides whether a missing path becomes a tombstone, and
+  a tombstone crosses the wire, so loading a performance concern onto it would
+  repeat the original mistake mirrored. The cache is filled only from real disk
+  reads, never from a requested value, so a filesystem that truncates cannot
+  make it miss forever. Absent in an older state file, where it warms on the
+  first scan.
+
+- **`FileMeta.mtime` is documented as informational and is never applied.**
+  Fabric records a modification time, sends it, and does not write it to a
+  materialized file, because git does not track mtime. The field is retained
+  rather than removed: it has no serde default, so removing it would break
+  parsing on any peer that has not upgraded.
+
 - **`fabric status` reports per-path probe latency.** The daemon had measured a
   round trip and a path class on every liveness probe since the connection
   telemetry landed, and there was no way to read it but to parse
