@@ -935,6 +935,119 @@ mod connection_telemetry_tests {
         }
     }
 
+    fn probed_peer(direct: &[u64], relay: &[u64]) -> PeerTelemetry {
+        let mut probe_latency = BTreeMap::new();
+        for (path, samples) in [("direct", direct), ("relay", relay)] {
+            if samples.is_empty() {
+                continue;
+            }
+            let mut latency = LatencySummary::default();
+            for micros in samples {
+                latency.record(*micros);
+            }
+            probe_latency.insert(path.to_string(), latency);
+        }
+        PeerTelemetry {
+            probes_reachable: (direct.len() + relay.len()) as u64,
+            probe_latency,
+            ..PeerTelemetry::default()
+        }
+    }
+
+    /// A healthy peer must show its paths. This is the whole point.
+    ///
+    /// The sessions block keys off losses, so a peer that has never dropped
+    /// prints nothing there. Healthy is the NORMAL state, so keying this block
+    /// the same way would blank exactly the peers an operator looks at most, and
+    /// hide the path evidence on every one of them.
+    #[test]
+    fn a_peer_with_probes_and_no_losses_still_shows_its_paths() {
+        let peer = probed_peer(&[80_000, 90_000], &[60_000, 64_000, 66_000]);
+        assert_eq!(peer.losses, 0, "this fixture must be the healthy case");
+        let lines = path_latency_lines(&BTreeMap::from([("droppy".to_string(), peer)]));
+
+        assert_eq!(lines[0], "paths");
+        assert!(
+            lines.iter().any(|line| line.contains("droppy")),
+            "a peer with no losses must not vanish: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("direct")),
+            "its direct path must be reported: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("relay")),
+            "its relay path must be reported: {lines:?}"
+        );
+    }
+
+    /// The busiest path comes first, because which path a peer actually spends
+    /// its time on is the finding rather than a detail.
+    #[test]
+    fn the_busiest_path_is_listed_first() {
+        let peer = probed_peer(&[80_000], &[60_000, 61_000, 62_000]);
+        let lines = path_latency_lines(&BTreeMap::from([("droppy".to_string(), peer)]));
+        let relay = lines.iter().position(|l| l.contains("relay")).unwrap();
+        let direct = lines.iter().position(|l| l.contains("direct")).unwrap();
+        assert!(relay < direct, "relay carried 3 of 4 probes: {lines:?}");
+        assert!(lines[relay].contains("75%"), "{}", lines[relay]);
+        assert!(lines[direct].contains("25%"), "{}", lines[direct]);
+    }
+
+    /// Mean and max are exact; bucketed percentiles are not.
+    ///
+    /// This shipped briefly reporting p50/p90 from the histogram. On live data
+    /// direct and relay both printed `p50=100.0ms p90=200.0ms` while their means
+    /// differed and their maxima differed by more than 2x, because the bucket
+    /// bounds double and both distributions fell in the same bucket. The display
+    /// hid the very difference it exists to show. Pin the exact values so nobody
+    /// swaps them back for percentiles that look more precise.
+    #[test]
+    fn the_reported_latency_is_exact_not_bucketed() {
+        // 40ms and 680ms sit in different buckets; their mean, 360ms, sits in
+        // neither, so a bucketed statistic could not produce this number.
+        let peer = probed_peer(&[40_000, 680_000], &[]);
+        let lines = path_latency_lines(&BTreeMap::from([("droppy".to_string(), peer)]));
+        let direct = lines.iter().find(|l| l.contains("direct")).unwrap();
+        assert!(
+            direct.contains("mean=360.0ms"),
+            "mean must be the exact average, got {direct}"
+        );
+        assert!(
+            direct.contains("max=680.0ms"),
+            "max must be the exact largest sample, got {direct}"
+        );
+        assert!(
+            !direct.contains("p50") && !direct.contains("p90"),
+            "bucketed percentiles collapse distinct paths together: {direct}"
+        );
+    }
+
+    /// A peer that never answered still has something worth reporting.
+    #[test]
+    fn an_unreachable_peer_reports_its_reachability_rather_than_vanishing() {
+        let peer = PeerTelemetry {
+            probes_reachable: 9,
+            probes_unreachable: 243,
+            ..PeerTelemetry::default()
+        };
+        let lines = path_latency_lines(&BTreeMap::from([("bluey".to_string(), peer)]));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("bluey") && l.contains("reachable 9/252")),
+            "an unreachable peer must still be listed: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn no_probes_at_all_says_so_rather_than_printing_an_empty_heading() {
+        assert_eq!(
+            path_latency_lines(&BTreeMap::new()),
+            vec!["paths\tno probes recorded".to_string()]
+        );
+    }
+
     /// The README shows this shape and tells an operator how to read it, so a
     /// silent rename here would make the documentation wrong.
     #[test]
@@ -1142,6 +1255,7 @@ fn print_status(
     println!("exec\t{}", if allow_exec { "allowed" } else { "disabled" });
     print_peer_reachability(peers);
     print_connection_telemetry(connection_telemetry);
+    print_path_latency(connection_telemetry);
     Ok(())
 }
 
@@ -1154,6 +1268,86 @@ fn print_status(
 fn print_connection_telemetry(telemetry: &BTreeMap<String, PeerTelemetry>) {
     for line in connection_telemetry_lines(telemetry) {
         println!("{line}");
+    }
+}
+
+/// Report the accumulated probe latency for each peer, split by path.
+///
+/// The peer table above shows one instantaneous ping. That single sample cannot
+/// answer the question that matters for a machine that moves networks: is the
+/// direct path to this peer actually better than the relay, and which one is it
+/// spending its time on? The daemon has measured that on every probe since it
+/// started, and until now the only way to read it was to parse `telemetry.json`
+/// by hand — the exact grepping these counters exist to end.
+///
+/// This reports facts and reaches no verdict. It does not label a path degraded
+/// and it changes no routing.
+fn print_path_latency(telemetry: &BTreeMap<String, PeerTelemetry>) {
+    for line in path_latency_lines(telemetry) {
+        println!("{line}");
+    }
+}
+
+fn path_latency_lines(telemetry: &BTreeMap<String, PeerTelemetry>) -> Vec<String> {
+    // A peer is included on probe evidence alone. Keying this off losses, the
+    // way the sessions block does, would blank the healthy peer — and healthy is
+    // the normal state, so it is the one that must never be empty.
+    let measured: Vec<_> = telemetry
+        .iter()
+        .filter(|(_, stats)| stats.probes_reachable > 0 || stats.probes_unreachable > 0)
+        .collect();
+    if measured.is_empty() {
+        return vec!["paths\tno probes recorded".to_string()];
+    }
+
+    let mut lines = vec!["paths".to_string()];
+    for (peer, stats) in measured {
+        let total = stats.probes_reachable + stats.probes_unreachable;
+        lines.push(format!(
+            "  {peer}\treachable {}/{}",
+            stats.probes_reachable, total
+        ));
+
+        // Busiest path first: which path a peer actually spends its time on is
+        // the finding, not an afterthought.
+        let mut paths: Vec<_> = stats
+            .probe_latency
+            .iter()
+            .filter(|(_, latency)| latency.samples > 0)
+            .collect();
+        paths.sort_by(|a, b| b.1.samples.cmp(&a.1.samples).then(a.0.cmp(b.0)));
+
+        let answered: u64 = paths.iter().map(|(_, latency)| latency.samples).sum();
+        for (path, latency) in paths {
+            let share = if answered > 0 {
+                format!("{:.0}%", 100.0 * latency.samples as f64 / answered as f64)
+            } else {
+                "-".to_string()
+            };
+            // Mean and max, not percentiles, and that is deliberate. Latency is
+            // stored in buckets whose bounds double, so around 50–200ms two
+            // paths that genuinely differ land in the same bucket and print
+            // identical percentiles. Live data showed exactly that: direct and
+            // relay both reported p50 100.0ms and p90 200.0ms while their means
+            // differed and their maxima differed by more than 2x. A number that
+            // hides the difference it exists to show is worse than none.
+            //
+            // Mean and max are both stored exactly, so they are reported exactly.
+            lines.push(format!(
+                "    {path}\t{share}\tn={}\tmean={}\tmax={}",
+                latency.samples,
+                format_micros(latency.mean_micros()),
+                format_micros(Some(latency.max_micros)),
+            ));
+        }
+    }
+    lines
+}
+
+fn format_micros(micros: Option<u64>) -> String {
+    match micros {
+        Some(micros) => format!("{:.1}ms", micros as f64 / 1000.0),
+        None => "-".to_string(),
     }
 }
 
