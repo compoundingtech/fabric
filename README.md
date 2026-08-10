@@ -772,6 +772,13 @@ fabric's config and returns when the daemon restarts; recreate the dial listener
 after restarting machine A's daemon. Run `fabric unexpose demo-http` on machine
 B when the exposure is no longer wanted.
 
+**8080 and 9080 above are examples, not recommendations.** Pick a port you have
+checked, and remember that **availability is not permission**: a port being free
+right now does not make it yours to take. On a machine you share, `lsof -i :<port>`
+tells you what is listening at this instant and nothing about whose port it is.
+If a port belongs to somebody's habitual workflow, take a different one — a
+dial listener is a local choice and costs nothing to move.
+
 ### Check Connectivity Or Open A Shell
 
 ```sh
