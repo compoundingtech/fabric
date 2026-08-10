@@ -403,11 +403,21 @@ systemctl --user restart fabric-pty-view-expose.service
 - Killing the fabric process causes systemd to restart it:
 
 ```sh
-pkill -f 'fabric .* daemon'
+# Ask systemd which pid it owns, then signal that pid alone.
+pid="$(systemctl --user show -p MainPID --value fabric.service)"
+[ -n "$pid" ] && [ "$pid" != 0 ] && kill "$pid"
 sleep 3
 systemctl --user is-active fabric.service
 ~/.local/bin/fabric status
 ```
+
+Do **not** reach for `pkill -f 'fabric .* daemon'` here, or anywhere else. That
+pattern matches *every* fabric daemon on the host, not the one you meant. This
+repository's own dev workflow runs a second daemon on a separate `FABRIC_HOME`,
+so the pattern would kill a colleague's dev instance, or a production daemon
+while you were testing a dev one — and on a shared desk machine it can kill work
+that is not yours at all. Ask the service manager for the pid, check it, signal
+it.
 
 - Rebooting Hetzner brings the fabric service back without SSH login, assuming
   lingering is enabled.
