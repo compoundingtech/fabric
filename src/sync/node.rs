@@ -59,6 +59,22 @@ impl Reconciled {
     }
 }
 
+/// What the caller knows when it asks [`SyncNode::sweep_tombstones`] to forget
+/// a deletion. Every field is this machine's own clock; none of it is on the
+/// wire, because a peer's word about time is not evidence about what this node
+/// has replicated.
+#[derive(Debug, Clone, Copy)]
+pub struct SweepEvidence {
+    /// Local time now.
+    pub now_secs: i64,
+    /// How long a tombstone must survive before it may be forgotten.
+    pub ttl_secs: i64,
+    /// The local time through which EVERY configured peer has completed a
+    /// reconcile. `None` means the caller cannot prove that, and nothing is
+    /// swept.
+    pub acked_through: Option<i64>,
+}
+
 impl SyncNode {
     pub fn new(author: Author) -> Self {
         Self {
@@ -174,6 +190,94 @@ impl SyncNode {
             }),
         );
         true
+    }
+
+    /// Forget tombstones that are provably dead and provably replicated.
+    ///
+    /// A tombstone is the only record that a path was deleted. Forgetting one
+    /// is therefore **not** a local cleanup: `diff_from` adopts any entry a
+    /// peer holds that we do not, so a node that forgets a tombstone while a
+    /// peer still holds `Present` for that path adopts the file back. Sweeping
+    /// too early resurrects deleted files across the fleet.
+    ///
+    /// So a path is swept only when every one of these holds:
+    ///
+    /// - the policy sweeps at all (bus does, catalog never does),
+    /// - the entry is a tombstone,
+    /// - nothing is on local disk for it (`observed` has no receipt), so we are
+    ///   not discarding the record of a file that still exists,
+    /// - the tombstone is older than `ttl_secs`, and
+    /// - every peer acked *after this node was seen holding the tombstone*.
+    ///
+    /// That last rule is the subtle one. `deleted_secs` comes from the clock of
+    /// whichever node performed the delete, so it says when the file died, NOT
+    /// when this node started holding the record of it. A tombstone can reach us
+    /// already older than the TTL — every tombstone on a bus that has never
+    /// swept is — and then an ack collected before it arrived would appear to
+    /// authorize forgetting it. `expired_since` closes that: it stamps the local
+    /// time each tombstone was first seen expired here, and the ack must beat
+    /// that stamp. See the sweep tests in this module.
+    ///
+    /// `evidence.acked_through` is the caller's proof of replication: the
+    /// earliest local time at which *every* configured peer last completed a
+    /// reconcile. The caller passes `None` when it cannot prove that for all
+    /// peers, and then nothing is swept. Fail-closed is deliberate — the cost of
+    /// not sweeping is CPU, and the cost of sweeping early is a deleted file
+    /// coming back.
+    ///
+    /// `expired_since` is caller-owned scratch state, mutated here. It holds one
+    /// entry per *expired, not yet swept* tombstone, so it stays small in steady
+    /// state and empties as the sweep drains a backlog. Losing it (a restart)
+    /// costs one more ack round, never correctness.
+    ///
+    /// Returns the swept paths. Content is intentionally left alone: it is
+    /// shared by hash and may still back a present path.
+    pub fn sweep_tombstones(
+        &mut self,
+        policy: PolicyRules,
+        evidence: SweepEvidence,
+        observed: &HashMap<String, ContentHash>,
+        expired_since: &mut HashMap<String, i64>,
+    ) -> Vec<String> {
+        let SweepEvidence {
+            now_secs,
+            ttl_secs,
+            acked_through,
+        } = evidence;
+        if !policy.sweep_tombstones || ttl_secs <= 0 {
+            return Vec::new();
+        }
+        let mut swept = Vec::new();
+        let mut waiting = HashMap::new();
+        for (path, entry) in self.manifest.entries() {
+            let Entry::Tombstone(tombstone) = entry else {
+                continue;
+            };
+            if observed.contains_key(path) {
+                continue;
+            }
+            let Some(expires_at) = tombstone.deleted_secs.checked_add(ttl_secs) else {
+                continue;
+            };
+            if now_secs < expires_at {
+                continue;
+            }
+            // First time we have seen this one expired. Stamp it now, so the
+            // ack we demand is one this node earned while already holding it.
+            let held_since = expired_since.get(path).copied().unwrap_or(now_secs);
+            if acked_through.is_some_and(|acked| acked >= held_since) {
+                swept.push(path.clone());
+            } else {
+                waiting.insert(path.clone(), held_since);
+            }
+        }
+        for path in &swept {
+            self.manifest.remove(path);
+        }
+        // Rebuilt rather than retained, so the map tracks exactly the tombstones
+        // still waiting for an ack and never grows into a second manifest.
+        *expired_since = waiting;
+        swept
     }
 
     /// The materialized folder: every present manifest entry whose content this
@@ -337,6 +441,220 @@ mod tests {
         let (lo, hi) = if a < b { (a, b) } else { (b, a) };
         let (left, right) = nodes.split_at_mut(hi);
         left[lo].reconcile(&mut right[0])
+    }
+
+    /// The real bus preset, not a local fixture. The `BUS` const above predates
+    /// the sweep and still says `sweep_tombstones: false`, so a sweep test
+    /// written against it would pass while production behaved differently.
+    fn bus() -> PolicyRules {
+        crate::sync::config::SyncPolicy::Bus.rules()
+    }
+
+    /// One node holding a tombstone for `path`, deleted at `deleted_secs`, with
+    /// nothing on disk for it.
+    fn tombstoned(deleted_secs: i64) -> SyncNode {
+        let mut a = node(1);
+        a.local_write("gone.txt", b"bytes", 0, 0);
+        assert!(a.local_remove("gone.txt", bus(), deleted_secs));
+        a
+    }
+
+    const DAY: i64 = 24 * 60 * 60;
+
+    /// One sweep with no memory of an earlier pass. A test that cares what a
+    /// previous pass stamped calls `sweep_tombstones` directly with its own map.
+    fn sweep_once(
+        node: &mut SyncNode,
+        policy: PolicyRules,
+        now_secs: i64,
+        acked_through: Option<i64>,
+        observed: &HashMap<String, ContentHash>,
+    ) -> Vec<String> {
+        node.sweep_tombstones(
+            policy,
+            SweepEvidence {
+                now_secs,
+                ttl_secs: DAY,
+                acked_through,
+            },
+            observed,
+            &mut HashMap::new(),
+        )
+    }
+
+    #[test]
+    fn a_tombstone_is_swept_only_after_the_ttl_and_only_once_every_peer_acked() {
+        // now, acked_through, expected-to-sweep. Expiry is deleted(100) + ttl.
+        let cases = [
+            (100 + DAY, Some(100 + DAY), true, "exactly at expiry"),
+            (100 + 5 * DAY, Some(100 + 5 * DAY), true, "well past expiry"),
+            (100 + DAY - 1, Some(100 + 5 * DAY), false, "ttl not elapsed"),
+            (100 + 5 * DAY, Some(100 + DAY - 1), false, "ack predates expiry"),
+            (100 + 5 * DAY, None, false, "a peer never acked"),
+        ];
+        for (now, acked, expected, why) in cases {
+            let mut a = tombstoned(100);
+            let swept = sweep_once(&mut a, bus(), now, acked, &HashMap::new());
+            assert_eq!(!swept.is_empty(), expected, "{why}");
+            assert_eq!(
+                a.manifest().get("gone.txt").is_none(),
+                expected,
+                "manifest disagrees with the returned sweep: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_policy_never_sweeps_however_old_the_tombstone_is() {
+        let mut a = tombstoned(100);
+        let swept = sweep_once(
+            &mut a,
+            CATALOG,
+            100 + 999 * DAY,
+            Some(i64::MAX),
+            &HashMap::new(),
+        );
+        assert!(swept.is_empty());
+        assert!(a.manifest().get("gone.txt").is_some());
+    }
+
+    #[test]
+    fn a_tombstone_whose_file_is_still_on_disk_is_never_swept() {
+        let mut a = tombstoned(100);
+        // An observed receipt means the bytes are physically present. Forgetting
+        // the tombstone here would republish the file as a fresh local write.
+        let observed = HashMap::from([("gone.txt".to_string(), content_hash(b"bytes"))]);
+        let swept = sweep_once(&mut a, bus(), 100 + 9 * DAY, Some(i64::MAX), &observed);
+        assert!(swept.is_empty());
+        assert!(a.manifest().get("gone.txt").is_some());
+    }
+
+    #[test]
+    fn a_present_entry_is_never_swept() {
+        let mut a = node(1);
+        a.local_write("live.txt", b"bytes", 0, 0);
+        let swept = sweep_once(&mut a, bus(), i64::MAX / 2, Some(i64::MAX), &HashMap::new());
+        assert!(swept.is_empty());
+        assert!(a.manifest().get("live.txt").unwrap().is_present());
+    }
+
+    /// The reason the ack gate exists, proved rather than asserted.
+    ///
+    /// A node that forgets a tombstone a peer never received adopts the peer's
+    /// `Present` back, because `diff_from` takes any entry we do not hold. This
+    /// test sweeps under both rules and shows the unguarded one resurrects a
+    /// deleted file while the guarded one does not.
+    #[test]
+    fn sweeping_before_a_peer_acked_resurrects_the_deleted_file() {
+        // b never learned about the delete: it still holds the file.
+        let mut b = node(2);
+        b.local_write("gone.txt", b"bytes", 0, 0);
+
+        // Unguarded: sweep with an ack that satisfies the rule, which models
+        // trusting a TTL alone. The file comes back on the next reconcile.
+        let mut unguarded = tombstoned(100);
+        let swept = sweep_once(
+            &mut unguarded,
+            bus(),
+            100 + 9 * DAY,
+            Some(i64::MAX),
+            &HashMap::new(),
+        );
+        assert_eq!(swept, vec!["gone.txt".to_string()]);
+        let mut peer = b.clone();
+        unguarded.reconcile(&mut peer);
+        assert!(
+            unguarded.manifest().get("gone.txt").is_some_and(|e| e.is_present()),
+            "sweeping early must resurrect the file, or this test proves nothing"
+        );
+
+        // Guarded: b has never acked, so acked_through is None and nothing is
+        // swept. The tombstone survives the same reconcile and still wins.
+        let mut guarded = tombstoned(100);
+        let swept = sweep_once(&mut guarded, bus(), 100 + 9 * DAY, None, &HashMap::new());
+        assert!(swept.is_empty());
+        let mut peer = b.clone();
+        guarded.reconcile(&mut peer);
+        assert!(
+            !guarded.manifest().get("gone.txt").unwrap().is_present(),
+            "the tombstone must still beat the peer's stale Present"
+        );
+        assert!(!peer.manifest().get("gone.txt").unwrap().is_present());
+    }
+
+    /// An ack older than the tombstone itself proves nothing.
+    ///
+    /// `deleted_secs` is the ORIGINATING node's clock reading, so it says when
+    /// the file died, not when THIS node started holding the record of it. A
+    /// tombstone that reaches us already older than the TTL is therefore
+    /// sweepable on its first pass, against acks collected before we had it.
+    ///
+    /// One pass reconciles peers in list order, so this is ordinary: `x` acks,
+    /// then `h` hands us a tombstone `x` has never seen, then the sweep runs.
+    /// Every existing tombstone on the live bus is older than any sane TTL, so
+    /// the first pass after the sweep is enabled is exactly this shape.
+    #[test]
+    fn an_ack_collected_before_the_tombstone_arrived_does_not_authorize_a_sweep() {
+        // x is reachable and acking, and it still holds the file.
+        let mut x = node(3);
+        x.local_write("gone.txt", b"bytes", 0, 0);
+        // h deleted it long ago: older than the TTL by nine days.
+        let mut h = tombstoned(100);
+
+        let mut m = node(2);
+
+        // The pass reconciles x first, so x's ack is stamped here, and at this
+        // moment m does not hold the tombstone yet.
+        m.reconcile(&mut x);
+        let acked_through = 100 + 9 * DAY;
+
+        // Then h hands m the tombstone. x has not been told.
+        m.reconcile(&mut h);
+        let now = acked_through + 1;
+
+        let mut expired_since = HashMap::new();
+        let evidence = |now, acked| SweepEvidence {
+            now_secs: now,
+            ttl_secs: DAY,
+            acked_through: Some(acked),
+        };
+        let swept = m.sweep_tombstones(
+            bus(),
+            evidence(now, acked_through),
+            &HashMap::new(),
+            &mut expired_since,
+        );
+        assert!(
+            swept.is_empty(),
+            "x acked before m held this tombstone, so x cannot have received it"
+        );
+        assert_eq!(
+            expired_since.get("gone.txt"),
+            Some(&now),
+            "the refusal must be recorded, or the next pass repeats it forever"
+        );
+
+        // The consequence, so the assertion above is about a real outcome.
+        m.reconcile(&mut x);
+        assert!(
+            !m.manifest().get("gone.txt").unwrap().is_present(),
+            "the deleted file must not come back from x"
+        );
+
+        // Second pass. That reconcile told x, and x acks after the stamp, so the
+        // same tombstone is now provably replicated and the sweep proceeds.
+        let later = now + 60;
+        let swept = m.sweep_tombstones(
+            bus(),
+            evidence(later, later),
+            &HashMap::new(),
+            &mut expired_since,
+        );
+        assert_eq!(swept, vec!["gone.txt".to_string()], "waiting must end");
+        assert!(
+            expired_since.is_empty(),
+            "a swept path must not keep a stamp; the map tracks only the backlog"
+        );
     }
 
     #[test]
