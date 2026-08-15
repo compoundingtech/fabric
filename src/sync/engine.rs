@@ -36,7 +36,7 @@ use crate::config::FabricHome;
 
 use super::config::{PolicyRules, SyncBook, SyncEntry, SyncPeers};
 use super::manifest::{Author, ContentHash, Manifest};
-use super::node::{Reconciled, SyncNode, content_hash};
+use super::node::{Reconciled, SweepEvidence, SyncNode, content_hash};
 
 /// How long to wait after a filesystem event settles before syncing, so a burst
 /// of writes coalesces into one reconcile.
@@ -360,6 +360,16 @@ struct EntryState {
     observed: Arc<StdMutex<HashMap<String, ContentHash>>>,
     /// Local hash cache, keyed on this machine's own disk facts. Never sent.
     scan_cache: Arc<StdMutex<HashMap<String, ScanCacheEntry>>>,
+    /// Local wall-clock time of the last reconcile this node completed with
+    /// each peer, keyed by peer id. Never sent; it is this node's own evidence
+    /// of what a peer has been told, and the tombstone sweep will not forget a
+    /// deletion until every configured peer has an ack newer than it.
+    peer_acks: Arc<StdMutex<HashMap<String, i64>>>,
+    /// Local time each expired tombstone was first seen expired HERE, for the
+    /// tombstones still waiting on an ack. Deliberately not persisted: a
+    /// tombstone whose stamp is lost is simply stamped again on the next pass
+    /// and waits one more ack round, which is the safe direction.
+    expired_since: Arc<StdMutex<HashMap<String, i64>>>,
     work: Arc<EntryWork>,
 }
 
@@ -375,6 +385,11 @@ struct PersistedEntryState {
     /// case the first scan re-hashes once and warms it.
     #[serde(default)]
     scan_cache: HashMap<String, ScanCacheEntry>,
+    /// Per-peer reconcile acks. Absent in files written before it existed, and
+    /// an empty map is the safe value: with no ack for a peer the sweep
+    /// refuses to forget anything until one is earned.
+    #[serde(default)]
+    peer_acks: HashMap<String, i64>,
 }
 
 /// What the LOCAL disk looked like when this path was last hashed.
@@ -487,25 +502,31 @@ impl<T: SyncTransport> SyncEngine<T> {
                 .unwrap_or_else(EntryWork::new);
             // Reuse an existing node for an unchanged entry so in-memory content
             // survives a reload; otherwise start one from the persisted manifest.
-            let (node, operation, observed, scan_cache) = match entries.get(&cfg.name) {
-                Some(existing) if existing.config == *cfg => (
-                    existing.node.clone(),
-                    existing.operation.clone(),
-                    existing.observed.clone(),
-                    existing.scan_cache.clone(),
-                ),
-                _ => {
-                    work.durable_generation.store(0, Ordering::Release);
-                    work.record_mutation();
-                    let (node, observed, scan_cache) = self.load_node_and_observed(cfg).await?;
-                    (
-                        Arc::new(Mutex::new(node)),
-                        Arc::new(Mutex::new(())),
-                        Arc::new(StdMutex::new(observed)),
-                        Arc::new(StdMutex::new(scan_cache)),
-                    )
-                }
-            };
+            let (node, operation, observed, scan_cache, peer_acks, expired_since) =
+                match entries.get(&cfg.name) {
+                    Some(existing) if existing.config == *cfg => (
+                        existing.node.clone(),
+                        existing.operation.clone(),
+                        existing.observed.clone(),
+                        existing.scan_cache.clone(),
+                        existing.peer_acks.clone(),
+                        existing.expired_since.clone(),
+                    ),
+                    _ => {
+                        work.durable_generation.store(0, Ordering::Release);
+                        work.record_mutation();
+                        let (node, observed, scan_cache, peer_acks) =
+                            self.load_node_and_observed(cfg).await?;
+                        (
+                            Arc::new(Mutex::new(node)),
+                            Arc::new(Mutex::new(())),
+                            Arc::new(StdMutex::new(observed)),
+                            Arc::new(StdMutex::new(scan_cache)),
+                            Arc::new(StdMutex::new(peer_acks)),
+                            Arc::new(StdMutex::new(HashMap::new())),
+                        )
+                    }
+                };
             next.insert(
                 cfg.name.clone(),
                 Arc::new(EntryState {
@@ -515,6 +536,8 @@ impl<T: SyncTransport> SyncEngine<T> {
                     operation,
                     observed,
                     scan_cache,
+                    peer_acks,
+                    expired_since,
                     work,
                 }),
             );
@@ -530,6 +553,7 @@ impl<T: SyncTransport> SyncEngine<T> {
         SyncNode,
         HashMap<String, ContentHash>,
         HashMap<String, ScanCacheEntry>,
+        HashMap<String, i64>,
     )> {
         let mut node = SyncNode::new(self.author);
         if let Some(state) = self.read_state(&cfg.name)? {
@@ -537,14 +561,14 @@ impl<T: SyncTransport> SyncEngine<T> {
             // The cache is absent in a file written before it existed. An empty
             // one is correct, not a fault: the next scan re-hashes once and
             // warms it.
-            return Ok((node, state.observed, state.scan_cache));
+            return Ok((node, state.observed, state.scan_cache, state.peer_acks));
         }
         if let Some(manifest) = self.read_manifest(&cfg.name)? {
             node.adopt(&manifest);
         }
         let mut scan_cache = HashMap::new();
         let observed = observed_from_disk(node.manifest(), cfg, &mut scan_cache)?;
-        Ok((node, observed, scan_cache))
+        Ok((node, observed, scan_cache, HashMap::new()))
     }
 
     /// Resolve a sync name to its node (used by the daemon's inbound accept).
@@ -766,7 +790,7 @@ impl<T: SyncTransport> SyncEngine<T> {
         };
 
         let peers = self.transport.peers_for(&entry.config.peers).await;
-        for peer in peers {
+        for peer in &peers {
             if self.cancel.is_cancelled() {
                 break;
             }
@@ -779,6 +803,14 @@ impl<T: SyncTransport> SyncEngine<T> {
                     if !stats.is_noop() {
                         tracing::debug!(sync = name, peer = peer.id, ?stats, "sync reconciled");
                     }
+                    // A completed reconcile means this peer has merged the
+                    // manifest we just sent, tombstones included. That is the
+                    // only evidence the sweep is allowed to act on.
+                    entry
+                        .peer_acks
+                        .lock()
+                        .unwrap()
+                        .insert(peer.id.clone(), now_secs());
                 }
                 Err(error) => {
                     tracing::debug!(sync = name, peer = peer.id, %error, "sync reconcile failed");
@@ -789,6 +821,7 @@ impl<T: SyncTransport> SyncEngine<T> {
         let _operation = entry.operation.lock().await;
         self.scan_entry(&entry).await?;
         self.materialize_entry_state(&entry, &baseline).await?;
+        self.sweep_entry_tombstones(&entry, &peers).await;
         let final_manifest = entry.node.lock().await.manifest().clone();
         let final_observed = entry.observed.lock().unwrap().clone();
         if final_manifest != manifest || final_observed != baseline {
@@ -839,18 +872,59 @@ impl<T: SyncTransport> SyncEngine<T> {
         )
     }
 
+    /// Forget tombstones this node can prove are dead and replicated.
+    ///
+    /// Called after the peer loop so the acks are as fresh as possible, and
+    /// inside the caller's operation guard so a scan cannot interleave. It is a
+    /// no-op unless the sweep is explicitly enabled, the policy sweeps, and
+    /// every configured peer has acked while this node held the tombstone.
+    async fn sweep_entry_tombstones(&self, entry: &EntryState, peers: &[PeerRef]) {
+        let Some(ttl_secs) = tombstone_sweep_ttl_secs() else {
+            return;
+        };
+        if !entry.policy.sweep_tombstones {
+            return;
+        }
+        let acked_through = {
+            let acks = entry.peer_acks.lock().unwrap();
+            acked_through(&entry.config.peers, peers, &acks)
+        };
+        let observed = entry.observed.lock().unwrap().clone();
+        let evidence = SweepEvidence {
+            now_secs: now_secs(),
+            ttl_secs,
+            acked_through,
+        };
+        let swept = {
+            // Node first: a std guard held across the node's await point is not
+            // Send, and this runs inside a spawned task.
+            let mut node = entry.node.lock().await;
+            let mut expired_since = entry.expired_since.lock().unwrap();
+            node.sweep_tombstones(entry.policy, evidence, &observed, &mut expired_since)
+        };
+        if !swept.is_empty() {
+            tracing::info!(
+                sync = entry.config.name,
+                swept = swept.len(),
+                "swept expired tombstones"
+            );
+        }
+    }
+
     async fn persist_entry(&self, entry: &EntryState) -> Result<()> {
         #[cfg(test)]
         entry.work.persist_calls.fetch_add(1, Ordering::Relaxed);
         let manifest = entry.node.lock().await.manifest().clone();
         let observed = entry.observed.lock().unwrap().clone();
         let scan_cache = entry.scan_cache.lock().unwrap().clone();
+        let peer_acks = entry.peer_acks.lock().unwrap().clone();
         self.write_state(
             &entry.config.name,
             &PersistedEntryState {
                 manifest,
                 observed,
                 scan_cache,
+                peer_acks,
             },
         )?;
         entry.work.commit_daemon_writes();
@@ -1624,6 +1698,50 @@ fn mtime_of(entry: &std::fs::DirEntry) -> (i64, u32) {
     }
 }
 
+/// Resolve the tombstone sweep window from `FABRIC_TOMBSTONE_SWEEP_DAYS`.
+///
+/// Unset means the sweep is OFF. That is deliberate: forgetting a tombstone is
+/// the one sync operation that can bring a deleted file back across a fleet, so
+/// it is opt-in per machine rather than a default that arrives with an upgrade.
+/// A value that is absent, unparseable, or not positive disables it.
+pub(crate) fn resolve_tombstone_sweep_days(raw: Option<&str>) -> Option<i64> {
+    let days: i64 = raw?.trim().parse().ok()?;
+    (days > 0).then_some(days)
+}
+
+fn tombstone_sweep_ttl_secs() -> Option<i64> {
+    resolve_tombstone_sweep_days(std::env::var("FABRIC_TOMBSTONE_SWEEP_DAYS").ok().as_deref())
+        .map(|days| days * 24 * 60 * 60)
+}
+
+/// The local time through which EVERY configured peer has completed a
+/// reconcile, or `None` when that cannot be proven for all of them.
+///
+/// `resolved` is what `peers_for` returned. It silently drops a configured peer
+/// that is not in the peer book, so a short list is itself a reason to refuse:
+/// a peer we cannot even resolve is a peer we cannot claim has our tombstones.
+/// A wildcard entry is refused outright, because its peer set is whatever the
+/// book holds right now and a peer leaving the book must not be what makes a
+/// deletion forgettable.
+fn acked_through(
+    configured: &SyncPeers,
+    resolved: &[PeerRef],
+    acks: &HashMap<String, i64>,
+) -> Option<i64> {
+    let SyncPeers::List(selectors) = configured else {
+        return None;
+    };
+    if selectors.is_empty() || resolved.len() != selectors.len() {
+        return None;
+    }
+    let mut earliest = i64::MAX;
+    for peer in resolved {
+        let ack = *acks.get(&peer.id)?;
+        earliest = earliest.min(ack);
+    }
+    (earliest != i64::MAX).then_some(earliest)
+}
+
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1739,7 +1857,7 @@ fn spawn_watcher(
 mod tests {
     use super::*;
     use crate::sync::config::SyncPolicy;
-    use crate::sync::manifest::Entry;
+    use crate::sync::manifest::{Author, Entry, FileMeta, Tombstone};
     use std::sync::{Mutex as StdMutex, Weak};
 
     #[test]
@@ -1904,6 +2022,153 @@ mod tests {
 
     fn catalog_entry(name: &str, folder: &Path) -> SyncEntry {
         entry_with_policy(name, folder, SyncPolicy::Catalog)
+    }
+
+    fn peer(id: &str) -> PeerRef {
+        PeerRef {
+            id: id.to_string(),
+            addr: None,
+        }
+    }
+
+    /// What the sweep is worth, measured rather than asserted.
+    ///
+    /// Ignored by default because it is a measurement, not a guard. Run it with
+    /// `cargo test --release -- --ignored --nocapture manifest_decode_cost`.
+    /// The corpus is sized to the live `st2-bus-default` manifest observed on
+    /// 2026-08-14: 11,636 present and 11,771 tombstones.
+    #[test]
+    #[ignore = "measurement, not a guard"]
+    fn manifest_decode_cost_before_and_after_a_sweep() {
+        const PRESENT: usize = 11_636;
+        const TOMBSTONES: usize = 11_771;
+        const ROUNDS: u32 = 5;
+
+        let mut full = Manifest::new();
+        for i in 0..PRESENT {
+            full.insert(
+                format!("agents/host{}/agent{i}/resources/item-{i}.json", i % 7),
+                Entry::Present(FileMeta {
+                    hash: ContentHash([(i % 251) as u8; 32]),
+                    size: 1024 + i as u64,
+                    executable: false,
+                    mtime_secs: 1_786_700_000 + i as i64,
+                    mtime_nanos: (i % 1_000_000_000) as u32,
+                    version: 1 + (i % 5) as u64,
+                    author: Author([(i % 13) as u8; 32]),
+                }),
+            );
+        }
+        let mut swept = full.clone();
+        for i in 0..TOMBSTONES {
+            full.insert(
+                format!("agents/host{}/agent{i}/inbox/msg-{i}.md", i % 7),
+                Entry::Tombstone(Tombstone {
+                    version: 2,
+                    author: Author([(i % 13) as u8; 32]),
+                    deleted_secs: 1_786_000_000 + i as i64,
+                }),
+            );
+        }
+
+        let time = |manifest: &Manifest, label: &str| {
+            let bytes = serde_json::to_vec(manifest).unwrap();
+            let start = std::time::Instant::now();
+            for _ in 0..ROUNDS {
+                let decoded: Manifest = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(decoded.len(), manifest.len());
+            }
+            let per_decode = start.elapsed() / ROUNDS;
+            println!(
+                "{label}: {} entries, {:.1} MB, {:?} per decode",
+                manifest.len(),
+                bytes.len() as f64 / 1_048_576.0,
+                per_decode
+            );
+            per_decode
+        };
+
+        // A real manifest beats a modelled one. Point FABRIC_MEASURE_MANIFEST at
+        // a copy of a live manifest.json to measure the actual corpus; the
+        // synthetic one above is the reproducible fallback.
+        if let Ok(path) = std::env::var("FABRIC_MEASURE_MANIFEST") {
+            let raw = std::fs::read(&path).expect("corpus file");
+            let live: Manifest = serde_json::from_slice(&raw).expect("corpus parses as a manifest");
+            let mut live_swept = Manifest::new();
+            for (path, entry) in live.entries() {
+                if entry.is_present() {
+                    live_swept.insert(path.clone(), *entry);
+                }
+            }
+            println!("corpus: {path}");
+            let before = time(&live, "live before ");
+            let after = time(&live_swept, "live after  ");
+            println!(
+                "decode cost removed by the sweep: {:.1}%",
+                100.0 - (after.as_secs_f64() / before.as_secs_f64() * 100.0)
+            );
+            return;
+        }
+
+        // `swept` already holds only the present entries, which is exactly the
+        // manifest a completed sweep leaves behind.
+        let before = time(&full, "before sweep");
+        let after = time(&mut swept, "after sweep ");
+        println!(
+            "decode cost removed by the sweep: {:.1}%",
+            100.0 - (after.as_secs_f64() / before.as_secs_f64() * 100.0)
+        );
+    }
+
+    #[test]
+    fn the_tombstone_sweep_is_off_unless_explicitly_configured() {
+        assert_eq!(resolve_tombstone_sweep_days(None), None, "unset means off");
+        for raw in ["", "  ", "no", "0", "-1", "1.5", "many"] {
+            assert_eq!(
+                resolve_tombstone_sweep_days(Some(raw)),
+                None,
+                "{raw:?} must not enable the sweep"
+            );
+        }
+        assert_eq!(resolve_tombstone_sweep_days(Some("7")), Some(7));
+        assert_eq!(resolve_tombstone_sweep_days(Some(" 30 ")), Some(30));
+    }
+
+    #[test]
+    fn acked_through_is_the_earliest_ack_and_only_when_every_peer_has_one() {
+        let both = SyncPeers::List(vec!["a".into(), "b".into()]);
+        let resolved = vec![peer("a"), peer("b")];
+        let acks = HashMap::from([("a".to_string(), 500), ("b".to_string(), 300)]);
+        assert_eq!(
+            acked_through(&both, &resolved, &acks),
+            Some(300),
+            "the slowest peer bounds what we may forget"
+        );
+
+        // One peer has never acked: nothing is provable, so nothing is swept.
+        let acks = HashMap::from([("a".to_string(), 500)]);
+        assert_eq!(acked_through(&both, &resolved, &acks), None);
+    }
+
+    #[test]
+    fn acked_through_refuses_a_wildcard_and_an_unresolvable_peer() {
+        let acks = HashMap::from([("a".to_string(), 500), ("b".to_string(), 500)]);
+
+        // A wildcard's peer set is whatever the book holds now. A peer leaving
+        // the book must never be the thing that makes a deletion forgettable.
+        let wildcard = SyncPeers::Wildcard("*".into());
+        assert_eq!(
+            acked_through(&wildcard, &[peer("a"), peer("b")], &acks),
+            None
+        );
+
+        // peers_for silently drops a configured peer missing from the book, so
+        // a short resolved list means we cannot speak for everyone.
+        let three = SyncPeers::List(vec!["a".into(), "b".into(), "c".into()]);
+        assert_eq!(acked_through(&three, &[peer("a"), peer("b")], &acks), None);
+
+        // An empty list would otherwise make the sweep vacuously safe.
+        assert_eq!(acked_through(&SyncPeers::List(vec![]), &[], &acks), None);
     }
 
     #[test]
@@ -3009,6 +3274,7 @@ mod tests {
                     manifest: manifest.clone(),
                     observed,
                     scan_cache: HashMap::new(),
+                    peer_acks: HashMap::new(),
                 },
             )
             .unwrap();
@@ -4220,6 +4486,7 @@ mod tests {
             manifest: tombstone_manifest,
             observed: HashMap::new(),
             scan_cache: HashMap::new(),
+            peer_acks: HashMap::new(),
         };
 
         // Block only manifest.json's atomic temp path. write_state must report
@@ -4329,6 +4596,7 @@ mod tests {
                         manifest: node.manifest().clone(),
                         observed,
                         scan_cache: HashMap::new(),
+                        peer_acks: HashMap::new(),
                     },
                 )
                 .unwrap();
