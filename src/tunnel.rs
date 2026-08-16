@@ -649,13 +649,27 @@ impl TunnelSession {
             bytes[already_have..].to_vec()
         };
 
-        {
+        let write_failed = {
             let mut write = self.local_write.lock().await;
             let Some(write) = write.as_mut() else {
                 bail!("tunnel {} local write is closed", self.id);
             };
-            write.write_all(&bytes).await?;
-            write.flush().await?;
+            match write.write_all(&bytes).await {
+                Ok(()) => write.flush().await.err(),
+                Err(error) => Some(error),
+            }
+        };
+        if let Some(error) = write_failed {
+            // Nobody is holding the other end of the local socket any more. End
+            // the send side for the same reason an abrupt local read close does:
+            // only a recorded close makes the writer emit `Frame::Close`, which
+            // is what lets the server stop counting this session as attached.
+            self.mark_send_closed().await;
+            return Err(LocalEndpointGone {
+                id: self.id,
+                source: error,
+            }
+            .into());
         }
 
         let close_now = {
@@ -1097,14 +1111,7 @@ async fn run_client_attach_loop(
             }
             Err(error) => {
                 let message = format!("{error:#}");
-                // An endpoint-level local rejection is a permanent trust/auth
-                // failure for this session, not a transient transport drop.
-                // Retrying it forever makes default-deny shell/exec requests
-                // hang instead of returning the refusal to the caller.
-                let permanently_rejected = error.downcast_ref::<ServerRejected>().is_some()
-                    || message.contains("code 403")
-                    || message.contains("node is not in fabric allow-list");
-                if permanently_rejected {
+                if is_permanent_failure(&error) {
                     if let Some(notices) = notices.as_ref() {
                         notices
                             .emit(
@@ -1247,6 +1254,56 @@ impl fmt::Display for ServerRejected {
 }
 
 impl std::error::Error for ServerRejected {}
+
+/// The local endpoint this tunnel exists to serve has gone away.
+///
+/// Raised when remote output cannot be written to the local socket, which is
+/// what a caller abandoning its dial looks like from in here. It is a distinct
+/// type rather than a message because the retry loop must be able to tell it
+/// apart from a transport drop without matching on prose.
+#[derive(Debug)]
+struct LocalEndpointGone {
+    id: TunnelSessionId,
+    source: std::io::Error,
+}
+
+impl fmt::Display for LocalEndpointGone {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "tunnel {} local endpoint is gone: {}",
+            self.id, self.source
+        )
+    }
+}
+
+impl std::error::Error for LocalEndpointGone {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Whether reconnecting could possibly help, or the session is simply over.
+///
+/// Two shapes are permanent. An endpoint-level rejection is a trust decision the
+/// peer will make identically every time, so retrying it forever makes a
+/// default-deny shell or exec request hang instead of returning the refusal.
+///
+/// A dead LOCAL endpoint is permanent for a different and stronger reason: the
+/// thing the tunnel exists to serve is gone. No remote peer can repair it, so
+/// every further attempt reattaches, receives output nobody will read, fails on
+/// the same dead socket, and sleeps. That is issue 51 — the loop cannot end,
+/// because a pty never closes its side and `is_complete` waits for a remote
+/// close that will never come.
+fn is_permanent_failure(error: &anyhow::Error) -> bool {
+    if error.downcast_ref::<ServerRejected>().is_some()
+        || error.downcast_ref::<LocalEndpointGone>().is_some()
+    {
+        return true;
+    }
+    let message = format!("{error:#}");
+    message.contains("code 403") || message.contains("node is not in fabric allow-list")
+}
 
 #[derive(Debug, Clone)]
 pub struct ServerSessionStore {
@@ -2222,6 +2279,84 @@ mod tests {
             abrupt_closed, clean_closed,
             "an abrupt local close must end the send side exactly like a clean EOF; \
              leaving it open is what makes the server hold the session attached"
+        );
+    }
+
+    /// Issue 51: an abandoned local dial must end the session, not retry forever.
+    ///
+    /// The caller exits, nobody holds the local socket, and the remote pty keeps
+    /// producing output. Writing that output fails with a local `BrokenPipe`.
+    /// Classified as a transport failure it reattaches, fails on the same dead
+    /// socket, and sleeps, forever: `is_complete` waits for a remote close and a
+    /// pty never closes its side, and every reconnect clears `last_detached` so
+    /// the detached TTL cannot collect it either.
+    #[tokio::test]
+    async fn a_dead_local_endpoint_is_permanent_not_a_transport_drop() {
+        let (write_peer, write) = duplex(64);
+        let (session, _local_read) = TunnelSession::new_parts(
+            session_id(51),
+            peer_id(),
+            Box::new(tokio::io::empty()),
+            Box::new(write),
+        );
+        // What an abandoned dial looks like from inside the tunnel.
+        drop(write_peer);
+
+        let error = session
+            .accept_data(0, b"remote pty output".to_vec())
+            .await
+            .expect_err("writing into a dropped local socket must fail");
+
+        assert!(
+            error.downcast_ref::<LocalEndpointGone>().is_some(),
+            "a local io failure must be a type the retry loop can match on, \
+             not prose it has to grep: {error:#}"
+        );
+        assert!(
+            is_permanent_failure(&error),
+            "no remote peer can repair a dead local socket, so this must not retry"
+        );
+        assert_eq!(
+            session.state.lock().await.send_closed,
+            Some(0),
+            "the send side must close, or the server keeps counting this attached"
+        );
+    }
+
+    /// The control for the case above. A transport drop must STAY retryable, or
+    /// the fix above would turn every network blip into a killed session.
+    #[test]
+    fn a_transport_drop_is_still_retryable_and_a_refusal_is_still_permanent() {
+        for transient in [
+            "connection lost: timed out",
+            "tunnel attach stream closed",
+            "no route to host",
+        ] {
+            let error = anyhow::anyhow!("{transient}");
+            assert!(
+                !is_permanent_failure(&error),
+                "{transient:?} must remain retryable"
+            );
+        }
+
+        let refused = anyhow::Error::new(ServerRejected("denied".to_string()));
+        assert!(
+            is_permanent_failure(&refused),
+            "a trust refusal is permanent"
+        );
+        let allow_list = anyhow::anyhow!("node is not in fabric allow-list");
+        assert!(is_permanent_failure(&allow_list));
+
+        // The typed error must survive being wrapped in context on the way up,
+        // because that is how it actually reaches the retry loop.
+        let wrapped = anyhow::Error::new(LocalEndpointGone {
+            id: session_id(51),
+            source: std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+        })
+        .context("reading tunnel attach stream");
+        assert!(
+            is_permanent_failure(&wrapped),
+            "context wrapping must not hide a dead local endpoint"
         );
     }
 
