@@ -2340,7 +2340,10 @@ mod tests {
         }
 
         let refused = anyhow::Error::new(ServerRejected("denied".to_string()));
-        assert!(is_permanent_failure(&refused), "a trust refusal is permanent");
+        assert!(
+            is_permanent_failure(&refused),
+            "a trust refusal is permanent"
+        );
         let allow_list = anyhow::anyhow!("node is not in fabric allow-list");
         assert!(is_permanent_failure(&allow_list));
 
