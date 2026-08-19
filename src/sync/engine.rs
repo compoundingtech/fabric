@@ -2157,6 +2157,124 @@ mod tests {
         }
     }
 
+    /// What the materialize re-read costs in RESIDENT MEMORY, measured.
+    ///
+    /// Ignored by default because it is a measurement, not a guard. Run it with
+    /// `cargo test --release -- --ignored --nocapture materialize_resident_cost`.
+    ///
+    /// Sized to the live `st2-declarations-default` entry observed on
+    /// 2026-08-19: three files of about 23 MB, 70.2 MB total, passed over once
+    /// or twice a second. On 19 August the daemon's RSS sat at 2.52 GB with
+    /// 2.2 GB resident and dirty in EMPTY large-allocation regions, while RSS
+    /// was flat under 12.5 GB of churn per 90 s. That is retention, and this
+    /// measures whether the read is what feeds it.
+    #[test]
+    #[ignore = "measurement, not a guard"]
+    fn materialize_resident_cost_with_and_without_the_cache() {
+        fn rss_kb() -> u64 {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+                .output()
+                .expect("ps");
+            String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Three files the size of the real build artifacts.
+        let mut node = SyncNode::new(Author([3u8; 32]));
+        let blob = vec![0xABu8; 23_346_256];
+        for name in ["a.bin", "b.bin", "c.bin"] {
+            node.local_write(name, &blob, 1_700_000_000, 0);
+        }
+        drop(blob);
+
+        let mut observed = HashMap::new();
+        materialize_tracked(
+            &mut node,
+            &root,
+            SyncPolicy::Catalog.rules(),
+            &HashMap::new(),
+            &mut observed,
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+
+        // The cache a scan would have recorded for these three files.
+        let mut cache = HashMap::new();
+        let mut total = 0u64;
+        for (rel, meta) in node
+            .manifest()
+            .present_paths()
+            .map(|(r, m)| (r.clone(), *m))
+            .collect::<Vec<_>>()
+        {
+            let path = root.join(&rel);
+            let disk = std::fs::metadata(&path).unwrap();
+            let (secs, nanos) = mtime_of_metadata(&disk);
+            total += disk.len();
+            cache.insert(
+                rel,
+                ScanCacheEntry {
+                    size: disk.len(),
+                    mtime_secs: secs,
+                    mtime_nanos: nanos,
+                    hash: meta.hash,
+                },
+            );
+        }
+        println!("corpus: {} files, {:.1} MB", cache.len(), total as f64 / 1e6);
+
+        const PASSES: usize = 200;
+
+        let before = rss_kb();
+        for _ in 0..PASSES {
+            let mut obs = HashMap::new();
+            materialize_tracked(
+                &mut node,
+                &root,
+                SyncPolicy::Catalog.rules(),
+                &HashMap::new(),
+                &mut obs,
+                &HashMap::new(),
+                None,
+            )
+            .unwrap();
+        }
+        let after_reads = rss_kb();
+
+        for _ in 0..PASSES {
+            let mut obs = HashMap::new();
+            materialize_tracked(
+                &mut node,
+                &root,
+                SyncPolicy::Catalog.rules(),
+                &HashMap::new(),
+                &mut obs,
+                &cache,
+                None,
+            )
+            .unwrap();
+        }
+        let after_cached = rss_kb();
+
+        println!(
+            "RSS MB: start {:.0}, after {} re-reading passes {:.0}, after {} cached passes {:.0}",
+            before as f64 / 1024.0,
+            PASSES,
+            after_reads as f64 / 1024.0,
+            PASSES,
+            after_cached as f64 / 1024.0
+        );
+        println!(
+            "bytes read: re-reading path {:.1} GB, cached path 0.0 GB",
+            (total as f64 * PASSES as f64) / 1e9
+        );
+    }
+
     /// What the sweep is worth, measured rather than asserted.
     ///
     /// Ignored by default because it is a measurement, not a guard. Run it with
