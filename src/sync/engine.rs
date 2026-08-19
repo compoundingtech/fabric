@@ -2484,6 +2484,20 @@ mod tests {
             "a write outside the glob must not reach the loop, even on the \
              entry's first run when the root had to be created first"
         );
+
+        // POSITIVE CONTROL. The assertion above is satisfied by a watcher that
+        // never started, so on its own it cannot fail. This proves the watcher
+        // is alive and delivering on this very root, which is what makes the
+        // silence above mean something.
+        std::fs::create_dir_all(root.join("agents/Silber/fabric")).unwrap();
+        std::fs::write(root.join("agents/Silber/fabric/agent.kdl"), b"agent {}").unwrap();
+        assert!(
+            matches!(
+                tokio::time::timeout(Duration::from_secs(5), rx.recv()).await,
+                Ok(Some(_))
+            ),
+            "the watcher must be alive on this root, or the silence above proves nothing"
+        );
     }
 
     #[cfg(target_os = "linux")]
