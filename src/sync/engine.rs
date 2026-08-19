@@ -1043,7 +1043,7 @@ impl<T: SyncTransport> SyncEngine<T> {
         // keeping it bounded prevents an arbitrarily hot writer from building
         // an in-memory event backlog while the current sync is running.
         let (tx, mut rx) = mpsc::channel::<WatchEvent>(1);
-        let _watcher = spawn_watcher(&root, tx, entry.work.clone());
+        let _watcher = spawn_watcher(&root, tx, entry.work.clone(), entry.config.clone());
 
         let mut ticker = tokio::time::interval(PERIODIC_RESYNC);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1818,21 +1818,96 @@ impl WatchEventBatch {
     }
 }
 
+/// Whether a watched path can affect what this entry syncs.
+///
+/// Issue #57. An entry watches its whole root, but it syncs only what its
+/// include globs select. On the live Silber daemon the declarations entry
+/// selects 64 of 14,368 files, and st2 continuously writes files it does not
+/// select: agent `status` files, and `pty/*.events.jsonl`. Every one of those
+/// writes woke a full scan, so a tree whose selected files had not changed for
+/// 101.6 hours was scanned about twice a second.
+///
+/// The default is to KEEP. An entry with no include globs selects everything,
+/// so `includes` returns true and nothing is dropped. Anything this cannot
+/// judge is kept too, because a missed real change is far worse than a wasted
+/// scan: the cost of keeping is one scan, and the cost of dropping wrongly is a
+/// declaration that does not propagate until the safety scan.
+///
+/// A directory is always kept. A directory event names the directory, not the
+/// descendants the entry may sync under it.
+/// Both spellings of the watched root: as configured, and as the OS resolves it.
+///
+/// A watcher reports the real path. Where the root reaches through a symlink,
+/// which is the normal case for a macOS temp dir and can be the case for a
+/// home, the two differ and only the resolved one strips cleanly.
+fn watch_roots_for(root: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![root.to_path_buf()];
+    if let Ok(resolved) = std::fs::canonicalize(root)
+        && resolved != *root
+    {
+        roots.push(resolved);
+    }
+    roots
+}
+
+fn watch_path_is_relevant(roots: &[PathBuf], path: &Path, cfg: &SyncEntry) -> bool {
+    let Some(rel) = roots.iter().find_map(|root| path.strip_prefix(root).ok()) else {
+        // Outside every spelling of the root. Not ours to judge, so keep.
+        return true;
+    };
+    let rel = rel.to_string_lossy();
+    let Some(norm) = Manifest::normalize_path(&rel) else {
+        // The root itself, or a path that does not normalize. Keep.
+        return true;
+    };
+    if cfg.includes(&norm) {
+        return true;
+    }
+    // A delete leaves nothing to stat, and `is_dir` is false for it. That is
+    // the right way round: under catalog policy a delete does not propagate,
+    // and the safety scan is the backstop for every other case.
+    path.is_dir()
+}
+
 fn spawn_watcher(
     root: &Path,
     tx: mpsc::Sender<WatchEvent>,
     work: Arc<EntryWork>,
+    cfg: SyncEntry,
 ) -> Option<notify::RecommendedWatcher> {
     use notify::{RecursiveMode, Watcher};
 
+    // Create the folder BEFORE resolving the root, not just before watching it.
+    // `canonicalize` fails on a path that does not exist, so a first run would
+    // otherwise resolve nothing and carry only the configured spelling.
+    let _ = std::fs::create_dir_all(root);
+
+    // The watcher reports the REAL path. On macOS the temp and home roots run
+    // through a symlink, so `/var/...` is reported as `/private/var/...` and a
+    // strip against the configured root fails for every event. That failure is
+    // safe, because an unjudgeable path is kept, but it would make this filter
+    // silently inert on exactly the machine that needs it. Carry both spellings.
+    let watch_roots = watch_roots_for(root);
     let mut watcher =
         match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             if let Ok(event) = res
                 && watcher_event_is_mutation(&event.kind)
             {
+                let paths: Vec<PathBuf> = event
+                    .paths
+                    .into_iter()
+                    .filter(|path| watch_path_is_relevant(&watch_roots, path, &cfg))
+                    .collect();
+                // Nothing this entry syncs can have changed. Do NOT record a
+                // mutation: the generation drives `dirty`, so bumping it here
+                // would make the periodic tick scan anyway and the filter would
+                // buy nothing.
+                if paths.is_empty() {
+                    return;
+                }
                 let generation = work.record_mutation();
                 let _ = tx.try_send(WatchEvent {
-                    paths: event.paths,
+                    paths,
                     generation,
                     daemon_write_candidate: watcher_event_can_match_daemon_write(&event.kind),
                 });
@@ -1844,8 +1919,6 @@ fn spawn_watcher(
                 return None;
             }
         };
-    // Create the folder first so watching it succeeds.
-    let _ = std::fs::create_dir_all(root);
     if let Err(error) = watcher.watch(root, RecursiveMode::Recursive) {
         tracing::warn!(root = %root.display(), %error, "failed to watch folder");
         return None;
@@ -2200,6 +2273,219 @@ mod tests {
         ));
     }
 
+    /// The declarations entry as it is really configured: it selects agent
+    /// declarations, templates and plans out of a catalog that also carries
+    /// continuously written bus data.
+    fn declarations_like_entry(root: &Path) -> SyncEntry {
+        let mut cfg = entry_with_policy("declarations", root, SyncPolicy::Catalog);
+        cfg.include = Some(vec![
+            "_templates/**".to_string(),
+            "**/agent.kdl".to_string(),
+            "plans/**".to_string(),
+        ]);
+        cfg
+    }
+
+    /// Issue #57: a write the entry does not sync must not wake a scan.
+    ///
+    /// These are the paths st2 actually writes, taken from the live Silber
+    /// catalog. Each one used to trigger a full scan of 14,368 files, which is
+    /// why a tree whose selected files had not changed for 101.6 hours was
+    /// scanned about twice a second.
+    #[test]
+    fn a_write_outside_the_glob_does_not_wake_a_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cfg = declarations_like_entry(root);
+
+        for noise in [
+            "agents/Silber/cos/status",
+            "agents/hetz/root/status",
+            "pty/Silber.fabric.events.jsonl",
+            "agents/Silber/cos/resources/archive/1785390445488-eavhqh.md",
+        ] {
+            let path = root.join(noise);
+            assert!(
+                !watch_path_is_relevant(&watch_roots_for(root), &path, &cfg),
+                "{noise} is not selected by this entry, so it must not wake a scan"
+            );
+        }
+    }
+
+    /// THE REGRESSION THAT MATTERS, and the reason this filter is dangerous.
+    ///
+    /// If the filter over-matches, a real declaration change stops waking a
+    /// scan and waits up to `MISSED_EVENT_RESYNC` instead of `WATCH_DEBOUNCE`.
+    /// That is 300 s rather than 150 ms, and a slow declaration sync is how a
+    /// fleet ends up running two versions of the truth. That is worse than the
+    /// cost this filter removes.
+    #[test]
+    fn a_real_declaration_change_still_wakes_a_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cfg = declarations_like_entry(root);
+
+        for real in [
+            "agents/Silber/fabric/agent.kdl",
+            "agents/hetz/root/agent.kdl",
+            "agents/.hetz-backup-1786658066/st2/agent.kdl",
+            "_templates/Silber.root.AGENTS.md",
+            "plans/artifacts/fabric/pr25/f26618d/RECEIPT.md",
+        ] {
+            let path = root.join(real);
+            assert!(
+                watch_path_is_relevant(&watch_roots_for(root), &path, &cfg),
+                "{real} IS selected by this entry, so it must still wake a scan"
+            );
+        }
+    }
+
+    /// A directory event names the directory, not the descendants the entry
+    /// syncs under it, so a directory is always kept.
+    #[test]
+    fn a_directory_event_is_kept_even_when_it_does_not_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cfg = declarations_like_entry(root);
+
+        let agent_dir = root.join("agents/Silber/fabric");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        assert!(
+            !cfg.includes("agents/Silber/fabric"),
+            "the directory itself does not match the glob"
+        );
+        assert!(
+            watch_path_is_relevant(&watch_roots_for(root), &agent_dir, &cfg),
+            "a directory can hold files the entry syncs, so it must be kept"
+        );
+    }
+
+    /// An entry with no include globs selects everything, so the filter must be
+    /// a no-op for it. This is what keeps the change safe for every other entry.
+    #[test]
+    fn an_entry_without_globs_keeps_every_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cfg = entry_with_policy("bus", root, SyncPolicy::Bus);
+        assert!(cfg.include.is_none(), "this entry selects everything");
+
+        for any in ["a.md", "deep/nested/file.bin", "agents/x/status"] {
+            assert!(
+                watch_path_is_relevant(&watch_roots_for(root), &root.join(any), &cfg),
+                "{any} must be kept when the entry has no globs"
+            );
+        }
+    }
+
+    /// A path the filter cannot judge is kept. Dropping wrongly costs a
+    /// declaration that does not propagate; keeping wrongly costs one scan.
+    #[test]
+    fn a_path_outside_the_root_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cfg = declarations_like_entry(root);
+        assert!(
+            watch_path_is_relevant(
+                &watch_roots_for(root),
+                Path::new("/somewhere/else/status"),
+                &cfg
+            ),
+            "a path this cannot judge must be kept"
+        );
+        assert!(
+            watch_path_is_relevant(&watch_roots_for(root), root, &cfg),
+            "the root itself must be kept"
+        );
+    }
+
+    /// The regression that a passing unit test could NOT have caught.
+    ///
+    /// The watcher reports the REAL path. A macOS temp dir, and a home, can
+    /// reach through a symlink, so the watcher says `/private/var/...` while
+    /// the entry says `/var/...`. A filter that strips only the configured root
+    /// fails to strip, keeps the path, and is SILENTLY INERT on the machine
+    /// that needs it. Every glob unit test still passes, because none of them
+    /// goes through a watcher.
+    ///
+    /// This one does, so it fails if the roots stop being carried in both
+    /// spellings.
+    #[tokio::test]
+    async fn the_filter_survives_a_root_that_reaches_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("agents/Silber/cos")).unwrap();
+        std::fs::create_dir_all(root.join("agents/Silber/fabric")).unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<WatchEvent>(8);
+        let work = EntryWork::new();
+        let _watcher =
+            spawn_watcher(root, tx, work.clone(), declarations_like_entry(root)).unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // `EntryWork` starts at generation one on purpose, so compare against
+        // what it was, not against zero.
+        let quiet_generation = work.mutation_generation.load(Ordering::Acquire);
+
+        // Noise the entry does not sync. No event may reach the loop.
+        std::fs::write(root.join("agents/Silber/cos/status"), b"available").unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1500), rx.recv())
+                .await
+                .is_err(),
+            "a write outside the glob must not reach the sync loop; if the root \
+             spelling stops matching, this filter goes silently inert"
+        );
+        assert_eq!(
+            work.mutation_generation.load(Ordering::Acquire),
+            quiet_generation,
+            "and it must not bump the generation, or the periodic tick scans anyway"
+        );
+
+        // A real declaration change must still get through, promptly.
+        std::fs::write(root.join("agents/Silber/fabric/agent.kdl"), b"agent {}").unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        assert!(
+            matches!(got, Ok(Some(_))),
+            "a real declaration change must still wake the sync loop"
+        );
+    }
+
+    /// The same inertness, reached a different way: a root that does not exist
+    /// yet.
+    ///
+    /// `canonicalize` fails on a path that is not there, so resolving the root
+    /// before creating it carries only the configured spelling, and the filter
+    /// goes inert for the entry's whole first run.
+    #[tokio::test]
+    async fn the_filter_works_on_a_root_that_did_not_exist_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        // Deliberately NOT created: spawn_watcher must create it before it
+        // resolves it.
+        let root = dir.path().join("fresh-entry");
+        assert!(!root.exists(), "the root must not exist yet");
+
+        let (tx, mut rx) = mpsc::channel::<WatchEvent>(8);
+        let work = EntryWork::new();
+        let _watcher =
+            spawn_watcher(&root, tx, work.clone(), declarations_like_entry(&root)).unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        std::fs::create_dir_all(root.join("agents/Silber/cos")).unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        while tokio::time::timeout(Duration::from_millis(50), rx.recv())
+            .await
+            .is_ok()
+        {}
+
+        std::fs::write(root.join("agents/Silber/cos/status"), b"available").unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1500), rx.recv())
+                .await
+                .is_err(),
+            "a write outside the glob must not reach the loop, even on the \
+             entry's first run when the root had to be created first"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn linux_file_reads_do_not_wake_watcher_but_writes_do() {
@@ -2208,7 +2494,13 @@ mod tests {
         std::fs::write(&path, b"seed").unwrap();
         let (tx, mut rx) = mpsc::channel::<WatchEvent>(1);
         let work = EntryWork::new();
-        let _watcher = spawn_watcher(dir.path(), tx, work.clone()).unwrap();
+        let _watcher = spawn_watcher(
+            dir.path(),
+            tx,
+            work.clone(),
+            entry_with_policy("watch", dir.path(), SyncPolicy::Bus),
+        )
+        .unwrap();
         let generation = work.mutation_generation.load(Ordering::Acquire);
 
         assert_eq!(std::fs::read(&path).unwrap(), b"seed");
