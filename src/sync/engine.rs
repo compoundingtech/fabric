@@ -35,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::FabricHome;
 
 use super::config::{PolicyRules, SyncBook, SyncEntry, SyncPeers};
-use super::manifest::{Author, ContentHash, Manifest};
+use super::manifest::{Author, ContentHash, FileMeta, Manifest};
 use super::node::{Reconciled, SweepEvidence, SyncNode, content_hash};
 
 /// How long to wait after a filesystem event settles before syncing, so a burst
@@ -862,12 +862,15 @@ impl<T: SyncTransport> SyncEngine<T> {
         let generation = entry.work.mutation_generation.load(Ordering::Acquire);
         let mut node = entry.node.lock().await;
         let mut observed = entry.observed.lock().unwrap();
+        // Same lock order as `scan_entry`: node, then observed, then cache.
+        let cache = entry.scan_cache.lock().unwrap();
         materialize_tracked(
             &mut node,
             &root,
             policy,
             protected,
             &mut observed,
+            &cache,
             Some((&entry.work, generation)),
         )
     }
@@ -1476,12 +1479,53 @@ fn materialize(node: &SyncNode, root: &Path, policy: PolicyRules) -> Result<()> 
 /// locally Present before the merge vanished after the scan, record its
 /// tombstone instead of restoring it. A remote-only path is not in `protected`,
 /// so an absent destination is still materialized normally.
+/// Whether the disk already holds the manifest's bytes, decided from a `stat`.
+///
+/// Materialization used to read and hash EVERY present file on EVERY pass. On a
+/// converged tree that answer is always "unchanged", so the read and the hash
+/// were pure waste. Measured on the live Silber daemon: one entry re-read and
+/// re-hashed 70,157,702 bytes every 0.51 s, which is 136 MB/s, and
+/// `blake3_hash_many_neon` was 14.22% of one core.
+///
+/// This asks the same question `scan_folder` asks, from the same evidence: size
+/// and both mtime components byte-identical to what THIS MACHINE last observed.
+/// Trusting that is not a new risk. `scan_folder` already runs first in every
+/// pass and already trusts it, so re-deriving the opposite answer here from the
+/// same disk was incoherent rather than safe.
+///
+/// A local cache entry is trusted by design; see
+/// `materialization_does_not_manufacture_an_mtime_collision`, which pins that
+/// only this machine can create one, so no peer can manufacture a hit.
+///
+/// Anything unknown, differing, or unreadable returns false and takes the full
+/// read-and-hash path exactly as before.
+fn already_materialized(
+    path: &Path,
+    rel: &str,
+    meta: &FileMeta,
+    cache: &HashMap<String, ScanCacheEntry>,
+) -> bool {
+    let Some(seen) = cache.get(rel) else {
+        return false;
+    };
+    // The cache must agree with the manifest, or there is real work to do.
+    if seen.hash != meta.hash {
+        return false;
+    }
+    let Ok(disk) = std::fs::metadata(path) else {
+        return false;
+    };
+    let (mtime_secs, mtime_nanos) = mtime_of_metadata(&disk);
+    seen.size == disk.len() && seen.mtime_secs == mtime_secs && seen.mtime_nanos == mtime_nanos
+}
+
 fn materialize_tracked(
     node: &mut SyncNode,
     root: &Path,
     policy: PolicyRules,
     protected: &HashMap<String, ContentHash>,
     observed: &mut HashMap<String, ContentHash>,
+    cache: &HashMap<String, ScanCacheEntry>,
     daemon_writes: Option<(&EntryWork, u64)>,
 ) -> Result<()> {
     std::fs::create_dir_all(root)
@@ -1494,6 +1538,10 @@ fn materialize_tracked(
     let now = now_secs();
     for (rel, meta) in present {
         let path = root.join(&rel);
+        if already_materialized(&path, &rel, &meta, cache) {
+            observed.insert(rel.clone(), meta.hash);
+            continue;
+        }
         let existing = std::fs::read(&path);
         let protected_local_path = protected.contains_key(&rel);
         if policy.propagate_deletes
@@ -1685,10 +1733,7 @@ fn set_file_mtime(path: &Path, secs: i64, nanos: u32) -> Result<()> {
     Ok(())
 }
 
-fn mtime_of(entry: &std::fs::DirEntry) -> (i64, u32) {
-    let Ok(meta) = entry.metadata() else {
-        return (0, 0);
-    };
+fn mtime_of_metadata(meta: &std::fs::Metadata) -> (i64, u32) {
     let Ok(modified) = meta.modified() else {
         return (0, 0);
     };
@@ -1696,6 +1741,13 @@ fn mtime_of(entry: &std::fs::DirEntry) -> (i64, u32) {
         Ok(dur) => (dur.as_secs() as i64, dur.subsec_nanos()),
         Err(err) => (-(err.duration().as_secs() as i64), 0),
     }
+}
+
+fn mtime_of(entry: &std::fs::DirEntry) -> (i64, u32) {
+    let Ok(meta) = entry.metadata() else {
+        return (0, 0);
+    };
+    mtime_of_metadata(&meta)
 }
 
 /// Resolve the tombstone sweep window from `FABRIC_TOMBSTONE_SWEEP_DAYS`.
@@ -1962,6 +2014,7 @@ mod tests {
             entry.policy.rules(),
             &HashMap::new(),
             &mut observed,
+            &HashMap::new(),
             None,
         )?;
         assert!(root.join("from-peer.md").exists(), "file was materialized");
@@ -2559,6 +2612,7 @@ mod tests {
             SyncPolicy::Bus.rules(),
             &HashMap::new(),
             &mut observed,
+            &HashMap::new(),
             Some((&work, generation)),
         )
         .unwrap();
@@ -2910,7 +2964,16 @@ mod tests {
             }
             assert_eq!(observed.get("retired.toml"), Some(&stale_hash));
 
-            materialize_tracked(&mut node, root, rules, &protected, &mut observed, None).unwrap();
+            materialize_tracked(
+                &mut node,
+                root,
+                rules,
+                &protected,
+                &mut observed,
+                &HashMap::new(),
+                None,
+            )
+            .unwrap();
             let file_survives = policy == SyncPolicy::Catalog;
             assert_eq!(path.exists(), file_survives, "policy {policy:?}");
             assert_eq!(
@@ -4029,6 +4092,7 @@ mod tests {
             entry.policy.rules(),
             &HashMap::new(),
             &mut observed,
+            &HashMap::new(),
             None,
         )
         .unwrap();
@@ -4037,6 +4101,167 @@ mod tests {
             (written_secs, written_nanos),
             (shared_secs, shared_nanos),
             "materialization must not apply the origin mtime"
+        );
+    }
+
+    /// Issue #56: materialization must not re-read a file the cache already
+    /// settled.
+    ///
+    /// Materialization used to read and hash EVERY present file on EVERY pass.
+    /// On the live daemon that was 70,157,702 bytes every 0.51 s, and
+    /// `blake3_hash_many_neon` was 14.22% of one core.
+    ///
+    /// The read cannot be observed directly, so this test makes the read CHANGE
+    /// THE ANSWER. The disk carries bytes that differ from the recorded hash
+    /// while wearing the same size and mtime. A materialization that reads sees
+    /// drift and republishes it. A materialization that trusts the cache leaves
+    /// it alone.
+    ///
+    /// Trusting it is the existing contract, not a new one.
+    /// `materialization_does_not_manufacture_an_mtime_collision` pins that a
+    /// LOCAL cache entry is trusted by design, and `scan_folder` already runs
+    /// first in every pass and already trusts it. Re-deriving the opposite
+    /// answer here, from the same disk, was incoherent rather than safe.
+    #[test]
+    fn a_converged_file_is_not_re_read_on_materialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let recorded = b"the bytes the manifest records";
+        let mut node = SyncNode::new(Author([7u8; 32]));
+        node.local_write("hot.txt", recorded, 1_700_000_000, 123_456_789);
+        let meta = node
+            .manifest()
+            .get("hot.txt")
+            .and_then(|e| e.meta())
+            .copied()
+            .unwrap();
+
+        // Materialize once, with no cache, so the file lands on disk.
+        let mut observed = HashMap::new();
+        materialize_tracked(
+            &mut node,
+            &root,
+            SyncPolicy::Bus.rules(),
+            &HashMap::new(),
+            &mut observed,
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        let path = root.join("hot.txt");
+        assert_eq!(std::fs::read(&path).unwrap(), recorded);
+
+        // Record what THIS MACHINE observed, which is what a scan would record.
+        let size = std::fs::metadata(&path).unwrap().len();
+        let (secs, nanos) = mtime_of_path(&path);
+        let mut cache = HashMap::new();
+        cache.insert(
+            "hot.txt".to_string(),
+            ScanCacheEntry {
+                size,
+                mtime_secs: secs,
+                mtime_nanos: nanos,
+                hash: meta.hash,
+            },
+        );
+
+        // Put DIFFERENT bytes of the SAME length on disk, wearing that mtime.
+        let drifted = b"the bytes the manifest recordZ";
+        assert_eq!(
+            drifted.len(),
+            recorded.len(),
+            "the collision needs equal size"
+        );
+        std::fs::write(&path, drifted).unwrap();
+        set_file_mtime(&path, secs, nanos).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            size,
+            "the test must actually reproduce the size collision"
+        );
+        assert_eq!(
+            mtime_of_path(&path),
+            (secs, nanos),
+            "the test must actually reproduce the mtime collision"
+        );
+
+        let before = node.manifest().clone();
+        let mut observed_after = HashMap::new();
+        materialize_tracked(
+            &mut node,
+            &root,
+            SyncPolicy::Bus.rules(),
+            &HashMap::new(),
+            &mut observed_after,
+            &cache,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            node.manifest(),
+            &before,
+            "a cache hit must not be re-read, so the drift must not republish"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            drifted,
+            "and a cache hit must not rewrite the file either"
+        );
+        assert_eq!(
+            observed_after.get("hot.txt"),
+            Some(&meta.hash),
+            "the receipt must still be recorded on the skip path"
+        );
+    }
+
+    /// The control. A file the cache does NOT cover is still read and hashed,
+    /// so the fast path cannot quietly become "never check anything".
+    #[test]
+    fn a_file_the_cache_does_not_cover_is_still_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let recorded = b"the bytes the manifest records";
+        let mut node = SyncNode::new(Author([7u8; 32]));
+        node.local_write("hot.txt", recorded, 1_700_000_000, 123_456_789);
+
+        let mut observed = HashMap::new();
+        materialize_tracked(
+            &mut node,
+            &root,
+            SyncPolicy::Bus.rules(),
+            &HashMap::new(),
+            &mut observed,
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        let path = root.join("hot.txt");
+
+        // Drift the file, and offer a cache that does not mention it.
+        let drifted = b"the bytes the manifest recordZ";
+        std::fs::write(&path, drifted).unwrap();
+
+        let before = node.manifest().clone();
+        let mut observed_after = HashMap::new();
+        materialize_tracked(
+            &mut node,
+            &root,
+            SyncPolicy::Bus.rules(),
+            &HashMap::new(),
+            &mut observed_after,
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        assert_ne!(
+            node.manifest(),
+            &before,
+            "an uncached file must still be read, so this drift must republish"
         );
     }
 
@@ -4063,6 +4288,7 @@ mod tests {
             entry.policy.rules(),
             &HashMap::new(),
             &mut observed,
+            &HashMap::new(),
             None,
         )
         .unwrap();
@@ -4198,6 +4424,7 @@ mod tests {
             entry.policy.rules(),
             &HashMap::new(),
             &mut observed,
+            &HashMap::new(),
             None,
         )
         .unwrap();
