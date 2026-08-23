@@ -816,7 +816,7 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                     let present = logical_present(&entry);
                     if entry.missing == 0 && entry.unexpected == 0 && entry.mismatched == 0 {
                         println!(
-                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}",
+                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tsweep={}",
                             entry.name,
                             entry.folder,
                             entry.policy,
@@ -826,10 +826,11 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                             entry.full_scans,
                             entry.inbound_noop_transactions,
                             entry.inbound_guarded_transactions,
+                            sweep_token(&entry),
                         );
                     } else {
                         println!(
-                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}",
+                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tsweep={}",
                             entry.name,
                             entry.folder,
                             entry.policy,
@@ -842,6 +843,7 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                             entry.full_scans,
                             entry.inbound_noop_transactions,
                             entry.inbound_guarded_transactions,
+                            sweep_token(&entry),
                         );
                     }
                 }
@@ -881,6 +883,9 @@ struct SyncLsJsonEntry<'a> {
     full_scans: u64,
     inbound_noop_transactions: u64,
     inbound_guarded_transactions: u64,
+    /// Why the tombstone sweep did or did not forget anything. `unknown` from a
+    /// daemon that predates the field.
+    sweep: &'a str,
 }
 
 impl<'a> From<&'a fabric::control::SyncEntryStatus> for SyncLsJsonEntry<'a> {
@@ -900,7 +905,20 @@ impl<'a> From<&'a fabric::control::SyncEntryStatus> for SyncLsJsonEntry<'a> {
             full_scans: entry.full_scans,
             inbound_noop_transactions: entry.inbound_noop_transactions,
             inbound_guarded_transactions: entry.inbound_guarded_transactions,
+            sweep: sweep_token(entry),
         }
+    }
+}
+
+/// The sweep reason, or a placeholder when the daemon has not decided one yet.
+///
+/// An older daemon sends nothing here, so this must not render an empty string
+/// as if it were a state.
+fn sweep_token(entry: &fabric::control::SyncEntryStatus) -> &str {
+    if entry.sweep.is_empty() {
+        "unknown"
+    } else {
+        &entry.sweep
     }
 }
 
