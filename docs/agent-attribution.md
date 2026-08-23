@@ -28,17 +28,30 @@ would be a guess written as a fact.
 
 ## The merge boundary, carried in the pull request
 
-`.github/pull_request_template.md` states that the authoring agent does not
-merge its own pull request.
+`.github/pull_request_template.md` states when an agent may merge its own work:
+only with the reviewer's approval of that specific pull request, and only when
+it is working. Both conditions bind.
 
 Putting it in the template rather than in a message is the point. A convention
 that lives in conversation has to be restated to stay alive, and in August 2026
-it stopped being restated when standing authorisations arrived. Nobody noticed
+it stopped being restated when a blanket authorisation arrived. Nobody noticed
 the stopping. A line in every pull request cannot stop quietly; its absence is
 visible.
 
 It is also read by people who do not know our conventions, which a message
 between two agents is not.
+
+### The cost of writing a rule into an artefact
+
+The same property cuts the other way, and it bit within two hours. The rule
+changed on 2026-08-23, and the template still carried the previous one until it
+was edited. A message that goes stale is merely old. **An artefact that goes
+stale is confidently wrong**, and it is read by exactly the people who have no
+other source.
+
+So this file and the template are part of the rule, not a description of it.
+When the rule changes they change in the same pull request, or the next reader
+is misled by the thing built to inform them.
 
 ## What these do not do
 
