@@ -180,6 +180,11 @@ pub struct SyncEntryStatus {
     /// Monotonic inbound transactions that selected guarded reconciliation.
     #[serde(default)]
     pub inbound_guarded_transactions: u64,
+    /// Why the tombstone sweep did or did not forget anything, as a short
+    /// stable token. Empty from a daemon that predates the field, which is why
+    /// it carries `#[serde(default)]` like the counters above.
+    #[serde(default)]
+    pub sweep: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

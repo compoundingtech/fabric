@@ -370,6 +370,11 @@ struct EntryState {
     /// tombstone whose stamp is lost is simply stamped again on the next pass
     /// and waits one more ack round, which is the safe direction.
     expired_since: Arc<StdMutex<HashMap<String, i64>>>,
+    /// The last sweep state REPORTED for this entry. The sweep runs on every
+    /// pass, so logging its reason every time would bury the validation log.
+    /// This is what makes the log fire on a CHANGE and lets `sync ls` answer on
+    /// demand.
+    last_sweep: Arc<StdMutex<Option<SweepState>>>,
     work: Arc<EntryWork>,
 }
 
@@ -538,6 +543,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                     scan_cache,
                     peer_acks,
                     expired_since,
+                    last_sweep: Arc::new(StdMutex::new(None)),
                     work,
                 }),
             );
@@ -759,6 +765,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                     .work
                     .inbound_guarded_transactions
                     .load(Ordering::Relaxed),
+                sweep: entry.last_sweep.lock().unwrap().clone(),
             });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -883,20 +890,28 @@ impl<T: SyncTransport> SyncEngine<T> {
     /// every configured peer has acked while this node held the tombstone.
     async fn sweep_entry_tombstones(&self, entry: &EntryState, peers: &[PeerRef]) {
         let Some(ttl_secs) = tombstone_sweep_ttl_secs() else {
+            self.report_sweep_state(entry, SweepState::Disabled);
             return;
         };
         if !entry.policy.sweep_tombstones {
+            self.report_sweep_state(entry, SweepState::PolicyRetains);
             return;
         }
-        let acked_through = {
+        let state = {
             let acks = entry.peer_acks.lock().unwrap();
-            acked_through(&entry.config.peers, peers, &acks)
+            ack_gate(&entry.config.peers, peers, &acks)
+        };
+        self.report_sweep_state(entry, state.clone());
+        let SweepState::Ready { acked_through } = state else {
+            // Refusing is normal and usually correct. It is now also VISIBLE:
+            // `report_sweep_state` has recorded the named reason.
+            return;
         };
         let observed = entry.observed.lock().unwrap().clone();
         let evidence = SweepEvidence {
             now_secs: now_secs(),
             ttl_secs,
-            acked_through,
+            acked_through: Some(acked_through),
         };
         let swept = {
             // Node first: a std guard held across the node's await point is not
@@ -911,6 +926,57 @@ impl<T: SyncTransport> SyncEngine<T> {
                 swept = swept.len(),
                 "swept expired tombstones"
             );
+        }
+    }
+
+    /// Record the sweep state, and log it only when it CHANGES.
+    ///
+    /// The sweep runs on every pass. Logging the reason each time would add
+    /// thousands of identical lines an hour and bury the signal it exists to
+    /// provide, so the log fires on a transition and `fabric sync ls` answers
+    /// the rest of the time.
+    fn report_sweep_state(&self, entry: &EntryState, state: SweepState) {
+        let changed = {
+            let mut last = entry.last_sweep.lock().unwrap();
+            if last.as_ref() == Some(&state) {
+                false
+            } else {
+                *last = Some(state.clone());
+                true
+            }
+        };
+        if !changed {
+            return;
+        }
+        match &state {
+            SweepState::WaitingOnPeers(waiting) => tracing::info!(
+                sync = entry.config.name,
+                waiting_on = waiting.join(","),
+                "tombstone sweep is waiting on a peer ack"
+            ),
+            SweepState::PeersAreWildcard => tracing::warn!(
+                sync = entry.config.name,
+                "tombstone sweep can NEVER run: a wildcard peer set cannot prove receipt"
+            ),
+            SweepState::PeersUnresolved {
+                configured,
+                resolved,
+            } => tracing::info!(
+                sync = entry.config.name,
+                configured,
+                resolved,
+                "tombstone sweep is waiting: a configured peer is not in the peer book"
+            ),
+            SweepState::Ready { acked_through } => tracing::info!(
+                sync = entry.config.name,
+                acked_through,
+                "tombstone sweep gate is open"
+            ),
+            SweepState::Disabled | SweepState::PolicyRetains => tracing::debug!(
+                sync = entry.config.name,
+                state = state.token(),
+                "tombstone sweep is off"
+            ),
         }
     }
 
@@ -1155,6 +1221,9 @@ pub struct SyncStatus {
     pub inbound_noop_transactions: u64,
     /// Inbound transactions that selected the guarded scan/materialize path.
     pub inbound_guarded_transactions: u64,
+    /// Why the tombstone sweep did or did not forget anything, as last decided.
+    /// `None` means no pass has reached the sweep yet for this entry instance.
+    pub sweep: Option<SweepState>,
 }
 
 // ---- filesystem scan / materialize (sync helpers, unit-testable) ----
@@ -1775,23 +1844,89 @@ fn tombstone_sweep_ttl_secs() -> Option<i64> {
 /// A wildcard entry is refused outright, because its peer set is whatever the
 /// book holds right now and a peer leaving the book must not be what makes a
 /// deletion forgettable.
-fn acked_through(
+/// Why a tombstone sweep did or did not forget anything.
+///
+/// The sweep refusing is normal and usually correct. It refusing SILENTLY is
+/// not: "waiting on a peer" and "nothing to sweep" looked identical from
+/// outside, so an entry could wait on one roaming peer forever and report the
+/// same thing as a healthy entry with no expired tombstones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SweepState {
+    /// `FABRIC_TOMBSTONE_SWEEP_DAYS` is unset. Off is the default.
+    Disabled,
+    /// This policy retains tombstones by design. Catalog never sweeps.
+    PolicyRetains,
+    /// The peer set is a wildcard, so membership is whatever `peers.toml` holds
+    /// at this moment. A peer leaving the book must never be what makes a
+    /// deletion forgettable, so a wildcard entry can NEVER sweep.
+    ///
+    /// This is the trapdoor: `"*"` is the obvious way to add a peer, and doing
+    /// so turns the sweep off rather than blocking it.
+    PeersAreWildcard,
+    /// A configured peer is absent from the local peer book, so it cannot be
+    /// asked and its receipt cannot be proven.
+    PeersUnresolved { configured: usize, resolved: usize },
+    /// These peers have not acked while this node held the tombstones. Named,
+    /// because "waiting" without a name is the thing that was missing.
+    WaitingOnPeers(Vec<String>),
+    /// The gate is open.
+    Ready { acked_through: i64 },
+}
+
+impl SweepState {
+    /// A short stable token for `fabric sync ls`.
+    pub fn token(&self) -> String {
+        match self {
+            SweepState::Disabled => "disabled".to_string(),
+            SweepState::PolicyRetains => "policy-retains".to_string(),
+            SweepState::PeersAreWildcard => "never-sweeps-wildcard-peers".to_string(),
+            SweepState::PeersUnresolved {
+                configured,
+                resolved,
+            } => format!("peers-unresolved:{resolved}/{configured}"),
+            SweepState::WaitingOnPeers(peers) => format!("waiting-on:{}", peers.join(",")),
+            SweepState::Ready { .. } => "ready".to_string(),
+        }
+    }
+}
+
+/// Decide the gate AND say why, so the refusal can be reported.
+fn ack_gate(
     configured: &SyncPeers,
     resolved: &[PeerRef],
     acks: &HashMap<String, i64>,
-) -> Option<i64> {
+) -> SweepState {
     let SyncPeers::List(selectors) = configured else {
-        return None;
+        return SweepState::PeersAreWildcard;
     };
     if selectors.is_empty() || resolved.len() != selectors.len() {
-        return None;
+        return SweepState::PeersUnresolved {
+            configured: selectors.len(),
+            resolved: resolved.len(),
+        };
+    }
+    let mut waiting: Vec<String> = resolved
+        .iter()
+        .filter(|peer| !acks.contains_key(&peer.id))
+        .map(|peer| peer.id.clone())
+        .collect();
+    if !waiting.is_empty() {
+        waiting.sort();
+        return SweepState::WaitingOnPeers(waiting);
     }
     let mut earliest = i64::MAX;
     for peer in resolved {
-        let ack = *acks.get(&peer.id)?;
-        earliest = earliest.min(ack);
+        earliest = earliest.min(acks[&peer.id]);
     }
-    (earliest != i64::MAX).then_some(earliest)
+    if earliest == i64::MAX {
+        return SweepState::PeersUnresolved {
+            configured: selectors.len(),
+            resolved: resolved.len(),
+        };
+    }
+    SweepState::Ready {
+        acked_through: earliest,
+    }
 }
 
 fn now_secs() -> i64 {
@@ -2176,7 +2311,10 @@ mod tests {
                 .args(["-o", "rss=", "-p", &std::process::id().to_string()])
                 .output()
                 .expect("ps");
-            String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0)
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(0)
         }
 
         let dir = tempfile::tempdir().unwrap();
@@ -2226,7 +2364,11 @@ mod tests {
                 },
             );
         }
-        println!("corpus: {} files, {:.1} MB", cache.len(), total as f64 / 1e6);
+        println!(
+            "corpus: {} files, {:.1} MB",
+            cache.len(),
+            total as f64 / 1e6
+        );
 
         const PASSES: usize = 200;
 
@@ -2378,20 +2520,106 @@ mod tests {
         assert_eq!(resolve_tombstone_sweep_days(Some(" 30 ")), Some(30));
     }
 
+    /// Every reason the sweep can refuse must be NAMED, not merely absent.
+    ///
+    /// Nathan's rule on 2026-08-23: Bluey roams, and its reachability must
+    /// never cause a concern. The sweep refusing is normal and usually
+    /// correct. It refusing silently is the fault, because "waiting on a peer"
+    /// and "nothing to sweep" looked identical from outside.
+    #[test]
+    fn every_sweep_refusal_says_why() {
+        let both = SyncPeers::List(vec!["hetz".into(), "droppy".into()]);
+        let resolved = vec![peer("hetz"), peer("droppy")];
+
+        // 1. A peer that has never acked is NAMED.
+        let acks = HashMap::from([("hetz".to_string(), 500)]);
+        assert_eq!(
+            ack_gate(&both, &resolved, &acks),
+            SweepState::WaitingOnPeers(vec!["droppy".to_string()]),
+            "the peer holding the sweep up must be named"
+        );
+        assert_eq!(
+            ack_gate(&both, &resolved, &acks).token(),
+            "waiting-on:droppy"
+        );
+
+        // 2. A configured peer absent from the peer book is reported as such,
+        //    and NOT as a missing ack. They are different problems.
+        assert_eq!(
+            ack_gate(&both, &[peer("hetz")], &acks),
+            SweepState::PeersUnresolved {
+                configured: 2,
+                resolved: 1
+            }
+        );
+
+        // 3. The wildcard trapdoor. `"*"` is the obvious way to add a roaming
+        //    peer, and it turns the sweep OFF rather than blocking it. It must
+        //    say so rather than look like an ordinary empty sweep.
+        let wildcard = SyncPeers::Wildcard("*".into());
+        assert_eq!(
+            ack_gate(&wildcard, &resolved, &acks),
+            SweepState::PeersAreWildcard
+        );
+        assert_eq!(
+            ack_gate(&wildcard, &resolved, &acks).token(),
+            "never-sweeps-wildcard-peers",
+            "the token must say it can never sweep, not merely that it did not"
+        );
+
+        // 4. The gate open, bounded by the SLOWEST peer.
+        let acks = HashMap::from([("hetz".to_string(), 500), ("droppy".to_string(), 300)]);
+        assert_eq!(
+            ack_gate(&both, &resolved, &acks),
+            SweepState::Ready { acked_through: 300 },
+            "the slowest peer still bounds what we may forget"
+        );
+    }
+
+    /// A roaming peer that is NOT configured on the entry cannot hold it up.
+    ///
+    /// This is the state on Silber on 2026-08-23: both entries read
+    /// `peers=hetz,droppy`, and Bluey is only in the node peer book. The
+    /// hazard is latent, and this pins that it stays latent.
+    #[test]
+    fn a_peer_outside_the_entry_cannot_block_its_sweep() {
+        let configured = SyncPeers::List(vec!["hetz".into(), "droppy".into()]);
+        let resolved = vec![peer("hetz"), peer("droppy")];
+        let acks = HashMap::from([("hetz".to_string(), 500), ("droppy".to_string(), 500)]);
+
+        assert_eq!(
+            ack_gate(&configured, &resolved, &acks),
+            SweepState::Ready { acked_through: 500 },
+            "bluey is not configured on this entry, so it cannot gate it"
+        );
+
+        // Adding it to the ENTRY is what would gate it, and that must show as a
+        // named wait rather than as silence.
+        let with_bluey = SyncPeers::List(vec!["hetz".into(), "droppy".into(), "bluey".into()]);
+        let resolved = vec![peer("hetz"), peer("droppy"), peer("bluey")];
+        assert_eq!(
+            ack_gate(&with_bluey, &resolved, &acks),
+            SweepState::WaitingOnPeers(vec!["bluey".to_string()])
+        );
+    }
+
     #[test]
     fn acked_through_is_the_earliest_ack_and_only_when_every_peer_has_one() {
         let both = SyncPeers::List(vec!["a".into(), "b".into()]);
         let resolved = vec![peer("a"), peer("b")];
         let acks = HashMap::from([("a".to_string(), 500), ("b".to_string(), 300)]);
         assert_eq!(
-            acked_through(&both, &resolved, &acks),
-            Some(300),
+            ack_gate(&both, &resolved, &acks),
+            SweepState::Ready { acked_through: 300 },
             "the slowest peer bounds what we may forget"
         );
 
         // One peer has never acked: nothing is provable, so nothing is swept.
         let acks = HashMap::from([("a".to_string(), 500)]);
-        assert_eq!(acked_through(&both, &resolved, &acks), None);
+        assert_eq!(
+            ack_gate(&both, &resolved, &acks),
+            SweepState::WaitingOnPeers(vec!["b".to_string()])
+        );
     }
 
     #[test]
@@ -2402,17 +2630,29 @@ mod tests {
         // the book must never be the thing that makes a deletion forgettable.
         let wildcard = SyncPeers::Wildcard("*".into());
         assert_eq!(
-            acked_through(&wildcard, &[peer("a"), peer("b")], &acks),
-            None
+            ack_gate(&wildcard, &[peer("a"), peer("b")], &acks),
+            SweepState::PeersAreWildcard
         );
 
         // peers_for silently drops a configured peer missing from the book, so
         // a short resolved list means we cannot speak for everyone.
         let three = SyncPeers::List(vec!["a".into(), "b".into(), "c".into()]);
-        assert_eq!(acked_through(&three, &[peer("a"), peer("b")], &acks), None);
+        assert_eq!(
+            ack_gate(&three, &[peer("a"), peer("b")], &acks),
+            SweepState::PeersUnresolved {
+                configured: 3,
+                resolved: 2
+            }
+        );
 
         // An empty list would otherwise make the sweep vacuously safe.
-        assert_eq!(acked_through(&SyncPeers::List(vec![]), &[], &acks), None);
+        assert_eq!(
+            ack_gate(&SyncPeers::List(vec![]), &[], &acks),
+            SweepState::PeersUnresolved {
+                configured: 0,
+                resolved: 0
+            }
+        );
     }
 
     #[test]
