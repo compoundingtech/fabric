@@ -56,8 +56,24 @@ pub struct FileMeta {
     pub hash: ContentHash,
     /// File size in bytes (informational; the hash is the identity).
     pub size: u64,
-    /// Whether the file is executable, the way git tracks it: a file is either
-    /// mode 644 or 755, and no other permission bit is replicated.
+    /// Whether the file is executable, the way git tracks it. ONLY this bit
+    /// replicates; no other permission bit crosses.
+    ///
+    /// The resulting MODE is not fixed, and an earlier version of this comment
+    /// claimed it was. Materialization creates the file with `fs::write`, which
+    /// yields `0666 & ~umask`, and then ORs in `0o111`. So the mode depends on
+    /// the RECEIVING host's umask:
+    ///
+    /// | receiver umask | plain file | executable file |
+    /// | --- | --- | --- |
+    /// | 022 | 0644 | 0755 |
+    /// | 002 | 0664 | 0775 |
+    ///
+    /// Observed on hetz and droppy on 2026-08-23: 0664 and 0775, both umask
+    /// 002. Do NOT depend on an exact mode here; depend only on the executable
+    /// bit. st2's render deliberately differs: it writes an exact mode that is
+    /// immune to umask, so the two systems do not agree on the other bits and
+    /// are not meant to.
     ///
     /// Defaulted so a peer that predates this field still parses. Note the
     /// asymmetry: adding a field with a default is safe, removing one is not.

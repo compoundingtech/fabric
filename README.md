@@ -355,8 +355,8 @@ Upgrading the fabric binary under a running daemon — especially on a remote
 machine reached only over `fabric shell` — must be done lockout-safe: a botched
 restart can sever the only path back to the box. Follow this order.
 
-Download a release asset directly, verify it against the release's combined
-`SHA256SUMS` manifest, and stage both the old and new binaries with same-directory
+Download a release asset directly, verify it against that asset's published
+`.sha256`, and stage both the old and new binaries with same-directory
 renames. A release archive contains exactly one member named literal `fabric`
 (not `./fabric`); verify that shape before extracting:
 
@@ -377,9 +377,12 @@ download_dir="$(mktemp -d)"
 trap 'rm -rf "$download_dir"' EXIT
 
 curl --fail --location "$release_url/$asset" --output "$download_dir/$asset"
-curl --fail --location "$release_url/SHA256SUMS" --output "$download_dir/SHA256SUMS"
+curl --fail --location "$release_url/$asset.sha256" --output "$download_dir/$asset.sha256"
 
-expected="$(awk -v asset="$asset" '$2 == asset { print $1 }' "$download_dir/SHA256SUMS")"
+# The release publishes ONE .sha256 per asset, not a combined manifest. The file
+# holds "<hash>  dist/<archive>", with the builder's path still in it, so
+# `shasum -c` fails here. Take field one and compare it ourselves.
+expected="$(awk 'NR == 1 { print $1 }' "$download_dir/$asset.sha256")"
 test -n "$expected"
 if command -v sha256sum >/dev/null 2>&1; then
   actual="$(sha256sum "$download_dir/$asset" | awk '{ print $1 }')"
