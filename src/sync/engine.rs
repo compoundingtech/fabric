@@ -1497,6 +1497,17 @@ fn scan_into_node_observed(
 /// Write `node`'s present entries to disk (only where content differs) and, under
 /// a delete-propagating policy, remove tombstoned files.
 #[cfg(test)]
+/// Test-only door onto [`materialize`], so a wire test can check what actually
+/// lands on the peer's disk rather than only what its manifest says.
+#[cfg(test)]
+pub(crate) fn materialize_for_test(
+    node: &SyncNode,
+    root: &Path,
+    policy: PolicyRules,
+) -> Result<()> {
+    materialize(node, root, policy)
+}
+
 fn materialize(node: &SyncNode, root: &Path, policy: PolicyRules) -> Result<()> {
     std::fs::create_dir_all(root)
         .with_context(|| format!("failed to create {}", root.display()))?;

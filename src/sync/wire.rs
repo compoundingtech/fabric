@@ -315,6 +315,91 @@ mod tests {
         assert_eq!(a.lock().await.folder_state(), b.lock().await.folder_state());
     }
 
+    /// END TO END: an executable file must arrive executable on the PEER.
+    ///
+    /// `a_materialized_file_carries_the_executable_bit` in the engine covers
+    /// only the last mile: it hand-builds a manifest saying executable and
+    /// checks that materialization honours it. It never scans a real file,
+    /// never crosses the wire, and never calls `adopt`.
+    ///
+    /// On 2026-08-23 that green test coexisted with production where NO file in
+    /// the live catalog had ever arrived executable on a peer. This covers the
+    /// whole path the feature is named for.
+    #[tokio::test]
+    async fn an_executable_file_arrives_executable_over_the_wire() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let a = Arc::new(Mutex::new(SyncNode::new(author(1))));
+        let b = Arc::new(Mutex::new(SyncNode::new(author(2))));
+        a.lock()
+            .await
+            .local_write_with_mode("tool", b"#!/bin/sh\necho hi\n", 0, 0, true);
+        a.lock()
+            .await
+            .local_write_with_mode("plain.txt", b"text\n", 0, 0, false);
+
+        let (client_end, server_end) = tokio::io::duplex(1 << 20);
+        let b_for_server = b.clone();
+        let server = tokio::spawn(async move {
+            run_server(server_end, move |_, _| async move {
+                Ok(Some((b_for_server, ())))
+            })
+            .await
+        });
+        run_client(client_end, a.clone(), "cat").await.unwrap();
+        server.await.unwrap().unwrap();
+
+        // The bit must survive the wire, in the RECEIVER's manifest.
+        let received = b.lock().await;
+        let meta = received
+            .manifest()
+            .get("tool")
+            .and_then(|e| e.meta())
+            .copied()
+            .expect("the peer adopted the file");
+        assert!(
+            meta.executable,
+            "the executable bit must cross the wire; if it dies here the \
+             receiver can never write the right mode"
+        );
+        let plain = received
+            .manifest()
+            .get("plain.txt")
+            .and_then(|e| e.meta())
+            .copied()
+            .unwrap();
+        assert!(!plain.executable, "a plain file must not become executable");
+        drop(received);
+
+        // And it must reach the peer's DISK, which is what a caller runs.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("peer");
+        std::fs::create_dir_all(&root).unwrap();
+        {
+            let received = b.lock().await;
+            crate::sync::engine::materialize_for_test(
+                &received,
+                &root,
+                crate::sync::config::SyncPolicy::Catalog.rules(),
+            )
+            .unwrap();
+        }
+        let mode = std::fs::metadata(root.join("tool")).unwrap().permissions().mode();
+        assert!(
+            mode & 0o111 != 0,
+            "an executable file must arrive executable on the peer's disk, \
+             got mode {mode:o}"
+        );
+        let plain_mode = std::fs::metadata(root.join("plain.txt"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert!(
+            plain_mode & 0o111 == 0,
+            "a plain file must not be executable, got mode {plain_mode:o}"
+        );
+    }
+
     #[tokio::test]
     async fn converged_wire_session_is_a_noop() {
         let a = Arc::new(Mutex::new(SyncNode::new(author(1))));
