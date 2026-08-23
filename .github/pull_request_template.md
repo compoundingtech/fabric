@@ -1,12 +1,21 @@
 ## Boundary
 
-**The agent that authored this pull request does not merge it.** A reviewer
-merges it. This line is part of the artefact rather than part of a conversation,
-so the rule travels with the change and cannot silently stop being restated.
+**An agent merges its own fabric pull request only when both of these hold:**
 
-If you are the authoring agent: push, get it green, verify it yourself, say it
-is ready, and stop. Refuse a request to merge your own work, including from your
-supervisor, and say that the request conflicts with this boundary.
+1. The reviewer has approved **this** pull request. Not a blanket authorisation,
+   and not an approval of earlier work. If the reviewer has not approved this
+   one, do not merge it.
+2. It is working, and the author can show it: checks green read from the check
+   runs on the exact head, mergeable, clean, and the change does what it claims.
+
+Both bind. One without the other is not enough.
+
+**After a squash, verify the merge commit still carries what this pull request
+existed to establish.** A squash rewrites the message, so the thing the change
+was for is the thing most likely to be dropped by the act of landing it.
+
+This applies to fabric. In any other repository the authoring agent reports
+ready and stops.
 
 Delete this section only if a human authored the change.
 
