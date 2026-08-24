@@ -107,8 +107,8 @@ pub struct FileMeta {
     pub author: Author,
 }
 
-/// A record that a path was deleted. Only produced under a delete-propagating
-/// policy (bus); catalog never creates one.
+/// A record that a path was deleted. Produced under any delete-propagating
+/// policy, which is now every policy: catalog creates these too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tombstone {
     pub version: u64,
