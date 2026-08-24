@@ -1556,6 +1556,23 @@ fn scan_into_node_observed(
     observed: &mut HashMap<String, ContentHash>,
     cache: &mut HashMap<String, ScanCacheEntry>,
 ) -> Result<bool> {
+    // A ROOT THAT IS NOT THERE IS NOT A FOLDER SOMEBODY EMPTIED.
+    //
+    // `scan_folder` returns an empty result for a missing root. Every tracked
+    // path would then be in the observed set and absent from the scan, which is
+    // the same shape as a local delete, so a delete-propagating policy would
+    // tombstone the entire entry and send that to every peer.
+    //
+    // A root vanishes for reasons that are not a deletion: an unmounted volume,
+    // a directory renamed while a pass runs, a mount that is not ready at boot.
+    // The blast radius is the whole entry rather than one path, so this is the
+    // one place where doing nothing is clearly right. Wait until we can see it.
+    //
+    // Deleting the CONTENTS of a folder still propagates normally, because the
+    // root survives that and the scan runs.
+    if !root.exists() {
+        return Ok(false);
+    }
     let scanned = scan_folder(root, entry, cache)?;
     // Refresh the cache from what this scan actually saw, so the next scan of an
     // untouched file is free. Rebuilt rather than merged, so a vanished path
@@ -3412,6 +3429,59 @@ mod tests {
             .map(|(p, _)| p.clone())
             .collect();
         assert_eq!(paths, vec!["agent.toml".to_string()]);
+    }
+
+    /// A WATCHED FOLDER THAT IS NOT THERE IS NOT A FOLDER SOMEBODY EMPTIED.
+    ///
+    /// `scan_folder` returns an EMPTY result when the root does not exist. Every
+    /// tracked path is then in the observed set and absent from the scan, which
+    /// is the same shape as a local delete, so a delete-propagating policy
+    /// tombstones the lot and sends that to every peer.
+    ///
+    /// The root can vanish for reasons that are not a deletion: an unmounted
+    /// volume, a directory renamed while a pass runs, a mount that is not ready
+    /// yet at boot. None of those mean the user deleted their files, and the
+    /// blast radius is the whole entry rather than one path.
+    ///
+    /// Prefer the annoying failure. A folder we cannot see is a folder we cannot
+    /// see, and the honest answer is to do nothing until we can.
+    #[test]
+    fn a_vanished_root_is_not_a_mass_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("watched");
+        std::fs::create_dir_all(&root).unwrap();
+        for name in ["a.md", "b.md", "c.md"] {
+            std::fs::write(root.join(name), b"payload").unwrap();
+        }
+        let entry = entry_with_policy("sync", &root, SyncPolicy::Bus);
+        let rules = entry.policy.rules();
+        assert!(
+            rules.propagate_deletes,
+            "this test is about a policy that propagates deletes"
+        );
+
+        let mut node = SyncNode::new(Author([1; 32]));
+        let mut observed = HashMap::new();
+        let mut cache = HashMap::new();
+        scan_into_node_observed(&mut node, &root, &entry, rules, &mut observed, &mut cache)
+            .unwrap();
+        assert_eq!(
+            node.manifest().present_paths().count(),
+            3,
+            "the fixture never recorded the files, so losing them below proves nothing"
+        );
+
+        // The volume goes away. Nobody deleted anything.
+        std::fs::remove_dir_all(&root).unwrap();
+        scan_into_node_observed(&mut node, &root, &entry, rules, &mut observed, &mut cache)
+            .unwrap();
+
+        assert_eq!(
+            node.manifest().present_paths().count(),
+            3,
+            "a root that vanished was read as a delete of every file in the entry, \
+             and that tombstone set goes to every peer"
+        );
     }
 
     /// Turning delete propagation ON must not delete a file that is simply
