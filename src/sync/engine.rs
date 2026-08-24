@@ -880,7 +880,11 @@ impl<T: SyncTransport> SyncEngine<T> {
             // it cannot say whether both peers cost the same. A relay-routed
             // peer and a direct one in the same window are the case that
             // matters, and the aggregate hides it.
-            tracing::debug!(
+            // INFO, not DEBUG. The daemon's default validation filter is
+            // `fabric=info` (see `validation_log_filter`), so a `debug!` here is
+            // dropped and the diagnostic is SILENT rather than quiet. It shipped
+            // that way in #69 and emitted nothing at all on the live daemon.
+            tracing::info!(
                 target: VALIDATION_LOG_TARGET,
                 event = "reconcile_peer",
                 sync = name,

@@ -4152,6 +4152,67 @@ async fn pipe_unix_iroh(
 mod tests {
     use super::*;
 
+    /// The default validation filter must PASS the level our diagnostics use.
+    ///
+    /// This is the test I declined to write for #69, on the grounds that
+    /// asserting a log line fires would mirror the change. That judgement was
+    /// wrong and it cost a merge, a release and a deploy: the per-peer
+    /// reconcile diagnostic went out at `debug!`, the default filter is
+    /// `fabric=info`, and it emitted NOTHING on the live daemon. Three passes
+    /// ran and produced zero lines.
+    ///
+    /// It is not a mirror. It pins the INTERACTION between two things written
+    /// far apart: the level a diagnostic chooses, and the filter the daemon
+    /// actually runs. Either can move without the other, and neither file
+    /// mentions the other.
+    #[test]
+    fn the_default_validation_filter_passes_info_and_drops_debug() {
+        use std::io;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Buffer {
+            fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+            type Writer = Buffer;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        // Assert the DEFAULT the daemon ships with, not whatever the shell set.
+        let filter = EnvFilter::new("fabric=info,iroh=warn,noq=warn,netwatch=warn");
+        let buffer = Buffer(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(buffer.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: VALIDATION_LOG_TARGET, event = "probe_info", "info probe");
+            tracing::debug!(target: VALIDATION_LOG_TARGET, event = "probe_debug", "debug probe");
+        });
+
+        let written = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            written.contains("probe_info"),
+            "an INFO diagnostic on the validation target must reach the log, got: {written}"
+        );
+        assert!(
+            !written.contains("probe_debug"),
+            "DEBUG is dropped by the default filter, so a debug! diagnostic is silent \
+             rather than quiet. That is what shipped in #69. Got: {written}"
+        );
+    }
+
     #[test]
     fn sync_accept_info_logging_is_bounded() {
         let samples = (0..10_000)
