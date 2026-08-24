@@ -195,3 +195,84 @@ async fn bus_delete_while_peer_away_does_not_resurrect_on_return() -> Result<()>
     node_a.shutdown().await?;
     Ok(())
 }
+
+fn write_sync_with_include(home_dir: &Path, folder: &Path, policy: &str, include: &str) {
+    let toml = format!(
+        "[[sync]]\nname = \"shared\"\nfolder = {folder:?}\npeers = \"*\"\npolicy = {policy:?}\ninclude = [{include:?}]\n"
+    );
+    std::fs::write(home_dir.join("syncs.toml"), toml).unwrap();
+}
+
+/// MIGRATION SAFETY, WITH A POSITIVE CONTROL.
+///
+/// `scan_folder` consults the include globs, but `materialize_tracked` walks
+/// every present path in the manifest and consults nothing. So the question is
+/// whether dropping a path from `include` is enough to stop the entry writing it
+/// back, or whether the manifest must also forget it.
+///
+/// A "the file did not come back" result means nothing unless the same setup
+/// CAN bring a file back. So this runs both arms:
+///
+/// CONTROL: path still included, delete it, it must come back. That is tonight's
+/// bug and it proves the restore machinery is live in this fixture.
+/// TEST: path excluded, delete it, does it still come back?
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropping_a_path_from_include_stops_the_manifest_restoring_it() -> Result<()> {
+    let _guard = FOLDER_SYNC_LOCK.lock().await;
+    let a_dir = TempDir::new()?;
+    let a_home = FabricHome::new(a_dir.path());
+    let a_folder = a_dir.path().join("shared");
+    std::fs::create_dir_all(a_folder.join("plans"))?;
+    write_sync_with_include(a_dir.path(), &a_folder, "catalog", "plans/**");
+
+    let node_a = FabricNode::start(a_home.clone()).await?;
+
+    let control = a_folder.join("plans/control.md");
+    std::fs::write(&control, b"a plan")?;
+    reload_sync(&a_home).await?;
+    assert!(
+        wait_for_file(&control, b"a plan").await,
+        "fixture never settled, so neither arm below would mean anything"
+    );
+
+    // CONTROL ARM. Still included. A catalog delete must be undone.
+    std::fs::remove_file(&control)?;
+    reload_sync(&a_home).await?;
+    let mut control_returned = false;
+    for _ in 0..40 {
+        if control.exists() {
+            control_returned = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        control_returned,
+        "POSITIVE CONTROL FAILED: an included catalog path was not restored, so \
+         this fixture cannot detect a restore and the test arm proves nothing"
+    );
+
+    // TEST ARM. Same fixture, same file, now excluded.
+    write_sync_with_include(a_dir.path(), &a_folder, "catalog", "_templates/**");
+    reload_sync(&a_home).await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    std::fs::remove_file(&control)?;
+    reload_sync(&a_home).await?;
+    let mut excluded_returned = false;
+    for _ in 0..40 {
+        if control.exists() {
+            excluded_returned = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    node_a.shutdown().await?;
+    assert!(
+        !excluded_returned,
+        "an EXCLUDED path was still restored from the manifest, so moving a path \
+         between entries is a STATE change, not a configuration change"
+    );
+    Ok(())
+}
