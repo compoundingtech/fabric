@@ -2840,6 +2840,11 @@ async fn process_control_request(
                         full_scans: status.full_scans,
                         inbound_noop_transactions: status.inbound_noop_transactions,
                         inbound_guarded_transactions: status.inbound_guarded_transactions,
+                        sync_passes: status.sync_passes,
+                        scan_micros: status.scan_micros,
+                        materialize_micros: status.materialize_micros,
+                        persist_micros: status.persist_micros,
+                        reconcile_micros: status.reconcile_micros,
                         sweep: status
                             .sweep
                             .as_ref()
