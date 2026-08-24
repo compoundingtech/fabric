@@ -96,7 +96,9 @@ const PEER_HEALTH_ATTEMPTS_BEFORE_RECYCLE: usize = 3;
 /// peer, so a genuinely-down peer does not cause recovery thrash.
 const PEER_HEALTH_RECOVER_INITIAL_BACKOFF: Duration = Duration::from_secs(30);
 const PEER_HEALTH_RECOVER_MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
-const VALIDATION_LOG_TARGET: &str = "fabric::validation";
+/// The validation log target. `pub(crate)` because `sync::engine` writes to the
+/// same log and a second copy of the literal is a string that drifts.
+pub(crate) const VALIDATION_LOG_TARGET: &str = "fabric::validation";
 
 /// What a backoff record is about.
 ///

@@ -27,6 +27,8 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+
+use crate::daemon::VALIDATION_LOG_TARGET;
 use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, mpsc};
@@ -868,11 +870,26 @@ impl<T: SyncTransport> SyncEngine<T> {
             if self.cancel.is_cancelled() {
                 break;
             }
-            match self
+            let peer_started = Instant::now();
+            let outcome = self
                 .transport
                 .reconcile(peer.clone(), name.to_string(), entry.node.clone())
-                .await
-            {
+                .await;
+            // Per peer, every pass, whether or not it changed anything. The
+            // aggregate reconcile counter says the peer step is 91% of a pass;
+            // it cannot say whether both peers cost the same. A relay-routed
+            // peer and a direct one in the same window are the case that
+            // matters, and the aggregate hides it.
+            tracing::debug!(
+                target: VALIDATION_LOG_TARGET,
+                event = "reconcile_peer",
+                sync = name,
+                peer = peer.id,
+                micros = peer_started.elapsed().as_micros() as u64,
+                failed = outcome.is_err(),
+                "per-peer reconcile cost"
+            );
+            match outcome {
                 Ok(stats) => {
                     if !stats.is_noop() {
                         tracing::debug!(sync = name, peer = peer.id, ?stats, "sync reconciled");
