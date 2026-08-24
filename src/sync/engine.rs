@@ -1342,8 +1342,16 @@ fn scan_folder(
             if !entry.includes(&norm) {
                 continue;
             }
-            let (mtime_secs, mtime_nanos) = mtime_of(&child);
+            // One stat per file, not two. `DirEntry::metadata` is a fresh
+            // lstat on every call, and this loop used to call it twice: once
+            // inside `mtime_of` and again on the next line. `mtime_of_metadata`
+            // already takes the result, so the single-call shape was in the
+            // file the whole time.
             let disk = child.metadata().ok();
+            let (mtime_secs, mtime_nanos) = disk
+                .as_ref()
+                .map(mtime_of_metadata)
+                .unwrap_or((0, 0));
             let size = disk.as_ref().map(|meta| meta.len()).unwrap_or(u64::MAX);
             let executable = disk.as_ref().is_some_and(is_executable);
             // Reuse the recorded hash when size and both mtime components are
@@ -1830,13 +1838,6 @@ fn mtime_of_metadata(meta: &std::fs::Metadata) -> (i64, u32) {
         Ok(dur) => (dur.as_secs() as i64, dur.subsec_nanos()),
         Err(err) => (-(err.duration().as_secs() as i64), 0),
     }
-}
-
-fn mtime_of(entry: &std::fs::DirEntry) -> (i64, u32) {
-    let Ok(meta) = entry.metadata() else {
-        return (0, 0);
-    };
-    mtime_of_metadata(&meta)
 }
 
 /// Resolve the tombstone sweep window from `FABRIC_TOMBSTONE_SWEEP_DAYS`.
