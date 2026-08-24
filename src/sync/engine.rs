@@ -3431,7 +3431,6 @@ mod tests {
         }
     }
 
-||||||| parent of 93ecda2 (sync: a delete must stick, in every synced folder)
     /// Catalog USED TO ignore a local delete here and materialize restored the
     /// file from retained content. That is the behaviour this test was written
     /// to protect and it is deliberately gone: a delete now changes the
