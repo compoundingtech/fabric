@@ -25,12 +25,25 @@ use crate::config::FabricHome;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncPolicy {
-    /// Union + newer-wins + NEVER originate a delete + no sweep.
+    /// Union + newer-wins + a delete propagates + no sweep.
     ///
-    /// Safe for a job catalog: a file present on any peer is present on all
-    /// peers, and nothing ever removes a file. An inherited tombstone is
-    /// superseded when any physical copy survives. Decommissioning is expressed
-    /// as an edit (e.g. `retired = true`), never a file deletion.
+    /// For a job catalog: a file present on any peer is present on all peers,
+    /// and a file DELETED on any peer is deleted on all peers.
+    ///
+    /// IT DID NOT ALWAYS PROPAGATE A DELETE, and the old behaviour is worth
+    /// stating so nobody restores it by accident. Catalog used to refuse to
+    /// originate a delete, and a node that still held the bytes advanced them
+    /// back to a higher Present, so a deleted file returned across the whole
+    /// fleet. That was deliberate and it was specified, and it was still wrong:
+    /// a folder sync that undoes a delete is broken as a folder sync. If you
+    /// delete a file in iCloud Drive and it comes back, that is a bug.
+    ///
+    /// The guarantee it bought is now redundant. The catalog is a git
+    /// repository with an owning agent, so git is the safety net against a
+    /// wanted file being lost, and paying for a second one broke the product.
+    ///
+    /// Tombstones are still NEVER swept here, so a delete cannot un-stick by a
+    /// tombstone expiring.
     Catalog,
     /// Union + newer-wins + no delete + tombstone sweep. Reserved for the
     /// smalltalk bus; not yet fully implemented (see [`PolicyRules`]).
@@ -44,7 +57,12 @@ pub enum SyncPolicy {
 /// across current presets, so only the delete/sweep axes vary here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PolicyRules {
-    /// Whether a local deletion propagates to peers (catalog: `false`).
+    /// Whether a local deletion propagates to peers.
+    ///
+    /// This also decides whether a node that still holds the bytes may advance a
+    /// tombstoned path back to a higher `Present`. That resurrection is the way
+    /// a peer returning from a long absence undoes a delete for everybody, so
+    /// the two behaviours are one knob on purpose.
     pub propagate_deletes: bool,
     /// Whether tombstones are swept after their TTL (catalog: `false`).
     pub sweep_tombstones: bool,
@@ -54,7 +72,7 @@ impl SyncPolicy {
     pub fn rules(self) -> PolicyRules {
         match self {
             SyncPolicy::Catalog => PolicyRules {
-                propagate_deletes: false,
+                propagate_deletes: true,
                 sweep_tombstones: false,
             },
             SyncPolicy::Bus => PolicyRules {
@@ -294,7 +312,7 @@ mod tests {
         assert_eq!(
             entry.policy.rules(),
             PolicyRules {
-                propagate_deletes: false,
+                propagate_deletes: true,
                 sweep_tombstones: false,
             }
         );

@@ -1,8 +1,7 @@
 //! End-to-end `fabric sync` over real iroh on one machine — the local stand-in
 //! for the Mac -> Hetzner catalog proof. Two daemons, each with a catalog sync
 //! entry, mutually trusted: a file dropped on A propagates to B's folder over the
-//! `fabric/sync` ALPN, and a catalog delete on B is restored (never propagates a
-//! deletion).
+//! `fabric/sync` ALPN, and a delete on B propagates to A and stays deleted.
 
 use std::{path::Path, time::Duration};
 
@@ -89,7 +88,7 @@ async fn assert_stays_missing(path: &Path) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn catalog_sync_propagates_new_file_and_restores_catalog_delete() -> Result<()> {
+async fn catalog_sync_propagates_new_file_and_a_delete_sticks() -> Result<()> {
     let _guard = SYNC_SLICE_LOCK.lock().await;
     let a_dir = TempDir::new()?;
     let b_dir = TempDir::new()?;
@@ -122,17 +121,21 @@ async fn catalog_sync_propagates_new_file_and_restores_catalog_delete() -> Resul
         "job file did not propagate from A to B"
     );
 
-    // A catalog delete on B must be restored, not propagated back to A.
+    // A delete on B must stick, on B and on A. Deleting a file is a normal
+    // thing a person does and a folder sync that undoes it is broken as a
+    // folder sync, whatever the policy once specified.
     std::fs::remove_file(&b_job)?;
     reload_sync(&b_home).await?;
     assert!(
-        wait_for_file(&b_job, b"host=hetz").await,
-        "catalog delete on B was not restored"
+        wait_for_missing(&b_job).await,
+        "catalog delete on B was undone on B"
     );
     assert!(
-        a_catalog.join("job-hetz.toml").exists(),
-        "catalog delete on B must not remove the file on A"
+        wait_for_missing(&a_catalog.join("job-hetz.toml")).await,
+        "catalog delete on B never reached A"
     );
+    assert_stays_missing(&b_job).await;
+    assert_stays_missing(&a_catalog.join("job-hetz.toml")).await;
 
     node_b.shutdown().await?;
     node_a.shutdown().await?;

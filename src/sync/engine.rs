@@ -3431,8 +3431,13 @@ mod tests {
         }
     }
 
+||||||| parent of 93ecda2 (sync: a delete must stick, in every synced folder)
+    /// Catalog USED TO ignore a local delete here and materialize restored the
+    /// file from retained content. That is the behaviour this test was written
+    /// to protect and it is deliberately gone: a delete now changes the
+    /// manifest and materialize leaves the path deleted.
     #[test]
-    fn catalog_scan_ignores_local_delete_and_materialize_restores() {
+    fn catalog_scan_records_local_delete_and_materialize_leaves_it_deleted() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("keep.toml"), b"payload").unwrap();
@@ -3442,17 +3447,18 @@ mod tests {
         let mut node = SyncNode::new(Author([1; 32]));
         scan_into_node(&mut node, root, &entry, policy).unwrap();
 
-        // Delete on disk, rescan: catalog records no change.
         std::fs::remove_file(root.join("keep.toml")).unwrap();
         let changed = scan_into_node(&mut node, root, &entry, policy).unwrap();
-        assert!(!changed, "catalog delete must not change the manifest");
-        // Materialize restores the file from the retained content.
+        assert!(changed, "a catalog delete is a change to the manifest");
         materialize(&node, root, policy).unwrap();
-        assert_eq!(std::fs::read(root.join("keep.toml")).unwrap(), b"payload");
+        assert!(
+            !root.join("keep.toml").exists(),
+            "materialize brought a deleted catalog file back"
+        );
     }
 
     #[test]
-    fn authoritative_tombstone_with_stale_observed_file_respects_policy() {
+    fn authoritative_tombstone_is_never_overturned_by_a_surviving_stale_file() {
         for policy in [SyncPolicy::Catalog, SyncPolicy::Bus] {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
@@ -3479,19 +3485,17 @@ mod tests {
                 &mut HashMap::new(),
             )
             .unwrap();
-            assert_eq!(changed, policy == SyncPolicy::Catalog);
-            if policy == SyncPolicy::Catalog {
-                assert!(matches!(
-                    node.manifest().get("retired.toml"),
-                    Some(Entry::Present(meta))
-                        if meta.version == 3 && meta.hash == stale_hash
-                ));
-            } else {
-                assert!(matches!(
+            // NO POLICY MAY RESURRECT. Catalog used to advance the surviving
+            // bytes to Present/v3 here, which is exactly how one peer returning
+            // from a long absence undid a delete for the whole fleet.
+            assert!(!changed, "a surviving stale file must not revive a tombstone");
+            assert!(
+                matches!(
                     node.manifest().get("retired.toml"),
                     Some(Entry::Tombstone(tombstone)) if tombstone.version == 2
-                ));
-            }
+                ),
+                "{policy:?} let stale bytes on disk overturn an authoritative tombstone"
+            );
             assert_eq!(observed.get("retired.toml"), Some(&stale_hash));
 
             materialize_tracked(
@@ -3504,12 +3508,15 @@ mod tests {
                 None,
             )
             .unwrap();
-            let file_survives = policy == SyncPolicy::Catalog;
-            assert_eq!(path.exists(), file_survives, "policy {policy:?}");
-            assert_eq!(
-                observed.contains_key("retired.toml"),
-                file_survives,
-                "policy {policy:?}"
+            // The tombstone is authoritative under EVERY policy now, so the
+            // stale file is removed and its observed receipt goes with it.
+            assert!(
+                !path.exists(),
+                "{policy:?} kept a file an authoritative tombstone had deleted"
+            );
+            assert!(
+                !observed.contains_key("retired.toml"),
+                "{policy:?} kept an observed receipt for a deleted path"
             );
         }
     }
@@ -4400,23 +4407,26 @@ mod tests {
             b"host=hetz"
         );
 
-        // Converge fully, then a catalog delete on B must be restored (never
-        // propagates a deletion back to A).
+        // Converge fully, then a delete on B must stick on B and reach A. This
+        // used to assert the opposite, that the file was restored on B and kept
+        // on A.
         a.sync_once("catalog").await.unwrap();
         std::fs::remove_file(dir_b.path().join("catalog/job.toml")).unwrap();
         b.sync_once("catalog").await.unwrap();
+        a.sync_once("catalog").await.unwrap();
+        b.sync_once("catalog").await.unwrap();
         assert!(
-            std::fs::read(dir_b.path().join("catalog/job.toml")).is_ok(),
-            "catalog delete should be restored on B"
+            !dir_b.path().join("catalog/job.toml").exists(),
+            "the delete was undone on the machine that made it"
         );
         assert!(
-            std::fs::read(dir_a.path().join("catalog/job.toml")).is_ok(),
-            "catalog delete must not remove the file on A"
+            !dir_a.path().join("catalog/job.toml").exists(),
+            "the delete never reached the peer"
         );
     }
 
     #[tokio::test]
-    async fn catalog_recovers_shared_tombstone_from_one_surviving_copy_over_wire_and_restart() {
+    async fn a_shared_tombstone_is_not_undone_by_the_one_node_that_kept_the_bytes() {
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();
         let root_a = dir_a.path().join("catalog");
@@ -4482,15 +4492,22 @@ mod tests {
         transport_a.add_peer("b", "catalog", engine_b.node_for("catalog").await.unwrap());
         transport_b.add_peer("a", "catalog", engine_a.node_for("catalog").await.unwrap());
 
-        // A's catalog scan advances the surviving bytes to Present/v3, the wire
-        // transfers that winner and its content, and B materializes it.
+        // A USED TO advance the surviving bytes to Present/v3 here, the wire
+        // used to carry that winner to B, and B used to materialize it. That is
+        // how one node holding an old copy undid a delete for everybody, and it
+        // is the exact shape of a peer coming home after a fortnight away.
         engine_a.sync_once("catalog").await.unwrap();
         engine_b.sync_once("catalog").await.unwrap();
         engine_a.sync_once("catalog").await.unwrap();
 
-        let recovered = b"role \"worker\"\n";
-        assert_eq!(std::fs::read(root_a.join("agent.kdl")).unwrap(), recovered);
-        assert_eq!(std::fs::read(root_b.join("agent.kdl")).unwrap(), recovered);
+        assert!(
+            !root_a.join("agent.kdl").exists(),
+            "the node that kept the bytes resurrected a deleted file"
+        );
+        assert!(
+            !root_b.join("agent.kdl").exists(),
+            "a resurrected file crossed the wire to a node that had let it go"
+        );
         for engine in [&engine_a, &engine_b] {
             assert!(matches!(
                 engine
@@ -4501,13 +4518,12 @@ mod tests {
                     .await
                     .manifest()
                     .get("agent.kdl"),
-                Some(Entry::Present(meta))
-                    if meta.version == 3 && meta.hash == stale_hash
+                Some(Entry::Tombstone(tombstone)) if tombstone.version == 2
             ));
         }
 
-        // The same Present/v3 plus observed receipt is authoritative after a
-        // restart, and replaying the scan does not create another version.
+        // The tombstone is still authoritative after a restart, and replaying
+        // the scan does not revive the path from the bytes A once held.
         drop(engine_a);
         drop(engine_b);
         for (home, root, author) in [
@@ -4532,14 +4548,10 @@ mod tests {
                 .unwrap();
             assert!(matches!(
                 entry.node.lock().await.manifest().get("agent.kdl"),
-                Some(Entry::Present(meta))
-                    if meta.version == 3 && meta.hash == stale_hash
+                Some(Entry::Tombstone(tombstone)) if tombstone.version == 2
             ));
-            assert_eq!(
-                entry.observed.lock().unwrap().get("agent.kdl"),
-                Some(&stale_hash)
-            );
-            assert_eq!(std::fs::read(root.join("agent.kdl")).unwrap(), recovered);
+            assert_eq!(entry.observed.lock().unwrap().get("agent.kdl"), None);
+            assert!(!root.join("agent.kdl").exists());
         }
     }
 
@@ -5894,37 +5906,43 @@ mod tests {
             label: &'static str,
             observed: Option<&'static [u8]>,
             disk: &'static [u8],
-            expected_bus_present: bool,
+            expected_present: bool,
         }
 
-        // Catalog always recovers physical bytes into a higher Present because
-        // union-of-presence cannot retain a Tombstone while any copy survives.
-        // Bus keeps a matching unchanged receipt tombstoned; absent, mismatched,
-        // or edited bytes are new local intent and advance to Present/v3.
+        // BOTH POLICIES BEHAVE THE SAME NOW. Catalog used to recover physical
+        // bytes into a higher Present, because union-of-presence could not
+        // retain a Tombstone while any copy survived. That is gone: a delete
+        // must stick in every synced folder.
+        //
+        // What remains is the receipt rule, and it is the same under either
+        // policy. A matching unchanged receipt stays tombstoned, because those
+        // bytes are the ones the delete was about. Absent, mismatched, or edited
+        // bytes are NEW local intent and still advance to Present/v3, so an edit
+        // made while a delete was in flight is never silently thrown away.
         let cases = [
             Case {
                 label: "matching receipt and unchanged bytes",
                 observed: Some(b"old"),
                 disk: b"old",
-                expected_bus_present: false,
+                expected_present: false,
             },
             Case {
                 label: "absent receipt and unchanged bytes",
                 observed: None,
                 disk: b"old",
-                expected_bus_present: true,
+                expected_present: true,
             },
             Case {
                 label: "mismatched receipt and unchanged bytes",
                 observed: Some(b"different"),
                 disk: b"old",
-                expected_bus_present: true,
+                expected_present: true,
             },
             Case {
                 label: "matching receipt and edited bytes",
                 observed: Some(b"old"),
                 disk: b"edited",
-                expected_bus_present: true,
+                expected_present: true,
             },
         ];
 
@@ -5989,8 +6007,7 @@ mod tests {
                 let manifest = entry.node.lock().await.manifest().clone();
                 let observed = entry.observed.lock().unwrap().clone();
                 let context = format!("{} under {final_policy:?}", case.label);
-                let expected_present =
-                    final_policy == SyncPolicy::Catalog || case.expected_bus_present;
+                let expected_present = case.expected_present;
                 if expected_present {
                     assert!(
                         matches!(
@@ -6014,13 +6031,10 @@ mod tests {
                         ),
                         "{context}"
                     );
-                    let file_survives = final_policy == SyncPolicy::Catalog;
-                    assert_eq!(path.exists(), file_survives, "{context}");
-                    assert_eq!(
-                        observed.contains_key("retired.md"),
-                        file_survives,
-                        "{context}"
-                    );
+                    // Tombstoned under either policy means the file is gone
+                    // from disk and its observed receipt with it.
+                    assert!(!path.exists(), "{context}");
+                    assert!(!observed.contains_key("retired.md"), "{context}");
                 }
 
                 // A second replay must be stable under either final policy.
