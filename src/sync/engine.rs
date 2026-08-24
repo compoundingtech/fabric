@@ -787,9 +787,29 @@ impl<T: SyncTransport> SyncEngine<T> {
             let _operation = entry.operation.lock().await;
             let protected = entry.observed.lock().unwrap().clone();
             let generation = entry.work.mutation_generation.load(Ordering::Acquire);
-            self.scan_entry(&entry).await?;
+            let scan_changed = self.scan_entry(&entry).await?;
             self.materialize_entry_state(&entry, &protected).await?;
-            self.persist_entry(&entry).await?;
+            // A pass that changed nothing has nothing to record. This call was
+            // unguarded while `prepare_inbound_entry` guards the identical one,
+            // whose comment already states the rule: an already durable no-op
+            // scan needs no rewrite. Applying it here, not inventing it.
+            //
+            // Each term earns its place:
+            // - `scan_changed` is what the scan already returned and this call
+            //   site used to discard.
+            // - `observed` can move when the scan found nothing, because
+            //   materialization restores a file deleted under catalog policy.
+            // - the generation catches a watcher event not yet made durable.
+            // - a legacy entry may have no state.json yet, so a first pass must
+            //   write even when it changed nothing.
+            let observed_changed = { *entry.observed.lock().unwrap() != protected };
+            if scan_changed
+                || observed_changed
+                || entry.work.durable_generation.load(Ordering::Acquire) != generation
+                || !self.state_path(&entry.config.name).exists()
+            {
+                self.persist_entry(&entry).await?;
+            }
             entry.work.mark_generation_durable(generation);
             let baseline = entry.observed.lock().unwrap().clone();
             let manifest = entry.node.lock().await.manifest().clone();
@@ -3548,6 +3568,108 @@ mod tests {
 
     fn write_syncs(home: &Path, folder: &Path) {
         write_named_sync(home, "catalog", folder, SyncPolicy::Catalog);
+    }
+
+    /// A pass that changes nothing must not rewrite state.
+    ///
+    /// Measured on the live fleet on 2026-08-25: `sync_once` rewrote a 45 MB
+    /// state.json and a 25 MB manifest.json roughly every twenty seconds while
+    /// `full_scans` rose and `present`, `tombstones` and
+    /// `inbound_guarded_transactions` did not move at all. About 2 TB a day
+    /// across four machines, all of it re-writing what was already there.
+    ///
+    /// The rule already existed on the inbound path, in
+    /// `prepare_inbound_entry`, whose own comment says "an already durable
+    /// no-op scan needs no rewrite". It was simply never applied here.
+    #[tokio::test]
+    async fn a_no_op_sync_pass_does_not_rewrite_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.md"), b"seed").unwrap();
+        write_bus_sync(dir.path(), &root);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        // The first pass discovers the file. It MUST persist.
+        engine.sync_once("bus").await.unwrap();
+        let entry = engine.entries.read().await.get("bus").cloned().unwrap();
+        assert!(
+            entry.work.persist_calls.load(Ordering::Relaxed) > 0,
+            "the first pass discovers a file and must write it"
+        );
+        entry.work.persist_calls.store(0, Ordering::Relaxed);
+
+        // Nothing changes on disk. These passes have nothing to record.
+        engine.sync_once("bus").await.unwrap();
+        engine.sync_once("bus").await.unwrap();
+        engine.sync_once("bus").await.unwrap();
+
+        assert_eq!(
+            entry.work.persist_calls.load(Ordering::Relaxed),
+            0,
+            "a pass that changed nothing must not rewrite state"
+        );
+    }
+
+    /// Skipping the write must not claim a durability we do not have.
+    ///
+    /// The dangerous version of this fix is one that stops writing AND still
+    /// marks the generation durable, so a crash loses whatever the skipped
+    /// write would have carried. This asserts the property that matters rather
+    /// than the counter: after a no-op pass, what is ON DISK still equals what
+    /// is in memory.
+    #[tokio::test]
+    async fn a_skipped_write_leaves_the_persisted_state_still_correct() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.md"), b"seed").unwrap();
+        write_bus_sync(dir.path(), &root);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+
+        // A real local change, then several no-op passes on top of it.
+        std::fs::write(root.join("b.md"), b"second").unwrap();
+        engine.sync_once("bus").await.unwrap();
+        engine.sync_once("bus").await.unwrap();
+        engine.sync_once("bus").await.unwrap();
+
+        let in_memory = engine
+            .node_for("bus")
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .manifest()
+            .clone();
+        let raw = std::fs::read(engine.state_path("bus")).unwrap();
+        let on_disk: PersistedEntryState = serde_json::from_slice(&raw).unwrap();
+
+        assert_eq!(
+            on_disk.manifest, in_memory,
+            "after skipping writes, the persisted manifest must still equal the \
+             live one, or a crash loses the change the skip decided not to record"
+        );
+        assert!(
+            on_disk.manifest.get("b.md").is_some(),
+            "the real change must be on disk, not merely in memory"
+        );
     }
 
     fn write_bus_sync(home: &Path, folder: &Path) {
