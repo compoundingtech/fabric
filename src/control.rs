@@ -180,6 +180,19 @@ pub struct SyncEntryStatus {
     /// Monotonic inbound transactions that selected guarded reconciliation.
     #[serde(default)]
     pub inbound_guarded_transactions: u64,
+    /// Calls to `sync_once`. NOT `full_scans`, which counts two per call.
+    #[serde(default)]
+    pub sync_passes: u64,
+    /// Cumulative microseconds inside each phase of `sync_once`. Two samples
+    /// and a division describe the present; a total describes the past.
+    #[serde(default)]
+    pub scan_micros: u64,
+    #[serde(default)]
+    pub materialize_micros: u64,
+    #[serde(default)]
+    pub persist_micros: u64,
+    #[serde(default)]
+    pub reconcile_micros: u64,
     /// Why the tombstone sweep did or did not forget anything, as a short
     /// stable token. Empty from a daemon that predates the field, which is why
     /// it carries `#[serde(default)]` like the counters above.

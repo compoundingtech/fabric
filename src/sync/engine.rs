@@ -23,7 +23,7 @@ use std::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -230,6 +230,19 @@ struct EntryWork {
     inbound_noop_transactions: AtomicU64,
     /// Inbound transactions that selected the guarded scan/materialize path.
     inbound_guarded_transactions: AtomicU64,
+    /// Calls to `sync_once`. NOT the same as `full_scans`, which counts TWO per
+    /// call because `sync_once` scans once before the peer step and again
+    /// after. Reading `full_scans` as a pass count overstates the rate by 2x,
+    /// and dividing anything by it understates the per-pass cost by half. That
+    /// mistake was made and reported before this counter existed.
+    sync_passes: AtomicU64,
+    /// Cumulative time inside each phase of `sync_once`, in microseconds.
+    /// Cumulative rather than per-pass so a reader takes two samples and
+    /// divides, which is the only thing that describes the present.
+    scan_micros: AtomicU64,
+    materialize_micros: AtomicU64,
+    persist_micros: AtomicU64,
+    reconcile_micros: AtomicU64,
     #[cfg(test)]
     persist_calls: AtomicUsize,
 }
@@ -246,9 +259,23 @@ impl EntryWork {
             full_scans: AtomicU64::new(0),
             inbound_noop_transactions: AtomicU64::new(0),
             inbound_guarded_transactions: AtomicU64::new(0),
+            sync_passes: AtomicU64::new(0),
+            scan_micros: AtomicU64::new(0),
+            materialize_micros: AtomicU64::new(0),
+            persist_micros: AtomicU64::new(0),
+            reconcile_micros: AtomicU64::new(0),
             #[cfg(test)]
             persist_calls: AtomicUsize::new(0),
         })
+    }
+
+    /// Add one phase's elapsed time to its running total.
+    ///
+    /// Saturating, because a counter that wraps is worse than one that stops:
+    /// a wrapped delta reads as a huge negative and looks like a real event.
+    fn add_phase(counter: &AtomicU64, started: Instant) {
+        let micros = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        counter.fetch_add(micros, Ordering::Relaxed);
     }
 
     fn record_mutation(&self) -> u64 {
@@ -765,6 +792,11 @@ impl<T: SyncTransport> SyncEngine<T> {
                     .work
                     .inbound_guarded_transactions
                     .load(Ordering::Relaxed),
+                sync_passes: entry.work.sync_passes.load(Ordering::Relaxed),
+                scan_micros: entry.work.scan_micros.load(Ordering::Relaxed),
+                materialize_micros: entry.work.materialize_micros.load(Ordering::Relaxed),
+                persist_micros: entry.work.persist_micros.load(Ordering::Relaxed),
+                reconcile_micros: entry.work.reconcile_micros.load(Ordering::Relaxed),
                 sweep: entry.last_sweep.lock().unwrap().clone(),
             });
         }
@@ -779,6 +811,11 @@ impl<T: SyncTransport> SyncEngine<T> {
         let Some(entry) = self.entries.read().await.get(name).cloned() else {
             return Ok(());
         };
+        // Counted on entry, not on success, so it matches `full_scans`, which
+        // counts attempts. Counting completions instead would let an early
+        // error add phase time to the totals without adding a pass to divide
+        // by, which inflates the per-pass cost exactly when something is wrong.
+        entry.work.sync_passes.fetch_add(1, Ordering::Relaxed);
         // Never hold the local operation guard across a peer dial. If A and B
         // initiate together, retaining A while awaiting B's inbound guard (and
         // vice versa) is a distributed lock inversion. Carry a pre-merge
@@ -787,8 +824,12 @@ impl<T: SyncTransport> SyncEngine<T> {
             let _operation = entry.operation.lock().await;
             let protected = entry.observed.lock().unwrap().clone();
             let generation = entry.work.mutation_generation.load(Ordering::Acquire);
+            let phase = Instant::now();
             let scan_changed = self.scan_entry(&entry).await?;
+            EntryWork::add_phase(&entry.work.scan_micros, phase);
+            let phase = Instant::now();
             self.materialize_entry_state(&entry, &protected).await?;
+            EntryWork::add_phase(&entry.work.materialize_micros, phase);
             // A pass that changed nothing has nothing to record. This call was
             // unguarded while `prepare_inbound_entry` guards the identical one,
             // whose comment already states the rule: an already durable no-op
@@ -808,7 +849,9 @@ impl<T: SyncTransport> SyncEngine<T> {
                 || entry.work.durable_generation.load(Ordering::Acquire) != generation
                 || !self.state_path(&entry.config.name).exists()
             {
+                let phase = Instant::now();
                 self.persist_entry(&entry).await?;
+                EntryWork::add_phase(&entry.work.persist_micros, phase);
             }
             entry.work.mark_generation_durable(generation);
             let baseline = entry.observed.lock().unwrap().clone();
@@ -817,6 +860,10 @@ impl<T: SyncTransport> SyncEngine<T> {
         };
 
         let peers = self.transport.peers_for(&entry.config.peers).await;
+        // The whole peer step, every peer together. Timed as one phase because
+        // that is the unit a reader can act on; a per-peer split is a later
+        // change if this turns out to be where the time goes.
+        let reconcile_phase = Instant::now();
         for peer in &peers {
             if self.cancel.is_cancelled() {
                 break;
@@ -845,14 +892,22 @@ impl<T: SyncTransport> SyncEngine<T> {
             }
         }
 
+        EntryWork::add_phase(&entry.work.reconcile_micros, reconcile_phase);
+
         let _operation = entry.operation.lock().await;
+        let phase = Instant::now();
         self.scan_entry(&entry).await?;
+        EntryWork::add_phase(&entry.work.scan_micros, phase);
+        let phase = Instant::now();
         self.materialize_entry_state(&entry, &baseline).await?;
+        EntryWork::add_phase(&entry.work.materialize_micros, phase);
         self.sweep_entry_tombstones(&entry, &peers).await;
         let final_manifest = entry.node.lock().await.manifest().clone();
         let final_observed = entry.observed.lock().unwrap().clone();
         if final_manifest != manifest || final_observed != baseline {
+            let phase = Instant::now();
             self.persist_entry(&entry).await?;
+            EntryWork::add_phase(&entry.work.persist_micros, phase);
         }
         Ok(())
     }
@@ -1241,6 +1296,14 @@ pub struct SyncStatus {
     pub inbound_noop_transactions: u64,
     /// Inbound transactions that selected the guarded scan/materialize path.
     pub inbound_guarded_transactions: u64,
+    /// Calls to `sync_once`. NOT `full_scans`, which is two per call.
+    pub sync_passes: u64,
+    /// Cumulative microseconds inside each phase of `sync_once`. Take two
+    /// samples and divide; a total on its own describes the past.
+    pub scan_micros: u64,
+    pub materialize_micros: u64,
+    pub persist_micros: u64,
+    pub reconcile_micros: u64,
     /// Why the tombstone sweep did or did not forget anything, as last decided.
     /// `None` means no pass has reached the sweep yet for this entry instance.
     pub sweep: Option<SweepState>,
@@ -3617,6 +3680,108 @@ mod tests {
             entry.work.persist_calls.load(Ordering::Relaxed),
             0,
             "a pass that changed nothing must not rewrite state"
+        );
+    }
+
+    /// `full_scans` is TWO per `sync_once`, and `sync_passes` is one.
+    ///
+    /// This is not a decorative counter. Reading `full_scans` as a pass count
+    /// overstates the rate by 2x, and dividing a per-pass cost by it halves the
+    /// answer. That mistake was made against the live fleet and a measurement
+    /// was reported and then withdrawn because of it.
+    ///
+    /// `sync_once` scans once before the peer step and again after, so the 2:1
+    /// ratio is a property of the function rather than an accident of counting.
+    /// If someone later removes the second scan, this test fails and tells them
+    /// the counters now mean something different, which is the point.
+    #[tokio::test]
+    async fn full_scans_counts_two_per_pass_and_sync_passes_counts_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.md"), b"seed").unwrap();
+        write_bus_sync(dir.path(), &root);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let entry = {
+            engine.sync_once("bus").await.unwrap();
+            engine.entries.read().await.get("bus").cloned().unwrap()
+        };
+        entry.work.full_scans.store(0, Ordering::Relaxed);
+        entry.work.sync_passes.store(0, Ordering::Relaxed);
+
+        for _ in 0..5 {
+            engine.sync_once("bus").await.unwrap();
+        }
+
+        assert_eq!(
+            entry.work.sync_passes.load(Ordering::Relaxed),
+            5,
+            "sync_passes must count one per sync_once call"
+        );
+        assert_eq!(
+            entry.work.full_scans.load(Ordering::Relaxed),
+            10,
+            "full_scans must count two per sync_once, once each side of the peer step"
+        );
+    }
+
+    /// A pass must attribute its time to the phase that spent it.
+    ///
+    /// Not a counter mirror: it pins that the phases are wired to the work they
+    /// name. `persist_micros` must stay at zero across passes that write
+    /// nothing, while `scan_micros` rises, because every pass scans and only a
+    /// changed pass writes. A phase timer attached to the wrong call site, or
+    /// left outside the `if` that guards the write, fails here.
+    #[tokio::test]
+    async fn phase_timers_follow_the_work_and_not_the_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.md"), b"seed").unwrap();
+        write_bus_sync(dir.path(), &root);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        // The discovering pass writes, so persist time must be recorded.
+        engine.sync_once("bus").await.unwrap();
+        let entry = engine.entries.read().await.get("bus").cloned().unwrap();
+        assert!(
+            entry.work.persist_micros.load(Ordering::Relaxed) > 0,
+            "a pass that wrote must record persist time"
+        );
+
+        let persist_after_write = entry.work.persist_micros.load(Ordering::Relaxed);
+        let scan_after_write = entry.work.scan_micros.load(Ordering::Relaxed);
+
+        // Nothing changes. These passes still scan, and must not write.
+        for _ in 0..3 {
+            engine.sync_once("bus").await.unwrap();
+        }
+
+        assert_eq!(
+            entry.work.persist_micros.load(Ordering::Relaxed),
+            persist_after_write,
+            "a pass that wrote nothing must add no persist time"
+        );
+        assert!(
+            entry.work.scan_micros.load(Ordering::Relaxed) > scan_after_write,
+            "every pass scans, so scan time must keep rising"
         );
     }
 

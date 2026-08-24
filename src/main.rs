@@ -816,21 +816,26 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                     let present = logical_present(&entry);
                     if entry.missing == 0 && entry.unexpected == 0 && entry.mismatched == 0 {
                         println!(
-                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tsweep={}",
+                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\tsweep={}",
                             entry.name,
                             entry.folder,
                             entry.policy,
                             entry.peers,
                             entry.tombstones,
                             entry.observed,
+                            entry.sync_passes,
                             entry.full_scans,
                             entry.inbound_noop_transactions,
                             entry.inbound_guarded_transactions,
+                            entry.scan_micros / 1000,
+                            entry.materialize_micros / 1000,
+                            entry.persist_micros / 1000,
+                            entry.reconcile_micros / 1000,
                             sweep_token(&entry),
                         );
                     } else {
                         println!(
-                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tsweep={}",
+                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\tsweep={}",
                             entry.name,
                             entry.folder,
                             entry.policy,
@@ -840,9 +845,14 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                             entry.missing,
                             entry.unexpected,
                             entry.mismatched,
+                            entry.sync_passes,
                             entry.full_scans,
                             entry.inbound_noop_transactions,
                             entry.inbound_guarded_transactions,
+                            entry.scan_micros / 1000,
+                            entry.materialize_micros / 1000,
+                            entry.persist_micros / 1000,
+                            entry.reconcile_micros / 1000,
                             sweep_token(&entry),
                         );
                     }
@@ -880,9 +890,17 @@ struct SyncLsJsonEntry<'a> {
     missing: usize,
     unexpected: usize,
     mismatched: usize,
+    /// Calls to `sync_once`. NOT `full_scans`, which is two per call.
+    sync_passes: u64,
     full_scans: u64,
     inbound_noop_transactions: u64,
     inbound_guarded_transactions: u64,
+    /// Cumulative microseconds per phase of `sync_once`. Two samples and a
+    /// division describe the present; a total on its own describes the past.
+    scan_micros: u64,
+    materialize_micros: u64,
+    persist_micros: u64,
+    reconcile_micros: u64,
     /// Why the tombstone sweep did or did not forget anything. `unknown` from a
     /// daemon that predates the field.
     sweep: &'a str,
@@ -902,9 +920,14 @@ impl<'a> From<&'a fabric::control::SyncEntryStatus> for SyncLsJsonEntry<'a> {
             missing: entry.missing,
             unexpected: entry.unexpected,
             mismatched: entry.mismatched,
+            sync_passes: entry.sync_passes,
             full_scans: entry.full_scans,
             inbound_noop_transactions: entry.inbound_noop_transactions,
             inbound_guarded_transactions: entry.inbound_guarded_transactions,
+            scan_micros: entry.scan_micros,
+            materialize_micros: entry.materialize_micros,
+            persist_micros: entry.persist_micros,
+            reconcile_micros: entry.reconcile_micros,
             sweep: sweep_token(entry),
         }
     }
@@ -1144,9 +1167,14 @@ mod sync_ls_tests {
             missing: 0,
             unexpected: 2,
             mismatched: 0,
+            sync_passes: 9,
             full_scans: 17,
             inbound_noop_transactions: 11,
             inbound_guarded_transactions: 3,
+            scan_micros: 1_500,
+            materialize_micros: 2_500,
+            persist_micros: 3_500,
+            reconcile_micros: 4_500,
             sweep: "disabled".to_string(),
         }
     }
@@ -1172,6 +1200,11 @@ mod sync_ls_tests {
                 "full_scans": 17,
                 "inbound_noop_transactions": 11,
                 "inbound_guarded_transactions": 3,
+                "sync_passes": 9,
+                "scan_micros": 1500,
+                "materialize_micros": 2500,
+                "persist_micros": 3500,
+                "reconcile_micros": 4500,
                 "sweep": "disabled"
             })
         );
