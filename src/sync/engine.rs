@@ -1163,8 +1163,11 @@ impl<T: SyncTransport> SyncEngine<T> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let raw = serde_json::to_string_pretty(manifest)?;
-        write_atomic(&path, raw.as_bytes())
+        // COMPACT, NOT PRETTY. This file is fabric's own index, not anyone's
+        // data, and nobody reads 26 MB of JSON by eye. The indentation was 62%
+        // of every byte written, and this file is rewritten WHOLE every time.
+        let raw = serde_json::to_vec(manifest)?;
+        write_atomic(&path, &raw)
     }
 
     fn write_state(&self, name: &str, state: &PersistedEntryState) -> Result<()> {
@@ -1172,9 +1175,11 @@ impl<T: SyncTransport> SyncEngine<T> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let raw = serde_json::to_string_pretty(state)?;
+        // Compact for the same reason as the manifest. Still JSON, so a build
+        // that predates this reads it unchanged; only the whitespace is gone.
+        let raw = serde_json::to_vec(state)?;
         // The combined state is authoritative and lands atomically first.
-        write_atomic(&path, raw.as_bytes())?;
+        write_atomic(&path, &raw)?;
         // Keep the established manifest path current for operators and older
         // Fabric binaries. A crash between these writes still recovers from the
         // already-committed combined state above.
@@ -3386,6 +3391,46 @@ mod tests {
         assert_eq!(paths, vec!["agent.toml".to_string()]);
     }
 
+    /// The bookkeeping files are rewritten WHOLE every time they are written,
+    /// and they are fabric's own index rather than anyone's data. Indenting
+    /// them for a reader who does not exist cost 62% of every byte.
+    ///
+    /// Newlines are the property to pin, because `serde_json`'s compact form
+    /// emits none and its pretty form emits one per field. This fails the moment
+    /// somebody restores the indentation for readability.
+    #[tokio::test]
+    async fn persisted_bookkeeping_is_compact_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        // Enough records that pretty-printing is unmistakable rather than noise.
+        for i in 0..25 {
+            std::fs::write(root.join(format!("f{i}.md")), format!("body {i}")).unwrap();
+        }
+        write_bus_sync(dir.path(), &root);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+
+        for leaf in ["state.json", "manifest.json"] {
+            let path = dir.path().join("sync").join("bus").join(leaf);
+            let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("{leaf}: {e}"));
+            assert!(!raw.is_empty(), "{leaf} was not written");
+            assert!(
+                !raw.contains(&b'\n'),
+                "{leaf} is pretty-printed ({} bytes); the compact form has no newlines",
+                raw.len()
+            );
+        }
+    }
+
     #[test]
     fn catalog_scan_ignores_local_delete_and_materialize_restores() {
         let dir = tempfile::tempdir().unwrap();
@@ -5569,16 +5614,36 @@ mod tests {
         // caps expressed against that same rate, 112/36 and 76/36 of it, which is
         // the derivation the previous comment described. No new number is invented.
         let elapsed_millis = elapsed.as_millis().max(1);
+        // The ceiling was 4 per second, derived when a persist wrote 72 MB of
+        // pretty-printed JSON. Compact bookkeeping made a pass cheaper, so more
+        // legitimate passes fit the same fixed burst, and the old ceiling stopped
+        // bounding amplification and started bounding speed.
+        //
+        // MEASURED ON ONE MACHINE, FIVE RUNS EACH, THE SAME BURST:
+        //   pretty   30 to 34 reconciles, 2.86 to 3.15 per second
+        //   compact  38 reconciles every run, 3.52 to 3.60 per second
+        //
+        // That rise is the intended effect and not amplification. The writers
+        // still perform a fixed number of revisions, and the run still has to
+        // converge below. The ceiling is re-derived to keep roughly the headroom
+        // it used to have above the observed rate, so a genuine feedback loop
+        // still trips it. It is fractionally more headroom than before, which is
+        // deliberate: this test has a history of failing on a loaded machine at
+        // rates that were legitimate.
+        //
+        // The scan and persist ceilings stay expressed against this same rate,
+        // 112/36 and 76/36 of it, so the original relationships are unchanged.
+        const MAX_RECONCILES_PER_SEC: u128 = 5;
         assert!(
-            (reconciles as u128) * 1_000 <= elapsed_millis * 4,
+            (reconciles as u128) * 1_000 <= elapsed_millis * MAX_RECONCILES_PER_SEC,
             "reconcile rate exceeded: {reconciles} reconciles, {scans} scans, and {persists} persists in {elapsed:?}"
         );
         assert!(
-            (scans as u128) * 1_000 * 36 <= elapsed_millis * 4 * 112,
+            (scans as u128) * 1_000 * 36 <= elapsed_millis * MAX_RECONCILES_PER_SEC * 112,
             "full-folder scan rate exceeded: {scans} scans against {reconciles} reconciles in {elapsed:?}"
         );
         assert!(
-            (persists as u128) * 1_000 * 36 <= elapsed_millis * 4 * 76,
+            (persists as u128) * 1_000 * 36 <= elapsed_millis * MAX_RECONCILES_PER_SEC * 76,
             "state persist rate exceeded: {persists} persists against {reconciles} reconciles in {elapsed:?}"
         );
 

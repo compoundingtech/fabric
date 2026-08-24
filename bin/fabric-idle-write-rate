@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Measure what fabric writes to disk while nothing in a synced folder changes.
+
+The number this prints is only meaningful if the folders really were idle, so
+this measures that too and says so. A write rate without its window and its load
+is not a measurement.
+
+Exit codes:
+  0  measured, and the rate is at or under --max-mb-per-day
+  1  measured, and the rate is OVER --max-mb-per-day
+  2  the folders were NOT idle, so no idle rate was measured
+  3  could not measure at all (no entries, no daemon)
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+BOOKKEEPING = ("state.json", "manifest.json")
+
+
+def entries(home):
+    """The sync entries the running daemon reports, as (name, folder)."""
+    cmd = ["fabric"]
+    if home:
+        cmd += ["--home", home]
+    cmd += ["sync", "ls", "--json"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    try:
+        return [(e["name"], e["folder"]) for e in json.loads(out.stdout)]
+    except (ValueError, KeyError, TypeError):
+        return []
+
+
+def sanitize(name):
+    """Mirror `sanitize_name` in src/sync/engine.rs exactly.
+
+    Alphanumeric, hyphen and underscore survive; everything else becomes an
+    underscore. Getting this wrong makes the tool find no files and report a
+    reassuring zero, which is the worst thing it could do.
+    """
+    return "".join(c if (c.isalnum() or c in "-_") else "_" for c in name)
+
+
+def bookkeeping_files(home, names):
+    root = os.path.join(home, "sync")
+    found = []
+    for name in names:
+        for leaf in BOOKKEEPING:
+            path = os.path.join(root, sanitize(name), leaf)
+            if os.path.exists(path):
+                found.append(path)
+    return found
+
+
+def stamp(path):
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def folder_stamp(folder):
+    """A cheap fingerprint of a synced folder: file count and newest mtime."""
+    count = 0
+    newest = 0
+    for root, _dirs, files in os.walk(folder):
+        for f in files:
+            try:
+                st = os.stat(os.path.join(root, f))
+            except OSError:
+                continue
+            count += 1
+            newest = max(newest, st.st_mtime_ns)
+    return (count, newest)
+
+
+def human(n):
+    return f"{n / 1048576:.1f} MB" if n else "0 MB"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--seconds", type=int, default=120)
+    ap.add_argument("--max-mb-per-day", type=float, default=1024.0)
+    ap.add_argument("--home", default=os.path.expanduser("~/.local/share/fabric"))
+    ap.add_argument(
+        "--allow-active",
+        action="store_true",
+        help="report the rate even when a folder changed (it is not an idle rate)",
+    )
+    args = ap.parse_args()
+
+    found = entries(args.home)
+    if not found:
+        print("no sync entries reported; is the daemon running?", file=sys.stderr)
+        return 3
+    names = [n for n, _ in found]
+    folders = [f for _, f in found]
+
+    files = bookkeeping_files(args.home, names)
+    if not files:
+        print(f"no bookkeeping files under {args.home}/sync", file=sys.stderr)
+        return 3
+
+    before_folders = {f: folder_stamp(f) for f in folders}
+    last = {p: stamp(p) for p in files}
+    written = {p: 0 for p in files}
+    rewrites = {p: 0 for p in files}
+
+    start = time.time()
+    while time.time() - start < args.seconds:
+        for path in files:
+            now = stamp(path)
+            if now is not None and now != last[path]:
+                written[path] += now[1]
+                rewrites[path] += 1
+                last[path] = now
+        time.sleep(0.5)
+    window = time.time() - start
+
+    after_folders = {f: folder_stamp(f) for f in folders}
+    changed = [f for f in folders if before_folders[f] != after_folders[f]]
+
+    total = sum(written.values())
+    per_day = total / window * 86400 / 1048576
+
+    print(f"window            {window:.0f} s")
+    print(f"entries           {', '.join(names)}")
+    print(f"folders idle      {'NO' if changed else 'yes'}")
+    for f in changed:
+        print(f"  changed during the window: {f}")
+    print("")
+    for path in files:
+        if rewrites[path]:
+            short = os.path.join(
+                os.path.basename(os.path.dirname(path)), os.path.basename(path)
+            )
+            print(
+                f"  {short:<46} {rewrites[path]:>4} rewrites  {human(written[path]):>10}"
+            )
+    print("")
+    print(f"total written     {human(total)} in {window:.0f} s")
+    print(f"rate              {total / window / 1048576:.3f} MB/s")
+    print(f"                  {per_day:.1f} MB/day  ({per_day / 1024:.2f} GB/day)")
+    print(f"budget            {args.max_mb_per_day:.1f} MB/day")
+
+    if changed and not args.allow_active:
+        print("")
+        print("NOT AN IDLE MEASUREMENT: a synced folder changed during the window.")
+        print("Re-run with the fleet stopped, or pass --allow-active to accept it.")
+        return 2
+
+    if per_day > args.max_mb_per_day:
+        print("")
+        print(f"OVER BUDGET by {per_day - args.max_mb_per_day:.1f} MB/day")
+        return 1
+    print("")
+    print("within budget")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
