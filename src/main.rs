@@ -1147,6 +1147,7 @@ mod sync_ls_tests {
             full_scans: 17,
             inbound_noop_transactions: 11,
             inbound_guarded_transactions: 3,
+            sweep: "disabled".to_string(),
         }
     }
 
@@ -1170,7 +1171,8 @@ mod sync_ls_tests {
                 "mismatched": 0,
                 "full_scans": 17,
                 "inbound_noop_transactions": 11,
-                "inbound_guarded_transactions": 3
+                "inbound_guarded_transactions": 3,
+                "sweep": "disabled"
             })
         );
     }
