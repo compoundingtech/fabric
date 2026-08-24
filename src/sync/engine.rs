@@ -226,17 +226,39 @@ struct EntryWork {
     /// Monotonic while this name remains continuously configured in the same
     /// daemon. Exposed through `fabric sync ls` so production can prove whether
     /// an inbound transaction walked the tree.
+    ///
+    /// This counts EVERY `scan_entry` call, from all three of its callers, not
+    /// the calls made by `sync_once` alone. Divide a cost by `sync_passes`.
+    /// Never divide it by this, and never convert this into a pass count.
     full_scans: AtomicU64,
     /// Exact-manifest, complete-content inbound transactions that bypassed the
     /// guarded scan/materialize path.
     inbound_noop_transactions: AtomicU64,
     /// Inbound transactions that selected the guarded scan/materialize path.
     inbound_guarded_transactions: AtomicU64,
-    /// Calls to `sync_once`. NOT the same as `full_scans`, which counts TWO per
-    /// call because `sync_once` scans once before the peer step and again
-    /// after. Reading `full_scans` as a pass count overstates the rate by 2x,
-    /// and dividing anything by it understates the per-pass cost by half. That
-    /// mistake was made and reported before this counter existed.
+    /// Calls to `sync_once`, and the ONLY correct denominator for a per-pass
+    /// cost.
+    ///
+    /// It is not `full_scans`, and NO CONSTANT converts one into the other.
+    /// `scan_entry` has three callers. `sync_once` calls it twice, once each
+    /// side of the peer step. `complete_inbound` calls it exactly once per
+    /// guarded inbound transaction. `prepare_inbound_entry` calls it at most
+    /// once more, and skips it when the durable scan is still good. So:
+    ///
+    /// ```text
+    /// 2*sync_passes + guarded <= full_scans <= 2*sync_passes + 2*guarded
+    /// ```
+    ///
+    /// where `guarded` is `inbound_guarded_transactions`. Inbound traffic is
+    /// not a fixed multiple of local passes, so the ratio moves with what the
+    /// peers are doing, and it is not knowable from this side.
+    ///
+    /// An earlier version of this comment asserted a flat two per call and
+    /// named a "2x" correction. Measured on the live fleet in one 300 s window,
+    /// the real ratio was 3.71 on a busy entry and 2.33 on a quiet one. A
+    /// reader who applied the documented 2x to the busy entry would have
+    /// overstated the rate by 85%, which is the same class of miscorrection
+    /// this counter was added to prevent.
     sync_passes: AtomicU64,
     /// Cumulative time inside each phase of `sync_once`, in microseconds.
     /// Cumulative rather than per-pass so a reader takes two samples and
@@ -3715,6 +3737,10 @@ mod tests {
     /// ratio is a property of the function rather than an accident of counting.
     /// If someone later removes the second scan, this test fails and tells them
     /// the counters now mean something different, which is the point.
+    ///
+    /// With NO inbound traffic, and only then, `sync_once` is the sole caller
+    /// of `scan_entry` and the ratio is exactly two. The test below pins what
+    /// production actually sees.
     #[tokio::test]
     async fn full_scans_counts_two_per_pass_and_sync_passes_counts_one() {
         let dir = tempfile::tempdir().unwrap();
@@ -3752,6 +3778,80 @@ mod tests {
             entry.work.full_scans.load(Ordering::Relaxed),
             10,
             "full_scans must count two per sync_once, once each side of the peer step"
+        );
+    }
+
+    /// The 2:1 ratio above holds ONLY when no peer is talking to us, and
+    /// production always has peers talking to us.
+    ///
+    /// `scan_entry` has three callers. `complete_inbound` runs it once per
+    /// guarded inbound transaction and `prepare_inbound_entry` runs it at most
+    /// once more, so inbound traffic lifts `full_scans` while leaving
+    /// `sync_passes` alone. A reader who converts `full_scans` into a pass
+    /// count with any constant is wrong by however much the peers happened to
+    /// be doing, and that error is invisible from this side.
+    ///
+    /// This pins the bound instead, so the mistake is caught by a test rather
+    /// than by a withdrawn number.
+    #[tokio::test]
+    async fn full_scans_counts_inbound_transactions_as_well_as_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.md"), b"seed").unwrap();
+        write_bus_sync(dir.path(), &root);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let entry = {
+            engine.sync_once("bus").await.unwrap();
+            engine.entries.read().await.get("bus").cloned().unwrap()
+        };
+        entry.work.full_scans.store(0, Ordering::Relaxed);
+        entry.work.sync_passes.store(0, Ordering::Relaxed);
+        entry
+            .work
+            .inbound_guarded_transactions
+            .store(0, Ordering::Relaxed);
+
+        for _ in 0..3 {
+            engine.sync_once("bus").await.unwrap();
+        }
+        for _ in 0..2 {
+            let prepared = engine.prepare_inbound("bus").await.unwrap().unwrap();
+            engine.complete_inbound(prepared).await.unwrap();
+        }
+
+        let passes = entry.work.sync_passes.load(Ordering::Relaxed);
+        let scans = entry.work.full_scans.load(Ordering::Relaxed);
+        let guarded = entry
+            .work
+            .inbound_guarded_transactions
+            .load(Ordering::Relaxed);
+
+        assert_eq!(passes, 3, "only sync_once is a pass");
+        assert_eq!(
+            guarded, 2,
+            "both inbound transactions took the guarded path"
+        );
+        assert!(
+            scans > 2 * passes,
+            "inbound transactions scan too, so full_scans must exceed two per \
+             pass: scans={scans}, passes={passes}"
+        );
+        assert!(
+            scans >= 2 * passes + guarded && scans <= 2 * passes + 2 * guarded,
+            "full_scans must stay inside the bound the callers imply: \
+             {} <= {scans} <= {}",
+            2 * passes + guarded,
+            2 * passes + 2 * guarded
         );
     }
 

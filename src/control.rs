@@ -180,7 +180,9 @@ pub struct SyncEntryStatus {
     /// Monotonic inbound transactions that selected guarded reconciliation.
     #[serde(default)]
     pub inbound_guarded_transactions: u64,
-    /// Calls to `sync_once`. NOT `full_scans`, which counts two per call.
+    /// Calls to `sync_once`, and the only correct denominator for a per-pass
+    /// cost. NOT `full_scans`: `scan_entry` also runs for inbound transactions,
+    /// so no constant converts `full_scans` into a pass count.
     #[serde(default)]
     pub sync_passes: u64,
     /// Cumulative microseconds inside each phase of `sync_once`. Two samples
