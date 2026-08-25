@@ -493,6 +493,14 @@ pub struct FabricConfig {
     allow_shell: Option<bool>,
     #[serde(default)]
     allow_exec: Option<bool>,
+    /// The memory ceiling the last install asked for, in MiB.
+    ///
+    /// Persisted for the same reason the two allow flags are: the rendered
+    /// plist or unit is not a place to remember an operator's choice, because
+    /// the next re-render starts from whatever the caller passed and silently
+    /// drops what it does not mention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory_max_mb: Option<u64>,
     #[serde(default)]
     server_sessions: ServerSessionConfig,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -565,6 +573,10 @@ impl FabricConfig {
         self.allow_exec
     }
 
+    pub fn memory_max_mb(&self) -> Option<u64> {
+        self.memory_max_mb
+    }
+
     pub fn server_sessions(&self) -> &ServerSessionConfig {
         &self.server_sessions
     }
@@ -575,6 +587,11 @@ impl FabricConfig {
 
     pub fn set_allow_exec(&mut self, allow_exec: bool) {
         self.allow_exec = Some(allow_exec);
+    }
+
+    /// `None` clears the ceiling, which is what `--no-memory-max-mb` asks for.
+    pub fn set_memory_max_mb(&mut self, memory_max_mb: Option<u64>) {
+        self.memory_max_mb = memory_max_mb;
     }
 
     pub fn exposes(&self) -> &[PersistedExpose] {
