@@ -425,14 +425,18 @@ const SUPERVISE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// inside the service's own cgroup and dies with the restart. So it is scheduled
 /// as a transient unit, and it runs the ROLLBACK binary rather than the new one,
 /// because the rollback is the copy already proven to work on this machine.
-pub async fn supervise_restart(home: &crate::config::FabricHome, rollback: &Path) -> Result<()> {
-    if crate::service::wait_for_control_socket(home, SUPERVISE_READY_TIMEOUT) {
-        println!("supervise\tthe daemon came back");
+pub async fn supervise_restart(
+    home: &crate::config::FabricHome,
+    rollback: &Path,
+    expect: &str,
+) -> Result<()> {
+    if wait_for_daemon_version(home, expect, SUPERVISE_READY_TIMEOUT).await {
+        println!("supervise\tthe daemon came back running {expect}");
         return Ok(());
     }
 
     eprintln!(
-        "supervise\tthe daemon did not answer within {}s; restoring {}",
+        "supervise\tthe daemon is not running {expect} after {}s; restoring {}",
         SUPERVISE_READY_TIMEOUT.as_secs(),
         rollback.display()
     );
@@ -453,6 +457,42 @@ pub async fn supervise_restart(home: &crate::config::FabricHome, rollback: &Path
         "rolled back to {} and the daemon still did not answer; this machine needs a person",
         rollback.display()
     );
+}
+
+/// Wait until the RUNNING DAEMON reports `expect`, not merely until something
+/// answers the control socket.
+///
+/// "A socket answers" is not verification. The supervisor is scheduled alongside
+/// the restart, and systemd batches timers by up to `AccuracySec`, so the two can
+/// fire together — at which point the OLD daemon is still up and still
+/// answering. It observed exactly that on droppy: supervisor and restart both
+/// ran at 10:58:39 and it reported success having possibly never seen the new
+/// binary at all.
+///
+/// If the new binary were broken, that race would report a healthy machine while
+/// the machine went down, which is the one outcome this whole mechanism exists to
+/// prevent. So ask the daemon who it is.
+async fn wait_for_daemon_version(
+    home: &crate::config::FabricHome,
+    expect: &str,
+    timeout: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        // ReachabilityStatus rather than Status, because only that reply
+        // carries the daemon's version, which is the whole question here.
+        if let Ok(crate::control::ControlResponse::ReachabilityStatus { version, .. }) =
+            crate::daemon::send_control(home, crate::control::ControlRequest::ReachabilityStatus)
+                .await
+            && version == expect
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }
 
 /// Restart the managed service, in place. Only the supervisor calls this: it
@@ -500,12 +540,17 @@ fn restart_service() -> Result<()> {
 /// It runs the ROLLBACK binary, not the new one. The rollback is the copy
 /// already proven to work on this machine; asking a binary that may be broken to
 /// supervise its own installation is not supervision.
-pub fn supervisor_argv(home: &Path, rollback: &Path) -> (&'static str, Vec<String>) {
+pub fn supervisor_argv(home: &Path, rollback: &Path, expect: &str) -> (&'static str, Vec<String>) {
     (
         "systemd-run",
         vec![
             "--user".into(),
-            // Well after the +3s restart that `service::install` scheduled: this
+            // WITHOUT THIS THE DELAY IS A SUGGESTION. systemd defaults to
+            // AccuracySec=1min and batches timers, so `--on-active=12` fired at
+            // the same instant as the +3s restart on droppy, collapsing the
+            // ordering these two delays exist to create.
+            "--timer-property=AccuracySec=1s".into(),
+            // After the +3s restart that `service::install` scheduled: this
             // verifies that restart, it does not perform it.
             "--on-active=12".into(),
             rollback.display().to_string(),
@@ -514,19 +559,25 @@ pub fn supervisor_argv(home: &Path, rollback: &Path) -> (&'static str, Vec<Strin
             "supervise-restart".into(),
             "--rollback".into(),
             rollback.display().to_string(),
+            "--expect".into(),
+            expect.into(),
         ],
     )
 }
 
 #[cfg(target_os = "linux")]
-fn schedule_supervisor(home: &crate::config::FabricHome, rollback: &Path) -> Result<()> {
+fn schedule_supervisor(
+    home: &crate::config::FabricHome,
+    rollback: &Path,
+    expect: &str,
+) -> Result<()> {
     if !rollback.exists() {
         // A first install has no rollback, so there is nothing to heal back to
         // and nothing known-good to supervise with.
         println!("supervise\tskipped, there is no previous binary to fall back to");
         return Ok(());
     }
-    let (program, args) = supervisor_argv(home.root(), rollback);
+    let (program, args) = supervisor_argv(home.root(), rollback, expect);
     let status = std::process::Command::new(program)
         .args(&args)
         .status()
@@ -542,7 +593,11 @@ fn schedule_supervisor(home: &crate::config::FabricHome, rollback: &Path) -> Res
 }
 
 #[cfg(not(target_os = "linux"))]
-fn schedule_supervisor(_home: &crate::config::FabricHome, _rollback: &Path) -> Result<()> {
+fn schedule_supervisor(
+    _home: &crate::config::FabricHome,
+    _rollback: &Path,
+    _expect: &str,
+) -> Result<()> {
     // macOS installs verify in place: `launchctl kickstart` does not tear down
     // the caller, so `service::install` already waits for the control socket and
     // fails loudly if it never answers.
@@ -635,7 +690,8 @@ pub async fn run(home: &crate::config::FabricHome, options: UpdateOptions) -> Re
         println!("rollback\t{}", rollback.display());
     }
 
-    finish(home, &options, &rollback)?;
+    let running = binary_version(&installed_path)?;
+    finish(home, &options, &rollback, &running)?;
     Ok(0)
 }
 
@@ -683,7 +739,8 @@ async fn roll_back(
     if previous.exists() {
         println!("rollback\t{}", previous.display());
     }
-    finish(home, options, &previous)?;
+    let running = binary_version(installed_path)?;
+    finish(home, options, &previous, &running)?;
     Ok(0)
 }
 
@@ -692,6 +749,7 @@ fn finish(
     home: &crate::config::FabricHome,
     options: &UpdateOptions,
     rollback: &Path,
+    expect: &str,
 ) -> Result<()> {
     if options.no_restart {
         println!("restart\tskipped");
@@ -727,7 +785,7 @@ fn finish(
             memory_max_mb: None,
         },
     )?;
-    schedule_supervisor(home, rollback)
+    schedule_supervisor(home, rollback, expect)
 }
 
 #[cfg(test)]
@@ -1083,7 +1141,8 @@ mod supervisor_tests {
     #[test]
     fn the_supervisor_runs_detached_and_uses_the_known_good_binary() {
         let rollback = Path::new("/home/n/.local/bin/fabric.rollback-1000");
-        let (program, args) = supervisor_argv(Path::new("/home/n/.local/share/fabric"), rollback);
+        let (program, args) =
+            supervisor_argv(Path::new("/home/n/.local/share/fabric"), rollback, "0.2.0+abc1234");
 
         assert_eq!(
             program, "systemd-run",
@@ -1110,6 +1169,40 @@ mod supervisor_tests {
         assert!(
             args.contains(&"supervise-restart"),
             "the supervisor does not invoke the supervising subcommand: {args:?}"
+        );
+    }
+
+    /// The two delays encode an ORDER: restart at +3s, verify at +12s. systemd
+    /// defaults to `AccuracySec=1min` and batches timers, which on droppy fired
+    /// both at the same instant and collapsed that order.
+    #[test]
+    fn the_supervisor_timer_is_accurate_enough_for_its_own_delay() {
+        let (_, args) = supervisor_argv(
+            Path::new("/home/n/.local/share/fabric"),
+            Path::new("/home/n/.local/bin/fabric.rollback-1000"),
+            "0.2.0+abc1234",
+        );
+        assert!(
+            args.iter().any(|a| a == "--timer-property=AccuracySec=1s"),
+            "without this systemd may fire the verifier alongside the restart it \
+             is meant to verify: {args:?}"
+        );
+    }
+
+    /// The supervisor must be told WHICH version counts as a healthy restart.
+    /// Without it the only question it can ask is whether something answers the
+    /// socket, and the old daemon answers right up until it is torn down.
+    #[test]
+    fn the_supervisor_is_told_what_a_healthy_restart_looks_like() {
+        let (_, args) = supervisor_argv(
+            Path::new("/home/n/.local/share/fabric"),
+            Path::new("/home/n/.local/bin/fabric.rollback-1000"),
+            "0.2.0+abc1234",
+        );
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        assert!(
+            args.windows(2).any(|w| w == ["--expect", "0.2.0+abc1234"]),
+            "the supervisor cannot tell the new daemon from the old one: {args:?}"
         );
     }
 }

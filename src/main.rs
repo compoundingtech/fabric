@@ -187,6 +187,11 @@ enum Commands {
     SuperviseRestart {
         #[arg(long)]
         rollback: PathBuf,
+        /// The version the daemon must report before this counts as a healthy
+        /// restart. Checking that a socket answers is not enough: the old daemon
+        /// is still answering until the moment it is torn down.
+        #[arg(long)]
+        expect: String,
     },
     /// Update this machine's fabric to a verified build, then restart it.
     ///
@@ -708,8 +713,8 @@ async fn main() -> Result<()> {
                         service::uninstall()?;
                     }
                 },
-                Commands::SuperviseRestart { rollback } => {
-                    update::supervise_restart(&home, &rollback).await?;
+                Commands::SuperviseRestart { rollback, expect } => {
+                    update::supervise_restart(&home, &rollback, &expect).await?;
                 }
                 Commands::Update {
                     tag,
