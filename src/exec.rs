@@ -60,6 +60,32 @@ where
 /// Server side of an exec session: read the argv, spawn the command with no tty
 /// and a null stdin, stream its stdout and stderr back as separate frames, then
 /// send the process's exit code.
+/// `PATH` for a spawned command: fabric's own directory, then whatever the
+/// daemon inherited.
+///
+/// Prepended rather than appended, so the fabric that answers is the one
+/// actually running this daemon rather than an older copy earlier in the path.
+/// Absent or unresolvable, the inherited value is returned unchanged: a spawned
+/// command with a slightly short PATH is a much smaller problem than one with no
+/// PATH at all.
+pub fn exec_path_env() -> String {
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+    else {
+        return inherited;
+    };
+    let dir = dir.display().to_string();
+    if inherited.is_empty() {
+        return dir;
+    }
+    if inherited.split(':').any(|entry| entry == dir) {
+        return inherited;
+    }
+    format!("{dir}:{inherited}")
+}
+
 pub async fn serve_exec_session<R, W>(recv: &mut R, send: &mut W, peer: &str) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -77,6 +103,22 @@ where
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
+        // Put fabric's own directory on PATH for the spawned command.
+        //
+        // The daemon inherits a minimal environment, so `fabric exec <peer> --
+        // fabric ...` failed with "No such file or directory" even though fabric
+        // was plainly installed. A login shell found it, because a profile adds
+        // the directory; a bare exec did not.
+        //
+        // That is not a cosmetic gap. `fabric update` is deliberately local-only
+        // BECAUSE a fleet sweep composes as `fabric exec <peer> -- fabric
+        // update`. If that composition does not resolve, the argument for
+        // leaving out a sweep subcommand is not true.
+        //
+        // The running binary's own directory, not a login shell: it is
+        // deterministic, it runs no profile code we do not control, and it makes
+        // `fabric exec <peer> -- fabric <anything>` work by construction.
+        .env("PATH", exec_path_env())
         // Markers so the spawned command (and any shell it sources) can tell it is
         // running under fabric exec — in the daemon's session, not the caller's.
         // FABRIC_PEER is the connecting peer's NodeID — who ran this command.
@@ -361,5 +403,60 @@ mod tests {
             read_server_frame(&mut reader).await.unwrap(),
             Some(ServerFrame::Exit(EXIT_EXEC_DISABLED))
         ));
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    /// `fabric exec <peer> -- fabric ...` must resolve, because that composition
+    /// is the reason `fabric update` has no fleet-sweep subcommand. If it does
+    /// not resolve, the argument for the smaller scope is not true.
+    #[test]
+    fn a_spawned_command_can_find_the_fabric_that_spawned_it() {
+        let path = exec_path_env();
+        let dir = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .display()
+            .to_string();
+        assert!(
+            path.split(':').any(|entry| entry == dir),
+            "the running fabric's directory is not on the spawned PATH:\n{path}"
+        );
+    }
+
+    /// Prepended, so the fabric that answers is the one running this daemon and
+    /// not an older copy sitting earlier in the inherited path.
+    #[test]
+    fn fabric_comes_before_whatever_was_inherited() {
+        let path = exec_path_env();
+        let dir = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .display()
+            .to_string();
+        assert_eq!(
+            path.split(':').next(),
+            Some(dir.as_str()),
+            "fabric's directory is not first:\n{path}"
+        );
+    }
+
+    /// Whatever the daemon inherited has to survive. A command that gains fabric
+    /// and loses `sh` is worse off than before.
+    #[test]
+    fn the_inherited_path_is_kept() {
+        let inherited = std::env::var("PATH").unwrap_or_default();
+        let path = exec_path_env();
+        for entry in inherited.split(':').filter(|entry| !entry.is_empty()) {
+            assert!(
+                path.split(':').any(|kept| kept == entry),
+                "the inherited entry {entry} was dropped:\n{path}"
+            );
+        }
     }
 }
