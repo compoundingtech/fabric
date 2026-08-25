@@ -1,0 +1,1115 @@
+//! `fabric update` — replace this machine's fabric with a verified build.
+//!
+//! The recipe here is not new. It existed three times over, in `install.sh`, in
+//! the README, and in a shell script that lived on one machine and was
+//! base64-encoded across the wire to the others. Each copy knew a trap the
+//! others did not. This is one copy, in the binary, with the traps as tests.
+//!
+//! WHAT THE CHECKSUM DOES AND DOES NOT DO. With `--url` and an explicit
+//! `--sha256` it is a real check that the bytes are the ones the caller named.
+//! On the release paths the sidecar is fetched from the SAME server as the
+//! artifact, so it protects against corruption and truncation and NOT against a
+//! compromised release. That is the ordinary trust model for a release install,
+//! and it is written down here so nobody reads the word "verify" as more than it
+//! is.
+
+use anyhow::{Context, Result, bail};
+
+/// `--check` answers three questions, not two. A sweep that cannot tell "the
+/// release server is unreachable" from "an update is available" will act on the
+/// wrong one.
+pub const CHECK_EXIT_CURRENT: i32 = 0;
+pub const CHECK_EXIT_AVAILABLE: i32 = 1;
+pub const CHECK_EXIT_ERROR: i32 = 2;
+
+const RELEASE_REPO: &str = "compoundingtech/fabric";
+
+/// Where the artifact comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// A published release. `None` means whatever is latest.
+    Release { tag: Option<String> },
+    /// An artifact the caller named, with the hash they expect it to have.
+    Explicit { url: String, sha256: String },
+}
+
+/// The release target triple for the machine this binary was built for.
+///
+/// Deliberately built from `cfg!` rather than read from the environment: the
+/// asset that gets installed must match the binary doing the installing, and a
+/// runtime lookup could disagree with the compile that produced it.
+pub fn target_triple() -> Result<&'static str> {
+    Ok(match (cfg!(target_os = "macos"), cfg!(target_arch = "aarch64")) {
+        (true, true) => "aarch64-apple-darwin",
+        (false, true) => "aarch64-unknown-linux-gnu",
+        (false, false) => "x86_64-unknown-linux-gnu",
+        (true, false) => bail!("fabric publishes no release for this platform"),
+    })
+}
+
+pub fn asset_name(target: &str) -> String {
+    format!("fabric-{target}.tar.gz")
+}
+
+pub fn release_asset_url(tag: &str, asset: &str) -> String {
+    format!("https://github.com/{RELEASE_REPO}/releases/download/{tag}/{asset}")
+}
+
+pub fn latest_release_api_url() -> String {
+    format!("https://api.github.com/repos/{RELEASE_REPO}/releases/latest")
+}
+
+/// Decide where the artifact comes from, refusing the combination that would
+/// run unverified bytes.
+///
+/// An explicit URL with no hash is remote code execution with good manners, so
+/// it is rejected rather than defaulted. There is nothing sensible to default
+/// to: the whole point of `--url` is that fabric does not know what is there.
+pub fn resolve_source(
+    tag: Option<String>,
+    url: Option<String>,
+    sha256: Option<String>,
+) -> Result<Source> {
+    match (tag, url, sha256) {
+        (Some(_), Some(_), _) => {
+            bail!("--tag and --url name two different artifacts; pass one of them")
+        }
+        (_, None, Some(_)) => {
+            bail!("--sha256 only means something with --url; a release carries its own checksum")
+        }
+        (_, Some(url), None) => bail!(
+            "--url requires --sha256.\n\
+             \n\
+             fabric will not install bytes it cannot check against a hash you \
+             named, and it has nothing to compare {url} against on its own."
+        ),
+        (_, Some(url), Some(sha256)) => {
+            let sha256 = normalise_sha256(&sha256)?;
+            Ok(Source::Explicit { url, sha256 })
+        }
+        (tag, None, None) => Ok(Source::Release { tag }),
+    }
+}
+
+/// Accept a hash in the shape a person actually pastes, and reject anything that
+/// is not one. Length and alphabet are the whole contract.
+fn normalise_sha256(raw: &str) -> Result<String> {
+    let hash = raw.trim().to_ascii_lowercase();
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!(
+            "--sha256 must be 64 hex characters, got {} characters: {raw}",
+            hash.len()
+        );
+    }
+    Ok(hash)
+}
+
+/// Pull the hash out of a published `.sha256` sidecar.
+///
+/// The sidecar reads `<hash>  dist/fabric-<target>.tar.gz`, carrying the path it
+/// had on the builder. That path does not exist here, so handing the file to
+/// `shasum -c` fails on the path rather than on the bytes. Take field one.
+pub fn parse_sha256_sidecar(text: &str) -> Result<String> {
+    let field = text
+        .split_whitespace()
+        .next()
+        .context("the checksum sidecar was empty")?;
+    normalise_sha256(field)
+}
+
+/// Compare the bytes we hold against the hash we expected.
+pub fn verify_sha256(bytes: &[u8], expected: &str) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let actual = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if actual != expected {
+        bail!(
+            "checksum mismatch, nothing was installed\n  expected  {expected}\n  actual    {actual}"
+        );
+    }
+    Ok(())
+}
+
+/// Take the one `fabric` binary out of a release archive, refusing anything that
+/// is not exactly that.
+///
+/// A release archive holds a single member named literally `fabric`. Not
+/// `./fabric`, not a directory, not two files. Anything else is not a thing we
+/// published, and unpacking it to find out would already have written it.
+pub fn extract_fabric_binary(archive: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let decoder = flate2::read::GzDecoder::new(archive);
+    let mut tar = tar::Archive::new(decoder);
+    let mut found: Option<Vec<u8>> = None;
+    let mut names = Vec::new();
+    for entry in tar.entries().context("the archive could not be read")? {
+        let mut entry = entry.context("the archive holds an unreadable member")?;
+        // Compare the RAW stored name. The parsed path agrees with it today —
+        // the tar crate normalises `./fabric` on the way IN, not on the way out,
+        // so both forms read back as `./fabric` and both would reject it. This
+        // is belt and braces, not a fix: it cannot drift if the path parser ever
+        // starts normalising, and the exact bytes are what we actually publish.
+        //
+        // I claimed the opposite here first, that the parsed form would accept
+        // `./fabric`. Mutating the code back proved it would not. Left corrected
+        // rather than left flattering.
+        let raw = entry.path_bytes().into_owned();
+        let name = String::from_utf8_lossy(&raw).into_owned();
+        names.push(name.clone());
+        if raw.as_slice() == b"fabric" {
+            let mut bytes = Vec::new();
+            entry
+                .read_to_end(&mut bytes)
+                .context("the fabric member could not be read")?;
+            found = Some(bytes);
+        }
+    }
+    if names.len() != 1 || found.is_none() {
+        bail!(
+            "the archive is not a fabric release: expected exactly one member named \
+             `fabric`, found {names:?}"
+        );
+    }
+    Ok(found.expect("checked above"))
+}
+
+/// The version a release tag promises. Tags are `v<version>`; the binary reports
+/// `<version>`.
+pub fn version_for_tag(tag: &str) -> &str {
+    tag.strip_prefix('v').unwrap_or(tag)
+}
+
+// ---------------------------------------------------------------------------
+// Everything below touches the network, the filesystem or the service manager.
+// ---------------------------------------------------------------------------
+
+use std::path::{Path, PathBuf};
+
+/// reqwest is built here without a process-wide crypto provider, because iroh
+/// supplies one per endpoint instead. `update` makes its own requests, so it has
+/// to install one before the first, and only once per process.
+fn ensure_crypto_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+/// Fetch bytes from `https://` or `file:///`.
+///
+/// `file:///` exists so a locally built artifact can be installed the same way a
+/// release is, with the same hash check. reqwest does not handle that scheme, so
+/// it is read directly rather than pretended to be a request.
+pub async fn fetch(url: &str) -> Result<Vec<u8>> {
+    if let Some(path) = url.strip_prefix("file://") {
+        // `file:///tmp/x` leaves a leading slash, which is the absolute path.
+        let path = if path.is_empty() { "/" } else { path };
+        return tokio::fs::read(path)
+            .await
+            .with_context(|| format!("failed to read {path}"));
+    }
+    if !url.starts_with("https://") {
+        bail!("refusing {url}: only https:// and file:/// are accepted");
+    }
+    ensure_crypto_provider();
+    let response = reqwest::Client::builder()
+        // GitHub rejects requests with no user agent.
+        .user_agent(concat!("fabric/", env!("CARGO_PKG_VERSION")))
+        .build()?
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("failed to reach {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("{url} returned {status}");
+    }
+    Ok(response
+        .bytes()
+        .await
+        .with_context(|| format!("failed to read the body of {url}"))?
+        .to_vec())
+}
+
+/// The tag GitHub currently marks as latest.
+pub async fn latest_tag() -> Result<String> {
+    let body = fetch(&latest_release_api_url()).await?;
+    let json: serde_json::Value =
+        serde_json::from_slice(&body).context("the release API returned something that is not JSON")?;
+    json.get("tag_name")
+        .and_then(|tag| tag.as_str())
+        .map(str::to_string)
+        .context("the release API returned no tag_name")
+}
+
+/// Where the binary that the SERVICE MANAGER runs actually lives.
+///
+/// Not `command -v fabric`, and not always `current_exe`. The interactive
+/// binary on `$PATH` can differ from the one in the plist or unit, and
+/// installing at the wrong one leaves the daemon running the old code while
+/// `--version` cheerfully reports the new. That trap is inherited from the shell
+/// script this replaces, where it is written in a comment nobody else could see.
+pub fn managed_binary_path() -> Result<PathBuf> {
+    if let Some(path) = managed_binary_path_from_service_manager() {
+        return Ok(path);
+    }
+    std::env::current_exe().context("could not determine which binary is running")
+}
+
+#[cfg(target_os = "macos")]
+fn managed_binary_path_from_service_manager() -> Option<PathBuf> {
+    let plist = crate::service::launch_agent_path().ok()?;
+    if !plist.exists() {
+        return None;
+    }
+    // `plutil` is part of macOS and `service.rs` already relies on it. Parsing
+    // our own XML by hand would be one guess about a file a person may have
+    // edited.
+    let out = std::process::Command::new("plutil")
+        .args(["-extract", "ProgramArguments.0", "raw", "-o", "-"])
+        .arg(&plist)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+#[cfg(target_os = "linux")]
+fn managed_binary_path_from_service_manager() -> Option<PathBuf> {
+    let out = std::process::Command::new("systemctl")
+        .args(["--user", "show", "-p", "ExecStart", "--value", "fabric.service"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    // The value reads `... argv[]=/path/to/fabric --home ... ; ...`
+    let path = text
+        .split("argv[]=")
+        .nth(1)?
+        .split_whitespace()
+        .next()?
+        .trim_end_matches(';')
+        .to_string();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+/// What a staged binary says it is. Running it is the only honest way to ask.
+pub fn binary_version(path: &Path) -> Result<String> {
+    let out = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("failed to run {}", path.display()))?;
+    if !out.status.success() {
+        bail!("{} could not report its version", path.display());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Put `bytes` at `path`, keeping the file that was there as a rollback.
+///
+/// Both steps go through a same-directory temporary plus a rename. Copying over
+/// a running binary is `ETXTBSY`; renaming past it leaves the running process on
+/// its old inode and the next start on the new one. Same directory matters, or
+/// the rename is a cross-filesystem copy and stops being atomic.
+pub fn install_binary(path: &Path, bytes: &[u8], stamp: &str) -> Result<PathBuf> {
+    let staged = stage_binary(path, bytes, stamp)?;
+    commit_staged(&staged, path, stamp)
+}
+
+/// Write the incoming binary NEXT TO where it will live, executable, without
+/// disturbing what is there.
+///
+/// Beside it rather than in a temp dir for two reasons: the rename that follows
+/// is only atomic within one filesystem, and a staged binary has to be runnable
+/// so its `--version` can be asked before anything is committed.
+pub fn stage_binary(path: &Path, bytes: &[u8], stamp: &str) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = path
+        .parent()
+        .context("the install path has no directory to write beside")?;
+    let staged = dir.join(format!(".fabric-incoming-{stamp}"));
+    std::fs::write(&staged, bytes)
+        .with_context(|| format!("failed to stage {}", staged.display()))?;
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("failed to make {} executable", staged.display()))?;
+    Ok(staged)
+}
+
+/// Move a staged binary into place, keeping whatever was there as a rollback.
+///
+/// Both moves are renames within one directory. Copying over a running binary is
+/// `ETXTBSY`; renaming past it leaves the running process on its old inode and
+/// the next start on the new one.
+pub fn commit_staged(staged: &Path, path: &Path, stamp: &str) -> Result<PathBuf> {
+    let dir = path
+        .parent()
+        .context("the install path has no directory to write beside")?;
+    let rollback = path.with_file_name(format!(
+        "{}.rollback-{stamp}",
+        path.file_name()
+            .context("the install path has no file name")?
+            .to_string_lossy()
+    ));
+
+    if path.exists() {
+        let aside = dir.join(format!(".fabric-rollback-{stamp}"));
+        std::fs::copy(path, &aside)
+            .with_context(|| format!("failed to copy {} aside", path.display()))?;
+        std::fs::rename(&aside, &rollback)
+            .with_context(|| format!("failed to place {}", rollback.display()))?;
+    }
+    std::fs::rename(staged, path)
+        .with_context(|| format!("failed to install {}", path.display()))?;
+    Ok(rollback)
+}
+
+/// A stamp for rollback names. Seconds are enough: two updates inside one second
+/// on one machine is not a case worth a dependency.
+pub fn timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    format!("{secs}")
+}
+
+/// The newest rollback binary sitting beside `path`, if there is one.
+pub fn newest_rollback(path: &Path) -> Result<Option<PathBuf>> {
+    let dir = path.parent().context("no directory to search")?;
+    let prefix = format!(
+        "{}.rollback-",
+        path.file_name()
+            .context("no file name")?
+            .to_string_lossy()
+    );
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let modified = entry.metadata()?.modified()?;
+        if best.as_ref().is_none_or(|(seen, _)| modified > *seen) {
+            best = Some((modified, entry.path()));
+        }
+    }
+    Ok(best.map(|(_, path)| path))
+}
+
+/// How long the supervisor gives the restarted daemon to answer before it
+/// decides the new binary does not work. Generous: a slow machine coming back
+/// under load must not be mistaken for a broken build.
+const SUPERVISE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Check that the daemon came back, and put the old binary back if it did not.
+///
+/// THIS EXISTS BECAUSE NOTHING OUTSIDE THE MACHINE CAN FIX IT. If a bad binary
+/// takes the daemon down, `fabric exec` stops working, and the tool that would
+/// repair the machine is the tool that just broke it. On hetz and droppy there
+/// is still ssh. On a travelling laptop there may be nothing for days.
+///
+/// It cannot run in the updating process either: on Linux that process lives
+/// inside the service's own cgroup and dies with the restart. So it is scheduled
+/// as a transient unit, and it runs the ROLLBACK binary rather than the new one,
+/// because the rollback is the copy already proven to work on this machine.
+pub async fn supervise_restart(home: &crate::config::FabricHome, rollback: &Path) -> Result<()> {
+    if crate::service::wait_for_control_socket(home, SUPERVISE_READY_TIMEOUT) {
+        println!("supervise\tthe daemon came back");
+        return Ok(());
+    }
+
+    eprintln!(
+        "supervise\tthe daemon did not answer within {}s; restoring {}",
+        SUPERVISE_READY_TIMEOUT.as_secs(),
+        rollback.display()
+    );
+
+    let installed_path = managed_binary_path()?;
+    let bytes = std::fs::read(rollback)
+        .with_context(|| format!("failed to read {}", rollback.display()))?;
+    let stamp = timestamp();
+    let staged = stage_binary(&installed_path, &bytes, &stamp)?;
+    commit_staged(&staged, &installed_path, &stamp)?;
+
+    restart_service()?;
+    if crate::service::wait_for_control_socket(home, SUPERVISE_READY_TIMEOUT) {
+        eprintln!("supervise\trolled back and the daemon came back");
+        return Ok(());
+    }
+    bail!(
+        "rolled back to {} and the daemon still did not answer; this machine needs a person",
+        rollback.display()
+    );
+}
+
+/// Restart the managed service, in place. Only the supervisor calls this: it
+/// already runs outside the service's cgroup, so it is not restarting itself.
+fn restart_service() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::process::Command::new("systemctl")
+            .args(["--user", "restart", "fabric.service"])
+            .status()
+            .context("failed to run systemctl")?;
+        if !status.success() {
+            bail!("systemctl --user restart fabric.service failed with {status}");
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let target = format!(
+            "gui/{}/com.compoundingtech.fabric",
+            unsafe { libc::geteuid() }
+        );
+        let status = std::process::Command::new("launchctl")
+            .args(["kickstart", "-k", &target])
+            .status()
+            .context("failed to run launchctl")?;
+        if !status.success() {
+            bail!("launchctl kickstart failed with {status}");
+        }
+        Ok(())
+    }
+}
+
+/// Schedule the supervisor to run outside this process's cgroup.
+///
+/// The delay lets the restart that `service::install` scheduled actually happen
+/// first: the supervisor is a verifier, not the thing that bounces the daemon.
+/// The command that schedules the supervisor.
+///
+/// NOT cfg-gated, so it can be tested from a Mac. This is the shape whose
+/// regression leaves a Linux machine down with no way in, which is exactly the
+/// kind of thing that must not be verifiable only on the platform where it
+/// hurts.
+///
+/// It runs the ROLLBACK binary, not the new one. The rollback is the copy
+/// already proven to work on this machine; asking a binary that may be broken to
+/// supervise its own installation is not supervision.
+pub fn supervisor_argv(home: &Path, rollback: &Path) -> (&'static str, Vec<String>) {
+    (
+        "systemd-run",
+        vec![
+            "--user".into(),
+            // Well after the +3s restart that `service::install` scheduled: this
+            // verifies that restart, it does not perform it.
+            "--on-active=12".into(),
+            rollback.display().to_string(),
+            "--home".into(),
+            home.display().to_string(),
+            "supervise-restart".into(),
+            "--rollback".into(),
+            rollback.display().to_string(),
+        ],
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn schedule_supervisor(home: &crate::config::FabricHome, rollback: &Path) -> Result<()> {
+    if !rollback.exists() {
+        // A first install has no rollback, so there is nothing to heal back to
+        // and nothing known-good to supervise with.
+        println!("supervise\tskipped, there is no previous binary to fall back to");
+        return Ok(());
+    }
+    let (program, args) = supervisor_argv(home.root(), rollback);
+    let status = std::process::Command::new(program)
+        .args(&args)
+        .status()
+        .context("failed to schedule the restart supervisor")?;
+    if !status.success() {
+        bail!("could not schedule the restart supervisor: {status}");
+    }
+    println!(
+        "supervise\tscheduled, will restore {} if the daemon does not come back",
+        rollback.display()
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn schedule_supervisor(_home: &crate::config::FabricHome, _rollback: &Path) -> Result<()> {
+    // macOS installs verify in place: `launchctl kickstart` does not tear down
+    // the caller, so `service::install` already waits for the control socket and
+    // fails loudly if it never answers.
+    Ok(())
+}
+
+/// What the caller asked for.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateOptions {
+    pub tag: Option<String>,
+    pub url: Option<String>,
+    pub sha256: Option<String>,
+    pub check: bool,
+    pub dry_run: bool,
+    pub no_restart: bool,
+    pub rollback: bool,
+}
+
+/// Run an update. Returns the process exit code, which only `--check` uses for
+/// anything other than success.
+pub async fn run(home: &crate::config::FabricHome, options: UpdateOptions) -> Result<i32> {
+    let installed_path = managed_binary_path()?;
+    let installed = binary_version(&installed_path).unwrap_or_else(|_| "unknown".into());
+    println!("installed\t{installed}");
+    println!("path\t{}", installed_path.display());
+
+    if options.rollback {
+        return roll_back(home, &installed_path, &options).await;
+    }
+
+    let source = resolve_source(options.tag.clone(), options.url.clone(), options.sha256.clone())?;
+    let (url, expected_hash, expected_version) = resolve_artifact(&source).await?;
+    println!("source\t{url}");
+
+    if options.check {
+        let Some(available) = expected_version else {
+            bail!(
+                "--check compares released versions, and --url names an artifact whose \
+                 version is only knowable by downloading it. Run without --check."
+            );
+        };
+        println!("available\t{available}");
+        if installed == available {
+            println!("up to date");
+            return Ok(CHECK_EXIT_CURRENT);
+        }
+        println!("update available");
+        return Ok(CHECK_EXIT_AVAILABLE);
+    }
+
+    let archive = fetch(&url).await?;
+    verify_sha256(&archive, &expected_hash)?;
+    println!("checksum\tok");
+
+    let binary = extract_fabric_binary(&archive)?;
+    let stamp = timestamp();
+    let staged = stage_binary(&installed_path, &binary, &stamp)?;
+
+    // Ask the binary what it is before trusting it with the name of the one
+    // that is running. A staged file that cannot answer is not installed.
+    let staged_version = match binary_version(&staged) {
+        Ok(version) => version,
+        Err(error) => {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error.context("the downloaded binary could not run, so nothing was installed"));
+        }
+    };
+    println!("downloaded\t{staged_version}");
+
+    if let Some(expected) = &expected_version
+        && &staged_version != expected
+    {
+        let _ = std::fs::remove_file(&staged);
+        bail!(
+            "the release claims to be {expected} but the binary in it reports \
+             {staged_version}; nothing was installed"
+        );
+    }
+
+    if options.dry_run {
+        let _ = std::fs::remove_file(&staged);
+        println!();
+        println!("DRY RUN: verified and stopped. Nothing was changed.");
+        return Ok(0);
+    }
+
+    let rollback = commit_staged(&staged, &installed_path, &stamp)?;
+    println!("installed\t{}", binary_version(&installed_path)?);
+    if rollback.exists() {
+        println!("rollback\t{}", rollback.display());
+    }
+
+    finish(home, &options, &rollback)?;
+    Ok(0)
+}
+
+/// Work out where the bytes come from, what hash they must have, and what
+/// version they claim, without downloading the artifact itself.
+async fn resolve_artifact(source: &Source) -> Result<(String, String, Option<String>)> {
+    match source {
+        Source::Explicit { url, sha256 } => Ok((url.clone(), sha256.clone(), None)),
+        Source::Release { tag } => {
+            let tag = match tag {
+                Some(tag) => tag.clone(),
+                None => latest_tag().await?,
+            };
+            let asset = asset_name(target_triple()?);
+            let url = release_asset_url(&tag, &asset);
+            let sidecar = fetch(&format!("{url}.sha256")).await?;
+            let hash = parse_sha256_sidecar(&String::from_utf8_lossy(&sidecar))?;
+            Ok((url, hash, Some(version_for_tag(&tag).to_string())))
+        }
+    }
+}
+
+/// Put the most recent rollback binary back.
+async fn roll_back(
+    home: &crate::config::FabricHome,
+    installed_path: &Path,
+    options: &UpdateOptions,
+) -> Result<i32> {
+    let Some(rollback) = newest_rollback(installed_path)? else {
+        bail!(
+            "there is no rollback binary beside {}, so there is nothing to go back to",
+            installed_path.display()
+        );
+    };
+    let version = binary_version(&rollback)?;
+    println!("rolling back to\t{version}");
+    println!("from\t{}", rollback.display());
+
+    let bytes = std::fs::read(&rollback)
+        .with_context(|| format!("failed to read {}", rollback.display()))?;
+    let stamp = timestamp();
+    let staged = stage_binary(installed_path, &bytes, &stamp)?;
+    let previous = commit_staged(&staged, installed_path, &stamp)?;
+    println!("installed\t{}", binary_version(installed_path)?);
+    if previous.exists() {
+        println!("rollback\t{}", previous.display());
+    }
+    finish(home, options, &previous)?;
+    Ok(0)
+}
+
+/// Re-render the unit and restart, unless told not to.
+fn finish(
+    home: &crate::config::FabricHome,
+    options: &UpdateOptions,
+    rollback: &Path,
+) -> Result<()> {
+    if options.no_restart {
+        println!("restart\tskipped");
+        println!();
+        println!("The new binary is in place but the running daemon is still the old one.");
+        return Ok(());
+    }
+    if !home.is_default_state_root() {
+        // `service::install` refuses a non-default home on purpose, so say why
+        // rather than letting it fail with a message about something else.
+        println!("restart\tskipped");
+        println!();
+        println!(
+            "This --home is not the managed one, so there is no service to re-render \
+             or restart."
+        );
+        return Ok(());
+    }
+
+    // Re-render the unit and restart in one step. Passing every option as `None`
+    // keeps allow-shell, allow-exec and any memory ceiling exactly as they were:
+    // they round trip through config.toml rather than being re-derived here.
+    // Re-render pointing at the MANAGED binary, not at whatever is running this
+    // command. `service::install` would use `current_exe`, which during a manual
+    // test is a `target/debug` build.
+    let managed = managed_binary_path()?;
+    crate::service::install_at(
+        home,
+        &managed,
+        crate::service::ServiceInstallOptions {
+            allow_shell: None,
+            allow_exec: None,
+            memory_max_mb: None,
+        },
+    )?;
+    schedule_supervisor(home, rollback)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a tarball the way the release workflow does, so the archive checks
+    /// are tested against real bytes rather than a mock of them.
+    fn make_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+        for (name, bytes) in members {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder.append_data(&mut header, name, *bytes).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    const HASH: &str = "e6aac12fcf8be256aa713a017cfcd8d4e258f5f9f42e5bf8911ff189b73a1214";
+
+    /// The one refusal that matters. `--url` with no hash means running bytes
+    /// nobody checked, and there is nothing to default to: the whole point of
+    /// `--url` is that fabric does not know what is there.
+    #[test]
+    fn an_explicit_url_without_a_hash_is_refused() {
+        let error = resolve_source(None, Some("https://example.test/f.tar.gz".into()), None)
+            .expect_err("an unverified url was accepted");
+        let message = format!("{error}");
+        assert!(
+            message.contains("--sha256"),
+            "the refusal must name what is missing: {message}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_url_with_a_hash_is_accepted_and_the_hash_normalised() {
+        let source = resolve_source(
+            None,
+            Some("file:///tmp/f.tar.gz".into()),
+            // Pasted with stray case and whitespace, as a person would.
+            Some(format!("  {}  ", HASH.to_ascii_uppercase())),
+        )
+        .expect("a hashed url was refused");
+        assert_eq!(
+            source,
+            Source::Explicit {
+                url: "file:///tmp/f.tar.gz".into(),
+                sha256: HASH.into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_hash_that_is_not_a_sha256_is_refused() {
+        for bad in ["deadbeef", "", &"z".repeat(64)] {
+            assert!(
+                resolve_source(None, Some("file:///f".into()), Some(bad.into())).is_err(),
+                "accepted {bad:?} as a sha256"
+            );
+        }
+    }
+
+    #[test]
+    fn naming_two_sources_at_once_is_refused() {
+        assert!(
+            resolve_source(Some("v0.2.0".into()), Some("file:///f".into()), Some(HASH.into()))
+                .is_err(),
+            "--tag and --url name different artifacts and must not combine"
+        );
+    }
+
+    #[test]
+    fn a_hash_without_a_url_is_refused() {
+        assert!(
+            resolve_source(None, None, Some(HASH.into())).is_err(),
+            "a release carries its own checksum, so --sha256 alone is a mistake worth naming"
+        );
+    }
+
+    #[test]
+    fn no_options_means_the_latest_release() {
+        assert_eq!(
+            resolve_source(None, None, None).unwrap(),
+            Source::Release { tag: None }
+        );
+    }
+
+    /// The sidecar carries the path it had on the builder, which does not exist
+    /// here. Taking field one is the difference between checking the bytes and
+    /// failing on a directory name.
+    #[test]
+    fn the_sidecar_builder_path_is_ignored() {
+        let sidecar = format!("{HASH}  dist/fabric-aarch64-apple-darwin.tar.gz\n");
+        assert_eq!(parse_sha256_sidecar(&sidecar).unwrap(), HASH);
+    }
+
+    #[test]
+    fn a_checksum_mismatch_is_an_error_that_names_both_sides() {
+        let error = verify_sha256(b"not the release", HASH).expect_err("a mismatch was accepted");
+        let message = format!("{error}");
+        assert!(message.contains(HASH), "the expected hash is missing: {message}");
+        assert!(
+            message.contains("nothing was installed"),
+            "a mismatch must say that it changed nothing: {message}"
+        );
+    }
+
+    #[test]
+    fn a_matching_checksum_passes() {
+        use sha2::{Digest, Sha256};
+        let bytes = b"some release bytes";
+        let hash = Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        verify_sha256(bytes, &hash).expect("a matching checksum was rejected");
+    }
+
+    #[test]
+    fn a_release_archive_yields_the_binary() {
+        let archive = make_archive(&[("fabric", b"ELF-ish")]);
+        assert_eq!(extract_fabric_binary(&archive).unwrap(), b"ELF-ish");
+    }
+
+    /// Write a tar header by hand so the stored name is EXACTLY what we say.
+    ///
+    /// `tar::Builder` normalises `./fabric` to `fabric` on the way in, so it
+    /// cannot produce the archive shape this test is about. GNU tar does produce
+    /// it — `tar -czf x.tgz .` stores the dot-slash — so the fixture has to be
+    /// built by hand or the test would silently be checking `fabric`.
+    fn make_archive_with_raw_name(name: &str, bytes: &[u8]) -> Vec<u8> {
+        let mut header = [0u8; 512];
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        header[100..107].copy_from_slice(b"0000755");
+        header[108..115].copy_from_slice(b"0000000");
+        header[116..123].copy_from_slice(b"0000000");
+        let size = format!("{:011o}", bytes.len());
+        header[124..135].copy_from_slice(size.as_bytes());
+        header[136..147].copy_from_slice(b"00000000000");
+        header[148..156].copy_from_slice(b"        ");
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        let checksum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+        let checksum = format!("{checksum:06o}\0 ");
+        header[148..156].copy_from_slice(checksum.as_bytes());
+
+        let mut tar = Vec::new();
+        tar.extend_from_slice(&header);
+        tar.extend_from_slice(bytes);
+        tar.resize(tar.len().div_ceil(512) * 512, 0);
+        tar.extend_from_slice(&[0u8; 1024]);
+
+        use std::io::Write;
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&tar).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// `./fabric` is what GNU tar stores for `tar -czf x.tgz .`, and it is not
+    /// what the release workflow emits. Accepting it would mean accepting
+    /// archives we did not build.
+    #[test]
+    fn an_archive_whose_member_is_dot_slash_fabric_is_refused() {
+        // The fixture really does carry the dot-slash, or this proves nothing.
+        let archive = make_archive_with_raw_name("./fabric", b"ELF-ish");
+        let decoder = flate2::read::GzDecoder::new(&archive[..]);
+        let mut probe = tar::Archive::new(decoder);
+        let stored = probe
+            .entries()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path_bytes()
+            .into_owned();
+        assert_eq!(
+            stored.as_slice(),
+            b"./fabric",
+            "the fixture was normalised, so the test below would prove nothing"
+        );
+
+        assert!(
+            extract_fabric_binary(&archive).is_err(),
+            "./fabric is not the member name a fabric release has"
+        );
+    }
+
+    #[test]
+    fn an_archive_with_an_extra_member_is_refused() {
+        let archive = make_archive(&[("fabric", b"ELF-ish"), ("install.sh", b"rm -rf /")]);
+        assert!(
+            extract_fabric_binary(&archive).is_err(),
+            "a release holds one member; a second one is somebody else's archive"
+        );
+    }
+
+    #[test]
+    fn an_archive_without_fabric_is_refused() {
+        let archive = make_archive(&[("something-else", b"nope")]);
+        assert!(extract_fabric_binary(&archive).is_err());
+    }
+
+    #[test]
+    fn a_tag_names_the_version_the_binary_will_report() {
+        assert_eq!(version_for_tag("v0.2.0+76376d4"), "0.2.0+76376d4");
+        // Idempotent, because a caller may paste either form.
+        assert_eq!(version_for_tag("0.2.0+76376d4"), "0.2.0+76376d4");
+    }
+
+    #[test]
+    fn the_release_url_matches_what_the_workflow_publishes() {
+        let asset = asset_name("aarch64-apple-darwin");
+        assert_eq!(asset, "fabric-aarch64-apple-darwin.tar.gz");
+        assert_eq!(
+            release_asset_url("v0.2.0+76376d4", &asset),
+            "https://github.com/compoundingtech/fabric/releases/download/v0.2.0+76376d4/fabric-aarch64-apple-darwin.tar.gz"
+        );
+    }
+}
+
+#[cfg(test)]
+mod io_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// `file:///` is not a convenience. It is how a locally built artifact gets
+    /// installed through exactly the same path a release does, hash check
+    /// included, so the custom-build route is not a second untested code path.
+    #[tokio::test]
+    async fn a_file_url_is_read_and_hashed_like_any_other_source() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = dir.path().join("fabric.tar.gz");
+        std::fs::write(&artifact, b"pretend archive").unwrap();
+
+        let url = format!("file://{}", artifact.display());
+        let bytes = fetch(&url).await.expect("a file url could not be read");
+        assert_eq!(bytes, b"pretend archive");
+
+        let hash = Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        verify_sha256(&bytes, &hash).expect("the same bytes failed their own hash");
+    }
+
+    #[tokio::test]
+    async fn a_scheme_we_do_not_understand_is_refused() {
+        for url in ["http://example.test/f", "ftp://example.test/f", "/tmp/f"] {
+            let error = fetch(url).await.expect_err("accepted {url}");
+            assert!(
+                format!("{error}").contains("only https:// and file:///"),
+                "the refusal should say what is accepted: {error}"
+            );
+        }
+    }
+
+    /// The binary that was there must still be reachable after an install, or a
+    /// bad update has nothing to fall back to.
+    #[test]
+    fn installing_keeps_the_previous_binary_as_a_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fabric");
+        std::fs::write(&path, b"the old binary").unwrap();
+
+        let rollback = install_binary(&path, b"the new binary", "stamp").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"the new binary");
+        assert_eq!(
+            std::fs::read(&rollback).unwrap(),
+            b"the old binary",
+            "the previous binary was not preserved, so there is nothing to roll back to"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "an installed binary that is not executable is not installed"
+        );
+    }
+
+    /// A first install has nothing to preserve and must not invent something.
+    #[test]
+    fn installing_where_nothing_was_leaves_no_empty_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fabric");
+        let rollback = install_binary(&path, b"the new binary", "stamp").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"the new binary");
+        assert!(
+            !rollback.exists(),
+            "a rollback was created for a binary that never existed"
+        );
+    }
+
+    /// Nothing partial may survive a run. A leftover `.fabric-incoming-*` beside
+    /// the binary would be a half-written binary sitting in the install
+    /// directory, which is the sort of thing somebody later runs by mistake.
+    #[test]
+    fn installing_leaves_no_temporary_files_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fabric");
+        std::fs::write(&path, b"old").unwrap();
+        install_binary(&path, b"new", "stamp").unwrap();
+
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".fabric-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files were left: {leftovers:?}");
+    }
+
+    #[test]
+    fn the_newest_rollback_is_the_one_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fabric");
+        std::fs::write(&path, b"current").unwrap();
+
+        assert!(
+            newest_rollback(&path).unwrap().is_none(),
+            "a rollback was offered when none had been made"
+        );
+
+        let first = install_binary(&path, b"second", "1000").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let second = install_binary(&path, b"third", "2000").unwrap();
+
+        let newest = newest_rollback(&path).unwrap().expect("no rollback found");
+        assert_eq!(
+            newest, second,
+            "rolling back would have gone to {first:?} rather than the most recent"
+        );
+        assert_eq!(std::fs::read(&newest).unwrap(), b"second");
+    }
+}
+
+#[cfg(test)]
+mod supervisor_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// The supervisor must run OUTSIDE the caller's cgroup, and it must run the
+    /// binary already proven to work on this machine.
+    ///
+    /// Pinned as a shape rather than an effect, and deliberately not cfg-gated to
+    /// Linux. The failure this guards against leaves a remote machine down with
+    /// no way back in, so it cannot be a thing only testable on the platform
+    /// where it does the damage.
+    #[test]
+    fn the_supervisor_runs_detached_and_uses_the_known_good_binary() {
+        let rollback = Path::new("/home/n/.local/bin/fabric.rollback-1000");
+        let (program, args) = supervisor_argv(Path::new("/home/n/.local/share/fabric"), rollback);
+
+        assert_eq!(
+            program, "systemd-run",
+            "the supervisor would die with the cgroup it is meant to outlive"
+        );
+        assert!(
+            args.iter().any(|a| a.starts_with("--on-active=")),
+            "the supervisor must be scheduled, not run inline: {args:?}"
+        );
+
+        // It runs the rollback binary. Asking a possibly-broken new binary to
+        // supervise its own installation is not supervision.
+        assert_eq!(
+            args.iter().find(|a| a.contains("fabric.rollback-")),
+            Some(&rollback.display().to_string()),
+            "the supervisor is not the known-good binary: {args:?}"
+        );
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--rollback", &rollback.display().to_string()]),
+            "the supervisor was not told what to restore: {args:?}"
+        );
+        assert!(
+            args.contains(&"supervise-restart"),
+            "the supervisor does not invoke the supervising subcommand: {args:?}"
+        );
+    }
+}

@@ -18,6 +18,18 @@ n0-watcher = "1.0.0"
 portable-pty = "0.9.0"
 rand = "0.10.2"
 serde = { version = "1", features = ["derive"] }
+# `fabric update` downloads and verifies a release artifact. reqwest, rustls and
+# sha2 are already compiled as transitive dependencies of iroh, so naming them
+# here costs no new crates. The feature pin matters: reqwest's defaults would
+# pull aws-lc-rs in alongside the ring provider iroh already uses.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+sha2 = "0.11"
+# tar and flate2 ARE new. The updater is the recovery path, so it should depend
+# on as few working system tools as it can: `tar -xzf` is one more thing that has
+# to be present and correct on a machine that may already be unwell.
+tar = "0.4"
+flate2 = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"

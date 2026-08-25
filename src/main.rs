@@ -21,6 +21,7 @@ use fabric::{
     },
     exec,
     service::{self, ServiceInstallOptions},
+    update,
     shell::{self, ServerFrame},
     sync::config::{SyncBook, SyncEntry, SyncPeers, SyncPolicy},
     telemetry::PeerTelemetry,
@@ -178,6 +179,48 @@ enum Commands {
     Service {
         #[command(subcommand)]
         command: ServiceCommands,
+    },
+    /// Verify a restart from outside the service's own cgroup, and put the
+    /// previous binary back if the daemon does not come up. Scheduled by
+    /// `fabric update`; not something to run by hand.
+    #[command(hide = true)]
+    SuperviseRestart {
+        #[arg(long)]
+        rollback: PathBuf,
+    },
+    /// Update this machine's fabric to a verified build, then restart it.
+    ///
+    /// Acts on this machine only. To sweep the fleet, compose it:
+    /// `fabric exec <peer> -- fabric update`, one machine at a time.
+    Update {
+        /// Install a specific release tag instead of the latest.
+        #[arg(long)]
+        tag: Option<String>,
+        /// Install an artifact from an explicit URL. `https://` or `file:///`,
+        /// the latter for testing a build you made yourself. Requires --sha256.
+        #[arg(long)]
+        url: Option<String>,
+        /// The SHA-256 the artifact at --url must have. Required with --url:
+        /// fabric will not install bytes it cannot check against a hash you
+        /// named. Note this proves the bytes are the ones you asked for, not
+        /// that they are trustworthy.
+        #[arg(long)]
+        sha256: Option<String>,
+        /// Report what is installed against what is available and change
+        /// nothing. Exits 0 up to date, 1 update available, 2 error — an
+        /// unreachable release server must not read as an available update.
+        #[arg(long)]
+        check: bool,
+        /// Download, verify and stage, then stop without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Install without re-rendering the service or restarting it. The
+        /// running daemon keeps using the old binary until it is restarted.
+        #[arg(long)]
+        no_restart: bool,
+        /// Put the most recent rollback binary back and restart.
+        #[arg(long, conflicts_with_all = ["tag", "url", "check", "dry_run"])]
+        rollback: bool,
     },
     /// Internal/debug commands for transport testing.
     #[command(hide = true)]
@@ -665,6 +708,46 @@ async fn main() -> Result<()> {
                         service::uninstall()?;
                     }
                 },
+                Commands::SuperviseRestart { rollback } => {
+                    update::supervise_restart(&home, &rollback).await?;
+                }
+                Commands::Update {
+                    tag,
+                    url,
+                    sha256,
+                    check,
+                    dry_run,
+                    no_restart,
+                    rollback,
+                } => {
+                    let result = update::run(
+                        &home,
+                        update::UpdateOptions {
+                            tag,
+                            url,
+                            sha256,
+                            check,
+                            dry_run,
+                            no_restart,
+                            rollback,
+                        },
+                    )
+                    .await;
+                    match result {
+                        Ok(0) => {}
+                        Ok(code) => std::process::exit(code),
+                        // A FAILURE WHILE CHECKING IS NOT AN AVAILABLE UPDATE.
+                        // Letting the error propagate would exit 1, which is the
+                        // code that means "there is a new version", so a fleet
+                        // sweep would read an unreachable release server as
+                        // work to do. It exits 2 instead.
+                        Err(error) if check => {
+                            eprintln!("Error: {error:?}");
+                            std::process::exit(update::CHECK_EXIT_ERROR);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
                 Commands::Debug { command } => match command {
                     DebugCommands::DropTunnels => {
                         send_control(&home, ControlRequest::DropTunnelConnections).await?;
