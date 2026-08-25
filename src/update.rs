@@ -545,10 +545,17 @@ pub fn supervisor_argv(home: &Path, rollback: &Path, expect: &str) -> (&'static 
         "systemd-run",
         vec![
             "--user".into(),
-            // WITHOUT THIS THE DELAY IS A SUGGESTION. systemd defaults to
-            // AccuracySec=1min and batches timers, so `--on-active=12` fired at
-            // the same instant as the +3s restart on droppy, collapsing the
-            // ordering these two delays exist to create.
+            // WITHOUT THIS THE DELAY IS A SUGGESTION, and the finding is worth
+            // more than the flag.
+            //
+            // systemd defaults to AccuracySec=1min and batches timers. On droppy
+            // both this verifier and the +3s restart were scheduled at 10:58:16
+            // and BOTH FIRED AT 10:58:39 — 23 seconds late, together. The two
+            // delays encode an ORDER, restart then verify, and batching turned
+            // that order into a coincidence.
+            //
+            // A future reader sees two sensible delays and has no way to know
+            // they were not honoured.
             "--timer-property=AccuracySec=1s".into(),
             // After the +3s restart that `service::install` scheduled: this
             // verifies that restart, it does not perform it.
@@ -1203,6 +1210,90 @@ mod supervisor_tests {
         assert!(
             args.windows(2).any(|w| w == ["--expect", "0.2.0+abc1234"]),
             "the supervisor cannot tell the new daemon from the old one: {args:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod supervisor_failure_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Stand up something that answers the control socket and calls itself
+    /// `version`, so the supervisor can be pointed at a daemon that is up but is
+    /// the WRONG ONE.
+    async fn fake_daemon(home: &crate::config::FabricHome, version: &str) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let path = home.control_socket_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let version = version.to_string();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = vec![0u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let reply = crate::control::ControlResponse::ReachabilityStatus {
+                    version: version.clone(),
+                    node_id: "fake".into(),
+                    endpoint_addr: serde_json::Value::Null,
+                    exposed_protocols: Vec::new(),
+                    dial_sockets: Vec::new(),
+                    allow_shell: false,
+                    allow_exec: false,
+                    peers: Vec::new(),
+                    connection_telemetry: Default::default(),
+                };
+                let _ = stream
+                    .write_all(&serde_json::to_vec(&reply).unwrap())
+                    .await;
+                let _ = stream.shutdown().await;
+            }
+        });
+    }
+
+    /// THE FAULT THIS INSTRUMENT EXISTS TO DETECT, made to happen on purpose.
+    ///
+    /// A daemon is up and answering, and it is the OLD one. That is exactly the
+    /// state a failed update leaves behind, and the state the supervisor
+    /// previously blessed as healthy because something answered the socket.
+    ///
+    /// An instrument has to be able to fail before its success means anything.
+    #[tokio::test]
+    async fn a_daemon_answering_with_the_wrong_version_is_not_a_healthy_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = crate::config::FabricHome::new(dir.path());
+        fake_daemon(&home, "0.2.0+theoldone").await;
+
+        assert!(
+            !wait_for_daemon_version(&home, "0.2.0+thenewone", Duration::from_millis(600)).await,
+            "the supervisor accepted the OLD daemon as a healthy restart, which is \
+             the failure it exists to catch"
+        );
+    }
+
+    /// And it must accept the right one, or it would roll back every good update.
+    #[tokio::test]
+    async fn a_daemon_answering_with_the_expected_version_is_a_healthy_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = crate::config::FabricHome::new(dir.path());
+        fake_daemon(&home, "0.2.0+thenewone").await;
+
+        assert!(
+            wait_for_daemon_version(&home, "0.2.0+thenewone", Duration::from_secs(5)).await,
+            "the supervisor rejected the daemon it was told to expect"
+        );
+    }
+
+    /// Nothing answering at all must also fail, and must give up rather than hang.
+    #[tokio::test]
+    async fn no_daemon_at_all_is_not_a_healthy_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = crate::config::FabricHome::new(dir.path());
+        let started = std::time::Instant::now();
+        assert!(!wait_for_daemon_version(&home, "0.2.0+anything", Duration::from_millis(400)).await);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the supervisor hung instead of giving up"
         );
     }
 }
