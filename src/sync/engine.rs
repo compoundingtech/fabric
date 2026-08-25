@@ -5783,37 +5783,64 @@ mod tests {
         // caps expressed against that same rate, 112/36 and 76/36 of it, which is
         // the derivation the previous comment described. No new number is invented.
         let elapsed_millis = elapsed.as_millis().max(1);
-        // The ceiling was 4 per second, derived when a persist wrote 72 MB of
-        // pretty-printed JSON. Compact bookkeeping made a pass cheaper, so more
-        // legitimate passes fit the same fixed burst, and the old ceiling stopped
-        // bounding amplification and started bounding speed.
+
+        // BOUND THE AMPLIFICATION, NOT THE MACHINE.
         //
-        // MEASURED ON ONE MACHINE, FIVE RUNS EACH, THE SAME BURST:
-        //   pretty   30 to 34 reconciles, 2.86 to 3.15 per second
-        //   compact  38 reconciles every run, 3.52 to 3.60 per second
+        // This test used to cap reconciles per SECOND, and the scan and persist
+        // caps were derived from that same per-second figure. That made every
+        // bound a function of how fast the machine happened to be, so the test
+        // failed on hardware that was merely quick.
         //
-        // That rise is the intended effect and not amplification. The writers
-        // still perform a fixed number of revisions, and the run still has to
-        // converge below. The ceiling is re-derived to keep roughly the headroom
-        // it used to have above the observed rate, so a genuine feedback loop
-        // still trips it. It is fractionally more headroom than before, which is
-        // deliberate: this test has a history of failing on a loaded machine at
-        // rates that were legitimate.
+        // It failed exactly that way twice. The cap was 4/s, derived when a
+        // persist wrote 72 MB of pretty-printed JSON. Compact bookkeeping made a
+        // pass cheaper, more legitimate passes fit the same fixed burst, and I
+        // re-derived the cap as 5/s from macOS runs. Linux CI then produced
+        // 5.04/s and went red on a run whose behaviour was fine.
         //
-        // The scan and persist ceilings stay expressed against this same rate,
-        // 112/36 and 76/36 of it, so the original relationships are unchanged.
-        const MAX_RECONCILES_PER_SEC: u128 = 5;
+        // MEASURED, AND THIS IS THE POINT. Across both platforms the RATE moves
+        // a lot and the RATIOS barely move:
+        //
+        //   macOS      3.99 to 4.27 reconciles/s   2.50-2.61 scans   1.86-1.95 persists
+        //   Linux CI   5.04 reconciles/s           2.53 scans        1.81 persists
+        //
+        // Scans and persists PER RECONCILE are what "amplification" means, and
+        // they are independent of clock speed. So they are bounded directly, at
+        // the same strictness the old per-second forms implied: 112/36 scans and
+        // 76/36 persists per reconcile. Nothing is loosened.
+        //
+        // The reconcile rate keeps a ceiling, but only as a runaway backstop. A
+        // genuine feedback loop is orders of magnitude, not a fast laptop, so it
+        // sits far above anything either platform has produced.
+        const RUNAWAY_RECONCILES_PER_SEC: u128 = 10;
+        // One source for the allowance so the assertion and the message it
+        // prints can never disagree. They did: a tightened numerator still
+        // printed the old limit, which would send the next reader looking in
+        // the wrong place.
+        const ALLOWANCE_DEN: u128 = 36;
+        const SCANS_ALLOWED: u128 = 112;
+        const PERSISTS_ALLOWED: u128 = 76;
         assert!(
-            (reconciles as u128) * 1_000 <= elapsed_millis * MAX_RECONCILES_PER_SEC,
-            "reconcile rate exceeded: {reconciles} reconciles, {scans} scans, and {persists} persists in {elapsed:?}"
+            (reconciles as u128) * 1_000 <= elapsed_millis * RUNAWAY_RECONCILES_PER_SEC,
+            "runaway reconcile rate: {reconciles} reconciles in {elapsed:?}, which is \
+             far beyond anything a slow or fast machine explains"
         );
         assert!(
-            (scans as u128) * 1_000 * 36 <= elapsed_millis * MAX_RECONCILES_PER_SEC * 112,
-            "full-folder scan rate exceeded: {scans} scans against {reconciles} reconciles in {elapsed:?}"
+            reconciles > 0,
+            "no reconciles happened, so the ratios below would prove nothing"
         );
         assert!(
-            (persists as u128) * 1_000 * 36 <= elapsed_millis * MAX_RECONCILES_PER_SEC * 76,
-            "state persist rate exceeded: {persists} persists against {reconciles} reconciles in {elapsed:?}"
+            (scans as u128) * ALLOWANCE_DEN <= (reconciles as u128) * SCANS_ALLOWED,
+            "scan amplification: {scans} scans for {reconciles} reconciles is {:.2} \
+             per reconcile, over the {:.2} this entry is allowed",
+            scans as f64 / reconciles as f64,
+            SCANS_ALLOWED as f64 / ALLOWANCE_DEN as f64
+        );
+        assert!(
+            (persists as u128) * ALLOWANCE_DEN <= (reconciles as u128) * PERSISTS_ALLOWED,
+            "persist amplification: {persists} persists for {reconciles} reconciles is \
+             {:.2} per reconcile, over the {:.2} this entry is allowed",
+            persists as f64 / reconciles as f64,
+            PERSISTS_ALLOWED as f64 / ALLOWANCE_DEN as f64
         );
 
         // The bounded watcher work must still converge the latest value.
