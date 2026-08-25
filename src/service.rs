@@ -585,6 +585,7 @@ Type=simple\n\
 ExecStart={exec_start}\n\
 Restart=on-failure\n\
 RestartSec=5s\n\
+LimitNOFILE=8192\n\
 {memory_max}WorkingDirectory={}\n\
 \n\
 [Install]\n\
@@ -897,6 +898,9 @@ mod tests {
         let unit = render_systemd_user_unit(&spec);
         assert!(!unit.contains("MemoryMax"));
         assert!(unit.contains("Restart=on-failure"));
+        // Same reasoning as the launchd plist: the descriptor ceiling is not
+        // opt-in, because the inherited default is a number nobody chose.
+        assert!(unit.contains("LimitNOFILE=8192"));
 
         let plist = render_launch_agent_plist(&home, &spec)?;
         // The resident-set ceiling stays opt-in, so none of it appears here.
