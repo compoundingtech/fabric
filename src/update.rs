@@ -490,31 +490,54 @@ fn restart_service() -> Result<()> {
 ///
 /// The delay lets the restart that `service::install` scheduled actually happen
 /// first: the supervisor is a verifier, not the thing that bounces the daemon.
+/// The command that schedules the supervisor.
+///
+/// NOT cfg-gated, so it can be tested from a Mac. This is the shape whose
+/// regression leaves a Linux machine down with no way in, which is exactly the
+/// kind of thing that must not be verifiable only on the platform where it
+/// hurts.
+///
+/// It runs the ROLLBACK binary, not the new one. The rollback is the copy
+/// already proven to work on this machine; asking a binary that may be broken to
+/// supervise its own installation is not supervision.
+pub fn supervisor_argv(home: &Path, rollback: &Path) -> (&'static str, Vec<String>) {
+    (
+        "systemd-run",
+        vec![
+            "--user".into(),
+            // Well after the +3s restart that `service::install` scheduled: this
+            // verifies that restart, it does not perform it.
+            "--on-active=12".into(),
+            rollback.display().to_string(),
+            "--home".into(),
+            home.display().to_string(),
+            "supervise-restart".into(),
+            "--rollback".into(),
+            rollback.display().to_string(),
+        ],
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn schedule_supervisor(home: &crate::config::FabricHome, rollback: &Path) -> Result<()> {
-    let exe = rollback.to_path_buf();
-    if !exe.exists() {
+    if !rollback.exists() {
         // A first install has no rollback, so there is nothing to heal back to
-        // and nothing to supervise with.
+        // and nothing known-good to supervise with.
         println!("supervise\tskipped, there is no previous binary to fall back to");
         return Ok(());
     }
-    let status = std::process::Command::new("systemd-run")
-        .arg("--user")
-        // Well after the restart that install scheduled at +3s.
-        .arg("--on-active=12")
-        .arg(&exe)
-        .arg("--home")
-        .arg(home.root())
-        .arg("supervise-restart")
-        .arg("--rollback")
-        .arg(rollback)
+    let (program, args) = supervisor_argv(home.root(), rollback);
+    let status = std::process::Command::new(program)
+        .args(&args)
         .status()
         .context("failed to schedule the restart supervisor")?;
     if !status.success() {
         bail!("could not schedule the restart supervisor: {status}");
     }
-    println!("supervise\tscheduled, will restore {} if the daemon does not come back", rollback.display());
+    println!(
+        "supervise\tscheduled, will restore {} if the daemon does not come back",
+        rollback.display()
+    );
     Ok(())
 }
 
@@ -1042,5 +1065,51 @@ mod io_tests {
             "rolling back would have gone to {first:?} rather than the most recent"
         );
         assert_eq!(std::fs::read(&newest).unwrap(), b"second");
+    }
+}
+
+#[cfg(test)]
+mod supervisor_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// The supervisor must run OUTSIDE the caller's cgroup, and it must run the
+    /// binary already proven to work on this machine.
+    ///
+    /// Pinned as a shape rather than an effect, and deliberately not cfg-gated to
+    /// Linux. The failure this guards against leaves a remote machine down with
+    /// no way back in, so it cannot be a thing only testable on the platform
+    /// where it does the damage.
+    #[test]
+    fn the_supervisor_runs_detached_and_uses_the_known_good_binary() {
+        let rollback = Path::new("/home/n/.local/bin/fabric.rollback-1000");
+        let (program, args) = supervisor_argv(Path::new("/home/n/.local/share/fabric"), rollback);
+
+        assert_eq!(
+            program, "systemd-run",
+            "the supervisor would die with the cgroup it is meant to outlive"
+        );
+        assert!(
+            args.iter().any(|a| a.starts_with("--on-active=")),
+            "the supervisor must be scheduled, not run inline: {args:?}"
+        );
+
+        // It runs the rollback binary. Asking a possibly-broken new binary to
+        // supervise its own installation is not supervision.
+        assert_eq!(
+            args.iter().find(|a| a.contains("fabric.rollback-")),
+            Some(&rollback.display().to_string()),
+            "the supervisor is not the known-good binary: {args:?}"
+        );
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--rollback", &rollback.display().to_string()]),
+            "the supervisor was not told what to restore: {args:?}"
+        );
+        assert!(
+            args.contains(&"supervise-restart"),
+            "the supervisor does not invoke the supervising subcommand: {args:?}"
+        );
     }
 }
