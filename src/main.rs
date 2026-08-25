@@ -243,8 +243,12 @@ enum ServiceCommands {
         /// Memory ceiling applied by systemd/launchd, in MiB. Unset by default:
         /// a healthy working set depends on how much this node syncs, so Fabric
         /// declares no ceiling unless an operator measures one and asks for it.
-        #[arg(long)]
+        /// Once set it is remembered, so a later install that omits it keeps it.
+        #[arg(long, conflicts_with = "no_memory_max_mb")]
         memory_max_mb: Option<u64>,
+        /// Remove a previously persisted memory ceiling.
+        #[arg(long)]
+        no_memory_max_mb: bool,
     },
     /// Show native service-manager status.
     Status,
@@ -643,13 +647,14 @@ async fn main() -> Result<()> {
                         allow_exec,
                         no_allow_exec,
                         memory_max_mb,
+                        no_memory_max_mb,
                     } => {
                         service::install(
                             &home,
                             ServiceInstallOptions {
                                 allow_shell: allow_override(allow_shell, no_allow_shell),
                                 allow_exec: allow_override(allow_exec, no_allow_exec),
-                                memory_max_mb,
+                                memory_max_mb: memory_override(memory_max_mb, no_memory_max_mb),
                             },
                         )?;
                     }
@@ -1515,6 +1520,15 @@ fn joined_or_dash(values: &[String]) -> String {
 /// Resolve an enable/disable flag pair into a tri-state override: `Some(true)` to
 /// enable, `Some(false)` to explicitly disable, `None` to leave the persisted
 /// value untouched. Shared by the shell and exec allow flags.
+/// The same tri-state as `allow_override`, for a value that is itself optional.
+/// Nothing said keeps the persisted ceiling; `--no-memory-max-mb` clears it.
+fn memory_override(value: Option<u64>, clear: bool) -> Option<Option<u64>> {
+    if clear {
+        return Some(None);
+    }
+    value.map(Some)
+}
+
 fn allow_override(enable: bool, disable: bool) -> Option<bool> {
     if enable {
         Some(true)

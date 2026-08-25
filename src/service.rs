@@ -10,7 +10,9 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{FabricConfig, FabricHome};
 
-#[cfg(target_os = "linux")]
+/// Not `cfg`-gated, so the restart argv below and its test build on every
+/// platform. A Linux-only string cannot be tested from a Mac, and this is the
+/// exact shape whose regression takes a remote machine down.
 const SERVICE_NAME: &str = "fabric.service";
 const LAUNCHD_LABEL: &str = "com.compoundingtech.fabric";
 /// How long to wait for launchd to fully unload a booted-out service before
@@ -30,9 +32,10 @@ const LAUNCHD_BOOTSTRAP_MAX_ATTEMPTS: usize = 5;
 pub struct ServiceInstallOptions {
     pub allow_shell: Option<bool>,
     pub allow_exec: Option<bool>,
-    /// Operator-declared memory ceiling. `None` means no ceiling is written into
-    /// the generated unit or plist at all.
-    pub memory_max_mb: Option<u64>,
+    /// Operator-declared memory ceiling, tri-state because a ceiling is itself
+    /// optional. `None` means the caller never mentioned it, so keep whatever is
+    /// persisted. `Some(None)` clears it. `Some(Some(mb))` sets it.
+    pub memory_max_mb: Option<Option<u64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,7 +115,8 @@ pub fn install(home: &FabricHome, options: ServiceInstallOptions) -> Result<()> 
     home.prepare()?;
     let allow_shell = resolve_allow_shell(home, options.allow_shell)?;
     let allow_exec = resolve_allow_exec(home, options.allow_exec)?;
-    let spec = ServiceSpec::current(home, allow_shell, allow_exec, options.memory_max_mb)?;
+    let memory_max_mb = resolve_memory_max_mb(home, options.memory_max_mb)?;
+    let spec = ServiceSpec::current(home, allow_shell, allow_exec, memory_max_mb)?;
     match ServiceManager::current()? {
         #[cfg(target_os = "linux")]
         ServiceManager::SystemdUser => install_systemd_user(&spec)?,
@@ -131,10 +135,12 @@ pub fn install(home: &FabricHome, options: ServiceInstallOptions) -> Result<()> 
     println!("home\t{}", home.root().display());
     println!("allow-shell\t{allow_shell}");
     println!("allow-exec\t{allow_exec}");
+    // Report the RESOLVED ceiling, not what the caller passed. They differ
+    // whenever the caller said nothing and a persisted ceiling was kept, which
+    // is precisely the case this line exists to make visible.
     println!(
         "memory-max-mb\t{}",
-        options
-            .memory_max_mb
+        memory_max_mb
             .map(|mb| mb.to_string())
             .unwrap_or_else(|| "unset".to_string())
     );
@@ -219,6 +225,49 @@ fn resolve_allow_exec(home: &FabricHome, requested: Option<bool>) -> Result<bool
     Ok(config.allow_exec().unwrap_or(false))
 }
 
+/// The command that restarts the managed Linux service, handed to systemd to
+/// run on its own rather than issued in place.
+///
+/// `fabric exec` runs inside `fabric.service`'s cgroup, so a direct
+/// `systemctl --user restart` tears down the caller mid-command. Scheduling it
+/// as a transient unit moves the restart out of that cgroup and lets the caller
+/// return first.
+///
+/// No `--unit` name is passed on purpose. systemd names the transient unit
+/// itself, so two updates close together cannot collide on a name that already
+/// exists — which would fail the second one for a reason nobody would guess.
+fn systemd_restart_argv() -> (&'static str, Vec<String>) {
+    (
+        "systemd-run",
+        vec![
+            "--user".into(),
+            // Long enough that the caller returns before its cgroup goes away,
+            // short enough that an operator is not left waiting on it.
+            "--on-active=3".into(),
+            "systemctl".into(),
+            "--user".into(),
+            "restart".into(),
+            SERVICE_NAME.into(),
+        ],
+    )
+}
+
+/// Resolve the memory ceiling, in the same shape as the two allow flags above.
+///
+/// The tri-state matters. A caller that says nothing must KEEP the persisted
+/// ceiling; only an explicit `--no-memory-max-mb` removes one. Before this
+/// existed the ceiling lived solely in the rendered unit, so every re-render
+/// that did not name it threw it away, silently.
+fn resolve_memory_max_mb(home: &FabricHome, requested: Option<Option<u64>>) -> Result<Option<u64>> {
+    let mut config = FabricConfig::load(home)?;
+    if let Some(memory_max_mb) = requested {
+        config.set_memory_max_mb(memory_max_mb);
+        config.save(home)?;
+        return Ok(memory_max_mb);
+    }
+    Ok(config.memory_max_mb())
+}
+
 enum ServiceManager {
     #[cfg(target_os = "linux")]
     SystemdUser,
@@ -255,8 +304,13 @@ fn install_systemd_user(spec: &ServiceSpec) -> Result<()> {
 
     run_command("systemctl", &["--user", "daemon-reload"])?;
     run_command("systemctl", &["--user", "enable", SERVICE_NAME])?;
-    run_command("systemctl", &["--user", "restart", SERVICE_NAME])?;
+    let (program, args) = systemd_restart_argv();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_command(program, &args)?;
     println!("unit\t{}", unit_path.display());
+    // Say scheduled, because it is. Claiming a restart that has not happened yet
+    // would make a failed start look like a successful install.
+    println!("restart\tscheduled");
     Ok(())
 }
 
@@ -735,6 +789,75 @@ fn xml_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A restart issued from inside the service's own cgroup kills the process
+    /// issuing it.
+    ///
+    /// `fabric exec` runs its session inside `fabric.service`, so
+    /// `fabric exec hetz -- fabric service install` restarts the very cgroup the
+    /// caller lives in and dies partway through. That is reachable today with a
+    /// command any of us might run.
+    ///
+    /// The restart therefore has to be handed to systemd to run on its own,
+    /// outside the caller's cgroup. This pins the shape rather than the effect,
+    /// because the failure mode is that the CALLER dies — a test that waited for
+    /// the effect would be the thing that got killed.
+    #[test]
+    fn the_linux_service_restart_is_detached_from_the_caller() {
+        let (program, args) = systemd_restart_argv();
+        assert_eq!(
+            program, "systemd-run",
+            "the restart is issued in place, so it kills its own caller"
+        );
+        assert!(
+            args.iter().any(|arg| arg == "--user"),
+            "a user service restart must stay in the user manager: {args:?}"
+        );
+        assert!(
+            args.iter().any(|arg| arg.starts_with("--on-active=")),
+            "the restart must be scheduled, so the caller can return first: {args:?}"
+        );
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        assert!(
+            args.windows(4)
+                .any(|w| w == ["systemctl", "--user", "restart", SERVICE_NAME]),
+            "whatever wrapping it gains, it must still restart {SERVICE_NAME}: {args:?}"
+        );
+    }
+
+    /// A ceiling an operator set once must survive a re-install that does not
+    /// mention it.
+    ///
+    /// `allow_shell` and `allow_exec` already survive, because they round trip
+    /// through `config.toml`. `memory_max_mb` did not: it lived only in the
+    /// rendered plist or unit, and `render_*` emits it only when `Some`. So any
+    /// re-install without `--memory-max-mb` removed a ceiling somebody set
+    /// earlier, silently.
+    ///
+    /// `fabric update` re-renders the unit on every run, so this would have
+    /// fired constantly rather than rarely.
+    #[test]
+    fn a_memory_ceiling_survives_a_reinstall_that_does_not_mention_it() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        home.prepare()?;
+
+        // An operator sets a ceiling once.
+        assert_eq!(
+            resolve_memory_max_mb(&home, Some(Some(512)))?,
+            Some(512),
+            "the ceiling the operator asked for was not the one applied"
+        );
+
+        // A later install says nothing about memory. It must not remove it.
+        assert_eq!(
+            resolve_memory_max_mb(&home, None)?,
+            Some(512),
+            "a re-install that never mentioned the ceiling removed it"
+        );
+        Ok(())
+    }
+
 
     #[test]
     fn bootout_no_such_process_is_ignorable_but_real_errors_surface() {
