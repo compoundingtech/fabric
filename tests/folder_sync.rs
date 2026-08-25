@@ -336,3 +336,61 @@ async fn catalog_delete_while_peer_away_does_not_resurrect_on_return() -> Result
     node_a.shutdown().await?;
     Ok(())
 }
+
+/// THE INCIDENT OF 2026-08-25, AS A TEST.
+///
+/// Removing a path from an entry's `include` leaves whatever the manifest
+/// already recorded for it. Under a policy that does not propagate deletes that
+/// is inert. Under one that does, the entry sees a path that is Present in its
+/// manifest and absent from its scan, which is exactly what a local delete looks
+/// like, so it tombstones the path and DELETES THE REAL FILE.
+///
+/// That is not hypothetical. It removed thirteen live plan files from three
+/// machines. Every one was recoverable from git, which is the only reason it was
+/// a bad night rather than a disaster.
+///
+/// A path that leaves an entry's include set must be FORGOTTEN, not deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_path_dropped_from_include_is_forgotten_not_deleted() -> Result<()> {
+    let _guard = FOLDER_SYNC_LOCK.lock().await;
+    let a_dir = TempDir::new()?;
+    let a_home = FabricHome::new(a_dir.path());
+    let a_folder = a_dir.path().join("shared");
+    std::fs::create_dir_all(a_folder.join("plans"))?;
+    std::fs::create_dir_all(a_folder.join("keep"))?;
+    write_sync_with_include(a_dir.path(), &a_folder, "catalog", "**");
+
+    let node_a = FabricNode::start(a_home.clone()).await?;
+
+    let doomed = a_folder.join("plans/live-work.md");
+    let kept = a_folder.join("keep/other.md");
+    std::fs::write(&doomed, b"work someone is going to ship")?;
+    std::fs::write(&kept, b"still included")?;
+    reload_sync(&a_home).await?;
+    assert!(
+        wait_for_file(&doomed, b"work someone is going to ship").await,
+        "POSITIVE CONTROL FAILED: the entry never recorded the file, so dropping \
+         it from the include afterwards would prove nothing"
+    );
+
+    // Now narrow the include so plans/ is no longer this entry's business. The
+    // file itself is untouched on disk and nobody asked for it to be deleted.
+    write_sync_with_include(a_dir.path(), &a_folder, "catalog", "keep/**");
+    reload_sync(&a_home).await?;
+
+    assert_stays_missing(&a_folder.join("never-existed.md"), "sanity").await;
+    node_a.shutdown().await?;
+
+    assert!(
+        doomed.exists(),
+        "DROPPING A PATH FROM THE INCLUDE DELETED THE FILE. A path that leaves an \
+         entry is not a file anybody deleted."
+    );
+    assert_eq!(
+        std::fs::read(&doomed)?,
+        b"work someone is going to ship",
+        "the excluded file survived but its content changed"
+    );
+    assert!(kept.exists(), "an included file was lost too");
+    Ok(())
+}

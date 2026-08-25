@@ -1556,6 +1556,23 @@ fn scan_into_node_observed(
     observed: &mut HashMap<String, ContentHash>,
     cache: &mut HashMap<String, ScanCacheEntry>,
 ) -> Result<bool> {
+    // A ROOT THAT IS NOT THERE IS NOT A FOLDER SOMEBODY EMPTIED.
+    //
+    // `scan_folder` returns an empty result for a missing root. Every tracked
+    // path would then be in the observed set and absent from the scan, which is
+    // the same shape as a local delete, so a delete-propagating policy would
+    // tombstone the entire entry and send that to every peer.
+    //
+    // A root vanishes for reasons that are not a deletion: an unmounted volume,
+    // a directory renamed while a pass runs, a mount that is not ready at boot.
+    // The blast radius is the whole entry rather than one path, so this is the
+    // one place where doing nothing is clearly right. Wait until we can see it.
+    //
+    // Deleting the CONTENTS of a folder still propagates normally, because the
+    // root survives that and the scan runs.
+    if !root.exists() {
+        return Ok(false);
+    }
     let scanned = scan_folder(root, entry, cache)?;
     // Refresh the cache from what this scan actually saw, so the next scan of an
     // untouched file is free. Rebuilt rather than merged, so a vanished path
@@ -1625,10 +1642,33 @@ fn scan_into_node_observed(
 
     let now = now_secs();
     for path in previous.keys() {
-        if !current.contains_key(path) && node.local_remove(path, policy, now) {
+        if current.contains_key(path) {
+            continue;
+        }
+        // A PATH THE ENTRY NO LONGER SELECTS HAS NOT BEEN DELETED. It has left
+        // this entry's scope, and the two are indistinguishable from here: both
+        // look like "in my records, absent from my scan".
+        //
+        // Treating the first as the second removed thirteen live files from
+        // three machines on 2026-08-25. `plans/**` was taken out of an entry's
+        // include, which left its paths recorded but unscannable, and the next
+        // release turned delete propagation on. Every one of those files was
+        // recoverable from git, which is the only reason it was recoverable.
+        //
+        // Narrowing an include is a scope change. Nobody deleted anything.
+        if !entry.includes(path) {
+            continue;
+        }
+        if node.local_remove(path, policy, now) {
             changed = true;
         }
     }
+    // NOT DONE HERE: dropping the excluded paths from the manifest outright.
+    // It is the tidier half of the rule and it needs its own change, because a
+    // peer whose config still selects the path would send it back on every
+    // reconcile and this side would drop it again, writing the whole index each
+    // time. Fixing a delete by inventing a write loop is not a fix. Filtering on
+    // adopt is the likelier answer and it changes what crosses the wire.
     *observed = current;
     Ok(changed)
 }
@@ -3389,6 +3429,124 @@ mod tests {
             .map(|(p, _)| p.clone())
             .collect();
         assert_eq!(paths, vec!["agent.toml".to_string()]);
+    }
+
+    /// A WATCHED FOLDER THAT IS NOT THERE IS NOT A FOLDER SOMEBODY EMPTIED.
+    ///
+    /// `scan_folder` returns an EMPTY result when the root does not exist. Every
+    /// tracked path is then in the observed set and absent from the scan, which
+    /// is the same shape as a local delete, so a delete-propagating policy
+    /// tombstones the lot and sends that to every peer.
+    ///
+    /// The root can vanish for reasons that are not a deletion: an unmounted
+    /// volume, a directory renamed while a pass runs, a mount that is not ready
+    /// yet at boot. None of those mean the user deleted their files, and the
+    /// blast radius is the whole entry rather than one path.
+    ///
+    /// Prefer the annoying failure. A folder we cannot see is a folder we cannot
+    /// see, and the honest answer is to do nothing until we can.
+    #[test]
+    fn a_vanished_root_is_not_a_mass_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("watched");
+        std::fs::create_dir_all(&root).unwrap();
+        for name in ["a.md", "b.md", "c.md"] {
+            std::fs::write(root.join(name), b"payload").unwrap();
+        }
+        let entry = entry_with_policy("sync", &root, SyncPolicy::Bus);
+        let rules = entry.policy.rules();
+        assert!(
+            rules.propagate_deletes,
+            "this test is about a policy that propagates deletes"
+        );
+
+        let mut node = SyncNode::new(Author([1; 32]));
+        let mut observed = HashMap::new();
+        let mut cache = HashMap::new();
+        scan_into_node_observed(&mut node, &root, &entry, rules, &mut observed, &mut cache)
+            .unwrap();
+        assert_eq!(
+            node.manifest().present_paths().count(),
+            3,
+            "the fixture never recorded the files, so losing them below proves nothing"
+        );
+
+        // The volume goes away. Nobody deleted anything.
+        std::fs::remove_dir_all(&root).unwrap();
+        scan_into_node_observed(&mut node, &root, &entry, rules, &mut observed, &mut cache)
+            .unwrap();
+
+        assert_eq!(
+            node.manifest().present_paths().count(),
+            3,
+            "a root that vanished was read as a delete of every file in the entry, \
+             and that tombstone set goes to every peer"
+        );
+    }
+
+    /// Turning delete propagation ON must not delete a file that is simply
+    /// there. A delete pending for an unknown length of time is not a delete
+    /// anybody asked for today.
+    ///
+    /// HONESTY ABOUT THIS TEST: it passes before the fix as well as after, and I
+    /// am keeping it anyway. It was written to reproduce a proposed cause of the
+    /// 2026-08-25 file loss, that enabling propagation replayed a backlog of old
+    /// deletes. IT DOES NOT REPRODUCE, because that was not the cause. The cause
+    /// was a path removed from an entry's include, which left it recorded but
+    /// unscannable, and `a_path_dropped_from_include_is_forgotten_not_deleted`
+    /// in tests/folder_sync.rs is the test that DOES reproduce it.
+    ///
+    /// A test that passes before and after is still worth having: it proves the
+    /// switch itself is not the dangerous part, so nobody has to wonder again.
+    #[test]
+    fn enabling_delete_propagation_does_not_delete_what_is_still_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.md"), b"alpha").unwrap();
+        std::fs::write(root.join("b.md"), b"beta").unwrap();
+        let entry = entry_with_policy("sync", root, SyncPolicy::Catalog);
+        let quiet = PolicyRules {
+            propagate_deletes: false,
+            sweep_tombstones: false,
+        };
+        let loud = PolicyRules {
+            propagate_deletes: true,
+            sweep_tombstones: false,
+        };
+
+        let mut node = SyncNode::new(Author([1; 32]));
+        let mut observed = HashMap::new();
+        let mut cache = HashMap::new();
+        scan_into_node_observed(&mut node, root, &entry, quiet, &mut observed, &mut cache)
+            .unwrap();
+        assert_eq!(
+            node.manifest().present_paths().count(),
+            2,
+            "the fixture never recorded both files, so the switch below proves nothing"
+        );
+
+        // The switch. Same disk, same records, nobody deleted anything.
+        scan_into_node_observed(&mut node, root, &entry, loud, &mut observed, &mut cache)
+            .unwrap();
+        let protected = observed.clone();
+        materialize_tracked(
+            &mut node,
+            root,
+            loud,
+            &protected,
+            &mut observed,
+            &cache,
+            None,
+        )
+        .unwrap();
+
+        assert!(root.join("a.md").exists(), "enabling propagation deleted a.md");
+        assert!(root.join("b.md").exists(), "enabling propagation deleted b.md");
+        assert_eq!(
+            node.manifest().present_paths().count(),
+            2,
+            "enabling propagation tombstoned a file nobody deleted"
+        );
     }
 
     /// The bookkeeping files are rewritten WHOLE every time they are written,
