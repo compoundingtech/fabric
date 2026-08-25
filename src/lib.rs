@@ -17,6 +17,7 @@ pub mod sync;
 pub mod telemetry;
 pub mod terminal;
 mod tunnel;
+pub mod update;
 
 const SPIKE_ALPN: &[u8] = b"fabric/spike/echo/0";
 
