@@ -602,27 +602,53 @@ pub fn render_launch_agent_plist(home: &FabricHome, spec: &ServiceSpec) -> Resul
     // launchd treats ResidentSetSize as a reclaim preference rather than a kill,
     // but it is still a fixed number, and shipping one by default declares a
     // healthy working set nobody has measured yet.
-    let resource_limits = match spec.memory_max_mb {
-        None => String::new(),
-        Some(mb) => {
-            let rss_bytes = mb
-                .checked_mul(1024)
-                .and_then(|value| value.checked_mul(1024))
-                .context("--memory-max-mb is too large")?;
-            format!(
-                "    <key>SoftResourceLimits</key>\n\
-    <dict>\n\
-        <key>ResidentSetSize</key>\n\
-        <integer>{rss_bytes}</integer>\n\
-    </dict>\n\
-    <key>HardResourceLimits</key>\n\
+    // A DESCRIPTOR CEILING IS NOT OPTIONAL, unlike the resident-set one.
+    //
+    // A launchd agent inherits launchd's own default, and that default is small.
+    // This daemon holds a QUIC endpoint, a connection per peer, a control
+    // socket, a dial socket per tunnel and the files it is syncing, so the
+    // default is not a ceiling anybody chose for it.
+    //
+    // It ran out: `service.err.log` on the Mac carries
+    // `Error: Too many open files (os error 24)` and the daemon died there.
+    //
+    // 8192 is not a measurement, and saying so matters. It is simply far above
+    // any working set this daemon has shown, which for the entry that syncs
+    // 17,600 files sat at a few dozen descriptors. The point is to remove an
+    // arbitrary small number, not to install a different arbitrary number close
+    // enough to matter.
+    let mut soft_limits = String::from(
+        "        <key>NumberOfFiles</key>\n\
+        <integer>8192</integer>\n",
+    );
+    let mut hard_limits = String::new();
+
+    // The resident-set ceiling stays opt-in. launchd treats ResidentSetSize as a
+    // reclaim preference rather than a kill, but it is still a fixed number, and
+    // shipping one by default declares a healthy working set nobody has measured.
+    if let Some(mb) = spec.memory_max_mb {
+        let rss_bytes = mb
+            .checked_mul(1024)
+            .and_then(|value| value.checked_mul(1024))
+            .context("--memory-max-mb is too large")?;
+        soft_limits.push_str(&format!(
+            "        <key>ResidentSetSize</key>\n\
+        <integer>{rss_bytes}</integer>\n"
+        ));
+        hard_limits = format!(
+            "    <key>HardResourceLimits</key>\n\
     <dict>\n\
         <key>ResidentSetSize</key>\n\
         <integer>{rss_bytes}</integer>\n\
     </dict>\n"
-            )
-        }
-    };
+        );
+    }
+    let resource_limits = format!(
+        "    <key>SoftResourceLimits</key>\n\
+    <dict>\n\
+{soft_limits}    </dict>\n\
+{hard_limits}"
+    );
     let stdout_path = home.root().join("logs/service.out.log");
     let stderr_path = home.root().join("logs/service.err.log");
     let args = spec
@@ -873,9 +899,15 @@ mod tests {
         assert!(unit.contains("Restart=on-failure"));
 
         let plist = render_launch_agent_plist(&home, &spec)?;
+        // The resident-set ceiling stays opt-in, so none of it appears here.
         assert!(!plist.contains("ResidentSetSize"));
-        assert!(!plist.contains("SoftResourceLimits"));
         assert!(!plist.contains("HardResourceLimits"));
+        // The DESCRIPTOR ceiling is not opt-in. Without it the daemon inherits
+        // launchd's own small default, and it has already died of that:
+        // `Error: Too many open files (os error 24)`.
+        assert!(plist.contains("<key>SoftResourceLimits</key>"));
+        assert!(plist.contains("<key>NumberOfFiles</key>"));
+        assert!(plist.contains("<integer>8192</integer>"));
         assert!(plist.contains("<key>KeepAlive</key>"));
         Ok(())
     }
@@ -971,6 +1003,41 @@ mod tests {
         assert!(plist.contains("<string>/tmp/fabric&lt;dev&gt;</string>"));
         assert!(plist.contains("<string>/Users/nathan/Fabric &amp; Test</string>"));
         assert!(!plist.contains("<string>--allow-shell</string>"));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod plist_validity {
+    use super::*;
+
+    /// A malformed plist does not fail a string assertion, it fails at install
+    /// time on somebody's machine. Render both branches and hand them to the
+    /// system parser.
+    #[test]
+    fn rendered_plists_are_valid_property_lists() -> Result<()> {
+        let home = FabricHome::new(std::path::Path::new("/home/nathan/.local/share/fabric"));
+        for memory in [None, Some(512u64)] {
+            let spec = ServiceSpec::new("/usr/local/bin/fabric", home.root(), true, true, memory)?;
+            let plist = render_launch_agent_plist(&home, &spec)?;
+            let path = std::env::temp_dir().join(format!("fabric-plist-{:?}.plist", memory));
+            std::fs::write(&path, &plist)?;
+            let out = std::process::Command::new("plutil")
+                .arg("-lint")
+                .arg(&path)
+                .output();
+            let _ = std::fs::remove_file(&path);
+            match out {
+                Ok(out) => assert!(
+                    out.status.success(),
+                    "plutil rejected the plist for memory_max_mb={memory:?}: {}\n{plist}",
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+                // Not a Mac, so there is nothing to lint with. Say so rather
+                // than passing silently as if it had been checked.
+                Err(_) => eprintln!("plutil unavailable, plist not linted here"),
+            }
+        }
         Ok(())
     }
 }
