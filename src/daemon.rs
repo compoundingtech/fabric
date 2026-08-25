@@ -2847,6 +2847,7 @@ async fn process_control_request(
                         materialize_micros: status.materialize_micros,
                         persist_micros: status.persist_micros,
                         reconcile_micros: status.reconcile_micros,
+                        reconcile_failures: status.reconcile_failures,
                         sweep: status
                             .sweep
                             .as_ref()

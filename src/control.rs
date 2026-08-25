@@ -195,6 +195,11 @@ pub struct SyncEntryStatus {
     pub persist_micros: u64,
     #[serde(default)]
     pub reconcile_micros: u64,
+    /// Peer reconciles that returned an error, cumulative. A number that MOVES
+    /// between two samples is a fault happening now; a large total on an old
+    /// daemon may be history.
+    #[serde(default)]
+    pub reconcile_failures: u64,
     /// Why the tombstone sweep did or did not forget anything, as a short
     /// stable token. Empty from a daemon that predates the field, which is why
     /// it carries `#[serde(default)]` like the counters above.

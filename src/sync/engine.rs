@@ -267,6 +267,20 @@ struct EntryWork {
     materialize_micros: AtomicU64,
     persist_micros: AtomicU64,
     reconcile_micros: AtomicU64,
+    /// Peer reconciles that returned an error, cumulative.
+    ///
+    /// Nine dead entries on one machine failed EVERY reconcile for weeks: 81
+    /// failures against 62 successes in 300 log lines, each one a dial to an
+    /// entry name no peer had. The daemon reported all of it, at debug level,
+    /// into a file nobody reads.
+    ///
+    /// A fault that announces itself where nobody is listening is not visible.
+    /// `fabric sync ls` is where somebody looks, so it is counted there.
+    ///
+    /// Cumulative, like its neighbours: two samples and a division describe the
+    /// present, and a total only describes the past. A large number here on a
+    /// long-lived daemon may be old news; a number that MOVES is not.
+    reconcile_failures: AtomicU64,
     #[cfg(test)]
     persist_calls: AtomicUsize,
 }
@@ -288,6 +302,7 @@ impl EntryWork {
             materialize_micros: AtomicU64::new(0),
             persist_micros: AtomicU64::new(0),
             reconcile_micros: AtomicU64::new(0),
+            reconcile_failures: AtomicU64::new(0),
             #[cfg(test)]
             persist_calls: AtomicUsize::new(0),
         })
@@ -821,6 +836,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                 materialize_micros: entry.work.materialize_micros.load(Ordering::Relaxed),
                 persist_micros: entry.work.persist_micros.load(Ordering::Relaxed),
                 reconcile_micros: entry.work.reconcile_micros.load(Ordering::Relaxed),
+                reconcile_failures: entry.work.reconcile_failures.load(Ordering::Relaxed),
                 sweep: entry.last_sweep.lock().unwrap().clone(),
             });
         }
@@ -930,6 +946,10 @@ impl<T: SyncTransport> SyncEngine<T> {
                         .insert(peer.id.clone(), now_secs());
                 }
                 Err(error) => {
+                    entry
+                        .work
+                        .reconcile_failures
+                        .fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(sync = name, peer = peer.id, %error, "sync reconcile failed");
                 }
             }
@@ -1352,6 +1372,7 @@ pub struct SyncStatus {
     pub materialize_micros: u64,
     pub persist_micros: u64,
     pub reconcile_micros: u64,
+    pub reconcile_failures: u64,
     /// Why the tombstone sweep did or did not forget anything, as last decided.
     /// `None` means no pass has reached the sweep yet for this entry instance.
     pub sweep: Option<SweepState>,
@@ -3742,6 +3763,32 @@ mod tests {
         }
     }
 
+    /// A peer that is reachable enough to dial and always fails the reconcile.
+    ///
+    /// That is what nine dead entries on hetz looked like for weeks: a peer
+    /// named in the config that no peer actually served, so every pass dialled
+    /// and every dial failed.
+    #[derive(Default)]
+    struct AlwaysFailingTransport;
+
+    impl SyncTransport for AlwaysFailingTransport {
+        async fn peers_for(&self, _peers: &SyncPeers) -> Vec<PeerRef> {
+            vec![PeerRef {
+                id: "a-peer-that-does-not-serve-this-entry".to_string(),
+                addr: None,
+            }]
+        }
+
+        async fn reconcile(
+            &self,
+            _peer: PeerRef,
+            _name: String,
+            _node: Arc<Mutex<SyncNode>>,
+        ) -> Result<Reconciled> {
+            anyhow::bail!("no peer serves this entry")
+        }
+    }
+
     impl SyncTransport for LoopbackTransport {
         async fn peers_for(&self, _peers: &SyncPeers) -> Vec<PeerRef> {
             self.peers
@@ -3947,6 +3994,80 @@ mod tests {
     /// If someone later removes the second scan, this test fails and tells them
     /// the counters now mean something different, which is the point.
     ///
+    /// A RECONCILE THAT FAILS MUST BE COUNTED WHERE SOMEBODY LOOKS.
+    ///
+    /// Nine dead entries on hetz failed every reconcile for weeks: 81 failures
+    /// against 62 successes in 300 log lines. The daemon reported every one of
+    /// them, at debug level, into a file nobody reads. Nothing in `fabric sync
+    /// ls` moved, so the fault was loud and invisible at the same time.
+    ///
+    /// A silent fault is worse, but a fault that announces itself where nobody
+    /// is listening is not meaningfully better.
+    #[tokio::test]
+    async fn a_failing_reconcile_is_counted_where_somebody_looks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.md"), b"seed").unwrap();
+        write_bus_sync(dir.path(), &root);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(AlwaysFailingTransport),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        for _ in 0..3 {
+            engine.sync_once("bus").await.unwrap();
+        }
+
+        let status = engine
+            .status()
+            .await
+            .into_iter()
+            .find(|entry| entry.name == "bus")
+            .expect("no status for the entry");
+
+        assert_eq!(
+            status.reconcile_failures, 3,
+            "three passes each failed one peer, and the count somebody would \
+             actually read says {}",
+            status.reconcile_failures
+        );
+    }
+
+    /// And a healthy entry must stay at zero, or the counter is just noise and
+    /// a reader learns to ignore it.
+    #[tokio::test]
+    async fn a_healthy_entry_reports_no_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.md"), b"seed").unwrap();
+        write_bus_sync(dir.path(), &root);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+
+        let status = engine
+            .status()
+            .await
+            .into_iter()
+            .find(|entry| entry.name == "bus")
+            .expect("no status for the entry");
+        assert_eq!(status.reconcile_failures, 0);
+    }
+
     /// With NO inbound traffic, and only then, `sync_once` is the sole caller
     /// of `scan_entry` and the ratio is exactly two. The test below pins what
     /// production actually sees.
@@ -6447,3 +6568,4 @@ mod tests {
         assert_archive_outcome(&engine, &root).await;
     }
 }
+
