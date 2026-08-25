@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -95,6 +95,22 @@ impl ServiceSpec {
 }
 
 pub fn install(home: &FabricHome, options: ServiceInstallOptions) -> Result<()> {
+    let exe = env::current_exe().context("failed to resolve current fabric executable")?;
+    install_at(home, &exe, options)
+}
+
+/// Install the service so it runs `exe`, whatever binary is asking.
+///
+/// `fabric update` needs this. It resolves the binary the service manager
+/// already runs and installs the new bytes THERE, then re-renders the unit — and
+/// the unit must keep naming that path. Rendering from `current_exe` would point
+/// the daemon at whichever binary happened to run the update, which during
+/// testing is a `target/debug` build and in general is nobody's idea of the
+/// installed fabric.
+///
+/// That is the same trap as installing at `command -v fabric`, entered from the
+/// other side.
+pub fn install_at(home: &FabricHome, exe: &Path, options: ServiceInstallOptions) -> Result<()> {
     // The managed OS-service is a PROD-only concept, under a single global label.
     // Installing it against a dev/custom home would register a SECOND service on
     // the same label that fights the prod daemon (the service-vs-manual race).
@@ -116,7 +132,7 @@ pub fn install(home: &FabricHome, options: ServiceInstallOptions) -> Result<()> 
     let allow_shell = resolve_allow_shell(home, options.allow_shell)?;
     let allow_exec = resolve_allow_exec(home, options.allow_exec)?;
     let memory_max_mb = resolve_memory_max_mb(home, options.memory_max_mb)?;
-    let spec = ServiceSpec::current(home, allow_shell, allow_exec, memory_max_mb)?;
+    let spec = ServiceSpec::new(exe, home.root(), allow_shell, allow_exec, memory_max_mb)?;
     match ServiceManager::current()? {
         #[cfg(target_os = "linux")]
         ServiceManager::SystemdUser => install_systemd_user(&spec)?,
@@ -165,7 +181,7 @@ pub fn install(home: &FabricHome, options: ServiceInstallOptions) -> Result<()> 
 ///
 /// Connect-and-drop is the honest check: the socket file appears before the
 /// daemon is listening on it, so existence proves nothing.
-fn wait_for_control_socket(home: &FabricHome, timeout: Duration) -> bool {
+pub(crate) fn wait_for_control_socket(home: &FabricHome, timeout: Duration) -> bool {
     let path = home.control_socket_path();
     let deadline = Instant::now() + timeout;
     loop {
@@ -607,7 +623,7 @@ fn systemd_user_unit_path() -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn launch_agent_path() -> Result<PathBuf> {
+pub(crate) fn launch_agent_path() -> Result<PathBuf> {
     Ok(home_dir()?
         .join("Library/LaunchAgents")
         .join(format!("{LAUNCHD_LABEL}.plist")))
@@ -789,6 +805,39 @@ fn xml_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The unit must name the binary it was GIVEN, not the one rendering it.
+    ///
+    /// `fabric update` installs new bytes at the path the service manager
+    /// already runs, then re-renders. If rendering used `current_exe` the unit
+    /// would point at whichever binary ran the update — a `target/debug` build
+    /// while testing, and in general nobody's idea of the installed fabric. That
+    /// is the "install at the wrong path" trap entered from the other side.
+    #[test]
+    fn the_unit_names_the_binary_it_was_given_not_the_one_rendering_it() -> Result<()> {
+        let home = FabricHome::new(Path::new("/home/nathan/.local/share/fabric"));
+        let spec = ServiceSpec::new("/usr/local/bin/fabric", home.root(), true, true, None)?;
+
+        let unit = render_systemd_user_unit(&spec);
+        assert!(
+            unit.contains("ExecStart=/usr/local/bin/fabric"),
+            "the unit does not run the binary it was given:\n{unit}"
+        );
+        let plist = render_launch_agent_plist(&home, &spec)?;
+        assert!(
+            plist.contains("<string>/usr/local/bin/fabric</string>"),
+            "the plist does not run the binary it was given:\n{plist}"
+        );
+
+        // And specifically not this test binary, which is what `current_exe`
+        // would have produced.
+        let running = std::env::current_exe()?.display().to_string();
+        assert!(
+            !unit.contains(&running) && !plist.contains(&running),
+            "the rendered unit picked up the running binary instead of the given one"
+        );
+        Ok(())
+    }
 
     /// A restart issued from inside the service's own cgroup kills the process
     /// issuing it.

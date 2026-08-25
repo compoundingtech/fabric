@@ -184,6 +184,529 @@ pub fn version_for_tag(tag: &str) -> &str {
     tag.strip_prefix('v').unwrap_or(tag)
 }
 
+// ---------------------------------------------------------------------------
+// Everything below touches the network, the filesystem or the service manager.
+// ---------------------------------------------------------------------------
+
+use std::path::{Path, PathBuf};
+
+/// reqwest is built here without a process-wide crypto provider, because iroh
+/// supplies one per endpoint instead. `update` makes its own requests, so it has
+/// to install one before the first, and only once per process.
+fn ensure_crypto_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+/// Fetch bytes from `https://` or `file:///`.
+///
+/// `file:///` exists so a locally built artifact can be installed the same way a
+/// release is, with the same hash check. reqwest does not handle that scheme, so
+/// it is read directly rather than pretended to be a request.
+pub async fn fetch(url: &str) -> Result<Vec<u8>> {
+    if let Some(path) = url.strip_prefix("file://") {
+        // `file:///tmp/x` leaves a leading slash, which is the absolute path.
+        let path = if path.is_empty() { "/" } else { path };
+        return tokio::fs::read(path)
+            .await
+            .with_context(|| format!("failed to read {path}"));
+    }
+    if !url.starts_with("https://") {
+        bail!("refusing {url}: only https:// and file:/// are accepted");
+    }
+    ensure_crypto_provider();
+    let response = reqwest::Client::builder()
+        // GitHub rejects requests with no user agent.
+        .user_agent(concat!("fabric/", env!("CARGO_PKG_VERSION")))
+        .build()?
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("failed to reach {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("{url} returned {status}");
+    }
+    Ok(response
+        .bytes()
+        .await
+        .with_context(|| format!("failed to read the body of {url}"))?
+        .to_vec())
+}
+
+/// The tag GitHub currently marks as latest.
+pub async fn latest_tag() -> Result<String> {
+    let body = fetch(&latest_release_api_url()).await?;
+    let json: serde_json::Value =
+        serde_json::from_slice(&body).context("the release API returned something that is not JSON")?;
+    json.get("tag_name")
+        .and_then(|tag| tag.as_str())
+        .map(str::to_string)
+        .context("the release API returned no tag_name")
+}
+
+/// Where the binary that the SERVICE MANAGER runs actually lives.
+///
+/// Not `command -v fabric`, and not always `current_exe`. The interactive
+/// binary on `$PATH` can differ from the one in the plist or unit, and
+/// installing at the wrong one leaves the daemon running the old code while
+/// `--version` cheerfully reports the new. That trap is inherited from the shell
+/// script this replaces, where it is written in a comment nobody else could see.
+pub fn managed_binary_path() -> Result<PathBuf> {
+    if let Some(path) = managed_binary_path_from_service_manager() {
+        return Ok(path);
+    }
+    std::env::current_exe().context("could not determine which binary is running")
+}
+
+#[cfg(target_os = "macos")]
+fn managed_binary_path_from_service_manager() -> Option<PathBuf> {
+    let plist = crate::service::launch_agent_path().ok()?;
+    if !plist.exists() {
+        return None;
+    }
+    // `plutil` is part of macOS and `service.rs` already relies on it. Parsing
+    // our own XML by hand would be one guess about a file a person may have
+    // edited.
+    let out = std::process::Command::new("plutil")
+        .args(["-extract", "ProgramArguments.0", "raw", "-o", "-"])
+        .arg(&plist)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+#[cfg(target_os = "linux")]
+fn managed_binary_path_from_service_manager() -> Option<PathBuf> {
+    let out = std::process::Command::new("systemctl")
+        .args(["--user", "show", "-p", "ExecStart", "--value", "fabric.service"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    // The value reads `... argv[]=/path/to/fabric --home ... ; ...`
+    let path = text
+        .split("argv[]=")
+        .nth(1)?
+        .split_whitespace()
+        .next()?
+        .trim_end_matches(';')
+        .to_string();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+/// What a staged binary says it is. Running it is the only honest way to ask.
+pub fn binary_version(path: &Path) -> Result<String> {
+    let out = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("failed to run {}", path.display()))?;
+    if !out.status.success() {
+        bail!("{} could not report its version", path.display());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Put `bytes` at `path`, keeping the file that was there as a rollback.
+///
+/// Both steps go through a same-directory temporary plus a rename. Copying over
+/// a running binary is `ETXTBSY`; renaming past it leaves the running process on
+/// its old inode and the next start on the new one. Same directory matters, or
+/// the rename is a cross-filesystem copy and stops being atomic.
+pub fn install_binary(path: &Path, bytes: &[u8], stamp: &str) -> Result<PathBuf> {
+    let staged = stage_binary(path, bytes, stamp)?;
+    commit_staged(&staged, path, stamp)
+}
+
+/// Write the incoming binary NEXT TO where it will live, executable, without
+/// disturbing what is there.
+///
+/// Beside it rather than in a temp dir for two reasons: the rename that follows
+/// is only atomic within one filesystem, and a staged binary has to be runnable
+/// so its `--version` can be asked before anything is committed.
+pub fn stage_binary(path: &Path, bytes: &[u8], stamp: &str) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = path
+        .parent()
+        .context("the install path has no directory to write beside")?;
+    let staged = dir.join(format!(".fabric-incoming-{stamp}"));
+    std::fs::write(&staged, bytes)
+        .with_context(|| format!("failed to stage {}", staged.display()))?;
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("failed to make {} executable", staged.display()))?;
+    Ok(staged)
+}
+
+/// Move a staged binary into place, keeping whatever was there as a rollback.
+///
+/// Both moves are renames within one directory. Copying over a running binary is
+/// `ETXTBSY`; renaming past it leaves the running process on its old inode and
+/// the next start on the new one.
+pub fn commit_staged(staged: &Path, path: &Path, stamp: &str) -> Result<PathBuf> {
+    let dir = path
+        .parent()
+        .context("the install path has no directory to write beside")?;
+    let rollback = path.with_file_name(format!(
+        "{}.rollback-{stamp}",
+        path.file_name()
+            .context("the install path has no file name")?
+            .to_string_lossy()
+    ));
+
+    if path.exists() {
+        let aside = dir.join(format!(".fabric-rollback-{stamp}"));
+        std::fs::copy(path, &aside)
+            .with_context(|| format!("failed to copy {} aside", path.display()))?;
+        std::fs::rename(&aside, &rollback)
+            .with_context(|| format!("failed to place {}", rollback.display()))?;
+    }
+    std::fs::rename(staged, path)
+        .with_context(|| format!("failed to install {}", path.display()))?;
+    Ok(rollback)
+}
+
+/// A stamp for rollback names. Seconds are enough: two updates inside one second
+/// on one machine is not a case worth a dependency.
+pub fn timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    format!("{secs}")
+}
+
+/// The newest rollback binary sitting beside `path`, if there is one.
+pub fn newest_rollback(path: &Path) -> Result<Option<PathBuf>> {
+    let dir = path.parent().context("no directory to search")?;
+    let prefix = format!(
+        "{}.rollback-",
+        path.file_name()
+            .context("no file name")?
+            .to_string_lossy()
+    );
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let modified = entry.metadata()?.modified()?;
+        if best.as_ref().is_none_or(|(seen, _)| modified > *seen) {
+            best = Some((modified, entry.path()));
+        }
+    }
+    Ok(best.map(|(_, path)| path))
+}
+
+/// How long the supervisor gives the restarted daemon to answer before it
+/// decides the new binary does not work. Generous: a slow machine coming back
+/// under load must not be mistaken for a broken build.
+const SUPERVISE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Check that the daemon came back, and put the old binary back if it did not.
+///
+/// THIS EXISTS BECAUSE NOTHING OUTSIDE THE MACHINE CAN FIX IT. If a bad binary
+/// takes the daemon down, `fabric exec` stops working, and the tool that would
+/// repair the machine is the tool that just broke it. On hetz and droppy there
+/// is still ssh. On a travelling laptop there may be nothing for days.
+///
+/// It cannot run in the updating process either: on Linux that process lives
+/// inside the service's own cgroup and dies with the restart. So it is scheduled
+/// as a transient unit, and it runs the ROLLBACK binary rather than the new one,
+/// because the rollback is the copy already proven to work on this machine.
+pub async fn supervise_restart(home: &crate::config::FabricHome, rollback: &Path) -> Result<()> {
+    if crate::service::wait_for_control_socket(home, SUPERVISE_READY_TIMEOUT) {
+        println!("supervise\tthe daemon came back");
+        return Ok(());
+    }
+
+    eprintln!(
+        "supervise\tthe daemon did not answer within {}s; restoring {}",
+        SUPERVISE_READY_TIMEOUT.as_secs(),
+        rollback.display()
+    );
+
+    let installed_path = managed_binary_path()?;
+    let bytes = std::fs::read(rollback)
+        .with_context(|| format!("failed to read {}", rollback.display()))?;
+    let stamp = timestamp();
+    let staged = stage_binary(&installed_path, &bytes, &stamp)?;
+    commit_staged(&staged, &installed_path, &stamp)?;
+
+    restart_service()?;
+    if crate::service::wait_for_control_socket(home, SUPERVISE_READY_TIMEOUT) {
+        eprintln!("supervise\trolled back and the daemon came back");
+        return Ok(());
+    }
+    bail!(
+        "rolled back to {} and the daemon still did not answer; this machine needs a person",
+        rollback.display()
+    );
+}
+
+/// Restart the managed service, in place. Only the supervisor calls this: it
+/// already runs outside the service's cgroup, so it is not restarting itself.
+fn restart_service() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::process::Command::new("systemctl")
+            .args(["--user", "restart", "fabric.service"])
+            .status()
+            .context("failed to run systemctl")?;
+        if !status.success() {
+            bail!("systemctl --user restart fabric.service failed with {status}");
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let target = format!(
+            "gui/{}/com.compoundingtech.fabric",
+            unsafe { libc::geteuid() }
+        );
+        let status = std::process::Command::new("launchctl")
+            .args(["kickstart", "-k", &target])
+            .status()
+            .context("failed to run launchctl")?;
+        if !status.success() {
+            bail!("launchctl kickstart failed with {status}");
+        }
+        Ok(())
+    }
+}
+
+/// Schedule the supervisor to run outside this process's cgroup.
+///
+/// The delay lets the restart that `service::install` scheduled actually happen
+/// first: the supervisor is a verifier, not the thing that bounces the daemon.
+#[cfg(target_os = "linux")]
+fn schedule_supervisor(home: &crate::config::FabricHome, rollback: &Path) -> Result<()> {
+    let exe = rollback.to_path_buf();
+    if !exe.exists() {
+        // A first install has no rollback, so there is nothing to heal back to
+        // and nothing to supervise with.
+        println!("supervise\tskipped, there is no previous binary to fall back to");
+        return Ok(());
+    }
+    let status = std::process::Command::new("systemd-run")
+        .arg("--user")
+        // Well after the restart that install scheduled at +3s.
+        .arg("--on-active=12")
+        .arg(&exe)
+        .arg("--home")
+        .arg(home.root())
+        .arg("supervise-restart")
+        .arg("--rollback")
+        .arg(rollback)
+        .status()
+        .context("failed to schedule the restart supervisor")?;
+    if !status.success() {
+        bail!("could not schedule the restart supervisor: {status}");
+    }
+    println!("supervise\tscheduled, will restore {} if the daemon does not come back", rollback.display());
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn schedule_supervisor(_home: &crate::config::FabricHome, _rollback: &Path) -> Result<()> {
+    // macOS installs verify in place: `launchctl kickstart` does not tear down
+    // the caller, so `service::install` already waits for the control socket and
+    // fails loudly if it never answers.
+    Ok(())
+}
+
+/// What the caller asked for.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateOptions {
+    pub tag: Option<String>,
+    pub url: Option<String>,
+    pub sha256: Option<String>,
+    pub check: bool,
+    pub dry_run: bool,
+    pub no_restart: bool,
+    pub rollback: bool,
+}
+
+/// Run an update. Returns the process exit code, which only `--check` uses for
+/// anything other than success.
+pub async fn run(home: &crate::config::FabricHome, options: UpdateOptions) -> Result<i32> {
+    let installed_path = managed_binary_path()?;
+    let installed = binary_version(&installed_path).unwrap_or_else(|_| "unknown".into());
+    println!("installed\t{installed}");
+    println!("path\t{}", installed_path.display());
+
+    if options.rollback {
+        return roll_back(home, &installed_path, &options).await;
+    }
+
+    let source = resolve_source(options.tag.clone(), options.url.clone(), options.sha256.clone())?;
+    let (url, expected_hash, expected_version) = resolve_artifact(&source).await?;
+    println!("source\t{url}");
+
+    if options.check {
+        let Some(available) = expected_version else {
+            bail!(
+                "--check compares released versions, and --url names an artifact whose \
+                 version is only knowable by downloading it. Run without --check."
+            );
+        };
+        println!("available\t{available}");
+        if installed == available {
+            println!("up to date");
+            return Ok(CHECK_EXIT_CURRENT);
+        }
+        println!("update available");
+        return Ok(CHECK_EXIT_AVAILABLE);
+    }
+
+    let archive = fetch(&url).await?;
+    verify_sha256(&archive, &expected_hash)?;
+    println!("checksum\tok");
+
+    let binary = extract_fabric_binary(&archive)?;
+    let stamp = timestamp();
+    let staged = stage_binary(&installed_path, &binary, &stamp)?;
+
+    // Ask the binary what it is before trusting it with the name of the one
+    // that is running. A staged file that cannot answer is not installed.
+    let staged_version = match binary_version(&staged) {
+        Ok(version) => version,
+        Err(error) => {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error.context("the downloaded binary could not run, so nothing was installed"));
+        }
+    };
+    println!("downloaded\t{staged_version}");
+
+    if let Some(expected) = &expected_version
+        && &staged_version != expected
+    {
+        let _ = std::fs::remove_file(&staged);
+        bail!(
+            "the release claims to be {expected} but the binary in it reports \
+             {staged_version}; nothing was installed"
+        );
+    }
+
+    if options.dry_run {
+        let _ = std::fs::remove_file(&staged);
+        println!();
+        println!("DRY RUN: verified and stopped. Nothing was changed.");
+        return Ok(0);
+    }
+
+    let rollback = commit_staged(&staged, &installed_path, &stamp)?;
+    println!("installed\t{}", binary_version(&installed_path)?);
+    if rollback.exists() {
+        println!("rollback\t{}", rollback.display());
+    }
+
+    finish(home, &options, &rollback)?;
+    Ok(0)
+}
+
+/// Work out where the bytes come from, what hash they must have, and what
+/// version they claim, without downloading the artifact itself.
+async fn resolve_artifact(source: &Source) -> Result<(String, String, Option<String>)> {
+    match source {
+        Source::Explicit { url, sha256 } => Ok((url.clone(), sha256.clone(), None)),
+        Source::Release { tag } => {
+            let tag = match tag {
+                Some(tag) => tag.clone(),
+                None => latest_tag().await?,
+            };
+            let asset = asset_name(target_triple()?);
+            let url = release_asset_url(&tag, &asset);
+            let sidecar = fetch(&format!("{url}.sha256")).await?;
+            let hash = parse_sha256_sidecar(&String::from_utf8_lossy(&sidecar))?;
+            Ok((url, hash, Some(version_for_tag(&tag).to_string())))
+        }
+    }
+}
+
+/// Put the most recent rollback binary back.
+async fn roll_back(
+    home: &crate::config::FabricHome,
+    installed_path: &Path,
+    options: &UpdateOptions,
+) -> Result<i32> {
+    let Some(rollback) = newest_rollback(installed_path)? else {
+        bail!(
+            "there is no rollback binary beside {}, so there is nothing to go back to",
+            installed_path.display()
+        );
+    };
+    let version = binary_version(&rollback)?;
+    println!("rolling back to\t{version}");
+    println!("from\t{}", rollback.display());
+
+    let bytes = std::fs::read(&rollback)
+        .with_context(|| format!("failed to read {}", rollback.display()))?;
+    let stamp = timestamp();
+    let staged = stage_binary(installed_path, &bytes, &stamp)?;
+    let previous = commit_staged(&staged, installed_path, &stamp)?;
+    println!("installed\t{}", binary_version(installed_path)?);
+    if previous.exists() {
+        println!("rollback\t{}", previous.display());
+    }
+    finish(home, options, &previous)?;
+    Ok(0)
+}
+
+/// Re-render the unit and restart, unless told not to.
+fn finish(
+    home: &crate::config::FabricHome,
+    options: &UpdateOptions,
+    rollback: &Path,
+) -> Result<()> {
+    if options.no_restart {
+        println!("restart\tskipped");
+        println!();
+        println!("The new binary is in place but the running daemon is still the old one.");
+        return Ok(());
+    }
+    if !home.is_default_state_root() {
+        // `service::install` refuses a non-default home on purpose, so say why
+        // rather than letting it fail with a message about something else.
+        println!("restart\tskipped");
+        println!();
+        println!(
+            "This --home is not the managed one, so there is no service to re-render \
+             or restart."
+        );
+        return Ok(());
+    }
+
+    // Re-render the unit and restart in one step. Passing every option as `None`
+    // keeps allow-shell, allow-exec and any memory ceiling exactly as they were:
+    // they round trip through config.toml rather than being re-derived here.
+    // Re-render pointing at the MANAGED binary, not at whatever is running this
+    // command. `service::install` would use `current_exe`, which during a manual
+    // test is a `target/debug` build.
+    let managed = managed_binary_path()?;
+    crate::service::install_at(
+        home,
+        &managed,
+        crate::service::ServiceInstallOptions {
+            allow_shell: None,
+            allow_exec: None,
+            memory_max_mb: None,
+        },
+    )?;
+    schedule_supervisor(home, rollback)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,5 +927,120 @@ mod tests {
             release_asset_url("v0.2.0+76376d4", &asset),
             "https://github.com/compoundingtech/fabric/releases/download/v0.2.0+76376d4/fabric-aarch64-apple-darwin.tar.gz"
         );
+    }
+}
+
+#[cfg(test)]
+mod io_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// `file:///` is not a convenience. It is how a locally built artifact gets
+    /// installed through exactly the same path a release does, hash check
+    /// included, so the custom-build route is not a second untested code path.
+    #[tokio::test]
+    async fn a_file_url_is_read_and_hashed_like_any_other_source() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = dir.path().join("fabric.tar.gz");
+        std::fs::write(&artifact, b"pretend archive").unwrap();
+
+        let url = format!("file://{}", artifact.display());
+        let bytes = fetch(&url).await.expect("a file url could not be read");
+        assert_eq!(bytes, b"pretend archive");
+
+        let hash = Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        verify_sha256(&bytes, &hash).expect("the same bytes failed their own hash");
+    }
+
+    #[tokio::test]
+    async fn a_scheme_we_do_not_understand_is_refused() {
+        for url in ["http://example.test/f", "ftp://example.test/f", "/tmp/f"] {
+            let error = fetch(url).await.expect_err("accepted {url}");
+            assert!(
+                format!("{error}").contains("only https:// and file:///"),
+                "the refusal should say what is accepted: {error}"
+            );
+        }
+    }
+
+    /// The binary that was there must still be reachable after an install, or a
+    /// bad update has nothing to fall back to.
+    #[test]
+    fn installing_keeps_the_previous_binary_as_a_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fabric");
+        std::fs::write(&path, b"the old binary").unwrap();
+
+        let rollback = install_binary(&path, b"the new binary", "stamp").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"the new binary");
+        assert_eq!(
+            std::fs::read(&rollback).unwrap(),
+            b"the old binary",
+            "the previous binary was not preserved, so there is nothing to roll back to"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "an installed binary that is not executable is not installed"
+        );
+    }
+
+    /// A first install has nothing to preserve and must not invent something.
+    #[test]
+    fn installing_where_nothing_was_leaves_no_empty_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fabric");
+        let rollback = install_binary(&path, b"the new binary", "stamp").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"the new binary");
+        assert!(
+            !rollback.exists(),
+            "a rollback was created for a binary that never existed"
+        );
+    }
+
+    /// Nothing partial may survive a run. A leftover `.fabric-incoming-*` beside
+    /// the binary would be a half-written binary sitting in the install
+    /// directory, which is the sort of thing somebody later runs by mistake.
+    #[test]
+    fn installing_leaves_no_temporary_files_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fabric");
+        std::fs::write(&path, b"old").unwrap();
+        install_binary(&path, b"new", "stamp").unwrap();
+
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".fabric-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files were left: {leftovers:?}");
+    }
+
+    #[test]
+    fn the_newest_rollback_is_the_one_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fabric");
+        std::fs::write(&path, b"current").unwrap();
+
+        assert!(
+            newest_rollback(&path).unwrap().is_none(),
+            "a rollback was offered when none had been made"
+        );
+
+        let first = install_binary(&path, b"second", "1000").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let second = install_binary(&path, b"third", "2000").unwrap();
+
+        let newest = newest_rollback(&path).unwrap().expect("no rollback found");
+        assert_eq!(
+            newest, second,
+            "rolling back would have gone to {first:?} rather than the most recent"
+        );
+        assert_eq!(std::fs::read(&newest).unwrap(), b"second");
     }
 }
