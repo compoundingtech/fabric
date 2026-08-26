@@ -514,6 +514,129 @@ async fn a_path_dropped_from_include_is_forgotten_not_deleted() -> Result<()> {
     Ok(())
 }
 
+/// The assumption the merge-key digest rests on, made executable.
+///
+/// `Manifest::digest` covers `order_key` and deliberately omits `size`,
+/// `executable`, `mtime_secs` and `mtime_nanos`. That is only sound because a
+/// replica stores the origin's `FileMeta` VERBATIM: the scanner compares content
+/// hashes rather than metadata, so a materialized copy never rewrites those
+/// fields with its own.
+///
+/// If that ever stops being true, two correctly converged peers start holding
+/// different metadata for the same path, and the digest cannot see it. Silent is
+/// exactly the failure the whole instrument exists to prevent, so the assumption
+/// is written here as a test rather than left in a design note.
+///
+/// It compares the manifests on disk field by field, not through the digest,
+/// because a digest that ignores a field cannot notice that field changing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replica_stores_the_origin_metadata_verbatim() -> Result<()> {
+    let _guard = FOLDER_SYNC_LOCK.lock().await;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let a_home = FabricHome::new(a_dir.path());
+    let b_home = FabricHome::new(b_dir.path());
+    let a_folder = a_dir.path().join("shared");
+    let b_folder = b_dir.path().join("shared");
+    std::fs::create_dir_all(&a_folder)?;
+    std::fs::create_dir_all(&b_folder)?;
+    write_sync(a_dir.path(), &a_folder, "bus");
+    write_sync(b_dir.path(), &b_folder, "bus");
+
+    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_b = FabricNode::start(b_home.clone()).await?;
+    trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
+    trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
+
+    std::fs::write(a_folder.join("plain.md"), b"hello")?;
+    std::fs::write(a_folder.join("run.sh"), b"#!/bin/sh\necho hi\n")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            a_folder.join("run.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )?;
+    }
+    std::fs::write(a_folder.join("doomed.md"), b"delete me")?;
+    reload_sync(&a_home).await?;
+    assert!(
+        wait_for_file(&b_folder.join("run.sh"), b"#!/bin/sh\necho hi\n").await,
+        "nothing reached B, so there is no replica to compare"
+    );
+    std::fs::remove_file(a_folder.join("doomed.md"))?;
+    reload_sync(&a_home).await?;
+    assert!(
+        wait_for_missing(&b_folder.join("doomed.md")).await,
+        "the delete never reached B, so there is no tombstone to compare"
+    );
+
+    let read_manifest = |dir: &Path| -> Option<serde_json::Value> {
+        let raw = std::fs::read(dir.join("sync").join("shared").join("manifest.json")).ok()?;
+        serde_json::from_slice(&raw).ok()
+    };
+
+    // Wait for both sides to hold all three entries before comparing, or the
+    // comparison races propagation and fails for the wrong reason.
+    let mut pair = None;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (Some(a), Some(b)) = (read_manifest(a_dir.path()), read_manifest(b_dir.path())) else {
+            continue;
+        };
+        let count = |v: &serde_json::Value| {
+            v.get("entries")
+                .and_then(|e| e.as_object())
+                .map(|o| o.len())
+                .unwrap_or(0)
+        };
+        if count(&a) == 3 && count(&b) == 3 {
+            pair = Some((a, b));
+            break;
+        }
+    }
+    let (a_manifest, b_manifest) = pair.expect("both peers never held all three entries");
+
+    let a_entries = a_manifest["entries"].as_object().unwrap();
+    let b_entries = b_manifest["entries"].as_object().unwrap();
+
+    // Prove the comparison is not vacuous. If the on-disk shape ever stops
+    // carrying these fields, an equality check over the entries would still
+    // pass while guarding nothing at all.
+    let present = a_entries
+        .values()
+        .find(|e| e.get("kind").and_then(|k| k.as_str()) == Some("present"))
+        .expect("no present entry on disk to compare");
+    for field in ["size", "executable", "mtime_secs", "mtime_nanos", "hash"] {
+        assert!(
+            present.get(field).is_some(),
+            "the manifest on disk has no `{field}` field, so this test guards \
+             nothing. The entry shape changed: {present}"
+        );
+    }
+
+    for (path, a_entry) in a_entries {
+        let b_entry = b_entries
+            .get(path)
+            .unwrap_or_else(|| panic!("B is missing {path}"));
+        assert_eq!(
+            a_entry, b_entry,
+            "the replica rewrote metadata for {path}. The merge-key digest omits \
+             size, executable and mtime, so it CANNOT see this difference. Either \
+             restore verbatim storage or widen `Manifest::digest`"
+        );
+    }
+    assert_eq!(
+        a_entries.len(),
+        b_entries.len(),
+        "the two peers hold a different number of entries"
+    );
+
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
 /// The delta-replication goal, written as a property: **a small change must not
 /// ship the whole manifest.**
 ///
