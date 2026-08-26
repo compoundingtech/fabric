@@ -24,6 +24,24 @@
 //! holds. This sequence is local, dense and gap-free by construction, and it is
 //! only ever compared against cursors this same node handed out.
 //!
+//! # The responder cannot acknowledge on its own
+//!
+//! This is a hole in the mechanism, not an implementation detail, and only
+//! running it found it. It is recorded here because the shape is easy to
+//! reinvent.
+//!
+//! A responder sees the initiator's digest when the Hello arrives, and that is
+//! its only chance to notice the two sides already agree. Such a pass never
+//! happens. Fabric runs NO pass at all when nothing has changed, and when
+//! something has changed the digests differ by definition. So the responder
+//! would hold a cursor for nobody and ship its whole manifest forever, while the
+//! initiating side looked fixed.
+//!
+//! The initiator therefore reports the digest it LANDED on, after merging, in a
+//! frame the responder reads before it answers. That frame is sent only to a
+//! peer that reported a digest of its own, so an older build is never handed one
+//! it does not read.
+//!
 //! # Re-sending is free, skipping is fatal
 //!
 //! The join is idempotent, so a peer that receives a change twice merges it

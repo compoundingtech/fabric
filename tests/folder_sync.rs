@@ -9,6 +9,29 @@
 //! These run real daemons over real iroh on one machine, because the failures
 //! that matter are the ones a simulated transport cannot show: a peer that goes
 //! away and comes back holding a stale copy.
+//!
+//! # READ THIS BEFORE WRITING THE NEXT TEST HERE
+//!
+//! **A test that runs with a fallback underneath it must assert the fallback did
+//! not fire.** Otherwise it passes for the wrong reason and stays green while the
+//! thing it guards is broken.
+//!
+//! This is not hypothetical. `a_delete_sticks_starting_from_either_peer` was
+//! written without that assertion. Making `Manifest::subset` silently drop every
+//! tombstone did NOT fail it: the incomplete delta produced a digest mismatch,
+//! the cursor reset, and the next pass carried the delete inside a full
+//! manifest. The delete arrived, the test passed, and a delta that never carried
+//! a tombstone would have shipped while every delete in the fleet quietly cost a
+//! whole manifest.
+//!
+//! Sync has two fallbacks that will do this to you. `delta_fallbacks` counts a
+//! reconcile that found a payload incomplete and sent full state instead. The
+//! periodic safety scan re-reads the tree when a watcher event is missed. Both
+//! exist to make failures survivable, and both make a broken mechanism look
+//! healthy from the outside.
+//!
+//! So assert the mechanism, not only the outcome. "The file is gone on B" is an
+//! outcome. "The file is gone on B AND nothing fell back" is the mechanism.
 
 use std::{path::Path, time::Duration};
 
@@ -965,5 +988,108 @@ async fn a_delete_sticks_starting_from_either_peer() -> Result<()> {
 
     node_b.shutdown().await?;
     node_a.shutdown().await?;
+    Ok(())
+}
+
+/// Three nodes in a LINE, so a change must travel THROUGH a peer that is neither
+/// its origin nor its destination.
+///
+/// Two nodes cannot show this. On a pair, every change reaches its destination
+/// directly, so a peer that adopts correctly but forwards nothing looks perfect.
+/// The delta path makes that failure reachable: a node forwards by recording
+/// what it adopted into its own buffer, and if it recorded nothing it would
+/// converge with its source and silently starve everyone downstream.
+///
+/// A trusts only B. C trusts only B. A and C never speak, so B is the only route
+/// and every assertion about C is an assertion about forwarding.
+///
+/// The delete travels in both directions across the line, because the delta path
+/// is asymmetric and the middle peer is an initiator to one side and a responder
+/// to the other in the same pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_change_and_a_delete_cross_a_peer_that_is_only_a_relay() -> Result<()> {
+    let _guard = FOLDER_SYNC_LOCK.lock().await;
+    let dirs = [TempDir::new()?, TempDir::new()?, TempDir::new()?];
+    let homes: Vec<FabricHome> = dirs.iter().map(|d| FabricHome::new(d.path())).collect();
+    let folders: Vec<_> = dirs.iter().map(|d| d.path().join("shared")).collect();
+    for (dir, folder) in dirs.iter().zip(&folders) {
+        std::fs::create_dir_all(folder)?;
+        write_sync(dir.path(), folder, "bus");
+    }
+
+    let a = FabricNode::start(homes[0].clone()).await?;
+    let b = FabricNode::start(homes[1].clone()).await?;
+    let c = FabricNode::start(homes[2].clone()).await?;
+
+    // A — B — C. A and C are never introduced.
+    trust_peer(&homes[0], &a, b.id(), "b", b.addr()).await?;
+    trust_peer(&homes[1], &b, a.id(), "a", a.addr()).await?;
+    trust_peer(&homes[1], &b, c.id(), "c", c.addr()).await?;
+    trust_peer(&homes[2], &c, b.id(), "b", b.addr()).await?;
+
+    let fallbacks_before = (
+        fallbacks_of(&homes[0]).await?,
+        fallbacks_of(&homes[1]).await?,
+        fallbacks_of(&homes[2]).await?,
+    );
+
+    // Outward: born on A, must reach C through B.
+    std::fs::write(folders[0].join("relayed.md"), b"through the middle")?;
+    reload_sync(&homes[0]).await?;
+    assert!(
+        wait_for_file(&folders[2].join("relayed.md"), b"through the middle").await,
+        "A's file never reached C, so B adopted it and forwarded nothing"
+    );
+
+    // Backward: born on C, must reach A through B.
+    std::fs::write(folders[2].join("returned.md"), b"back the other way")?;
+    reload_sync(&homes[2]).await?;
+    assert!(
+        wait_for_file(&folders[0].join("returned.md"), b"back the other way").await,
+        "C's file never reached A through B"
+    );
+
+    // A delete has to cross the relay too, in both directions.
+    std::fs::remove_file(folders[0].join("relayed.md"))?;
+    reload_sync(&homes[0]).await?;
+    assert!(
+        wait_for_missing(&folders[2].join("relayed.md")).await,
+        "a delete on A never crossed B to reach C. A tombstone is a fragment like \
+         any other and must forward like one"
+    );
+    std::fs::remove_file(folders[2].join("returned.md"))?;
+    reload_sync(&homes[2]).await?;
+    assert!(
+        wait_for_missing(&folders[0].join("returned.md")).await,
+        "a delete on C never crossed B to reach A"
+    );
+
+    // Neither may come back anywhere on the line, the relay included.
+    for (i, folder) in folders.iter().enumerate() {
+        assert_stays_missing(&folder.join("relayed.md"), &format!("node {i}")).await;
+        assert!(
+            !folder.join("returned.md").exists(),
+            "returned.md came back on node {i}"
+        );
+    }
+
+    // And none of it may have been rescued by a fallback. Without this the test
+    // passes when forwarding is broken, because a digest mismatch resets the
+    // cursor and the next full manifest carries everything anyway. See the note
+    // at the top of this file.
+    let fallbacks_after = (
+        fallbacks_of(&homes[0]).await?,
+        fallbacks_of(&homes[1]).await?,
+        fallbacks_of(&homes[2]).await?,
+    );
+    assert_eq!(
+        fallbacks_after, fallbacks_before,
+        "relaying forced a fallback to full state, so changes are not forwarding \
+         in the delta and the middle peer costs a whole manifest per change"
+    );
+
+    c.shutdown().await?;
+    b.shutdown().await?;
+    a.shutdown().await?;
     Ok(())
 }
