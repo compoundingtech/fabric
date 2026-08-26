@@ -195,6 +195,11 @@ pub struct SyncEntryStatus {
     pub persist_micros: u64,
     #[serde(default)]
     pub reconcile_micros: u64,
+    /// Every byte this entry put on or took off the wire, cumulative, INCLUDING
+    /// the manifest shipped on every pass. Counted client-side, so summing
+    /// across the fleet counts each transfer once.
+    #[serde(default)]
+    pub reconcile_wire_bytes: u64,
     /// Peer reconciles that returned an error, cumulative. A number that MOVES
     /// between two samples is a fault happening now; a large total on an old
     /// daemon may be history.

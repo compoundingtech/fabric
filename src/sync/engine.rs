@@ -267,6 +267,17 @@ struct EntryWork {
     materialize_micros: AtomicU64,
     persist_micros: AtomicU64,
     reconcile_micros: AtomicU64,
+    /// Every byte this entry has put on or taken off the wire, cumulative.
+    ///
+    /// Counted on the CLIENT side of a reconcile, which is the side this node
+    /// originates. A transfer is one node's outbound and another's inbound, so
+    /// summing this across the fleet counts each transfer once rather than
+    /// twice.
+    ///
+    /// It includes THE MANIFEST, which is the dominant term and the one delta
+    /// replication exists to remove. A figure that counted only content would
+    /// report a converged pass as free, and a converged pass ships about 10 MB.
+    reconcile_wire_bytes: AtomicU64,
     /// Peer reconciles that returned an error, cumulative.
     ///
     /// Nine dead entries on one machine failed EVERY reconcile for weeks: 81
@@ -302,6 +313,7 @@ impl EntryWork {
             materialize_micros: AtomicU64::new(0),
             persist_micros: AtomicU64::new(0),
             reconcile_micros: AtomicU64::new(0),
+            reconcile_wire_bytes: AtomicU64::new(0),
             reconcile_failures: AtomicU64::new(0),
             #[cfg(test)]
             persist_calls: AtomicUsize::new(0),
@@ -836,6 +848,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                 materialize_micros: entry.work.materialize_micros.load(Ordering::Relaxed),
                 persist_micros: entry.work.persist_micros.load(Ordering::Relaxed),
                 reconcile_micros: entry.work.reconcile_micros.load(Ordering::Relaxed),
+                reconcile_wire_bytes: entry.work.reconcile_wire_bytes.load(Ordering::Relaxed),
                 reconcile_failures: entry.work.reconcile_failures.load(Ordering::Relaxed),
                 sweep: entry.last_sweep.lock().unwrap().clone(),
             });
@@ -933,6 +946,10 @@ impl<T: SyncTransport> SyncEngine<T> {
             );
             match outcome {
                 Ok(stats) => {
+                    entry
+                        .work
+                        .reconcile_wire_bytes
+                        .fetch_add(stats.wire_bytes as u64, Ordering::Relaxed);
                     if !stats.is_noop() {
                         tracing::debug!(sync = name, peer = peer.id, ?stats, "sync reconciled");
                     }
@@ -1372,6 +1389,7 @@ pub struct SyncStatus {
     pub materialize_micros: u64,
     pub persist_micros: u64,
     pub reconcile_micros: u64,
+    pub reconcile_wire_bytes: u64,
     pub reconcile_failures: u64,
     /// Why the tombstone sweep did or did not forget anything, as last decided.
     /// `None` means no pass has reached the sweep yet for this entry instance.

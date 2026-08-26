@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Measure what fabric spends per byte that actually changed.
+
+Two ratios, both over one stated window:
+
+    write ratio   bookkeeping bytes written  / bytes changed on disk
+    ship ratio    bytes put on the wire      / bytes changed on disk
+
+WHAT "BYTES CHANGED" MEANS, because the number is only as honest as this. A file
+whose size or mtime moved contributes its WHOLE size, not the size of the edit.
+A one-byte change to a one-kilobyte file counts as a kilobyte. That OVERSTATES
+the denominator, which UNDERSTATES both ratios. The real amplification is worse
+than whatever this prints, and that is the direction to be wrong in.
+
+THE SHIP FIGURE INCLUDES THE MANIFEST, which is shipped whole on every pass
+whether or not anything changed, and which is the term delta replication exists
+to remove. It is counted on the client side of each reconcile, so summing across
+machines counts each transfer once rather than twice.
+
+Exit codes:
+  0  measured, both ratios within budget
+  1  measured, a ratio is OVER budget
+  2  nothing changed during the window, so there is no ratio to report
+  3  could not measure at all
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+BOOKKEEPING = ("state.json", "manifest.json")
+
+
+def sanitize(name):
+    """Mirror `sanitize_name` in src/sync/engine.rs exactly."""
+    return "".join(c if (c.isalnum() or c in "-_") else "_" for c in name)
+
+
+def sync_status(home):
+    cmd = ["fabric"]
+    if home:
+        cmd += ["--home", home]
+    cmd += ["sync", "ls", "--json"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        return json.loads(out.stdout)
+    except ValueError:
+        return None
+
+
+def tree_snapshot(folder):
+    """Every file's size and mtime under `folder`.
+
+    One function for both the before and the after snapshot, on purpose. A
+    baseline built one way and compared another matched nothing and reported
+    every file as gone, which is a mistake worth only making once.
+    """
+    out = {}
+    for root, _dirs, files in os.walk(folder):
+        if f"{os.sep}.git" in root:
+            continue
+        for name in files:
+            path = os.path.join(root, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            out[path] = (st.st_size, st.st_mtime_ns)
+    return out
+
+
+def bytes_changed(before, after):
+    """Whole size of every file that appeared or moved. Deliberately generous."""
+    total = 0
+    for path, (size, mtime) in after.items():
+        was = before.get(path)
+        if was is None or was != (size, mtime):
+            total += size
+    return total
+
+
+def ratios(changed, written, shipped):
+    """The arithmetic, separated so it can be tested without a fleet."""
+    if changed <= 0:
+        return None, None
+    return written / changed, shipped / changed
+
+
+def self_test():
+    """Make the instrument fail on purpose, for the faults it exists to detect.
+
+    A measurement tool that has never been shown to report a bad number is not
+    evidence of a good one.
+    """
+    failures = []
+
+    # A quiet fleet must not be reported as a ratio at all.
+    if ratios(0, 10_000, 10_000) != (None, None):
+        failures.append("nothing changed but a ratio was still produced")
+
+    # The fault it exists to catch: enormous write and ship per byte changed.
+    write, ship = ratios(76, 71_000_000, 21_000_000)
+    if write is None or write < 100_000:
+        failures.append(f"a ~950,000x write amplification read as {write}")
+    if ship is None or ship < 100_000:
+        failures.append(f"a large ship amplification read as {ship}")
+
+    # And a healthy system must come out small, or every number reads as alarming.
+    write, ship = ratios(1_000_000, 1_100_000, 1_050_000)
+    if write is None or write > 2:
+        failures.append(f"a healthy write ratio read as {write}")
+    if ship is None or ship > 2:
+        failures.append(f"a healthy ship ratio read as {ship}")
+
+    # The snapshot comparison must notice a file that changed, and must not
+    # invent changes when nothing moved.
+    before = {"/a": (10, 1), "/b": (20, 1)}
+    if bytes_changed(before, before) != 0:
+        failures.append("an unchanged tree reported changed bytes")
+    if bytes_changed(before, {"/a": (10, 2), "/b": (20, 1)}) != 10:
+        failures.append("a changed file was not counted as its whole size")
+    if bytes_changed(before, {**before, "/c": (5, 1)}) != 5:
+        failures.append("a new file was not counted")
+
+    for line in failures:
+        print(f"  SELF TEST FAILED: {line}")
+    if failures:
+        return 1
+    print("  self test passed: the arithmetic reports what it should, both ways")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--seconds", type=int, default=120)
+    ap.add_argument("--max-write-ratio", type=float, default=100.0)
+    ap.add_argument("--max-ship-ratio", type=float, default=100.0)
+    ap.add_argument("--home", default=os.path.expanduser("~/.local/share/fabric"))
+    ap.add_argument("--self-test", action="store_true")
+    args = ap.parse_args()
+
+    if args.self_test:
+        return self_test()
+
+    entries = sync_status(args.home)
+    if not entries:
+        print("no sync entries reported; is the daemon running?", file=sys.stderr)
+        return 3
+
+    folders = {e["name"]: e["folder"] for e in entries}
+    files = []
+    for name in folders:
+        for leaf in BOOKKEEPING:
+            path = os.path.join(args.home, "sync", sanitize(name), leaf)
+            if os.path.exists(path):
+                files.append(path)
+
+    shipped_before = sum(e.get("reconcile_wire_bytes", 0) for e in entries)
+    if not any("reconcile_wire_bytes" in e for e in entries):
+        print("this daemon does not report reconcile_wire_bytes; it predates the counter",
+              file=sys.stderr)
+        return 3
+
+    trees_before = {name: tree_snapshot(folder) for name, folder in folders.items()}
+    last = {p: os.stat(p).st_mtime_ns for p in files}
+    written = 0
+
+    start = time.time()
+    while time.time() - start < args.seconds:
+        for path in files:
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if st.st_mtime_ns != last[path]:
+                written += st.st_size
+                last[path] = st.st_mtime_ns
+        time.sleep(0.5)
+    window = time.time() - start
+
+    entries_after = sync_status(args.home) or []
+    shipped = sum(e.get("reconcile_wire_bytes", 0) for e in entries_after) - shipped_before
+    changed = sum(
+        bytes_changed(trees_before[name], tree_snapshot(folder))
+        for name, folder in folders.items()
+    )
+
+    print(f"window        {window:.0f} s")
+    print(f"entries       {', '.join(folders)}")
+    print(f"changed       {changed} bytes on disk")
+    print(f"written       {written} bytes of bookkeeping")
+    print(f"shipped       {shipped} bytes on the wire, manifest included")
+
+    write_ratio, ship_ratio = ratios(changed, written, shipped)
+    if write_ratio is None:
+        print("")
+        print("NOTHING CHANGED in the window, so there is no ratio to report.")
+        print(f"Fabric still wrote {written} and shipped {shipped} bytes to achieve that.")
+        return 2
+
+    print("")
+    print(f"write ratio   {write_ratio:,.0f}x   budget {args.max_write_ratio:,.0f}x")
+    print(f"ship ratio    {ship_ratio:,.0f}x   budget {args.max_ship_ratio:,.0f}x")
+    print("")
+    print("Both ratios UNDERSTATE the real figure: a changed file counts as its")
+    print("whole size, not the size of the edit.")
+
+    over = write_ratio > args.max_write_ratio or ship_ratio > args.max_ship_ratio
+    if over:
+        print("")
+        print("OVER BUDGET")
+        return 1
+    print("")
+    print("within budget")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

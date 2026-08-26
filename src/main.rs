@@ -909,7 +909,7 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                     let present = logical_present(&entry);
                     if entry.missing == 0 && entry.unexpected == 0 && entry.mismatched == 0 {
                         println!(
-                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_failures={}\tsweep={}",
+                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}",
                             entry.name,
                             entry.folder,
                             entry.policy,
@@ -924,12 +924,13 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                             entry.materialize_micros / 1000,
                             entry.persist_micros / 1000,
                             entry.reconcile_micros / 1000,
+                            entry.reconcile_wire_bytes,
                             entry.reconcile_failures,
                             sweep_token(&entry),
                         );
                     } else {
                         println!(
-                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_failures={}\tsweep={}",
+                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}",
                             entry.name,
                             entry.folder,
                             entry.policy,
@@ -947,6 +948,7 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                             entry.materialize_micros / 1000,
                             entry.persist_micros / 1000,
                             entry.reconcile_micros / 1000,
+                            entry.reconcile_wire_bytes,
                             entry.reconcile_failures,
                             sweep_token(&entry),
                         );
@@ -996,6 +998,7 @@ struct SyncLsJsonEntry<'a> {
     materialize_micros: u64,
     persist_micros: u64,
     reconcile_micros: u64,
+    reconcile_wire_bytes: u64,
     reconcile_failures: u64,
     /// Why the tombstone sweep did or did not forget anything. `unknown` from a
     /// daemon that predates the field.
@@ -1024,6 +1027,7 @@ impl<'a> From<&'a fabric::control::SyncEntryStatus> for SyncLsJsonEntry<'a> {
             materialize_micros: entry.materialize_micros,
             persist_micros: entry.persist_micros,
             reconcile_micros: entry.reconcile_micros,
+            reconcile_wire_bytes: entry.reconcile_wire_bytes,
             reconcile_failures: entry.reconcile_failures,
             sweep: sweep_token(entry),
         }
@@ -1272,6 +1276,7 @@ mod sync_ls_tests {
             materialize_micros: 2_500,
             persist_micros: 3_500,
             reconcile_micros: 4_500,
+            reconcile_wire_bytes: 11_000_000,
             reconcile_failures: 3,
             sweep: "disabled".to_string(),
         }
@@ -1303,6 +1308,7 @@ mod sync_ls_tests {
                 "materialize_micros": 2500,
                 "persist_micros": 3500,
                 "reconcile_micros": 4500,
+                "reconcile_wire_bytes": 11000000,
                 "reconcile_failures": 3,
                 "sweep": "disabled"
             })

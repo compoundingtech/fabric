@@ -51,6 +51,17 @@ pub struct Reconciled {
     pub pushed: usize,
     /// Content bytes transferred in either direction.
     pub bytes: usize,
+    /// EVERY byte this reconcile put on or took off the wire, not just content.
+    ///
+    /// `bytes` above counts content blobs only, and content is the SMALL part.
+    /// A pass ships the entire manifest in its Hello frame whether or not
+    /// anything changed — 10 MB of it on the bus entry — so a figure that
+    /// excludes the manifest understates what a reconcile costs by orders of
+    /// magnitude, and the manifest is precisely what delta replication exists to
+    /// stop shipping.
+    ///
+    /// Measuring the thing we are about to remove is the point.
+    pub wire_bytes: usize,
 }
 
 impl Reconciled {
@@ -347,6 +358,8 @@ impl SyncNode {
         let other_adopts = other.manifest.diff_from(&self.manifest);
 
         let mut stats = Reconciled {
+            // The loopback path moves nothing over a wire.
+            wire_bytes: 0,
             pulled: self_adopts.len(),
             pushed: other_adopts.len(),
             bytes: 0,

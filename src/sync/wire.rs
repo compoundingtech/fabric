@@ -148,16 +148,23 @@ where
         manifest: local_manifest.clone(),
         wanted,
     };
-    write_len_bytes(&mut stream, &serde_json::to_vec(&hello)?).await?;
+    let hello_frame = serde_json::to_vec(&hello)?;
+    // THE WHOLE MANIFEST, ON EVERY PASS, CHANGED OR NOT. This is the term that
+    // makes a reconcile expensive and the term delta replication exists to
+    // remove, so a measurement that leaves it out measures the wrong thing.
+    let mut wire_bytes = hello_frame.len();
+    write_len_bytes(&mut stream, &hello_frame).await?;
     stream.flush().await?;
 
     // 2. Read the server's reply header, then its content bundle into our store.
-    let reply: ReplyHeader = serde_json::from_slice(
-        &read_len_bytes(&mut stream, MAX_JSON_FRAME)
-            .await
-            .context("reading sync reply header")?,
-    )?;
+    let reply_frame = read_len_bytes(&mut stream, MAX_JSON_FRAME)
+        .await
+        .context("reading sync reply header")?;
+    // The peer's whole manifest comes back the same way.
+    wire_bytes += reply_frame.len();
+    let reply: ReplyHeader = serde_json::from_slice(&reply_frame)?;
     let received = read_blobs_into(&mut stream, &node).await?;
+    wire_bytes += received.bytes;
 
     // 3. Adopt the server's winning entries and bundle what the server needs.
     let for_server = {
@@ -181,10 +188,12 @@ where
     let _ack = read_u32(&mut stream).await?;
 
     let sent: usize = for_server.1.iter().map(|(_, b)| b.len()).sum();
+    wire_bytes += sent;
     Ok(Reconciled {
         pulled: for_server.0,
         pushed: for_server.1.len(),
         bytes: sent + received.bytes,
+        wire_bytes,
     })
 }
 
@@ -252,6 +261,8 @@ where
     Ok((
         name,
         Reconciled {
+            // Measured on the CLIENT side, which is where a pass originates.
+            wire_bytes: 0,
             pulled: received.blobs,
             pushed,
             bytes: sent + received.bytes,
@@ -401,6 +412,88 @@ mod tests {
         assert!(
             client_replay.is_noop() && server_replay.is_noop(),
             "a converged Tombstone replay moved state: client={client_replay:?} server={server_replay:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod wire_cost_tests {
+    use super::tests::*;
+    use super::*;
+
+    fn author(n: u8) -> super::super::manifest::Author {
+        super::super::manifest::Author([n; 32])
+    }
+
+    async fn reconcile_once(
+        a: Arc<Mutex<SyncNode>>,
+        b: Arc<Mutex<SyncNode>>,
+    ) -> Reconciled {
+        let (client_end, server_end) = tokio::io::duplex(1 << 22);
+        let b_for_server = b.clone();
+        let server = tokio::spawn(async move {
+            run_server(server_end, move |_, _| async move { Ok(Some((b_for_server, ()))) }).await
+        });
+        let stats = run_client(client_end, a, "cat").await.unwrap();
+        let _ = server.await.unwrap().unwrap();
+        stats
+    }
+
+    /// A CONVERGED PASS SHIPS NOTHING AND STILL COSTS A MANIFEST.
+    ///
+    /// `bytes` counts content blobs, and a converged pass transfers no content,
+    /// so by that measure a no-op reconcile is free. It is not: both sides send
+    /// their entire manifest in the handshake whether or not anything changed.
+    /// On the bus entry that is about 10 MB, every pass, per peer.
+    ///
+    /// A cost measurement that reports zero here would hide the exact term delta
+    /// replication exists to remove, which is the only reason this counter was
+    /// added.
+    #[tokio::test]
+    async fn a_converged_pass_transfers_no_content_and_still_ships_a_manifest() {
+        let a = Arc::new(Mutex::new(SyncNode::new(author(1))));
+        let b = Arc::new(Mutex::new(SyncNode::new(author(2))));
+        // Enough entries that the manifest is unmistakably the dominant term.
+        for i in 0..200 {
+            let name = format!("file-{i:03}.md");
+            a.lock().await.local_write(&name, b"x", 0, 0);
+        }
+        // Converge them.
+        reconcile_once(a.clone(), b.clone()).await;
+        let second = reconcile_once(a.clone(), b.clone()).await;
+
+        assert!(
+            second.is_noop(),
+            "the second pass was not converged, so this measures the wrong thing"
+        );
+        assert_eq!(
+            second.bytes, 0,
+            "a converged pass moved content, so the fixture is wrong"
+        );
+        assert!(
+            second.wire_bytes > 4_000,
+            "a converged pass reported {} wire bytes; the manifests are not being \
+             counted, and the manifest is the whole cost",
+            second.wire_bytes
+        );
+    }
+
+    /// And content must still be counted, or the figure swaps one blind spot for
+    /// another.
+    #[tokio::test]
+    async fn content_is_counted_as_well_as_the_manifest() {
+        let a = Arc::new(Mutex::new(SyncNode::new(author(1))));
+        let b = Arc::new(Mutex::new(SyncNode::new(author(2))));
+        let payload = vec![b'z'; 64 * 1024];
+        a.lock().await.local_write("big.bin", &payload, 0, 0);
+
+        let stats = reconcile_once(a, b).await;
+        assert!(stats.bytes >= payload.len(), "the content was not transferred");
+        assert!(
+            stats.wire_bytes >= payload.len(),
+            "wire bytes {} excludes the {} byte payload",
+            stats.wire_bytes,
+            payload.len()
         );
     }
 }
