@@ -90,6 +90,18 @@ async fn reload_sync(home: &FabricHome) -> Result<()> {
 }
 
 /// Read both manifest digests for the `shared` entry.
+/// Reconciles that found a payload incomplete and fell back to full state.
+async fn fallbacks_of(home: &FabricHome) -> Result<u64> {
+    match send_control(home, ControlRequest::SyncStatus).await? {
+        fabric::control::ControlResponse::SyncStatus { entries } => Ok(entries
+            .into_iter()
+            .find(|e| e.name == "shared")
+            .map(|e| e.delta_fallbacks)
+            .unwrap_or(0)),
+        other => panic!("expected SyncStatus, got {other:?}"),
+    }
+}
+
 async fn digest_of(home: &FabricHome) -> Result<String> {
     match send_control(home, ControlRequest::SyncStatus).await? {
         fabric::control::ControlResponse::SyncStatus { entries } => {
@@ -863,6 +875,92 @@ async fn a_path_outside_the_receivers_include_is_not_deleted() -> Result<()> {
         std::fs::read(&doc)?,
         b"the shared document",
         "the document survived but its content changed"
+    );
+
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
+/// A delete must stick in BOTH directions, not just outward from the machine
+/// that happened to be tested.
+///
+/// The delta path is asymmetric: the initiating side sends first, and the
+/// serving side answers with a payload chosen by a cursor it maintains
+/// differently. A delete that propagates from the initiator therefore proves
+/// nothing about one that starts on the responder. Both are exercised here in
+/// one run, on the same pair, so neither direction can pass by accident of who
+/// dialled whom.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_sticks_starting_from_either_peer() -> Result<()> {
+    let _guard = FOLDER_SYNC_LOCK.lock().await;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let a_home = FabricHome::new(a_dir.path());
+    let b_home = FabricHome::new(b_dir.path());
+    let a_folder = a_dir.path().join("shared");
+    let b_folder = b_dir.path().join("shared");
+    std::fs::create_dir_all(&a_folder)?;
+    std::fs::create_dir_all(&b_folder)?;
+    write_sync(a_dir.path(), &a_folder, "bus");
+    write_sync(b_dir.path(), &b_folder, "bus");
+
+    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_b = FabricNode::start(b_home.clone()).await?;
+    trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
+    trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
+
+    // A delete must travel IN the delta, not be rescued by the fallback.
+    //
+    // Without this the test cannot tell the two apart. A delta that silently
+    // dropped tombstones would still pass: the digests would disagree, the
+    // cursor would reset, and the next pass would carry the tombstone in a full
+    // manifest. The delete sticks either way, and every delete would quietly
+    // cost a whole manifest. Mutation-tested: dropping tombstones from
+    // `Manifest::subset` passes without this and fails with it.
+    let fallbacks_before = (fallbacks_of(&a_home).await?, fallbacks_of(&b_home).await?);
+
+    // Direction one: born on A, deleted on A.
+    std::fs::write(a_folder.join("from-a.md"), b"a")?;
+    reload_sync(&a_home).await?;
+    assert!(
+        wait_for_file(&b_folder.join("from-a.md"), b"a").await,
+        "A's file never reached B"
+    );
+    std::fs::remove_file(a_folder.join("from-a.md"))?;
+    reload_sync(&a_home).await?;
+    assert!(
+        wait_for_missing(&b_folder.join("from-a.md")).await,
+        "a delete on A never reached B"
+    );
+
+    // Direction two: born on B, deleted on B, over the same converged pair.
+    std::fs::write(b_folder.join("from-b.md"), b"b")?;
+    reload_sync(&b_home).await?;
+    assert!(
+        wait_for_file(&a_folder.join("from-b.md"), b"b").await,
+        "B's file never reached A"
+    );
+    std::fs::remove_file(b_folder.join("from-b.md"))?;
+    reload_sync(&b_home).await?;
+    assert!(
+        wait_for_missing(&a_folder.join("from-b.md")).await,
+        "a delete on B never reached A. The delta path is asymmetric and this is \
+         the direction that gets missed"
+    );
+
+    // Neither may come back. A delete that held for one pass and returned on the
+    // next is the shape of the original bug.
+    assert_stays_missing(&b_folder.join("from-a.md"), "A-born delete").await;
+    assert_stays_missing(&a_folder.join("from-b.md"), "B-born delete").await;
+    assert_stays_missing(&a_folder.join("from-a.md"), "delete undone on deleter").await;
+    assert_stays_missing(&b_folder.join("from-b.md"), "delete undone on deleter").await;
+
+    let fallbacks_after = (fallbacks_of(&a_home).await?, fallbacks_of(&b_home).await?);
+    assert_eq!(
+        fallbacks_after, fallbacks_before,
+        "a delete forced a fallback to full state, so tombstones are not \
+         travelling in the delta and every delete costs a whole manifest"
     );
 
     node_b.shutdown().await?;
