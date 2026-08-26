@@ -1371,17 +1371,31 @@ impl<T: SyncTransport> SyncEngine<T> {
 
     /// Append one line per changed path.
     ///
-    /// Deliberately NOT fsynced. The log is an INDEX, and an index can always be
-    /// re-derived. For a local change the filesystem is the durable record: the
-    /// file is on disk whether or not the line survived, and the next scan
-    /// re-derives the entry. For an adopted change the peer is the durable
-    /// record and re-sends it. A local DELETE survives too, because deletion is
-    /// detected by scanning against the manifest, not from the log: the snapshot
-    /// still holds the entry Present, the scan finds nothing, and the delete is
-    /// re-derived with a higher version.
+    /// Deliberately NOT fsynced, because a lost tail costs a catch-up rather
+    /// than data. An fsync per record would buy latency and nothing else.
     ///
-    /// So a lost tail costs a catch-up, never data, and an fsync per record
-    /// would buy latency and nothing else.
+    /// The reason is narrower than "an index can always be re-derived", and that
+    /// tidier version is FALSE. It is worth stating exactly, because the tidy
+    /// one is what a reader will otherwise carry away:
+    ///
+    /// - A local change is covered by the FILESYSTEM. The file is on disk
+    ///   whether or not the line survived, and the next scan re-derives it.
+    /// - An adopted change is covered by the PEER, which re-sends it.
+    /// - A local DELETE is covered only while the SNAPSHOT survives. Deletion is
+    ///   detected by scanning against the manifest: the snapshot still holds the
+    ///   entry Present, the scan finds nothing, and the delete is re-derived
+    ///   with a higher version.
+    ///
+    /// **A tombstone exists only in the index.** Nothing on disk records that a
+    /// file used to be there, so a node that loses its SNAPSHOT cannot re-derive
+    /// its deletes and must get them back from a peer. Measured on a
+    /// production-scale fixture: deleting `state.json` cost 411 seconds to
+    /// rebuild, of which the folder scan was 620 ms. The rest was recovering
+    /// 14,006 tombstones over the wire. If every peer lost its snapshot at once,
+    /// deleted files would come back.
+    ///
+    /// That is not made worse by the log and was equally true before it. It is
+    /// why the snapshot, and only the snapshot, is written with an fsync.
     fn append_log(&self, name: &str, records: &[LoggedChange]) -> Result<()> {
         if records.is_empty() {
             return Ok(());

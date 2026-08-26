@@ -17,6 +17,16 @@
 //! through it, so there is no eviction threshold to pick and no runaway to
 //! guard. A peer that has fallen far behind is not a growth problem here.
 //!
+//! # Reach for the shape of the data before reaching for a constant
+//!
+//! That bound was not chosen, it fell out of coalescing by path. The log's
+//! compaction bound went the same way: it is a fraction of the SNAPSHOT's own
+//! size, so it scales with the entry instead of being a number somebody picked
+//! and nobody can defend later. See `LOG_COMPACTION_DIVISOR`.
+//!
+//! Twice is enough to make it a habit. When a limit is needed here, look first
+//! for one the data already implies.
+//!
 //! # Why a local sequence rather than a version vector
 //!
 //! [`crate::sync::manifest::FileMeta::version`] is per-path Lamport, NOT a
