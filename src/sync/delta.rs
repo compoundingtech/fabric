@@ -53,6 +53,13 @@ pub struct ChangeBuffer {
     next_seq: Cursor,
     by_seq: BTreeMap<Cursor, String>,
     by_path: HashMap<String, Cursor>,
+    /// How much of this buffer each peer has confirmed taking.
+    ///
+    /// A peer ABSENT from this map has confirmed nothing, and that is the safe
+    /// reading: it means send full state. A restart restores exactly that, for
+    /// every peer, because nothing here is written to disk. A cursor that cannot
+    /// be persisted cannot be restored wrongly.
+    acked: HashMap<String, Cursor>,
 }
 
 impl ChangeBuffer {
@@ -110,6 +117,48 @@ impl ChangeBuffer {
             .range(cursor..)
             .map(|(_, path)| path.as_str())
             .collect()
+    }
+
+    /// How much of this buffer `peer` has confirmed taking.
+    ///
+    /// `None` means it has confirmed nothing and must be sent full state. That
+    /// covers a peer met for the first time and every peer after a restart.
+    pub fn cursor_for(&self, peer: &str) -> Option<Cursor> {
+        self.acked.get(peer).copied()
+    }
+
+    /// Record that `peer` durably applied everything below `cursor`.
+    ///
+    /// Call this only AFTER the peer confirmed it. Recording an acknowledgement
+    /// that has not happened is how a change gets skipped, and a skipped change
+    /// is silent divergence.
+    pub fn acknowledge(&mut self, peer: &str, cursor: Cursor) {
+        self.acked.insert(peer.to_string(), cursor);
+    }
+
+    /// Forget what `peer` has taken, so the next pass sends it full state.
+    ///
+    /// This is the fallback trigger. It is always safe: the cost is one full
+    /// exchange and the alternative is a peer that quietly stays behind.
+    pub fn reset_peer(&mut self, peer: &str) {
+        self.acked.remove(peer);
+    }
+
+    /// The cursor every one of `peers` has reached, which is ZERO when any of
+    /// them has confirmed nothing.
+    ///
+    /// Eviction uses this. A peer that has confirmed nothing must hold eviction
+    /// back completely, or the buffer drops a change that peer still needs and
+    /// nothing ever tells it what it missed.
+    pub fn acked_by_all(&self, peers: &[&str]) -> Cursor {
+        let mut low = Cursor::MAX;
+        for peer in peers {
+            match self.acked.get(*peer) {
+                Some(cursor) => low = low.min(*cursor),
+                None => return 0,
+            }
+        }
+        if peers.is_empty() { 0 } else { low }
     }
 
     /// Drop one path because it no longer exists in the manifest.
@@ -277,6 +326,63 @@ mod tests {
             vec!["a.txt"],
             "a.txt changed after the cursor and must survive"
         );
+    }
+
+    #[test]
+    fn an_unknown_peer_has_no_cursor_and_must_get_full_state() {
+        let buffer = ChangeBuffer::new();
+        assert_eq!(buffer.cursor_for("hetz"), None);
+    }
+
+    #[test]
+    fn acknowledging_then_resetting_returns_a_peer_to_full_state() {
+        let mut buffer = ChangeBuffer::new();
+        buffer.record("a.txt");
+        buffer.acknowledge("hetz", buffer.head());
+        assert_eq!(buffer.cursor_for("hetz"), Some(1));
+        buffer.reset_peer("hetz");
+        assert_eq!(
+            buffer.cursor_for("hetz"),
+            None,
+            "a reset peer must be sent everything again"
+        );
+    }
+
+    /// The eviction guard. One peer that has confirmed nothing must hold the
+    /// whole buffer, or eviction drops a change that peer still needs and
+    /// nothing will ever tell it what it missed.
+    #[test]
+    fn one_silent_peer_holds_eviction_back_completely() {
+        let mut buffer = ChangeBuffer::new();
+        buffer.record("a.txt");
+        buffer.acknowledge("hetz", buffer.head());
+        assert_eq!(
+            buffer.acked_by_all(&["hetz", "droppy"]),
+            0,
+            "droppy has confirmed nothing, so nothing may be forgotten"
+        );
+        buffer.acknowledge("droppy", buffer.head());
+        assert_eq!(buffer.acked_by_all(&["hetz", "droppy"]), 1);
+    }
+
+    #[test]
+    fn the_slowest_peer_sets_the_eviction_point() {
+        let mut buffer = ChangeBuffer::new();
+        buffer.record("a.txt");
+        let slow = buffer.head();
+        buffer.record("b.txt");
+        buffer.acknowledge("hetz", buffer.head());
+        buffer.acknowledge("droppy", slow);
+        assert_eq!(buffer.acked_by_all(&["hetz", "droppy"]), slow);
+    }
+
+    /// With no peers there is nothing to protect, but forgetting everything on
+    /// that basis would strand the first peer that ever appears.
+    #[test]
+    fn no_peers_forgets_nothing() {
+        let mut buffer = ChangeBuffer::new();
+        buffer.record("a.txt");
+        assert_eq!(buffer.acked_by_all(&[]), 0);
     }
 
     proptest! {

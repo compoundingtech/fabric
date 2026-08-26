@@ -353,6 +353,26 @@ impl SyncNode {
         adopted
     }
 
+    /// Content hashes for the present entries of `delta` that this node holds.
+    ///
+    /// A DELTA PASS MUST USE THIS, never `hashes_peer_needs`. That function
+    /// infers what a peer lacks by diffing against the manifest the peer sent,
+    /// which is only sound when the peer sent its WHOLE manifest. Give it a
+    /// delta and every path outside the delta looks like a path the peer is
+    /// missing, so the pass pushes content for the entire tree. That turns the
+    /// optimisation into a regression far worse than the thing it replaced.
+    ///
+    /// `hashes_peer_needs_is_unsound_for_a_delta` holds that trap still.
+    pub fn content_for(&self, delta: &Manifest) -> Vec<ContentHash> {
+        let mut out = Vec::new();
+        for (_, meta) in delta.present_paths() {
+            if self.content.contains_key(&meta.hash) && !out.contains(&meta.hash) {
+                out.push(meta.hash);
+            }
+        }
+        out
+    }
+
     /// The content bytes this node holds for `hashes`, as `(hash, bytes)` pairs.
     /// Hashes it lacks are silently skipped. Used to bundle content for a peer.
     pub fn gather_content(&self, hashes: &[ContentHash]) -> Vec<(ContentHash, Vec<u8>)> {
@@ -738,6 +758,103 @@ mod tests {
         let mut recorded = target.changes().since(cursor);
         recorded.sort_unstable();
         assert_eq!(recorded, vec!["a.txt", "b.txt"]);
+    }
+
+    /// A restart must re-send, never skip.
+    ///
+    /// The engine restores a node by adopting the manifest it read from disk,
+    /// and `adopt` records. So the buffer comes back holding every path and a
+    /// peer at cursor zero is offered all of it. If `adopt` ever stops
+    /// recording, a restarted node offers a peer NOTHING and the peer waits
+    /// forever for changes it already missed. That is silent divergence, and it
+    /// is exactly the crash-shaped footgun the delta literature warns about.
+    #[test]
+    fn a_node_restored_from_disk_offers_every_path_to_a_peer_at_zero() {
+        let mut before = node(1);
+        before.local_write("x.txt", b"one", 0, 0);
+        before.local_write("y.txt", b"two", 0, 0);
+        before.local_remove("y.txt", bus(), 100);
+        before.local_write("z.txt", b"three", 0, 0);
+
+        // What the engine does on load: a fresh node adopts the persisted
+        // manifest. Nothing else restores the buffer.
+        let mut restored = node(1);
+        restored.adopt(before.manifest());
+
+        let mut offered = restored.changes().since(0);
+        offered.sort_unstable();
+        assert_eq!(
+            offered,
+            vec!["x.txt", "y.txt", "z.txt"],
+            "a restarted node must offer every path, tombstones included"
+        );
+        assert_eq!(
+            restored.manifest().digest(),
+            before.manifest().digest(),
+            "the restore itself lost state, so the buffer check proves nothing"
+        );
+    }
+
+    /// The trap a delta pass must not fall into, written down so nobody has to
+    /// rediscover it by shipping it.
+    ///
+    /// `hashes_peer_needs` answers "what must the peer adopt from us", by
+    /// diffing against the manifest the peer sent. That is right for a full
+    /// manifest and WRONG for a delta: paths outside the delta look absent, so
+    /// the answer becomes the whole tree.
+    #[test]
+    fn hashes_peer_needs_is_unsound_for_a_delta() {
+        let mut node = node(1);
+        node.local_write("x.txt", b"one", 0, 0);
+        node.local_write("y.txt", b"two", 0, 0);
+        node.local_write("z.txt", b"three", 0, 0);
+
+        // The peer holds everything, and only z.txt is actually in flight.
+        let peer_full = node.manifest().clone();
+        let delta = peer_full.subset(["z.txt"]);
+
+        assert!(
+            node.hashes_peer_needs(&peer_full).is_empty(),
+            "against the peer's whole manifest there is nothing to push"
+        );
+        assert_eq!(
+            node.hashes_peer_needs(&delta).len(),
+            2,
+            "against a delta it claims the peer needs every path OUTSIDE the \
+             delta, which is the entire tree on a real folder"
+        );
+        assert_eq!(
+            node.content_for(&delta).len(),
+            1,
+            "content_for ships exactly the delta's own content"
+        );
+    }
+
+    #[test]
+    fn content_for_skips_entries_whose_bytes_we_lack() {
+        let mut holder = node(1);
+        holder.local_write("x.txt", b"one", 0, 0);
+        let delta = holder.manifest().clone();
+
+        // A node that knows the entry but never received its bytes.
+        let mut empty = node(2);
+        empty.adopt(&delta);
+        assert!(
+            empty.content_for(&delta).is_empty(),
+            "a node cannot offer bytes it does not hold"
+        );
+    }
+
+    #[test]
+    fn content_for_ignores_tombstones() {
+        let mut node = node(1);
+        node.local_write("x.txt", b"one", 0, 0);
+        node.local_remove("x.txt", bus(), 100);
+        let delta = node.manifest().clone();
+        assert!(
+            node.content_for(&delta).is_empty(),
+            "a tombstone has no content to ship"
+        );
     }
 
     /// THE EQUIVALENCE THE DELTA PATH RESTS ON. Sending only the changed paths

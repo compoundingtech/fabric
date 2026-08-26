@@ -641,6 +641,12 @@ impl<T: SyncTransport> SyncEngine<T> {
     )> {
         let mut node = SyncNode::new(self.author);
         if let Some(state) = self.read_state(&cfg.name)? {
+            // `adopt` records every path it takes, so loading from disk also
+            // SEEDS the change buffer with the whole manifest. That is required,
+            // not incidental: a node that came back with an empty buffer would
+            // offer a peer at cursor zero nothing at all, and the peer would
+            // wait forever for changes it already missed. See
+            // `a_node_restored_from_disk_offers_every_path_to_a_peer_at_zero`.
             node.adopt(&state.manifest);
             // The cache is absent in a file written before it existed. An empty
             // one is correct, not a fault: the next scan re-hashes once and
