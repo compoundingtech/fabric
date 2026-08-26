@@ -619,9 +619,12 @@ async fn a_replica_stores_the_origin_metadata_verbatim() -> Result<()> {
         "the delete never reached B, so there is no tombstone to compare"
     );
 
+    // From `state.json`, which is the authoritative file. The `manifest.json`
+    // projection is no longer written; see `write_state`.
     let read_manifest = |dir: &Path| -> Option<serde_json::Value> {
-        let raw = std::fs::read(dir.join("sync").join("shared").join("manifest.json")).ok()?;
-        serde_json::from_slice(&raw).ok()
+        let raw = std::fs::read(dir.join("sync").join("shared").join("state.json")).ok()?;
+        let state: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+        state.get("manifest").cloned()
     };
 
     // Wait for both sides to hold all three entries before comparing, or the
@@ -748,15 +751,15 @@ async fn a_small_change_must_not_ship_the_whole_manifest() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(window)).await;
     let (b1, p1, d1) = sample(&a_home).await?;
 
-    let manifest = std::fs::metadata(
-        a_dir
-            .path()
-            .join("sync")
-            .join("shared")
-            .join("manifest.json"),
-    )
-    .map(|m| m.len())
-    .unwrap_or(0);
+    // The size of the MANIFEST, which is what a pass used to ship, taken from
+    // inside the authoritative state file rather than from the projection that
+    // is no longer written.
+    let manifest = std::fs::read(a_dir.path().join("sync").join("shared").join("state.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+        .and_then(|state| state.get("manifest").cloned())
+        .map(|m| serde_json::to_vec(&m).map(|v| v.len() as u64).unwrap_or(0))
+        .unwrap_or(0);
 
     println!("--- what a quiet pass ships ---");
     println!("window          {window} s, nothing changed");

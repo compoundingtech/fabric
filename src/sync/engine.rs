@@ -1244,12 +1244,49 @@ impl<T: SyncTransport> SyncEngine<T> {
         // Compact for the same reason as the manifest. Still JSON, so a build
         // that predates this reads it unchanged; only the whitespace is gone.
         let raw = serde_json::to_vec(state)?;
-        // The combined state is authoritative and lands atomically first.
+        // The combined state is authoritative and lands atomically first. It is
+        // self-contained: manifest, observed receipt, scan cache and peer acks.
         write_atomic(&path, &raw)?;
-        // Keep the established manifest path current for operators and older
-        // Fabric binaries. A crash between these writes still recovers from the
-        // already-committed combined state above.
-        self.write_manifest(name, &state.manifest)
+        // The manifest projection is NOT rewritten here, and that is the point.
+        //
+        // It used to be, to keep `manifest.json` current for operators and older
+        // binaries. It is a byte-for-byte duplicate of the manifest written
+        // moments earlier inside the state above, and on the production bus
+        // entry it was 11,440,720 bytes of a 31,056,281 byte write: 36.8% of
+        // everything fabric writes, spent storing the same thing twice.
+        //
+        // It is REMOVED rather than left behind. A projection that stops being
+        // updated is worse than one that never existed: it keeps parsing, it
+        // keeps looking authoritative, and it holds Present entries for paths
+        // that were tombstoned afterwards. An older binary reading a stale one
+        // would resurrect deleted files. An older binary that finds NOTHING
+        // rescans, records what is on disk, and loses to its peers' higher
+        // versions on the first reconcile, which converges.
+        self.remove_manifest_projection(name)
+    }
+
+    /// Delete the legacy `manifest.json` projection if it is still there.
+    ///
+    /// Called after the authoritative state commits, so a home that predates
+    /// `state.json` migrates on its first write: the load path reads the
+    /// projection, the first persist writes the state and removes it.
+    fn remove_manifest_projection(&self, name: &str) -> Result<()> {
+        let path = self.manifest_path(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            // Not fatal. The state above is already committed and correct, and a
+            // projection we failed to delete is a stale file, not a lost one.
+            Err(error) => {
+                tracing::debug!(
+                    sync = name,
+                    path = %path.display(),
+                    %error,
+                    "could not remove the legacy manifest projection"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Start watching every configured entry's folder and syncing on change,
@@ -3653,7 +3690,9 @@ mod tests {
         .unwrap();
         engine.sync_once("bus").await.unwrap();
 
-        for leaf in ["state.json", "manifest.json"] {
+        // Only the authoritative file. The `manifest.json` projection is no
+        // longer written; see `write_state`.
+        for leaf in ["state.json"] {
             let path = dir.path().join("sync").join("bus").join(leaf);
             let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("{leaf}: {e}"));
             assert!(!raw.is_empty(), "{leaf} was not written");
@@ -6131,6 +6170,84 @@ mod tests {
         ));
     }
 
+    /// ONE CHANGE MUST WRITE THE INDEX ONCE, NOT TWICE.
+    ///
+    /// `state.json` is self-contained and authoritative: it carries the
+    /// manifest, the observed receipt, the scan cache and the peer acks, and it
+    /// lands atomically. `manifest.json` is a PROJECTION of the manifest already
+    /// inside it, kept for operators and older binaries.
+    ///
+    /// On the production bus entry that projection is 11,440,720 bytes of a
+    /// 31,056,281 byte write, or 36.8% of everything fabric writes, and it is a
+    /// byte-for-byte duplicate of data written moments earlier in the same pass.
+    ///
+    /// The bar here is the authoritative file's own size, so the test measures
+    /// duplication rather than a number chosen to pass.
+    #[tokio::test]
+    async fn one_change_writes_the_index_once_not_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        // Enough entries that the index dwarfs any fixed per-write overhead.
+        for i in 0..400 {
+            std::fs::write(root.join(format!("f{i:03}.md")), format!("body {i}")).unwrap();
+        }
+        write_bus_sync(dir.path(), &root);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+
+        let entry_dir = engine.state_path("bus").parent().unwrap().to_path_buf();
+        let snapshot = || -> std::collections::BTreeMap<PathBuf, (u64, u64)> {
+            std::fs::read_dir(&entry_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let meta = e.metadata().ok()?;
+                    Some((e.path(), (meta.len(), meta.modified().ok()?.elapsed().ok()?.as_nanos() as u64)))
+                })
+                .collect()
+        };
+        let before = snapshot();
+        let state_bytes = std::fs::metadata(engine.state_path("bus")).unwrap().len();
+
+        // One small change, then one pass.
+        std::fs::write(root.join("f000.md"), b"a different body").unwrap();
+        // The mtime must actually differ, or the scan sees nothing and the test
+        // measures an idle pass instead of a change.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(root.join("f000.md"), b"a different body again").unwrap();
+        engine.sync_once("bus").await.unwrap();
+
+        let after = snapshot();
+        let mut rewritten = 0u64;
+        let mut names = Vec::new();
+        for (path, (len, _)) in &after {
+            let changed = match before.get(path) {
+                Some((old_len, _)) => old_len != len || true,
+                None => true,
+            };
+            if changed {
+                rewritten += len;
+                names.push(path.file_name().unwrap().to_string_lossy().to_string());
+            }
+        }
+        names.sort();
+        assert!(
+            rewritten <= state_bytes,
+            "one change rewrote {rewritten} bytes of index against a {state_bytes} \
+             byte authoritative state. The manifest is being stored twice. Files \
+             rewritten: {names:?}"
+        );
+    }
+
     #[tokio::test]
     async fn restart_prefers_atomic_state_pair_over_stale_projection_and_partial_temp() {
         let dir = tempfile::tempdir().unwrap();
@@ -6198,16 +6315,31 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
         assert_eq!(replayed.manifest, committed.manifest);
         assert_eq!(replayed.observed, committed.observed);
-        assert!(matches!(
-            serde_json::from_slice::<Manifest>(&std::fs::read(&manifest_path).unwrap())
-                .unwrap()
-                .get("retired.md"),
-            Some(Entry::Tombstone(tombstone)) if tombstone.version == 2
-        ));
+        // The stale projection this test deliberately left behind must be GONE,
+        // not merely out of date. A projection that keeps parsing while holding
+        // Present entries for paths since tombstoned is how an older binary
+        // resurrects deleted files.
+        assert!(
+            !manifest_path.exists(),
+            "a stale projection survived a pass and can still be read"
+        );
     }
 
+    /// A home written by an older build carries a `manifest.json` projection.
+    /// The first authoritative write must REMOVE it, not leave it behind.
+    ///
+    /// Leaving it is the dangerous option. A projection that stops being updated
+    /// keeps parsing and keeps looking authoritative while holding Present
+    /// entries for paths tombstoned afterwards, so an older binary reading one
+    /// resurrects deleted files. An older binary that finds nothing rescans and
+    /// loses to its peers' higher versions on the first reconcile, which
+    /// converges.
+    ///
+    /// This test previously asserted the opposite: that `write_state` reported
+    /// an error when the projection could not be written. That behaviour is
+    /// gone with the projection.
     #[tokio::test]
-    async fn authoritative_state_survives_projection_write_failure() {
+    async fn writing_the_authoritative_state_removes_a_legacy_projection() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("resources");
         std::fs::create_dir_all(&root).unwrap();
@@ -6236,22 +6368,21 @@ mod tests {
             peer_acks: HashMap::new(),
         };
 
-        // Block only manifest.json's atomic temp path. write_state must report
-        // the projection failure after the authoritative state pair committed.
+        // A legacy projection sitting on disk, as a home written by an older
+        // build would have. Writing the authoritative state must remove it and
+        // must not fail because of it.
         let manifest_path = engine.manifest_path("bus");
-        std::fs::create_dir(manifest_path.with_extension("json.fabric-tmp")).unwrap();
-        assert!(engine.write_state("bus", &committed).is_err());
+        std::fs::write(&manifest_path, b"{\"entries\":{}}").unwrap();
+        assert!(engine.write_state("bus", &committed).is_ok());
+        assert!(
+            !manifest_path.exists(),
+            "the legacy projection was left behind for an older binary to read"
+        );
 
         let on_disk: PersistedEntryState =
             serde_json::from_slice(&std::fs::read(engine.state_path("bus")).unwrap()).unwrap();
         assert_eq!(on_disk.manifest, committed.manifest);
         assert_eq!(on_disk.observed, committed.observed);
-        assert!(matches!(
-            serde_json::from_slice::<Manifest>(&std::fs::read(&manifest_path).unwrap())
-                .unwrap()
-                .get("retired.md"),
-            Some(Entry::Present(meta)) if meta.version == 1
-        ));
         drop(engine);
 
         let restarted = SyncEngine::new(
@@ -6463,7 +6594,13 @@ mod tests {
         let manifest_path = engine.manifest_path("bus");
         assert!(state_path.exists());
         drop(engine);
-        std::fs::remove_file(&manifest_path).unwrap();
+        // This used to remove the projection to prove the combined state is the
+        // only recovery source. It is no longer written at all, so its absence
+        // is the default rather than something the test has to arrange.
+        assert!(
+            !manifest_path.exists(),
+            "the projection is still being written"
+        );
 
         let engine = SyncEngine::new(
             FabricHome::new(dir.path()),
