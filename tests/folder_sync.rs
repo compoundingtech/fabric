@@ -315,6 +315,19 @@ async fn bus_delete_while_peer_away_does_not_resurrect_on_return() -> Result<()>
     Ok(())
 }
 
+/// Several include globs, as a real list rather than one comma-joined glob.
+fn write_sync_with_includes(home_dir: &Path, folder: &Path, policy: &str, include: &[&str]) {
+    let globs = include
+        .iter()
+        .map(|g| format!("{g:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let toml = format!(
+        "[[sync]]\nname = \"shared\"\nfolder = {folder:?}\npeers = \"*\"\npolicy = {policy:?}\ninclude = [{globs}]\n"
+    );
+    std::fs::write(home_dir.join("syncs.toml"), toml).unwrap();
+}
+
 fn write_sync_with_include(home_dir: &Path, folder: &Path, policy: &str, include: &str) {
     let toml = format!(
         "[[sync]]\nname = \"shared\"\nfolder = {folder:?}\npeers = \"*\"\npolicy = {policy:?}\ninclude = [{include:?}]\n"
@@ -769,6 +782,87 @@ async fn a_small_change_must_not_ship_the_whole_manifest() -> Result<()> {
          manifests of {manifest} bytes. The manifest is still the unit of \
          transfer",
         per_pass as f64 / manifest.max(1) as f64
+    );
+
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
+/// A path that arrives OUTSIDE the receiver's include must not come back as a
+/// delete.
+///
+/// This is the incident of 2026-08-25 in the other direction. `plans/**` was
+/// taken out of an include, which left about twenty paths recorded but
+/// unscannable, and the next pass read "in my records, absent from my scan" as a
+/// local delete. Thirteen live files disappeared from three machines.
+///
+/// Widening an include across a fleet cannot be atomic: one machine gets it
+/// first and ships entries the others cannot yet scan. This test models exactly
+/// that. A sends a path B does not select, and the file must survive on A.
+///
+/// The guard that makes it survive is in `scan_into_node_observed`, which skips
+/// the local-remove loop for any path outside the include.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_path_outside_the_receivers_include_is_not_deleted() -> Result<()> {
+    let _guard = FOLDER_SYNC_LOCK.lock().await;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let a_home = FabricHome::new(a_dir.path());
+    let b_home = FabricHome::new(b_dir.path());
+    let a_folder = a_dir.path().join("shared");
+    let b_folder = b_dir.path().join("shared");
+    std::fs::create_dir_all(a_folder.join("docs"))?;
+    std::fs::create_dir_all(a_folder.join("keep"))?;
+    std::fs::create_dir_all(b_folder.join("keep"))?;
+
+    // A selects docs/. B does NOT, exactly like a fleet mid-rollout. Bus policy,
+    // because that is the policy under which a delete actually propagates.
+    write_sync_with_includes(a_dir.path(), &a_folder, "bus", &["docs/**", "keep/**"]);
+    write_sync_with_includes(b_dir.path(), &b_folder, "bus", &["keep/**"]);
+
+    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_b = FabricNode::start(b_home.clone()).await?;
+    trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
+    trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
+
+    let doc = a_folder.join("docs/pairing-api.md");
+    std::fs::write(&doc, b"the shared document")?;
+    // A path both sides select, to prove the pair really is syncing. Without it
+    // a silent transport failure would look like a passing test.
+    let shared = a_folder.join("keep/shared.md");
+    std::fs::write(&shared, b"both sides want this")?;
+    reload_sync(&a_home).await?;
+
+    assert!(
+        wait_for_file(&b_folder.join("keep/shared.md"), b"both sides want this").await,
+        "the two peers never synced at all, so this proves nothing about includes"
+    );
+
+    // Now the real question. B holds an entry it cannot scan. Give it many
+    // passes to do the wrong thing.
+    // What B does with the file is recorded rather than demanded. `adopt` and
+    // `materialize_tracked` walk the manifest and consult no globs at all; only
+    // `scan_folder` filters. So B is expected to WRITE a path it does not
+    // select, and simply never scan it.
+    assert!(
+        b_folder.join("docs/pairing-api.md").exists(),
+        "B did not materialize a path outside its include. That is not a fault, \
+         but it changes the answer to \"which machine may take a widened include \
+         first\", so it must not change silently"
+    );
+    for _ in 0..25 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            doc.exists(),
+            "the document was deleted on A after B received a path it does not \
+             select. This is the 2026-08-25 incident, reproduced"
+        );
+    }
+    assert_eq!(
+        std::fs::read(&doc)?,
+        b"the shared document",
+        "the document survived but its content changed"
     );
 
     node_b.shutdown().await?;
