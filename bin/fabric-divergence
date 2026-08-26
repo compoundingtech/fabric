@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""Detect two fabric peers that believe they agree and do not.
+
+WHY THIS EXISTS. Silent divergence has no announcing moment. A peer does not log
+that it stopped converging; it simply holds different bytes than its peers and
+keeps reporting a healthy pass. Nobody notices until a person opens a file and
+finds the wrong content. The delta-replication work makes this failure MORE
+reachable, because durable per-peer acknowledgement offsets are a new thing that
+can be lost in a crash, and a lost offset makes a node skip deltas. So the
+instrument has to exist before the mechanism it watches.
+
+WHY COUNTS CANNOT DO THIS JOB. `fabric sync ls` reports present and tombstone
+counts. Two peers can report identical counts and hold different content: same
+path, same version, different bytes. See `counts_are_blind_to_divergence` in
+src/sync/manifest.rs. The digest covers the merge key for every path, which is
+exactly what a merge consults, so equal digests mean converged and unequal
+digests mean diverged.
+
+QUIESCENCE, AND WHY IT IS NOT OPTIONAL. Peers differ all the time in the normal
+course of propagating a change, and that is not divergence. A single sample
+therefore cannot tell "diverged" from "mid-flight". This samples every peer
+twice and only judges the peers whose own digest held still between the two
+samples. A peer still moving is reported as UNSETTLED, never as diverged.
+
+Exit codes:
+  0  every entry quiescent and every peer agrees
+  1  an entry is QUIESCENT AND DIVERGED, which is the failure this exists for
+  2  nothing settled inside the window, so there is no verdict to give
+  3  could not measure at all
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+import time
+
+EXIT_AGREED = 0
+EXIT_DIVERGED = 1
+EXIT_UNSETTLED = 2
+EXIT_CANNOT_MEASURE = 3
+
+
+def sync_status(peer, home, timeout):
+    """`sync ls --json` for one peer. `None` for the local machine."""
+    if peer is None:
+        cmd = ["fabric"]
+        if home:
+            cmd += ["--home", home]
+        cmd += ["sync", "ls", "--json"]
+    else:
+        cmd = ["fabric", "exec", peer, "--", "fabric", "sync", "ls", "--json"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        return json.loads(out.stdout)
+    except ValueError:
+        return None
+
+
+def digests(status):
+    """entry name -> digest, for one peer's status."""
+    if not status:
+        return {}
+    return {e["name"]: e.get("digest", "") for e in status}
+
+
+def verdicts(first, second):
+    """Judge each entry from two samples per peer.
+
+    `first` and `second` are {peer: {entry: digest}}. An entry is judged only
+    where a peer's own digest held still across the two samples, because a peer
+    mid-propagation is not a diverged peer.
+    """
+    names = sorted({n for peer in second.values() for n in peer})
+    out = []
+    for name in names:
+        settled, moving, unknown = {}, [], []
+        for peer in sorted(second):
+            before = first.get(peer, {}).get(name)
+            after = second.get(peer, {}).get(name)
+            if after is None or after == "":
+                unknown.append(peer)
+            elif before != after:
+                moving.append(peer)
+            else:
+                settled[peer] = after
+        distinct = set(settled.values())
+        if len(settled) < 2:
+            state = "UNSETTLED"
+        elif len(distinct) == 1:
+            state = "AGREED"
+        else:
+            state = "DIVERGED"
+        out.append(
+            {
+                "entry": name,
+                "state": state,
+                "settled": settled,
+                "moving": moving,
+                "unknown": unknown,
+            }
+        )
+    return out
+
+
+def self_test():
+    """Prove the judgement can fail before trusting it to pass.
+
+    A detector that only ever reports AGREED is worth nothing, so each case
+    below forces one verdict and asserts it.
+    """
+    agreed = verdicts(
+        {"a": {"bus": "X"}, "b": {"bus": "X"}},
+        {"a": {"bus": "X"}, "b": {"bus": "X"}},
+    )
+    assert agreed[0]["state"] == "AGREED", agreed
+
+    # Both peers held still and they do NOT match. This is the whole point.
+    diverged = verdicts(
+        {"a": {"bus": "X"}, "b": {"bus": "Y"}},
+        {"a": {"bus": "X"}, "b": {"bus": "Y"}},
+    )
+    assert diverged[0]["state"] == "DIVERGED", diverged
+
+    # Different digests, but b is still moving, so this is propagation and must
+    # NOT be called divergence.
+    moving = verdicts(
+        {"a": {"bus": "X"}, "b": {"bus": "W"}},
+        {"a": {"bus": "X"}, "b": {"bus": "Y"}},
+    )
+    assert moving[0]["state"] == "UNSETTLED", moving
+
+    # A daemon too old to report a digest must not be read as agreement.
+    old = verdicts(
+        {"a": {"bus": "X"}, "b": {"bus": ""}},
+        {"a": {"bus": "X"}, "b": {"bus": ""}},
+    )
+    assert old[0]["state"] == "UNSETTLED", old
+    assert old[0]["unknown"] == ["b"], old
+
+    print("self-test passed: AGREED, DIVERGED, UNSETTLED and old-daemon all fire")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--peer",
+        action="append",
+        default=[],
+        help="a peer to reach with `fabric exec`; repeat it. The local machine "
+        "is always included.",
+    )
+    ap.add_argument("--home", default=None)
+    ap.add_argument(
+        "--settle-seconds",
+        type=int,
+        default=20,
+        help="seconds between the two samples",
+    )
+    ap.add_argument("--timeout", type=int, default=120)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--self-test", action="store_true")
+    args = ap.parse_args()
+
+    if args.self_test:
+        return self_test()
+
+    peers = ["local"] + args.peer
+    first = {}
+    for peer in peers:
+        target = None if peer == "local" else peer
+        first[peer] = digests(sync_status(target, args.home, args.timeout))
+    if not any(first.values()):
+        print("could not read a digest from any peer", file=sys.stderr)
+        return EXIT_CANNOT_MEASURE
+
+    time.sleep(args.settle_seconds)
+
+    second = {}
+    for peer in peers:
+        target = None if peer == "local" else peer
+        second[peer] = digests(sync_status(target, args.home, args.timeout))
+
+    results = verdicts(first, second)
+    if args.json:
+        print(json.dumps({"window_s": args.settle_seconds, "entries": results}, indent=2))
+    else:
+        print(f"window        {args.settle_seconds} s between samples")
+        print(f"peers         {', '.join(peers)}")
+        print()
+        for r in results:
+            print(f"{r['entry']:20} {r['state']}")
+            for peer, d in sorted(r["settled"].items()):
+                print(f"    {peer:16} {d[:16]}")
+            for peer in r["moving"]:
+                print(f"    {peer:16} still moving, not judged")
+            for peer in r["unknown"]:
+                print(f"    {peer:16} no digest, not judged")
+        print()
+
+    if any(r["state"] == "DIVERGED" for r in results):
+        print("DIVERGED: peers held still and do not agree")
+        return EXIT_DIVERGED
+    if not results or all(r["state"] == "UNSETTLED" for r in results):
+        print("UNSETTLED: nothing held still long enough to judge")
+        return EXIT_UNSETTLED
+    print("AGREED")
+    return EXIT_AGREED
+
+
+if __name__ == "__main__":
+    sys.exit(main())

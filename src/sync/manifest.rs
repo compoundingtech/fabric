@@ -230,6 +230,42 @@ impl Manifest {
         self.entries.is_empty()
     }
 
+    /// A fingerprint of the LATTICE POINT this manifest occupies.
+    ///
+    /// It covers `order_key` for every path, which is exactly what `merge`
+    /// consults. Two peers that agree on every `order_key` make every merge in
+    /// both directions a no-op, and that is what convergence means. So equal
+    /// digests mean converged and unequal digests mean diverged.
+    ///
+    /// Counts cannot do this job: see `counts_are_blind_to_divergence`. This
+    /// exists because silent divergence has no announcing moment, so the
+    /// instrument has to exist before the thing it watches.
+    ///
+    /// Each path is length-prefixed so that "ab" + "c" cannot digest the same
+    /// as "a" + "bc".
+    ///
+    /// It deliberately omits `size`, `executable` and `mtime_secs`. A
+    /// whole-entry digest was built beside this one and then deleted, for two
+    /// reasons. Those three fields are already determined by the merge key,
+    /// because a replica stores the origin's `FileMeta` verbatim and the scanner
+    /// compares content hashes rather than metadata. And a whole-entry digest
+    /// must serialize every entry on every `sync ls`, which is real CPU spent to
+    /// find a state that cannot arise. Do not add it back without a measurement
+    /// that shows the state arising.
+    pub fn digest(&self) -> String {
+        let mut hasher = blake3::Hasher::new();
+        for (path, entry) in &self.entries {
+            let (version, kind, author, tiebreak) = entry.order_key();
+            hasher.update(&(path.len() as u64).to_le_bytes());
+            hasher.update(path.as_bytes());
+            hasher.update(&version.to_le_bytes());
+            hasher.update(&[kind]);
+            hasher.update(&author);
+            hasher.update(&tiebreak);
+        }
+        hasher.finalize().to_hex().to_string()
+    }
+
     pub fn get(&self, path: &str) -> Option<&Entry> {
         self.entries.get(path)
     }
@@ -385,6 +421,71 @@ mod tests {
         })
     }
 
+    /// `fabric sync ls` reports present and tombstone COUNTS. An operator reads
+    /// two peers with equal counts as two peers that agree. Two peers can be
+    /// equal by count and diverged in fact at the same moment. This test holds
+    /// that blindness still so the digest has something to be measured against.
+    #[test]
+    fn counts_are_blind_to_divergence() {
+        let mut a = Manifest::new();
+        a.insert("notes.txt".into(), present(4, 1, 7));
+        a.insert("gone.txt".into(), tomb(2, 1));
+
+        let mut b = Manifest::new();
+        // Same path, same version, DIFFERENT content. A real divergence.
+        b.insert("notes.txt".into(), present(4, 1, 9));
+        b.insert("gone.txt".into(), tomb(2, 1));
+
+        assert_ne!(a, b, "the two manifests really do differ");
+
+        let counts = |m: &Manifest| {
+            let present = m.entries().filter(|(_, e)| e.is_present()).count();
+            (present, m.len() - present, m.len())
+        };
+        assert_eq!(
+            counts(&a),
+            counts(&b),
+            "counts agree while the state does not: this is the blindness"
+        );
+    }
+
+    /// The digest must separate what the counts call equal. That is the whole
+    /// reason it exists.
+    #[test]
+    fn digest_separates_manifests_that_counts_call_equal() {
+        let mut a = Manifest::new();
+        a.insert("notes.txt".into(), present(4, 1, 7));
+        a.insert("gone.txt".into(), tomb(2, 1));
+
+        let mut b = Manifest::new();
+        b.insert("notes.txt".into(), present(4, 1, 9));
+        b.insert("gone.txt".into(), tomb(2, 1));
+
+        assert_ne!(
+            a.digest(),
+            b.digest(),
+            "the digest must see what the counts cannot"
+        );
+    }
+
+    /// Insertion order must not change the digest. Every peer learns entries in
+    /// its own order, so an order-sensitive digest would report every peer as
+    /// diverged from every other. That is the common case, not an edge case.
+    #[test]
+    fn digest_ignores_insertion_order() {
+        let mut a = Manifest::new();
+        a.insert("a.txt".into(), present(1, 1, 1));
+        a.insert("b.txt".into(), present(2, 2, 2));
+        a.insert("c.txt".into(), tomb(3, 3));
+
+        let mut b = Manifest::new();
+        b.insert("c.txt".into(), tomb(3, 3));
+        b.insert("b.txt".into(), present(2, 2, 2));
+        b.insert("a.txt".into(), present(1, 1, 1));
+
+        assert_eq!(a.digest(), b.digest(), "same entries, same lattice point");
+    }
+
     #[test]
     fn normalize_rejects_escapes_and_absolutes() {
         assert_eq!(
@@ -515,6 +616,28 @@ mod tests {
         #[test]
         fn merge_is_commutative(a in arb_manifest(), b in arb_manifest()) {
             prop_assert_eq!(a.merge(&b), b.merge(&a));
+        }
+
+        /// The instrument's contract, stated as a property. Two peers that have
+        /// each merged the other MUST report the same digest. If this can fail,
+        /// the digest cannot be used to detect divergence, because it would call
+        /// converged peers diverged.
+        #[test]
+        fn merged_peers_agree_on_the_digest(a in arb_manifest(), b in arb_manifest()) {
+            prop_assert_eq!(a.merge(&b).digest(), b.merge(&a).digest());
+        }
+
+        /// Equal digest means equal lattice point, and nothing weaker. This is
+        /// the other half: the digest must not be so coarse that two genuinely
+        /// different states share one.
+        #[test]
+        fn digest_equality_means_lattice_equality(a in arb_manifest(), b in arb_manifest()) {
+            let keys = |m: &Manifest| {
+                m.entries()
+                    .map(|(p, e)| (p.clone(), e.order_key()))
+                    .collect::<Vec<_>>()
+            };
+            prop_assert_eq!(a.digest() == b.digest(), keys(&a) == keys(&b));
         }
 
         #[test]

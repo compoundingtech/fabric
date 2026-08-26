@@ -909,7 +909,7 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                     let present = logical_present(&entry);
                     if entry.missing == 0 && entry.unexpected == 0 && entry.mismatched == 0 {
                         println!(
-                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}",
+                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdigest={}",
                             entry.name,
                             entry.folder,
                             entry.policy,
@@ -927,10 +927,11 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                             entry.reconcile_wire_bytes,
                             entry.reconcile_failures,
                             sweep_token(&entry),
+                            short_digest(&entry.digest),
                         );
                     } else {
                         println!(
-                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}",
+                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdigest={}",
                             entry.name,
                             entry.folder,
                             entry.policy,
@@ -951,6 +952,7 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                             entry.reconcile_wire_bytes,
                             entry.reconcile_failures,
                             sweep_token(&entry),
+                            short_digest(&entry.digest),
                         );
                     }
                 }
@@ -1003,6 +1005,11 @@ struct SyncLsJsonEntry<'a> {
     /// Why the tombstone sweep did or did not forget anything. `unknown` from a
     /// daemon that predates the field.
     sweep: &'a str,
+    /// Lattice-point fingerprint of this entry's manifest. Compare it ACROSS
+    /// peers: equal means converged, unequal means diverged. `present` and
+    /// `tombstones` can match while the state differs, so they cannot answer
+    /// this. Empty from a daemon that predates the field.
+    digest: &'a str,
 }
 
 impl<'a> From<&'a fabric::control::SyncEntryStatus> for SyncLsJsonEntry<'a> {
@@ -1019,6 +1026,7 @@ impl<'a> From<&'a fabric::control::SyncEntryStatus> for SyncLsJsonEntry<'a> {
             missing: entry.missing,
             unexpected: entry.unexpected,
             mismatched: entry.mismatched,
+            digest: &entry.digest,
             sync_passes: entry.sync_passes,
             full_scans: entry.full_scans,
             inbound_noop_transactions: entry.inbound_noop_transactions,
@@ -1038,6 +1046,16 @@ impl<'a> From<&'a fabric::control::SyncEntryStatus> for SyncLsJsonEntry<'a> {
 ///
 /// An older daemon sends nothing here, so this must not render an empty string
 /// as if it were a state.
+/// The first 12 characters of the lattice-point digest, which is enough to
+/// compare two machines by eye. Scripts should read the full value from
+/// `sync ls --json` rather than this.
+fn short_digest(digest: &str) -> &str {
+    if digest.is_empty() {
+        return "unknown";
+    }
+    &digest[..digest.len().min(12)]
+}
+
 fn sweep_token(entry: &fabric::control::SyncEntryStatus) -> &str {
     if entry.sweep.is_empty() {
         "unknown"
@@ -1257,6 +1275,7 @@ mod sync_ls_tests {
 
     fn status() -> SyncEntryStatus {
         SyncEntryStatus {
+            digest: "lattice-point-aaaa".into(),
             name: "catalog".to_string(),
             folder: "/catalog".to_string(),
             policy: "catalog".to_string(),
@@ -1310,7 +1329,8 @@ mod sync_ls_tests {
                 "reconcile_micros": 4500,
                 "reconcile_wire_bytes": 11000000,
                 "reconcile_failures": 3,
-                "sweep": "disabled"
+                "sweep": "disabled",
+                "digest": "lattice-point-aaaa"
             })
         );
     }

@@ -89,6 +89,125 @@ async fn reload_sync(home: &FabricHome) -> Result<()> {
     Ok(())
 }
 
+/// Read both manifest digests for the `shared` entry.
+async fn digest_of(home: &FabricHome) -> Result<String> {
+    match send_control(home, ControlRequest::SyncStatus).await? {
+        fabric::control::ControlResponse::SyncStatus { entries } => {
+            let entry = entries
+                .into_iter()
+                .find(|e| e.name == "shared")
+                .expect("the shared entry must exist");
+            Ok(entry.digest)
+        }
+        other => panic!("expected SyncStatus, got {other:?}"),
+    }
+}
+
+/// Two peers that hold the same files must report the same digest.
+///
+/// This is the contract the divergence instrument rests on. If two correctly
+/// converged peers can report different digests, the instrument reports a
+/// divergence that is not there, and a false alarm every pass is worse than no
+/// instrument at all.
+///
+/// It covers a plain file, an executable file and a tombstone, because the
+/// digest has to agree about all three kinds of entry and not only the easy one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn converged_peers_report_the_same_digest() -> Result<()> {
+    let _guard = FOLDER_SYNC_LOCK.lock().await;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let a_home = FabricHome::new(a_dir.path());
+    let b_home = FabricHome::new(b_dir.path());
+
+    let a_folder = a_dir.path().join("shared");
+    let b_folder = b_dir.path().join("shared");
+    std::fs::create_dir_all(&a_folder)?;
+    std::fs::create_dir_all(&b_folder)?;
+    write_sync(a_dir.path(), &a_folder, "bus");
+    write_sync(b_dir.path(), &b_folder, "bus");
+
+    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_b = FabricNode::start(b_home.clone()).await?;
+    trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
+    trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
+
+    // Positive control. The digest has to RESPOND to state before agreement
+    // between two peers means anything: a constant would match every peer every
+    // time and detect nothing. Capture the empty value now and compare later.
+    let empty = digest_of(&a_home).await?;
+
+    // A plain file, an executable file, and a delete, so the digest has to
+    // agree about all three kinds of entry rather than only the easy one.
+    std::fs::write(a_folder.join("plain.md"), b"hello")?;
+    std::fs::write(a_folder.join("run.sh"), b"#!/bin/sh\necho hi\n")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            a_folder.join("run.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )?;
+    }
+    std::fs::write(a_folder.join("doomed.md"), b"delete me")?;
+    reload_sync(&a_home).await?;
+
+    assert!(
+        wait_for_file(&b_folder.join("plain.md"), b"hello").await,
+        "the file never reached B, so there is nothing to compare"
+    );
+    assert!(
+        wait_for_file(&b_folder.join("run.sh"), b"#!/bin/sh\necho hi\n").await,
+        "the executable never reached B"
+    );
+
+    std::fs::remove_file(a_folder.join("doomed.md"))?;
+    reload_sync(&a_home).await?;
+    assert!(
+        wait_for_missing(&b_folder.join("doomed.md")).await,
+        "the delete never reached B, so there is no tombstone to compare"
+    );
+
+    // Both peers hold the same three entries now. Let the passes settle.
+    let mut last = (String::new(), String::new());
+    for _ in 0..50 {
+        let a_key = digest_of(&a_home).await?;
+        let b_key = digest_of(&b_home).await?;
+        last = (a_key.clone(), b_key.clone());
+        if a_key == b_key && !a_key.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let (a_key, b_key) = last;
+
+    assert!(!a_key.is_empty(), "A reported no digest at all");
+    assert_ne!(
+        a_key, empty,
+        "the digest did not move when three entries arrived, so it is a \
+         constant and it can detect nothing"
+    );
+    assert_eq!(
+        a_key, b_key,
+        "two converged peers disagree on the digest, so it cannot detect \
+         divergence"
+    );
+
+    // The digest must also be STABLE. A value that changes every pass on a
+    // quiet folder would make every cross-peer sample a coin toss.
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            digest_of(&a_home).await?,
+            a_key,
+            "the digest moved while nothing changed"
+        );
+    }
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
 /// Delete on A. It must go on B, and it must not come back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bus_delete_propagates_and_stays_deleted() -> Result<()> {

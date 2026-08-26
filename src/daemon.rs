@@ -2828,6 +2828,7 @@ async fn process_control_request(
                     .await
                     .into_iter()
                     .map(|status| SyncEntryStatus {
+                        digest: status.digest,
                         name: status.name,
                         folder: status.folder.display().to_string(),
                         policy: status.policy.to_string(),

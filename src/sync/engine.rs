@@ -824,6 +824,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                 })
                 .count();
             out.push(SyncStatus {
+                digest: manifest.digest(),
                 name: name.clone(),
                 folder: entry.config.folder.clone(),
                 policy: entry.config.policy.as_str(),
@@ -1391,6 +1392,11 @@ pub struct SyncStatus {
     pub reconcile_micros: u64,
     pub reconcile_wire_bytes: u64,
     pub reconcile_failures: u64,
+    /// A fingerprint of the lattice point this entry's manifest occupies. Two
+    /// converged peers report the SAME value; two diverged peers cannot. The
+    /// counts above can be equal while the state differs, so this is the only
+    /// field here that answers "do these peers agree".
+    pub digest: String,
     /// Why the tombstone sweep did or did not forget anything, as last decided.
     /// `None` means no pass has reached the sweep yet for this entry instance.
     pub sweep: Option<SweepState>,
