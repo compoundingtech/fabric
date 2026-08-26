@@ -210,6 +210,11 @@ pub struct SyncEntryStatus {
     /// it carries `#[serde(default)]` like the counters above.
     #[serde(default)]
     pub sweep: String,
+    /// Reconciles that fell back to full state because a payload was
+    /// incomplete. Zero is healthy. A number that RISES between two samples is a
+    /// bug report: a cursor described state a peer did not hold.
+    #[serde(default)]
+    pub delta_fallbacks: u64,
     /// Lattice-point fingerprint of this entry's manifest. Empty from a daemon
     /// that predates the field. Compare it ACROSS peers: equal means converged,
     /// unequal means diverged. Counts cannot tell you this.

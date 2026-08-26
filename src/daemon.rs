@@ -2828,6 +2828,7 @@ async fn process_control_request(
                     .await
                     .into_iter()
                     .map(|status| SyncEntryStatus {
+                        delta_fallbacks: status.delta_fallbacks,
                         digest: status.digest,
                         name: status.name,
                         folder: status.folder.display().to_string(),
@@ -3124,12 +3125,11 @@ async fn handle_sync(connection: Connection, state: Arc<DaemonState>) -> Result<
     let (send, recv) = connection.accept_bi().await?;
     let stream = tokio::io::join(recv, send);
     let resolver_engine = engine.clone();
-    let outcome = sync::wire::run_server(stream, move |name, remote_manifest| {
+    let peer = connection.remote_id().to_string();
+    let outcome = sync::wire::run_server(stream, &peer, move |hello| {
         let engine = resolver_engine.clone();
         async move {
-            let prepared = engine
-                .prepare_inbound_for_manifest(&name, &remote_manifest)
-                .await?;
+            let prepared = engine.prepare_inbound_for_hello(&hello).await?;
             Ok(prepared.map(|prepared| (prepared.node(), prepared)))
         }
     })
@@ -3225,7 +3225,7 @@ impl SyncTransport for IrohSyncTransport {
         let connection = endpoint.connect(addr, SYNC_ALPN).await?;
         let (send, recv) = connection.open_bi().await?;
         let stream = tokio::io::join(recv, send);
-        let stats = sync::wire::run_client(stream, node, &name).await?;
+        let stats = sync::wire::run_client(stream, node, &name, &peer.id).await?;
         connection.close(0u32.into(), b"done");
         Ok(stats)
     }

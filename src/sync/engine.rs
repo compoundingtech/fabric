@@ -278,6 +278,13 @@ struct EntryWork {
     /// replication exists to remove. A figure that counted only content would
     /// report a converged pass as free, and a converged pass ships about 10 MB.
     reconcile_wire_bytes: AtomicU64,
+    /// Reconciles that found a payload incomplete and fell back to full state.
+    ///
+    /// Zero is the healthy value. A number that RISES between two samples means
+    /// a cursor described state a peer did not hold, which is a bug report, not
+    /// a status line. It is surfaced on `sync ls` because that is where a person
+    /// already looks, and a counter nobody reads is not a bug report.
+    delta_fallbacks: AtomicU64,
     /// Peer reconciles that returned an error, cumulative.
     ///
     /// Nine dead entries on one machine failed EVERY reconcile for weeks: 81
@@ -314,6 +321,7 @@ impl EntryWork {
             persist_micros: AtomicU64::new(0),
             reconcile_micros: AtomicU64::new(0),
             reconcile_wire_bytes: AtomicU64::new(0),
+            delta_fallbacks: AtomicU64::new(0),
             reconcile_failures: AtomicU64::new(0),
             #[cfg(test)]
             persist_calls: AtomicUsize::new(0),
@@ -678,17 +686,26 @@ impl<T: SyncTransport> SyncEngine<T> {
     /// the peer's manifest cannot win or cause local materialization, so the
     /// watcher can record the local intent normally. Any differing manifest or
     /// missing local content takes the guarded path below.
-    pub(crate) async fn prepare_inbound_for_manifest(
+    pub(crate) async fn prepare_inbound_for_hello(
         &self,
-        name: &str,
-        remote_manifest: &Manifest,
+        hello: &crate::sync::wire::HelloInfo,
     ) -> Result<Option<PreparedInbound>> {
-        let Some(entry) = self.entries.read().await.get(name).cloned() else {
+        let Some(entry) = self.entries.read().await.get(&hello.name).cloned() else {
             return Ok(None);
         };
         let is_complete_noop = {
             let node = entry.node.lock().await;
-            node.manifest() == remote_manifest && node.missing_content_hashes().is_empty()
+            // A DELTA cannot be compared against a whole manifest: it is a
+            // subset by construction, so equality would be false even when the
+            // two sides are identical, and the fast path would never fire again.
+            // The peer's digest is the only thing that can answer "are we
+            // already at the same point" without its whole manifest.
+            let converged = if hello.is_delta {
+                !hello.digest.is_empty() && hello.digest == node.manifest().digest()
+            } else {
+                node.manifest() == hello.manifest.as_ref()
+            };
+            converged && node.missing_content_hashes().is_empty()
         };
         if is_complete_noop {
             entry
@@ -856,6 +873,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                 persist_micros: entry.work.persist_micros.load(Ordering::Relaxed),
                 reconcile_micros: entry.work.reconcile_micros.load(Ordering::Relaxed),
                 reconcile_wire_bytes: entry.work.reconcile_wire_bytes.load(Ordering::Relaxed),
+                delta_fallbacks: entry.work.delta_fallbacks.load(Ordering::Relaxed),
                 reconcile_failures: entry.work.reconcile_failures.load(Ordering::Relaxed),
                 sweep: entry.last_sweep.lock().unwrap().clone(),
             });
@@ -957,6 +975,10 @@ impl<T: SyncTransport> SyncEngine<T> {
                         .work
                         .reconcile_wire_bytes
                         .fetch_add(stats.wire_bytes as u64, Ordering::Relaxed);
+                    entry
+                        .work
+                        .delta_fallbacks
+                        .fetch_add(stats.fallbacks as u64, Ordering::Relaxed);
                     if !stats.is_noop() {
                         tracing::debug!(sync = name, peer = peer.id, ?stats, "sync reconciled");
                     }
@@ -1398,6 +1420,9 @@ pub struct SyncStatus {
     pub reconcile_micros: u64,
     pub reconcile_wire_bytes: u64,
     pub reconcile_failures: u64,
+    /// Reconciles that fell back to full state. Zero is healthy; a RISING number
+    /// means a cursor described state a peer did not hold.
+    pub delta_fallbacks: u64,
     /// A fingerprint of the lattice point this entry's manifest occupies. Two
     /// converged peers report the SAME value; two diverged peers cannot. The
     /// counts above can be equal while the state differs, so this is the only
@@ -3819,6 +3844,17 @@ mod tests {
         }
     }
 
+    /// A stable name for the CLIENT, as the serving side sees it.
+    ///
+    /// Cursors are per-peer and each side keeps its own map, so the two ends do
+    /// not have to agree on a naming scheme. They only have to be CONSISTENT
+    /// across passes. Production uses iroh ids; here the node's author serves,
+    /// because it is already the stable per-node identity.
+    async fn client_label(node: &Arc<Mutex<SyncNode>>) -> String {
+        let author = node.lock().await.author();
+        author.0.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
     impl SyncTransport for LoopbackTransport {
         async fn peers_for(&self, _peers: &SyncPeers) -> Vec<PeerRef> {
             self.peers
@@ -3850,9 +3886,10 @@ mod tests {
             };
             let (client_end, server_end) = tokio::io::duplex(1 << 20);
             let server_name = name.clone();
+            let label = client_label(&node).await;
             let server = tokio::spawn(async move {
-                crate::sync::wire::run_server(server_end, move |n, _| async move {
-                    Ok(if n == server_name {
+                crate::sync::wire::run_server(server_end, &label, move |hello| async move {
+                    Ok(if hello.name == server_name {
                         Some((target, ()))
                     } else {
                         None
@@ -3860,7 +3897,7 @@ mod tests {
                 })
                 .await
             });
-            let stats = crate::sync::wire::run_client(client_end, node, &name).await?;
+            let stats = crate::sync::wire::run_client(client_end, node, &name, &peer.id).await?;
             let _ = server.await;
             Ok(stats)
         }
@@ -3931,21 +3968,20 @@ mod tests {
 
             let (client_end, server_end) = tokio::io::duplex(1 << 20);
             let resolver_target = target.clone();
+            let label = client_label(&node).await;
             let server = tokio::spawn(async move {
                 let (_, _, prepared) =
-                    crate::sync::wire::run_server(server_end, move |requested, remote_manifest| {
+                    crate::sync::wire::run_server(server_end, &label, move |hello| {
                         let engine = resolver_target.clone();
                         async move {
-                            let prepared = engine
-                                .prepare_inbound_for_manifest(&requested, &remote_manifest)
-                                .await?;
+                            let prepared = engine.prepare_inbound_for_hello(&hello).await?;
                             Ok(prepared.map(|prepared| (prepared.node(), prepared)))
                         }
                     })
                     .await?;
                 target.complete_inbound(prepared).await
             });
-            let stats = crate::sync::wire::run_client(client_end, node, &name).await?;
+            let stats = crate::sync::wire::run_client(client_end, node, &name, &peer.id).await?;
             server.await??;
             Ok(stats)
         }
@@ -4329,14 +4365,13 @@ mod tests {
     ) -> Reconciled {
         let (client_end, server_end) = tokio::io::duplex(1 << 20);
         let resolver_engine = engine.clone();
+        let label = client_label(&remote).await;
         let server = tokio::spawn(async move {
             let (_, stats, prepared) =
-                crate::sync::wire::run_server(server_end, move |name, remote_manifest| {
+                crate::sync::wire::run_server(server_end, &label, move |hello| {
                     let engine = resolver_engine.clone();
                     async move {
-                        let prepared = engine
-                            .prepare_inbound_for_manifest(&name, &remote_manifest)
-                            .await?;
+                        let prepared = engine.prepare_inbound_for_hello(&hello).await?;
                         Ok(prepared.map(|prepared| (prepared.node(), prepared)))
                     }
                 })
@@ -4344,7 +4379,7 @@ mod tests {
             engine.complete_inbound(prepared).await?;
             Ok::<_, anyhow::Error>(stats)
         });
-        crate::sync::wire::run_client(client_end, remote, "bus")
+        crate::sync::wire::run_client(client_end, remote, "bus", "inbound-wire-peer")
             .await
             .unwrap();
         server.await.unwrap().unwrap()
@@ -6064,16 +6099,16 @@ mod tests {
         let (client_end, server_end) = tokio::io::duplex(1 << 20);
         let resolver_engine = engine.clone();
         let server = tokio::spawn(async move {
-            crate::sync::wire::run_server(server_end, move |name, _| {
+            crate::sync::wire::run_server(server_end, "repair-peer", move |hello| {
                 let engine = resolver_engine.clone();
                 async move {
-                    let prepared = engine.prepare_inbound(&name).await?;
+                    let prepared = engine.prepare_inbound(&hello.name).await?;
                     Ok(prepared.map(|prepared| (prepared.node(), prepared)))
                 }
             })
             .await
         });
-        crate::sync::wire::run_client(client_end, remote, "bus")
+        crate::sync::wire::run_client(client_end, remote, "bus", "repair-server")
             .await
             .unwrap();
         let (_, _, prepared) = server.await.unwrap().unwrap();
@@ -6493,13 +6528,13 @@ mod tests {
         let node = prepared.node();
         let (client_end, server_end) = tokio::io::duplex(1 << 20);
         let server = tokio::spawn(async move {
-            crate::sync::wire::run_server(server_end, move |name, _| async move {
-                assert_eq!(name, "bus");
+            crate::sync::wire::run_server(server_end, "window-peer", move |hello| async move {
+                assert_eq!(hello.name, "bus");
                 Ok(Some((node, prepared)))
             })
             .await
         });
-        crate::sync::wire::run_client(client_end, remote, "bus")
+        crate::sync::wire::run_client(client_end, remote, "bus", "window-server")
             .await
             .unwrap();
         let (_, _, prepared) = server.await.unwrap().unwrap();
@@ -6569,7 +6604,12 @@ mod tests {
         // says inbox/archived.md is Present when the atomic archive lands.
         let remote_manifest = remote.lock().await.manifest().clone();
         let prepared = engine
-            .prepare_inbound_for_manifest("bus", &remote_manifest)
+            .prepare_inbound_for_hello(&crate::sync::wire::HelloInfo {
+                name: "bus".to_string(),
+                manifest: Arc::new(remote_manifest),
+                is_delta: false,
+                digest: String::new(),
+            })
             .await
             .unwrap()
             .unwrap();
@@ -6583,13 +6623,13 @@ mod tests {
         let (client_end, server_end) = tokio::io::duplex(1 << 20);
         let node = prepared.node();
         let server = tokio::spawn(async move {
-            crate::sync::wire::run_server(server_end, move |name, _| async move {
-                assert_eq!(name, "bus");
+            crate::sync::wire::run_server(server_end, "test-peer", move |hello| async move {
+                assert_eq!(hello.name, "bus");
                 Ok(Some((node, prepared)))
             })
             .await
         });
-        crate::sync::wire::run_client(client_end, remote, "bus")
+        crate::sync::wire::run_client(client_end, remote, "bus", "test-server")
             .await
             .unwrap();
         let (_, _, prepared) = server.await.unwrap().unwrap();

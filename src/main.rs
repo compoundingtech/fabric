@@ -909,7 +909,7 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                     let present = logical_present(&entry);
                     if entry.missing == 0 && entry.unexpected == 0 && entry.mismatched == 0 {
                         println!(
-                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdigest={}",
+                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tdigest={}",
                             entry.name,
                             entry.folder,
                             entry.policy,
@@ -927,11 +927,12 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                             entry.reconcile_wire_bytes,
                             entry.reconcile_failures,
                             sweep_token(&entry),
+                            entry.delta_fallbacks,
                             short_digest(&entry.digest),
                         );
                     } else {
                         println!(
-                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdigest={}",
+                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tdigest={}",
                             entry.name,
                             entry.folder,
                             entry.policy,
@@ -952,6 +953,7 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                             entry.reconcile_wire_bytes,
                             entry.reconcile_failures,
                             sweep_token(&entry),
+                            entry.delta_fallbacks,
                             short_digest(&entry.digest),
                         );
                     }
@@ -1005,6 +1007,9 @@ struct SyncLsJsonEntry<'a> {
     /// Why the tombstone sweep did or did not forget anything. `unknown` from a
     /// daemon that predates the field.
     sweep: &'a str,
+    /// Reconciles that fell back to full state. Zero is healthy; a RISING
+    /// number means a cursor described state a peer did not hold.
+    delta_fallbacks: u64,
     /// Lattice-point fingerprint of this entry's manifest. Compare it ACROSS
     /// peers: equal means converged, unequal means diverged. `present` and
     /// `tombstones` can match while the state differs, so they cannot answer
@@ -1026,6 +1031,7 @@ impl<'a> From<&'a fabric::control::SyncEntryStatus> for SyncLsJsonEntry<'a> {
             missing: entry.missing,
             unexpected: entry.unexpected,
             mismatched: entry.mismatched,
+            delta_fallbacks: entry.delta_fallbacks,
             digest: &entry.digest,
             sync_passes: entry.sync_passes,
             full_scans: entry.full_scans,
@@ -1275,6 +1281,7 @@ mod sync_ls_tests {
 
     fn status() -> SyncEntryStatus {
         SyncEntryStatus {
+            delta_fallbacks: 0,
             digest: "lattice-point-aaaa".into(),
             name: "catalog".to_string(),
             folder: "/catalog".to_string(),
@@ -1330,6 +1337,7 @@ mod sync_ls_tests {
                 "reconcile_wire_bytes": 11000000,
                 "reconcile_failures": 3,
                 "sweep": "disabled",
+                "delta_fallbacks": 0,
                 "digest": "lattice-point-aaaa"
             })
         );

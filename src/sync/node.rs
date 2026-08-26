@@ -56,6 +56,10 @@ pub struct Reconciled {
     pub pushed: usize,
     /// Content bytes transferred in either direction.
     pub bytes: usize,
+    /// Reconciles that found a payload was incomplete and fell back to full
+    /// state. Zero is the healthy value. A number that RISES between two samples
+    /// is a bug report: it means a cursor described state a peer did not hold.
+    pub fallbacks: usize,
     /// EVERY byte this reconcile put on or took off the wire, not just content.
     ///
     /// `bytes` above counts content blobs only, and content is the SMALL part.
@@ -406,6 +410,9 @@ impl SyncNode {
             pulled: self_adopts.len(),
             pushed: other_adopts.len(),
             bytes: 0,
+            // The loopback path merges both sides directly, so it cannot leave a
+            // payload incomplete and has nothing to fall back from.
+            fallbacks: 0,
         };
 
         for adopt in &self_adopts.adopt {

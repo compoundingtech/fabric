@@ -640,24 +640,21 @@ async fn a_replica_stores_the_origin_metadata_verbatim() -> Result<()> {
 /// The delta-replication goal, written as a property: **a small change must not
 /// ship the whole manifest.**
 ///
-/// This test is expected to FAIL until delta replication lands. It is ignored so
-/// it does not block CI, and it must be run explicitly:
+/// This failed when it was written, which was the point of writing it then. An
+/// eight byte change shipped 218,565 bytes, or 2.00 whole manifests. It now
+/// ships about 776 bytes against the same fixture.
 ///
-/// ```text
-/// cargo test --test folder_sync a_small_change -- --ignored --nocapture
-/// ```
-///
-/// It also measures a quiet window first, and that half already passes. Fabric
-/// runs NO pass and ships NO bytes when nothing changes, so the idle case is
-/// already free and needs no work. That measurement is kept here because it
-/// rules out a whole class of fix: there are no idle passes to make cheaper, so
-/// a cheap converged handshake would win nothing. The entire cost is in the
-/// change case.
+/// It measures a quiet window first, and that half passed from the beginning.
+/// Fabric runs NO pass and ships NO bytes when nothing changes, so the idle case
+/// was already free. That measurement is kept because it rules out a whole class
+/// of fix: there are no idle passes to make cheaper, so a cheap converged
+/// handshake would have won nothing. It also explains why the serving side needs
+/// the landing digest, since a pass where the digests already agree on arrival
+/// never happens.
 ///
 /// The positive control at the end is not optional. A quiet window that reports
 /// zero proves nothing unless the same counters are shown to move.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "expected to fail until delta replication lands; run explicitly"]
 async fn a_small_change_must_not_ship_the_whole_manifest() -> Result<()> {
     let _guard = FOLDER_SYNC_LOCK.lock().await;
     let a_dir = TempDir::new()?;
@@ -699,7 +696,7 @@ async fn a_small_change_must_not_ship_the_whole_manifest() -> Result<()> {
     }
 
     let (b0, p0, d0) = sample(&a_home).await?;
-    let window = 75;
+    let window = 45;
     tokio::time::sleep(Duration::from_secs(window)).await;
     let (b1, p1, d1) = sample(&a_home).await?;
 

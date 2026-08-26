@@ -42,14 +42,41 @@ const MAX_BLOB_COUNT: u32 = 1_000_000;
 #[derive(Debug, Serialize, Deserialize)]
 struct HelloHeader {
     name: String,
+    /// The sender's state to share: its WHOLE manifest, or a delta when
+    /// `is_delta` is set. Named `manifest` because an older build parses this
+    /// field by name and always reads it as a whole manifest.
     manifest: Manifest,
     wanted: Vec<ContentHash>,
+    /// The sender's lattice-point digest BEFORE this exchange.
+    ///
+    /// Empty from a build that predates deltas, and that emptiness is the
+    /// capability signal: a peer that cannot report a digest is never sent a
+    /// delta, because it would read one as a whole manifest.
+    #[serde(default)]
+    digest: String,
+    /// True when `manifest` carries only what changed.
+    ///
+    /// Never set for a peer that did not report a digest. An older build ignores
+    /// this field and would treat a delta as the sender's entire state, which
+    /// would make it push content for every path outside the delta.
+    #[serde(default)]
+    is_delta: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ReplyHeader {
     manifest: Manifest,
     wanted: Vec<ContentHash>,
+    /// The responder's digest AFTER adopting what the initiator sent.
+    ///
+    /// This is the acknowledgement. The join is commutative, so once both sides
+    /// have exchanged complete payloads they are at the SAME lattice point. If
+    /// the initiator's own post-merge digest does not equal this, a payload was
+    /// incomplete and the cursor that produced it cannot be trusted.
+    #[serde(default)]
+    digest: String,
+    #[serde(default)]
+    is_delta: bool,
 }
 
 // ---- framing primitives ----
@@ -127,6 +154,16 @@ async fn read_blobs_into<R: AsyncRead + Unpin>(
     Ok(received)
 }
 
+/// What a peer said in its Hello, for the resolver to route and decide on.
+pub struct HelloInfo {
+    pub name: String,
+    /// The peer's payload: its whole manifest, or a delta when `is_delta`.
+    pub manifest: Arc<Manifest>,
+    pub is_delta: bool,
+    /// The peer's digest before this exchange. Empty from an older build.
+    pub digest: String,
+}
+
 // ---- sessions ----
 
 /// Run the initiating side of a reconcile for sync `name` against a peer stream.
@@ -134,19 +171,33 @@ pub async fn run_client<S>(
     mut stream: S,
     node: Arc<Mutex<SyncNode>>,
     name: &str,
+    peer: &str,
 ) -> Result<Reconciled>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     // 1. Snapshot local state and send Hello.
-    let (local_manifest, wanted) = {
+    //
+    // A peer we hold a cursor for gets only what changed since that cursor. A
+    // peer we do not gets everything, which covers first contact, a peer we
+    // reset after a mismatch, and every peer after a restart.
+    let (payload, is_delta, wanted) = {
         let node = node.lock().await;
-        (node.manifest().clone(), node.missing_content_hashes())
+        let wanted = node.missing_content_hashes();
+        match node.changes().cursor_for(peer) {
+            Some(cursor) => {
+                let changed = node.changes().since(cursor);
+                (node.manifest().subset(changed), true, wanted)
+            }
+            None => (node.manifest().clone(), false, wanted),
+        }
     };
     let hello = HelloHeader {
         name: name.to_string(),
-        manifest: local_manifest.clone(),
+        manifest: payload.clone(),
         wanted,
+        digest: { node.lock().await.manifest().digest() },
+        is_delta,
     };
     let hello_frame = serde_json::to_vec(&hello)?;
     // THE WHOLE MANIFEST, ON EVERY PASS, CHANGED OR NOT. This is the term that
@@ -167,19 +218,80 @@ where
     wire_bytes += received.bytes;
 
     // 3. Adopt the server's winning entries and bundle what the server needs.
-    let for_server = {
+    let (pulled, blobs_for_server, fallback, final_digest) = {
         let mut node = node.lock().await;
         let pulled = node.adopt(&reply.manifest);
-        let mut wanted = node.hashes_peer_needs(&reply.manifest);
+        // What content to push. `hashes_peer_needs` infers what the peer lacks
+        // by diffing against what it sent, which is only sound when it sent
+        // EVERYTHING. Against a delta, every path outside the delta looks
+        // missing and we would push the whole tree. See
+        // `hashes_peer_needs_is_unsound_for_a_delta`.
+        let mut wanted = if !reply.is_delta {
+            node.hashes_peer_needs(&reply.manifest)
+        } else if is_delta {
+            node.content_for(&payload)
+        } else {
+            // We sent our whole manifest and the peer sent a delta. Inferring
+            // from a delta is unsound, and pushing content for our entire
+            // manifest would cost more than the thing this removes. The peer's
+            // `wanted` list covers what it knows it lacks.
+            Vec::new()
+        };
         for hash in reply.wanted {
             if !wanted.contains(&hash) {
                 wanted.push(hash);
             }
         }
         let blobs = node.gather_content(&wanted);
-        (pulled, blobs)
+
+        // The acknowledgement. Both sides have now exchanged their payloads, and
+        // the join is commutative, so complete payloads leave us at the SAME
+        // lattice point. Equal digests therefore prove the peer holds everything
+        // we had at `head_at_send`.
+        //
+        // Unequal digests prove a payload was incomplete, whatever the reason:
+        // a cursor that outlived the state it described, a peer that lost its
+        // manifest, a bug in this path. Forgetting the cursor costs one full
+        // exchange and repairs all of them. This is the self-healing trigger,
+        // and a rising count of it is a bug report.
+        let final_digest = node.manifest().digest();
+        let fallback = if reply.digest.is_empty() {
+            // A peer that reports no digest predates deltas. It must never be
+            // sent one, and no cursor may be held for it.
+            node.changes_mut().reset_peer(peer);
+            false
+        } else if final_digest == reply.digest {
+            // Acknowledge our head AFTER adopting, not `head_at_send`.
+            //
+            // Equal digests mean the peer holds the same manifest we do, so it
+            // holds EVERY path in our buffer, including the ones we just adopted
+            // from it in this very pass. Acknowledging the older head would send
+            // those paths straight back to the peer they came from on the next
+            // pass, which is an echo that costs content bytes and never ends.
+            let head = node.changes().head();
+            node.changes_mut().acknowledge(peer, head);
+            false
+        } else {
+            node.changes_mut().reset_peer(peer);
+            true
+        };
+        (pulled, blobs, fallback, final_digest)
     };
+    let for_server = (pulled, blobs_for_server);
     write_blobs(&mut stream, &for_server.1).await?;
+    // Tell the server where we landed, so it can advance its cursor too.
+    //
+    // Without this the serving side can only ever acknowledge during a pass
+    // where the digests ALREADY matched on arrival. Such a pass does not happen:
+    // fabric runs no pass at all when nothing has changed, and when something
+    // has changed the digests differ by definition. The server would therefore
+    // never hold a cursor and would send its whole manifest forever.
+    //
+    // Sent only to a peer that reported a digest of its own. An older build does
+    // not read this frame and must not be given it.
+    if !reply.digest.is_empty() {
+        write_len_bytes(&mut stream, final_digest.as_bytes()).await?;
+    }
     stream.flush().await?;
 
     // Wait for the server to acknowledge it has read and stored the push before
@@ -194,6 +306,7 @@ where
         pushed: for_server.1.len(),
         bytes: sent + received.bytes,
         wire_bytes,
+        fallbacks: usize::from(fallback),
     })
 }
 
@@ -201,10 +314,14 @@ where
 /// `name` the peer asked for (so the daemon can route to the right entry), the
 /// reconcile stats, and the resolver-provided context kept alive for the full
 /// session.
-pub async fn run_server<S, F, Fut, C>(mut stream: S, resolve: F) -> Result<(String, Reconciled, C)>
+pub async fn run_server<S, F, Fut, C>(
+    mut stream: S,
+    peer: &str,
+    resolve: F,
+) -> Result<(String, Reconciled, C)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
-    F: FnOnce(String, Arc<Manifest>) -> Fut,
+    F: FnOnce(HelloInfo) -> Fut,
     Fut: std::future::Future<Output = Result<Option<(Arc<Mutex<SyncNode>>, C)>>>,
 {
     // 1. Read Hello.
@@ -212,6 +329,8 @@ where
         name,
         manifest,
         wanted,
+        digest: peer_digest,
+        is_delta,
     } = serde_json::from_slice(
         &read_len_bytes(&mut stream, MAX_JSON_FRAME)
             .await
@@ -219,7 +338,14 @@ where
     )?;
     let manifest = Arc::new(manifest);
 
-    let Some((node, context)) = resolve(name.clone(), manifest.clone()).await? else {
+    let Some((node, context)) = resolve(HelloInfo {
+        name: name.clone(),
+        manifest: manifest.clone(),
+        is_delta,
+        digest: peer_digest.clone(),
+    })
+    .await?
+    else {
         bail!("no local sync entry named {name:?}");
     };
 
@@ -227,10 +353,52 @@ where
     // then adopt the client's winning entries (content arrives in the Push).
     let (reply, blobs_for_client, pushed) = {
         let mut node = node.lock().await;
-        let server_manifest = node.manifest().clone();
-        // Content the client should adopt from us (present entries where we win)
-        // plus anything the client explicitly reported missing.
-        let mut client_needs = node.hashes_peer_needs(&manifest);
+        let before_digest = node.manifest().digest();
+
+        // Take the acknowledgement FIRST, because it describes the state before
+        // this exchange and therefore decides what we may send in it.
+        //
+        // A peer that reported no digest predates deltas and must never be sent
+        // one. A peer standing exactly where we stand already holds everything
+        // we hold, so our cursor for it may advance to our head.
+        let acknowledged = if peer_digest.is_empty() {
+            node.changes_mut().reset_peer(peer);
+            false
+        } else if peer_digest == before_digest {
+            let head = node.changes().head();
+            node.changes_mut().acknowledge(peer, head);
+            true
+        } else {
+            false
+        };
+
+        // Our side of the exchange, chosen the way the client chose its own.
+        let (server_payload, reply_is_delta) = match node.changes().cursor_for(peer) {
+            Some(cursor) => {
+                let changed = node.changes().since(cursor);
+                (node.manifest().subset(changed), true)
+            }
+            None => (node.manifest().clone(), false),
+        };
+
+        // What content to push.
+        //
+        // `hashes_peer_needs` infers what the peer lacks by diffing against what
+        // it sent, which is only sound when it sent EVERYTHING. Against a delta
+        // every path outside the delta looks missing. See
+        // `hashes_peer_needs_is_unsound_for_a_delta`.
+        let mut client_needs = if !is_delta {
+            node.hashes_peer_needs(&manifest)
+        } else if reply_is_delta {
+            node.content_for(&server_payload)
+        } else {
+            // The peer sent a delta but we hold no cursor for it, so we must
+            // send our whole manifest. We cannot infer what it lacks from a
+            // delta, and pushing content for our entire manifest would cost far
+            // more than the thing this change removes. Its `wanted` list below
+            // covers what it knows it lacks, and the next pass covers the rest.
+            Vec::new()
+        };
         for hash in &wanted {
             if !client_needs.contains(hash) {
                 client_needs.push(*hash);
@@ -238,11 +406,16 @@ where
         }
         let blobs = node.gather_content(&client_needs);
         let pushed = node.adopt(&manifest);
-        // The reply advertises what WE are still missing so the client repairs us.
+
+        // The reply advertises what WE are still missing so the client repairs
+        // us, and carries our POST-adopt digest as the acknowledgement.
         let reply = ReplyHeader {
-            manifest: server_manifest,
+            manifest: server_payload,
             wanted: node.missing_content_hashes(),
+            digest: node.manifest().digest(),
+            is_delta: reply_is_delta,
         };
+        let _ = acknowledged;
         (reply, blobs, pushed)
     };
 
@@ -252,6 +425,26 @@ where
     stream.flush().await?;
 
     let received = read_blobs_into(&mut stream, &node).await?;
+
+    // Where the client landed. Equal digests mean it holds the same manifest we
+    // do, so it holds every path in our buffer and our cursor may advance to our
+    // head. Unequal digests mean a payload was incomplete, whatever the cause,
+    // and one full exchange repairs it.
+    let mut fallback = false;
+    if !peer_digest.is_empty() {
+        let frame = read_len_bytes(&mut stream, MAX_JSON_FRAME)
+            .await
+            .context("reading the client's landing digest")?;
+        let client_landed = String::from_utf8_lossy(&frame).to_string();
+        let mut node = node.lock().await;
+        if client_landed == node.manifest().digest() {
+            let head = node.changes().head();
+            node.changes_mut().acknowledge(peer, head);
+        } else {
+            node.changes_mut().reset_peer(peer);
+            fallback = true;
+        }
+    }
 
     // Acknowledge the push so the client can safely close the connection.
     write_u32(&mut stream, 1).await?;
@@ -266,6 +459,7 @@ where
             pulled: received.blobs,
             pushed,
             bytes: sent + received.bytes,
+            fallbacks: usize::from(fallback),
         },
         context,
     ))
@@ -309,13 +503,13 @@ mod tests {
         let (client_end, server_end) = tokio::io::duplex(1 << 20);
         let b_for_server = b.clone();
         let server = tokio::spawn(async move {
-            run_server(server_end, move |name, _| async move {
-                assert_eq!(name, "cat");
+            run_server(server_end, "test-peer", move |hello| async move {
+                assert_eq!(hello.name, "cat");
                 Ok(Some((b_for_server, ())))
             })
             .await
         });
-        let client = run_client(client_end, a.clone(), "cat").await.unwrap();
+        let client = run_client(client_end, a.clone(), "cat", "test-server").await.unwrap();
         let (name, _server_stats, ()) = server.await.unwrap().unwrap();
         assert_eq!(name, "cat");
         assert!(!client.is_noop());
@@ -337,18 +531,18 @@ mod tests {
             let (c, s) = tokio::io::duplex(1 << 20);
             let b2 = b.clone();
             let srv = tokio::spawn(async move {
-                run_server(s, move |_, _| async move { Ok(Some((b2, ()))) }).await
+                run_server(s, "test-peer", move |_| async move { Ok(Some((b2, ()))) }).await
             });
-            run_client(c, a.clone(), "cat").await.unwrap();
+            run_client(c, a.clone(), "cat", "test-server").await.unwrap();
             srv.await.unwrap().unwrap();
         }
         // Second session after convergence transfers no content.
         let (c, s) = tokio::io::duplex(1 << 20);
         let b2 = b.clone();
         let srv = tokio::spawn(async move {
-            run_server(s, move |_, _| async move { Ok(Some((b2, ()))) }).await
+            run_server(s, "test-peer", move |_| async move { Ok(Some((b2, ()))) }).await
         });
-        let stats = run_client(c, a.clone(), "cat").await.unwrap();
+        let stats = run_client(c, a.clone(), "cat", "test-server").await.unwrap();
         srv.await.unwrap().unwrap();
         assert_eq!(
             stats.bytes, 0,
@@ -368,9 +562,9 @@ mod tests {
         let (c, s) = tokio::io::duplex(1 << 20);
         let b2 = b.clone();
         let srv = tokio::spawn(async move {
-            run_server(s, move |_, _| async move { Ok(Some((b2, ()))) }).await
+            run_server(s, "test-peer", move |_| async move { Ok(Some((b2, ()))) }).await
         });
-        run_client(c, a.clone(), "cat").await.unwrap();
+        run_client(c, a.clone(), "cat", "test-server").await.unwrap();
         srv.await.unwrap().unwrap();
 
         let folder = b.lock().await.folder_state();
@@ -389,9 +583,9 @@ mod tests {
         let reconcile = |a: Arc<Mutex<SyncNode>>, b: Arc<Mutex<SyncNode>>| async move {
             let (client, server) = tokio::io::duplex(1 << 20);
             let task = tokio::spawn(async move {
-                run_server(server, move |_, _| async move { Ok(Some((b, ()))) }).await
+                run_server(server, "test-peer", move |_| async move { Ok(Some((b, ()))) }).await
             });
-            let client_stats = run_client(client, a, "bus").await.unwrap();
+            let client_stats = run_client(client, a, "bus", "test-server").await.unwrap();
             let (_, server_stats, ()) = task.await.unwrap().unwrap();
             (client_stats, server_stats)
         };
@@ -432,25 +626,29 @@ mod wire_cost_tests {
         let (client_end, server_end) = tokio::io::duplex(1 << 22);
         let b_for_server = b.clone();
         let server = tokio::spawn(async move {
-            run_server(server_end, move |_, _| async move { Ok(Some((b_for_server, ()))) }).await
+            run_server(server_end, "peer-a", move |_| async move {
+                Ok(Some((b_for_server, ())))
+            })
+            .await
         });
-        let stats = run_client(client_end, a, "cat").await.unwrap();
+        let stats = run_client(client_end, a, "cat", "peer-b").await.unwrap();
         let _ = server.await.unwrap().unwrap();
         stats
     }
 
-    /// A CONVERGED PASS SHIPS NOTHING AND STILL COSTS A MANIFEST.
+    /// A CONVERGED PASS MUST SHIP NEITHER CONTENT NOR A MANIFEST.
     ///
-    /// `bytes` counts content blobs, and a converged pass transfers no content,
-    /// so by that measure a no-op reconcile is free. It is not: both sides send
-    /// their entire manifest in the handshake whether or not anything changed.
-    /// On the bus entry that is about 10 MB, every pass, per peer.
+    /// This assertion used to run the other way. Both sides sent their ENTIRE
+    /// manifest in the handshake whether or not anything had changed, about
+    /// 10 MB per pass per peer on the bus entry, and this test insisted on
+    /// seeing that cost so a measurement could not report a converged pass as
+    /// free. The delta path removed the cost, so the test now pins its absence.
     ///
-    /// A cost measurement that reports zero here would hide the exact term delta
-    /// replication exists to remove, which is the only reason this counter was
-    /// added.
+    /// The bar is the fixture's OWN manifest size rather than a number picked to
+    /// pass. A converged pass that costs a tenth of a manifest is still shipping
+    /// something proportional to the tree, which is the thing being removed.
     #[tokio::test]
-    async fn a_converged_pass_transfers_no_content_and_still_ships_a_manifest() {
+    async fn a_converged_pass_ships_neither_content_nor_a_manifest() {
         let a = Arc::new(Mutex::new(SyncNode::new(author(1))));
         let b = Arc::new(Mutex::new(SyncNode::new(author(2))));
         // Enough entries that the manifest is unmistakably the dominant term.
@@ -458,10 +656,24 @@ mod wire_cost_tests {
             let name = format!("file-{i:03}.md");
             a.lock().await.local_write(&name, b"x", 0, 0);
         }
-        // Converge them.
-        reconcile_once(a.clone(), b.clone()).await;
-        let second = reconcile_once(a.clone(), b.clone()).await;
+        let manifest_bytes = serde_json::to_vec(a.lock().await.manifest())
+            .unwrap()
+            .len();
+        assert!(
+            manifest_bytes > 4_000,
+            "the fixture manifest is only {manifest_bytes} bytes, too small to \
+             tell a delta from a manifest"
+        );
 
+        // Converge them.
+        let first = reconcile_once(a.clone(), b.clone()).await;
+        assert!(
+            first.wire_bytes > manifest_bytes,
+            "the first pass must still carry the whole manifest, or the peers \
+             never converged and the second pass proves nothing"
+        );
+
+        let second = reconcile_once(a.clone(), b.clone()).await;
         assert!(
             second.is_noop(),
             "the second pass was not converged, so this measures the wrong thing"
@@ -470,10 +682,15 @@ mod wire_cost_tests {
             second.bytes, 0,
             "a converged pass moved content, so the fixture is wrong"
         );
+        assert_eq!(
+            second.fallbacks, 0,
+            "a converged pass fell back to full state, which means a cursor \
+             described state the peer did not hold"
+        );
         assert!(
-            second.wire_bytes > 4_000,
-            "a converged pass reported {} wire bytes; the manifests are not being \
-             counted, and the manifest is the whole cost",
+            second.wire_bytes * 10 < manifest_bytes,
+            "a converged pass shipped {} wire bytes against a {manifest_bytes} \
+             byte manifest. It is still paying for the size of the tree",
             second.wire_bytes
         );
     }
