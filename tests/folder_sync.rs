@@ -513,3 +513,145 @@ async fn a_path_dropped_from_include_is_forgotten_not_deleted() -> Result<()> {
     assert!(kept.exists(), "an included file was lost too");
     Ok(())
 }
+
+/// The delta-replication goal, written as a property: **a small change must not
+/// ship the whole manifest.**
+///
+/// This test is expected to FAIL until delta replication lands. It is ignored so
+/// it does not block CI, and it must be run explicitly:
+///
+/// ```text
+/// cargo test --test folder_sync a_small_change -- --ignored --nocapture
+/// ```
+///
+/// It also measures a quiet window first, and that half already passes. Fabric
+/// runs NO pass and ships NO bytes when nothing changes, so the idle case is
+/// already free and needs no work. That measurement is kept here because it
+/// rules out a whole class of fix: there are no idle passes to make cheaper, so
+/// a cheap converged handshake would win nothing. The entire cost is in the
+/// change case.
+///
+/// The positive control at the end is not optional. A quiet window that reports
+/// zero proves nothing unless the same counters are shown to move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "expected to fail until delta replication lands; run explicitly"]
+async fn a_small_change_must_not_ship_the_whole_manifest() -> Result<()> {
+    let _guard = FOLDER_SYNC_LOCK.lock().await;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let a_home = FabricHome::new(a_dir.path());
+    let b_home = FabricHome::new(b_dir.path());
+    let a_folder = a_dir.path().join("shared");
+    let b_folder = b_dir.path().join("shared");
+    std::fs::create_dir_all(&a_folder)?;
+    std::fs::create_dir_all(&b_folder)?;
+    write_sync(a_dir.path(), &a_folder, "bus");
+    write_sync(b_dir.path(), &b_folder, "bus");
+
+    for i in 0..300 {
+        std::fs::write(a_folder.join(format!("f{i}.txt")), format!("content {i}\n"))?;
+    }
+
+    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_b = FabricNode::start(b_home.clone()).await?;
+    trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
+    trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
+    reload_sync(&a_home).await?;
+
+    assert!(
+        wait_for_file(&b_folder.join("f299.txt"), b"content 299\n").await,
+        "the peers never converged, so there is no quiet pass to measure"
+    );
+    // Let the tail of propagation finish before the window opens.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    async fn sample(home: &FabricHome) -> Result<(u64, u64, String)> {
+        match send_control(home, ControlRequest::SyncStatus).await? {
+            fabric::control::ControlResponse::SyncStatus { entries } => {
+                let e = entries.into_iter().find(|e| e.name == "shared").unwrap();
+                Ok((e.reconcile_wire_bytes, e.sync_passes, e.digest))
+            }
+            other => panic!("expected SyncStatus, got {other:?}"),
+        }
+    }
+
+    let (b0, p0, d0) = sample(&a_home).await?;
+    let window = 75;
+    tokio::time::sleep(Duration::from_secs(window)).await;
+    let (b1, p1, d1) = sample(&a_home).await?;
+
+    let manifest = std::fs::metadata(
+        a_dir
+            .path()
+            .join("sync")
+            .join("shared")
+            .join("manifest.json"),
+    )
+    .map(|m| m.len())
+    .unwrap_or(0);
+
+    println!("--- what a quiet pass ships ---");
+    println!("window          {window} s, nothing changed");
+    println!("digest before   {d0}");
+    println!("digest after    {d1}");
+    println!("digest moved    {}", d0 != d1);
+    println!("manifest bytes  {manifest}");
+    println!("passes          {}", p1 - p0);
+    println!("wire bytes      {}", b1 - b0);
+    if p1 > p0 {
+        println!("per pass        {}", (b1 - b0) / (p1 - p0));
+        println!(
+            "manifests/pass  {:.2}",
+            (b1 - b0) as f64 / (p1 - p0) as f64 / manifest.max(1) as f64
+        );
+    }
+
+    // POSITIVE CONTROL. A zero above is only meaningful if these counters can
+    // move at all. Change ONE file and prove they do. Without this, "0 passes"
+    // is indistinguishable from a broken counter.
+    std::fs::write(a_folder.join("f0.txt"), b"changed\n")?;
+    let mut moved = (0u64, 0u64);
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let (b2, p2, d2) = sample(&a_home).await?;
+        if p2 > p1 && b2 > b1 {
+            moved = (b2 - b1, p2 - p1);
+            println!("--- positive control: one file changed ---");
+            println!("passes          {}", p2 - p1);
+            println!("wire bytes      {}", b2 - b1);
+            println!("per pass        {}", (b2 - b1) / (p2 - p1));
+            println!(
+                "manifests/pass  {:.2}",
+                (b2 - b1) as f64 / (p2 - p1) as f64 / manifest.max(1) as f64
+            );
+            println!("digest moved    {}", d2 != d1);
+            break;
+        }
+    }
+    assert!(
+        moved.1 > 0,
+        "the counters never moved even after a real change, so the quiet-window \
+         zero above proves nothing"
+    );
+
+    // The goal sentence of the delta plan: stop shipping the whole manifest.
+    // One file changed by eight bytes. Anything at or above a whole manifest
+    // per pass means the manifest is still the unit of transfer.
+    //
+    // One manifest per pass is the loosest bar that still means "not the whole
+    // manifest". The real target is far lower and is not named here, because a
+    // target chosen before the instrument runs everywhere is a target chosen to
+    // be met.
+    let per_pass = moved.0 / moved.1;
+    assert!(
+        per_pass < manifest,
+        "a change of eight bytes shipped {per_pass} bytes, which is {:.2} whole \
+         manifests of {manifest} bytes. The manifest is still the unit of \
+         transfer",
+        per_pass as f64 / manifest.max(1) as f64
+    );
+
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
