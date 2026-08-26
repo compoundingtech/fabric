@@ -258,7 +258,24 @@ async fn production_status_exposes_exact_inbound_scan_ledger() -> Result<()> {
         "ledger seed did not converge"
     );
     reload_sync(&b_home).await?;
-    let baseline = sync_status(&b_home, "shared").await?;
+    // Let the pair go quiet before taking the baseline. Sampling while a pass
+    // is still in flight counts it on one side of the comparison and not the
+    // other, which made this test fail about one run in ten.
+    let baseline = {
+        let mut last = sync_status(&b_home, "shared").await?;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let now = sync_status(&b_home, "shared").await?;
+            if now.inbound_noop_transactions == last.inbound_noop_transactions
+                && now.full_scans == last.full_scans
+                && now.inbound_guarded_transactions == last.inbound_guarded_transactions
+            {
+                break;
+            }
+            last = now;
+        }
+        last
+    };
 
     reload_sync(&a_home).await?;
     reload_sync(&a_home).await?;

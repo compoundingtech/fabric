@@ -37,7 +37,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::FabricHome;
 
 use super::config::{PolicyRules, SyncBook, SyncEntry, SyncPeers};
-use super::manifest::{Author, ContentHash, FileMeta, Manifest};
+use super::manifest::{Author, ContentHash, Entry, FileMeta, Manifest};
 use super::node::{Reconciled, SweepEvidence, SyncNode, content_hash};
 
 /// How long to wait after a filesystem event settles before syncing, so a burst
@@ -451,6 +451,15 @@ struct EntryState {
     /// of what a peer has been told, and the tombstone sweep will not forget a
     /// deletion until every configured peer has an ack newer than it.
     peer_acks: Arc<StdMutex<HashMap<String, i64>>>,
+    /// What was in `observed` at the last durable write, so a persist can log
+    /// only the paths that moved.
+    ///
+    /// Held rather than derived because `observed` is replaced wholesale in one
+    /// place, so per-site dirty tracking would silently miss changes and a
+    /// missed one is silent divergence. A copy of this map is about 1.8 MB on
+    /// the production bus entry; the manifest side needs no copy at all,
+    /// because `ChangeBuffer` already records every path that moved.
+    persisted_observed: Arc<StdMutex<HashMap<String, ContentHash>>>,
     /// Local time each expired tombstone was first seen expired HERE, for the
     /// tombstones still waiting on an ack. Deliberately not persisted: a
     /// tombstone whose stamp is lost is simply stamped again on the next pass
@@ -506,6 +515,35 @@ struct ScanCacheEntry {
     mtime_secs: i64,
     mtime_nanos: u32,
     hash: ContentHash,
+}
+
+/// Compact when the log reaches this fraction of the snapshot. Four means 25%.
+///
+/// Bounded against the snapshot rather than an absolute size so it scales with
+/// the entry. Recovery reads the snapshot plus at most this much log, and the
+/// steady-state write is a fraction of what a rewrite used to cost.
+const LOG_COMPACTION_DIVISOR: u64 = 4;
+
+/// One path's durable state, as appended to the log.
+///
+/// The manifest entry and the observed receipt travel TOGETHER because they must
+/// stay consistent. `observed` is what makes "in my records, absent from my
+/// scan" mean a local delete rather than a file that has not materialized yet.
+/// If it lagged behind the manifest, that ambiguity is exactly the one that
+/// removed thirteen live files on 2026-08-25.
+///
+/// The scan cache is deliberately absent. It is derived and self-detecting: a
+/// cached hash is reused only when size and both mtime components are
+/// byte-identical to what was recorded, so a stale line simply forces a rehash.
+/// It is written at snapshot time only, on a slower clock than the state that
+/// must be exact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LoggedChange {
+    path: String,
+    /// `None` means the path left the manifest, as a swept tombstone does.
+    entry: Option<Entry>,
+    /// `None` means the path is no longer observed on local disk.
+    observed: Option<ContentHash>,
 }
 
 /// State retained across an inbound merge.
@@ -618,6 +656,9 @@ impl<T: SyncTransport> SyncEngine<T> {
                         )
                     }
                 };
+            // What is durable right now: the snapshot with its log replayed.
+            let persisted_observed =
+                Arc::new(StdMutex::new(observed.lock().unwrap().clone()));
             next.insert(
                 cfg.name.clone(),
                 Arc::new(EntryState {
@@ -625,6 +666,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                     policy,
                     node,
                     operation,
+                    persisted_observed,
                     observed,
                     scan_cache,
                     peer_acks,
@@ -648,7 +690,7 @@ impl<T: SyncTransport> SyncEngine<T> {
         HashMap<String, i64>,
     )> {
         let mut node = SyncNode::new(self.author);
-        if let Some(state) = self.read_state(&cfg.name)? {
+        if let Some(state) = self.read_durable_state(&cfg.name)? {
             // `adopt` records every path it takes, so loading from disk also
             // SEEDS the change buffer with the whole manifest. That is required,
             // not incidental: a node that came back with an empty buffer would
@@ -1164,24 +1206,223 @@ impl<T: SyncTransport> SyncEngine<T> {
         }
     }
 
+    /// Make this entry's state durable, by appending what changed.
+    ///
+    /// A full rewrite costs the size of the TREE. Appending costs the size of
+    /// the CHANGE. The snapshot still happens, just rarely, and
+    /// `should_compact` decides when.
     async fn persist_entry(&self, entry: &EntryState) -> Result<()> {
         #[cfg(test)]
         entry.work.persist_calls.fetch_add(1, Ordering::Relaxed);
-        let manifest = entry.node.lock().await.manifest().clone();
+        let name = &entry.config.name;
+
+        // Which paths moved. The manifest side is free: `ChangeBuffer` already
+        // recorded every path that changed, and the durable cursor says how far
+        // disk has got. The observed side is diffed against the copy held from
+        // the last write, because `observed` is replaced wholesale in one place
+        // and per-site tracking would miss it.
+        let (head, manifest_dirty, manifest) = {
+            let node = entry.node.lock().await;
+            let durable = node.changes().durable_cursor();
+            let dirty: Vec<String> = node
+                .changes()
+                .since(durable)
+                .into_iter()
+                .map(String::from)
+                .collect();
+            (node.changes().head(), dirty, node.manifest().clone())
+        };
         let observed = entry.observed.lock().unwrap().clone();
-        let scan_cache = entry.scan_cache.lock().unwrap().clone();
-        let peer_acks = entry.peer_acks.lock().unwrap().clone();
-        self.write_state(
-            &entry.config.name,
-            &PersistedEntryState {
-                manifest,
-                observed,
-                scan_cache,
-                peer_acks,
-            },
-        )?;
+
+        let mut changed: std::collections::BTreeSet<String> =
+            manifest_dirty.into_iter().collect();
+        {
+            let was = entry.persisted_observed.lock().unwrap();
+            for (path, hash) in &observed {
+                if was.get(path) != Some(hash) {
+                    changed.insert(path.clone());
+                }
+            }
+            for path in was.keys() {
+                if !observed.contains_key(path) {
+                    changed.insert(path.clone());
+                }
+            }
+        }
+
+        if self.should_compact(name, &changed) {
+            let scan_cache = entry.scan_cache.lock().unwrap().clone();
+            let peer_acks = entry.peer_acks.lock().unwrap().clone();
+            self.write_state(
+                name,
+                &PersistedEntryState {
+                    manifest,
+                    observed: observed.clone(),
+                    scan_cache,
+                    peer_acks,
+                },
+            )?;
+        } else {
+            let records: Vec<LoggedChange> = changed
+                .iter()
+                .map(|path| LoggedChange {
+                    path: path.clone(),
+                    entry: manifest.get(path).copied(),
+                    observed: observed.get(path).copied(),
+                })
+                .collect();
+            self.append_log(name, &records)?;
+        }
+
+        // Only AFTER the write. Marking a change durable before it lands is how
+        // it is dropped from the log and never written again.
+        entry.node.lock().await.changes_mut().mark_durable(head);
+        *entry.persisted_observed.lock().unwrap() = observed;
         entry.work.commit_daemon_writes();
         Ok(())
+    }
+
+    /// One pass, and a second one if the first found a payload incomplete.
+    ///
+    /// A REPAIR TAKES TWO PASSES AND ONLY ONE IS SCHEDULED. When a peer's cursor
+    /// describes state we no longer hold, the first pass is what discovers it:
+    /// the peer sends a delta based on its stale cursor, we adopt nothing, and
+    /// the digests disagree. Both sides then forget their cursors, which is
+    /// exactly the right repair and is useless until somebody reconciles again.
+    ///
+    /// Nothing would. Fabric runs no pass when nothing has changed, and after a
+    /// failed repair nothing HAS changed locally, so the second pass waits on
+    /// the five-minute safety net. A node that came back from a crash missing
+    /// entries would sit quietly wrong for that whole window, and quiet is the
+    /// failure this design exists to prevent.
+    ///
+    /// So a fallback schedules the pass that uses it. Bounded to one retry: if
+    /// the second pass also falls back, something is wrong that repeating will
+    /// not fix, and a loop here would hammer a peer.
+    async fn sync_once_repairing(&self, name: &str) -> Result<()> {
+        let before = self.delta_fallbacks_of(name).await;
+        self.sync_once(name).await?;
+        if self.delta_fallbacks_of(name).await > before {
+            tracing::debug!(
+                sync = name,
+                "a payload was incomplete; reconciling again to apply the repair"
+            );
+            self.sync_once(name).await?;
+        }
+        Ok(())
+    }
+
+    async fn delta_fallbacks_of(&self, name: &str) -> u64 {
+        self.entries
+            .read()
+            .await
+            .get(name)
+            .map(|entry| entry.work.delta_fallbacks.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Whether to write a whole snapshot instead of appending.
+    ///
+    /// The bound is a fraction of the SNAPSHOT's own size, so it scales with the
+    /// entry rather than being a number someone picked. That is the second time
+    /// the honest bound here turned out to be structural; the first is the delta
+    /// buffer, which cannot outgrow its own path count. Reach for the shape of
+    /// the data before reaching for a constant.
+    ///
+    /// A missing snapshot forces one: an append log with nothing under it
+    /// recovers nothing.
+    fn should_compact(&self, name: &str, changed: &std::collections::BTreeSet<String>) -> bool {
+        let snapshot = match std::fs::metadata(self.state_path(name)) {
+            Ok(meta) => meta.len(),
+            Err(_) => return true,
+        };
+        if changed.is_empty() {
+            return false;
+        }
+        let log = std::fs::metadata(self.log_path(name))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        log * LOG_COMPACTION_DIVISOR >= snapshot
+    }
+
+    fn log_path(&self, name: &str) -> PathBuf {
+        self.home
+            .root()
+            .join("sync")
+            .join(sanitize_name(name))
+            .join("log.jsonl")
+    }
+
+    /// Append one line per changed path.
+    ///
+    /// Deliberately NOT fsynced. The log is an INDEX, and an index can always be
+    /// re-derived. For a local change the filesystem is the durable record: the
+    /// file is on disk whether or not the line survived, and the next scan
+    /// re-derives the entry. For an adopted change the peer is the durable
+    /// record and re-sends it. A local DELETE survives too, because deletion is
+    /// detected by scanning against the manifest, not from the log: the snapshot
+    /// still holds the entry Present, the scan finds nothing, and the delete is
+    /// re-derived with a higher version.
+    ///
+    /// So a lost tail costs a catch-up, never data, and an fsync per record
+    /// would buy latency and nothing else.
+    fn append_log(&self, name: &str, records: &[LoggedChange]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let path = self.log_path(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut buf = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut buf, record)?;
+            buf.push(b'\n');
+        }
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        file.write_all(&buf)
+            .with_context(|| format!("failed to append to {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Read the log, discarding a torn tail.
+    ///
+    /// Records are line-delimited and only ever appended, so a write interrupted
+    /// by a crash can only damage the LAST line. A line that does not parse ends
+    /// the replay; everything before it is intact and everything after it cannot
+    /// exist. Losing that tail is case three above: the node comes back behind
+    /// and converges.
+    fn read_log(&self, name: &str) -> Vec<LoggedChange> {
+        let path = self.log_path(name);
+        let Ok(raw) = std::fs::read(&path) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for line in raw.split(|b| *b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_slice::<LoggedChange>(line) {
+                Ok(record) => out.push(record),
+                Err(_) => {
+                    // A torn final line. Stop rather than skip: a later line
+                    // cannot exist, and treating this as a gap would apply
+                    // records out of order.
+                    tracing::debug!(
+                        sync = name,
+                        recovered = out.len(),
+                        "discarding a torn tail from the sync log"
+                    );
+                    break;
+                }
+            }
+        }
+        out
     }
 
     fn manifest_path(&self, name: &str) -> PathBuf {
@@ -1209,6 +1450,48 @@ impl<T: SyncTransport> SyncEngine<T> {
             .with_context(|| format!("failed to read {}", path.display()))?;
         let state: PersistedEntryState = serde_json::from_str(&raw)
             .with_context(|| format!("failed to parse {}", path.display()))?;
+        Ok(Some(state))
+    }
+
+    /// THE durable state: the snapshot with its log replayed over it.
+    ///
+    /// This is what a restart sees, and it is the only definition of "what is on
+    /// disk". Reading `state.json` alone answers a different and now-wrong
+    /// question, because everything since the last snapshot lives in the log.
+    ///
+    /// Each record is the last word on its path, so applying them in order
+    /// reproduces the state at the final append. Replaying a record already
+    /// inside the snapshot is a no-op: last-writer-wins per path, identical
+    /// values. That is what makes it safe for a snapshot to commit before its
+    /// log is truncated.
+    fn read_durable_state(&self, name: &str) -> Result<Option<PersistedEntryState>> {
+        let Some(mut state) = self.read_state(name)? else {
+            return Ok(None);
+        };
+        let replayed = self.read_log(name);
+        if !replayed.is_empty() {
+            tracing::debug!(
+                sync = name,
+                records = replayed.len(),
+                "replaying the sync log over the snapshot"
+            );
+        }
+        for record in replayed {
+            match record.entry {
+                Some(entry) => state.manifest.insert(record.path.clone(), entry),
+                None => {
+                    state.manifest.remove(&record.path);
+                }
+            }
+            match record.observed {
+                Some(hash) => {
+                    state.observed.insert(record.path, hash);
+                }
+                None => {
+                    state.observed.remove(&record.path);
+                }
+            }
+        }
         Ok(Some(state))
     }
 
@@ -1246,7 +1529,27 @@ impl<T: SyncTransport> SyncEngine<T> {
         let raw = serde_json::to_vec(state)?;
         // The combined state is authoritative and lands atomically first. It is
         // self-contained: manifest, observed receipt, scan cache and peer acks.
-        write_atomic(&path, &raw)?;
+        //
+        // DURABLY, because the log is truncated against it below. This is the
+        // ordering that loses data if it is reversed, and it is the only one.
+        write_atomic_durable(&path, &raw)?;
+        // Only now, with the snapshot on the platter, may the log go. A crash
+        // between these two leaves records that are already inside the snapshot,
+        // and replaying those is a no-op.
+        match std::fs::remove_file(self.log_path(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                // Not fatal, and not silent. The snapshot is committed and
+                // correct, and replaying a log it already contains changes
+                // nothing.
+                tracing::debug!(
+                    sync = name,
+                    %error,
+                    "could not truncate the sync log after a snapshot"
+                );
+            }
+        }
         // The manifest projection is NOT rewritten here, and that is the point.
         //
         // It used to be, to keep `manifest.json` current for operators and older
@@ -1330,7 +1633,7 @@ impl<T: SyncTransport> SyncEngine<T> {
         let root = entry.config.folder.clone();
 
         // Best-effort initial sync.
-        if let Err(error) = self.sync_once(&name).await {
+        if let Err(error) = self.sync_once_repairing(&name).await {
             tracing::warn!(sync = %name, %error, "initial sync failed");
         }
 
@@ -1354,7 +1657,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                     let safety_due = last_safety_scan.elapsed() >= MISSED_EVENT_RESYNC;
                     if periodic_scan_due(dirty, safety_due) {
                         if safety_due { last_safety_scan = tokio::time::Instant::now(); }
-                        if let Err(error) = self.sync_once(&name).await {
+                        if let Err(error) = self.sync_once_repairing(&name).await {
                             tracing::debug!(sync = %name, %error, "periodic sync failed");
                         }
                     }
@@ -2046,6 +2349,44 @@ fn write_atomic_inner(path: &Path, bytes: &[u8], executable: bool) -> Result<()>
     }
     std::fs::rename(&tmp, path)
         .with_context(|| format!("failed to rename into {}", path.display()))?;
+    Ok(())
+}
+
+/// Write a file atomically AND durably, for a snapshot the log is about to be
+/// truncated against.
+///
+/// `write_atomic` renames without flushing, which is fine for a file nothing is
+/// traded against: a crash loses the write and the next pass repeats it. It is
+/// NOT fine for the snapshot. Truncating the log against bytes that are still
+/// only in the page cache is the one ordering in this design that loses data:
+/// the log is gone, the snapshot never landed, and neither the filesystem nor a
+/// peer knows what the manifest used to say.
+///
+/// So the temp file is flushed before the rename, and the directory after it, so
+/// the rename itself survives too.
+fn write_atomic_durable(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension(format!(
+        "{}.fabric-tmp",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("")
+    ));
+    {
+        let mut file = std::fs::File::create(&tmp)
+            .with_context(|| format!("failed to create {}", tmp.display()))?;
+        use std::io::Write as _;
+        file.write_all(bytes)
+            .with_context(|| format!("failed to write {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to flush {}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("failed to rename into {}", path.display()))?;
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        // Best effort. A platform that refuses to flush a directory still has
+        // the file's own contents durable from `sync_all` above.
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 
@@ -4380,8 +4721,10 @@ mod tests {
             .await
             .manifest()
             .clone();
-        let raw = std::fs::read(engine.state_path("bus")).unwrap();
-        let on_disk: PersistedEntryState = serde_json::from_slice(&raw).unwrap();
+        // What a restart would see. The snapshot alone is no longer the whole
+        // answer: a change since the last snapshot lives in the log, and this
+        // test is precisely about whether a change reached disk at all.
+        let on_disk: PersistedEntryState = engine.read_durable_state("bus").unwrap().unwrap();
 
         assert_eq!(
             on_disk.manifest, in_memory,
@@ -4391,6 +4734,162 @@ mod tests {
         assert!(
             on_disk.manifest.get("b.md").is_some(),
             "the real change must be on disk, not merely in memory"
+        );
+    }
+
+    /// CASE FIVE, THE ONLY ORDERING THAT LOSES DATA.
+    ///
+    /// The log may be truncated ONLY after the snapshot is durable. If a
+    /// snapshot fails and the log has already gone, the change is in neither:
+    /// the log is empty, the snapshot never landed, and neither the filesystem
+    /// nor a peer knows what the manifest used to say.
+    ///
+    /// The snapshot write is made to fail by blocking its temp path, and the log
+    /// must still hold everything.
+    #[tokio::test]
+    async fn a_failed_snapshot_must_not_take_the_log_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("seed.md"), b"seed").unwrap();
+        write_bus_sync(dir.path(), &root);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+
+        // A change that lives only in the log.
+        std::fs::write(root.join("logged.md"), b"only in the log").unwrap();
+        engine.sync_once("bus").await.unwrap();
+        let log_before = std::fs::read(engine.log_path("bus")).unwrap();
+        assert!(
+            !log_before.is_empty(),
+            "nothing reached the log, so this test cannot say anything about \
+             losing it"
+        );
+        let durable_before = engine.read_durable_state("bus").unwrap().unwrap();
+        assert!(durable_before.manifest.get("logged.md").is_some());
+
+        // Block the snapshot's temp path so the snapshot cannot land.
+        let state_path = engine.state_path("bus");
+        std::fs::create_dir(state_path.with_extension("json.fabric-tmp")).unwrap();
+        let state = PersistedEntryState {
+            manifest: durable_before.manifest.clone(),
+            observed: durable_before.observed.clone(),
+            scan_cache: HashMap::new(),
+            peer_acks: HashMap::new(),
+        };
+        assert!(
+            engine.write_state("bus", &state).is_err(),
+            "the snapshot was supposed to fail; this test proves nothing if it \
+             succeeded"
+        );
+
+        assert_eq!(
+            std::fs::read(engine.log_path("bus")).unwrap(),
+            log_before,
+            "the log was truncated against a snapshot that never landed. This is \
+             the one ordering in this design that loses data"
+        );
+        let durable_after = engine.read_durable_state("bus").unwrap().unwrap();
+        assert_eq!(
+            durable_after.manifest, durable_before.manifest,
+            "the durable state lost a change to a failed snapshot"
+        );
+    }
+
+    /// CASE FOUR. A snapshot that committed before its log was truncated leaves
+    /// records already inside the snapshot. Replaying them must change nothing.
+    #[tokio::test]
+    async fn replaying_records_already_in_the_snapshot_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.md"), b"one").unwrap();
+        write_bus_sync(dir.path(), &root);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+        std::fs::write(root.join("b.md"), b"two").unwrap();
+        engine.sync_once("bus").await.unwrap();
+
+        let before = engine.read_durable_state("bus").unwrap().unwrap();
+        // Force a snapshot, then put the log back exactly as it was, which is
+        // what a crash between the two leaves behind.
+        let log = std::fs::read(engine.log_path("bus")).unwrap_or_default();
+        let state = PersistedEntryState {
+            manifest: before.manifest.clone(),
+            observed: before.observed.clone(),
+            scan_cache: HashMap::new(),
+            peer_acks: HashMap::new(),
+        };
+        engine.write_state("bus", &state).unwrap();
+        std::fs::write(engine.log_path("bus"), &log).unwrap();
+
+        let after = engine.read_durable_state("bus").unwrap().unwrap();
+        assert_eq!(after.manifest, before.manifest, "replay was not a no-op");
+        assert_eq!(after.observed, before.observed, "replay was not a no-op");
+    }
+
+    /// CASE TWO. A crash during an append can only damage the LAST line, because
+    /// records are line-delimited and only ever appended. It must be discarded
+    /// and everything before it kept.
+    #[tokio::test]
+    async fn a_torn_final_line_is_discarded_and_the_rest_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        // Enough seed entries that a handful of appends stays well under the
+        // compaction bound, or the snapshot fires and there is no log to tear.
+        for i in 0..300 {
+            std::fs::write(root.join(format!("seed{i:03}.md")), b"seed").unwrap();
+        }
+        std::fs::write(root.join("a.md"), b"one").unwrap();
+        write_bus_sync(dir.path(), &root);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+        std::fs::write(root.join("b.md"), b"two").unwrap();
+        engine.sync_once("bus").await.unwrap();
+        std::fs::write(root.join("c.md"), b"three").unwrap();
+        engine.sync_once("bus").await.unwrap();
+
+        let whole = engine.read_durable_state("bus").unwrap().unwrap();
+        assert!(whole.manifest.get("c.md").is_some(), "c.md never reached disk");
+
+        // Tear the last line, as an interrupted append would.
+        let log = std::fs::read(engine.log_path("bus")).unwrap();
+        let torn = &log[..log.len() - 12];
+        std::fs::write(engine.log_path("bus"), torn).unwrap();
+
+        let recovered = engine.read_durable_state("bus").unwrap().unwrap();
+        assert!(
+            recovered.manifest.get("a.md").is_some(),
+            "a torn tail took an earlier record with it"
+        );
+        assert!(
+            recovered.manifest.get("b.md").is_some(),
+            "a torn tail took an earlier record with it"
         );
     }
 
@@ -6170,7 +6669,7 @@ mod tests {
         ));
     }
 
-    /// ONE CHANGE MUST WRITE THE INDEX ONCE, NOT TWICE.
+    /// ONE CHANGE MUST WRITE THE CHANGE, NOT THE TREE.
     ///
     /// `state.json` is self-contained and authoritative: it carries the
     /// manifest, the observed receipt, the scan cache and the peer acks, and it
@@ -6184,7 +6683,7 @@ mod tests {
     /// The bar here is the authoritative file's own size, so the test measures
     /// duplication rather than a number chosen to pass.
     #[tokio::test]
-    async fn one_change_writes_the_index_once_not_twice() {
+    async fn one_change_writes_the_change_not_the_tree() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("resources");
         std::fs::create_dir_all(&root).unwrap();
@@ -6205,13 +6704,22 @@ mod tests {
         engine.sync_once("bus").await.unwrap();
 
         let entry_dir = engine.state_path("bus").parent().unwrap().to_path_buf();
-        let snapshot = || -> std::collections::BTreeMap<PathBuf, (u64, u64)> {
+        // Size AND real mtime. An earlier version of this compared
+        // `elapsed()`, which moves on its own and made every file look
+        // rewritten, so the test counted the whole directory.
+        let snapshot = || -> std::collections::BTreeMap<PathBuf, (u64, u128)> {
             std::fs::read_dir(&entry_dir)
                 .unwrap()
                 .filter_map(|e| e.ok())
                 .filter_map(|e| {
                     let meta = e.metadata().ok()?;
-                    Some((e.path(), (meta.len(), meta.modified().ok()?.elapsed().ok()?.as_nanos() as u64)))
+                    let mtime = meta
+                        .modified()
+                        .ok()?
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()?
+                        .as_nanos();
+                    Some((e.path(), (meta.len(), mtime)))
                 })
                 .collect()
         };
@@ -6229,9 +6737,9 @@ mod tests {
         let after = snapshot();
         let mut rewritten = 0u64;
         let mut names = Vec::new();
-        for (path, (len, _)) in &after {
+        for (path, (len, _mtime)) in &after {
             let changed = match before.get(path) {
-                Some((old_len, _)) => old_len != len || true,
+                Some(was) => was != &(*len, after[path].1),
                 None => true,
             };
             if changed {
@@ -6240,10 +6748,13 @@ mod tests {
             }
         }
         names.sort();
+        // A tenth of the index is the loosest bar that still means "the change,
+        // not the tree". A full rewrite is 100% of it and the old double write
+        // was 150%, so both fail here. The real figure is a few hundred bytes.
         assert!(
-            rewritten <= state_bytes,
-            "one change rewrote {rewritten} bytes of index against a {state_bytes} \
-             byte authoritative state. The manifest is being stored twice. Files \
+            rewritten * 10 < state_bytes,
+            "one change rewrote {rewritten} bytes against a {state_bytes} byte \
+             index. It is still paying for the size of the tree. Files \
              rewritten: {names:?}"
         );
     }
@@ -6278,8 +6789,11 @@ mod tests {
         engine.sync_once("bus").await.unwrap();
         let state_path = engine.state_path("bus");
         let manifest_path = engine.manifest_path("bus");
+        // What a RESTART would see: the snapshot with its log replayed. Reading
+        // state.json alone now answers a different question, because everything
+        // since the last snapshot is in the log.
         let committed: PersistedEntryState =
-            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+            engine.read_durable_state("bus").unwrap().unwrap();
         assert!(matches!(
             committed.manifest.get("retired.md"),
             Some(Entry::Tombstone(tombstone)) if tombstone.version == 2
@@ -6312,7 +6826,7 @@ mod tests {
 
         restarted.sync_once("bus").await.unwrap();
         let replayed: PersistedEntryState =
-            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+            restarted.read_durable_state("bus").unwrap().unwrap();
         assert_eq!(replayed.manifest, committed.manifest);
         assert_eq!(replayed.observed, committed.observed);
         // The stale projection this test deliberately left behind must be GONE,
@@ -6379,8 +6893,7 @@ mod tests {
             "the legacy projection was left behind for an older binary to read"
         );
 
-        let on_disk: PersistedEntryState =
-            serde_json::from_slice(&std::fs::read(engine.state_path("bus")).unwrap()).unwrap();
+        let on_disk: PersistedEntryState = engine.read_durable_state("bus").unwrap().unwrap();
         assert_eq!(on_disk.manifest, committed.manifest);
         assert_eq!(on_disk.observed, committed.observed);
         drop(engine);

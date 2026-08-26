@@ -78,6 +78,12 @@ pub struct ChangeBuffer {
     /// every peer, because nothing here is written to disk. A cursor that cannot
     /// be persisted cannot be restored wrongly.
     acked: HashMap<String, Cursor>,
+    /// How much of this buffer is on disk.
+    ///
+    /// Separate from `acked` because durability and replication are different
+    /// questions with different answers, and conflating them would let a peer's
+    /// acknowledgement decide what gets written.
+    durable: Cursor,
 }
 
 impl ChangeBuffer {
@@ -177,6 +183,21 @@ impl ChangeBuffer {
             }
         }
         if peers.is_empty() { 0 } else { low }
+    }
+
+    /// How much of this buffer is already on disk.
+    pub fn durable_cursor(&self) -> Cursor {
+        self.durable
+    }
+
+    /// Record that everything below `cursor` reached disk.
+    ///
+    /// Call this only AFTER the write, never before. Marking a change durable
+    /// that is not is how a change is dropped from the log and never written
+    /// again, and the filesystem cannot re-derive an entry the manifest no
+    /// longer disagrees with.
+    pub fn mark_durable(&mut self, cursor: Cursor) {
+        self.durable = self.durable.max(cursor);
     }
 
     /// Drop one path because it no longer exists in the manifest.
@@ -343,6 +364,32 @@ mod tests {
             buffer.since(0),
             vec!["a.txt"],
             "a.txt changed after the cursor and must survive"
+        );
+    }
+
+    #[test]
+    fn durability_starts_at_nothing_and_only_moves_forward() {
+        let mut buffer = ChangeBuffer::new();
+        assert_eq!(buffer.durable_cursor(), 0);
+        buffer.record("a.txt");
+        buffer.mark_durable(buffer.head());
+        assert_eq!(buffer.durable_cursor(), 1);
+        // An older cursor must never pull it back: that would re-log work
+        // already written, and worse, suggest unwritten work is written.
+        buffer.mark_durable(0);
+        assert_eq!(buffer.durable_cursor(), 1);
+    }
+
+    #[test]
+    fn a_peer_acknowledgement_does_not_make_a_change_durable() {
+        let mut buffer = ChangeBuffer::new();
+        buffer.record("a.txt");
+        buffer.acknowledge("hetz", buffer.head());
+        assert_eq!(
+            buffer.durable_cursor(),
+            0,
+            "a peer holding a change is not the same as this machine having \
+             written it down"
         );
     }
 

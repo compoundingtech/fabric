@@ -1096,3 +1096,207 @@ async fn a_change_and_a_delete_cross_a_peer_that_is_only_a_relay() -> Result<()>
     a.shutdown().await?;
     Ok(())
 }
+
+/// CASE THREE. A node that loses its unflushed log tail must converge, not sit
+/// quietly behind.
+///
+/// The log is deliberately not fsynced per record, because it is an INDEX and an
+/// index can be re-derived. The claim has two halves and this tests both on one
+/// node: for a LOCAL change the filesystem holds the truth, and for an ADOPTED
+/// change the peer does. So the whole log is taken away, which is worse than any
+/// real crash, and both kinds of change must come back.
+///
+/// It does NOT delete the files themselves. An earlier version did, trying to
+/// force the peer to be the only source, and it was measuring the wrong thing:
+/// a file missing from disk is a user's delete, and fabric propagated it
+/// correctly. The two peers agreed perfectly on the tombstones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_that_loses_its_log_converges_instead_of_staying_behind() -> Result<()> {
+    let _guard = FOLDER_SYNC_LOCK.lock().await;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let a_home = FabricHome::new(a_dir.path());
+    let b_home = FabricHome::new(b_dir.path());
+    let a_folder = a_dir.path().join("shared");
+    let b_folder = b_dir.path().join("shared");
+    std::fs::create_dir_all(&a_folder)?;
+    std::fs::create_dir_all(&b_folder)?;
+    write_sync(a_dir.path(), &a_folder, "bus");
+    write_sync(b_dir.path(), &b_folder, "bus");
+
+    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_b = FabricNode::start(b_home.clone()).await?;
+    trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
+    trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
+
+    // Converge on a body of files, so a snapshot really exists underneath.
+    for i in 0..40 {
+        std::fs::write(a_folder.join(format!("seed{i:02}.md")), format!("seed {i}"))?;
+    }
+    reload_sync(&a_home).await?;
+    assert!(
+        wait_for_file(&b_folder.join("seed39.md"), b"seed 39").await,
+        "the peers never converged, so there is no 'behind' to come back from"
+    );
+
+    // One change of each kind, both landing in A's log rather than its snapshot.
+    std::fs::write(a_folder.join("born-on-a.md"), b"local change")?;
+    std::fs::write(b_folder.join("born-on-b.md"), b"adopted change")?;
+    reload_sync(&a_home).await?;
+    reload_sync(&b_home).await?;
+    assert!(
+        wait_for_file(&b_folder.join("born-on-a.md"), b"local change").await,
+        "A's local change never reached B"
+    );
+    assert!(
+        wait_for_file(&a_folder.join("born-on-b.md"), b"adopted change").await,
+        "B's change never reached A"
+    );
+
+    // Kill A and take its WHOLE log, which is worse than losing a tail.
+    node_a.shutdown().await?;
+    let log = a_dir.path().join("sync").join("shared").join("log.jsonl");
+    // Control. If there was no log, nothing was taken away and everything below
+    // passes for the wrong reason.
+    assert!(
+        log.exists(),
+        "A had no log to lose, so this test removes nothing and proves nothing"
+    );
+    let lost = std::fs::read(&log)?;
+    assert!(!lost.is_empty(), "A's log was empty");
+    std::fs::remove_file(&log)?;
+
+    let node_a = FabricNode::start(a_home.clone()).await?;
+    trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
+
+    // Neither change may be lost, and neither may be resurrected as a delete.
+    assert!(
+        wait_for_file(&a_folder.join("born-on-a.md"), b"local change").await,
+        "A lost its own local change with the log. The filesystem was supposed \
+         to be the durable record for that half"
+    );
+    assert!(
+        wait_for_file(&a_folder.join("born-on-b.md"), b"adopted change").await,
+        "A lost a change it had adopted. The peer was supposed to be the durable \
+         record for that half"
+    );
+    assert!(
+        wait_for_file(&b_folder.join("born-on-a.md"), b"local change").await,
+        "A's lost log took the file off B as well, which is data loss, not a \
+         catch-up"
+    );
+
+    // And they must actually agree, not merely both hold the files.
+    let mut agreed = (String::new(), String::new());
+    for _ in 0..60 {
+        let a_digest = digest_of(&a_home).await?;
+        let b_digest = digest_of(&b_home).await?;
+        agreed = (a_digest.clone(), b_digest.clone());
+        if a_digest == b_digest && !a_digest.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(
+        agreed.0, agreed.1,
+        "the two peers never reached the same lattice point after A lost its log"
+    );
+
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
+/// A REPAIR TAKES TWO PASSES AND ONLY ONE IS SCHEDULED.
+///
+/// This is the state that needs the second one. A is rolled back so it is
+/// missing an entry AND the file, consistently, so its own scan sees nothing
+/// wrong and records no delete. B still holds a cursor saying A has everything,
+/// so B sends an empty delta. Nothing on either side has changed, so nothing
+/// triggers another pass.
+///
+/// The first pass discovers the disagreement and both sides forget their
+/// cursors, which is the right repair and useless until somebody reconciles
+/// again. Without a follow-up, A sits quietly wrong until the five minute safety
+/// net, and quiet is the failure this design exists to prevent.
+///
+/// The rollback is artificial. The state it produces is not: it is a crash
+/// between adopting an entry and materialising its content.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_holding_a_stale_cursor_still_repairs_a_node_that_fell_behind() -> Result<()> {
+    let _guard = FOLDER_SYNC_LOCK.lock().await;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let a_home = FabricHome::new(a_dir.path());
+    let b_home = FabricHome::new(b_dir.path());
+    let a_folder = a_dir.path().join("shared");
+    let b_folder = b_dir.path().join("shared");
+    std::fs::create_dir_all(&a_folder)?;
+    std::fs::create_dir_all(&b_folder)?;
+    write_sync(a_dir.path(), &a_folder, "bus");
+    write_sync(b_dir.path(), &b_folder, "bus");
+
+    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_b = FabricNode::start(b_home.clone()).await?;
+    trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
+    trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
+
+    for i in 0..40 {
+        std::fs::write(a_folder.join(format!("seed{i:02}.md")), format!("seed {i}"))?;
+    }
+    reload_sync(&a_home).await?;
+    assert!(
+        wait_for_file(&b_folder.join("seed39.md"), b"seed 39").await,
+        "the peers never converged"
+    );
+    // Let A snapshot this state, which is the point it will be rolled back to.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let a_state = a_dir.path().join("sync").join("shared").join("state.json");
+    let rollback = std::fs::read(&a_state)?;
+    assert!(!rollback.is_empty(), "A never wrote a snapshot to roll back to");
+
+    // Now something B owns, which A adopts AFTER that snapshot.
+    std::fs::write(b_folder.join("only-on-b.md"), b"B owns this")?;
+    reload_sync(&b_home).await?;
+    assert!(
+        wait_for_file(&a_folder.join("only-on-b.md"), b"B owns this").await,
+        "B's file never reached A, so there is nothing for A to lose"
+    );
+    // B must have acknowledged A, or its cursor is not stale and the case does
+    // not arise.
+    let mut acknowledged = false;
+    for _ in 0..40 {
+        if digest_of(&a_home).await? == digest_of(&b_home).await? {
+            acknowledged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(acknowledged, "the peers never agreed, so B's cursor is not stale");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Roll A back to before it ever saw the file, consistently: old snapshot, no
+    // log, no file. A's own scan will find nothing missing and record no delete.
+    node_a.shutdown().await?;
+    std::fs::write(&a_state, &rollback)?;
+    let log = a_dir.path().join("sync").join("shared").join("log.jsonl");
+    let _ = std::fs::remove_file(&log);
+    std::fs::remove_file(a_folder.join("only-on-b.md"))?;
+
+    let node_a = FabricNode::start(a_home.clone()).await?;
+    trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
+
+    assert!(
+        wait_for_file(&a_folder.join("only-on-b.md"), b"B owns this").await,
+        "A fell behind and B's stale cursor kept it there. The repair was applied \
+         to the cursors and nothing ever used it"
+    );
+    assert!(
+        b_folder.join("only-on-b.md").exists(),
+        "B's own file went missing while repairing A"
+    );
+
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
