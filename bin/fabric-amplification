@@ -31,7 +31,12 @@ import subprocess
 import sys
 import time
 
-BOOKKEEPING = ("state.json", "manifest.json")
+# Every file fabric writes to keep its own index. MISSING ONE MAKES THE RESULT
+# LOOK BETTER THAN IT IS, which is the direction a measurement must never be
+# wrong in. `log.jsonl` is where a change goes now; `manifest.json` is a legacy
+# projection no longer written, kept here so an older daemon still measures
+# honestly.
+BOOKKEEPING = ("state.json", "manifest.json", "log.jsonl")
 
 
 def sanitize(name):
@@ -156,12 +161,15 @@ def main():
         return 3
 
     folders = {e["name"]: e["folder"] for e in entries}
-    files = []
-    for name in folders:
-        for leaf in BOOKKEEPING:
-            path = os.path.join(args.home, "sync", sanitize(name), leaf)
-            if os.path.exists(path):
-                files.append(path)
+    # EVERY candidate, whether or not it exists yet. A file that appears during
+    # the window is exactly the interesting case: an append log is created on the
+    # first change, and a list built from what exists at t=0 would never watch it
+    # and would report a write volume of zero for it.
+    files = [
+        os.path.join(args.home, "sync", sanitize(name), leaf)
+        for name in folders
+        for leaf in BOOKKEEPING
+    ]
 
     shipped_before = sum(e.get("reconcile_wire_bytes", 0) for e in entries)
     if not any("reconcile_wire_bytes" in e for e in entries):
@@ -170,19 +178,38 @@ def main():
         return 3
 
     trees_before = {name: tree_snapshot(folder) for name, folder in folders.items()}
-    last = {p: os.stat(p).st_mtime_ns for p in files}
+    def stat_of(path):
+        try:
+            st = os.stat(path)
+            # The INODE is what separates an append from a rewrite. Fabric
+            # replaces a snapshot by writing a temp file and renaming it, so the
+            # replacement is a different inode even though the path is the same.
+            # Without this, a snapshot that happened to grow by a few bytes was
+            # counted as a few bytes appended instead of a whole file rewritten,
+            # and the instrument reported 699 bytes where the truth was 26 MB.
+            return (st.st_ino, st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    last = {p: stat_of(p) for p in files}
     written = 0
 
     start = time.time()
     while time.time() - start < args.seconds:
         for path in files:
-            try:
-                st = os.stat(path)
-            except OSError:
+            now = stat_of(path)
+            if now is None or now == last[path]:
                 continue
-            if st.st_mtime_ns != last[path]:
-                written += st.st_size
-                last[path] = st.st_mtime_ns
+            inode, _mtime, size = now
+            was = last[path]
+            # Same inode and larger: bytes were APPENDED, so only the growth was
+            # written. Anything else is a new file at that path, which costs its
+            # full size.
+            if was is not None and was[0] == inode and size > was[2]:
+                written += size - was[2]
+            else:
+                written += size
+            last[path] = now
         time.sleep(0.5)
     window = time.time() - start
 

@@ -698,6 +698,22 @@ impl<T: SyncTransport> SyncEngine<T> {
             // wait forever for changes it already missed. See
             // `a_node_restored_from_disk_offers_every_path_to_a_peer_at_zero`.
             node.adopt(&state.manifest);
+            // Everything just loaded is ALREADY on disk, so it is already
+            // durable. Without this the first persist after every restart
+            // appends the whole tree to the log, because the durable cursor
+            // still says nothing has been written. On the production bus entry
+            // that was a 13 MB log written by a daemon that had done nothing.
+            //
+            // This is durability only. The peer cursors stay at zero, so a
+            // restart still offers every peer full state, which is the safe
+            // direction and a different question.
+            let head = node.changes().head();
+            node.changes_mut().mark_durable(head);
+            // A projection left by an older build is stale from this moment on.
+            // Waiting for the first snapshot to remove it leaves a file that
+            // still parses and still looks authoritative, holding Present
+            // entries for paths tombstoned since.
+            self.remove_manifest_projection(&cfg.name)?;
             // The cache is absent in a file written before it existed. An empty
             // one is correct, not a fault: the next scan re-hashes once and
             // warms it.
@@ -4734,6 +4750,63 @@ mod tests {
         assert!(
             on_disk.manifest.get("b.md").is_some(),
             "the real change must be on disk, not merely in memory"
+        );
+    }
+
+    /// A RESTART MUST NOT WRITE THE WHOLE TREE INTO THE LOG.
+    ///
+    /// Loading seeds the change buffer with every path, because a restarted node
+    /// must offer every peer full state. Durability is a different question:
+    /// everything just loaded is already on disk. If the durable cursor is not
+    /// moved with it, the first persist after every restart appends the entire
+    /// manifest to the log, and a daemon that has done nothing writes more than
+    /// a full snapshot would have.
+    ///
+    /// Found by measuring a production-scale fixture, where restarting produced
+    /// a 13 MB log before anything had changed.
+    #[tokio::test]
+    async fn a_restart_does_not_append_the_whole_tree_to_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        for i in 0..400 {
+            std::fs::write(root.join(format!("f{i:03}.md")), format!("body {i}")).unwrap();
+        }
+        write_bus_sync(dir.path(), &root);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+        let state_bytes = std::fs::metadata(engine.state_path("bus")).unwrap().len();
+        drop(engine);
+
+        // A restart: a fresh engine over the same home.
+        let restarted = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(root.join("f000.md"), b"one small change").unwrap();
+        restarted.sync_once("bus").await.unwrap();
+
+        let log = std::fs::metadata(restarted.log_path("bus"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert!(
+            log * 10 < state_bytes,
+            "a restart plus one change wrote a {log} byte log against a \
+             {state_bytes} byte snapshot. The whole tree went into the log \
+             because the durable cursor was not seeded"
         );
     }
 
