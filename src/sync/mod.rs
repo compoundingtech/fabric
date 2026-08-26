@@ -12,8 +12,11 @@
 //! - [`config`]: the declarative `syncs.toml` surface (what tools/humans edit).
 //! - [`manifest`]: the pure reconciliation core (versioned per-file state, merge,
 //!   diff) — deterministic and heavily property-tested, no I/O.
+//! - [`delta`]: what changed here and which peer has seen it, so a pass can ship
+//!   the changed paths instead of the whole manifest.
 
 pub mod config;
+pub mod delta;
 pub mod engine;
 pub mod glob;
 pub mod manifest;
@@ -21,6 +24,7 @@ pub mod node;
 pub mod wire;
 
 pub use config::{PolicyRules, SyncBook, SyncEntry, SyncPeers, SyncPolicy};
+pub use delta::{ChangeBuffer, Cursor};
 pub use engine::{PeerRef, SyncEngine, SyncStatus, SyncTransport};
 pub use manifest::{FileMeta, Manifest, ManifestDiff};
 pub use node::{Reconciled, SyncNode, content_hash};

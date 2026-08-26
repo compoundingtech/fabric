@@ -24,6 +24,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use super::config::PolicyRules;
+use super::delta::ChangeBuffer;
 use super::manifest::{Author, ContentHash, Entry, FileMeta, Manifest, Tombstone};
 
 /// BLAKE3 content hash of `bytes` — the transfer identity for a file's content.
@@ -39,6 +40,10 @@ pub struct SyncNode {
     author: Author,
     manifest: Manifest,
     content: HashMap<ContentHash, Vec<u8>>,
+    /// Which paths changed here, and which peer has seen them. Nothing reads it
+    /// on the wire yet; it is filled first so the bookkeeping can be proven
+    /// correct before anything depends on it.
+    changes: ChangeBuffer,
 }
 
 /// What a single [`SyncNode::reconcile`] moved. All-zero means the two nodes were
@@ -92,6 +97,7 @@ impl SyncNode {
             author,
             manifest: Manifest::new(),
             content: HashMap::new(),
+            changes: ChangeBuffer::new(),
         }
     }
 
@@ -101,6 +107,16 @@ impl SyncNode {
 
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    /// The changed-path bookkeeping for this node.
+    pub fn changes(&self) -> &ChangeBuffer {
+        &self.changes
+    }
+
+    /// Mutable access, for the engine to seed on load and forget on acknowledge.
+    pub fn changes_mut(&mut self) -> &mut ChangeBuffer {
+        &mut self.changes
     }
 
     pub fn has_content(&self, hash: &ContentHash) -> bool {
@@ -159,6 +175,7 @@ impl SyncNode {
         }
         let next_version = self.manifest.get(path).map(Entry::version).unwrap_or(0) + 1;
         self.content.insert(hash, bytes.to_vec());
+        self.changes.record(path);
         self.manifest.insert(
             path.to_string(),
             Entry::Present(FileMeta {
@@ -192,6 +209,7 @@ impl SyncNode {
             return false;
         }
         let next_version = entry.version() + 1;
+        self.changes.record(path);
         self.manifest.insert(
             path.to_string(),
             Entry::Tombstone(Tombstone {
@@ -284,6 +302,10 @@ impl SyncNode {
         }
         for path in &swept {
             self.manifest.remove(path);
+            // A swept path has no entry left to send. It only reaches a sweep
+            // after every peer acknowledged the tombstone, so dropping its slot
+            // strands nobody.
+            self.changes.forget_path(path);
         }
         // Rebuilt rather than retained, so the map tracks exactly the tombstones
         // still waiting for an ack and never grows into a second manifest.
@@ -325,6 +347,7 @@ impl SyncNode {
         let diff = self.manifest.diff_from(remote);
         let adopted = diff.adopt.len();
         for entry in diff.adopt {
+            self.changes.record(&entry.path);
             self.manifest.insert(entry.path, entry.entry);
         }
         adopted
@@ -374,6 +397,7 @@ impl SyncNode {
                 }
                 self.content.insert(meta.hash, bytes.clone());
             }
+            self.changes.record(&adopt.path);
             self.manifest.insert(adopt.path.clone(), adopt.entry);
         }
 
@@ -386,6 +410,7 @@ impl SyncNode {
                 }
                 other.content.insert(meta.hash, bytes.clone());
             }
+            other.changes.record(&adopt.path);
             other.manifest.insert(adopt.path.clone(), adopt.entry);
         }
 
@@ -667,6 +692,96 @@ mod tests {
         assert!(
             expired_since.is_empty(),
             "a swept path must not keep a stamp; the map tracks only the backlog"
+        );
+    }
+
+    #[test]
+    fn a_local_write_records_exactly_that_path() {
+        let mut node = node(1);
+        node.local_write("a.txt", b"hello", 0, 0);
+        assert_eq!(node.changes().since(0), vec!["a.txt"]);
+    }
+
+    /// The echo-safe early return must not record. A node that recorded on every
+    /// re-scan would offer every peer every path forever and the delta would
+    /// cost more than the manifest.
+    #[test]
+    fn rewriting_identical_content_records_nothing() {
+        let mut node = node(1);
+        node.local_write("a.txt", b"hello", 0, 0);
+        let cursor = node.changes().head();
+        assert!(!node.local_write("a.txt", b"hello", 0, 0), "echo-safe");
+        assert!(
+            node.changes().since(cursor).is_empty(),
+            "an unchanged rewrite must not enter the buffer"
+        );
+    }
+
+    #[test]
+    fn a_local_delete_records_the_tombstoned_path() {
+        let mut node = node(1);
+        node.local_write("a.txt", b"hello", 0, 0);
+        let cursor = node.changes().head();
+        assert!(node.local_remove("a.txt", bus(), 100));
+        assert_eq!(node.changes().since(cursor), vec!["a.txt"]);
+    }
+
+    #[test]
+    fn adopting_from_a_peer_records_what_was_adopted() {
+        let mut source = node(1);
+        source.local_write("a.txt", b"hello", 0, 0);
+        source.local_write("b.txt", b"world", 0, 0);
+
+        let mut target = node(2);
+        let cursor = target.changes().head();
+        assert_eq!(target.adopt(source.manifest()), 2);
+        let mut recorded = target.changes().since(cursor);
+        recorded.sort_unstable();
+        assert_eq!(recorded, vec!["a.txt", "b.txt"]);
+    }
+
+    /// THE EQUIVALENCE THE DELTA PATH RESTS ON. Sending only the changed paths
+    /// must land a peer on the SAME lattice point as sending the whole manifest.
+    ///
+    /// The digest is the oracle. If these two ever differ, a delta pass and a
+    /// full pass disagree about the state of the world, and the disagreement is
+    /// silent because both sides report a healthy pass.
+    #[test]
+    fn shipping_only_the_changed_paths_reaches_the_same_digest_as_shipping_everything() {
+        let mut source = node(1);
+        source.local_write("x.txt", b"one", 0, 0);
+        source.local_write("y.txt", b"two", 0, 0);
+        source.local_write("z.txt", b"three", 0, 0);
+
+        // A peer that has already caught up on all three.
+        let mut caught_up = node(2);
+        caught_up.adopt(source.manifest());
+        let cursor = source.changes().head();
+
+        // Now the source changes two of them and deletes the third.
+        source.local_write("x.txt", b"one changed", 1, 0);
+        source.local_write("y.txt", b"two changed", 1, 0);
+        source.local_remove("z.txt", bus(), 100);
+
+        let changed = source.changes().since(cursor);
+        assert_eq!(changed.len(), 3, "three paths moved");
+
+        // One peer takes only the changed paths. Another takes everything.
+        let mut by_delta = caught_up.clone();
+        by_delta.adopt(&source.manifest().subset(changed));
+
+        let mut by_full = caught_up.clone();
+        by_full.adopt(source.manifest());
+
+        assert_eq!(
+            by_delta.manifest().digest(),
+            by_full.manifest().digest(),
+            "a delta pass and a full pass reached different lattice points"
+        );
+        assert_eq!(
+            by_delta.manifest().digest(),
+            source.manifest().digest(),
+            "neither peer actually caught up with the source"
         );
     }
 

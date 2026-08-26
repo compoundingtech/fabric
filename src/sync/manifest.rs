@@ -311,6 +311,26 @@ impl Manifest {
     ///
     /// This is commutative, associative, and idempotent — the semilattice laws
     /// that give convergence and echo-freedom.
+    /// The entries for `paths` that this manifest holds, as a manifest.
+    ///
+    /// This is what a delta pass sends: the CURRENT entry for each changed path,
+    /// looked up now rather than remembered from when the change happened. Only
+    /// the winning entry for a path can matter, so an older one would lose to
+    /// this anyway.
+    ///
+    /// A path this manifest no longer holds is skipped rather than reported. A
+    /// swept tombstone is the case, and a peer that never needed it is not owed
+    /// an empty slot.
+    pub fn subset<'a>(&self, paths: impl IntoIterator<Item = &'a str>) -> Manifest {
+        let mut out = Manifest::new();
+        for path in paths {
+            if let Some(entry) = self.entries.get(path) {
+                out.entries.insert(path.to_string(), *entry);
+            }
+        }
+        out
+    }
+
     pub fn merge(&self, other: &Manifest) -> Manifest {
         let mut out = self.clone();
         out.merge_in_place(other);
