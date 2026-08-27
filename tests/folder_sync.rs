@@ -1067,9 +1067,17 @@ async fn a_change_and_a_delete_cross_a_peer_that_is_only_a_relay() -> Result<()>
     );
 
     // Drive BOTH ends at once, so the middle peer is serving one side while the
-    // other is changing it. That is the state where a naive verdict compares two
-    // different moments and calls a healthy exchange incomplete. It reproduced
-    // only on CI until this loop existed.
+    // other is changing it.
+    //
+    // THIS BURST IS NOT THE GUARD for that defect and must not be mistaken for
+    // one. It still passes on a fast machine with the fix reverted, because the
+    // overlap it needs happens by luck of timing. The guards are
+    // `a_responder_that_changes_mid_exchange_does_not_call_it_incomplete` and
+    // its initiator twin in `src/sync/wire.rs`, which force the overlap with a
+    // hand-driven peer and fail deterministically in a hundredth of a second.
+    //
+    // What this burst adds is the real topology under real load, which is worth
+    // having for everything else it exercises.
     for round in 0..6 {
         std::fs::write(
             folders[0].join(format!("a-burst{round}.md")),

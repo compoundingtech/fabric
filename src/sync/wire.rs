@@ -503,6 +503,177 @@ mod tests {
         super::super::manifest::Author([n; 32])
     }
 
+    /// A RESPONDER THAT CHANGES MID-EXCHANGE MUST NOT CALL THE EXCHANGE
+    /// INCOMPLETE.
+    ///
+    /// This is the defect CI found and the three-daemon relay test could not
+    /// reproduce. That test depends on two exchanges overlapping by luck of
+    /// timing, and on a fast machine they do not, so it passed with the fix
+    /// reverted. A silent failure guarded by a test that cannot fail is not
+    /// guarded at all.
+    ///
+    /// So the overlap is FORCED here rather than hoped for. The responder blocks
+    /// reading the initiator's content bundle, and that window belongs entirely
+    /// to a hand-driven client: it reads the reply, changes the responder's node
+    /// as another peer would, and only then sends its push and its landing
+    /// digest.
+    ///
+    /// The initiator lands exactly where the reply said the responder was, which
+    /// is what a complete exchange looks like. Judging that against the
+    /// responder's CURRENT state calls it incomplete and throws away a good
+    /// cursor. Judging it against `reply.digest`, the true counterpart, does not.
+    #[tokio::test]
+    async fn a_responder_that_changes_mid_exchange_does_not_call_it_incomplete() {
+        let server_node = Arc::new(Mutex::new(SyncNode::new(author(2))));
+        server_node
+            .lock()
+            .await
+            .local_write("shared.md", b"same on both", 0, 0);
+        let converged = server_node.lock().await.manifest().clone();
+        let client_digest = converged.digest();
+
+        let (mut client_end, server_end) = tokio::io::duplex(1 << 20);
+        let for_server = server_node.clone();
+        let server = tokio::spawn(async move {
+            run_server(server_end, "peer-under-test", move |_| async move {
+                Ok(Some((for_server, ())))
+            })
+            .await
+        });
+
+        // Hello. The initiator stands exactly where the responder stands, so a
+        // correct exchange has nothing to carry and nothing to repair.
+        let hello = HelloHeader {
+            name: "cat".to_string(),
+            manifest: converged.clone(),
+            wanted: Vec::new(),
+            digest: client_digest.clone(),
+            is_delta: false,
+        };
+        write_len_bytes(&mut client_end, &serde_json::to_vec(&hello).unwrap())
+            .await
+            .unwrap();
+        client_end.flush().await.unwrap();
+
+        let reply_frame = read_len_bytes(&mut client_end, MAX_JSON_FRAME).await.unwrap();
+        let reply: ReplyHeader = serde_json::from_slice(&reply_frame).unwrap();
+        assert!(!reply.digest.is_empty(), "the responder reported no digest");
+        // Consume the responder's content bundle. Converged, so it is empty.
+        let blobs = read_u32(&mut client_end).await.unwrap();
+        assert_eq!(blobs, 0, "the fixture was not converged");
+
+        // THE WINDOW. The responder is now blocked reading our push, holding no
+        // lock. Move it, exactly as an exchange with a third peer would.
+        let moved_to = {
+            let mut node = server_node.lock().await;
+            node.local_write("arrived-meanwhile.md", b"from another peer", 0, 0);
+            node.manifest().digest()
+        };
+        assert_ne!(
+            moved_to, reply.digest,
+            "the responder did not actually move, so this test proves nothing"
+        );
+
+        // Our push is empty, and we landed exactly where the reply said the
+        // responder was.
+        write_u32(&mut client_end, 0).await.unwrap();
+        write_len_bytes(&mut client_end, reply.digest.as_bytes())
+            .await
+            .unwrap();
+        client_end.flush().await.unwrap();
+        let _ack = read_u32(&mut client_end).await.unwrap();
+
+        let (_, stats, ()) = server.await.unwrap().unwrap();
+        assert_eq!(
+            stats.fallbacks, 0,
+            "the responder called a complete exchange incomplete because its own \
+             state moved while it was serving. That forgets a good cursor and \
+             costs a full manifest on the next pass, on exactly the three node \
+             shape this runs on"
+        );
+        assert_eq!(
+            server_node
+                .lock()
+                .await
+                .changes()
+                .cursor_for("peer-under-test"),
+            Some(1),
+            "the cursor was not advanced to the head as of the reply. Anything \
+             recorded after it belongs to a change this exchange did not carry"
+        );
+    }
+
+    /// AN INITIATOR THAT CHANGES MID-EXCHANGE MUST NOT CALL IT INCOMPLETE
+    /// EITHER.
+    ///
+    /// The same defect from the other side. An inbound reconcile from a third
+    /// peer can move the initiator between its Hello and its adopt, and then its
+    /// own digest and the reply describe different moments. Disagreeing proves
+    /// nothing, so no verdict may be reached.
+    ///
+    /// Forced the same way: a hand-driven responder reads the Hello, changes the
+    /// initiator's node, and only then answers.
+    #[tokio::test]
+    async fn an_initiator_that_changes_mid_exchange_does_not_call_it_incomplete() {
+        let client_node = Arc::new(Mutex::new(SyncNode::new(author(1))));
+        client_node
+            .lock()
+            .await
+            .local_write("shared.md", b"same on both", 0, 0);
+        let converged = client_node.lock().await.manifest().clone();
+
+        let (client_end, mut server_end) = tokio::io::duplex(1 << 20);
+        let for_client = client_node.clone();
+        let client = tokio::spawn(async move {
+            run_client(client_end, for_client, "cat", "peer-under-test").await
+        });
+
+        // Read the Hello, then move the initiator before answering.
+        let hello_frame = read_len_bytes(&mut server_end, MAX_JSON_FRAME).await.unwrap();
+        let hello: HelloHeader = serde_json::from_slice(&hello_frame).unwrap();
+        let moved_to = {
+            let mut node = client_node.lock().await;
+            node.local_write("arrived-meanwhile.md", b"from another peer", 0, 0);
+            node.manifest().digest()
+        };
+        assert_ne!(
+            moved_to, hello.digest,
+            "the initiator did not actually move, so this test proves nothing"
+        );
+
+        // Answer as a converged peer would: nothing to send, and our digest is
+        // where the exchange says both sides stood.
+        let reply = ReplyHeader {
+            manifest: Manifest::new(),
+            wanted: Vec::new(),
+            digest: converged.digest(),
+            is_delta: true,
+        };
+        write_len_bytes(&mut server_end, &serde_json::to_vec(&reply).unwrap())
+            .await
+            .unwrap();
+        write_u32(&mut server_end, 0).await.unwrap();
+        server_end.flush().await.unwrap();
+
+        let pushed = read_u32(&mut server_end).await.unwrap();
+        for _ in 0..pushed {
+            let mut hash = [0u8; 32];
+            server_end.read_exact(&mut hash).await.unwrap();
+            let _ = read_len_bytes(&mut server_end, MAX_BLOB).await.unwrap();
+        }
+        let _landed = read_len_bytes(&mut server_end, MAX_JSON_FRAME).await.unwrap();
+        write_u32(&mut server_end, 1).await.unwrap();
+        server_end.flush().await.unwrap();
+
+        let stats = client.await.unwrap().unwrap();
+        assert_eq!(
+            stats.fallbacks, 0,
+            "the initiator called a complete exchange incomplete because its own \
+             state moved while it was mid-exchange. Its digest and the reply are \
+             describing different moments, and disagreeing proves nothing"
+        );
+    }
+
     /// The wire session must reach the exact same folder state as the pure
     /// reference reconcile — the swappable-backend conformance guarantee.
     #[tokio::test]
