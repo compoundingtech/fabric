@@ -113,29 +113,43 @@ async fn reload_sync(home: &FabricHome) -> Result<()> {
 }
 
 /// Read both manifest digests for the `shared` entry.
-/// Reconciles that found a payload incomplete and fell back to full state.
-async fn fallbacks_of(home: &FabricHome) -> Result<u64> {
-    match send_control(home, ControlRequest::SyncStatus).await? {
-        fabric::control::ControlResponse::SyncStatus { entries } => Ok(entries
-            .into_iter()
-            .find(|e| e.name == "shared")
-            .map(|e| e.delta_fallbacks)
-            .unwrap_or(0)),
-        other => panic!("expected SyncStatus, got {other:?}"),
+/// Ask a daemon for its sync status, waiting for its control socket.
+///
+/// `FabricNode::start` returns before the socket is necessarily accepting, so a
+/// single attempt fails with "fabric daemon is not running" about one run in
+/// three right after a restart. `reload_sync` already retries; these read the
+/// same socket and must be equally patient.
+async fn sync_status_of(home: &FabricHome) -> Result<Vec<fabric::control::SyncEntryStatus>> {
+    let mut last = None;
+    for _ in 0..50 {
+        match send_control(home, ControlRequest::SyncStatus).await {
+            Ok(fabric::control::ControlResponse::SyncStatus { entries }) => return Ok(entries),
+            Ok(other) => panic!("expected SyncStatus, got {other:?}"),
+            Err(error) => last = Some(error),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("no SyncStatus after 50 attempts")))
 }
 
+/// Reconciles that found a payload incomplete and fell back to full state.
+async fn fallbacks_of(home: &FabricHome) -> Result<u64> {
+    Ok(sync_status_of(home)
+        .await?
+        .into_iter()
+        .find(|e| e.name == "shared")
+        .map(|e| e.delta_fallbacks)
+        .unwrap_or(0))
+}
+
+
 async fn digest_of(home: &FabricHome) -> Result<String> {
-    match send_control(home, ControlRequest::SyncStatus).await? {
-        fabric::control::ControlResponse::SyncStatus { entries } => {
-            let entry = entries
-                .into_iter()
-                .find(|e| e.name == "shared")
-                .expect("the shared entry must exist");
-            Ok(entry.digest)
-        }
-        other => panic!("expected SyncStatus, got {other:?}"),
-    }
+    Ok(sync_status_of(home)
+        .await?
+        .into_iter()
+        .find(|e| e.name == "shared")
+        .expect("the shared entry must exist")
+        .digest)
 }
 
 /// Two peers that hold the same files must report the same digest.

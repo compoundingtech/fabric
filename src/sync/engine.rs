@@ -6574,9 +6574,13 @@ mod tests {
             .iter()
             .map(|entry| entry.work.persist_calls.load(Ordering::Relaxed))
             .sum::<usize>();
+        let fallbacks: u64 = entries
+            .iter()
+            .map(|entry| entry.work.delta_fallbacks.load(Ordering::Relaxed))
+            .sum();
         eprintln!(
             "bounded 3-node/2,000-file stress: {reconciles} reconciles, {scans} scans, \
-             {persists} persists in {elapsed:?}"
+             {persists} persists, {fallbacks} fallbacks in {elapsed:?}"
         );
         // Bounded as RATES, not as fixed counts.
         //
@@ -6629,7 +6633,32 @@ mod tests {
         // the wrong place.
         const ALLOWANCE_DEN: u128 = 36;
         const SCANS_ALLOWED: u128 = 112;
-        const PERSISTS_ALLOWED: u128 = 76;
+        // RE-DERIVED after the delta and append-log work, and this is a
+        // LOOSENING, so it needs a reason rather than a nudge.
+        //
+        // 76/36 is 2.111. Linux CI produced 2.1125 and went red on a run whose
+        // behaviour was fine, which is the third time this bound has failed a
+        // healthy run.
+        //
+        // The system underneath it changed. A pass used to rewrite the whole
+        // index and now appends a few hundred bytes, so far more passes fit the
+        // same fixed burst: this test's own comment records 30 to 34 reconciles
+        // locally and 54 on CI, and it now does 58 to 86. The ratio moved with
+        // that mix. Measured after the change, fallbacks zero on every run:
+        //
+        //   macOS      1.91 to 2.03 persists per reconcile, over six runs
+        //   Linux CI   2.11
+        //
+        // 95/36 is 2.64, which is a quarter above the highest either platform
+        // has produced. It still catches what this bound is for: a feedback loop
+        // persisting on every scan is orders of magnitude away, not a quarter.
+        //
+        // It is also a WEAKER proxy than it used to be. This ratio mattered when
+        // a persist wrote 26 MB; it now writes about 500 bytes, and write cost is
+        // measured directly by `one_change_writes_the_change_not_the_tree` and by
+        // `bin/fabric-amplification`. What survives here is the loop detector,
+        // and that is what the margin is chosen to protect.
+        const PERSISTS_ALLOWED: u128 = 95;
         assert!(
             (reconciles as u128) * 1_000 <= elapsed_millis * RUNAWAY_RECONCILES_PER_SEC,
             "runaway reconcile rate: {reconciles} reconciles in {elapsed:?}, which is \
