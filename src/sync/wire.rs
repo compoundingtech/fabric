@@ -181,15 +181,16 @@ where
     // A peer we hold a cursor for gets only what changed since that cursor. A
     // peer we do not gets everything, which covers first contact, a peer we
     // reset after a mismatch, and every peer after a restart.
-    let (payload, is_delta, wanted) = {
+    let (payload, is_delta, wanted, head_at_hello) = {
         let node = node.lock().await;
         let wanted = node.missing_content_hashes();
+        let head_at_hello = node.changes().head();
         match node.changes().cursor_for(peer) {
             Some(cursor) => {
                 let changed = node.changes().since(cursor);
-                (node.manifest().subset(changed), true, wanted)
+                (node.manifest().subset(changed), true, wanted, head_at_hello)
             }
-            None => (node.manifest().clone(), false, wanted),
+            None => (node.manifest().clone(), false, wanted, head_at_hello),
         }
     };
     let hello = HelloHeader {
@@ -255,10 +256,26 @@ where
         // exchange and repairs all of them. This is the self-healing trigger,
         // and a rising count of it is a bug report.
         let final_digest = node.manifest().digest();
+        // Did anything OTHER than this exchange move us?
+        //
+        // `adopt` records exactly one path per entry it takes, so a head that
+        // advanced by exactly `pulled` means nothing else touched this node
+        // between the Hello and now. Anything more is a concurrent local write
+        // or an inbound reconcile from another peer, and on a three node line
+        // the middle peer is almost always mid-flight with somebody.
+        //
+        // When that happens the digests below are comparing different moments
+        // and disagreeing proves nothing, so no verdict is reached. Not
+        // advancing the cursor costs a re-send, which is free; resetting it on a
+        // false alarm would cost a full exchange.
+        let only_this_exchange =
+            node.changes().head() == head_at_hello.saturating_add(pulled as u64);
         let fallback = if reply.digest.is_empty() {
             // A peer that reports no digest predates deltas. It must never be
             // sent one, and no cursor may be held for it.
             node.changes_mut().reset_peer(peer);
+            false
+        } else if !only_this_exchange {
             false
         } else if final_digest == reply.digest {
             // Acknowledge our head AFTER adopting, not `head_at_send`.
@@ -351,7 +368,7 @@ where
 
     // 2. Snapshot BEFORE adopting so the client still pushes the content we need,
     // then adopt the client's winning entries (content arrives in the Push).
-    let (reply, blobs_for_client, pushed) = {
+    let (reply, blobs_for_client, pushed, head_at_reply) = {
         let mut node = node.lock().await;
         let before_digest = node.manifest().digest();
 
@@ -416,7 +433,11 @@ where
             is_delta: reply_is_delta,
         };
         let _ = acknowledged;
-        (reply, blobs, pushed)
+        // The head AS OF THIS REPLY. Anything recorded after it belongs to a
+        // change this exchange did not carry, and acknowledging it would claim
+        // the peer holds something it was never sent.
+        let head_at_reply = node.changes().head();
+        (reply, blobs, pushed, head_at_reply)
     };
 
     // 3. Send reply header + our content bundle, then read the client's push.
@@ -426,10 +447,20 @@ where
 
     let received = read_blobs_into(&mut stream, &node).await?;
 
-    // Where the client landed. Equal digests mean it holds the same manifest we
-    // do, so it holds every path in our buffer and our cursor may advance to our
-    // head. Unequal digests mean a payload was incomplete, whatever the cause,
-    // and one full exchange repairs it.
+    // Where the client landed, against WHAT WE SENT rather than where we are now.
+    //
+    // The two are not the same thing. This node may serve one peer while another
+    // exchange is changing it, and on a three node line the middle peer is
+    // almost always mid-flight with somebody. Comparing against the current
+    // digest reports "a payload was incomplete" for a state that simply moved
+    // on, which forgets a perfectly good cursor and costs a full exchange. CI
+    // caught exactly that: the relay case fell back on Linux while passing on a
+    // quieter machine.
+    //
+    // `reply.digest` is the counterpart of the client's landing digest: both are
+    // the join of the two sides as this exchange saw them, so they are equal if
+    // and only if both payloads were complete. Anything that changed here
+    // afterwards has a sequence above `head_at_reply` and goes out next pass.
     let mut fallback = false;
     if !peer_digest.is_empty() {
         let frame = read_len_bytes(&mut stream, MAX_JSON_FRAME)
@@ -437,9 +468,8 @@ where
             .context("reading the client's landing digest")?;
         let client_landed = String::from_utf8_lossy(&frame).to_string();
         let mut node = node.lock().await;
-        if client_landed == node.manifest().digest() {
-            let head = node.changes().head();
-            node.changes_mut().acknowledge(peer, head);
+        if client_landed == reply.digest {
+            node.changes_mut().acknowledge(peer, head_at_reply);
         } else {
             node.changes_mut().reset_peer(peer);
             fallback = true;

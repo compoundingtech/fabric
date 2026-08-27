@@ -1052,6 +1052,32 @@ async fn a_change_and_a_delete_cross_a_peer_that_is_only_a_relay() -> Result<()>
         "C's file never reached A through B"
     );
 
+    // Drive BOTH ends at once, so the middle peer is serving one side while the
+    // other is changing it. That is the state where a naive verdict compares two
+    // different moments and calls a healthy exchange incomplete. It reproduced
+    // only on CI until this loop existed.
+    for round in 0..6 {
+        std::fs::write(
+            folders[0].join(format!("a-burst{round}.md")),
+            format!("from a {round}"),
+        )?;
+        std::fs::write(
+            folders[2].join(format!("c-burst{round}.md")),
+            format!("from c {round}"),
+        )?;
+        reload_sync(&homes[0]).await?;
+        reload_sync(&homes[2]).await?;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    assert!(
+        wait_for_file(&folders[2].join("a-burst5.md"), b"from a 5").await,
+        "a burst from A never crossed B to reach C"
+    );
+    assert!(
+        wait_for_file(&folders[0].join("c-burst5.md"), b"from c 5").await,
+        "a burst from C never crossed B to reach A"
+    );
+
     // A delete has to cross the relay too, in both directions.
     std::fs::remove_file(folders[0].join("relayed.md"))?;
     reload_sync(&homes[0]).await?;
