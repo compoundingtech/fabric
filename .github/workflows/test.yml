@@ -37,13 +37,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # `timeout` is GNU coreutils and is NOT on a macOS runner, which is what
+      # the ubuntu steps below use. Copying them verbatim failed this job with
+      # `timeout: command not found` before it compiled anything. Use the
+      # step-level bound instead: it is the platform-independent one, and it
+      # kills the step rather than the process inside it.
+      #
       # Includes the watcher tests that are #[cfg]-gated per platform and so
       # have never executed in CI at all.
       - name: Library and model tests
-        run: timeout 10m cargo test --locked --lib
+        timeout-minutes: 10
+        run: cargo test --locked --lib
 
       - name: Adversarial folder sync matrix
-        run: timeout 15m cargo test --locked --test folder_sync -- --test-threads=1
+        timeout-minutes: 15
+        run: cargo test --locked --test folder_sync -- --test-threads=1
 
   deterministic:
     runs-on: ubuntu-24.04
