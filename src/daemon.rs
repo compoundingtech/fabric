@@ -2830,6 +2830,7 @@ async fn process_control_request(
                     .map(|status| SyncEntryStatus {
                         delta_fallbacks: status.delta_fallbacks,
                         full_payload_sends: status.full_payload_sends,
+                        stopped_peers: status.stopped_peers,
                         digest: status.digest,
                         name: status.name,
                         folder: status.folder.display().to_string(),
@@ -3303,9 +3304,31 @@ impl SyncTransport for IrohSyncTransport {
         let Some(state) = self.state.upgrade() else {
             bail!("daemon is shutting down");
         };
+        // OUR OWN policy applies to our own outbound sync, and that is not
+        // symmetry for its own sake.
+        //
+        // Sync is bidirectional. Refusing a peer's incoming reconcile stops
+        // nothing on its own, because we still dial THEM and pull the same
+        // files. A one-way denial of a two-way protocol denies nothing, which
+        // is what `a_peer_denied_sync_makes_the_entry_report_stopped_not_clean`
+        // found: the file arrived anyway.
+        //
+        // So "this peer may not sync with me" also means "I will not sync with
+        // it". The refusal carries the same wire phrase as a remote one, so it
+        // is reported as `denied` rather than as a network fault.
         let Some(addr) = peer.addr.clone() else {
             bail!("sync peer {} has no address", peer.id);
         };
+        // The IDENTITY, from the address, NOT `peer.id`.
+        //
+        // `PeerRef.id` is a display label: the peer's name when it has one and
+        // the id only as a fallback. Keying policy on it silently skipped this
+        // check for every named peer, which is exactly the mistake the header
+        // in `peers.toml` warns about, made minutes after writing it. The test
+        // caught it; reading the code did not.
+        if let Err(denied) = state.may(&addr.id, "sync").await {
+            bail!("{denied}");
+        }
         let endpoint = state.current_endpoint();
         let connection = endpoint.connect(addr, SYNC_ALPN).await?;
         let (send, recv) = connection.open_bi().await?;

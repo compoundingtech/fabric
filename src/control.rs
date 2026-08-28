@@ -210,6 +210,13 @@ pub struct SyncEntryStatus {
     /// it carries `#[serde(default)]` like the counters above.
     #[serde(default)]
     pub sweep: String,
+    /// Peers this entry is NOT syncing with, and why, as `peer:reason`.
+    ///
+    /// Empty is healthy. `denied` means a person must edit `peers.toml`;
+    /// `unreachable` means the network will fix itself. A reader must be able to
+    /// tell a chore from weather without running a second command.
+    #[serde(default)]
+    pub stopped_peers: Vec<(String, String)>,
     /// Payloads this node SENT carrying its whole manifest, whatever the
     /// reason: first contact, a peer too old for deltas, a restart, or a cursor
     /// that stalled until its delta grew back to the whole manifest.

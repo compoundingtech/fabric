@@ -313,6 +313,24 @@ pub enum Denied {
     NotPermitted { service: String },
 }
 
+impl Denied {
+    /// The phrase a refusal carries across the wire.
+    ///
+    /// A WIRE CONTRACT, not a log string. The refusing side closes the
+    /// connection with this text and the dialling side matches on it to tell a
+    /// refusal apart from a peer that is merely away. Those need different
+    /// reactions: one waits for the network, the other waits for a person.
+    ///
+    /// `a_refusal_is_recognisable_from_the_other_side` pins both ends.
+    pub const WIRE_MARKER: &'static str = "not permitted for service";
+
+    /// Did this error come from a peer refusing us, rather than from the
+    /// network?
+    pub fn is_refusal(error: &str) -> bool {
+        error.contains(Self::WIRE_MARKER)
+    }
+}
+
 impl std::fmt::Display for Denied {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -964,6 +982,31 @@ mod tests {
                 service: "shell".into()
             })
         );
+    }
+
+    /// The refusing side's sentence and the dialling side's matcher have to
+    /// agree, or a refusal reads as a network fault and a person waits forever
+    /// for weather that is actually a chore.
+    #[test]
+    fn a_refusal_is_recognisable_from_the_other_side() {
+        let denied = Denied::NotPermitted {
+            service: "web".into(),
+        };
+        assert!(
+            Denied::is_refusal(&denied.to_string()),
+            "the sentence this node sends is not recognised by the matcher that \
+             reads it"
+        );
+        // As it actually arrives, wrapped by the transport.
+        assert!(Denied::is_refusal(
+            "connection lost: closed by peer: peer not permitted for service \"web\" (code 403)"
+        ));
+        // Not everything is a refusal. A peer that is simply away must NOT be
+        // reported as one, or a person goes looking for a permission problem
+        // that does not exist.
+        assert!(!Denied::is_refusal("connection timed out"));
+        assert!(!Denied::is_refusal("no addresses for peer"));
+        assert!(!Denied::is_refusal(&Denied::NotTrusted.to_string()));
     }
 
     #[test]

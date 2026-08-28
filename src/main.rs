@@ -929,13 +929,14 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                     let present = logical_present(&entry);
                     if entry.missing == 0 && entry.unexpected == 0 && entry.mismatched == 0 {
                         println!(
-                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tdigest={}",
+                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean\tstopped={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tdigest={}",
                             entry.name,
                             entry.folder,
                             entry.policy,
                             entry.peers,
                             entry.tombstones,
                             entry.observed,
+                            stopped_token(&entry),
                             entry.sync_passes,
                             entry.full_scans,
                             entry.inbound_noop_transactions,
@@ -953,7 +954,7 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                         );
                     } else {
                         println!(
-                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tdigest={}",
+                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}\tstopped={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tdigest={}",
                             entry.name,
                             entry.folder,
                             entry.policy,
@@ -963,6 +964,7 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                             entry.missing,
                             entry.unexpected,
                             entry.mismatched,
+                            stopped_token(&entry),
                             entry.sync_passes,
                             entry.full_scans,
                             entry.inbound_noop_transactions,
@@ -1029,6 +1031,8 @@ struct SyncLsJsonEntry<'a> {
     /// Why the tombstone sweep did or did not forget anything. `unknown` from a
     /// daemon that predates the field.
     sweep: &'a str,
+    /// Peers this entry is NOT syncing with, and why. Empty is healthy.
+    stopped_peers: Vec<String>,
     /// Payloads this node SENT carrying its whole manifest, whatever the reason.
     /// High `reconcile_wire_bytes` with a low count here means this machine is
     /// RECEIVING full payloads rather than sending them.
@@ -1057,6 +1061,11 @@ impl<'a> From<&'a fabric::control::SyncEntryStatus> for SyncLsJsonEntry<'a> {
             missing: entry.missing,
             unexpected: entry.unexpected,
             mismatched: entry.mismatched,
+            stopped_peers: entry
+                .stopped_peers
+                .iter()
+                .map(|(peer, reason)| format!("{peer}:{reason}"))
+                .collect(),
             full_payload_sends: entry.full_payload_sends,
             delta_fallbacks: entry.delta_fallbacks,
             digest: &entry.digest,
@@ -1122,6 +1131,23 @@ fn short_digest(digest: &str) -> &str {
         return "unknown";
     }
     &digest[..digest.len().min(12)]
+}
+
+/// Which peers this entry has stopped syncing with, and why.
+///
+/// `none` when everything is healthy. A partial stop names the peer, because an
+/// entry that converges with two machines and is cut off from a third is not a
+/// healthy entry and an entry-wide flag would call it one.
+fn stopped_token(entry: &fabric::control::SyncEntryStatus) -> String {
+    if entry.stopped_peers.is_empty() {
+        return "none".to_string();
+    }
+    entry
+        .stopped_peers
+        .iter()
+        .map(|(peer, reason)| format!("{peer}:{reason}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn sweep_token(entry: &fabric::control::SyncEntryStatus) -> &str {
@@ -1345,6 +1371,7 @@ mod sync_ls_tests {
         SyncEntryStatus {
             delta_fallbacks: 0,
             full_payload_sends: 0,
+            stopped_peers: vec![("hetz".into(), "denied".into())],
             digest: "lattice-point-aaaa".into(),
             name: "catalog".to_string(),
             folder: "/catalog".to_string(),
@@ -1402,6 +1429,7 @@ mod sync_ls_tests {
                 "sweep": "disabled",
                 "delta_fallbacks": 0,
                 "full_payload_sends": 0,
+                "stopped_peers": ["hetz:denied"],
                 "digest": "lattice-point-aaaa"
             })
         );

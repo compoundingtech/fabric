@@ -16,6 +16,7 @@
 //! versions stay monotonic across daemon restarts.
 
 use std::{
+    collections::BTreeMap,
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
     path::{Path, PathBuf},
@@ -451,6 +452,15 @@ struct EntryState {
     /// of what a peer has been told, and the tombstone sweep will not forget a
     /// deletion until every configured peer has an ack newer than it.
     peer_acks: Arc<StdMutex<HashMap<String, i64>>>,
+    /// The last reconcile outcome per peer, so a partial stop can name which
+    /// peer stopped.
+    ///
+    /// PARTIAL is the case that matters. An entry with three peers where one
+    /// refuses converges with two and silently stops with the third, and an
+    /// entry-wide "is everything fine" flag reports that as fine. It is the
+    /// likely mistake too: somebody writes `allow = ["web"]` for one peer and
+    /// forgets `sync`, and the other peers keep the line looking healthy.
+    peer_state: Arc<StdMutex<BTreeMap<String, PeerSyncState>>>,
     /// What was in `observed` at the last durable write, so a persist can log
     /// only the paths that moved.
     ///
@@ -523,6 +533,30 @@ struct ScanCacheEntry {
 /// the entry. Recovery reads the snapshot plus at most this much log, and the
 /// steady-state write is a fraction of what a rewrite used to cost.
 const LOG_COMPACTION_DIVISOR: u64 = 4;
+
+/// How the last reconcile with one peer went.
+///
+/// REFUSED and UNREACHABLE are deliberately different, because they ask
+/// different things of the person reading them. An unreachable peer converges
+/// on its own when it comes back; that is weather. A refused peer will never
+/// converge until a human edits `peers.toml`; that is a chore. Reporting both
+/// as "not syncing" would leave someone waiting for a network that is fine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerSyncState {
+    Ok,
+    Refused,
+    Unreachable,
+}
+
+impl PeerSyncState {
+    fn token(self) -> &'static str {
+        match self {
+            PeerSyncState::Ok => "ok",
+            PeerSyncState::Refused => "denied",
+            PeerSyncState::Unreachable => "unreachable",
+        }
+    }
+}
 
 /// One path's durable state, as appended to the log.
 ///
@@ -659,6 +693,7 @@ impl<T: SyncTransport> SyncEngine<T> {
             // What is durable right now: the snapshot with its log replayed.
             let persisted_observed =
                 Arc::new(StdMutex::new(observed.lock().unwrap().clone()));
+            let peer_state = Arc::new(StdMutex::new(BTreeMap::new()));
             next.insert(
                 cfg.name.clone(),
                 Arc::new(EntryState {
@@ -666,6 +701,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                     policy,
                     node,
                     operation,
+                    peer_state,
                     persisted_observed,
                     observed,
                     scan_cache,
@@ -933,6 +969,14 @@ impl<T: SyncTransport> SyncEngine<T> {
                 reconcile_wire_bytes: entry.work.reconcile_wire_bytes.load(Ordering::Relaxed),
                 delta_fallbacks: entry.work.delta_fallbacks.load(Ordering::Relaxed),
                 full_payload_sends: node.full_payload_sends(),
+                stopped_peers: entry
+                    .peer_state
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, state)| **state != PeerSyncState::Ok)
+                    .map(|(peer, state)| (peer.clone(), state.token().to_string()))
+                    .collect(),
                 reconcile_failures: entry.work.reconcile_failures.load(Ordering::Relaxed),
                 sweep: entry.last_sweep.lock().unwrap().clone(),
             });
@@ -1028,6 +1072,29 @@ impl<T: SyncTransport> SyncEngine<T> {
                 failed = outcome.is_err(),
                 "per-peer reconcile cost"
             );
+            match &outcome {
+                Ok(_) => {
+                    entry
+                        .peer_state
+                        .lock()
+                        .unwrap()
+                        .insert(peer.id.clone(), PeerSyncState::Ok);
+                }
+                Err(error) => {
+                    // Refused and unreachable are different answers. One waits
+                    // for a person, the other waits for the network.
+                    let state = if crate::config::Denied::is_refusal(&format!("{error:#}")) {
+                        PeerSyncState::Refused
+                    } else {
+                        PeerSyncState::Unreachable
+                    };
+                    entry
+                        .peer_state
+                        .lock()
+                        .unwrap()
+                        .insert(peer.id.clone(), state);
+                }
+            }
             match outcome {
                 Ok(stats) => {
                     entry
@@ -1797,6 +1864,13 @@ pub struct SyncStatus {
     /// Payloads this node SENT that carried its whole manifest, whatever the
     /// reason. Counts the outcome where `delta_fallbacks` counts one cause.
     pub full_payload_sends: u64,
+    /// Peers this entry is NOT currently syncing with, and why, as
+    /// `peer:reason` pairs. Empty is healthy.
+    ///
+    /// Separate from `drift` on purpose. `drift` answers "does my disk match my
+    /// manifest", and a stopped entry has not diverged, it has stopped. Two
+    /// states in one field is how a retired agent came to read as available.
+    pub stopped_peers: Vec<(String, String)>,
     /// A fingerprint of the lattice point this entry's manifest occupies. Two
     /// converged peers report the SAME value; two diverged peers cannot. The
     /// counts above can be equal while the state differs, so this is the only

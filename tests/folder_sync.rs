@@ -1348,3 +1348,100 @@ async fn a_peer_holding_a_stale_cursor_still_repairs_a_node_that_fell_behind() -
     node_a.shutdown().await?;
     Ok(())
 }
+
+/// A PARTIAL denial must not read as a healthy entry.
+///
+/// This is the failure that will actually happen. Somebody writes
+/// `allow = ["web"]` for one peer and forgets `sync`, and the entry keeps
+/// converging with everyone else. An entry-wide "is anything wrong" flag calls
+/// that fine, and the two machines quietly stop agreeing forever.
+///
+/// `drift` is deliberately NOT the field that reports it. Drift answers "does
+/// my disk match my manifest", and a denied entry has not diverged, it has
+/// stopped. Two states in one field is how a retired agent came to read as
+/// available.
+///
+/// So the state is separate, it names the peer, and it says WHY: `denied` needs
+/// a person to edit `peers.toml`, `unreachable` fixes itself when the peer
+/// returns. A reader must be able to tell a chore from weather.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_denied_sync_makes_the_entry_report_stopped_not_clean() -> Result<()> {
+    let _guard = FOLDER_SYNC_LOCK.lock().await;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let a_home = FabricHome::new(a_dir.path());
+    let b_home = FabricHome::new(b_dir.path());
+    let a_folder = a_dir.path().join("shared");
+    let b_folder = b_dir.path().join("shared");
+    std::fs::create_dir_all(&a_folder)?;
+    std::fs::create_dir_all(&b_folder)?;
+    write_sync(a_dir.path(), &a_folder, "bus");
+    write_sync(b_dir.path(), &b_folder, "bus");
+
+    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_b = FabricNode::start(b_home.clone()).await?;
+    trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
+
+    // B trusts A for `web` only. A's sync will be refused, and B is otherwise
+    // a perfectly reachable, perfectly healthy peer.
+    {
+        let mut peers = PeerBook::load(&b_home)?;
+        peers.add_with_allow(
+            node_a.id(),
+            Some("node-a".to_string()),
+            Some(node_a.addr()),
+            Some(vec!["web".to_string()]),
+        );
+        peers.save(&b_home)?;
+        node_b.state().reload_peers().await?;
+    }
+
+    std::fs::write(a_folder.join("never-arrives.md"), b"denied")?;
+    reload_sync(&a_home).await?;
+
+    // The file must NOT arrive, or the denial is not being enforced and this
+    // test is measuring nothing.
+    assert!(
+        !wait_for_file(&b_folder.join("never-arrives.md"), b"denied").await,
+        "a peer denied `sync` still received the file"
+    );
+
+    // And A must SAY so, naming the peer and the reason.
+    let mut stopped = Vec::new();
+    for _ in 0..40 {
+        stopped = match send_control(&a_home, ControlRequest::SyncStatus).await? {
+            fabric::control::ControlResponse::SyncStatus { entries } => entries
+                .into_iter()
+                .find(|e| e.name == "shared")
+                .map(|e| e.stopped_peers)
+                .unwrap_or_default(),
+            other => panic!("expected SyncStatus, got {other:?}"),
+        };
+        if !stopped.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        !stopped.is_empty(),
+        "the entry reported nothing stopped while a peer was refusing it, so it \
+         reads as healthy while it silently does not converge"
+    );
+    let (peer, reason) = &stopped[0];
+    assert_eq!(
+        reason, "denied",
+        "a refusal was reported as {reason:?}. Denied needs a person to edit \
+         peers.toml; unreachable fixes itself. Reporting one as the other sends \
+         somebody looking for the wrong problem"
+    );
+    assert_eq!(
+        peer, "node-b",
+        "the stopped state did not name the peer that stopped. It shows the
+         label a person configured, which is right for reading; the POLICY
+         behind it keys on the identity"
+    );
+
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
