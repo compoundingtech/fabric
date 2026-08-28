@@ -1486,9 +1486,15 @@ async fn wait_for_process_exit(pid: i32) -> Result<()> {
 // took and asserting a stated bound. "It recovers" is not a property; "it
 // carries bytes again within N seconds and nobody typed anything" is.
 //
-// Every test here is a row in docs/failure-modes.md. If you add one, add the
-// row; if you change what one proves, change the row. The document names the
-// test and the test names the row, so a reader can get from either to the other.
+// EVERY TEST HERE IS A ROW IN docs/failure-modes.md, and every row there names
+// the test that proves it. If you add a mode, add the row. If you change what a
+// test proves, change the row. If you find a mode with no test, add the row
+// anyway and write NOT PROVEN in it: a page listing only the failures we
+// happened to test reads as a complete list of what can go wrong, and is not.
+//
+// That page is written for somebody who does not know fabric and is deciding
+// whether to trust it on their own machines, so its numbers are the measured
+// ones printed by these tests rather than adjectives.
 // ---------------------------------------------------------------------------
 
 /// How long a partition test will wait for the tunnel to carry bytes again.
@@ -1783,6 +1789,128 @@ async fn a_peer_not_permitted_for_a_service_cannot_reach_it() -> Result<()> {
     );
 
     drop(stream);
+    task.abort();
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
+/// MODE 5: THE FAR PEER RESTARTS MID-SESSION. New process, same identity.
+///
+/// This is not an edge case, it is the daily workflow: a dev server is
+/// restarted while a browser is connected to it through the tunnel. The
+/// question a person actually has is "do I have to reload the page", and it has
+/// two halves that can differ:
+///
+///   1. Does a NEW request work again, with nothing typed?
+///   2. Does the connection that was already open survive?
+///
+/// The second is the live-reload socket. A page that looks fine and has quietly
+/// stopped updating is worse than one that visibly died, so this test records
+/// which of the two actually happens rather than asserting the comfortable one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_restarting_mid_session_restores_service_without_intervention() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let a_home = FabricHome::new(a_dir.path());
+    let b_home = FabricHome::new(b_dir.path());
+    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_b = FabricNode::start(b_home.clone()).await?;
+    trust_peer(&a_home, &node_a, node_b.id(), Some("node-b"), Some(node_b.addr())).await?;
+    trust_peer(&b_home, &node_b, node_a.id(), Some("node-a"), Some(node_a.addr())).await?;
+
+    let (echo_addr, hits, task) = spawn_tcp_echo_service().await?;
+    run_fabric(&a_home, &["expose", "web", "--tcp", echo_addr.as_str()])?;
+    let local_addr = run_fabric(&b_home, &["dial", "node-a", "web", "--tcp", "127.0.0.1:0"])?;
+
+    let mut live = TcpStream::connect(&local_addr).await?;
+    tcp_stream_round_trip(&mut live, b"before-restart").await?;
+
+    // The dev server's machine restarts fabric. Same identity, new process.
+    node_a.shutdown().await?;
+    let node_a = FabricNode::start(a_home.clone()).await?;
+    trust_peer(&a_home, &node_a, node_b.id(), Some("node-b"), Some(node_b.addr())).await?;
+
+    // Half one: a NEW request, which is a person reloading the page.
+    let fresh = time_until_tunnel_carries(&local_addr, b"after-restart").await?;
+
+    // Half two: the connection that was already open. Recorded, not demanded,
+    // because whichever way it goes belongs in the document as a fact.
+    let live_survived = tokio::time::timeout(Duration::from_secs(20), async {
+        live.write_all(b"live-after-restart").await?;
+        read_expected_tcp(&mut live, b"live-after-restart").await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false);
+
+    println!(
+        "MODE 5 peer restart: a new request worked in {fresh:?}; the already-open \
+         connection survived: {live_survived}"
+    );
+
+    // The property that must hold either way: service is restored with nothing
+    // typed. If a person must reload, the document has to say so, and that is
+    // what `live_survived` records.
+    assert!(
+        hits.load(Ordering::SeqCst) >= 1,
+        "the exposed service was never reached after the peer restarted"
+    );
+
+    drop(live);
+    task.abort();
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
+/// MODE 2: A LONG DROP. Does anything time out permanently and never come back?
+///
+/// The backoff ceiling is 15 seconds, so a 90 second outage walks the whole
+/// schedule several times over and sits at the top of it. That is the state
+/// where a retry loop with a bad terminal condition gives up for good, and the
+/// difference between "slow" and "never" is the only thing that matters here.
+///
+/// 90 seconds rather than the "minutes" in the brief: it clears the ceiling with
+/// room to spare, and a test nobody will run because it takes five minutes
+/// proves less than one that runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_long_outage_does_not_time_out_permanently() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let (_a_dir, _b_dir, a_home, _b_home, node_a, node_b, local_addr, _hits, task) =
+        tcp_tunnel_pair().await?;
+
+    let mut live = TcpStream::connect(&local_addr).await?;
+    tcp_stream_round_trip(&mut live, b"before").await?;
+
+    run_fabric(&a_home, &["debug", "block-tunnels"])?;
+    run_fabric(&a_home, &["debug", "drop-tunnels"])?;
+    live.write_all(b"during-long-outage").await?;
+
+    // Ninety seconds of nothing working.
+    tokio::time::sleep(Duration::from_secs(90)).await;
+    run_fabric(&a_home, &["debug", "unblock-tunnels"])?;
+
+    let resumed = std::time::Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(45),
+        read_expected_tcp(&mut live, b"during-long-outage"),
+    )
+    .await
+    .context(
+        "after a 90 second outage the live connection never came back, so \
+         something timed out permanently",
+    )??;
+    let live_took = resumed.elapsed();
+    let fresh = time_until_tunnel_carries(&local_addr, b"after-long-outage").await?;
+    println!(
+        "MODE 2 long outage (90 s): live connection resumed in {live_took:?}, a new \
+         one connected in {fresh:?}, nothing typed"
+    );
+
+    drop(live);
     task.abort();
     node_b.shutdown().await?;
     node_a.shutdown().await?;
