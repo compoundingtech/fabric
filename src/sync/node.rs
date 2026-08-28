@@ -40,10 +40,26 @@ pub struct SyncNode {
     author: Author,
     manifest: Manifest,
     content: HashMap<ContentHash, Vec<u8>>,
-    /// Which paths changed here, and which peer has seen them. Nothing reads it
-    /// on the wire yet; it is filled first so the bookkeeping can be proven
-    /// correct before anything depends on it.
+    /// Which paths changed here, and which peer has seen them.
     changes: ChangeBuffer,
+    /// Payloads this node has SENT that carried its entire manifest.
+    ///
+    /// Counts the OUTCOME, not the reason. First contact, a peer too old for
+    /// deltas, a restart, and a cursor that stalled until its delta grew back to
+    /// the whole manifest all land here, because from the wire's point of view
+    /// they are the same event and the cost is identical.
+    ///
+    /// `delta_fallbacks` cannot answer this. It counts one cause, a payload
+    /// found incomplete, and stays silent for the other three. This is the
+    /// number that was described to a person as "how you would know the delta
+    /// path is not working".
+    ///
+    /// Both sides count their own sends, so it also says WHICH end of a costly
+    /// exchange decided to be costly. `reconcile_wire_bytes` cannot: it is
+    /// counted on the initiator and includes the responder's reply, so a peer
+    /// sending a whole manifest inflates the other machine's byte count and
+    /// records nothing in its own.
+    full_payload_sends: u64,
 }
 
 /// What a single [`SyncNode::reconcile`] moved. All-zero means the two nodes were
@@ -102,6 +118,7 @@ impl SyncNode {
             manifest: Manifest::new(),
             content: HashMap::new(),
             changes: ChangeBuffer::new(),
+            full_payload_sends: 0,
         }
     }
 
@@ -111,6 +128,23 @@ impl SyncNode {
 
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    /// Payloads sent that carried this node's entire manifest.
+    pub fn full_payload_sends(&self) -> u64 {
+        self.full_payload_sends
+    }
+
+    /// Note that a payload about to go out carries the whole manifest.
+    ///
+    /// Takes the payload rather than a boolean so the caller cannot disagree
+    /// with the definition. A payload holding every path IS the manifest,
+    /// whatever flag it travels under, which is what makes a stalled cursor
+    /// visible here even though it is sent as a delta.
+    pub fn note_payload_sent(&mut self, payload: &Manifest) {
+        if payload.len() == self.manifest.len() && !self.manifest.is_empty() {
+            self.full_payload_sends += 1;
+        }
     }
 
     /// The changed-path bookkeeping for this node.

@@ -932,6 +932,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                 reconcile_micros: entry.work.reconcile_micros.load(Ordering::Relaxed),
                 reconcile_wire_bytes: entry.work.reconcile_wire_bytes.load(Ordering::Relaxed),
                 delta_fallbacks: entry.work.delta_fallbacks.load(Ordering::Relaxed),
+                full_payload_sends: node.full_payload_sends(),
                 reconcile_failures: entry.work.reconcile_failures.load(Ordering::Relaxed),
                 sweep: entry.last_sweep.lock().unwrap().clone(),
             });
@@ -1793,6 +1794,9 @@ pub struct SyncStatus {
     /// Reconciles that fell back to full state. Zero is healthy; a RISING number
     /// means a cursor described state a peer did not hold.
     pub delta_fallbacks: u64,
+    /// Payloads this node SENT that carried its whole manifest, whatever the
+    /// reason. Counts the outcome where `delta_fallbacks` counts one cause.
+    pub full_payload_sends: u64,
     /// A fingerprint of the lattice point this entry's manifest occupies. Two
     /// converged peers report the SAME value; two diverged peers cannot. The
     /// counts above can be equal while the state differs, so this is the only

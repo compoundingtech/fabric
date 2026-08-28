@@ -210,6 +210,15 @@ pub struct SyncEntryStatus {
     /// it carries `#[serde(default)]` like the counters above.
     #[serde(default)]
     pub sweep: String,
+    /// Payloads this node SENT carrying its whole manifest, whatever the
+    /// reason: first contact, a peer too old for deltas, a restart, or a cursor
+    /// that stalled until its delta grew back to the whole manifest.
+    ///
+    /// Read it BESIDE `reconcile_wire_bytes`, which is counted on the initiator
+    /// and includes the responder's reply. High bytes with a low count here
+    /// means this machine is RECEIVING full payloads, not sending them.
+    #[serde(default)]
+    pub full_payload_sends: u64,
     /// Reconciles that fell back to full state because a payload was
     /// incomplete. Zero is healthy. A number that RISES between two samples is a
     /// bug report: a cursor described state a peer did not hold.

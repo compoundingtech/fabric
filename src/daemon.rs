@@ -2829,6 +2829,7 @@ async fn process_control_request(
                     .into_iter()
                     .map(|status| SyncEntryStatus {
                         delta_fallbacks: status.delta_fallbacks,
+                        full_payload_sends: status.full_payload_sends,
                         digest: status.digest,
                         name: status.name,
                         folder: status.folder.display().to_string(),

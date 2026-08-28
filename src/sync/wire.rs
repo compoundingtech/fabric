@@ -193,6 +193,7 @@ where
             None => (node.manifest().clone(), false, wanted, head_at_hello),
         }
     };
+    node.lock().await.note_payload_sent(&payload);
     let hello = HelloHeader {
         name: name.to_string(),
         manifest: payload.clone(),
@@ -268,6 +269,19 @@ where
         // and disagreeing proves nothing, so no verdict is reached. Not
         // advancing the cursor costs a re-send, which is free; resetting it on a
         // false alarm would cost a full exchange.
+        //
+        // BUT READ THIS BEFORE TRUSTING IT. I traded a false-positive fallback
+        // for a silent stall and did not notice I had moved the failure rather
+        // than removed it. A node changed on every exchange never reaches a
+        // verdict here, so its cursor never advances and the delta computed from
+        // it grows until it is the whole manifest again. `delta_fallbacks` does
+        // not see that, because nothing was found incomplete and nothing was
+        // reset. See
+        // `a_stalled_cursor_grows_the_payload_and_the_fallback_counter_stays_zero`,
+        // and `full_payload_sends`, which counts the outcome whatever the cause.
+        //
+        // A fix that relocates a failure looks exactly like a fix that removes
+        // one. The only difference is whether somebody wrote down which it was.
         let only_this_exchange =
             node.changes().head() == head_at_hello.saturating_add(pulled as u64);
         let fallback = if reply.digest.is_empty() {
@@ -423,6 +437,8 @@ where
         }
         let blobs = node.gather_content(&client_needs);
         let pushed = node.adopt(&manifest);
+
+        node.note_payload_sent(&server_payload);
 
         // The reply advertises what WE are still missing so the client repairs
         // us, and carries our POST-adopt digest as the acknowledgement.
@@ -602,6 +618,54 @@ mod tests {
             "the payload grew without a single fallback being counted, which is \
              the point of this test: {sizes:?}"
         );
+
+        // And the counter that DOES see it. Round 0 sent the whole manifest at
+        // first contact. The stall has not yet grown back to the whole manifest
+        // in four rounds, so this is still 1: the point is that it counts the
+        // outcome, and it will count the stall the moment the delta reaches full
+        // size, which `delta_fallbacks` never will.
+        assert_eq!(
+            node.lock().await.full_payload_sends(),
+            1,
+            "full_payload_sends missed the first-contact send"
+        );
+    }
+
+    /// `full_payload_sends` counts a stalled cursor once its delta has grown
+    /// back to the whole manifest, which is the case `delta_fallbacks` cannot
+    /// see. It counts the OUTCOME, so the flag the payload travels under does
+    /// not matter.
+    #[tokio::test]
+    async fn full_payload_sends_counts_a_delta_that_grew_to_the_whole_manifest() {
+        let mut node = SyncNode::new(author(1));
+        node.local_write("a.md", b"one", 0, 0);
+        node.local_write("b.md", b"two", 0, 0);
+        assert_eq!(node.full_payload_sends(), 0);
+
+        // A real delta: one path of two. Not counted.
+        let small = node.manifest().subset(["a.md"]);
+        node.note_payload_sent(&small);
+        assert_eq!(
+            node.full_payload_sends(),
+            0,
+            "a genuine delta must not be counted"
+        );
+
+        // A delta that has grown to cover every path IS the manifest, whatever
+        // flag it travels under.
+        let grown = node.manifest().subset(["a.md", "b.md"]);
+        node.note_payload_sent(&grown);
+        assert_eq!(
+            node.full_payload_sends(),
+            1,
+            "a delta covering every path is a full payload and must be counted"
+        );
+
+        // An empty manifest is not a full payload, or a node with nothing to
+        // sync would count every converged pass.
+        let mut empty = SyncNode::new(author(2));
+        empty.note_payload_sent(&Manifest::new());
+        assert_eq!(empty.full_payload_sends(), 0, "nothing is not everything");
     }
 
     /// A RESPONDER THAT CHANGES MID-EXCHANGE MUST NOT CALL THE EXCHANGE
