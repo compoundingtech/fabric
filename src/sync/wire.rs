@@ -503,6 +503,107 @@ mod tests {
         super::super::manifest::Author([n; 32])
     }
 
+    /// WHAT `delta_fallbacks` DOES NOT COUNT.
+    ///
+    /// An initiator that keeps being changed mid-exchange never reaches a
+    /// verdict, so it never acknowledges, so its cursor never moves. The delta
+    /// it sends is computed correctly from a cursor that is simply old, and it
+    /// grows every round until it is the whole manifest.
+    ///
+    /// Nothing about that is a fallback. No payload was found incomplete and no
+    /// cursor was reset, so the counter stays at zero while the wire cost climbs
+    /// back to where it started. **A full-manifest-sized exchange therefore
+    /// happens without incrementing `delta_fallbacks`.**
+    ///
+    /// This test exists to state that plainly rather than to defend it. It
+    /// asserts the CURRENT behaviour, including the zero, so that whatever is
+    /// done about it has to come here and say so.
+    #[tokio::test]
+    async fn a_stalled_cursor_grows_the_payload_and_the_fallback_counter_stays_zero() {
+        let node = Arc::new(Mutex::new(SyncNode::new(author(1))));
+        for i in 0..200 {
+            node.lock()
+                .await
+                .local_write(&format!("f{i:03}.md"), format!("body {i}").as_bytes(), 0, 0);
+        }
+
+        // One clean exchange first, so a cursor exists to stall.
+        let mut sizes = Vec::new();
+        let mut fallbacks = 0usize;
+        for round in 0..4 {
+            let (client_end, mut server_end) = tokio::io::duplex(1 << 22);
+            let for_client = node.clone();
+            let client = tokio::spawn(async move {
+                run_client(client_end, for_client, "cat", "peer-under-test").await
+            });
+
+            let hello_frame = read_len_bytes(&mut server_end, MAX_JSON_FRAME).await.unwrap();
+            let hello: HelloHeader = serde_json::from_slice(&hello_frame).unwrap();
+            sizes.push(hello.manifest.len());
+
+            // From round 1 on, change the initiator while it waits for us. This
+            // is an inbound reconcile from a third peer, or a local write, on a
+            // node busy enough for it to happen every time.
+            if round > 0 {
+                node.lock().await.local_write(
+                    &format!("busy{round}.md"),
+                    b"a third peer, or an agent, writing",
+                    0,
+                    0,
+                );
+            }
+
+            // Answer as a converged peer: nothing to send, and the digest the
+            // exchange should have landed on.
+            let reply = ReplyHeader {
+                manifest: Manifest::new(),
+                wanted: Vec::new(),
+                digest: hello.digest.clone(),
+                is_delta: true,
+            };
+            write_len_bytes(&mut server_end, &serde_json::to_vec(&reply).unwrap())
+                .await
+                .unwrap();
+            write_u32(&mut server_end, 0).await.unwrap();
+            server_end.flush().await.unwrap();
+
+            let pushed = read_u32(&mut server_end).await.unwrap();
+            for _ in 0..pushed {
+                let mut hash = [0u8; 32];
+                server_end.read_exact(&mut hash).await.unwrap();
+                let _ = read_len_bytes(&mut server_end, MAX_BLOB).await.unwrap();
+            }
+            let _landed = read_len_bytes(&mut server_end, MAX_JSON_FRAME).await.unwrap();
+            write_u32(&mut server_end, 1).await.unwrap();
+            server_end.flush().await.unwrap();
+
+            fallbacks += client.await.unwrap().unwrap().fallbacks;
+        }
+
+        // Round 0 establishes the cursor from a full send. Round 1 is small
+        // because the cursor was acknowledged. From then on the initiator is
+        // changed every round, never acknowledges, and the payload climbs.
+        // Measured: [200, 0, 1, 2]. Round 0 is first contact and sends
+        // everything. Round 1 sends NOTHING, because round 0's exchange was
+        // clean and the cursor advanced. From round 2 the initiator is being
+        // changed every round, never acknowledges, and the payload climbs by one
+        // entry each time it is not acknowledged.
+        assert_eq!(sizes[0], 200, "round 0 should be first contact: {sizes:?}");
+        assert_eq!(
+            sizes[1], 0,
+            "round 1 should carry nothing, the cursor having just advanced: {sizes:?}"
+        );
+        assert!(
+            sizes[3] > sizes[2] && sizes[2] > sizes[1],
+            "the payload did not climb, so the cursor is not stalling: {sizes:?}"
+        );
+        assert_eq!(
+            fallbacks, 0,
+            "the payload grew without a single fallback being counted, which is \
+             the point of this test: {sizes:?}"
+        );
+    }
+
     /// A RESPONDER THAT CHANGES MID-EXCHANGE MUST NOT CALL THE EXCHANGE
     /// INCOMPLETE.
     ///
