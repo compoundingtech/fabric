@@ -1685,3 +1685,106 @@ async fn flapping_does_not_make_recovery_slower_than_the_outage() -> Result<()> 
     node_a.shutdown().await?;
     Ok(())
 }
+
+/// Trust a peer and restrict it to a set of services.
+async fn trust_peer_allowing(
+    home: &FabricHome,
+    node: &FabricNode,
+    id: iroh::EndpointId,
+    name: Option<&str>,
+    addr: Option<iroh::EndpointAddr>,
+    allow: &[&str],
+) -> Result<()> {
+    let mut peers = PeerBook::load(home)?;
+    peers.add_with_allow(
+        id,
+        name.map(str::to_string),
+        addr,
+        Some(allow.iter().map(|s| s.to_string()).collect()),
+    );
+    peers.save(home)?;
+    node.state().reload_peers().await?;
+    Ok(())
+}
+
+/// A peer restricted to other services cannot reach this one, and a permitted
+/// peer is unaffected.
+///
+/// This is the sharing feature: "Johannes may dial my web and nothing else" is
+/// the same mechanism as "droppy may not". Both halves are asserted here,
+/// because a permission system that denies everything is as useless as one that
+/// permits everything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_not_permitted_for_a_service_cannot_reach_it() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let a_home = FabricHome::new(a_dir.path());
+    let b_home = FabricHome::new(b_dir.path());
+    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_b = FabricNode::start(b_home.clone()).await?;
+
+    // A trusts B, but only for `echo`. `web` is exposed and NOT listed.
+    trust_peer_allowing(
+        &a_home,
+        &node_a,
+        node_b.id(),
+        Some("node-b"),
+        Some(node_b.addr()),
+        &["echo"],
+    )
+    .await?;
+    trust_peer(&b_home, &node_b, node_a.id(), Some("node-a"), Some(node_a.addr())).await?;
+
+    let (echo_addr, hits, task) = spawn_tcp_echo_service().await?;
+    run_fabric(&a_home, &["expose", "web", "--tcp", echo_addr.as_str()])?;
+    let local_addr = run_fabric(&b_home, &["dial", "node-a", "web", "--tcp", "127.0.0.1:0"])?;
+
+    // The dial listener binds locally either way; the refusal happens when the
+    // connection is actually made. So this must not carry bytes.
+    let denied = async {
+        let mut stream = TcpStream::connect(&local_addr).await?;
+        tcp_stream_round_trip(&mut stream, b"should-not-arrive").await
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), denied)
+            .await
+            .map(|r| r.is_err())
+            .unwrap_or(true),
+        "a peer with allow = [echo] reached `web`, so the gate is not gating"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "the exposed service was reached despite the peer not being permitted"
+    );
+
+    // Now permit it. The SAME dial must work, unchanged.
+    trust_peer_allowing(
+        &a_home,
+        &node_a,
+        node_b.id(),
+        Some("node-b"),
+        Some(node_b.addr()),
+        &["echo", "web"],
+    )
+    .await?;
+    let mut stream = TcpStream::connect(&local_addr).await?;
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        tcp_stream_round_trip(&mut stream, b"now-permitted"),
+    )
+    .await
+    .context("a permitted peer could not reach the service it was just granted")??;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "the permitted dial did not reach the exposed service"
+    );
+
+    drop(stream);
+    task.abort();
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}

@@ -67,6 +67,17 @@ enum Commands {
         /// Optional EndpointAddr JSON hint for deterministic local/direct dialing.
         #[arg(long = "addr-json")]
         addr_json: Option<String>,
+        /// Restrict this peer to these services, by the name a person types:
+        /// shell, exec, sync, echo, or any protocol you expose such as web.
+        ///
+        /// Anything unlisted is refused, INCLUDING a service you expose later.
+        /// Omit the flag and the peer is unrestricted, which is how peers
+        /// behaved before this existed.
+        ///
+        /// A service is a name, not a port. The port belongs to whoever runs
+        /// `fabric expose` and never crosses the wire.
+        #[arg(long = "allow", value_delimiter = ',')]
+        allow: Option<Vec<String>>,
     },
     /// Remove a trusted peer by NodeID or name.
     Remove { peer: String },
@@ -428,10 +439,17 @@ async fn main() -> Result<()> {
                 Commands::Peers => {
                     let book = PeerBook::load(&home)?;
                     for peer in book.peers() {
-                        match &peer.name {
-                            Some(name) => println!("{}\t{}", peer.id, name),
-                            None => println!("{}", peer.id),
-                        }
+                        let name = peer.name.clone().unwrap_or_default();
+                        // The effective policy, shown rather than assumed. A
+                        // peer written before permissions existed reads as
+                        // `unrestricted (legacy)`, so nobody has to infer what
+                        // an absent field means.
+                        let policy = match &peer.allow {
+                            None => "unrestricted (legacy)".to_string(),
+                            Some(allow) if allow.is_empty() => "no services".to_string(),
+                            Some(allow) => allow.join(","),
+                        };
+                        println!("{}\t{}\t{}", peer.id, name, policy);
                     }
                 }
                 Commands::ReloadPeers => {
@@ -442,11 +460,13 @@ async fn main() -> Result<()> {
                     nodeid,
                     name,
                     addr_json,
+                    allow,
                 } => {
                     let id = parse_node_id(&nodeid)?;
                     let addr = parse_addr_json(addr_json.as_deref(), id)?;
                     let mut book = PeerBook::load(&home)?;
-                    book.add(id, name, addr);
+                    warn_if_permissions_would_stop_a_sync(&home, &allow)?;
+                    book.add_with_allow(id, name, addr, allow);
                     book.save(&home)?;
                     let _ = send_control(&home, ControlRequest::ReloadPeers).await;
                 }
@@ -1059,6 +1079,41 @@ impl<'a> From<&'a fabric::control::SyncEntryStatus> for SyncLsJsonEntry<'a> {
 ///
 /// An older daemon sends nothing here, so this must not render an empty string
 /// as if it were a state.
+/// Say so BEFORE writing a permission that would stop a sync entry.
+///
+/// Every other signal about a denied sync arrives after the mistake and only
+/// for somebody looking: a counter someone reads, a line in `sync ls` someone
+/// runs. None of them wake anyone. The moment a person's hands are on the
+/// keyboard is the only moment this information is free.
+fn warn_if_permissions_would_stop_a_sync(
+    home: &fabric::config::FabricHome,
+    allow: &Option<Vec<String>>,
+) -> Result<()> {
+    let Some(allow) = allow else {
+        return Ok(());
+    };
+    if allow.iter().any(|service| service == "sync") {
+        return Ok(());
+    }
+    let configured = fabric::sync::SyncBook::load(home)
+        .map(|book| book.entries().len())
+        .unwrap_or(0);
+    if configured == 0 {
+        return Ok(());
+    }
+    eprintln!(
+        "fabric: this peer will NOT be permitted to sync, and {configured} sync \
+         entr{} configured on this machine.",
+        if configured == 1 { "y is" } else { "ies are" }
+    );
+    eprintln!(
+        "fabric: a denied sync does not fail loudly. The two machines simply \
+         stop converging."
+    );
+    eprintln!("fabric: add `sync` to --allow if that is not what you meant.");
+    Ok(())
+}
+
 /// The first 12 characters of the lattice-point digest, which is enough to
 /// compare two machines by eye. Scripts should read the full value from
 /// `sync ls --json` rather than this.

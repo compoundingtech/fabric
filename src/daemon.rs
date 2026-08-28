@@ -2989,6 +2989,71 @@ async fn handshake_and_identify(
     Ok(connection)
 }
 
+impl DaemonState {
+    /// May this peer reach this service? PER-PEER policy only.
+    ///
+    /// The daemon-wide `allow_shell` / `allow_exec` blanket is deliberately NOT
+    /// applied here, and that is a correction rather than an omission. It is
+    /// already enforced further in, by `serve_shell_disabled` and its exec
+    /// twin, which refuse at the protocol level with a readable sentence and
+    /// exit 126 — the conventional "found but not permitted to run".
+    ///
+    /// Checking it here as well replaced that with a closed connection and exit
+    /// 1, which is a worse error for the same condition. A blanket that
+    /// subtracts is right; subtracting it twice, in the place with the poorer
+    /// message, is not.
+    ///
+    /// The ordering property still holds: no `allow` list can lift the blanket,
+    /// because the blanket refuses after this check passes.
+    pub async fn may(
+        &self,
+        peer: &iroh::EndpointId,
+        service: &str,
+    ) -> Result<(), crate::config::Denied> {
+        self.peer_book.read().await.may(peer, service)
+    }
+}
+
+/// The name a person would write in `allow` for this ALPN.
+///
+/// The ALPN is the protocol string verbatim, so an exposed service is simply
+/// its own name. The built-ins get the short word someone would actually type,
+/// and BOTH shell ALPNs answer to `shell`: a permission should be about the
+/// service, not about which wire version negotiated it.
+fn service_name_for_alpn(alpn: &[u8]) -> String {
+    if alpn == BUILTIN_ECHO_ALPN {
+        return "echo".to_string();
+    }
+    if alpn == shell::SHELL_ALPN || alpn == shell::RESUMABLE_SHELL_ALPN {
+        return "shell".to_string();
+    }
+    if alpn == exec::EXEC_ALPN {
+        return "exec".to_string();
+    }
+    if alpn == SYNC_ALPN {
+        return "sync".to_string();
+    }
+    String::from_utf8_lossy(alpn).to_string()
+}
+
+/// Refuse a connection from a peer that is trusted but not permitted here.
+///
+/// Closed with the reason attached, so the dialling side can print WHY rather
+/// than reporting a reset. A denial nobody can read is indistinguishable from a
+/// network fault, and somebody who cannot tell them apart turns the feature off.
+async fn deny_connection(connection: &Connection, service: &str, denied: &crate::config::Denied) {
+    let reason = denied.to_string();
+    tracing::info!(
+        target: VALIDATION_LOG_TARGET,
+        event = "permission_denied",
+        peer = %connection.remote_id(),
+        service = service,
+        reason = %reason,
+        "refused a service this peer is not permitted to reach"
+    );
+    connection.close(VarInt::from_u32(403), reason.as_bytes());
+}
+
 async fn process_incoming_iroh(
     incoming: Incoming,
     state: Arc<DaemonState>,
@@ -2997,46 +3062,65 @@ async fn process_incoming_iroh(
     let mut accepting = incoming.accept()?;
     let alpn = accepting.alpn().await?;
     identity.alpn = Some(String::from_utf8_lossy(&alpn).to_string());
+
+    // A generic exposure that does not exist is refused before the handshake,
+    // exactly as before.
+    let exposure = if matches_reserved_alpn(&alpn) {
+        None
+    } else {
+        let found = {
+            let exposures = state.exposures.read().await;
+            exposures.get(alpn.as_slice()).cloned()
+        };
+        match found {
+            Some(exposure) => Some(exposure),
+            None => return Ok(()),
+        }
+    };
+
+    let connection = handshake_and_identify(accepting, identity).await?;
+
+    // ONE GATE. Every service reaches it: echo, both shells, exec, sync, and
+    // every generic exposure. One place to get right and one place to test.
+    //
+    // Trusted and permitted are two different questions. `AllowListHook`
+    // answered the first at handshake; this answers the second, and it needs
+    // the ALPN, which the hook cannot see.
+    let service = service_name_for_alpn(&alpn);
+    if let Err(denied) = state.may(&connection.remote_id(), &service).await {
+        deny_connection(&connection, &service, &denied).await;
+        return Ok(());
+    }
+
     if alpn == BUILTIN_ECHO_ALPN {
-        let connection = handshake_and_identify(accepting, identity).await?;
         log_connection_paths("builtin_echo_accept", &connection);
         handle_builtin_echo(connection, state).await?;
         return Ok(());
     }
     if alpn == shell::SHELL_ALPN {
-        let connection = handshake_and_identify(accepting, identity).await?;
         log_connection_paths("builtin_legacy_shell_accept", &connection);
         handle_builtin_legacy_shell(connection, state).await?;
         return Ok(());
     }
     if alpn == shell::RESUMABLE_SHELL_ALPN {
-        let connection = handshake_and_identify(accepting, identity).await?;
         log_connection_paths("builtin_resumable_shell_accept", &connection);
         handle_builtin_resumable_shell(connection, state).await?;
         return Ok(());
     }
     if alpn == exec::EXEC_ALPN {
-        let connection = handshake_and_identify(accepting, identity).await?;
         log_connection_paths("builtin_exec_accept", &connection);
         handle_builtin_exec(connection, state).await?;
         return Ok(());
     }
     if alpn == SYNC_ALPN {
-        let connection = handshake_and_identify(accepting, identity).await?;
         log_sync_connection_paths(&connection);
         handle_sync(connection, state).await?;
         return Ok(());
     }
 
-    let exposure = {
-        let exposures = state.exposures.read().await;
-        exposures.get(alpn.as_slice()).cloned()
-    };
     let Some(exposure) = exposure else {
         return Ok(());
     };
-
-    let connection = handshake_and_identify(accepting, identity).await?;
     log_connection_paths("tunnel_accept", &connection);
     if state.tunnel_blocked.load(Ordering::SeqCst) {
         connection.close(0u32.into(), b"fabric tunnel blocked");

@@ -285,6 +285,46 @@ pub struct Peer {
     pub id: EndpointId,
     pub name: Option<String>,
     pub addr: Option<EndpointAddr>,
+    /// Which services this peer may reach, by the NAME a person types:
+    /// `shell`, `exec`, `sync`, `echo`, or any exposed protocol such as `web`.
+    ///
+    /// NAMES A SERVICE, NOT A PORT, and that is deliberate. Fabric publishes
+    /// named services; the port is a detail of the exposing side that never
+    /// crosses the wire. A permission naming a port would name something the
+    /// peer cannot see and this machine can change without telling anyone.
+    ///
+    /// `None` means UNRESTRICTED, which is how every peer written before this
+    /// existed behaves and keeps behaving. `Some` means deny by default: a
+    /// service not in the list is refused, including one exposed later.
+    ///
+    /// Policy keys on `id` and never on `name`. A name is a local label that
+    /// can be changed at any time, and a permission that follows a rename is a
+    /// permission granted to whoever inherits the label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<Vec<String>>,
+}
+
+/// Why an incoming connection was refused, in the words a person should read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Denied {
+    /// The node is not in the allow-list at all.
+    NotTrusted,
+    /// The node is trusted, but not for this service.
+    NotPermitted { service: String },
+}
+
+impl std::fmt::Display for Denied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Two DIFFERENT sentences on purpose. A person who cannot tell
+            // denial from a network fault, or one kind of denial from the
+            // other, will turn the whole thing off.
+            Denied::NotTrusted => write!(f, "peer is not trusted by this node"),
+            Denied::NotPermitted { service } => {
+                write!(f, "peer not permitted for service {service:?}")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -337,10 +377,33 @@ impl PeerBook {
         Ok(())
     }
 
+    /// The header written above every `peers.toml`.
+    ///
+    /// The rule about `name` lives in the FILE, not only in the documentation.
+    /// A rule someone has to go and read is a rule that gets designed around by
+    /// somebody who did read it.
+    const PEER_FILE_HEADER: &'static str = "\
+# fabric peers. Written by `fabric add` and `fabric remove`; safe to edit.
+#
+# id     the peer's identity. PERMISSIONS KEY ON THIS AND ONLY THIS.
+# name   a local label for your convenience. You can rename it at any time,
+#        and nothing about permissions follows the rename. Never write a rule
+#        that depends on a name.
+# allow  which services this peer may reach, by the name a person types:
+#        shell, exec, sync, echo, or any protocol you expose such as web.
+#        Omit it and the peer is unrestricted, which is how peers behaved
+#        before this field existed. Include it and anything unlisted is
+#        refused, including a service you expose later.
+#
+# A service is a NAME, not a port. The port belongs to whichever side runs
+# `fabric expose`, and it never crosses the wire.
+
+";
+
     fn write_peer_file(&self, home: &FabricHome) -> Result<()> {
         home.prepare()?;
         let path = home.peers_path();
-        let raw = toml::to_string_pretty(self)?;
+        let raw = format!("{}{}", Self::PEER_FILE_HEADER, toml::to_string_pretty(self)?);
         fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))
     }
 
@@ -360,17 +423,67 @@ impl PeerBook {
         &self.peers
     }
 
+    /// May `id` reach `service`? The ONLY place this question is answered.
+    ///
+    /// Trusted and permitted are two different answers. A peer absent from the
+    /// book is `NotTrusted`; a peer present but restricted is `NotPermitted`.
+    ///
+    /// This does NOT consult the daemon-wide `allow_shell` / `allow_exec`
+    /// flags. Those are a blanket that subtracts and never adds, applied by the
+    /// caller, so that a machine saying "no incoming exec, ever" cannot be
+    /// overridden by an entry in a file.
+    pub fn may(&self, id: &EndpointId, service: &str) -> Result<(), Denied> {
+        let Some(peer) = self.peers.iter().find(|peer| peer.id == *id) else {
+            return Err(Denied::NotTrusted);
+        };
+        match &peer.allow {
+            // Written before permissions existed. Unrestricted, and shown as
+            // legacy by `fabric peers` so it is visible rather than assumed.
+            None => Ok(()),
+            Some(allowed) if allowed.iter().any(|s| s == service) => Ok(()),
+            Some(_) => Err(Denied::NotPermitted {
+                service: service.to_string(),
+            }),
+        }
+    }
+
     pub fn trusted_ids(&self) -> HashSet<EndpointId> {
         self.peers.iter().map(|peer| peer.id).collect()
     }
 
     pub fn add(&mut self, id: EndpointId, name: Option<String>, addr: Option<EndpointAddr>) {
+        self.add_with_allow(id, name, addr, None)
+    }
+
+    /// Add a peer, optionally restricting it to a set of services.
+    ///
+    /// An existing entry's `allow` is preserved when this is called without
+    /// one, so re-adding a peer to update its address cannot silently widen its
+    /// permissions.
+    pub fn add_with_allow(
+        &mut self,
+        id: EndpointId,
+        name: Option<String>,
+        addr: Option<EndpointAddr>,
+        allow: Option<Vec<String>>,
+    ) {
+        let allow = allow.or_else(|| {
+            self.peers
+                .iter()
+                .find(|peer| peer.id == id)
+                .and_then(|peer| peer.allow.clone())
+        });
         self.peers.retain(|peer| peer.id != id);
         if let Some(name) = &name {
             self.peers
                 .retain(|peer| peer.name.as_deref() != Some(name.as_str()));
         }
-        self.peers.push(Peer { id, name, addr });
+        self.peers.push(Peer {
+            id,
+            name,
+            addr,
+            allow,
+        });
         self.peers
             .sort_by_key(|peer| (peer.name.clone().unwrap_or_default(), peer.id.to_string()));
     }
@@ -752,6 +865,106 @@ fn short_hash(input: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A distinct, valid identity per call. An `EndpointId` is an ed25519
+    /// public key, so it cannot be conjured from an arbitrary byte pattern.
+    fn an_id(_seed: u8) -> EndpointId {
+        SecretKey::generate().public()
+    }
+
+    /// A peer written before permissions existed stays unrestricted. This is the
+    /// compatibility rule the whole fleet depends on today.
+    #[test]
+    fn a_peer_without_an_allow_list_may_reach_everything() {
+        let mut book = PeerBook::default();
+        let hetz = an_id(1);
+        book.add(hetz, Some("hetz".into()), None);
+        assert_eq!(book.may(&hetz, "sync"), Ok(()));
+        assert_eq!(book.may(&hetz, "shell"), Ok(()));
+        assert_eq!(book.may(&hetz, "anything-exposed-later"), Ok(()));
+    }
+
+    /// A peer WITH a list is deny by default, including for services this
+    /// machine exposes later. That is the case worth having: trusting somebody
+    /// today must not hand them whatever you publish next month.
+    #[test]
+    fn a_peer_with_an_allow_list_is_denied_everything_else() {
+        let mut book = PeerBook::default();
+        let johannes = an_id(2);
+        book.add_with_allow(
+            johannes,
+            Some("johannes".into()),
+            None,
+            Some(vec!["web".into()]),
+        );
+        assert_eq!(book.may(&johannes, "web"), Ok(()));
+        assert_eq!(
+            book.may(&johannes, "shell"),
+            Err(Denied::NotPermitted {
+                service: "shell".into()
+            })
+        );
+        assert_eq!(
+            book.may(&johannes, "exposed-tomorrow"),
+            Err(Denied::NotPermitted {
+                service: "exposed-tomorrow".into()
+            })
+        );
+    }
+
+    /// Not trusted and not permitted are DIFFERENT answers with different
+    /// sentences. Somebody who cannot tell them apart cannot fix either.
+    #[test]
+    fn an_unknown_peer_is_not_trusted_rather_than_not_permitted() {
+        let book = PeerBook::default();
+        assert_eq!(book.may(&an_id(3), "web"), Err(Denied::NotTrusted));
+        assert_eq!(
+            Denied::NotTrusted.to_string(),
+            "peer is not trusted by this node"
+        );
+        assert_eq!(
+            Denied::NotPermitted {
+                service: "web".into()
+            }
+            .to_string(),
+            "peer not permitted for service \"web\""
+        );
+    }
+
+    /// Re-adding a peer to update its address must not silently widen what it
+    /// may reach. This is the shape of accident that grants access nobody meant
+    /// to grant.
+    #[test]
+    fn re_adding_a_peer_keeps_its_permissions() {
+        let mut book = PeerBook::default();
+        let droppy = an_id(4);
+        book.add_with_allow(droppy, Some("droppy".into()), None, Some(vec!["web".into()]));
+        book.add(droppy, Some("droppy".into()), None);
+        assert_eq!(
+            book.may(&droppy, "shell"),
+            Err(Denied::NotPermitted {
+                service: "shell".into()
+            }),
+            "re-adding a peer widened its permissions"
+        );
+    }
+
+    /// Policy keys on the id. Renaming a peer changes nothing about what it may
+    /// reach, and the label is free to move.
+    #[test]
+    fn renaming_a_peer_does_not_change_what_it_may_reach() {
+        let mut book = PeerBook::default();
+        let peer = an_id(5);
+        book.add_with_allow(peer, Some("old".into()), None, Some(vec!["web".into()]));
+        book.add_with_allow(peer, Some("new".into()), None, Some(vec!["web".into()]));
+        assert_eq!(book.may(&peer, "web"), Ok(()));
+        assert_eq!(
+            book.may(&peer, "shell"),
+            Err(Denied::NotPermitted {
+                service: "shell".into()
+            })
+        );
+    }
 
     #[test]
     fn resolve_default_home_puts_peers_in_xdg_config() {
