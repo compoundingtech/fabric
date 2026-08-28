@@ -58,9 +58,20 @@ pub fn inbox_for(home: &FabricHome, peer: &str) -> PathBuf {
 
 /// A peer's directory name, with anything path-shaped removed.
 ///
-/// The peer label comes off the wire on the receiving side, so it is not
-/// trusted either: a peer calling itself `../..` must not place its inbox
-/// outside the inbox directory.
+/// ANYTHING IN A MESSAGE THAT NAMES A LOCATION ON MY DISK IS HOSTILE INPUT
+/// UNTIL PROVEN OTHERWISE. That is the rule, and this function exists because I
+/// nearly broke it.
+///
+/// The obvious hostile field here is the file name, and it is checked. The peer
+/// LABEL is the one that reads as internal and is not: it also comes off the
+/// wire, it also names a directory, and a peer calling itself `/etc` would
+/// otherwise place its inbox there. That is a remote arbitrary write reachable
+/// by any trusted peer.
+///
+/// The daemon takes the peer id from the CONNECTION rather than from anything
+/// the sender said, and this sanitisation is the second line behind that. When
+/// adding a field to this protocol, ask whether it can name a path, and assume
+/// it will.
 fn sanitize_peer(peer: &str) -> String {
     let cleaned: String = peer
         .chars()

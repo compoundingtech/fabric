@@ -80,6 +80,26 @@ network is back, for the same reason, while a new request is immediate.
 application notices is up to the application; fabric restores the tunnel but
 cannot resurrect a socket the far process no longer has.
 
+## Why `send-file` is not shaped like scp
+
+`scp` lets the sender choose where a file lands on the far machine. **fabric
+does not, and that is deliberate rather than unfinished.**
+
+Sending a file to another machine is a remote write. If the sender chooses the
+path, it can write anywhere the receiving fabric can, and
+`../../.ssh/authorized_keys` is where that ends. So **the receiver decides**:
+every file arrives under an inbox belonging to the peer that sent it, and the
+sender may only name a relative path inside it.
+
+This is the same rule as per-peer permissions — **the side being acted on
+decides what is allowed** — and it has a second benefit: you always know where
+things arrive, without reading whatever command the sender typed.
+
+The name a sender asks for is checked on both machines. The sending side checks
+so that a mistake is reported to the person who made it. The receiving side
+checks because it cannot trust the sender, and that is the check that would
+still be there if the peer were hostile.
+
 ## How this page stays true
 
 Each row names the test that proves it. Each of those tests carries a comment
