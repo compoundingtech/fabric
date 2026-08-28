@@ -102,6 +102,19 @@ enum Commands {
     },
     /// Remove a trusted peer by NodeID or name.
     Remove { peer: String },
+    /// Send one file to a peer's inbox. One shot, one direction, no deletes.
+    SendFile {
+        /// The peer's name or NodeID.
+        peer: String,
+        /// The local file to send.
+        path: PathBuf,
+        /// What to call it in the peer's inbox. Defaults to the file's own name.
+        ///
+        /// A relative path only. Everything lands under the receiving machine's
+        /// inbox for this peer, so a sender cannot choose where files go.
+        #[arg(long)]
+        r#as: Option<String>,
+    },
     /// Manage the local certificate authority for fabric names.
     Ca {
         #[command(subcommand)]
@@ -503,6 +516,25 @@ async fn main() -> Result<()> {
                     book.add_with_allow(id, name, addr, allow);
                     book.save(&home)?;
                     let _ = send_control(&home, ControlRequest::ReloadPeers).await;
+                }
+                Commands::SendFile { peer, path, r#as } => {
+                    let name = match r#as {
+                        Some(name) => name,
+                        None => path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(str::to_string)
+                            .context("that path has no file name; pass --as")?,
+                    };
+                    match send_control(&home, ControlRequest::SendFile { peer, path, name }).await?
+                    {
+                        ControlResponse::SentFile { peer, name, bytes } => {
+                            println!("sent\t{bytes} bytes");
+                            println!("to\t{peer}");
+                            println!("as\t{name}");
+                        }
+                        other => bail!("unexpected response: {other:?}"),
+                    }
                 }
                 Commands::Ca { command } => match command {
                     CaCommands::Init => {

@@ -2857,6 +2857,26 @@ async fn process_control_request(
             }
             ControlResponse::Ok
         }
+        ControlRequest::SendFile { peer, path, name } => {
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Ok(ControlResponse::Error {
+                        message: format!("could not read {}: {error}", path.display()),
+                    });
+                }
+            };
+            match send_file_to_peer(&state, &peer, &name, &bytes).await {
+                Ok(()) => ControlResponse::SentFile {
+                    peer,
+                    name,
+                    bytes: bytes.len() as u64,
+                },
+                Err(error) => ControlResponse::Error {
+                    message: format!("{error:#}"),
+                },
+            }
+        }
         ControlRequest::SyncStatus => {
             let entries = match state.sync_engine() {
                 Some(engine) => engine
@@ -3070,6 +3090,9 @@ fn service_name_for_alpn(alpn: &[u8]) -> String {
     if alpn == SYNC_ALPN {
         return "sync".to_string();
     }
+    if alpn == crate::sendfile::SEND_FILE_ALPN {
+        return crate::sendfile::SERVICE.to_string();
+    }
     String::from_utf8_lossy(alpn).to_string()
 }
 
@@ -3154,6 +3177,11 @@ async fn process_incoming_iroh(
         handle_sync(connection, state).await?;
         return Ok(());
     }
+    if alpn == crate::sendfile::SEND_FILE_ALPN {
+        log_connection_paths("send_file_accept", &connection);
+        handle_send_file(connection, state).await?;
+        return Ok(());
+    }
 
     let Some(exposure) = exposure else {
         return Ok(());
@@ -3175,6 +3203,60 @@ async fn process_incoming_iroh(
         state.tunnel_drop_rx(),
     )
     .await?;
+    Ok(())
+}
+
+/// Dial a peer and hand it one file.
+async fn send_file_to_peer(
+    state: &Arc<DaemonState>,
+    peer: &str,
+    name: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    let addr = {
+        let book = state.peer_book.read().await;
+        let found = book
+            .peers()
+            .iter()
+            .find(|candidate| {
+                candidate.id.to_string() == peer || candidate.name.as_deref() == Some(peer)
+            })
+            .cloned();
+        let found = found.with_context(|| format!("peer {peer:?} is not trusted"))?;
+        found
+            .addr
+            .clone()
+            .unwrap_or_else(|| EndpointAddr::new(found.id))
+    };
+    let endpoint = state.current_endpoint();
+    let connection = endpoint
+        .connect(addr, crate::sendfile::SEND_FILE_ALPN)
+        .await
+        .with_context(|| format!("dialling {peer}"))?;
+    let (send, recv) = connection.open_bi().await?;
+    let stream = tokio::io::join(recv, send);
+    let result = crate::sendfile::send(stream, name, bytes).await;
+    connection.close(0u32.into(), b"done");
+    result
+}
+
+/// Accept one file into this peer's inbox.
+///
+/// The peer's own id names the inbox, taken from the CONNECTION rather than
+/// from anything the sender said, so a peer cannot choose where its files land.
+async fn handle_send_file(connection: Connection, state: Arc<DaemonState>) -> Result<()> {
+    let peer = connection.remote_id().to_string();
+    let (send, recv) = connection.accept_bi().await?;
+    let stream = tokio::io::join(recv, send);
+    match crate::sendfile::receive(stream, &state.home, &peer).await {
+        Ok(path) => {
+            info!(peer = %peer, path = %path.display(), "received a file");
+        }
+        Err(error) => {
+            debug!(peer = %peer, %error, "refused or failed to receive a file");
+        }
+    }
+    connection.closed().await;
     Ok(())
 }
 
@@ -3283,12 +3365,14 @@ fn accepted_alpns(exposures: &HashMap<Vec<u8>, Exposure>) -> Vec<Vec<u8>> {
     alpns.push(shell::RESUMABLE_SHELL_ALPN.to_vec());
     alpns.push(exec::EXEC_ALPN.to_vec());
     alpns.push(SYNC_ALPN.to_vec());
+    alpns.push(crate::sendfile::SEND_FILE_ALPN.to_vec());
     alpns.extend(exposures.keys().cloned());
     alpns
 }
 
 fn matches_reserved_alpn(alpn: &[u8]) -> bool {
-    alpn == BUILTIN_ECHO_ALPN
+    alpn == crate::sendfile::SEND_FILE_ALPN
+        || alpn == BUILTIN_ECHO_ALPN
         || alpn == shell::SHELL_ALPN
         || alpn == shell::RESUMABLE_SHELL_ALPN
         || alpn == exec::EXEC_ALPN

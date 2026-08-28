@@ -12,6 +12,7 @@ pub mod daemon;
 pub mod exec;
 pub mod mux;
 pub mod pathwatch;
+pub mod sendfile;
 pub mod service;
 pub mod shell;
 pub mod sync;

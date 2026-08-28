@@ -72,6 +72,17 @@ pub enum ControlRequest {
     },
     /// Re-read syncs.toml into the running daemon (mirrors ReloadPeers).
     SyncReload,
+    /// Send one local file to a peer's inbox.
+    ///
+    /// Carries the PATH rather than the bytes. The daemon runs as the same user
+    /// and reads the file itself, so a large transfer never crosses the control
+    /// socket.
+    SendFile {
+        peer: String,
+        path: std::path::PathBuf,
+        /// The relative name it should land under in the peer's inbox.
+        name: String,
+    },
     /// Report the daemon's configured sync entries and their state.
     SyncStatus,
     Shutdown,
@@ -140,6 +151,11 @@ pub enum ControlResponse {
         round_trip_micros: Option<u64>,
         transport: Option<String>,
         error: Option<String>,
+    },
+    SentFile {
+        peer: String,
+        name: String,
+        bytes: u64,
     },
     SyncStatus {
         entries: Vec<SyncEntryStatus>,
