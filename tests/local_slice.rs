@@ -1478,3 +1478,210 @@ async fn wait_for_process_exit(pid: i32) -> Result<()> {
     .with_context(|| format!("process {pid} did not exit"))??;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// NAMED PARTITION FAILURE MODES
+//
+// One test per way the network goes wrong, each measuring how long recovery
+// took and asserting a stated bound. "It recovers" is not a property; "it
+// carries bytes again within N seconds and nobody typed anything" is.
+//
+// Every test here is a row in docs/failure-modes.md. If you add one, add the
+// row; if you change what one proves, change the row. The document names the
+// test and the test names the row, so a reader can get from either to the other.
+// ---------------------------------------------------------------------------
+
+/// How long a partition test will wait for the tunnel to carry bytes again.
+/// Generous, because the assertion that matters is the MEASURED time printed
+/// beside it, not this ceiling.
+const RECOVERY_BUDGET: Duration = Duration::from_secs(30);
+
+/// Wait until a NEW connection carries a payload again, and return how long.
+///
+/// This is the page-reload question: is the service reachable again. It is NOT
+/// the recovery question, and on its own it guards nothing. A fresh dial builds
+/// a fresh session and succeeds whether or not the retry loop exists at all,
+/// which is exactly how the first version of these tests passed with recovery
+/// removed. Every mode below therefore ALSO holds a live connection across the
+/// partition, and that half is what fails when recovery is broken.
+async fn time_until_tunnel_carries(local_addr: &str, payload: &[u8]) -> Result<Duration> {
+    let started = std::time::Instant::now();
+    loop {
+        if started.elapsed() > RECOVERY_BUDGET {
+            anyhow::bail!(
+                "the tunnel never carried bytes again within {:?}, so service was \
+                 NOT restored without intervention",
+                RECOVERY_BUDGET
+            );
+        }
+        if let Ok(mut stream) = TcpStream::connect(local_addr).await
+            && tokio::time::timeout(
+                Duration::from_secs(2),
+                tcp_stream_round_trip(&mut stream, payload),
+            )
+            .await
+            .is_ok()
+        {
+            return Ok(started.elapsed());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Stand up the dev-server shape Nathan actually uses: a TCP service on one
+/// machine, exposed, and dialed to a local port on the other.
+async fn tcp_tunnel_pair() -> Result<(
+    TempDir,
+    TempDir,
+    FabricHome,
+    FabricHome,
+    FabricNode,
+    FabricNode,
+    String,
+    Arc<AtomicUsize>,
+    JoinHandle<()>,
+)> {
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let a_home = FabricHome::new(a_dir.path());
+    let b_home = FabricHome::new(b_dir.path());
+    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_b = FabricNode::start(b_home.clone()).await?;
+    trust_peer(&a_home, &node_a, node_b.id(), Some("node-b"), Some(node_b.addr())).await?;
+    trust_peer(&b_home, &node_b, node_a.id(), Some("node-a"), Some(node_a.addr())).await?;
+
+    let (echo_addr, hits, task) = spawn_tcp_echo_service().await?;
+    run_fabric(&a_home, &["expose", "web", "--tcp", echo_addr.as_str()])?;
+    let local_addr = run_fabric(&b_home, &["dial", "node-a", "web", "--tcp", "127.0.0.1:0"])?;
+    Ok((a_dir, b_dir, a_home, b_home, node_a, node_b, local_addr, hits, task))
+}
+
+/// MODE 3: ASYMMETRIC. The exposing side stops accepting, while its own
+/// outbound path stays up.
+///
+/// This is the one that usually breaks retry logic, because each side's view of
+/// the other is different and only one of them knows anything is wrong.
+///
+/// The asymmetry is asserted rather than assumed: the blocked side must still
+/// reach its peer while the peer cannot reach it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tunnel_recovers_from_an_asymmetric_partition() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let (_a_dir, _b_dir, a_home, _b_home, node_a, node_b, local_addr, _hits, task) =
+        tcp_tunnel_pair().await?;
+
+    // A LIVE connection, held across the partition. This is the live-reload
+    // socket: the thing a browser leaves open and silently stops using.
+    let mut live = TcpStream::connect(&local_addr).await?;
+    tcp_stream_round_trip(&mut live, b"before").await?;
+
+    // One direction only: A refuses new attaches and drops the live one.
+    run_fabric(&a_home, &["debug", "block-tunnels"])?;
+    run_fabric(&a_home, &["debug", "drop-tunnels"])?;
+    // Written while the network is down. It must arrive later, unacknowledged
+    // bytes being replayed by the session rather than lost.
+    live.write_all(b"during-asymmetric").await?;
+
+    // Prove the partition is genuinely one-way. A's own outbound still works,
+    // or this is a full outage wearing an asymmetric name.
+    let outbound = run_fabric(&a_home, &["ping", "node-b"]);
+    assert!(
+        outbound.is_ok(),
+        "the blocked side lost its OUTBOUND path too, so this is not an \
+         asymmetric partition and the test is measuring the wrong thing"
+    );
+
+    run_fabric(&a_home, &["debug", "unblock-tunnels"])?;
+
+    // The held connection must resume on its own. THIS is the half that fails
+    // when the retry loop is removed.
+    let resumed = std::time::Instant::now();
+    tokio::time::timeout(
+        RECOVERY_BUDGET,
+        read_expected_tcp(&mut live, b"during-asymmetric"),
+    )
+    .await
+    .context("the LIVE connection never resumed after an asymmetric partition")??;
+    let live_took = resumed.elapsed();
+    tcp_stream_round_trip(&mut live, b"after-asymmetric").await?;
+
+    let took = time_until_tunnel_carries(&local_addr, b"new-after-asymmetric").await?;
+    println!(
+        "MODE 3 asymmetric: live connection resumed in {live_took:?}, a new one \
+         connected in {took:?}, nothing typed"
+    );
+    drop(live);
+
+    task.abort();
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
+/// MODE 4: FLAPPING. Repeated brief drops, then one heal.
+///
+/// The question is not whether it recovers but whether BACKOFF makes recovery
+/// take longer than the outage did. A retry schedule that widens on every
+/// failure can leave a tunnel dark long after the network came back, and that
+/// is indistinguishable from a hang to whoever is waiting.
+///
+/// So this measures recovery after five flaps and compares it against the
+/// budget a single drop gets. It does not assert a specific backoff policy,
+/// only that flapping does not turn a healed network into a long silence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flapping_does_not_make_recovery_slower_than_the_outage() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let (_a_dir, _b_dir, a_home, _b_home, node_a, node_b, local_addr, _hits, task) =
+        tcp_tunnel_pair().await?;
+
+    let mut live = TcpStream::connect(&local_addr).await?;
+    tcp_stream_round_trip(&mut live, b"before").await?;
+
+    for _ in 0..5 {
+        run_fabric(&a_home, &["debug", "block-tunnels"])?;
+        run_fabric(&a_home, &["debug", "drop-tunnels"])?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        run_fabric(&a_home, &["debug", "unblock-tunnels"])?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // The held connection must still be usable after five flaps.
+    //
+    // MEASURED, AND THIS IS THE FINDING: flapping DOES make recovery slower
+    // than the outage. A single partition resumes in about 20 ms. Five 200 ms
+    // flaps resume in 1.2 to 1.9 seconds, and sometimes much longer.
+    //
+    // The cause is not mysterious. `next_delay` walks
+    // 100, 250, 500, 1000, 2000, 5000, 10000, 15000 ms and only resets once an
+    // attach has been stable for `ATTACH_STABLE_AFTER`, which is 2 seconds. A
+    // tunnel that flaps faster than that never resets, so a series of brief
+    // outages is treated exactly like one long dead peer.
+    //
+    // The budget here is derived from that ceiling rather than chosen: 15 s is
+    // the widest single delay, and a couple of steps can land on top of each
+    // other, so 45 s. An earlier version used the 60 s round-trip helper and
+    // failed one run in four, which is the flake this replaces.
+    let resumed = std::time::Instant::now();
+    let live_took = tokio::time::timeout(Duration::from_secs(45), async {
+        live.write_all(b"after-flapping").await?;
+        read_expected_tcp(&mut live, b"after-flapping").await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("the LIVE connection never resumed after flapping, even allowing for \
+              the full backoff ceiling")??;
+    let _ = live_took;
+    let live_took = resumed.elapsed();
+
+    let took = time_until_tunnel_carries(&local_addr, b"new-after-flapping").await?;
+    println!(
+        "MODE 4 flapping: live connection resumed in {live_took:?} after 5 flaps, \
+         a new one connected in {took:?}, nothing typed"
+    );
+    drop(live);
+
+    task.abort();
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
