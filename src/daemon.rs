@@ -2111,9 +2111,45 @@ impl DaemonLease {
             .open(path)?;
         #[cfg(unix)]
         {
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if rc != 0 {
-                bail!("fabric daemon lease is already held");
+            // "Already held" can be TRANSIENTLY WRONG, so it is retried briefly
+            // before being believed.
+            //
+            // A flock belongs to the open file description, and a forked child
+            // shares its parent's descriptions until it execs. fabric spawns
+            // subprocesses constantly — exec, shell, `security`, `systemctl` —
+            // so a lease released a moment ago can still be pinned by a child
+            // that has forked and not yet reached exec. The descriptor is
+            // CLOEXEC, so the window is microseconds, and it closes on its own.
+            //
+            // Found as a test that failed three runs in five once something else
+            // in the same binary started spawning subprocesses. The same race
+            // reaches `fabric restart`, where it would read as "another daemon
+            // is running" when none is.
+            //
+            // The retry is deliberately short, and the number is bounded from
+            // BOTH sides rather than picked.
+            //
+            // Below: the window it rides out is a fork waiting to exec, which is
+            // microseconds, so 200 ms is a thousandfold margin.
+            //
+            // Above: a REFUSAL has to stay prompt. A second daemon told the
+            // lease is taken should say so and exit, and somebody waiting on
+            // that answer should not sit through a long pause.
+            // `second_daemon_for_same_home_is_refused_by_lease` allows 500 ms
+            // for the whole refusal, and a first attempt at 500 ms here failed
+            // it — the daemon was still retrying when the test looked. That test
+            // is right: a refusal is an answer, and an answer should arrive.
+            const LEASE_RETRY_FOR: Duration = Duration::from_millis(200);
+            let deadline = Instant::now() + LEASE_RETRY_FOR;
+            loop {
+                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if rc == 0 {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    bail!("fabric daemon lease is already held");
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
         Ok(Self { _file: file })

@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, Context};
 use clap::{CommandFactory, Parser, Subcommand};
 use fabric::{
     config::{
@@ -41,6 +41,27 @@ struct Cli {
 
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+/// The local certificate authority.
+///
+/// Separate verbs for install and uninstall, rather than a flag, because they
+/// are different acts. A trust decision that cannot be undone in one command is
+/// a trap rather than a decision.
+#[derive(Debug, Subcommand)]
+enum CaCommands {
+    /// Create a certificate authority for this machine. Trusts nothing yet.
+    Init,
+    /// Make this machine trust certificates fabric signs.
+    Install {
+        /// Skip the prompt. For a script that has already shown it.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Stop trusting them. The reverse of install, and just as easy.
+    Uninstall,
+    /// Whether an authority exists, whether it is trusted, and its limits.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -81,6 +102,19 @@ enum Commands {
     },
     /// Remove a trusted peer by NodeID or name.
     Remove { peer: String },
+    /// Manage the local certificate authority for fabric names.
+    Ca {
+        #[command(subcommand)]
+        command: CaCommands,
+    },
+    /// Issue a certificate for a fabric name, signed by the local authority.
+    Cert {
+        /// A name ending in .fabric, or localhost.
+        name: String,
+        /// Where to write the certificate. The key is written beside it.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Start the local fabric daemon.
     Up {
         /// Run in the foreground instead of spawning a background daemon.
@@ -469,6 +503,77 @@ async fn main() -> Result<()> {
                     book.add_with_allow(id, name, addr, allow);
                     book.save(&home)?;
                     let _ = send_control(&home, ControlRequest::ReloadPeers).await;
+                }
+                Commands::Ca { command } => match command {
+                    CaCommands::Init => {
+                        if fabric::ca::ca_cert_path(&home).exists() {
+                            bail!(
+                                "an authority already exists at {}. Remove it by hand if you \
+                                 mean to replace it; overwriting one silently would leave \
+                                 every certificate it signed unverifiable",
+                                fabric::ca::ca_cert_path(&home).display()
+                            );
+                        }
+                        let authority = fabric::ca::generate(&fabric::ca::hostname())?;
+                        fabric::ca::write(&home, &authority)?;
+                        println!("authority\t{}", fabric::ca::ca_cert_path(&home).display());
+                        println!("key\t{}", fabric::ca::ca_key_path(&home).display());
+                        println!("limited to\t{} and 127.0.0.0/8", fabric::ca::NAME_SUFFIX);
+                        println!("trusted\tno. run `fabric ca install` to trust it");
+                    }
+                    CaCommands::Install { yes } => {
+                        print!("{}", fabric::ca::install_prompt(&home));
+                        if !yes {
+                            print!("\nInstall it? [y/N] ");
+                            use std::io::Write as _;
+                            std::io::stdout().flush()?;
+                            let mut answer = String::new();
+                            std::io::stdin().read_line(&mut answer)?;
+                            if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                                println!("nothing was changed");
+                                return Ok(());
+                            }
+                        }
+                        fabric::ca::install(&home)?;
+                        println!("trusted\tyes");
+                        println!("undo\tfabric ca uninstall");
+                    }
+                    CaCommands::Uninstall => {
+                        fabric::ca::uninstall(&home)?;
+                        println!("trusted\tno");
+                    }
+                    CaCommands::Status => {
+                        let cert = fabric::ca::ca_cert_path(&home);
+                        if !cert.exists() {
+                            println!("authority\tnone. run `fabric ca init`");
+                            return Ok(());
+                        }
+                        println!("authority\t{}", cert.display());
+                        println!("key\t{}", fabric::ca::ca_key_path(&home).display());
+                        println!("limited to\t{} and 127.0.0.0/8", fabric::ca::NAME_SUFFIX);
+                        match fabric::ca::is_installed(&home) {
+                            Ok(true) => println!("trusted\tyes"),
+                            Ok(false) => println!("trusted\tno"),
+                            Err(error) => println!("trusted\tunknown: {error:#}"),
+                        }
+                    }
+                },
+                Commands::Cert { name, out } => {
+                    let ca_cert = std::fs::read_to_string(fabric::ca::ca_cert_path(&home))
+                        .with_context(|| {
+                            format!(
+                                "no authority at {}. Run `fabric ca init` first",
+                                fabric::ca::ca_cert_path(&home).display()
+                            )
+                        })?;
+                    let ca_key = std::fs::read_to_string(fabric::ca::ca_key_path(&home))?;
+                    let leaf = fabric::ca::issue(&ca_cert, &ca_key, &name)?;
+                    let cert_path = out.unwrap_or_else(|| PathBuf::from(format!("{name}.crt")));
+                    let key_path = cert_path.with_extension("key");
+                    std::fs::write(&cert_path, &leaf.cert_pem)?;
+                    fabric::ca::write_private(&key_path, &leaf.key_pem)?;
+                    println!("certificate\t{}", cert_path.display());
+                    println!("key\t{}", key_path.display());
                 }
                 Commands::Remove { peer } => {
                     let mut book = PeerBook::load(&home)?;

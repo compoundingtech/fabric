@@ -299,6 +299,33 @@ mod tests {
         assert!(ca_cert_path(&home).exists());
     }
 
+    /// A freshly generated authority is NOT trusted, and must say so.
+    ///
+    /// The first version of `is_installed` asked `security find-certificate` and
+    /// read its exit code. That code is 0 for a name that does not exist, so it
+    /// reported `trusted yes` on a machine where nothing had ever been
+    /// installed. Presence is not trust, and an exit code is not a match.
+    ///
+    /// This is safe to run anywhere: it only ever asks, and generating an
+    /// authority in a temporary directory changes no trust store.
+    #[test]
+    fn a_fresh_authority_is_not_trusted_until_it_is_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = FabricHome::new(dir.path());
+        assert!(
+            !is_installed(&home).unwrap(),
+            "reported trusted with no authority on disk at all"
+        );
+
+        let ca = generate("test-host").unwrap();
+        write(&home, &ca).unwrap();
+        assert!(
+            !is_installed(&home).unwrap(),
+            "a brand new authority reported itself as TRUSTED. Nothing installed \
+             it, so this is the check answering a question it cannot see"
+        );
+    }
+
     #[test]
     fn only_fabric_names_may_be_signed() {
         assert!(name_is_permitted("hetz.fabric"));
@@ -397,5 +424,214 @@ mod tests {
         let leaf = issue(&ca.cert_pem, &ca.key_pem, "hetz.fabric").unwrap();
         assert!(leaf.cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(leaf.key_pem.contains("PRIVATE KEY"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The trust store
+// ---------------------------------------------------------------------------
+
+/// Whether this machine currently TRUSTS the fabric authority.
+///
+/// Asks by verifying a certificate the authority just signed, against the system
+/// trust store with no root supplied. That is the property people care about,
+/// and it is not the same as the certificate being present somewhere.
+///
+/// The first version of this asked `security find-certificate` and read its exit
+/// code. That code is 0 for a name that does not exist, so it reported `trusted
+/// yes` on a machine where nothing had been installed. Presence is not trust,
+/// and an exit code is not a match.
+pub fn is_installed(home: &FabricHome) -> Result<bool> {
+    let cert = ca_cert_path(home);
+    if !cert.exists() {
+        return Ok(false);
+    }
+    let ca_cert = std::fs::read_to_string(&cert)?;
+    let ca_key = std::fs::read_to_string(ca_key_path(home))?;
+    let probe_name = format!("trust-probe{NAME_SUFFIX}");
+    let leaf = issue(&ca_cert, &ca_key, &probe_name)?;
+
+    let dir = std::env::temp_dir().join(format!("fabric-trust-probe-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let leaf_path = dir.join("probe.crt");
+    std::fs::write(&leaf_path, &leaf.cert_pem)?;
+    let trusted = verify_against_system(&leaf_path, &probe_name);
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(trusted)
+}
+
+/// Verify a leaf against the SYSTEM trust store, supplying no root.
+#[cfg(target_os = "macos")]
+fn verify_against_system(leaf: &Path, name: &str) -> bool {
+    std::process::Command::new("security")
+        .arg("verify-cert")
+        .arg("-c")
+        .arg(leaf)
+        .args(["-p", "ssl", "-s", name])
+        .output()
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout).contains("certificate verification successful")
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn verify_against_system(leaf: &Path, _name: &str) -> bool {
+    std::process::Command::new("openssl")
+        .arg("verify")
+        .arg(leaf)
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn linux_installed_path() -> Option<PathBuf> {
+    for dir in [
+        "/usr/local/share/ca-certificates",
+        "/etc/pki/ca-trust/source/anchors",
+    ] {
+        let dir = Path::new(dir);
+        if dir.is_dir() {
+            return Some(dir.join("fabric-local-ca.crt"));
+        }
+    }
+    None
+}
+
+/// The keychain a person's own trust decisions belong in.
+///
+/// The LOGIN keychain, not the system one. Installing into the system keychain
+/// would make this a decision about every account on the machine, taken by
+/// whoever happened to run the command.
+#[cfg(target_os = "macos")]
+fn login_keychain() -> Result<PathBuf> {
+    let out = std::process::Command::new("security")
+        .args(["default-keychain", "-d", "user"])
+        .output()
+        .context("asking for the login keychain")?;
+    let path = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .trim_matches('"')
+        .to_string();
+    if path.is_empty() {
+        bail!("could not determine the login keychain");
+    }
+    Ok(PathBuf::from(path))
+}
+
+/// This machine's hostname, for the certificate subject and the prompt.
+pub fn hostname() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "this machine".to_string())
+}
+
+/// What a person is agreeing to, printed before anything is changed.
+///
+/// Leads with the CONSEQUENCE rather than with what fabric is about to do, and
+/// puts the undo line second, because somebody deciding whether to say yes wants
+/// to know it is reversible before they finish reading rather than after.
+pub fn install_prompt(home: &FabricHome) -> String {
+    let host = hostname();
+    format!(
+        "This will make {host} trust certificates that fabric signs.\n\
+         You can undo it at any time with: fabric ca uninstall\n\
+         \n\
+         The certificate authority is limited to names ending in {NAME_SUFFIX} and to\n\
+         127.0.0.0/8. fabric verified that limit on this machine, against the\n\
+         macOS trust framework and OpenSSL. Firefox and Chrome use their own\n\
+         verifiers, which fabric has not tested, so treat the limit as a strong\n\
+         default rather than a guarantee.\n\
+         \n\
+         Anyone who can read {} can sign certificates {host}\n\
+         will trust. It is stored 0600 and never leaves this machine.\n",
+        ca_key_path(home).display()
+    )
+}
+
+/// Add the authority to this machine's trust store.
+pub fn install(home: &FabricHome) -> Result<()> {
+    let cert = ca_cert_path(home);
+    if !cert.exists() {
+        bail!(
+            "no authority at {}. Run `fabric ca init` first",
+            cert.display()
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // The platform's own tool, not a reimplementation. It prompts for
+        // authorisation itself, which is the right place for that to happen.
+        let status = std::process::Command::new("security")
+            .args(["add-trusted-cert", "-r", "trustRoot", "-k"])
+            .arg(login_keychain()?)
+            .arg(&cert)
+            .status()
+            .context("running `security add-trusted-cert`")?;
+        if !status.success() {
+            bail!("`security add-trusted-cert` refused; nothing was changed");
+        }
+        return Ok(());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let target = linux_installed_path()
+            .context("no system trust anchor directory found on this machine")?;
+        std::fs::copy(&cert, &target)
+            .with_context(|| format!("copying the authority into {}", target.display()))?;
+        let status = std::process::Command::new("update-ca-certificates")
+            .status()
+            .or_else(|_| std::process::Command::new("update-ca-trust").status())
+            .context("refreshing the system trust store")?;
+        if !status.success() {
+            bail!("refreshing the system trust store failed");
+        }
+        Ok(())
+    }
+}
+
+/// Remove the authority from this machine's trust store.
+///
+/// As easy as installing, deliberately. A trust decision that cannot be undone
+/// in one command is a trap rather than a decision.
+pub fn uninstall(home: &FabricHome) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let cert = ca_cert_path(home);
+        if !cert.exists() {
+            bail!("no authority at {} to remove", cert.display());
+        }
+        let status = std::process::Command::new("security")
+            .arg("remove-trusted-cert")
+            .arg(&cert)
+            .status()
+            .context("running `security remove-trusted-cert`")?;
+        if !status.success() {
+            bail!("`security remove-trusted-cert` refused");
+        }
+        return Ok(());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = home;
+        let target = linux_installed_path()
+            .context("no system trust anchor directory found on this machine")?;
+        if target.exists() {
+            std::fs::remove_file(&target)
+                .with_context(|| format!("removing {}", target.display()))?;
+        }
+        let status = std::process::Command::new("update-ca-certificates")
+            .status()
+            .or_else(|_| std::process::Command::new("update-ca-trust").status())
+            .context("refreshing the system trust store")?;
+        if !status.success() {
+            bail!("refreshing the system trust store failed");
+        }
+        Ok(())
     }
 }
