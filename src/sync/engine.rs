@@ -3675,15 +3675,38 @@ mod tests {
         // what it was, not against zero.
         let quiet_generation = work.mutation_generation.load(Ordering::Acquire);
 
+        // Setup created two directories. Their events are still in flight on a
+        // slow machine, and one arriving inside the window below would read as
+        // a filter failure while proving nothing. Take whatever setup produced
+        // before starting to measure.
+        //
+        // This does not weaken the assertion. The claim is about the write made
+        // after this point, and that write has not happened yet.
+        while tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .is_ok_and(|event| event.is_some())
+        {}
+
         // Noise the entry does not sync. No event may reach the loop.
-        std::fs::write(root.join("agents/Silber/cos/status"), b"available").unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(1500), rx.recv())
-                .await
-                .is_err(),
-            "a write outside the glob must not reach the sync loop; if the root \
-             spelling stops matching, this filter goes silently inert"
-        );
+        let noise = root.join("agents/Silber/cos/status");
+        std::fs::write(&noise, b"available").unwrap();
+        // Name what arrived. A bare "an event arrived" cannot tell a filter that
+        // failed from setup noise that was late, and this test runs on two
+        // platforms whose watchers do not agree about either.
+        if let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(1500), rx.recv()).await
+        {
+            panic!(
+                "a write outside the glob must not reach the sync loop; if the \
+                 root spelling stops matching, this filter goes silently inert.\n\
+                 the event carried: {:?}\n\
+                 the write under test was: {}\n\
+                 the entry root is: {}",
+                event.paths,
+                noise.display(),
+                root.display()
+            );
+        }
         assert_eq!(
             work.mutation_generation.load(Ordering::Acquire),
             quiet_generation,
