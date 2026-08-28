@@ -197,6 +197,16 @@ enum Commands {
         #[arg(long)]
         tcp: Option<String>,
     },
+    /// Say what is wrong with this machine, in words a stranger can act on.
+    ///
+    /// Reports each check as `ok`, `setup`, `problem`, or `unknown`. A check
+    /// that could not establish an answer says `unknown` rather than `ok`, and
+    /// that counts as needing attention: a doctor is read INSTEAD of
+    /// investigating, so it must not guess in the reassuring direction.
+    ///
+    /// Exit code is the answer: 0 nothing to do, 1 something needs attention.
+    /// It never changes anything.
+    Doctor,
     /// Round-trip a random nonce through a peer's built-in echo protocol.
     Ping { peer: String },
     /// Test whether a peer serves one protocol, right now, with a single connect.
@@ -720,6 +730,15 @@ async fn main() -> Result<()> {
                             response => bail!("unexpected daemon response: {response:?}"),
                         }
                     }
+                }
+                Commands::Doctor => {
+                    let facts = fabric::doctor::gather(&home, |request| {
+                        let home = home.clone();
+                        async move { send_control(&home, request).await }
+                    })
+                    .await;
+                    let findings = fabric::doctor::diagnose(&facts);
+                    std::process::exit(fabric::doctor::report(&facts, &findings));
                 }
                 Commands::Ping { peer } => {
                     match send_control(&home, ControlRequest::Ping { peer }).await? {

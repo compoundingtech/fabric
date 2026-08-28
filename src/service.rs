@@ -614,7 +614,7 @@ fn home_dir() -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn systemd_user_unit_path() -> Result<PathBuf> {
+pub(crate) fn systemd_user_unit_path() -> Result<PathBuf> {
     let base = match env::var_os("XDG_CONFIG_HOME") {
         Some(path) => PathBuf::from(path),
         None => home_dir()?.join(".config"),

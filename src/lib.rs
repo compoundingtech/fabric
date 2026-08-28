@@ -9,6 +9,7 @@ pub mod ca;
 pub mod config;
 pub mod control;
 pub mod daemon;
+pub mod doctor;
 pub mod exec;
 pub mod mux;
 pub mod pathwatch;
