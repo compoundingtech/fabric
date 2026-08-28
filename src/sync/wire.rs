@@ -282,6 +282,22 @@ where
         //
         // A fix that relocates a failure looks exactly like a fix that removes
         // one. The only difference is whether somebody wrote down which it was.
+        //
+        // AND THE RULE THAT CAME OUT OF DOING IT TWICE:
+        //
+        //   A guard that changes what one side does must SAY SO to the other,
+        //   or the other side infers something false.
+        //
+        // This guard was added without one. The initiator knew it had moved
+        // mid-exchange and reached no verdict; the responder could only see a
+        // landing digest that did not match, which is indistinguishable from an
+        // incomplete payload. So it forgot a good cursor and sent a whole
+        // manifest, three times in twenty minutes between two live machines,
+        // while every counter read healthy.
+        //
+        // The empty landing digest below is that sentence, spoken. Before adding
+        // a guard here, ask what the peer will conclude from the behaviour it
+        // can observe, and whether that conclusion is true.
         let only_this_exchange =
             node.changes().head() == head_at_hello.saturating_add(pulled as u64);
         let fallback = if reply.digest.is_empty() {

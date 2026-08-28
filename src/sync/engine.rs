@@ -279,6 +279,31 @@ struct EntryWork {
     /// replication exists to remove. A figure that counted only content would
     /// report a converged pass as free, and a converged pass ships about 10 MB.
     reconcile_wire_bytes: AtomicU64,
+    /// WHERE A COUNTER LIVES DECIDES WHAT IT CAN SEE. Read this before adding
+    /// another one.
+    ///
+    /// This counter has had three blind spots, and none of them were bugs in
+    /// its arithmetic:
+    ///
+    ///   1. It counts one CAUSE, a payload found incomplete, and stayed silent
+    ///      for the three other ways a whole manifest goes out. See
+    ///      `full_payload_sends`, which counts the outcome instead.
+    ///   2. It could not see a STALLED cursor, because a stall reaches no
+    ///      verdict and so is neither a fallback nor an acknowledgement.
+    ///   3. It lives on the ENTRY, and only the outbound loop wrote to it, so a
+    ///      fallback taken while SERVING a peer was dropped. `record_inbound`
+    ///      fixed that.
+    ///
+    /// The third is the general one. `full_payload_sends` lives on the NODE,
+    /// which both directions share, so it saw what this could not. The object a
+    /// counter is attached to determines which directions and which lifetimes
+    /// it can observe, and that is a design decision rather than an
+    /// implementation detail.
+    ///
+    /// A zero from a counter with a blind spot is not evidence. Two days of
+    /// zeroes here went into a report while a pair of machines exchanged whole
+    /// manifests.
+    ///
     /// Reconciles that found a payload incomplete and fell back to full state.
     ///
     /// Zero is the healthy value. A number that RISES between two samples means
