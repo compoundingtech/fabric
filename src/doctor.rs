@@ -297,6 +297,22 @@ fn version_findings(facts: &Facts) -> Vec<Finding> {
             .with_action(format!("fabric exec {} -- fabric update", names[0])),
         );
     } else if !unknown.is_empty() {
+        // Say what IS known as well. On the fleet's first real run this
+        // reported one unknown peer and nothing else, so a reader could not
+        // tell "one of three" from "one of one" — and the reassuring half is
+        // the half that says how much of the fleet was actually checked.
+        let known = facts.peers.len() - unknown.len();
+        if known > 0 {
+            out.push(Finding::new(
+                "versions",
+                Verdict::Ok,
+                format!(
+                    "{known} of {} peers answered, and all of them are on {}",
+                    facts.peers.len(),
+                    facts.own_version
+                ),
+            ));
+        }
         for peer in unknown {
             let reason = peer
                 .version_error
@@ -815,6 +831,32 @@ mod tests {
                 .as_deref()
                 .is_some_and(|a| a.contains("--allow-exec")),
             "it did not say what to change"
+        );
+    }
+
+    /// "one peer could not be asked" does not say one of how many.
+    #[test]
+    fn the_peers_that_did_answer_are_reported_too() {
+        let mut facts = configured();
+        facts.peers.push(PeerFact {
+            label: "droppy".to_string(),
+            has_address: true,
+            reachable: Some(true),
+            version: None,
+            version_error: Some("remote exec is disabled".to_string()),
+        });
+        let findings = diagnose(&facts);
+        let versions = find(&findings, "versions");
+        assert!(
+            versions
+                .iter()
+                .any(|f| f.verdict == Verdict::Ok && f.detail.contains("1 of 2")),
+            "it did not say how much of the fleet it actually checked: {:?}",
+            versions.iter().map(|f| &f.detail).collect::<Vec<_>>()
+        );
+        assert!(
+            versions.iter().any(|f| f.verdict == Verdict::Unknown),
+            "the unknown peer stopped being reported"
         );
     }
 
