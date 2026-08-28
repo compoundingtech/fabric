@@ -30,7 +30,7 @@ nothing tells you to look.
 | A long outage, ninety seconds | Nothing gives up. A new request works immediately. A connection that was already open waits out the retry schedule before it resumes. | New request 11 ms, open connection 12.4 s | `a_long_outage_does_not_time_out_permanently` |
 | One direction fails while the other still works | Both recover. This is the case that usually breaks retry logic, because each side sees something different and only one of them knows anything is wrong. | Open connection 23 ms, new request 6 ms | `a_tunnel_recovers_from_an_asymmetric_partition` |
 | The network flaps: repeated brief interruptions | It recovers, but **more slowly than the interruptions themselves**. Five 200 ms flaps cost seconds, not milliseconds. See "Known rough edges" below. | Open connection 1.2 to 2.0 s, new request 9 ms | `flapping_does_not_make_recovery_slower_than_the_outage` |
-| **The far machine restarts** — you restart your dev server while a browser is connected | A new request works almost immediately. **The connection that was already open does NOT survive.** So the page still loads, but a live-reload socket is gone and the page will sit there looking fine and stop updating. **You have to reload.** | New request 85 ms; open connection does not return | `a_peer_restarting_mid_session_restores_service_without_intervention` |
+| **The far machine restarts** — you restart your dev server while a browser is connected | The connection that was open does not survive, and **that part is not fabric's doing**: the process that owned it is gone, and the same socket dies with no fabric involved. What matters is the reconnect, and fabric accepts one straight away. A reconnect succeeds 76 ms after the restart, and **a reconnect attempted while the server is still down also succeeds, in 111 ms — it never hangs.** So a client that retries gets through. See "Whose problem is a page that stops updating" below. | Reconnect 76 ms; during the outage 111 ms; never hangs | `a_peer_restarting_mid_session_restores_service_without_intervention` |
 | The direct path between the machines dies while a relay is available | `NOT PROVEN.` Two daemons on one machine cannot lose a direct path they never had, so this cannot be forced in a test here. It is not hypothetical: on the three-machine fleet today, 1,569 connections used a direct path and 1,463 used a relay, so both are in constant use. Proving the switch needs two real machines. | Unmeasured | `NOT PROVEN` |
 | A machine's address changes mid-session, as a laptop moving between networks does | The session survives without restarting the process, and the machine keeps its identity. Proven for one kind of tunnel. | Not separately measured | `generic_tunnel_survives_client_endpoint_recycle_without_process_restart`. **`NOT PROVEN` for TCP tunnels specifically.** |
 
@@ -39,6 +39,30 @@ nothing tells you to look.
 fabric knows it is retrying and says so: it reports the attempt number, how long
 until the next try, and the error. **A dial that hangs silently would be worse
 than one that says the peer is unreachable**, so the information exists.
+
+## Whose problem is a page that stops updating
+
+A dev server with live reload holds a websocket open. **Restart the server and
+that socket dies — with or without fabric.** The process that owned it is gone.
+What makes it a non-event when you work locally is that the CLIENT reconnects,
+which vite and webpack both do within a second or two.
+
+So the question is what happens to that reconnect, and fabric's part is
+measured: **a reconnect succeeds 76 ms after the restart, and one attempted
+while the server is still down succeeds in 111 ms. It never hangs.** A client
+that retries at all gets through, and it is not punished for retrying.
+
+**So if your page stops updating after you restart your dev server, the
+application is not reconnecting.** That is worth knowing because it is fixable
+in the application and not in fabric, and because a page that looks fine and has
+stopped updating is the kind of thing that costs an hour before anyone suspects
+it.
+
+**The limit of this evidence:** it was measured with a TCP client through the
+tunnel, not with a browser driving a real websocket. The transport property —
+fabric accepts a reconnect immediately and never hangs — is proven. Whether a
+particular dev server's client retries is that client's business, and fabric
+cannot make it.
 
 ## Known rough edges
 
