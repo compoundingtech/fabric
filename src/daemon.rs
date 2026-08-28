@@ -3222,6 +3222,9 @@ async fn handle_sync(connection: Connection, state: Arc<DaemonState>) -> Result<
     .await;
     match outcome {
         Ok((name, stats, prepared)) => {
+            // The serving side's numbers used to stop here, which is how a
+            // fallback taken while serving a peer stayed invisible.
+            engine.record_inbound(&name, &stats).await;
             if !stats.is_noop() {
                 debug!(sync = %name, ?stats, "served sync reconcile");
             }

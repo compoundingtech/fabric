@@ -220,7 +220,7 @@ where
     wire_bytes += received.bytes;
 
     // 3. Adopt the server's winning entries and bundle what the server needs.
-    let (pulled, blobs_for_server, fallback, final_digest) = {
+    let (pulled, blobs_for_server, fallback, landing) = {
         let mut node = node.lock().await;
         let pulled = node.adopt(&reply.manifest);
         // What content to push. `hashes_peer_needs` infers what the peer lacks
@@ -306,7 +306,19 @@ where
             node.changes_mut().reset_peer(peer);
             true
         };
-        (pulled, blobs, fallback, final_digest)
+        // What we tell the responder we landed on. EMPTY when we cannot vouch
+        // for it, which is the other half of the guard above.
+        //
+        // We know we moved mid-exchange; the responder cannot. Sending a digest
+        // we know describes a different moment makes it reset a perfectly good
+        // cursor and send us a whole manifest next pass. Saying nothing means
+        // "no verdict", and it leaves its cursor alone.
+        let landing = if only_this_exchange {
+            final_digest.clone()
+        } else {
+            String::new()
+        };
+        (pulled, blobs, fallback, landing)
     };
     let for_server = (pulled, blobs_for_server);
     write_blobs(&mut stream, &for_server.1).await?;
@@ -321,7 +333,7 @@ where
     // Sent only to a peer that reported a digest of its own. An older build does
     // not read this frame and must not be given it.
     if !reply.digest.is_empty() {
-        write_len_bytes(&mut stream, final_digest.as_bytes()).await?;
+        write_len_bytes(&mut stream, landing.as_bytes()).await?;
     }
     stream.flush().await?;
 
@@ -484,7 +496,15 @@ where
             .context("reading the client's landing digest")?;
         let client_landed = String::from_utf8_lossy(&frame).to_string();
         let mut node = node.lock().await;
-        if client_landed == reply.digest {
+        if client_landed.is_empty() {
+            // The initiator says it cannot vouch for where it landed, because
+            // something else moved it mid-exchange. It knows that and we cannot
+            // see it. NO VERDICT: keep the cursor, send a delta next time.
+            //
+            // Treating this as a mismatch is what made a busy pair exchange
+            // whole manifests for no reason, three times in twenty minutes,
+            // while every counter read healthy.
+        } else if client_landed == reply.digest {
             node.changes_mut().acknowledge(peer, head_at_reply);
         } else {
             node.changes_mut().reset_peer(peer);

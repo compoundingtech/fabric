@@ -1405,6 +1405,33 @@ impl<T: SyncTransport> SyncEngine<T> {
             .unwrap_or(0)
     }
 
+    /// Record what an INBOUND reconcile did, from the serving side.
+    ///
+    /// The responder's numbers used to be logged and dropped. Only the outbound
+    /// loop incremented anything, so a fallback taken while SERVING a peer was
+    /// invisible: `delta_fallbacks` read zero while this node reset a cursor on
+    /// every inbound exchange and sent that peer a whole manifest next time.
+    ///
+    /// That is how droppy came to send Silber a full manifest repeatedly with
+    /// every counter reading healthy. `full_payload_sends` caught it because it
+    /// lives on the node and both directions share it; this counter did not,
+    /// because it lives on the entry and only one direction wrote to it.
+    ///
+    /// `wire_bytes` stays uncounted here on purpose. It is measured on the
+    /// initiator and counting it again on the responder would double every
+    /// exchange in a fleet-wide sum.
+    pub async fn record_inbound(&self, name: &str, stats: &Reconciled) {
+        if stats.fallbacks == 0 {
+            return;
+        }
+        if let Some(entry) = self.entries.read().await.get(name) {
+            entry
+                .work
+                .delta_fallbacks
+                .fetch_add(stats.fallbacks as u64, Ordering::Relaxed);
+        }
+    }
+
     /// Whether to write a whole snapshot instead of appending.
     ///
     /// The bound is a fraction of the SNAPSHOT's own size, so it scales with the
@@ -4899,6 +4926,77 @@ mod tests {
             "a restart plus one change wrote a {log} byte log against a \
              {state_bytes} byte snapshot. The whole tree went into the log \
              because the durable cursor was not seeded"
+        );
+    }
+
+    /// A FALLBACK TAKEN WHILE SERVING MUST BE COUNTED.
+    ///
+    /// It was not. `delta_fallbacks` was incremented only in the outbound peer
+    /// loop, so a node that reset a cursor while SERVING a peer recorded
+    /// nothing, sent that peer a whole manifest on the next exchange, and went
+    /// on reading zero.
+    ///
+    /// That is exactly what happened between two live machines: one sent the
+    /// other a full manifest three times in twenty minutes with every counter
+    /// healthy. `full_payload_sends` saw it because it lives on the node, which
+    /// both directions share. This one did not, because it lives on the entry
+    /// and only one direction wrote to it.
+    #[tokio::test]
+    async fn a_fallback_taken_while_serving_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.md"), b"one").unwrap();
+        write_bus_sync(dir.path(), &root);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+
+        let before = engine.status().await[0].delta_fallbacks;
+        engine
+            .record_inbound(
+                "bus",
+                &Reconciled {
+                    pulled: 0,
+                    pushed: 0,
+                    bytes: 0,
+                    fallbacks: 1,
+                    wire_bytes: 0,
+                },
+            )
+            .await;
+        let after = engine.status().await[0].delta_fallbacks;
+        assert_eq!(
+            after,
+            before + 1,
+            "a fallback taken while serving was dropped, which is how this stayed \
+             invisible on the fleet"
+        );
+
+        // And a clean inbound reconcile must not invent one.
+        engine
+            .record_inbound(
+                "bus",
+                &Reconciled {
+                    pulled: 0,
+                    pushed: 0,
+                    bytes: 0,
+                    fallbacks: 0,
+                    wire_bytes: 0,
+                },
+            )
+            .await;
+        assert_eq!(
+            engine.status().await[0].delta_fallbacks,
+            after,
+            "a healthy inbound reconcile counted a fallback"
         );
     }
 
