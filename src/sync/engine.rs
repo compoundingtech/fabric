@@ -220,6 +220,15 @@ pub trait SyncTransport: Send + Sync + 'static {
 /// redundant pre-merge scan/persist when no mutating event occurred meanwhile.
 #[derive(Debug)]
 struct EntryWork {
+    /// Woken when this entry adopts something from a peer and therefore owes
+    /// the change to every OTHER peer.
+    ///
+    /// The 30-second tick is a floor, not a delivery time. A change crossing a
+    /// three-node line would take a tick per hop, and a longer line multiplies
+    /// that. Nothing else wakes this loop on the inbound path: the watcher is
+    /// the only other source and the daemon deliberately suppresses the event
+    /// for its own materialization.
+    forward: tokio::sync::Notify,
     mutation_generation: AtomicU64,
     durable_generation: AtomicU64,
     inbound_waiters: AtomicUsize,
@@ -332,6 +341,7 @@ struct EntryWork {
 impl EntryWork {
     fn new() -> Arc<Self> {
         Arc::new(Self {
+            forward: tokio::sync::Notify::new(),
             // Generation one forces the first inbound session to scan even
             // before the watcher observes its first event.
             mutation_generation: AtomicU64::new(1),
@@ -1445,6 +1455,39 @@ impl<T: SyncTransport> SyncEngine<T> {
     /// `wire_bytes` stays uncounted here on purpose. It is measured on the
     /// initiator and counting it again on the responder would double every
     /// exchange in a fleet-wide sum.
+    /// An entry that ADOPTED something while serving a peer still owes every
+    /// OTHER peer that change.
+    ///
+    /// `complete_inbound` ends by marking the generation durable, which is true
+    /// and is the wrong answer to a different question. Durable means "written
+    /// down". It does not mean "everybody has been told". Nothing else moves
+    /// the mutation generation on the inbound path — only the watcher and a
+    /// config reload do — and the daemon suppresses the watcher event for its
+    /// own materialization, correctly, so that a write we caused does not look
+    /// like a write somebody made.
+    ///
+    /// The result was that a node in the middle of a line adopted a change,
+    /// declared itself clean, and forwarded nothing until the five-minute
+    /// safety scan. A fully-meshed fleet never notices, because no change ever
+    /// needs a relay. Ours is fully meshed, which is why this shipped.
+    ///
+    /// Marking it dirty costs one pass on the node that received something, and
+    /// nothing at all when nothing arrives. That is the propagation cost and
+    /// there is no cheaper honest version of it.
+    pub async fn note_inbound_adoption(&self, name: &str, stats: &Reconciled) {
+        if stats.pulled == 0 {
+            return;
+        }
+        if let Some(entry) = self.entries.read().await.get(name) {
+            // Both, and they answer different questions. The generation makes
+            // the periodic tick a backstop if the wake is missed; the wake is
+            // what makes a relayed change arrive in a second rather than in a
+            // tick per hop.
+            entry.work.record_mutation();
+            entry.work.forward.notify_one();
+        }
+    }
+
     pub async fn record_inbound(&self, name: &str, stats: &Reconciled) {
         if stats.fallbacks == 0 {
             return;
@@ -1801,6 +1844,15 @@ impl<T: SyncTransport> SyncEngine<T> {
         loop {
             tokio::select! {
                 _ = self.cancel.cancelled() => break,
+                // Something arrived from a peer and the peers that did not send
+                // it have not been told. `notify_one` holds a permit when no
+                // waiter is parked, so a wake raised while a pass is running is
+                // taken on the next turn rather than dropped.
+                _ = entry.work.forward.notified() => {
+                    if let Err(error) = self.sync_once_repairing(&name).await {
+                        tracing::debug!(sync = %name, %error, "forwarding sync failed");
+                    }
+                }
                 _ = ticker.tick() => {
                     let dirty = entry.work.mutation_generation.load(Ordering::Acquire)
                         != entry.work.durable_generation.load(Ordering::Acquire);
@@ -4720,6 +4772,75 @@ mod tests {
     /// The 2:1 ratio above holds ONLY when no peer is talking to us, and
     /// production always has peers talking to us.
     ///
+    /// A node that adopts something owes it to every peer it did not hear it
+    /// from, and `complete_inbound` ends by declaring the entry clean.
+    ///
+    /// Without this the middle of a chain adopts a change, marks its generation
+    /// durable, and forwards nothing until the five-minute safety scan. A
+    /// meshed fleet hides it completely, because nothing ever needs a relay.
+    #[tokio::test]
+    async fn adopting_from_a_peer_leaves_the_entry_owing_a_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.md"), b"seed").unwrap();
+        write_bus_sync(dir.path(), &root);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+        let entry = engine.entries.read().await.get("bus").cloned().unwrap();
+
+        // Settle: after its own pass the entry owes nobody anything.
+        let prepared = engine.prepare_inbound("bus").await.unwrap().unwrap();
+        engine.complete_inbound(prepared).await.unwrap();
+        assert!(
+            !is_dirty(&entry),
+            "an entry that adopted nothing still reported work to do"
+        );
+
+        // Now an inbound transaction that DID adopt something.
+        let prepared = engine.prepare_inbound("bus").await.unwrap().unwrap();
+        engine.complete_inbound(prepared).await.unwrap();
+        engine
+            .note_inbound_adoption(
+                "bus",
+                &Reconciled {
+                    pulled: 1,
+                    ..Reconciled::default()
+                },
+            )
+            .await;
+        assert!(
+            is_dirty(&entry),
+            "an entry adopted a change and then reported nothing to forward, \
+             so every peer other than the sender would wait for the safety scan"
+        );
+
+        // And adopting nothing must not manufacture work, or an idle fleet
+        // starts paying for passes that carry nothing.
+        let prepared = engine.prepare_inbound("bus").await.unwrap().unwrap();
+        engine.complete_inbound(prepared).await.unwrap();
+        engine
+            .note_inbound_adoption("bus", &Reconciled::default())
+            .await;
+        assert!(
+            !is_dirty(&entry),
+            "a reconcile that adopted nothing still scheduled a pass"
+        );
+    }
+
+    fn is_dirty(entry: &EntryState) -> bool {
+        entry.work.mutation_generation.load(Ordering::Acquire)
+            != entry.work.durable_generation.load(Ordering::Acquire)
+    }
+
     /// `scan_entry` has three callers. `complete_inbound` runs it once per
     /// guarded inbound transaction and `prepare_inbound_entry` runs it at most
     /// once more, so inbound traffic lifts `full_scans` while leaving

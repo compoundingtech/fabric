@@ -3351,6 +3351,10 @@ async fn handle_sync(connection: Connection, state: Arc<DaemonState>) -> Result<
             if let Err(error) = engine.complete_inbound(prepared).await {
                 debug!(sync = %name, %error, "sync completion failed");
             }
+            // AFTER completion, which ends by marking the generation durable.
+            // What we just adopted still has to reach every peer that is not
+            // the one we adopted it from.
+            engine.note_inbound_adoption(&name, &stats).await;
         }
         Err(error) => debug!(%error, "sync serve failed"),
     }
