@@ -10,6 +10,25 @@
 //! that matter are the ones a simulated transport cannot show: a peer that goes
 //! away and comes back holding a stale copy.
 //!
+//! # A GREEN CI RUN IS NOT A GREEN TEST
+//!
+//! **`a_change_and_a_delete_cross_a_peer_that_is_only_a_relay` was red on macOS
+//! and green on ubuntu for two days, at the same commit, while the bug it names
+//! was live in the fleet.** CI ran it. CI passed it. The forwarding defect was
+//! real, and on Linux something else woke the forward, so only one platform ever
+//! showed the colour.
+//!
+//! **Its own commit message predicted the exact failure before it happened** —
+//! a node "would converge with its source and silently starve everyone
+//! downstream, while every direct pair in the fleet still looked healthy." That
+//! is what it did. Somebody wrote the failure mode down and shipped the failure
+//! anyway, because the only machine that disagreed was not the one anybody read.
+//!
+//! **So: run this file locally before believing it, on the platform you are
+//! changing.** These tests use real daemons, real watchers, and real timing, and
+//! the watcher is where the platforms differ most. A CI badge tells you about
+//! ubuntu.
+//!
 //! # READ THIS BEFORE WRITING THE NEXT TEST HERE
 //!
 //! **A test that runs with a fallback underneath it must assert the fallback did
@@ -1050,6 +1069,16 @@ async fn a_change_and_a_delete_cross_a_peer_that_is_only_a_relay() -> Result<()>
         fallbacks_of(&homes[2]).await?,
     );
 
+    // THIS ASSERTION HAS ALREADY CAUGHT ITS BUG ONCE, on 2026-08-28.
+    //
+    // B adopted A's file, marked its entry durable, and forwarded nothing for
+    // five minutes. `complete_inbound` ends by marking the generation durable,
+    // which is true and answers a different question: durable means written
+    // down, not everybody has been told. The fix is `note_inbound_adoption`.
+    //
+    // It stayed live because a fully-meshed fleet never relays, so every direct
+    // pair looked healthy, and because this test is green on ubuntu.
+    //
     // Outward: born on A, must reach C through B.
     std::fs::write(folders[0].join("relayed.md"), b"through the middle")?;
     reload_sync(&homes[0]).await?;

@@ -13,6 +13,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The watcher is where the platforms genuinely differ, and for two days this
+  # workflow certified a real bug as fixed because it only ever asked ubuntu.
+  #
+  # `a_change_and_a_delete_cross_a_peer_that_is_only_a_relay` was red on macOS
+  # and green here, at the same commit, while the forwarding defect it names was
+  # live in the fleet. A node adopted a change and forwarded it to nobody for
+  # five minutes. The test existed, this workflow ran it, and it passed.
+  #
+  # The step at the bottom of the ubuntu job proves every tests/*.rs target runs
+  # SOMEWHERE. It cannot see this axis: it proves coverage on the one platform it
+  # knows about. That is the same failure one dimension over.
+  #
+  # Scoped deliberately rather than mirroring the whole matrix. macOS runners
+  # bill at a multiple of Linux, so this runs the library tests and the
+  # adversarial folder-sync matrix — the watcher-sensitive ones — and not the
+  # rest. Widen it when something escapes it, not before.
+  macos:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Includes the watcher tests that are #[cfg]-gated per platform and so
+      # have never executed in CI at all.
+      - name: Library and model tests
+        run: timeout 10m cargo test --locked --lib
+
+      - name: Adversarial folder sync matrix
+        run: timeout 15m cargo test --locked --test folder_sync -- --test-threads=1
+
   deterministic:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -70,6 +102,11 @@ jobs:
       - name: Every test target is accounted for
         run: |
           set -euo pipefail
+          # This proves every target runs on THIS platform. It says nothing
+          # about the others, which is how a macOS-only failure stayed invisible
+          # for two days at a green commit. The `macos` job above is the other
+          # half and it is deliberately narrower than this one.
+          #
           # Named here, deliberately not run, with the reason. Shorten this list.
           not_yet_verified_on_linux="lifecycle pathwatch_slice shell"
           missing=""
