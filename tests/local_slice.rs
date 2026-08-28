@@ -1559,6 +1559,12 @@ async fn tcp_tunnel_pair() -> Result<(
     let (echo_addr, hits, task) = spawn_tcp_echo_service().await?;
     run_fabric(&a_home, &["expose", "web", "--tcp", echo_addr.as_str()])?;
     let local_addr = run_fabric(&b_home, &["dial", "node-a", "web", "--tcp", "127.0.0.1:0"])?;
+    // Wait for the tunnel to actually carry before handing it over. `dial`
+    // binds the local port immediately, so a caller that connects straight away
+    // is racing the first attach. Under a loaded machine that race is lost, and
+    // the resulting timeout looks like a recovery failure in whichever test
+    // happens to be running.
+    time_until_tunnel_carries(&local_addr, b"ready").await?;
     Ok((a_dir, b_dir, a_home, b_home, node_a, node_b, local_addr, hits, task))
 }
 
@@ -1823,6 +1829,7 @@ async fn a_peer_restarting_mid_session_restores_service_without_intervention() -
     let (echo_addr, hits, task) = spawn_tcp_echo_service().await?;
     run_fabric(&a_home, &["expose", "web", "--tcp", echo_addr.as_str()])?;
     let local_addr = run_fabric(&b_home, &["dial", "node-a", "web", "--tcp", "127.0.0.1:0"])?;
+    time_until_tunnel_carries(&local_addr, b"ready").await?;
 
     let mut live = TcpStream::connect(&local_addr).await?;
     tcp_stream_round_trip(&mut live, b"before-restart").await?;
