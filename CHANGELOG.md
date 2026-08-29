@@ -247,6 +247,24 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **A path outside an entry's include is no longer deleted on every peer when
+  it is deleted locally.** Narrowing an include was already safe on its own:
+  the scan refuses to treat a path that left the include as a delete. But
+  materialization still recorded every manifest path it found on disk as
+  observed, include or not, so the excluded path stayed protected. The pass
+  after an operator deleted it locally saw "protected and not on disk", wrote a
+  tombstone at a higher version, and every peer deleted its copy. This is
+  finding 2 of the 2026-08-29 review, and the same class as the 2026-08-25
+  loss, one function later. `materialize_tracked` now consults the include
+  globs the way the scan does.
+
+  **Behaviour change:** a machine no longer WRITES a path its own include does
+  not select, and it no longer applies a peer's tombstone for one. Such a path
+  is left exactly as the operator left it. It stays in the manifest, so
+  widening the include later materializes it on the next pass without a resend.
+  Previously the receiver wrote the file and never scanned it, which is exactly
+  the protected-but-excluded shape above.
+
 - **Mixed-version shells no longer fail on the first frame.** `fabric/shell/0`
   is a wire contract with every released Fabric and carries one-shot raw
   framing only; the resumable shell moved to its own `fabric/shell/1` ALPN.
