@@ -377,7 +377,29 @@ fn sync_findings(sync: &SyncFact) -> Vec<Finding> {
     for (peer, reason) in &sync.stopped {
         // Denied waits for a person; unreachable waits for the network. Telling
         // them apart is the difference between a chore and weather.
-        let finding = if reason == "denied" {
+        let finding = if reason == "unknown" && peer == "*" {
+            Finding::new(
+                "sync",
+                Verdict::Problem,
+                format!(
+                    "{name} selects every trusted peer and this machine has no trusted \
+                     peer, so it is syncing with nobody"
+                ),
+            )
+            .with_action("fabric add <nodeid> <name> for at least one peer")
+        } else if reason == "unknown" {
+            Finding::new(
+                "sync",
+                Verdict::Problem,
+                format!(
+                    "{name} names a peer {peer} that is not in peers.toml, so it is \
+                     syncing with nobody by that name. This will not fix itself"
+                ),
+            )
+            .with_action(format!(
+                "fix the name in syncs.toml, or `fabric add <nodeid> {peer}`"
+            ))
+        } else if reason == "denied" {
             Finding::new(
                 "sync",
                 Verdict::Problem,
@@ -684,6 +706,53 @@ mod tests {
             );
         }
         assert_eq!(exit_code(&findings), 1, "unknown must count as attention");
+    }
+
+    /// Finding 3 of the 2026-08-29 review. A peer named in `syncs.toml` that is
+    /// not in `peers.toml` is a third kind of stopped: not a refusal, not the
+    /// network, a name nobody answers to. It needs a person to fix a file, and
+    /// it must not be reported as "unreachable ... clears when it comes back",
+    /// because it never will.
+    #[test]
+    fn a_sync_peer_that_resolves_to_nobody_is_named_as_such() {
+        let mut facts = configured();
+        facts.syncs[0].stopped = vec![("hetzner".to_string(), "unknown".to_string())];
+        let findings = diagnose(&facts);
+        let syncs = find(&findings, "sync");
+        let unknown = syncs
+            .iter()
+            .find(|f| f.detail.contains("hetzner"))
+            .expect("no finding for the unknown peer");
+        assert_eq!(unknown.verdict, Verdict::Problem);
+        assert!(
+            unknown.detail.contains("peers.toml") && !unknown.detail.contains("unreachable"),
+            "an unknown peer was described as a network fault: {}",
+            unknown.detail
+        );
+        assert!(
+            unknown
+                .action
+                .as_deref()
+                .is_some_and(|a| a.contains("syncs.toml") || a.contains("fabric add")),
+            "the action must point at the file to fix: {:?}",
+            unknown.action
+        );
+        assert!(
+            !syncs.iter().any(|f| f.detail.contains("syncing with every peer")),
+            "an entry syncing with nobody was still called clean and syncing with every peer"
+        );
+
+        // The wildcard form: nothing trusted at all.
+        facts.syncs[0].stopped = vec![("*".to_string(), "unknown".to_string())];
+        let findings = diagnose(&facts);
+        let syncs = find(&findings, "sync");
+        assert!(
+            syncs
+                .iter()
+                .any(|f| f.verdict == Verdict::Problem && f.detail.contains("no trusted peer")),
+            "a wildcard with no peers was not named: {:?}",
+            syncs.iter().map(|f| &f.detail).collect::<Vec<_>>()
+        );
     }
 
     #[test]

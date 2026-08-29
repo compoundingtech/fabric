@@ -198,10 +198,37 @@ pub struct PeerRef {
 
 /// The swappable transport that carries a client-side reconcile to a peer. The
 /// daemon implements this over iroh; tests implement it in-process.
+/// What an entry's peer selector resolves to right now, INCLUDING what it did
+/// not resolve to.
+///
+/// A selector that matches nothing used to be dropped here without a record.
+/// The engine then looped over the peers that did resolve, recorded nothing for
+/// the one that did not, and every status surface called the entry clean and
+/// syncing with every peer. That is what a typo in `syncs.toml` looks like from
+/// day one, and what renaming a peer with `fabric add` looks like the moment
+/// after. Finding 3 of the 2026-08-29 review.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedPeers {
+    pub peers: Vec<PeerRef>,
+    /// Selectors from the entry's `peers` that name no peer in the book. For a
+    /// wildcard that selects nobody at all, the single selector `"*"`.
+    pub unresolved: Vec<String>,
+}
+
+impl ResolvedPeers {
+    pub fn all(peers: Vec<PeerRef>) -> Self {
+        Self {
+            peers,
+            unresolved: Vec::new(),
+        }
+    }
+}
+
 pub trait SyncTransport: Send + Sync + 'static {
     /// The peers an entry's selector resolves to right now (membership follows
-    /// `peers.toml` for the `"*"` wildcard).
-    fn peers_for(&self, peers: &SyncPeers) -> impl Future<Output = Vec<PeerRef>> + Send;
+    /// `peers.toml` for the `"*"` wildcard), and the selectors it could not
+    /// resolve, which the engine reports rather than forgets.
+    fn peers_for(&self, peers: &SyncPeers) -> impl Future<Output = ResolvedPeers> + Send;
 
     /// Run a client reconcile for sync `name` against `peer`, mutating `node`.
     fn reconcile(
@@ -581,6 +608,9 @@ pub enum PeerSyncState {
     Ok,
     Refused,
     Unreachable,
+    /// The selector names no peer in `peers.toml`. Not a refusal and not the
+    /// network: a name nobody answers to, which a person has to fix in a file.
+    Unknown,
 }
 
 impl PeerSyncState {
@@ -589,6 +619,7 @@ impl PeerSyncState {
             PeerSyncState::Ok => "ok",
             PeerSyncState::Refused => "denied",
             PeerSyncState::Unreachable => "unreachable",
+            PeerSyncState::Unknown => "unknown",
         }
     }
 }
@@ -1076,7 +1107,22 @@ impl<T: SyncTransport> SyncEngine<T> {
             (baseline, manifest)
         };
 
-        let peers = self.transport.peers_for(&entry.config.peers).await;
+        let ResolvedPeers { peers, unresolved } =
+            self.transport.peers_for(&entry.config.peers).await;
+        {
+            // A selector that resolves to nobody is a stopped peer with a
+            // reason, recorded under the name a person wrote. And a state
+            // outlives its peer otherwise: a peer removed from the book would
+            // keep its last verdict for ever, so keep only what this pass can
+            // still speak for.
+            let mut states = entry.peer_state.lock().unwrap();
+            states.retain(|key, _| {
+                peers.iter().any(|peer| peer.id == *key) || unresolved.contains(key)
+            });
+            for selector in &unresolved {
+                states.insert(selector.clone(), PeerSyncState::Unknown);
+            }
+        }
         // The whole peer step, every peer together. Timed as one phase because
         // that is the unit a reader can act on; a per-peer split is a later
         // change if this turns out to be where the time goes.
@@ -4479,11 +4525,11 @@ mod tests {
     struct AlwaysFailingTransport;
 
     impl SyncTransport for AlwaysFailingTransport {
-        async fn peers_for(&self, _peers: &SyncPeers) -> Vec<PeerRef> {
-            vec![PeerRef {
+        async fn peers_for(&self, _peers: &SyncPeers) -> ResolvedPeers {
+            ResolvedPeers::all(vec![PeerRef {
                 id: "a-peer-that-does-not-serve-this-entry".to_string(),
                 addr: None,
-            }]
+            }])
         }
 
         async fn reconcile(
@@ -4508,8 +4554,9 @@ mod tests {
     }
 
     impl SyncTransport for LoopbackTransport {
-        async fn peers_for(&self, _peers: &SyncPeers) -> Vec<PeerRef> {
-            self.peers
+        async fn peers_for(&self, _peers: &SyncPeers) -> ResolvedPeers {
+            ResolvedPeers::all(
+                self.peers
                 .lock()
                 .unwrap()
                 .iter()
@@ -4517,7 +4564,8 @@ mod tests {
                     id: peer.id.clone(),
                     addr: None,
                 })
-                .collect()
+                .collect(),
+            )
         }
 
         async fn reconcile(
@@ -4587,8 +4635,9 @@ mod tests {
     }
 
     impl SyncTransport for EngineLoopbackTransport {
-        async fn peers_for(&self, _peers: &SyncPeers) -> Vec<PeerRef> {
-            self.peers
+        async fn peers_for(&self, _peers: &SyncPeers) -> ResolvedPeers {
+            ResolvedPeers::all(
+                self.peers
                 .lock()
                 .unwrap()
                 .iter()
@@ -4597,7 +4646,8 @@ mod tests {
                     id: peer.id.clone(),
                     addr: None,
                 })
-                .collect()
+                .collect(),
+            )
         }
 
         async fn reconcile(
@@ -4757,6 +4807,88 @@ mod tests {
         );
     }
 
+
+    /// Finding 3 of the 2026-08-29 review, at the engine. A transport that
+    /// resolves one selector and not the other must leave the entry reporting
+    /// the unresolved one as stopped, with the reason a person can act on.
+    /// And when the selector resolves on a later pass, the state must go.
+    struct HalfResolvedTransport {
+        resolve_nobody: std::sync::atomic::AtomicBool,
+    }
+
+    impl SyncTransport for HalfResolvedTransport {
+        async fn peers_for(&self, _peers: &SyncPeers) -> ResolvedPeers {
+            if self.resolve_nobody.load(Ordering::SeqCst) {
+                ResolvedPeers::all(vec![peer("nobody")])
+            } else {
+                ResolvedPeers {
+                    peers: Vec::new(),
+                    unresolved: vec!["nobody".to_string()],
+                }
+            }
+        }
+
+        async fn reconcile(
+            &self,
+            _peer: PeerRef,
+            _name: String,
+            _node: Arc<Mutex<SyncNode>>,
+        ) -> Result<Reconciled> {
+            Ok(Reconciled {
+                wire_bytes: 0,
+                pulled: 0,
+                pushed: 0,
+                bytes: 0,
+                fallbacks: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_selector_that_resolves_to_nobody_is_reported_and_then_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.md"), b"seed").unwrap();
+        write_bus_sync(dir.path(), &root);
+        let transport = Arc::new(HalfResolvedTransport {
+            resolve_nobody: std::sync::atomic::AtomicBool::new(false),
+        });
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            transport.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        async fn stopped(engine: &SyncEngine<HalfResolvedTransport>) -> Vec<(String, String)> {
+            engine
+                .status()
+                .await
+                .into_iter()
+                .find(|entry| entry.name == "bus")
+                .expect("no status for the entry")
+                .stopped_peers
+        }
+        engine.sync_once("bus").await.unwrap();
+        assert_eq!(
+            stopped(&engine).await,
+            vec![("nobody".to_string(), "unknown".to_string())],
+            "an unresolved selector must be reported as stopped, by name"
+        );
+
+        // The operator adds the peer. The next pass resolves it, reconciles it,
+        // and the stale verdict must not outlive the fix.
+        transport.resolve_nobody.store(true, Ordering::SeqCst);
+        engine.sync_once("bus").await.unwrap();
+        assert_eq!(
+            stopped(&engine).await,
+            Vec::<(String, String)>::new(),
+            "a selector that now resolves is still reported as unknown"
+        );
+    }
     /// And a healthy entry must stay at zero, or the counter is just noise and
     /// a reader learns to ignore it.
     #[tokio::test]

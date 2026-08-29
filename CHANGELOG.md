@@ -247,6 +247,19 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **A sync entry that names a peer not in `peers.toml` says so instead of
+  reporting healthy.** A selector that matched no peer was dropped without a
+  record. The engine looped over the peers that did resolve, recorded nothing for
+  the one that did not, and `fabric sync ls` and `fabric doctor` both called the
+  entry clean and syncing with every peer while two machines silently stopped
+  converging. A typo in `syncs.toml` did it from day one; renaming a peer with
+  `fabric add` did it the moment after. Finding 3 of the 2026-08-29 review.
+
+  The entry now reports the selector under `stopped=` with the reason `unknown`,
+  next to `denied` and `unreachable`, and doctor names the file to fix. A
+  wildcard entry on a machine that trusts no peer reports `*:unknown`. A stopped
+  state also no longer outlives its peer: a peer removed from `peers.toml` drops
+  out of `stopped=` on the next pass instead of keeping its last verdict.
 - **The daemon no longer holds every version of every synced file in memory
   until restart.** The content store only grew: `local_write` and the wire
   receive path inserted, and nothing removed. Every superseded version of every

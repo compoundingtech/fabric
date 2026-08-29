@@ -1385,6 +1385,116 @@ async fn a_peer_holding_a_stale_cursor_still_repairs_a_node_that_fell_behind() -
     Ok(())
 }
 
+/// An explicit peer list, as written in `syncs.toml`.
+fn write_sync_with_peers(home_dir: &Path, folder: &Path, policy: &str, peers: &[&str]) {
+    let list = peers
+        .iter()
+        .map(|p| format!("{p:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let toml = format!(
+        "[[sync]]\nname = \"shared\"\nfolder = {folder:?}\npeers = [{list}]\npolicy = {policy:?}\n"
+    );
+    std::fs::write(home_dir.join("syncs.toml"), toml).unwrap();
+}
+
+/// Read the `stopped` list for the `shared` entry, polling until it is
+/// non-empty or the budget is spent. Returns what it last saw either way.
+async fn stopped_peers_of(home: &FabricHome) -> Vec<(String, String)> {
+    let mut stopped = Vec::new();
+    for _ in 0..40 {
+        stopped = match send_control(home, ControlRequest::SyncStatus).await {
+            Ok(fabric::control::ControlResponse::SyncStatus { entries }) => entries
+                .into_iter()
+                .find(|e| e.name == "shared")
+                .map(|e| e.stopped_peers)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        if !stopped.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    stopped
+}
+
+/// Finding 3 of the 2026-08-29 review. A selector that matches no peer in
+/// `peers.toml` was dropped without a record. The engine looped over the peers
+/// that did resolve, recorded nothing for the one that did not, and every
+/// status surface called the entry clean and syncing with every peer.
+///
+/// That is what a typo in `syncs.toml` looks like from day one, and what
+/// renaming a peer with `fabric add` looks like the moment after. Two machines
+/// stop converging and nothing says so.
+///
+/// CONTROL: the peer that DOES resolve must still receive the file, so the test
+/// cannot pass by the whole entry being broken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_entry_that_names_an_unknown_peer_says_so() -> Result<()> {
+    let _guard = FOLDER_SYNC_LOCK.lock().await;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let a_home = FabricHome::new(a_dir.path());
+    let b_home = FabricHome::new(b_dir.path());
+    let a_folder = a_dir.path().join("shared");
+    let b_folder = b_dir.path().join("shared");
+    std::fs::create_dir_all(&a_folder)?;
+    std::fs::create_dir_all(&b_folder)?;
+    // A names a real peer and one that is nowhere in its peers.toml.
+    write_sync_with_peers(a_dir.path(), &a_folder, "bus", &["node-b", "nobody"]);
+    write_sync(b_dir.path(), &b_folder, "bus");
+
+    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_b = FabricNode::start(b_home.clone()).await?;
+    trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
+    trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
+
+    std::fs::write(a_folder.join("arrives.md"), b"via node-b")?;
+    reload_sync(&a_home).await?;
+    assert!(
+        wait_for_file(&b_folder.join("arrives.md"), b"via node-b").await,
+        "POSITIVE CONTROL FAILED: the resolvable peer never received the file, \
+         so the entry is broken for a reason this test is not about"
+    );
+
+    let stopped = stopped_peers_of(&a_home).await;
+    assert_eq!(
+        stopped,
+        vec![("nobody".to_string(), "unknown".to_string())],
+        "the entry names a peer that is not in peers.toml and reports {stopped:?}. \
+         It is syncing with nobody by that name, and nothing said so"
+    );
+
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
+/// The wildcard form of the same silence: `"*"` on a machine that trusts no
+/// peer at all selects nobody, and used to read as clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wildcard_entry_with_no_trusted_peers_says_so() -> Result<()> {
+    let _guard = FOLDER_SYNC_LOCK.lock().await;
+    let a_dir = TempDir::new()?;
+    let a_home = FabricHome::new(a_dir.path());
+    let a_folder = a_dir.path().join("shared");
+    std::fs::create_dir_all(&a_folder)?;
+    write_sync(a_dir.path(), &a_folder, "bus");
+    let node_a = FabricNode::start(a_home.clone()).await?;
+    std::fs::write(a_folder.join("lonely.md"), b"nobody to send to")?;
+    reload_sync(&a_home).await?;
+
+    let stopped = stopped_peers_of(&a_home).await;
+    assert_eq!(
+        stopped,
+        vec![("*".to_string(), "unknown".to_string())],
+        "a wildcard that selects no peer reported {stopped:?} instead of saying so"
+    );
+    node_a.shutdown().await?;
+    Ok(())
+}
+
 /// A PARTIAL denial must not read as a healthy entry.
 ///
 /// This is the failure that will actually happen. Somebody writes
