@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::IsTerminal,
     path::PathBuf,
@@ -17,7 +17,8 @@ use fabric::{
     },
     control::{ControlRequest, ControlResponse, PeerReachability},
     daemon::{
-        DaemonOptions, FabricNode, init_daemon_tracing, run_daemon_with_options, send_control,
+        BUILTIN_SERVICE_NAMES, DaemonOptions, FabricNode, init_daemon_tracing,
+        run_daemon_with_options, send_control,
     },
     exec,
     service::{self, ServiceInstallOptions},
@@ -77,8 +78,11 @@ enum Commands {
     Addr,
     /// Show daemon state and echo-ping reachability for trusted peers.
     Status,
-    /// List trusted peers.
-    Peers,
+    /// List trusted peers or make legacy permissions explicit.
+    Peers {
+        #[command(subcommand)]
+        command: Option<PeerCommands>,
+    },
     /// Reload peers.toml into the running daemon.
     ReloadPeers,
     /// Trust a peer NodeID and optionally assign a local name.
@@ -330,6 +334,12 @@ enum Commands {
 }
 
 #[derive(Debug, Subcommand)]
+enum PeerCommands {
+    /// Preserve every service available now, then make later services opt-in.
+    MakeExplicit,
+}
+
+#[derive(Debug, Subcommand)]
 enum KeyCommands {
     /// Generate an identity file without starting a daemon.
     Gen {
@@ -496,22 +506,51 @@ async fn main() -> Result<()> {
                         response => bail!("unexpected daemon response: {response:?}"),
                     }
                 }
-                Commands::Peers => {
-                    let book = PeerBook::load(&home)?;
-                    for peer in book.peers() {
-                        let name = peer.name.clone().unwrap_or_default();
-                        // The effective policy, shown rather than assumed. A
-                        // peer written before permissions existed reads as
-                        // `unrestricted (legacy)`, so nobody has to infer what
-                        // an absent field means.
-                        let policy = match &peer.allow {
-                            None => "unrestricted (legacy)".to_string(),
-                            Some(allow) if allow.is_empty() => "no services".to_string(),
-                            Some(allow) => allow.join(","),
-                        };
-                        println!("{}\t{}\t{}", peer.id, name, policy);
+                Commands::Peers { command } => match command {
+                    None => {
+                        let book = PeerBook::load(&home)?;
+                        for peer in book.peers() {
+                            let name = peer.name.clone().unwrap_or_default();
+                            // The effective policy, shown rather than assumed. A
+                            // peer written before permissions existed reads as
+                            // `unrestricted (legacy)`, so nobody has to infer what
+                            // an absent field means.
+                            let policy = match &peer.allow {
+                                None => "unrestricted (legacy)".to_string(),
+                                Some(allow) if allow.is_empty() => "no services".to_string(),
+                                Some(allow) => allow.join(","),
+                            };
+                            println!("{}\t{}\t{}", peer.id, name, policy);
+                        }
                     }
-                }
+                    Some(PeerCommands::MakeExplicit) => {
+                        let mut book = PeerBook::load(&home)?;
+                        let legacy = book
+                            .peers()
+                            .iter()
+                            .filter(|peer| peer.allow.is_none())
+                            .count();
+                        if legacy == 0 {
+                            println!("updated\t0");
+                        } else {
+                            // The daemon is the authority for exposures at this
+                            // instant. config.toml omits ephemeral exposures, so
+                            // reading only that file could narrow access now.
+                            let exposed = match send_control(&home, ControlRequest::Status).await? {
+                                ControlResponse::Status {
+                                    exposed_protocols, ..
+                                } => exposed_protocols,
+                                response => bail!("unexpected daemon response: {response:?}"),
+                            };
+                            let services = explicit_service_names(&exposed);
+                            let updated = book.make_legacy_permissions_explicit(&services);
+                            book.save(&home)?;
+                            send_control(&home, ControlRequest::ReloadPeers).await?;
+                            println!("updated\t{updated}");
+                            println!("allow\t{}", services.join(","));
+                        }
+                    }
+                },
                 Commands::ReloadPeers => {
                     send_control(&home, ControlRequest::ReloadPeers).await?;
                     println!("reloaded");
@@ -692,6 +731,7 @@ async fn main() -> Result<()> {
                     ephemeral,
                     command,
                 } => {
+                    let exposed_protocol = protocol.clone();
                     let request = expose_request(
                         protocol,
                         socket,
@@ -702,6 +742,13 @@ async fn main() -> Result<()> {
                         command,
                     )?;
                     send_control(&home, request).await?;
+                    if let Err(error) =
+                        warn_if_no_trusted_peer_can_reach(&home, &exposed_protocol)
+                    {
+                        eprintln!(
+                            "fabric: exposure succeeded, but its peer permissions could not be checked: {error:#}"
+                        );
+                    }
                     println!("exposed");
                 }
                 Commands::Unexpose { protocol } => {
@@ -1285,6 +1332,107 @@ fn warn_if_permissions_would_stop_a_sync(
     );
     eprintln!("fabric: add `sync` to --allow if that is not what you meant.");
     Ok(())
+}
+
+/// The explicit permission list that preserves every service available now.
+///
+/// Runtime status supplies custom exposures. This includes ephemeral services,
+/// which config.toml cannot supply. A sorted set makes the file stable.
+fn explicit_service_names(exposed_protocols: &[String]) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    names.extend(BUILTIN_SERVICE_NAMES.iter().map(|name| (*name).to_string()));
+    names.extend(exposed_protocols.iter().cloned());
+    names.into_iter().collect()
+}
+
+/// Return every peer that needs `service` added when nobody can reach it.
+fn peers_needing_new_service(book: &PeerBook, service: &str) -> Option<Vec<String>> {
+    if book.peers().is_empty() {
+        return None;
+    }
+    let mut denied = book
+        .peers()
+        .iter()
+        .filter(|peer| book.may(&peer.id, service).is_err())
+        .map(|peer| peer.name.clone().unwrap_or_else(|| peer.id.to_string()))
+        .collect::<Vec<_>>();
+    if denied.len() != book.peers().len() {
+        return None;
+    }
+    denied.sort();
+    Some(denied)
+}
+
+/// Warn after an exposure succeeds when its ACL makes it unreachable.
+fn warn_if_no_trusted_peer_can_reach(home: &FabricHome, service: &str) -> Result<()> {
+    let book = PeerBook::load(home)?;
+    let Some(peers) = peers_needing_new_service(&book, service) else {
+        return Ok(());
+    };
+    eprintln!(
+        "fabric: no trusted peer may reach {service:?}; add it to allow for: {}",
+        peers.join(", ")
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod permission_helpers_tests {
+    use super::*;
+
+    fn peer_book(legacy: bool) -> PeerBook {
+        let mut book = PeerBook::default();
+        let first = iroh::SecretKey::generate().public();
+        let second = iroh::SecretKey::generate().public();
+        book.add_with_allow(
+            first,
+            Some("droppy".into()),
+            None,
+            if legacy { None } else { Some(vec!["sync".into()]) },
+        );
+        book.add_with_allow(
+            second,
+            Some("hetz".into()),
+            None,
+            Some(vec!["sync".into()]),
+        );
+        book
+    }
+
+    #[test]
+    fn explicit_names_include_builtins_and_live_exposures_once() {
+        let names = explicit_service_names(&[
+            "st-sync".into(),
+            "pty-remote".into(),
+            "st-sync".into(),
+        ]);
+        for required in [
+            "shell",
+            "exec",
+            "sync",
+            "echo",
+            "send-file",
+            "st-sync",
+            "pty-remote",
+        ] {
+            assert!(names.iter().any(|name| name == required), "missing {required}");
+        }
+        let unique = names.iter().collect::<BTreeSet<_>>();
+        assert_eq!(unique.len(), names.len());
+    }
+
+    #[test]
+    fn a_new_exposure_warns_only_when_every_peer_is_denied() {
+        assert_eq!(
+            peers_needing_new_service(&peer_book(false), "web"),
+            Some(vec!["droppy".into(), "hetz".into()])
+        );
+        assert_eq!(
+            peers_needing_new_service(&peer_book(true), "web"),
+            None,
+            "a legacy peer can reach the exposure, so the warning would be false"
+        );
+    }
 }
 
 /// The first 12 characters of the lattice-point digest, which is enough to

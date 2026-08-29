@@ -276,11 +276,10 @@ it has opted in. They are independent (allowing one does not allow the other):
 **Check what a daemon serves** by running `fabric status` on it — it prints
 `shell allowed` / `disabled` and `exec allowed` / `disabled`.
 
-These flags are **daemon-global**: enabling `allow_shell` / `allow_exec` opens
-that capability to **every** trusted peer, not a chosen subset. Restricting shell
-or exec to specific peers is not supported today — it is all-or-nothing per
-capability, gated only by the peer allow-list (who is trusted at all). If you need
-per-peer scoping, keep the capability off and reach for it deliberately.
+These flags are **daemon-global** and only subtract access. A peer also needs its
+own `peers.toml` `allow` list to contain `shell` or `exec`. A legacy peer with no
+`allow` field remains unrestricted at this gate for compatibility. It still
+cannot use shell or exec unless the daemon-global flag enables that capability.
 
 Enable them with flags on `fabric service install`:
 
@@ -651,6 +650,17 @@ fabric peers
 Read and list the entries in the authoritative `peers.toml`.
 
 ```sh
+fabric peers make-explicit
+```
+
+Replace each legacy unrestricted peer with an explicit list that preserves all
+services available now. The command reads the running daemon's status, so the
+list includes the five built-ins and every persisted or ephemeral exposure on
+this machine. It then writes `peers.toml` and reloads the daemon. Existing
+explicit lists stay unchanged. A service exposed later is denied until it is
+added to that peer's list.
+
+```sh
 fabric reload-peers
 ```
 
@@ -740,8 +750,10 @@ the daemon starts. That same file also stores shell policy; `fabric add` writes
 the separate authoritative `peers.toml`. Use `--ephemeral` for short-lived test
 exposes that should not survive a daemon restart.
 
-Only allow-listed remote NodeIDs are accepted before the local socket is opened
-or the local TCP connection / exec command is started.
+Only permitted remote NodeIDs are accepted before the local socket is opened or
+the local TCP connection or exec command starts. If no trusted peer can reach a
+new exposure, `fabric expose` warns once and names the peers that need the new
+service in their `allow` lists.
 
 ```sh
 fabric unexpose <protocol>
@@ -1149,18 +1161,20 @@ human-editable and can be provisioned before Fabric ever runs. Each
   `fabric ping workstation`.
 - `addr` (optional): an iroh `EndpointAddr` hint whose `id` must match the
   peer's `id`.
+- `allow` (optional): the service names this peer may reach. Omit it for legacy
+  unrestricted behavior. An empty list permits no service.
 
 NodeIDs and names must be unique. Normal cross-machine setup should omit
 `addr`; NodeID-based iroh discovery supplies the current addresses.
 
 Trust is local and based on NodeID, not alias: `name` is only a command-line
-label. Each machine must independently list the other NodeID. A trusted peer can
-reach built-in Fabric protocols and explicitly exposed services; if this daemon
-also enables the global `allow_shell` or `allow_exec` capability, every trusted
-peer can use that enabled capability. Fabric does not currently support
-per-peer shell or exec grants.
+label. Each machine must independently list the other NodeID. An optional
+`allow` list limits that peer to named services such as `sync`, `shell`, `exec`,
+or an exposure name. A missing list keeps the legacy unrestricted behavior. The
+daemon-global shell and exec flags still apply and cannot be overridden by a
+peer entry.
 
-The usual file contains only NodeIDs and optional names:
+A file can mix legacy entries with explicit permissions:
 
 ```toml
 [[peers]]
@@ -1170,6 +1184,7 @@ name = "workstation"
 [[peers]]
 id = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 name = "server"
+allow = ["echo", "exec", "send-file", "shell", "sync", "web"]
 ```
 
 An explicit address hint, mainly useful for deterministic tests, has this exact

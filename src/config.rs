@@ -506,6 +506,25 @@ impl PeerBook {
             .sort_by_key(|peer| (peer.name.clone().unwrap_or_default(), peer.id.to_string()));
     }
 
+    /// Replace each legacy unrestricted entry with today's explicit services.
+    ///
+    /// Existing explicit entries stay unchanged. The caller must supply the
+    /// built-in names and the daemon's live exposure names. This preserves all
+    /// access that exists now while making a later service opt-in.
+    pub fn make_legacy_permissions_explicit(&mut self, services: &[String]) -> usize {
+        let mut explicit = services.to_vec();
+        explicit.sort();
+        explicit.dedup();
+        let mut changed = 0;
+        for peer in &mut self.peers {
+            if peer.allow.is_none() {
+                peer.allow = Some(explicit.clone());
+                changed += 1;
+            }
+        }
+        changed
+    }
+
     pub fn remove(&mut self, peer: &str) -> bool {
         let before = self.peers.len();
         if let Ok(id) = EndpointId::from_str(peer) {
@@ -900,6 +919,93 @@ mod tests {
         assert_eq!(book.may(&hetz, "sync"), Ok(()));
         assert_eq!(book.may(&hetz, "shell"), Ok(()));
         assert_eq!(book.may(&hetz, "anything-exposed-later"), Ok(()));
+    }
+
+    /// The 0.10 groundwork property, proven rather than asserted: writing a
+    /// legacy entry out as an explicit list of every service that exists TODAY
+    /// preserves every one of them, and changes exactly one thing — a service
+    /// exposed AFTER the transcription is no longer auto-granted.
+    ///
+    /// The second half is the half that matters. Every-current-service-still-Ok
+    /// would pass even if `may` ignored the allow field; the future service
+    /// being Ok under legacy and Denied under the explicit list is what proves
+    /// the gate is live and the transcription is real. This is the spec the
+    /// make-explicit helper must satisfy: the list it writes is exactly the
+    /// service names `service_name_for_alpn` produces plus this machine's
+    /// current exposures, and nothing narrows.
+    #[test]
+    fn an_explicit_list_of_todays_services_preserves_today_and_makes_tomorrow_opt_in() {
+        // The built-in service vocabulary the gate checks (see
+        // daemon::service_name_for_alpn). A real transcription also appends this
+        // machine's `fabric expose` names; omitting one of those would narrow by
+        // omission, which is why the helper reads them rather than hard-coding.
+        let today = ["shell", "exec", "sync", "echo", "send-file"];
+        let id = an_id(1);
+
+        let mut legacy = PeerBook::default();
+        legacy.add(id, Some("hetz".into()), None); // allow = None, unrestricted
+        let mut explicit = PeerBook::default();
+        explicit.add_with_allow(
+            id,
+            Some("hetz".into()),
+            None,
+            Some(today.iter().map(|s| s.to_string()).collect()),
+        );
+
+        for service in today {
+            assert_eq!(
+                legacy.may(&id, service),
+                Ok(()),
+                "legacy must reach {service} today"
+            );
+            assert_eq!(
+                explicit.may(&id, service),
+                Ok(()),
+                "the transcription must still reach {service}; it narrowed by omission"
+            );
+        }
+
+        // The one real difference, made visible instead of hidden.
+        assert_eq!(
+            legacy.may(&id, "exposed-tomorrow"),
+            Ok(()),
+            "legacy auto-grants a future service"
+        );
+        assert_eq!(
+            explicit.may(&id, "exposed-tomorrow"),
+            Err(Denied::NotPermitted {
+                service: "exposed-tomorrow".into()
+            }),
+            "the explicit list must make tomorrow opt-in — this is what proves the gate is live"
+        );
+    }
+
+    #[test]
+    fn make_explicit_changes_only_legacy_entries_and_keeps_every_named_service() {
+        let legacy = an_id(1);
+        let restricted = an_id(2);
+        let mut book = PeerBook::default();
+        book.add(legacy, Some("legacy".into()), None);
+        book.add_with_allow(
+            restricted,
+            Some("restricted".into()),
+            None,
+            Some(vec!["sync".into()]),
+        );
+
+        let changed = book.make_legacy_permissions_explicit(&[
+            "sync".into(),
+            "shell".into(),
+            "ephemeral-web".into(),
+            "sync".into(),
+        ]);
+        assert_eq!(changed, 1);
+        for service in ["sync", "shell", "ephemeral-web"] {
+            assert_eq!(book.may(&legacy, service), Ok(()));
+        }
+        assert!(book.may(&legacy, "exposed-tomorrow").is_err());
+        assert_eq!(book.may(&restricted, "sync"), Ok(()));
+        assert!(book.may(&restricted, "shell").is_err());
     }
 
     /// A peer WITH a list is deny by default, including for services this

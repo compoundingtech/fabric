@@ -57,6 +57,22 @@ use crate::{
 
 const BUILTIN_ECHO_ALPN: &[u8] = b"fabric/echo/0";
 const SYNC_ALPN: &[u8] = b"fabric/sync/1";
+const ECHO_SERVICE: &str = "echo";
+const SHELL_SERVICE: &str = "shell";
+const EXEC_SERVICE: &str = "exec";
+const SYNC_SERVICE: &str = "sync";
+
+/// Every built-in name accepted by a peer's explicit `allow` list.
+///
+/// A permission transcription uses this list plus the daemon's live exposure
+/// names. Keep it tied to `service_name_for_alpn`, which enforces the gate.
+pub const BUILTIN_SERVICE_NAMES: [&str; 5] = [
+    SHELL_SERVICE,
+    EXEC_SERVICE,
+    SYNC_SERVICE,
+    ECHO_SERVICE,
+    crate::sendfile::SERVICE,
+];
 const REACHABILITY_TIMEOUT: Duration = Duration::from_secs(3);
 const INCOMING_FAILURE_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const INCOMING_FAILURE_MAX_BACKOFF: Duration = Duration::from_secs(5);
@@ -3142,16 +3158,16 @@ impl DaemonState {
 /// service, not about which wire version negotiated it.
 fn service_name_for_alpn(alpn: &[u8]) -> String {
     if alpn == BUILTIN_ECHO_ALPN {
-        return "echo".to_string();
+        return ECHO_SERVICE.to_string();
     }
     if alpn == shell::SHELL_ALPN || alpn == shell::RESUMABLE_SHELL_ALPN {
-        return "shell".to_string();
+        return SHELL_SERVICE.to_string();
     }
     if alpn == exec::EXEC_ALPN {
-        return "exec".to_string();
+        return EXEC_SERVICE.to_string();
     }
     if alpn == SYNC_ALPN {
-        return "sync".to_string();
+        return SYNC_SERVICE.to_string();
     }
     if alpn == crate::sendfile::SEND_FILE_ALPN {
         return crate::sendfile::SERVICE.to_string();
@@ -6714,6 +6730,23 @@ mod tests {
         client.shutdown().await?;
         server.shutdown().await?;
         Ok(())
+    }
+
+    #[test]
+    fn explicit_acl_names_match_every_builtin_gate_name() {
+        let mapped = [
+            service_name_for_alpn(shell::SHELL_ALPN),
+            service_name_for_alpn(exec::EXEC_ALPN),
+            service_name_for_alpn(SYNC_ALPN),
+            service_name_for_alpn(BUILTIN_ECHO_ALPN),
+            service_name_for_alpn(crate::sendfile::SEND_FILE_ALPN),
+        ];
+        assert_eq!(mapped, BUILTIN_SERVICE_NAMES.map(str::to_string));
+        assert_eq!(
+            service_name_for_alpn(shell::RESUMABLE_SHELL_ALPN),
+            SHELL_SERVICE,
+            "both shell wire versions must use one permission name"
+        );
     }
 
     /// Finding 9 of the 2026-08-29 review. When the OS network monitor stops,

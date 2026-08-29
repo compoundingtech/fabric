@@ -149,6 +149,18 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Added
 
+- **Legacy peer permissions can become explicit without narrowing access now.**
+  `fabric peers make-explicit` reads the running daemon's live exposures, adds
+  the five built-in service names, and writes that list to every peer whose
+  `allow` field is absent. Persisted and ephemeral exposures are both included.
+  Existing explicit lists stay unchanged. Access available now stays available;
+  a service exposed later becomes opt-in instead of being granted silently.
+
+- **A new unreachable exposure says so at creation time.** After `fabric expose`
+  succeeds, it warns when every trusted peer's explicit list denies the service.
+  The one-line warning names the peers that need the service added. The warning
+  does not refuse the exposure.
+
 - **Durable connection telemetry.** `fabric status` now reports, per peer, how
   many times a session lost its transport, how many came back, how many gave
   up, and how long the reconnect took. The counters persist in
