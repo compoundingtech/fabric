@@ -40,6 +40,10 @@ pub struct SyncNode {
     author: Author,
     manifest: Manifest,
     content: HashMap<ContentHash, Vec<u8>>,
+    /// The include globs this node's entry selects, if any. A receive-side
+    /// boundary: `adopt_from_peer` will not take a path outside it. `None`
+    /// means no include is configured, so every path is in scope.
+    include: Option<Vec<String>>,
     /// Which paths changed here, and which peer has seen them.
     changes: ChangeBuffer,
     /// Payloads this node has SENT that carried its entire manifest.
@@ -117,6 +121,7 @@ impl SyncNode {
             author,
             manifest: Manifest::new(),
             content: HashMap::new(),
+            include: None,
             changes: ChangeBuffer::new(),
             full_payload_sends: 0,
         }
@@ -450,12 +455,61 @@ impl SyncNode {
     /// adopted. Content for any newly-present entry is fetched separately (over
     /// the wire) or is already held; an entry with no available content simply
     /// does not materialize until its bytes arrive.
+    /// Set the receive-side include boundary this node enforces on peer
+    /// adopts. Called from the engine when the node is built from its entry
+    /// config, and again on every reload, so it always reflects the current
+    /// `syncs.toml`.
+    pub fn set_include(&mut self, include: Option<Vec<String>>) {
+        self.include = include;
+    }
+
+    fn peer_path_in_scope(&self, path: &str) -> bool {
+        match &self.include {
+            None => true,
+            Some(globs) => crate::sync::glob::matches_any(globs, path),
+        }
+    }
+
+    /// Adopt every entry from `remote` that wins over ours, for LOADING THIS
+    /// NODE'S OWN STATE. No include filter: a path this machine already
+    /// recorded stays recorded even if the include later narrowed, because
+    /// dropping it here would lose this node's own record of it.
     pub fn adopt(&mut self, remote: &Manifest) -> usize {
         let diff = self.manifest.diff_from(remote);
         let adopted = diff.adopt.len();
         for entry in diff.adopt {
             self.changes.record(&entry.path);
             self.manifest.insert(entry.path, entry.entry);
+        }
+        if adopted > 0 {
+            self.prune_unreferenced_content();
+        }
+        adopted
+    }
+
+    /// Adopt what a PEER offers, refusing any path outside this node's include.
+    ///
+    /// This is the receive-side boundary the README always described and the
+    /// code did not have. A host with a broad include (or a mistaken `["**"]`)
+    /// used to have its machine-local files adopted into every peer's manifest
+    /// and relayed onward, because `adopt` took every winning entry. Finding 8
+    /// of the 2026-08-29 review; the delete half was finding 2. A path this
+    /// node does not select is never taken, so it never enters the manifest and
+    /// never crosses the wire to a third peer.
+    ///
+    /// Distinct from `adopt` on purpose: `adopt` loads this node's OWN durable
+    /// state and must keep every path it already held; this takes ANOTHER
+    /// node's paths and must honour the local boundary.
+    pub fn adopt_from_peer(&mut self, remote: &Manifest) -> usize {
+        let diff = self.manifest.diff_from(remote);
+        let mut adopted = 0;
+        for entry in diff.adopt {
+            if !self.peer_path_in_scope(&entry.path) {
+                continue;
+            }
+            self.changes.record(&entry.path);
+            self.manifest.insert(entry.path, entry.entry);
+            adopted += 1;
         }
         if adopted > 0 {
             self.prune_unreferenced_content();
@@ -1525,5 +1579,69 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Finding 8 of the 2026-08-29 review, the receive-side half. A node adopts
+    /// only paths inside its own include from a peer; the delete half (finding
+    /// 2) is separate. So a peer's path this node does not select never enters
+    /// its manifest, and therefore never relays to a third peer.
+    #[test]
+    fn adopt_from_peer_refuses_a_path_outside_the_include() {
+        let mut a = node(1);
+        a.local_write("keep/shared.md", b"both want this", 0, 0);
+        a.local_write("pty/machine-local.events", b"A's local runtime", 0, 0);
+
+        // B selects keep/** only. It is a real, reachable, healthy peer.
+        let mut b = node(2);
+        b.set_include(Some(vec!["keep/**".to_string()]));
+        let adopted = b.adopt_from_peer(a.manifest());
+
+        assert_eq!(adopted, 1, "only the included path should be taken");
+        assert!(b.manifest().get("keep/shared.md").is_some());
+        assert!(
+            b.manifest().get("pty/machine-local.events").is_none(),
+            "B took a path outside its include into its manifest; it would relay it onward"
+        );
+        // A change buffer that never recorded the excluded path cannot offer it
+        // to a third peer: everything B would send from cursor zero is included.
+        let offered = b.changes().since(0);
+        assert!(
+            !offered.contains(&"pty/machine-local.events"),
+            "B would relay a path it should never have taken: {offered:?}"
+        );
+    }
+
+    /// The control that keeps the boundary honest: with no include configured,
+    /// adopt_from_peer takes everything, exactly like adopt.
+    #[test]
+    fn adopt_from_peer_with_no_include_takes_everything() {
+        let mut a = node(1);
+        a.local_write("keep/x.md", b"x", 0, 0);
+        a.local_write("pty/y.events", b"y", 0, 0);
+        let mut b = node(2); // include defaults to None
+        assert_eq!(b.adopt_from_peer(a.manifest()), 2);
+        assert!(b.manifest().get("pty/y.events").is_some());
+    }
+
+    /// The distinction the fix rests on: loading this node's OWN durable state
+    /// with `adopt` must keep a path even when the include no longer selects it,
+    /// because that record is this node's, not a peer's. Losing it here would
+    /// forget a file this machine still holds.
+    #[test]
+    fn adopt_keeps_the_nodes_own_path_even_outside_a_narrowed_include() {
+        // The node's manifest as loaded from disk holds pty/local, and the
+        // include has since narrowed to keep/**.
+        let mut disk = node(1);
+        disk.local_write("keep/x.md", b"x", 0, 0);
+        disk.local_write("pty/local.events", b"mine", 0, 0);
+
+        let mut loaded = node(1);
+        loaded.set_include(Some(vec!["keep/**".to_string()]));
+        // Loading own state uses `adopt`, not `adopt_from_peer`.
+        loaded.adopt(disk.manifest());
+        assert!(
+            loaded.manifest().get("pty/local.events").is_some(),
+            "loading own durable state must not drop a path outside the current include"
+        );
     }
 }

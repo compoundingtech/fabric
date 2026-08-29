@@ -792,6 +792,9 @@ impl<T: SyncTransport> SyncEngine<T> {
         HashMap<String, i64>,
     )> {
         let mut node = SyncNode::new(self.author);
+        // The receive-side include boundary, refreshed on every load and
+        // reload so a narrowed or widened include takes effect immediately.
+        node.set_include(cfg.include.clone());
         if let Some(state) = self.read_durable_state(&cfg.name)? {
             // `adopt` records every path it takes, so loading from disk also
             // SEEDS the change buffer with the whole manifest. That is required,
