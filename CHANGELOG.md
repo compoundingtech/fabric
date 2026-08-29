@@ -257,6 +257,16 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **`fabric update` no longer rolls a good build back when systemd fires the
+  restart late.** The update schedules the restart at +3s and a verifier at +12s
+  that waits 45s for the new version and reinstalls the previous binary if it
+  does not appear. The verifier's timer set `AccuracySec=1s`; the restart's did
+  not, so systemd (default `AccuracySec=1min`) could batch the restart up to a
+  minute late while the verifier fired on time, saw the old daemon for its whole
+  window, and rolled the update back — cleanly, with the only record in the
+  journal. The restart timer now sets `AccuracySec=1s` too, so the two delays
+  keep the order they encode. Finding 6 of the 2026-08-29 review. Linux only.
+
 - **The tombstone sweep no longer forgets a tombstone in the pass it arrived.**
   The sweep stamps a tombstone the first time it is seen expired and demands an
   ack from every peer after that stamp. Stamps are whole seconds, and one pass

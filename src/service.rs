@@ -257,6 +257,19 @@ fn systemd_restart_argv() -> (&'static str, Vec<String>) {
         "systemd-run",
         vec![
             "--user".into(),
+            // THE VERIFIER TRUSTS THIS DELAY, so systemd must honour it.
+            //
+            // `fabric update` schedules this restart at +3s and a verifier at
+            // +12s that waits 45s for the new version and rolls back if it does
+            // not see it. systemd defaults to AccuracySec=1min and batches
+            // timers, so without this line the restart can fire up to a minute
+            // late while the verifier fires on time, sees the OLD daemon for its
+            // whole window, and rolls a good update back to the previous binary
+            // — cleanly, with the only record in the journal. The verifier's own
+            // timer already sets this; the restart it verifies must too, or the
+            // two delays encode an order systemd is free to ignore. Finding 6 of
+            // the 2026-08-29 review.
+            "--timer-property=AccuracySec=1s".into(),
             // Long enough that the caller returns before its cgroup goes away,
             // short enough that an operator is not left waiting on it.
             "--on-active=3".into(),
@@ -865,6 +878,10 @@ mod tests {
         assert!(
             args.iter().any(|arg| arg.starts_with("--on-active=")),
             "the restart must be scheduled, so the caller can return first: {args:?}"
+        );
+        assert!(
+            args.iter().any(|arg| arg == "--timer-property=AccuracySec=1s"),
+            "the restart must be as punctual as the verifier that checks it, or              systemd may batch it late and the verifier rolls a good update              back: {args:?}"
         );
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         assert!(
