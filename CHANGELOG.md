@@ -257,6 +257,16 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **`fabric doctor` reports whether the service is ENABLED, not just that its
+  unit file exists.** It read `service_installed` from the unit file's presence,
+  so a service disabled during an incident with its unit left in place said
+  "installed and managed by the OS" — and after a reboot no daemon started. The
+  CA trust check was fixed for exactly this mistake; the service check was not.
+  Doctor now queries the manager (`systemctl --user is-enabled`, or whether
+  launchd has the label loaded) and reads three states: enabled, present but not
+  enabled (a problem, because a reboot leaves no daemon), and not installed.
+  Finding 10 of the 2026-08-29 review.
+
 - **`fabric doctor` on a non-default home asks the right daemon which build a
   peer runs.** Doctor shells out to `fabric exec <peer> -- fabric --version`
   without `--home`, so `fabric --home X doctor` asked the DEFAULT daemon about a

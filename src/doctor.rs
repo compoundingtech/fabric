@@ -139,8 +139,9 @@ pub struct Facts {
     /// first-run report red, which is the one thing this design was for.
     pub manages_service: bool,
     pub daemon_running: bool,
-    /// `None` when it could not be determined, which is different from `false`.
-    pub service_installed: Option<bool>,
+    /// Whether the managed service will start on boot, not merely whether its
+    /// unit file exists. Presence is not enablement.
+    pub service: ServiceEnablement,
     pub own_version: String,
     pub peers: Vec<PeerFact>,
     pub syncs: Vec<SyncFact>,
@@ -155,7 +156,11 @@ impl Facts {
     fn never_configured(&self) -> bool {
         !self.has_identity
             && self.peers.is_empty()
-            && !(self.manages_service && self.service_installed == Some(true))
+            && !(self.manages_service
+                && matches!(
+                    self.service,
+                    ServiceEnablement::Enabled | ServiceEnablement::PresentNotEnabled
+                ))
     }
 }
 
@@ -182,18 +187,29 @@ pub fn diagnose(facts: &Facts) -> Vec<Finding> {
             "this home is not the managed one, so no OS service applies to it",
         )
     } else {
-        match facts.service_installed {
-        Some(true) => Finding::new("service", Verdict::Ok, "installed and managed by the OS"),
-        Some(false) => Finding::new(
+        match facts.service {
+        ServiceEnablement::Enabled => {
+            Finding::new("service", Verdict::Ok, "installed, enabled, and will start on boot")
+        }
+        // The unit file exists but the manager will not start it on boot. This
+        // is NOT the same as "installed": a reboot leaves no daemon. It reads
+        // differently from "not installed" because the repair differs.
+        ServiceEnablement::PresentNotEnabled => Finding::new(
+            "service",
+            if fresh { Verdict::Setup } else { Verdict::Problem },
+            "the service is installed but not enabled, so it will not start after a reboot",
+        )
+        .with_action("fabric service install"),
+        ServiceEnablement::NotInstalled => Finding::new(
             "service",
             if fresh { Verdict::Setup } else { Verdict::Problem },
             "fabric is not installed as a service, so it will not come back after a reboot",
         )
         .with_action("fabric service install"),
-        None => Finding::new(
+        ServiceEnablement::Unknown => Finding::new(
             "service",
             Verdict::Unknown,
-            "could not tell whether fabric is installed as a service",
+            "could not tell whether fabric is enabled as a service",
         ),
         }
     });
@@ -550,7 +566,7 @@ mod tests {
             has_identity: true,
             manages_service: true,
             daemon_running: true,
-            service_installed: Some(true),
+            service: ServiceEnablement::Enabled,
             own_version: "0.2.0+abc".to_string(),
             peers: vec![PeerFact {
                 label: "hetz".to_string(),
@@ -603,7 +619,7 @@ mod tests {
             has_identity: false,
             manages_service: true,
             daemon_running: false,
-            service_installed: Some(false),
+            service: ServiceEnablement::NotInstalled,
             own_version: "0.2.0+abc".to_string(),
             peers: Vec::new(),
             syncs: Vec::new(),
@@ -649,7 +665,7 @@ mod tests {
             manages_service: false,
             // ...but the unit is on disk for the prod home, and this is exactly
             // what the gatherer sees.
-            service_installed: Some(true),
+            service: ServiceEnablement::Enabled,
             daemon_running: false,
             own_version: "0.2.0+abc".to_string(),
             peers: Vec::new(),
@@ -679,7 +695,7 @@ mod tests {
     #[test]
     fn the_same_gap_on_a_configured_machine_is_a_problem() {
         let mut facts = configured();
-        facts.service_installed = Some(false);
+        facts.service = ServiceEnablement::NotInstalled;
         let findings = diagnose(&facts);
         let service = find(&findings, "service");
         assert_eq!(service[0].verdict, Verdict::Problem);
@@ -690,7 +706,7 @@ mod tests {
     #[test]
     fn a_check_that_could_not_look_says_unknown_and_counts() {
         let mut facts = configured();
-        facts.service_installed = None;
+        facts.service = ServiceEnablement::Unknown;
         facts.peers[0].reachable = None;
         facts.ca.present = true;
         facts.ca.installed = None;
@@ -773,6 +789,38 @@ mod tests {
         let dashes = argv.iter().position(|a| a == "--").expect("no argv separator");
         assert_eq!(&argv[dashes + 1..], ["fabric".to_string(), "--version".to_string()]);
         assert_eq!(argv.get(exec_at + 1).map(String::as_str), Some("hetz"));
+    }
+
+    /// Finding 10: a unit file left in place by a `disable` is NOT "installed
+    /// and managed by the OS". It will not start after a reboot, and it reads
+    /// as a problem with a different repair from "never installed".
+    #[test]
+    fn a_present_but_not_enabled_service_is_a_problem_not_ok() {
+        let mut facts = configured();
+        facts.service = ServiceEnablement::PresentNotEnabled;
+        let findings = diagnose(&facts);
+        let service = find(&findings, "service");
+        assert!(
+            service
+                .iter()
+                .any(|f| f.verdict == Verdict::Problem && f.detail.contains("not enabled")),
+            "a disabled-but-present service did not read as a problem: {:?}",
+            service.iter().map(|f| (&f.verdict, &f.detail)).collect::<Vec<_>>()
+        );
+        assert!(
+            !service.iter().any(|f| f.detail.contains("installed, enabled")),
+            "a disabled service was still called enabled"
+        );
+
+        // And the healthy case still reads Ok, so the test is about the state
+        // and not about the check being broken.
+        facts.service = ServiceEnablement::Enabled;
+        let findings = diagnose(&facts);
+        assert!(
+            find(&findings, "service")
+                .iter()
+                .any(|f| f.verdict == Verdict::Ok && f.detail.contains("will start on boot"))
+        );
     }
 
     #[test]
@@ -991,20 +1039,11 @@ mod tests {
 use anyhow::Result;
 
 use crate::ca;
+use crate::service::ServiceEnablement;
 use crate::config::FabricHome;
 use crate::control::{ControlRequest, ControlResponse, PeerReachability, SyncEntryStatus};
 
 /// Where the OS service definition would live on this platform.
-fn service_unit_path() -> Result<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        crate::service::launch_agent_path()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        crate::service::systemd_user_unit_path()
-    }
-}
 
 /// Collect everything the checks reason about.
 ///
@@ -1019,11 +1058,7 @@ where
     let has_identity = home.identity_path().exists();
     let manages_service = home.is_default_state_root();
 
-    let service_installed = match service_unit_path() {
-        Ok(path) => Some(path.exists()),
-        // Could not even work out where it would be. Not "no".
-        Err(_) => None,
-    };
+    let service = crate::service::service_enablement();
 
     let mut own_version = env!("CARGO_PKG_VERSION").to_string();
     let mut daemon_running = false;
@@ -1090,7 +1125,7 @@ where
         has_identity,
         manages_service,
         daemon_running,
-        service_installed,
+        service,
         own_version,
         peers,
         ca: gather_ca(home, &syncs),

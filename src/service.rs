@@ -297,6 +297,71 @@ fn resolve_memory_max_mb(home: &FabricHome, requested: Option<Option<u64>>) -> R
     Ok(config.memory_max_mb())
 }
 
+/// Whether the managed service will actually start on boot — not merely whether
+/// its unit file exists.
+///
+/// Presence is not enablement. A service disabled during an incident, with its
+/// unit file left in place, read as "installed and managed by the OS" and never
+/// came back after a reboot. The CA trust check was fixed for exactly this
+/// mistake; the service check was not. Finding 10 of the 2026-08-29 review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceEnablement {
+    /// Enabled: the manager will start it on boot.
+    Enabled,
+    /// The unit or plist is present, but the manager will not start it on boot.
+    PresentNotEnabled,
+    /// No unit or plist at all.
+    NotInstalled,
+    /// Could not determine (the manager could not be queried).
+    Unknown,
+}
+
+/// Query the OS service manager for the real enablement state.
+pub fn service_enablement() -> ServiceEnablement {
+    match ServiceManager::current() {
+        Ok(manager) => manager.enablement(),
+        Err(_) => ServiceEnablement::Unknown,
+    }
+}
+
+/// Interpret `systemctl --user is-enabled fabric.service`.
+///
+/// `present` is whether the unit file exists, `ran` whether the query executed,
+/// and `stdout` its first word. Kept free of `cfg` so it is tested on any host.
+fn interpret_systemd_is_enabled(present: bool, ran: bool, stdout: &str) -> ServiceEnablement {
+    if !present {
+        return ServiceEnablement::NotInstalled;
+    }
+    if !ran {
+        return ServiceEnablement::Unknown;
+    }
+    match stdout.split_whitespace().next().unwrap_or("") {
+        "enabled" | "enabled-runtime" => ServiceEnablement::Enabled,
+        // The unit exists but will not be started on boot. `static`, `masked`,
+        // `linked`, `indirect`, `generated`, `transient` all mean "not enabled
+        // to start" for our purposes, and so does an empty answer with the file
+        // present.
+        "disabled" | "static" | "masked" | "linked" | "indirect" | "generated"
+        | "transient" | "" => ServiceEnablement::PresentNotEnabled,
+        _ => ServiceEnablement::Unknown,
+    }
+}
+
+/// Interpret launchd signals: whether the plist is present and whether the
+/// label is currently loaded (`launchctl print` succeeds).
+fn interpret_launchd(present: bool, loaded: bool) -> ServiceEnablement {
+    if !present {
+        return ServiceEnablement::NotInstalled;
+    }
+    if loaded {
+        ServiceEnablement::Enabled
+    } else {
+        // The plist is on disk but launchd has not loaded it, so a reboot will
+        // not start it. This is the disabled-during-an-incident case.
+        ServiceEnablement::PresentNotEnabled
+    }
+}
+
 enum ServiceManager {
     #[cfg(target_os = "linux")]
     SystemdUser,
@@ -317,6 +382,36 @@ impl ServiceManager {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             bail!("fabric service is currently supported on Linux systemd-user and macOS launchd");
+        }
+    }
+
+    fn enablement(&self) -> ServiceEnablement {
+        match self {
+            #[cfg(target_os = "linux")]
+            ServiceManager::SystemdUser => {
+                let present = systemd_user_unit_path()
+                    .map(|path| path.exists())
+                    .unwrap_or(false);
+                let query = Command::new("systemctl")
+                    .args(["--user", "is-enabled", SERVICE_NAME])
+                    .output();
+                let (ran, stdout) = match &query {
+                    Ok(output) => (true, String::from_utf8_lossy(&output.stdout).into_owned()),
+                    Err(_) => (false, String::new()),
+                };
+                interpret_systemd_is_enabled(present, ran, &stdout)
+            }
+            #[cfg(target_os = "macos")]
+            ServiceManager::LaunchdUser => {
+                let present = launch_agent_path().map(|path| path.exists()).unwrap_or(false);
+                let target = launchd_service_target();
+                let loaded = Command::new("launchctl")
+                    .args(["print", &target])
+                    .output()
+                    .map(|output| output.status.success())
+                    .unwrap_or(false);
+                interpret_launchd(present, loaded)
+            }
         }
     }
 }
@@ -817,6 +912,46 @@ fn xml_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::{ServiceEnablement, interpret_launchd, interpret_systemd_is_enabled};
+
+    #[test]
+    fn systemd_is_enabled_reading_tells_enabled_from_merely_present() {
+        // The bug this replaces: a disabled service with its unit file present
+        // read as installed and never came back after a reboot.
+        assert_eq!(
+            interpret_systemd_is_enabled(true, true, "enabled\n"),
+            ServiceEnablement::Enabled
+        );
+        for present_not_enabled in ["disabled", "static", "masked", "linked", ""] {
+            assert_eq!(
+                interpret_systemd_is_enabled(true, true, present_not_enabled),
+                ServiceEnablement::PresentNotEnabled,
+                "is-enabled={present_not_enabled:?} must not read as enabled"
+            );
+        }
+        // No unit file at all, whatever the query says.
+        assert_eq!(
+            interpret_systemd_is_enabled(false, true, "enabled"),
+            ServiceEnablement::NotInstalled
+        );
+        // Could not run the query, but the file is there: not a claim either way.
+        assert_eq!(
+            interpret_systemd_is_enabled(true, false, ""),
+            ServiceEnablement::Unknown
+        );
+    }
+
+    #[test]
+    fn launchd_reading_tells_loaded_from_merely_present() {
+        assert_eq!(interpret_launchd(true, true), ServiceEnablement::Enabled);
+        assert_eq!(
+            interpret_launchd(true, false),
+            ServiceEnablement::PresentNotEnabled,
+            "a plist on disk that launchd has not loaded will not start on boot"
+        );
+        assert_eq!(interpret_launchd(false, false), ServiceEnablement::NotInstalled);
+    }
+
     use super::*;
 
     /// The unit must name the binary it was GIVEN, not the one rendering it.
