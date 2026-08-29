@@ -1088,7 +1088,7 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                     let present = logical_present(&entry);
                     if entry.missing == 0 && entry.unexpected == 0 && entry.mismatched == 0 {
                         println!(
-                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean\tstopped={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tdigest={}",
+                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean\tstopped={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tcontent_bytes={}\tdigest={}",
                             entry.name,
                             entry.folder,
                             entry.policy,
@@ -1109,11 +1109,12 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                             sweep_token(&entry),
                             entry.delta_fallbacks,
                             entry.full_payload_sends,
+                            entry.content_bytes,
                             short_digest(&entry.digest),
                         );
                     } else {
                         println!(
-                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}\tstopped={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tdigest={}",
+                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}\tstopped={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tcontent_bytes={}\tdigest={}",
                             entry.name,
                             entry.folder,
                             entry.policy,
@@ -1137,6 +1138,7 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                             sweep_token(&entry),
                             entry.delta_fallbacks,
                             entry.full_payload_sends,
+                            entry.content_bytes,
                             short_digest(&entry.digest),
                         );
                     }
@@ -1196,6 +1198,8 @@ struct SyncLsJsonEntry<'a> {
     /// High `reconcile_wire_bytes` with a low count here means this machine is
     /// RECEIVING full payloads rather than sending them.
     full_payload_sends: u64,
+    /// Bytes of file content the daemon holds in memory for this entry.
+    content_bytes: u64,
     /// Reconciles that fell back to full state. Zero is healthy; a RISING
     /// number means a cursor described state a peer did not hold.
     delta_fallbacks: u64,
@@ -1226,6 +1230,7 @@ impl<'a> From<&'a fabric::control::SyncEntryStatus> for SyncLsJsonEntry<'a> {
                 .map(|(peer, reason)| format!("{peer}:{reason}"))
                 .collect(),
             full_payload_sends: entry.full_payload_sends,
+            content_bytes: entry.content_bytes,
             delta_fallbacks: entry.delta_fallbacks,
             digest: &entry.digest,
             sync_passes: entry.sync_passes,
@@ -1530,6 +1535,7 @@ mod sync_ls_tests {
         SyncEntryStatus {
             delta_fallbacks: 0,
             full_payload_sends: 0,
+            content_bytes: 0,
             stopped_peers: vec![("hetz".into(), "denied".into())],
             digest: "lattice-point-aaaa".into(),
             name: "catalog".to_string(),
@@ -1588,6 +1594,7 @@ mod sync_ls_tests {
                 "sweep": "disabled",
                 "delta_fallbacks": 0,
                 "full_payload_sends": 0,
+                "content_bytes": 0,
                 "stopped_peers": ["hetz:denied"],
                 "digest": "lattice-point-aaaa"
             })

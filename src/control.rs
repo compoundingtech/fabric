@@ -249,6 +249,10 @@ pub struct SyncEntryStatus {
     /// means this machine is RECEIVING full payloads, not sending them.
     #[serde(default)]
     pub full_payload_sends: u64,
+    /// Bytes of file content the daemon holds in memory for this entry. It was
+    /// unbounded once, and this is the number that would have said so.
+    #[serde(default)]
+    pub content_bytes: u64,
     /// Reconciles that fell back to full state because a payload was
     /// incomplete. Zero is healthy. A number that RISES between two samples is a
     /// bug report: a cursor described state a peer did not hold.

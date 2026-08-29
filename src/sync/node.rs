@@ -21,7 +21,7 @@
 //!   interleaving of edits and pairwise reconciles converges (see the property
 //!   tests below).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::config::PolicyRules;
 use super::delta::ChangeBuffer;
@@ -161,6 +161,53 @@ impl SyncNode {
         self.content.contains_key(hash)
     }
 
+    /// Bytes of content held in memory for this entry, across every blob.
+    pub fn content_bytes(&self) -> u64 {
+        self.content.values().map(|bytes| bytes.len() as u64).sum()
+    }
+
+    pub fn content_blobs(&self) -> usize {
+        self.content.len()
+    }
+
+    /// THE CONTENT STORE IS BOUNDED BY THE MANIFEST. A blob stays while some
+    /// Present entry names its hash and goes when none does.
+    ///
+    /// It used to only grow. Every version of every file stayed resident until
+    /// restart: one 5 MB file rewritten forty times cost 376 MB on the writer
+    /// and 248 MB on its peer, and the bus entry rewrites status files all day.
+    ///
+    /// Dropping an unreferenced blob loses nothing a peer can ask for. A peer
+    /// requests a hash only after adopting the entry that names it from THIS
+    /// manifest, so every hash it can name is one this manifest still names.
+    /// Received blobs are inserted by `put_content` without pruning, and the
+    /// full prune runs only after adoption, so a blob that arrives ahead of its
+    /// entry is still there when the entry lands.
+    fn hash_is_referenced(&self, hash: &ContentHash) -> bool {
+        self.manifest
+            .present_paths()
+            .any(|(_, meta)| meta.hash == *hash)
+    }
+
+    /// The per-write form: one candidate hash, one linear pass over the
+    /// manifest. Cheaper than rebuilding the referenced set on every write.
+    fn forget_if_unreferenced(&mut self, hash: ContentHash) {
+        if !self.hash_is_referenced(&hash) {
+            self.content.remove(&hash);
+        }
+    }
+
+    /// The bulk form, after an adopt or a reconcile that may have superseded
+    /// many entries at once.
+    fn prune_unreferenced_content(&mut self) {
+        let referenced: HashSet<ContentHash> = self
+            .manifest
+            .present_paths()
+            .map(|(_, meta)| meta.hash)
+            .collect();
+        self.content.retain(|hash, _| referenced.contains(hash));
+    }
+
     pub fn get_content(&self, hash: &ContentHash) -> Option<&[u8]> {
         self.content.get(hash).map(Vec::as_slice)
     }
@@ -211,7 +258,9 @@ impl SyncNode {
             self.content.entry(hash).or_insert_with(|| bytes.to_vec());
             return false;
         }
-        let next_version = self.manifest.get(path).map(Entry::version).unwrap_or(0) + 1;
+        let previous = self.manifest.get(path);
+        let next_version = previous.map(Entry::version).unwrap_or(0) + 1;
+        let superseded = previous.and_then(Entry::meta).map(|meta| meta.hash);
         self.content.insert(hash, bytes.to_vec());
         self.changes.record(path);
         self.manifest.insert(
@@ -226,6 +275,11 @@ impl SyncNode {
                 author: self.author,
             }),
         );
+        if let Some(old) = superseded
+            && old != hash
+        {
+            self.forget_if_unreferenced(old);
+        }
         true
     }
 
@@ -247,6 +301,7 @@ impl SyncNode {
             return false;
         }
         let next_version = entry.version() + 1;
+        let superseded = entry.meta().map(|meta| meta.hash);
         self.changes.record(path);
         self.manifest.insert(
             path.to_string(),
@@ -256,6 +311,9 @@ impl SyncNode {
                 deleted_secs,
             }),
         );
+        if let Some(old) = superseded {
+            self.forget_if_unreferenced(old);
+        }
         true
     }
 
@@ -388,6 +446,9 @@ impl SyncNode {
             self.changes.record(&entry.path);
             self.manifest.insert(entry.path, entry.entry);
         }
+        if adopted > 0 {
+            self.prune_unreferenced_content();
+        }
         adopted
     }
 
@@ -479,6 +540,11 @@ impl SyncNode {
         // (e.g. adopted a hash the supplier didn't hold, or lost its store).
         stats.bytes += repair_content(self, other);
         stats.bytes += repair_content(other, self);
+
+        // Both sides may have superseded entries above; neither keeps the
+        // bytes of an entry it no longer names.
+        self.prune_unreferenced_content();
+        other.prune_unreferenced_content();
 
         stats
     }
@@ -1252,6 +1318,105 @@ mod tests {
                     let (left, right) = nodes.split_at_mut(j);
                     let stats = left[i].reconcile(&mut right[0]);
                     prop_assert!(stats.is_noop(), "echo after convergence: {:?}", stats);
+                }
+            }
+        }
+    }
+
+    /// Finding 4 of the 2026-08-29 review. The content store only grew: every
+    /// version of every file stayed in memory until restart. One 5 MB file
+    /// rewritten forty times cost 376 MB of resident memory on the writer and
+    /// 248 MB on its peer, for a live file of 5 MB.
+    ///
+    /// The bound is the manifest: a blob stays while some Present entry names
+    /// it, and goes when none does. That is the SMALLEST store that can still
+    /// materialize the tree and answer every peer, because a peer only ever
+    /// asks for a hash it just adopted from this manifest.
+    #[test]
+    fn a_superseded_version_is_not_held() {
+        let mut n = node(1);
+        for version in 0..40u8 {
+            n.local_write("hot.md", &vec![version; 5000], 0, 0);
+        }
+        assert_eq!(
+            n.content_blobs(),
+            1,
+            "forty rewrites of one path must leave one blob, the live one"
+        );
+        assert_eq!(n.content_bytes(), 5000);
+        assert!(n.has_content(&content_hash(&vec![39u8; 5000])));
+    }
+
+    /// The control that keeps the rule honest: content is shared by hash, so
+    /// a blob two paths name survives one of them moving on, and goes only
+    /// when the last reference goes, whether by rewrite or by tombstone.
+    #[test]
+    fn shared_content_survives_until_its_last_reference_goes() {
+        let mut n = node(2);
+        let same = content_hash(b"same bytes");
+        n.local_write("a.md", b"same bytes", 0, 0);
+        n.local_write("b.md", b"same bytes", 0, 0);
+        n.local_write("a.md", b"a moved on", 0, 0);
+        assert!(
+            n.has_content(&same),
+            "b.md still names these bytes; dropping them would leave b.md unmaterializable"
+        );
+        assert!(n.local_remove("b.md", bus(), 10));
+        assert!(
+            !n.has_content(&same),
+            "nothing names these bytes now, and a tombstone needs no content"
+        );
+        assert_eq!(n.content_blobs(), 1);
+    }
+
+    /// Adoption is the other way a version is superseded. A peer's newer
+    /// entry replaces ours, and our old bytes must go with the old entry.
+    #[test]
+    fn content_superseded_by_adoption_is_not_held() {
+        let mut a = node(1);
+        let mut b = node(2);
+        a.local_write("f.md", b"first", 0, 0);
+        a.reconcile(&mut b);
+        assert!(b.has_content(&content_hash(b"first")));
+
+        // b moves the file on; a adopts the newer version and its bytes.
+        b.local_write("f.md", b"second", 0, 0);
+        a.reconcile(&mut b);
+        for (label, n) in [("a", &a), ("b", &b)] {
+            assert!(
+                !n.has_content(&content_hash(b"first")),
+                "{label} still holds bytes no Present entry names"
+            );
+            assert!(n.has_content(&content_hash(b"second")));
+            assert_eq!(n.content_blobs(), 1, "{label}");
+        }
+    }
+
+    proptest! {
+        /// The property, over arbitrary write and delete sequences on two
+        /// reconciling nodes: after every step each node holds exactly the
+        /// blobs its Present entries name, no more and no fewer.
+        #[test]
+        fn content_held_is_exactly_what_the_manifest_names(
+            steps in proptest::collection::vec((0u8..2, 0u8..4, 0u8..6, any::<bool>()), 1..60)
+        ) {
+            let mut nodes = [node(1), node(2)];
+            for (who, path, content, delete) in steps {
+                let path = format!("p{path}");
+                let n = &mut nodes[who as usize];
+                if delete {
+                    n.local_remove(&path, bus(), 1);
+                } else {
+                    n.local_write(&path, &[content; 16], 0, 0);
+                }
+                let (left, right) = nodes.split_at_mut(1);
+                left[0].reconcile(&mut right[0]);
+                for n in &nodes {
+                    let named: std::collections::HashSet<ContentHash> =
+                        n.manifest().present_paths().map(|(_, m)| m.hash).collect();
+                    let held: std::collections::HashSet<ContentHash> =
+                        n.content.keys().copied().collect();
+                    prop_assert_eq!(&held, &named, "held must equal named");
                 }
             }
         }
