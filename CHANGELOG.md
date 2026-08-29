@@ -257,6 +257,17 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **`send-file` streams instead of holding the whole file in memory on both
+  daemons.** The sender read the file whole with `std::fs::read` and the receiver
+  allocated `header.len` bytes up front, so a 1.5 GiB transfer cost about 1.5 GiB
+  of resident memory on each daemon at once; on a host with a memory ceiling that
+  is enough to kill the daemon mid-transfer. Both sides now stream the body in
+  bounded chunks (`tokio::io::copy`), and the receiver writes straight to its
+  temp file, so neither allocates against the file size. The wire format is
+  unchanged, so a streaming build and an old build interoperate. A transfer that
+  ends short of its declared length is refused and leaves no file. Finding 7 of
+  the 2026-08-29 review.
+
 - **`fabric doctor` reports whether the service is ENABLED, not just that its
   unit file exists.** It read `service_installed` from the unit file's presence,
   so a service disabled during an incident with its unit left in place said

@@ -2918,19 +2918,21 @@ async fn process_control_request(
             ControlResponse::Ok
         }
         ControlRequest::SendFile { peer, path, name } => {
-            let bytes = match std::fs::read(&path) {
-                Ok(bytes) => bytes,
+            // Read the size, not the bytes: the file streams from disk during
+            // the transfer, so the sending daemon never holds it whole.
+            let bytes = match std::fs::metadata(&path) {
+                Ok(meta) => meta.len(),
                 Err(error) => {
                     return Ok(ControlResponse::Error {
                         message: format!("could not read {}: {error}", path.display()),
                     });
                 }
             };
-            match send_file_to_peer(&state, &peer, &name, &bytes).await {
+            match send_file_to_peer(&state, &peer, &name, &path).await {
                 Ok(()) => ControlResponse::SentFile {
                     peer,
                     name,
-                    bytes: bytes.len() as u64,
+                    bytes,
                 },
                 Err(error) => ControlResponse::Error {
                     message: format!("{error:#}"),
@@ -3272,7 +3274,7 @@ async fn send_file_to_peer(
     state: &Arc<DaemonState>,
     peer: &str,
     name: &str,
-    bytes: &[u8],
+    path: &std::path::Path,
 ) -> Result<()> {
     let addr = {
         let book = state.peer_book.read().await;
@@ -3296,7 +3298,7 @@ async fn send_file_to_peer(
         .with_context(|| format!("dialling {peer}"))?;
     let (send, recv) = connection.open_bi().await?;
     let stream = tokio::io::join(recv, send);
-    let result = crate::sendfile::send(stream, name, bytes).await;
+    let result = crate::sendfile::send_file(stream, name, path).await;
     connection.close(0u32.into(), b"done");
     result
 }
