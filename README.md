@@ -255,14 +255,16 @@ fabric service install
 
 On Linux this writes and starts a systemd user unit. On macOS this writes and
 starts a per-user LaunchAgent. The service runs the foreground daemon directly as
-`fabric --home <home> daemon`; it does not run `fabric up`. The default memory
-ceiling is 1 GiB and can be changed with `--memory-max-mb`.
+`fabric --home <home> daemon`; it does not run `fabric up`. No memory ceiling
+is set unless you pass `--memory-max-mb`. Fabric declares none by default,
+because a healthy working set has not been measured, and a ceiling nobody chose
+kills the daemon at a number nobody chose. (This README used to say the default
+was 1 GiB. It was not.)
 
-The default intentionally leaves headroom above fabric's in-process RSS recycle
-trigger. During endpoint recycle, the replacement endpoint can briefly overlap
-with the old endpoint in memory; setting the service cap too close to the
-300 MiB recycle threshold can let the OS kill fabric during a successful
-self-heal.
+If you do set one, leave headroom above fabric's in-process RSS recycle trigger.
+During endpoint recycle, the replacement endpoint can briefly overlap with the
+old endpoint in memory; a service cap too close to the 300 MiB recycle threshold
+lets the OS kill fabric during a successful self-heal.
 
 ### Enabling remote shell and exec
 
@@ -413,8 +415,9 @@ echo "installed $("$fabric_path" --version); rollback: $rollback"
 Set `tag` to the release being installed. `FABRIC_BIN_PATH` is only needed when
 the service's `ExecStart` binary is not the `fabric` found on the interactive
 shell's `PATH`. Do not compile a release through `fabric exec` on a managed
-target: the compiler inherits the daemon's service cgroup and can exhaust its
-memory limit, restarting the daemon that provides the connection.
+target: the compiler inherits the daemon's service cgroup and, if a memory
+ceiling is set, can exhaust it and restart the daemon that provides the
+connection.
 
 1. **Install the new binary atomically, at the path the daemon runs from.**
    `install.sh` installs via a temp file plus a rename, so it can replace the
@@ -823,9 +826,10 @@ native service manager entry and enables it for future user sessions. `status`
 delegates to `systemctl --user status fabric.service --no-pager` on Linux and
 `launchctl print gui/$UID/com.compoundingtech.fabric` on macOS. `uninstall` stops the
 managed service and removes only the systemd/launchd artifact; it leaves the
-fabric home, identity, peers, logs, and config in place. The default service
-memory ceiling is 1 GiB; use a lower `--memory-max-mb` only after validating
-that endpoint recycle can complete below that cap on the target machine.
+fabric home, identity, peers, logs, and config in place. No memory ceiling is
+set unless `--memory-max-mb` is passed, and `--no-memory-max-mb` removes one
+that was. Set one only after validating that endpoint recycle can complete
+below that cap on the target machine.
 
 ### Debug Transport Test Commands
 
@@ -922,30 +926,31 @@ sync only ever touches already-trusted peers — it adds no new trust surface.
 
 ### Policies
 
-- `catalog` — union, newer-wins, and **never deletes on a peer**: a file present
-  on any peer is present on all peers, and a local deletion is restored.
-  Decommission a file by editing it (for example `retired = true`), never by
-  deleting it. Safe for a job catalog.
-- `bus` — newer-wins and propagates a local deletion as a versioned tombstone.
-  Peers that receive the tombstone remove the path. Tombstones are retained;
-  automatic sweeping is not implemented.
+- `catalog` — union, newer-wins, and **a delete propagates**: a file present on
+  any peer is present on all peers, and a file deleted on any peer is deleted on
+  all peers. Tombstones are retained and never swept, so a delete cannot
+  un-stick. Fabric does NOT restore a local deletion. It did until August 2026,
+  and this README said so; that behaviour is gone, and git is the safety net for
+  a file somebody still wanted.
+- `bus` — union, newer-wins, and a delete propagates as a versioned tombstone.
+  Tombstones are retained by default. Sweeping them is opt-in: set
+  `FABRIC_TOMBSTONE_SWEEP_DAYS` in the daemon's environment, and only an entry
+  with an explicit `peers` list sweeps, once every named peer has acknowledged
+  the tombstone. `fabric sync ls` reports the sweep state per entry as `sweep=`.
 
-Catalog never originates tombstones, but persisted or wire state may inherit one
-from an older bus configuration. Fabric migrates that state using
-union-of-presence: if unchanged in-scope bytes still exist on any catalog node,
-that node advances them to a higher logical Present version and publishes their
-content, so every catalog manifest and materialized folder converges. Bus keeps
-the same tombstone authoritative and removes the stale bytes. If no catalog
-node retains a copy, Fabric cannot reconstruct deleted content; the inherited
-tombstone remains visible in `fabric sync ls` until an operator deliberately
-recreates the canonical file.
+Both policies propagate a delete, so the difference today is only whether a
+tombstone may ever be swept. A tombstone inherited from an older build stays
+authoritative under both policies: the stale bytes are removed, never revived.
+If no node retains a copy, Fabric cannot reconstruct deleted content; recreate
+the file deliberately.
 
 Publication tools must treat every watcher-visible, included path as a durable
 logical sync key. Stage temporary, backup, and partial files **outside the
 configured sync folder** (on the same filesystem when an atomic rename is
 required), then move only canonical final paths into the folder. Do not use a
-sibling temporary name inside the synced subtree: `catalog` will propagate that
-name as a real key and intentionally restore it after a later local deletion.
+sibling temporary name inside the synced subtree: either policy will propagate
+that name as a real key, and deleting it later propagates that delete to every
+peer.
 Include globs scope which paths are keys; they do not make matching temporary
 paths ephemeral.
 

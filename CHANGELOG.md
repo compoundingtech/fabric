@@ -118,6 +118,16 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed documentation
 
+- **Two README statements that decided operator actions were false.** The
+  policies section said catalog "never deletes on a peer" and that "a local
+  deletion is restored"; catalog has propagated deletes since August 2026 and
+  `tests/sync_slice.rs` pins it. Two operational choices on 2026-08-29 were made
+  the wrong way on the strength of that sentence. The service section said "the
+  default memory ceiling is 1 GiB"; no ceiling is set unless `--memory-max-mb`
+  is passed, and `src/service.rs` pins that too. Both now say what the code
+  does, and say what they used to say so a reader with the old sentence in
+  their head knows it changed. Finding 15 of the 2026-08-29 review.
+
 - **The detached replay buffer is capped, and the retention docs said it was
   not.** They claimed the buffer had no cap of its own, that a runaway remote
   shell would retain roughly 17 MB across a 15 minute window, and that the

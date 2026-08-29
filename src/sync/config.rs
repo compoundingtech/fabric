@@ -45,8 +45,9 @@ pub enum SyncPolicy {
     /// Tombstones are still NEVER swept here, so a delete cannot un-stick by a
     /// tombstone expiring.
     Catalog,
-    /// Union + newer-wins + no delete + tombstone sweep. Reserved for the
-    /// smalltalk bus; not yet fully implemented (see [`PolicyRules`]).
+    /// Union + newer-wins + a delete propagates + tombstone sweep, where the
+    /// sweep is opt-in through `FABRIC_TOMBSTONE_SWEEP_DAYS` and needs an
+    /// explicit peer list. For the st2 bus.
     Bus,
 }
 
