@@ -2236,7 +2236,37 @@ async fn run_network_rehome_loop(state: Arc<DaemonState>) -> Result<()> {
             return Ok(());
         }
     };
-    let mut interfaces = monitor.interface_state();
+    run_rehome_updates(state, monitor.interface_state()).await
+}
+
+/// The source of interface-change updates.
+///
+/// Abstracted for one reason: so the loop below can be driven by a fake that
+/// ends the stream on demand and the "monitor stopped" branch can be tested
+/// without waiting for a real OS network monitor to die. Production is the
+/// netwatch watcher.
+trait InterfaceUpdates: Send {
+    fn next_update(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<netwatch::interfaces::State>> + Send;
+}
+
+impl InterfaceUpdates for n0_watcher::Direct<netwatch::interfaces::State> {
+    async fn next_update(&mut self) -> Result<netwatch::interfaces::State> {
+        use n0_watcher::Watcher as _;
+        self.updated()
+            .await
+            .map_err(|_| anyhow::anyhow!("network monitor watcher disconnected"))
+    }
+}
+
+/// Drive roaming rehome from an interface-update stream until the daemon is
+/// cancelled. Split from `run_network_rehome_loop` so the monitor-stopped path
+/// is testable with an injected stream.
+async fn run_rehome_updates(
+    state: Arc<DaemonState>,
+    mut interfaces: impl InterfaceUpdates,
+) -> Result<()> {
     let mut debouncer = NetworkChangeDebouncer::new(NETWORK_CHANGE_DEBOUNCE);
 
     loop {
@@ -2265,9 +2295,21 @@ async fn run_network_rehome_loop(state: Arc<DaemonState>) -> Result<()> {
                         .await;
                 }
             }
-            update = interfaces.updated() => {
+            update = interfaces.next_update() => {
                 let Ok(network_state) = update else {
                     eprintln!("fabric: network monitor stopped; roaming rehome disabled");
+                    // PARK, do not exit. Returning Ok here would end serve()'s
+                    // select! and shut the daemon down with exit code 0, which
+                    // no supervisor restarts: the launchd plist sets
+                    // KeepAlive.SuccessfulExit=false and the systemd unit sets
+                    // Restart=on-failure. So the daemon would stay down until a
+                    // person noticed, and the one log line would say roaming was
+                    // disabled, not that the daemon exited. The daemon keeps
+                    // serving shell, exec and sync; only roaming rehome is lost.
+                    // Finding 9 of the 2026-08-29 review. This matches the
+                    // monitor-unavailable-at-startup branch above, which already
+                    // parks rather than returning.
+                    state.cancel.cancelled().await;
                     break;
                 };
                 let network_usable = network_state.default_route_interface.is_some()
