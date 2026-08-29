@@ -872,8 +872,12 @@ async fn a_small_change_must_not_ship_the_whole_manifest() -> Result<()> {
 /// first and ships entries the others cannot yet scan. This test models exactly
 /// that. A sends a path B does not select, and the file must survive on A.
 ///
-/// The guard that makes it survive is in `scan_into_node_observed`, which skips
-/// the local-remove loop for any path outside the include.
+/// Two guards make it survive. `scan_into_node_observed` skips the
+/// local-remove loop for any path outside the include, and `materialize_tracked`
+/// neither writes nor removes nor observes one. The second guard is why B does
+/// not write the path at all: a written path would have to be protected, and a
+/// protected path outside the include is exactly the shape that tombstoned a
+/// locally deleted file to every peer (finding 2 of the 2026-08-29 review).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_path_outside_the_receivers_include_is_not_deleted() -> Result<()> {
     let _guard = FOLDER_SYNC_LOCK.lock().await;
@@ -912,22 +916,25 @@ async fn a_path_outside_the_receivers_include_is_not_deleted() -> Result<()> {
 
     // Now the real question. B holds an entry it cannot scan. Give it many
     // passes to do the wrong thing.
-    // What B does with the file is recorded rather than demanded. `adopt` and
-    // `materialize_tracked` walk the manifest and consult no globs at all; only
-    // `scan_folder` filters. So B is expected to WRITE a path it does not
-    // select, and simply never scan it.
-    assert!(
-        b_folder.join("docs/pairing-api.md").exists(),
-        "B did not materialize a path outside its include. That is not a fault, \
-         but it changes the answer to \"which machine may take a widened include \
-         first\", so it must not change silently"
-    );
+    //
+    // B used to WRITE the path and never scan it, and this test recorded that
+    // as "not a fault". It was the setup for a fault: the written path stayed
+    // protected on B, so a later local delete of it on B tombstoned it for A.
+    // B now leaves a path outside its include alone in every direction. The
+    // entry still carries it in B's manifest, so widening B's include later
+    // materializes it without a resend.
     for _ in 0..25 {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
             doc.exists(),
             "the document was deleted on A after B received a path it does not \
              select. This is the 2026-08-25 incident, reproduced"
+        );
+        assert!(
+            !b_folder.join("docs/pairing-api.md").exists(),
+            "B wrote a path outside its include. A written path is a protected \
+             path, and a protected path outside the include is the shape that \
+             turned a local delete into a fleet-wide one"
         );
     }
     assert_eq!(
@@ -1469,6 +1476,97 @@ async fn a_peer_denied_sync_makes_the_entry_report_stopped_not_clean() -> Result
          label a person configured, which is right for reading; the POLICY
          behind it keys on the identity"
     );
+
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
+/// THE SECOND HALF OF THE 2026-08-25 INCIDENT, the half the first fix missed.
+///
+/// `a_path_dropped_from_include_is_forgotten_not_deleted` proves that NARROWING
+/// an include deletes nothing. It does not prove what happens next. The narrowed
+/// path stays in the manifest, and `materialize_tracked` re-records every
+/// manifest path it finds on disk as observed, include or not. So the path stays
+/// protected, and the moment the operator deletes it locally, believing it is no
+/// longer fabric's business on this machine, the next pass sees "protected and
+/// not on disk", records a tombstone, and every peer deletes its copy.
+///
+/// A file outside an entry's include is not a file that entry may delete on a
+/// peer. The scan already knows this. Materialization must too.
+///
+/// CONTROL: a delete of an INCLUDED file must still propagate, so the fixture
+/// can tell "excluded and protected" apart from "deletes are broken".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deleting_a_path_outside_the_include_does_not_delete_it_on_a_peer() -> Result<()> {
+    let _guard = FOLDER_SYNC_LOCK.lock().await;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let a_home = FabricHome::new(a_dir.path());
+    let b_home = FabricHome::new(b_dir.path());
+    let a_folder = a_dir.path().join("shared");
+    let b_folder = b_dir.path().join("shared");
+    for folder in [&a_folder, &b_folder] {
+        std::fs::create_dir_all(folder.join("plans"))?;
+        std::fs::create_dir_all(folder.join("keep"))?;
+    }
+    // Catalog policy, because it propagates deletes and it is the policy the
+    // live fleet runs on the entry that lost files.
+    write_sync_with_includes(a_dir.path(), &a_folder, "catalog", &["keep/**", "plans/**"]);
+    write_sync_with_includes(b_dir.path(), &b_folder, "catalog", &["keep/**", "plans/**"]);
+
+    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_b = FabricNode::start(b_home.clone()).await?;
+    trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
+    trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
+
+    let a_plan = a_folder.join("plans/live-work.md");
+    let a_keep = a_folder.join("keep/k.md");
+    let b_plan = b_folder.join("plans/live-work.md");
+    let b_keep = b_folder.join("keep/k.md");
+    std::fs::write(&a_plan, b"work someone is going to ship")?;
+    std::fs::write(&a_keep, b"kept")?;
+    reload_sync(&a_home).await?;
+    assert!(
+        wait_for_file(&b_plan, b"work someone is going to ship").await,
+        "POSITIVE CONTROL FAILED: B never received the plan, so nothing below \
+         can show whether A's delete reaches it"
+    );
+    assert!(wait_for_file(&b_keep, b"kept").await, "B never received keep/k.md");
+
+    // A narrows its include. plans/ is no longer this entry's business on A.
+    write_sync_with_includes(a_dir.path(), &a_folder, "catalog", &["keep/**"]);
+    reload_sync(&a_home).await?;
+    assert_stays_missing(&a_folder.join("never-existed.md"), "sanity").await;
+    assert!(a_plan.exists(), "narrowing the include deleted the file; that is the FIRST half of the incident and it has its own test");
+
+    // The operator deletes the plan on A. Fabric was told this path is not in
+    // scope here, so the delete is a local act and must stay local.
+    std::fs::remove_file(&a_plan)?;
+    reload_sync(&a_home).await?;
+
+    // Meanwhile, delete an INCLUDED file too. That delete must reach B, which
+    // proves the pass ran, the tombstone path works, and the wire is live.
+    std::fs::remove_file(&a_keep)?;
+    reload_sync(&a_home).await?;
+    assert!(
+        wait_for_missing(&b_keep).await,
+        "POSITIVE CONTROL FAILED: a delete of an included file never reached B, \
+         so the survival of the excluded file below would prove nothing"
+    );
+
+    // Now the question. The included delete has landed, so the excluded one has
+    // had every chance to land with it. Keep watching; a delete that lands one
+    // pass later is the same loss.
+    for _ in 0..25 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            b_plan.exists(),
+            "A DELETED A PATH OUTSIDE ITS INCLUDE AND THE DELETE REACHED B. A path \
+             the entry no longer selects on A is not one A may tombstone for B"
+        );
+    }
+    assert_eq!(std::fs::read(&b_plan)?, b"work someone is going to ship");
 
     node_b.shutdown().await?;
     node_a.shutdown().await?;

@@ -1219,6 +1219,7 @@ impl<T: SyncTransport> SyncEngine<T> {
         materialize_tracked(
             &mut node,
             &root,
+            &entry.config,
             policy,
             protected,
             &mut observed,
@@ -2398,6 +2399,7 @@ fn already_materialized(
 fn materialize_tracked(
     node: &mut SyncNode,
     root: &Path,
+    entry: &SyncEntry,
     policy: PolicyRules,
     protected: &HashMap<String, ContentHash>,
     observed: &mut HashMap<String, ContentHash>,
@@ -2413,6 +2415,27 @@ fn materialize_tracked(
         .collect();
     let now = now_secs();
     for (rel, meta) in present {
+        // A PATH OUTSIDE THIS ENTRY'S INCLUDE IS NOT THIS MACHINE'S TO TOUCH.
+        //
+        // The scan already refuses to tombstone such a path, because "in my
+        // records, absent from my scan" is what leaving the include looks like
+        // as well as what a delete looks like. This loop used to undo that:
+        // it recorded every manifest path it found on disk as observed, so an
+        // excluded path stayed protected, and the pass after the operator
+        // deleted it locally hit "protected and not on disk" below and sent a
+        // tombstone to every peer. The same loss the scan guard was written
+        // for, one function later.
+        //
+        // Not writing it either is the same rule from the other side. If this
+        // machine wrote an excluded path it would have to guard it, and then
+        // it would restore the operator's local delete on every pass. A path
+        // the entry does not select is left exactly as the operator left it:
+        // never written, never removed, never observed. It stays in the
+        // manifest so a widened include materializes it on the next pass.
+        if !entry.includes(&rel) {
+            observed.remove(&rel);
+            continue;
+        }
         let path = root.join(&rel);
         if already_materialized(&path, &rel, &meta, cache) {
             observed.insert(rel.clone(), meta.hash);
@@ -2484,8 +2507,11 @@ fn materialize_tracked(
         }
     }
     if policy.propagate_deletes {
-        for (rel, entry) in node.manifest().entries() {
-            if !entry.is_present() {
+        for (rel, record) in node.manifest().entries() {
+            // Same boundary inbound. A peer's tombstone for a path this entry
+            // does not select here describes a file this machine never
+            // treated as the entry's, so the entry does not delete it.
+            if !record.is_present() && entry.includes(rel) {
                 let _ = std::fs::remove_file(root.join(rel));
                 observed.remove(rel);
             }
@@ -2984,6 +3010,7 @@ mod tests {
         materialize_tracked(
             &mut node,
             root,
+            &entry,
             entry.policy.rules(),
             &HashMap::new(),
             &mut observed,
@@ -3171,6 +3198,7 @@ mod tests {
         materialize_tracked(
             &mut node,
             &root,
+            &entry_with_policy("materialize", &root, SyncPolicy::Catalog),
             SyncPolicy::Catalog.rules(),
             &HashMap::new(),
             &mut observed,
@@ -3216,6 +3244,7 @@ mod tests {
             materialize_tracked(
                 &mut node,
                 &root,
+                &entry_with_policy("materialize", &root, SyncPolicy::Catalog),
                 SyncPolicy::Catalog.rules(),
                 &HashMap::new(),
                 &mut obs,
@@ -3231,6 +3260,7 @@ mod tests {
             materialize_tracked(
                 &mut node,
                 &root,
+                &entry_with_policy("materialize", &root, SyncPolicy::Catalog),
                 SyncPolicy::Catalog.rules(),
                 &HashMap::new(),
                 &mut obs,
@@ -3828,6 +3858,7 @@ mod tests {
         materialize_tracked(
             &mut node,
             root,
+            &entry_with_policy("materialize", root, SyncPolicy::Bus),
             SyncPolicy::Bus.rules(),
             &HashMap::new(),
             &mut observed,
@@ -4221,6 +4252,7 @@ mod tests {
         materialize_tracked(
             &mut node,
             root,
+            &entry,
             loud,
             &protected,
             &mut observed,
@@ -4349,6 +4381,7 @@ mod tests {
             materialize_tracked(
                 &mut node,
                 root,
+                &entry,
                 rules,
                 &protected,
                 &mut observed,
@@ -6226,6 +6259,7 @@ mod tests {
         materialize_tracked(
             &mut peer,
             &root,
+            &entry,
             entry.policy.rules(),
             &HashMap::new(),
             &mut observed,
@@ -6280,6 +6314,7 @@ mod tests {
         materialize_tracked(
             &mut node,
             &root,
+            &entry_with_policy("materialize", &root, SyncPolicy::Bus),
             SyncPolicy::Bus.rules(),
             &HashMap::new(),
             &mut observed,
@@ -6329,6 +6364,7 @@ mod tests {
         materialize_tracked(
             &mut node,
             &root,
+            &entry_with_policy("materialize", &root, SyncPolicy::Bus),
             SyncPolicy::Bus.rules(),
             &HashMap::new(),
             &mut observed_after,
@@ -6370,6 +6406,7 @@ mod tests {
         materialize_tracked(
             &mut node,
             &root,
+            &entry_with_policy("materialize", &root, SyncPolicy::Bus),
             SyncPolicy::Bus.rules(),
             &HashMap::new(),
             &mut observed,
@@ -6388,6 +6425,7 @@ mod tests {
         materialize_tracked(
             &mut node,
             &root,
+            &entry_with_policy("materialize", &root, SyncPolicy::Bus),
             SyncPolicy::Bus.rules(),
             &HashMap::new(),
             &mut observed_after,
@@ -6422,6 +6460,7 @@ mod tests {
         materialize_tracked(
             &mut peer,
             &root,
+            &entry,
             entry.policy.rules(),
             &HashMap::new(),
             &mut observed,
@@ -6558,6 +6597,7 @@ mod tests {
         materialize_tracked(
             &mut peer,
             &root,
+            &entry,
             entry.policy.rules(),
             &HashMap::new(),
             &mut observed,
@@ -7748,5 +7788,177 @@ mod tests {
 
         assert_archive_outcome(&engine, &root).await;
     }
-}
 
+    fn entry_with_include(folder: &Path, policy: SyncPolicy, include: &[&str]) -> SyncEntry {
+        SyncEntry {
+            include: Some(include.iter().map(|g| g.to_string()).collect()),
+            ..entry_with_policy("scoped", folder, policy)
+        }
+    }
+
+    /// Finding 2 of the 2026-08-29 review, at the function that had the hole.
+    ///
+    /// The scan refuses to tombstone a path outside the include. Materialize
+    /// did not, so a protected path that was excluded and then deleted locally
+    /// became a tombstone at a higher version, and every peer deleted its copy.
+    ///
+    /// CONTROL: the same disk, the same records, and an include that DOES
+    /// select the path must still tombstone it. Otherwise this test cannot
+    /// tell "guarded by the include" apart from "deletes do not work here".
+    #[test]
+    fn materialize_does_not_tombstone_a_deleted_path_outside_the_include() {
+        for (include, expect_tombstone) in [
+            (&["keep/**", "plans/**"][..], true),
+            (&["keep/**"][..], false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            std::fs::create_dir_all(root.join("keep")).unwrap();
+            std::fs::write(root.join("keep/k.md"), b"kept").unwrap();
+            let entry = entry_with_include(root, SyncPolicy::Catalog, include);
+            let rules = entry.policy.rules();
+            assert!(rules.propagate_deletes, "the fixture policy must propagate deletes");
+
+            let mut node = SyncNode::new(Author([1; 32]));
+            node.local_write("keep/k.md", b"kept", 0, 0);
+            node.local_write("plans/p.md", b"work someone is going to ship", 0, 0);
+            // Both paths were observed on disk by an earlier pass. plans/p.md
+            // has since been deleted by the operator and is not on disk now.
+            let protected: HashMap<String, ContentHash> = HashMap::from([
+                ("keep/k.md".to_string(), content_hash(b"kept")),
+                (
+                    "plans/p.md".to_string(),
+                    content_hash(b"work someone is going to ship"),
+                ),
+            ]);
+            let mut observed = protected.clone();
+            materialize_tracked(
+                &mut node,
+                root,
+                &entry,
+                rules,
+                &protected,
+                &mut observed,
+                &HashMap::new(),
+                None,
+            )
+            .unwrap();
+
+            let is_tombstone = matches!(
+                node.manifest().get("plans/p.md"),
+                Some(Entry::Tombstone(_))
+            );
+            assert_eq!(
+                is_tombstone, expect_tombstone,
+                "include={include:?}: an included delete must tombstone and an \
+                 excluded one must not"
+            );
+            assert!(
+                !root.join("plans/p.md").exists(),
+                "include={include:?}: materialize wrote back a file the operator deleted"
+            );
+            assert!(
+                !observed.contains_key("plans/p.md"),
+                "include={include:?}: a path that is not on disk stayed observed"
+            );
+            assert!(
+                matches!(node.manifest().get("keep/k.md"), Some(Entry::Present(_))),
+                "the included file was disturbed"
+            );
+        }
+    }
+
+    /// The other half of the same boundary: a Present path this entry does
+    /// not select is not written here. Writing it would force this machine to
+    /// protect it, and then to restore the operator's local delete of it on
+    /// every pass. It stays in the manifest, so a widened include picks it up.
+    #[test]
+    fn materialize_does_not_write_a_path_outside_the_include() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let entry = entry_with_include(root, SyncPolicy::Bus, &["keep/**"]);
+        let mut node = SyncNode::new(Author([2; 32]));
+        node.local_write("keep/k.md", b"kept", 0, 0);
+        node.local_write("docs/d.md", b"not selected here", 0, 0);
+        let mut observed = HashMap::new();
+        materialize_tracked(
+            &mut node,
+            root,
+            &entry,
+            entry.policy.rules(),
+            &HashMap::new(),
+            &mut observed,
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(root.join("keep/k.md")).unwrap(), b"kept");
+        assert!(
+            !root.join("docs/d.md").exists(),
+            "materialize wrote a path outside the include"
+        );
+        assert!(!observed.contains_key("docs/d.md"));
+        assert!(
+            matches!(node.manifest().get("docs/d.md"), Some(Entry::Present(_))),
+            "the excluded path must stay in the manifest for a later, wider include"
+        );
+
+        // Widen the include and the same pass writes it. That is the property
+        // that lets an include roll out one machine at a time.
+        let wider = entry_with_include(root, SyncPolicy::Bus, &["keep/**", "docs/**"]);
+        materialize_tracked(
+            &mut node,
+            root,
+            &wider,
+            wider.policy.rules(),
+            &HashMap::new(),
+            &mut observed,
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(root.join("docs/d.md")).unwrap(),
+            b"not selected here"
+        );
+        assert!(observed.contains_key("docs/d.md"));
+    }
+
+    /// Inbound direction of the same rule. A peer's tombstone for a path this
+    /// entry does not select describes a file this machine never treated as
+    /// the entry's, so materialize leaves the local file alone.
+    #[test]
+    fn materialize_does_not_apply_a_tombstone_outside_the_include() {
+        for (include, expect_deleted) in [
+            (&["keep/**", "docs/**"][..], true),
+            (&["keep/**"][..], false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            std::fs::create_dir_all(root.join("docs")).unwrap();
+            std::fs::write(root.join("docs/d.md"), b"mine, locally").unwrap();
+            let entry = entry_with_include(root, SyncPolicy::Bus, include);
+            let mut node = SyncNode::new(Author([3; 32]));
+            node.local_write("docs/d.md", b"mine, locally", 0, 0);
+            node.local_remove("docs/d.md", SyncPolicy::Bus.rules(), 10);
+            let mut observed = HashMap::new();
+            materialize_tracked(
+                &mut node,
+                root,
+                &entry,
+                entry.policy.rules(),
+                &HashMap::new(),
+                &mut observed,
+                &HashMap::new(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                !root.join("docs/d.md").exists(),
+                expect_deleted,
+                "include={include:?}: an included tombstone must delete and an \
+                 excluded one must not"
+            );
+        }
+    }
+}
