@@ -11,9 +11,13 @@ _Last updated: 2026-08-29 by Silber.fabric (Claude Fable). fabric 0.2.0; fleet o
 **Who wrote this and why.** A Claude Fable session spent 2026-08-29 on the fabric
 review (`../cos/notes/fabric/review-2026-08-29.md`, 15 findings). Workers are
 moving to Codex, so this externalizes what commits and PRs do not carry. A
-running decision log also lives in st2 context under identity `Silber.fabric`; I
-do not know whether a Codex successor inherits it, so treat THIS file as the
-source of truth and the st2 context as a bonus if reachable.
+running decision log also lives in st2 context under identity `Silber.fabric` —
+on the message bus, NOT in any repository, so it has no history and is not
+reviewable. IF YOU CAN REACH IT, run `st2 context read` for the fuller log. Treat
+THIS file as the reviewable source of truth. The context is accurate as an
+append-only log, with one correction appended 2026-08-29 evening: its "morning
+plan" entry was written as if the same agent resumes — the actor is now you, and
+cos sends the soak-clear signal.
 
 **State of main (verified 2026-08-29).** origin/main at `343b08b`. Merged today:
 #86 (finding 2, include-delete), #87 (finding 1, dial-permit leak), #88 (finding
