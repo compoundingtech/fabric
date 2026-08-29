@@ -1004,6 +1004,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                 reconcile_wire_bytes: entry.work.reconcile_wire_bytes.load(Ordering::Relaxed),
                 delta_fallbacks: entry.work.delta_fallbacks.load(Ordering::Relaxed),
                 full_payload_sends: node.full_payload_sends(),
+                content_bytes: node.content_bytes(),
                 stopped_peers: entry
                     .peer_state
                     .lock()
@@ -1969,6 +1970,9 @@ pub struct SyncStatus {
     /// Payloads this node SENT that carried its whole manifest, whatever the
     /// reason. Counts the outcome where `delta_fallbacks` counts one cause.
     pub full_payload_sends: u64,
+    /// Bytes of file content this entry holds in memory right now. Bounded by
+    /// the manifest: every Present entry's bytes at most, never every version.
+    pub content_bytes: u64,
     /// Peers this entry is NOT currently syncing with, and why, as
     /// `peer:reason` pairs. Empty is healthy.
     ///

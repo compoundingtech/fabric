@@ -2904,6 +2904,7 @@ async fn process_control_request(
                     .map(|status| SyncEntryStatus {
                         delta_fallbacks: status.delta_fallbacks,
                         full_payload_sends: status.full_payload_sends,
+                        content_bytes: status.content_bytes,
                         stopped_peers: status.stopped_peers,
                         digest: status.digest,
                         name: status.name,

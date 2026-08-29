@@ -247,6 +247,26 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **The daemon no longer holds every version of every synced file in memory
+  until restart.** The content store only grew: `local_write` and the wire
+  receive path inserted, and nothing removed. Every superseded version of every
+  file in every entry stayed resident. Finding 4 of the 2026-08-29 review, and a
+  sufficient cause for the 2.52 GB resident size recorded on Silber on 19 August.
+
+  The store is now bounded by the manifest: a blob stays while some Present
+  entry names its hash and goes when none does, after a local write, a local
+  delete, an adopt, or a reconcile. A peer can only ask for a hash it adopted
+  from this manifest, so nothing a peer can request is dropped.
+
+  Measured on two release-build daemons on one machine, one 5 MB file rewritten
+  40 times over 82 s: before, the writer grew by 206 MB and its peer by 203 MB;
+  after, by 25 MB and 15 MB, and both report `content_bytes=5000005`, the live
+  file. `fabric sync ls` now prints `content_bytes`, which is the number that
+  would have said so on 19 August.
+
+  Not changed here: a file over 512 MiB is still read into memory and refused by
+  every peer, and every present file's bytes are still held once. Both are
+  separate changes.
 - **A dial to a peer that cannot be reached no longer holds its permit after the
   consumer leaves.** Every local connection to a dial socket, and every `shell`
   and `exec`, holds one of 32 dial permits for the life of its session. A session
