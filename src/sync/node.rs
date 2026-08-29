@@ -332,7 +332,8 @@ impl SyncNode {
     /// - nothing is on local disk for it (`observed` has no receipt), so we are
     ///   not discarding the record of a file that still exists,
     /// - the tombstone is older than `ttl_secs`, and
-    /// - every peer acked *after this node was seen holding the tombstone*.
+    /// - every peer acked *strictly after this node was seen holding the
+    ///   tombstone*, which with whole-second stamps means on a later pass.
     ///
     /// That last rule is the subtle one. `deleted_secs` comes from the clock of
     /// whichever node performed the delete, so it says when the file died, NOT
@@ -389,8 +390,18 @@ impl SyncNode {
             }
             // First time we have seen this one expired. Stamp it now, so the
             // ack we demand is one this node earned while already holding it.
+            //
+            // STRICTLY LATER, not "at or after". Stamps are whole seconds, and
+            // one pass can reconcile a peer, adopt an expired tombstone, and
+            // sweep inside the same second. `acked >= held_since` read that as
+            // proof and forgot the tombstone before the peer was ever sent it;
+            // the peer still held the file and handed it back on the next pass,
+            // which deleted it and swept it again, silently, for ever. An ack
+            // from a strictly later second is from a reconcile that completed
+            // after this pass, and only that reconcile can have carried the
+            // tombstone. Finding 5 of the 2026-08-29 review.
             let held_since = expired_since.get(path).copied().unwrap_or(now_secs);
-            if acked_through.is_some_and(|acked| acked >= held_since) {
+            if acked_through.is_some_and(|acked| acked > held_since) {
                 swept.push(path.clone());
             } else {
                 waiting.insert(path.clone(), held_since);
@@ -650,9 +661,12 @@ mod tests {
     #[test]
     fn a_tombstone_is_swept_only_after_the_ttl_and_only_once_every_peer_acked() {
         // now, acked_through, expected-to-sweep. Expiry is deleted(100) + ttl.
+        // A single pass with no memory of an earlier one can NEVER sweep: the
+        // pass that first sees a tombstone expired stamps it, and the ack it
+        // needs must postdate that stamp. So an ack equal to `now` refuses.
         let cases = [
-            (100 + DAY, Some(100 + DAY), true, "exactly at expiry"),
-            (100 + 5 * DAY, Some(100 + 5 * DAY), true, "well past expiry"),
+            (100 + DAY, Some(100 + DAY), false, "exactly at expiry, first seen now"),
+            (100 + 5 * DAY, Some(100 + 5 * DAY), false, "well past expiry, first seen now"),
             (100 + DAY - 1, Some(100 + 5 * DAY), false, "ttl not elapsed"),
             (100 + 5 * DAY, Some(100 + DAY - 1), false, "ack predates expiry"),
             (100 + 5 * DAY, None, false, "a peer never acked"),
@@ -666,6 +680,33 @@ mod tests {
                 expected,
                 "manifest disagrees with the returned sweep: {why}"
             );
+        }
+
+        // The positive case takes two passes: one to stamp, one with an ack
+        // that postdates the stamp. Exactly at expiry and well past it.
+        for first_seen in [100 + DAY, 100 + 5 * DAY] {
+            let mut a = tombstoned(100);
+            let mut expired_since = HashMap::new();
+            let evidence = |now, acked| SweepEvidence {
+                now_secs: now,
+                ttl_secs: DAY,
+                acked_through: Some(acked),
+            };
+            let swept = a.sweep_tombstones(
+                bus(),
+                evidence(first_seen, first_seen),
+                &HashMap::new(),
+                &mut expired_since,
+            );
+            assert!(swept.is_empty(), "first_seen={first_seen}: swept on first sight");
+            let swept = a.sweep_tombstones(
+                bus(),
+                evidence(first_seen + 1, first_seen + 1),
+                &HashMap::new(),
+                &mut expired_since,
+            );
+            assert_eq!(swept, vec!["gone.txt".to_string()], "first_seen={first_seen}");
+            assert!(a.manifest().get("gone.txt").is_none());
         }
     }
 
@@ -756,6 +797,70 @@ mod tests {
     ///
     /// One pass reconciles peers in list order, so this is ordinary: `x` acks,
     /// then `h` hands us a tombstone `x` has never seen, then the sweep runs.
+    /// Finding 5 of the 2026-08-29 review: the same shape as the test below,
+    /// with the clock reading the SAME SECOND for the ack and the sweep.
+    ///
+    /// Stamps are whole seconds. A pass that reconciles x (ack at T), then
+    /// adopts an already expired tombstone from h, then sweeps, all inside
+    /// second T, used to see `acked >= held_since` as `T >= T` and forget the
+    /// tombstone before x was ever sent it. x still held the file, so the next
+    /// pass adopted it back, deleted it again, swept again, and nothing said so.
+    ///
+    /// The rule that closes it: the ack must come from a reconcile that
+    /// completed AFTER the pass that first saw the tombstone expired. With
+    /// whole seconds that is a strictly later stamp, which is always a later
+    /// pass. The control at the end proves the gate still opens then.
+    #[test]
+    fn a_tombstone_first_seen_expired_this_pass_is_not_swept_this_pass() {
+        let mut x = node(3);
+        x.local_write("gone.txt", b"bytes", 0, 0);
+        let mut h = tombstoned(100);
+        let mut m = node(2);
+
+        // Pass 1, all inside one second T.
+        let t = 100 + 9 * DAY;
+        m.reconcile(&mut x); // x acks at T; m does not hold the tombstone yet
+        m.reconcile(&mut h); // now it does, already expired
+        let mut expired_since = HashMap::new();
+        let evidence = |now, acked| SweepEvidence {
+            now_secs: now,
+            ttl_secs: DAY,
+            acked_through: Some(acked),
+        };
+        let swept = m.sweep_tombstones(bus(), evidence(t, t), &HashMap::new(), &mut expired_since);
+        assert!(
+            swept.is_empty(),
+            "swept in the same second the tombstone arrived, before x was sent it"
+        );
+        assert!(
+            m.manifest().get("gone.txt").is_some_and(|e| !e.is_present()),
+            "m must still hold the tombstone"
+        );
+
+        // Pass 2, one second later: x is told, and its ack now postdates the
+        // stamp. This is the control: the gate opens when it should.
+        m.reconcile(&mut x);
+        assert!(
+            !x.manifest().get("gone.txt").unwrap().is_present(),
+            "x never received the tombstone, so the sweep below would strand it"
+        );
+        let swept = m.sweep_tombstones(
+            bus(),
+            evidence(t + 1, t + 1),
+            &HashMap::new(),
+            &mut expired_since,
+        );
+        assert_eq!(swept, vec!["gone.txt".to_string()]);
+
+        // And the file does not come back from x afterwards. x still holds
+        // the tombstone and may hand it back; a tombstone is not the file.
+        m.reconcile(&mut x);
+        assert!(
+            !m.manifest().get("gone.txt").is_some_and(|e| e.is_present()),
+            "RESURRECTED after a correct sweep"
+        );
+    }
+
     /// Every existing tombstone on the live bus is older than any sane TTL, so
     /// the first pass after the sweep is enabled is exactly this shape.
     #[test]
