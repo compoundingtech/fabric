@@ -1242,6 +1242,8 @@ mod supervisor_failure_tests {
                     allow_exec: false,
                     peers: Vec::new(),
                     connection_telemetry: Default::default(),
+                    active_dial_handlers: 0,
+                    max_dial_handlers: 32,
                 };
                 let _ = stream
                     .write_all(&serde_json::to_vec(&reply).unwrap())

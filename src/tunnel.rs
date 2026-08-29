@@ -37,6 +37,10 @@ const LOCAL_READ_BUF: usize = 8192;
 const MAX_BUFFERED_BYTES: usize = 4 * 1024 * 1024;
 const SERVER_SESSION_REAP_INTERVAL: Duration = Duration::from_secs(60);
 const ATTACH_STABLE_AFTER: Duration = Duration::from_secs(2);
+/// How often a session whose local input has ended asks the kernel whether the
+/// consumer is still there. Only such sessions probe, so the cost is one
+/// zero-length write per second per half-closed or abandoned session.
+const LOCAL_ENDPOINT_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
 const FRAME_HELLO: u8 = 1;
 const FRAME_DATA: u8 = 2;
@@ -720,6 +724,63 @@ impl TunnelSession {
         Ok(())
     }
 
+    async fn local_input_ended(&self) -> bool {
+        self.state.lock().await.send_closed.is_some()
+    }
+
+    /// Ask the kernel whether anybody still holds the other end of the local
+    /// socket. `Ok` means somebody does, or that the question does not apply
+    /// yet; `Err` is a typed `LocalEndpointGone`.
+    ///
+    /// Remote output used to be the only thing that could discover a consumer
+    /// had gone: the write failed, and that failure ended the session (issue
+    /// 51). A session that never reaches its peer never has output, so it
+    /// never discovered anything. It retried for ever and held its dial permit
+    /// the whole time, and thirty-two of them stopped every shell, exec and
+    /// dial on the machine while status and ping stayed green.
+    ///
+    /// A zero-length write reaches the kernel and fails with `EPIPE` once the
+    /// consumer has closed BOTH directions. A half-close, where the consumer
+    /// sent everything and is waiting for output, leaves the socket writable,
+    /// so it returns `Ok`. That is exactly the distinction needed: a consumer
+    /// that is waiting is served, a consumer that has left is not retried for.
+    ///
+    /// Gated on the local input having ended, because until the reader sees
+    /// EOF there is a consumer by definition, and the reader is the cheaper
+    /// instrument.
+    pub async fn probe_local_endpoint(&self) -> Result<()> {
+        if !self.local_input_ended().await {
+            return Ok(());
+        }
+        let failed = {
+            let mut write = self.local_write.lock().await;
+            let Some(write) = write.as_mut() else {
+                return Ok(());
+            };
+            write.write(&[]).await.err()
+        };
+        let Some(source) = failed else {
+            return Ok(());
+        };
+        self.mark_send_closed().await;
+        Err(LocalEndpointGone {
+            id: self.id,
+            source,
+        }
+        .into())
+    }
+
+    /// Resolve only when the local consumer has gone. Meant as a `select!` arm
+    /// beside whatever the session is otherwise waiting on.
+    async fn watch_local_endpoint(&self) -> anyhow::Error {
+        loop {
+            tokio::time::sleep(LOCAL_ENDPOINT_PROBE_INTERVAL).await;
+            if let Err(error) = self.probe_local_endpoint().await {
+                return error;
+            }
+        }
+    }
+
     pub async fn abort_local(&self) -> Result<()> {
         self.done.cancel();
         self.shutdown_local_write().await
@@ -863,6 +924,9 @@ async fn write_attach_loop(session: Arc<TunnelSession>, mut send: SendStream) ->
         tokio::select! {
             _ = session.notify.notified() => {}
             _ = session.done.cancelled() => return Ok(()),
+            // A silent remote never writes, so a write failure can never tell
+            // this loop the consumer left. Ask instead.
+            error = session.watch_local_endpoint() => return Err(error),
         }
     }
 }
@@ -1102,28 +1166,20 @@ async fn run_client_attach_loop(
                         )
                         .await;
                 }
-                if !wait_for_reconnect(delay, &cancel, &session, &mut drop_rx, &mut endpoint_rx)
+                match wait_for_reconnect(delay, &cancel, &session, &mut drop_rx, &mut endpoint_rx)
                     .await
                 {
-                    return Ok(());
+                    ReconnectWait::Retry => continue,
+                    ReconnectWait::Stop => return Ok(()),
+                    ReconnectWait::LocalGone(error) => {
+                        return fail_permanently(&session, notices.as_ref(), error).await;
+                    }
                 }
-                continue;
             }
             Err(error) => {
                 let message = format!("{error:#}");
                 if is_permanent_failure(&error) {
-                    if let Some(notices) = notices.as_ref() {
-                        notices
-                            .emit(
-                                &session,
-                                ClientConnectionEvent::Failed {
-                                    error: message.clone(),
-                                },
-                            )
-                            .await;
-                    }
-                    session.abort_local().await?;
-                    return Err(error);
+                    return fail_permanently(&session, notices.as_ref(), error).await;
                 }
                 let attempt = session
                     .record_reconnect_attempt(Some(message.clone()))
@@ -1141,15 +1197,47 @@ async fn run_client_attach_loop(
                         )
                         .await;
                 }
-                if !wait_for_reconnect(delay, &cancel, &session, &mut drop_rx, &mut endpoint_rx)
+                match wait_for_reconnect(delay, &cancel, &session, &mut drop_rx, &mut endpoint_rx)
                     .await
                 {
-                    return Ok(());
+                    ReconnectWait::Retry => continue,
+                    ReconnectWait::Stop => return Ok(()),
+                    ReconnectWait::LocalGone(error) => {
+                        return fail_permanently(&session, notices.as_ref(), error).await;
+                    }
                 }
-                continue;
             }
         }
     }
+}
+
+/// End a session the retry loop must not retry: say so, close the local side,
+/// and hand the typed error up so the caller can classify it too.
+async fn fail_permanently(
+    session: &TunnelSession,
+    notices: Option<&ClientConnectionNotices>,
+    error: anyhow::Error,
+) -> Result<()> {
+    if let Some(notices) = notices {
+        notices
+            .emit(
+                session,
+                ClientConnectionEvent::Failed {
+                    error: format!("{error:#}"),
+                },
+            )
+            .await;
+    }
+    session.abort_local().await?;
+    Err(error)
+}
+
+enum ReconnectWait {
+    Retry,
+    Stop,
+    /// The consumer closed its socket while this session waited to retry.
+    /// Nothing a reconnect could do is for anybody now.
+    LocalGone(anyhow::Error),
 }
 
 async fn wait_for_reconnect(
@@ -1158,13 +1246,14 @@ async fn wait_for_reconnect(
     session: &TunnelSession,
     drop_rx: &mut watch::Receiver<u64>,
     endpoint_rx: &mut watch::Receiver<CurrentEndpoint>,
-) -> bool {
+) -> ReconnectWait {
     tokio::select! {
-        _ = tokio::time::sleep(delay) => true,
-        _ = cancel.cancelled() => false,
-        _ = session.done.cancelled() => false,
-        changed = drop_rx.changed() => changed.is_ok(),
-        changed = endpoint_rx.changed() => changed.is_ok(),
+        _ = tokio::time::sleep(delay) => ReconnectWait::Retry,
+        _ = cancel.cancelled() => ReconnectWait::Stop,
+        _ = session.done.cancelled() => ReconnectWait::Stop,
+        changed = drop_rx.changed() => if changed.is_ok() { ReconnectWait::Retry } else { ReconnectWait::Stop },
+        changed = endpoint_rx.changed() => if changed.is_ok() { ReconnectWait::Retry } else { ReconnectWait::Stop },
+        error = session.watch_local_endpoint() => ReconnectWait::LocalGone(error),
     }
 }
 
@@ -1186,10 +1275,15 @@ async fn connect_and_attach(
     drop_rx: watch::Receiver<u64>,
     notices: Option<&ClientConnectionNotices>,
 ) -> Result<()> {
-    let connection = endpoint
-        .connect(peer_addr, alpn)
-        .await
-        .with_context(|| "failed to reconnect tunnel")?;
+    // A connect to a peer that is away can take the whole handshake timeout
+    // to fail. The consumer may leave during it, and then the rest of the
+    // attempt is for nobody.
+    let connection = tokio::select! {
+        connected = endpoint.connect(peer_addr, alpn) => {
+            connected.with_context(|| "failed to reconnect tunnel")?
+        }
+        error = session.watch_local_endpoint() => return Err(error),
+    };
     attach_connection(session, connection, drop_rx, notices).await
 }
 
@@ -2374,5 +2468,101 @@ mod tests {
                  (fail_at_end={fail_at_end})"
             );
         }
+    }
+
+    /// Finding 1 of the 2026-08-29 review, at the socket.
+    ///
+    /// A session whose peer never answers has no remote output, so the only
+    /// instrument issue 51 left it (a failed local write) never fires. It must
+    /// be able to ask the kernel directly, and the answer must tell a consumer
+    /// that has LEFT apart from one that has finished sending and is WAITING.
+    /// Getting that wrong in one direction leaks permits; in the other it
+    /// kills every request-then-half-close protocol while its peer is away.
+    #[tokio::test]
+    async fn a_consumer_that_closed_its_socket_is_detected_without_remote_output() {
+        let (consumer, local) = tokio::net::UnixStream::pair().unwrap();
+        let (session, read) = TunnelSession::new(session_id(1), peer_id(), local);
+        let reader = tokio::spawn(session.clone().run_local_reader(read));
+
+        // Alive and not even done sending: nothing to probe, nothing to say.
+        session
+            .probe_local_endpoint()
+            .await
+            .expect("a consumer that has not closed anything is present");
+
+        // The consumer gives up entirely. The reader sees EOF, and nothing
+        // else in the session can see anything.
+        drop(consumer);
+        let _ = reader.await;
+        assert!(
+            session.local_input_ended().await,
+            "the reader must have recorded the EOF, or the probe is gated off"
+        );
+
+        let error = session
+            .probe_local_endpoint()
+            .await
+            .expect_err("a zero-length write into a fully closed socket must fail");
+        assert!(
+            error.downcast_ref::<LocalEndpointGone>().is_some(),
+            "the retry loop matches on the type, not the prose: {error:#}"
+        );
+        assert!(is_permanent_failure(&error));
+    }
+
+    /// The control. A consumer that half-closed is still there, and must still
+    /// receive output that arrives later.
+    #[tokio::test]
+    async fn a_consumer_that_half_closed_is_still_served() {
+        let (mut consumer, local) = tokio::net::UnixStream::pair().unwrap();
+        let (session, read) = TunnelSession::new(session_id(2), peer_id(), local);
+        let reader = tokio::spawn(session.clone().run_local_reader(read));
+
+        // "I have sent my whole request; now I wait for the reply."
+        consumer.shutdown().await.unwrap();
+        let _ = reader.await;
+        assert!(session.local_input_ended().await);
+
+        session
+            .probe_local_endpoint()
+            .await
+            .expect("a half-closed consumer is waiting, not gone");
+        assert!(
+            tokio::time::timeout(
+                LOCAL_ENDPOINT_PROBE_INTERVAL * 3,
+                session.watch_local_endpoint()
+            )
+            .await
+            .is_err(),
+            "the watcher must not resolve while the consumer is waiting"
+        );
+
+        // And the reply it is waiting for still reaches it.
+        session
+            .accept_data(0, b"the late reply".to_vec())
+            .await
+            .expect("output to a waiting consumer must be written");
+        let mut got = vec![0; 32];
+        let n = consumer.read(&mut got).await.unwrap();
+        assert_eq!(&got[..n], b"the late reply");
+    }
+
+    /// The watcher is what the retry loop actually races against, so its
+    /// resolution is asserted, not only the probe underneath it.
+    #[tokio::test]
+    async fn the_watcher_resolves_once_the_consumer_leaves() {
+        let (consumer, local) = tokio::net::UnixStream::pair().unwrap();
+        let (session, read) = TunnelSession::new(session_id(3), peer_id(), local);
+        let reader = tokio::spawn(session.clone().run_local_reader(read));
+        drop(consumer);
+        let _ = reader.await;
+
+        let error = tokio::time::timeout(
+            LOCAL_ENDPOINT_PROBE_INTERVAL * 3,
+            session.watch_local_endpoint(),
+        )
+        .await
+        .expect("the watcher must resolve within a few probe intervals");
+        assert!(error.downcast_ref::<LocalEndpointGone>().is_some());
     }
 }

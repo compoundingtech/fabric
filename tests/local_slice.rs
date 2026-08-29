@@ -1196,6 +1196,114 @@ async fn peer_file_remains_authoritative_when_daemon_config_is_created() -> Resu
     Ok(())
 }
 
+/// Finding 1 of the 2026-08-29 review. A dial to a peer that cannot be reached
+/// held its permit for ever, and kept holding it after the consumer closed its
+/// socket. With all 32 held, every `shell`, `exec` and new dial on the machine
+/// waited with no error, while `status` and `ping` stayed green.
+///
+/// Bluey is the peer that makes this live: it is unreachable most of the time
+/// by design, and anything that dials it and gives up leaves a permit behind.
+///
+/// CONTROL: the 32 consumers must be seen holding 32 permits before they close,
+/// or "0 afterwards" proves nothing. And a fresh dial to a REAL peer must round
+/// trip afterwards, because that is the symptom a person sees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_abandoned_dial_to_an_unreachable_peer_releases_its_permit() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let node_a_dir = TempDir::new()?;
+    let node_b_dir = TempDir::new()?;
+    let node_a_home = FabricHome::new(node_a_dir.path());
+    let node_b_home = FabricHome::new(node_b_dir.path());
+    let node_a = FabricNode::start(node_a_home.clone()).await?;
+    let node_b = FabricNode::start(node_b_home.clone()).await?;
+    trust_peer(
+        &node_a_home,
+        &node_a,
+        node_b.id(),
+        Some("node-b"),
+        Some(node_b.addr()),
+    )
+    .await?;
+    trust_peer(
+        &node_b_home,
+        &node_b,
+        node_a.id(),
+        Some("node-a"),
+        Some(node_a.addr()),
+    )
+    .await?;
+
+    // A trusted peer with no address and nobody behind it: what a roaming
+    // laptop looks like while it is asleep.
+    let ghost = iroh::SecretKey::generate().public();
+    trust_peer(&node_a_home, &node_a, ghost, Some("ghost"), None).await?;
+    let ghost_socket = node_a.dial("ghost", "pty-view").await?;
+
+    let echo_socket = node_b_dir.path().join("echo.sock");
+    let echo_hits = Arc::new(AtomicUsize::new(0));
+    let echo_task = spawn_echo_service(&echo_socket, echo_hits.clone()).await?;
+    node_b.expose("pty-view", echo_socket).await?;
+    let echo_dial = node_a.dial("node-b", "pty-view").await?;
+
+    let state = node_a.state();
+    let max = state.max_dial_handlers();
+    assert_eq!(
+        state.active_dial_handlers(),
+        0,
+        "permits in use before anything dialed"
+    );
+
+    let mut consumers = Vec::new();
+    for _ in 0..max {
+        consumers.push(UnixStream::connect(&ghost_socket).await?);
+    }
+    let held = wait_for_dial_handlers(&state, max).await;
+    assert_eq!(
+        held, max,
+        "POSITIVE CONTROL FAILED: {max} consumers did not take {max} permits, so \
+         their release below would prove nothing"
+    );
+
+    // Every consumer gives up. Nobody is waiting on any of these sessions now.
+    drop(consumers);
+
+    let released = wait_for_dial_handlers(&state, 0).await;
+    assert_eq!(
+        released, 0,
+        "{released} dial permits are still held by sessions whose consumer closed. \
+         Every shell, exec and dial on this machine now waits for a restart"
+    );
+
+    // The symptom a person sees, checked directly: a dial to a real peer works.
+    let mut stream = tokio::time::timeout(LOCAL_IO_TIMEOUT, UnixStream::connect(&echo_dial))
+        .await
+        .context("connecting to the echo dial socket")??;
+    tokio::time::timeout(
+        LOCAL_IO_TIMEOUT,
+        stream_round_trip(&mut stream, b"after-the-ghosts"),
+    )
+    .await
+    .context("a dial to a reachable peer hung after abandoned dials to an unreachable one")??;
+
+    echo_task.abort();
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
+/// Poll the permit count until it reads `want`, for up to 30 s. Returns the
+/// last reading either way so the assertion can say what it saw.
+async fn wait_for_dial_handlers(state: &fabric::daemon::DaemonState, want: usize) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let now = state.active_dial_handlers();
+        if now == want || Instant::now() >= deadline {
+            return now;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn trust_peer(
     home: &FabricHome,
     node: &FabricNode,

@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, bail, Context};
+use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use fabric::{
     config::{
@@ -21,11 +21,11 @@ use fabric::{
     },
     exec,
     service::{self, ServiceInstallOptions},
-    update,
     shell::{self, ServerFrame},
     sync::config::{SyncBook, SyncEntry, SyncPeers, SyncPolicy},
     telemetry::PeerTelemetry,
     terminal::TerminalModeGuard,
+    update,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -477,6 +477,8 @@ async fn main() -> Result<()> {
                             allow_exec,
                             peers,
                             connection_telemetry,
+                            active_dial_handlers,
+                            max_dial_handlers,
                         } => {
                             print_status(
                                 &version,
@@ -488,6 +490,7 @@ async fn main() -> Result<()> {
                                 allow_exec,
                                 &peers,
                                 &connection_telemetry,
+                                (active_dial_handlers, max_dial_handlers),
                             )?;
                         }
                         response => bail!("unexpected daemon response: {response:?}"),
@@ -1672,6 +1675,7 @@ fn print_status(
     allow_exec: bool,
     peers: &[PeerReachability],
     connection_telemetry: &BTreeMap<String, PeerTelemetry>,
+    dial_handlers: (usize, usize),
 ) -> Result<()> {
     println!("version\t{version}");
     println!("node\t{node_id}");
@@ -1687,6 +1691,10 @@ fn print_status(
         if allow_shell { "allowed" } else { "disabled" }
     );
     println!("exec\t{}", if allow_exec { "allowed" } else { "disabled" });
+    // Shell, exec and every dial share these. When all are held, a new one
+    // waits with no error, which reads as "hangs while ping answers".
+    let (active, max) = dial_handlers;
+    println!("dial handlers\t{active}/{max} in use");
     print_peer_reachability(peers);
     print_connection_telemetry(connection_telemetry);
     print_path_latency(connection_telemetry);
