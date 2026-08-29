@@ -892,6 +892,24 @@ impl DaemonState {
         }))
     }
 
+    /// Dial permits in use right now, out of `MAX_DIAL_HANDLERS`.
+    ///
+    /// Every local connection to a dial socket, and every `shell` and `exec`,
+    /// holds one for the life of its session. When all are held, every new one
+    /// waits with no error and no log line, so this number is the instrument
+    /// for "shell hangs while ping answers".
+    pub fn active_dial_handlers(&self) -> usize {
+        MAX_DIAL_HANDLERS.saturating_sub(self.dial_slots.available_permits())
+    }
+
+    pub fn max_dial_handlers(&self) -> usize {
+        MAX_DIAL_HANDLERS
+    }
+
+    pub fn active_incoming_handlers(&self) -> usize {
+        MAX_INCOMING_HANDLERS.saturating_sub(self.incoming_slots.available_permits())
+    }
+
     pub(crate) fn telemetry(&self) -> Arc<TelemetryStore> {
         self.telemetry.clone()
     }
@@ -1332,6 +1350,8 @@ impl DaemonState {
             allow_exec: self.allow_exec,
             peers,
             connection_telemetry: self.telemetry.snapshot().peers,
+            active_dial_handlers: self.active_dial_handlers(),
+            max_dial_handlers: self.max_dial_handlers(),
         })
     }
 
@@ -1756,10 +1776,8 @@ impl DaemonState {
 
         let rss_bytes = current_rss_bytes();
         let server_sessions = self.tunnel_sessions.stats().await;
-        let active_incoming_handlers =
-            MAX_INCOMING_HANDLERS.saturating_sub(self.incoming_slots.available_permits());
-        let active_dial_handlers =
-            MAX_DIAL_HANDLERS.saturating_sub(self.dial_slots.available_permits());
+        let active_incoming_handlers = self.active_incoming_handlers();
+        let active_dial_handlers = self.active_dial_handlers();
         info!(
             target: VALIDATION_LOG_TARGET,
             event = "endpoint_snapshot",
@@ -4155,7 +4173,7 @@ fn generic_dial_notices(
                 peer = %peer,
                 protocol = %protocol,
                 error = %error,
-                "generic dial could not resume"
+                "generic dial session ended and will not retry"
             ),
         }
         // Never any bytes: this stream belongs to another protocol.

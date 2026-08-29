@@ -247,6 +247,25 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **A dial to a peer that cannot be reached no longer holds its permit after the
+  consumer leaves.** Every local connection to a dial socket, and every `shell`
+  and `exec`, holds one of 32 dial permits for the life of its session. A session
+  whose peer never answered had no remote output, so the only thing that could
+  discover its consumer had gone (a failed local write, issue 51) never fired. It
+  retried for ever with the permit held. Thirty-two such connections, which a
+  roaming peer that is asleep produces for free, made every new `shell`, `exec`
+  and dial on the machine wait with no error while `status` and `ping` stayed
+  green. Only a restart cleared it. Finding 1 of the 2026-08-29 review.
+
+  A session whose local input has ended now asks the kernel once a second whether
+  anybody still holds the other end, with a zero-length write. A consumer that
+  closed both directions fails it and the session ends at once, in whichever
+  state it was in: waiting to retry, mid-connect, or attached to a silent peer.
+  A consumer that half-closed and is waiting for output passes it and is served.
+
+  `fabric status` now prints `dial handlers N/32 in use`, which is the number
+  that would have said what was wrong.
+
 - **A path outside an entry's include is no longer deleted on every peer when
   it is deleted locally.** Narrowing an include was already safe on its own:
   the scan refuses to treat a path that left the include as a delete. But

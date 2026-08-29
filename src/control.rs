@@ -119,6 +119,13 @@ pub enum ControlResponse {
         /// older client still decodes a newer daemon's reply.
         #[serde(default)]
         connection_telemetry: BTreeMap<String, PeerTelemetry>,
+        /// Dial permits in use and the cap. Every shell, exec and dial holds
+        /// one for the life of its session, and when all are held every new
+        /// one waits with no error. Defaulted for an older daemon's reply.
+        #[serde(default)]
+        active_dial_handlers: usize,
+        #[serde(default)]
+        max_dial_handlers: usize,
     },
     Restarting {
         log: PathBuf,
@@ -312,6 +319,8 @@ mod tests {
             allow_exec: false,
             peers: Vec::new(),
             connection_telemetry: BTreeMap::from([("droppy".to_string(), populated_peer())]),
+            active_dial_handlers: 0,
+            max_dial_handlers: 32,
         };
 
         let bytes = serde_json::to_vec(&response)
