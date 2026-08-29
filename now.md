@@ -4,7 +4,174 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-07-21 by fabric-claude (opus). fabric 0.2.0 on origin main._
+_Last updated: 2026-08-29 by Silber.fabric (Claude Fable). fabric 0.2.0; fleet on v0.2.0+4bc04af; handing off to Codex._
+
+## Handoff — 2026-08-29 (Fable session; fleet moving to Codex, context will be lost)
+
+**Who wrote this and why.** A Claude Fable session spent 2026-08-29 on the fabric
+review (`../cos/notes/fabric/review-2026-08-29.md`, 15 findings). Workers are
+moving to Codex, so this externalizes what commits and PRs do not carry. A
+running decision log also lives in st2 context under identity `Silber.fabric`; I
+do not know whether a Codex successor inherits it, so treat THIS file as the
+source of truth and the st2 context as a bonus if reachable.
+
+**State of main (verified 2026-08-29).** origin/main at `343b08b`. Merged today:
+#86 (finding 2, include-delete), #87 (finding 1, dial-permit leak), #88 (finding
+4A, content memory) — these three are in release `v0.2.0+4bc04af`, deployed to
+the fleet. Also merged: #89 (finding 3), #90 (finding 15, README).
+
+**Open PRs:**
+- #91 F5 sweep-gate · #92 known-flakes doc · #93 F6 update-timer · #94 F9
+  monitor-park · #95 F12 doctor-`--home` · #96 F10 doctor service-enablement.
+  These are a STACKED CHAIN: each branch is rebased onto the previous, so
+  SQUASH-MERGE THEM IN ORDER 91→96. Out of order or one-at-a-time will conflict
+  on CHANGELOG. (#89 and #90 already landed this way, cleanly.)
+- #97 (finding 7, send-file streaming) and #98 (finding 8, adopt-honours-include)
+  — NOT in the chain. After the chain lands, rebase both onto new main (CHANGELOG
+  conflicts). #98 changes wire/convergence semantics — merge AFTER the soak.
+- Branch `feat/peer-acls-explicit-not-legacy` (`5350765`) — 0.10 ACL groundwork,
+  transcription test only so far; helper + expose warning still to write.
+
+### Decisions + reasons (settled with cos / Nathan, not in any file)
+
+1. **Affirmative-absence deletes — item 1 of the NEXT correctness pass.** A delete
+   must be inferred ONLY from an affirmative absence: a path missing from a
+   directory the scan COMPLETELY and successfully read. Split "absent from scan"
+   into three answers — PRESENT / AFFIRMATIVELY-GONE / UNKNOWN — and tombstone
+   only affirmatively-gone. Why: today `scan_folder` (src/sync/engine.rs) aborts
+   on the first unreadable file (`read_dir?`/`file_type?`/`fs::read?`), so an
+   unreadable file STALLS the whole entry rather than false-deleting; the delete
+   loop only runs on a fully-successful scan. Making the scan resilient (skip
+   what it can't read) would REINTRODUCE the false-delete for skipped paths. The
+   three-answer split fixes both at once and retires the guard accretion — three
+   guards today are one mechanism: the 2026-08-25 scan guard, #86's
+   materialize-time include check, and F4-B's proposed size guard. Filed as the
+   FIRST item of the next correctness pass, deliberately NOT under 1.0 (a
+   correctness fix under a feature milestone inherits the wrong gate; 1.0 is
+   folder sync + relay + DNS). Gate: the soak. Ceiling: the filesystem gives no
+   reliable delete event for a delete while the daemon was off, so the scan stays
+   the delete source — the change QUALIFIES its absences, it does not replace it.
+
+2. **F4-B and F11 are the first instances of (1), written in that shape, NOT as a
+   third guard.** F4-B: a single file over 512 MiB (`MAX_BLOB`, src/sync/wire.rs)
+   makes the whole entry bail and every peer read as "unreachable". F11: `no
+   local sync entry named X` and a residual oversize error must stop reading as
+   "unreachable, clears when it comes back" (classification in src/sync/engine.rs
+   → wording in src/doctor.rs). TRAP: the naive F4-B fix (skip oversized files at
+   scan) tombstones a file that was synced under the limit and later grew past it
+   — it goes absent-from-scan and bus policy reads that as a delete. That is the
+   2026-08-25 loss through a new door. Do not ship the naive version.
+
+3. **0.10 ACL groundwork — transcription vs narrowing.** `PeerBook::may(id,
+   service)` (src/config.rs) treats `allow = None` as unrestricted: it reaches
+   every service INCLUDING ones exposed in the future (pinned by test
+   `a_peer_without_an_allow_list_may_reach_everything`). Writing each legacy
+   entry's CURRENT effective permissions as an explicit `allow` list changes the
+   file but not today's access — a TRANSCRIPTION, which is cos's to do. It
+   becomes NARROWING (Nathan's decision) only when a list is smaller than what
+   the peer can reach today. Nathan's conscious decision (via cos): ACCEPT that a
+   service exposed AFTER the transcription is no longer auto-granted and must be
+   added per peer — that IS the cleanup; auto-granting every future service is
+   the leak the moment a peer is a friend rather than one of Nathan's own
+   machines. Each entry's explicit list = the five built-in service names
+   {shell, exec, sync, echo, send-file} (from `service_name_for_alpn`,
+   src/daemon.rs) PLUS THAT MACHINE'S `fabric expose` names. LIVE TRAP found on
+   hetz: omit an exposure and you narrow by omission and break the fleet — hetz
+   exposes `pty-remote` (how cos reaches hetz agents) and `st-sync` (carries the
+   bus/catalog). The helper MUST read the machine's expose names, never
+   hard-code; take them from `fabric status` on that machine at transcription
+   time.
+
+4. **Release cut convention.** Releases are `v0.2.0+<short-sha>` tags at a main
+   commit, NO crate-version bump. Push the tag → `.github/workflows/release.yml`
+   builds and publishes per-target tarballs each with a `.sha256` (there is no
+   combined SHA256SUMS; the README's checksum recipe is wrong about that).
+   `fabric --version` reports `0.2.0+<sha>` (build.rs `git rev-parse --short=7`),
+   so it matches the tag. Verify the artifact's checksum + `--version` before any
+   rollout. The 0.9 MILESTONE shipped as `v0.2.0+4bc04af` — there will never be a
+   tag named 0.9.
+
+5. **The soak.** The fleet is on `v0.2.0+4bc04af`. cos defined "soaked"
+   observably: seven conditions at every hourly sweep for 24h from the ~12:46 UTC
+   (14:46 Europe/Berlin) deploy on 2026-08-29 — so the window closes ~14:46
+   Berlin (12:46 UTC) on 2026-08-30: all three machines read the version;
+   delta_fallbacks 0; drift clean; digests agreeing; stopped none;
+   reconcile_failures 0; include-drift clean. Any one failing BREAKS the soak
+   (diagnose, then restart the window); elevated bytes-per-pass with fallbacks 0
+   and digests agreeing does NOT (it is the ~24 MB/restart cursor cost). cos
+   measures it and SIGNALS; do not watch the clock or ask.
+
+### Gotchas (cost time; don't rediscover the expensive way)
+
+- **`git checkout main` without `git pull` first** gives a stale local main. A
+  branch cut from it silently reverts already-merged commits and produces a
+  CONFLICTING PR with no CI. This happened (PR 97). Pull local main to origin/main
+  before branching, or branch from `origin/main` explicitly.
+- **st2 CLI arguments are shell-evaluated** — backticks and `$(...)` in a `-m`
+  body or in `context append --decision/--why` EXECUTE. Write the text to a file
+  and pass via `"$(cat file)"`; never inline backticks.
+- **Daemon-slice tests flake under CI load**: a_peer_not_permitted_for_a_service_cannot_reach_it,
+  exec_expose_reconnect_keeps_child_bound_to_tunnel_session, and
+  production_status_exposes_exact_inbound_scan_ledger. See `docs/known-flaky-tests.md`
+  (PR #92). Rerun the `deterministic` job; a real regression also fails on rerun.
+- **main and PR CI run DIFFERENT job sets** (main: Nix, test; PR: build, macos,
+  deterministic). A green main may never have run the job a PR runs, so it cannot
+  clear a merge of a `deterministic` failure.
+- **Stacked-PR chains squash-merge IN ORDER.** Each branch contains its
+  predecessors, so a 3-way merge folds the identical changes (it does not rely on
+  ancestry, which squash breaks). Merging out of order conflicts.
+
+### Deliberately NOT done (do not read as oversight)
+
+- F4-B/F11, F14, and the affirmative-absence refactor NOT authored — deferred to
+  fresh authoring and gated on the soak (they touch the sync scan / wire path the
+  fleet is soaking). Designs are above.
+- F13 (an exec child outlives a disconnected caller; src/exec.rs — needs
+  `kill_on_drop` PLUS a recv-EOF disconnect arm, because a quiet child never
+  triggers the write-failure path) NOT touched — cos gated it on the soak
+  because exec is how cos reaches two of the three machines to diagnose anything.
+- Did NOT edit live `peers.toml` on any machine — that is the
+  change-what-peers-can-reach boundary. Transcription is cos's per-machine
+  action; narrowing is Nathan's.
+- Did NOT bump the crate version at release (convention: +sha only).
+- #98 (F8) authored but flagged for POST-soak merge (wire/convergence semantics).
+
+### What I would do next, in order (my judgement)
+
+1. **When the soak clears (~14:46 Berlin 2026-08-30, cos signals):** author the
+   affirmative-absence delete refactor (decision 1), with F4-B and F11 as its
+   first instances, in the three-answer split shape. First because it is the
+   correctness fix the whole delete subsystem has been accreting guards toward.
+2. **Finish the 0.10 ACL slice** on `feat/peer-acls-explicit-not-legacy` (NOT
+   soak-gated; merge when green): (a) the make-explicit helper that reads THIS
+   machine's `fabric expose` names + the five built-ins and writes each legacy
+   entry's equivalent list (never narrow by omission); (b) a `fabric expose`
+   warning when no trusted peer is permitted to reach a newly-exposed service —
+   one line naming the peers that would need it, NOT a refusal (model on
+   `warn_if_permissions_would_stop_a_sync`, src/main.rs). The transcription
+   property is already pinned by the test in that branch.
+3. **After the #91–#96 chain lands:** rebase #97 and #98 onto new main (CHANGELOG
+   conflicts); #98 then merges post-soak.
+4. **F14** (an inbound sync session holds the entry guard with no timeout;
+   src/sync/engine.rs `prepare_inbound_entry` / src/daemon.rs `handle_sync`) —
+   soak-gated; add a deadline to the inbound wire session.
+5. **F13** — when cos calls it (post-soak).
+
+### Uncertain / unverified (flagged per "don't assert what you didn't verify")
+
+- Whether a Codex successor inherits my st2 context (`Silber.fabric`). If it can,
+  the log there has more detail; if not, this file stands alone.
+- bluey's exposures were NOT checked (bluey is a peer but not in Silber's sync
+  entries; the handbook says it has no remote exec). Check before transcribing
+  any bluey entry.
+- Whether the fleet is STILL on `v0.2.0+4bc04af` and the soak is intact — this
+  session was paused for budget mid-afternoon and did not re-check. Re-verify
+  before acting on anything soak-gated.
+- #91/#93/#94/#95/#96/#97/#98 each carry a red-before-green test and were green
+  locally on macOS at author time; their CI state at this handoff was not
+  re-checked.
+
+
 
 ## Hotfix DEPLOYED — peer-config split (resolved 2026-07-21)
 
