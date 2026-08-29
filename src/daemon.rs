@@ -6713,4 +6713,50 @@ mod tests {
         server.shutdown().await?;
         Ok(())
     }
+
+    /// Finding 9 of the 2026-08-29 review. When the OS network monitor stops,
+    /// the rehome loop must PARK, not return. `serve()` runs every background
+    /// loop in one `select!` and shuts the daemon down when the first one
+    /// returns, so a loop that returns `Ok` on "the monitor went away" exits the
+    /// whole daemon with code 0 — which neither supervisor restarts.
+    ///
+    /// The test drives the loop with an update source that reports the monitor
+    /// stopped, and asserts the loop does not return until the daemon is
+    /// cancelled. Without the fix the loop returns `Ok` at once and this fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stopped_network_monitor_parks_the_loop_instead_of_ending_the_daemon()
+    -> Result<()> {
+        struct MonitorStopped;
+        impl InterfaceUpdates for MonitorStopped {
+            async fn next_update(&mut self) -> Result<netwatch::interfaces::State> {
+                anyhow::bail!("the OS network monitor stopped")
+            }
+        }
+
+        let dir = tempfile::tempdir()?;
+        let cancel = CancellationToken::new();
+        let state =
+            DaemonState::new(FabricHome::new(dir.path()), cancel.clone(), DaemonOptions::default())
+                .await?;
+
+        let loop_task = tokio::spawn(run_rehome_updates(state.clone(), MonitorStopped));
+
+        // Long enough for the loop to hit the monitor-stopped branch several
+        // times over. With the bug it has already returned by now.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !loop_task.is_finished(),
+            "the rehome loop returned after the monitor stopped; serve() would \
+             treat that as a clean shutdown and the daemon would exit with code \
+             0, which no supervisor restarts"
+        );
+
+        // And it unwinds cleanly once the daemon really is cancelled, so the
+        // fix does not turn a lost monitor into a loop that never stops.
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), loop_task)
+            .await
+            .expect("the loop did not return after the daemon was cancelled")??;
+        Ok(())
+    }
 }
