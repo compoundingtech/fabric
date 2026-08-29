@@ -257,6 +257,13 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **`fabric doctor` on a non-default home asks the right daemon which build a
+  peer runs.** Doctor shells out to `fabric exec <peer> -- fabric --version`
+  without `--home`, so `fabric --home X doctor` asked the DEFAULT daemon about a
+  peer only the X daemon knows and reported `unknown peer`. The flag a person
+  typed does not reach the child unless doctor carries it. It now passes
+  `--home` before the `exec` subcommand. Finding 12 of the 2026-08-29 review.
+
 - **A lost network monitor no longer shuts the daemon down.** `serve()` runs
   every background loop in one `select!` and ends when the first returns, so a
   loop returning `Ok` shuts the daemon down. When the OS interface watcher
