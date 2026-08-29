@@ -47,7 +47,7 @@ use crate::{
     sync::{
         self,
         config::SyncPeers,
-        engine::{PeerRef, SyncEngine, SyncTransport},
+        engine::{PeerRef, ResolvedPeers, SyncEngine, SyncTransport},
         manifest::Author as SyncAuthor,
         node::SyncNode,
     },
@@ -3416,29 +3416,35 @@ impl IrohSyncTransport {
 }
 
 impl SyncTransport for IrohSyncTransport {
-    async fn peers_for(&self, peers: &SyncPeers) -> Vec<PeerRef> {
+    async fn peers_for(&self, peers: &SyncPeers) -> ResolvedPeers {
         let Some(state) = self.state.upgrade() else {
-            return Vec::new();
+            return ResolvedPeers::default();
         };
         let book = state.peer_book.read().await;
-        let mut refs = Vec::new();
+        let mut resolved = ResolvedPeers::default();
         match peers {
-            SyncPeers::Wildcard(_) => {
+            SyncPeers::Wildcard(selector) => {
                 for peer in book.peers() {
-                    refs.push(peer_ref(peer));
+                    resolved.peers.push(peer_ref(peer));
+                }
+                // "Every trusted peer" on a machine that trusts nobody is
+                // nobody, and that is worth a line rather than a clean report.
+                if resolved.peers.is_empty() {
+                    resolved.unresolved.push(selector.clone());
                 }
             }
             SyncPeers::List(selectors) => {
                 for selector in selectors {
-                    if let Some(peer) = book.peers().iter().find(|p| {
+                    match book.peers().iter().find(|p| {
                         p.id.to_string() == *selector || p.name.as_deref() == Some(selector)
                     }) {
-                        refs.push(peer_ref(peer));
+                        Some(peer) => resolved.peers.push(peer_ref(peer)),
+                        None => resolved.unresolved.push(selector.clone()),
                     }
                 }
             }
         }
-        refs
+        resolved
     }
 
     async fn reconcile(
