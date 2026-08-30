@@ -755,6 +755,26 @@ mod tests {
         );
     }
 
+    /// Finding 12: doctor must ask a peer its version over the home it was
+    /// invoked with, or on a non-default home it asks the wrong daemon and
+    /// reports `unknown peer` for a peer that is fine.
+    #[test]
+    fn peer_version_carries_the_home_flag_before_exec() {
+        let home = FabricHome::new(std::path::Path::new("/srv/fabric"));
+        let argv = peer_version_argv(&home, "hetz");
+        let home_at = argv.iter().position(|a| a == "--home").expect("no --home flag");
+        assert_eq!(argv.get(home_at + 1).map(String::as_str), Some("/srv/fabric"));
+        let exec_at = argv.iter().position(|a| a == "exec").expect("no exec verb");
+        assert!(
+            home_at < exec_at,
+            "--home must come before the exec subcommand or clap rejects it: {argv:?}"
+        );
+        // And it still runs the version query it describes.
+        let dashes = argv.iter().position(|a| a == "--").expect("no argv separator");
+        assert_eq!(&argv[dashes + 1..], ["fabric".to_string(), "--version".to_string()]);
+        assert_eq!(argv.get(exec_at + 1).map(String::as_str), Some("hetz"));
+    }
+
     #[test]
     fn a_denied_sync_and_an_unreachable_one_read_differently() {
         let mut facts = configured();
@@ -1023,7 +1043,7 @@ where
             let label = peer.name.clone().unwrap_or_else(|| peer.id.clone());
 
             let (version, version_error) = if peer.reachable {
-                match peer_version(&label) {
+                match peer_version(home, &label) {
                     Ok(version) => (Some(version), None),
                     Err(why) => (None, Some(why)),
                 }
@@ -1084,10 +1104,30 @@ where
 /// check that does not exercise the path it describes is how four status fields
 /// reported fine this week having established nothing. `None` when it could not
 /// be asked, which includes exec not being permitted.
-fn peer_version(label: &str) -> std::result::Result<String, String> {
+/// The arguments doctor runs to ask a peer its version, over the SAME home it
+/// was invoked with.
+///
+/// `--home` must be here. `fabric --home X doctor` asks about a peer only the X
+/// daemon knows, but the child `exec` without `--home` talks to the DEFAULT
+/// daemon, which reports `unknown peer`. FABRIC_HOME in the environment does
+/// propagate to the child; the flag a person typed does not, unless doctor
+/// carries it. Finding 12 of the 2026-08-29 review.
+fn peer_version_argv(home: &FabricHome, label: &str) -> Vec<String> {
+    vec![
+        "--home".to_string(),
+        home.root().display().to_string(),
+        "exec".to_string(),
+        label.to_string(),
+        "--".to_string(),
+        "fabric".to_string(),
+        "--version".to_string(),
+    ]
+}
+
+fn peer_version(home: &FabricHome, label: &str) -> std::result::Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let output = std::process::Command::new(exe)
-        .args(["exec", label, "--", "fabric", "--version"])
+        .args(peer_version_argv(home, label))
         .output()
         .map_err(|e| e.to_string())?;
     if !output.status.success() {
