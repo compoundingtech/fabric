@@ -257,6 +257,17 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **The tombstone sweep no longer forgets a tombstone in the pass it arrived.**
+  The sweep stamps a tombstone the first time it is seen expired and demands an
+  ack from every peer after that stamp. Stamps are whole seconds, and one pass
+  can reconcile a peer, adopt an already-expired tombstone, and sweep inside the
+  same second, so `acked >= held_since` read `T >= T` as proof and forgot the
+  tombstone before that peer was sent it. The peer still held the file, handed
+  it back on the next pass, and the cycle repeated silently. The gate is now
+  strictly later, which with whole seconds means a later pass. Finding 5 of the
+  2026-08-29 review. The sweep is opt-in (`FABRIC_TOMBSTONE_SWEEP_DAYS`) and off
+  on the fleet, so nothing live was affected.
+
 - **A sync entry that names a peer not in `peers.toml` says so instead of
   reporting healthy.** A selector that matched no peer was dropped without a
   record. The engine looped over the peers that did resolve, recorded nothing for
