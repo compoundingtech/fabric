@@ -109,3 +109,18 @@ a failure mode, add the row even when there is no test yet.**
 Every test here was checked by breaking the code it covers and confirming the
 test fails. A test that passes whether or not the feature works is worse than no
 test, because it reads as coverage.
+
+
+## Candidate finding: daemon-slice deadlines are tuned to a fast machine
+
+Three tests in the daemon slice fail under CI load and pass on a rerun of the
+same commit: see [known-flaky-tests.md](known-flaky-tests.md). They are timing
+failures, not logic failures, and they cluster on one cause. A deadline that
+holds locally and elapses under CI load is a property of the deadline in the
+code, not a defect in the test. The two round-trip timeouts
+(`a_peer_not_permitted_for_a_service_cannot_reach_it`,
+`exec_expose_reconnect_keeps_child_bound_to_tunnel_session`) and the ledger
+count race (`production_status_exposes_exact_inbound_scan_ledger`) are worth
+retuning or making load-tolerant, so a red `deterministic` always means a real
+regression. NOT PROVEN as a single root cause; recorded here so the next reader
+starts from the pattern rather than one instance.
