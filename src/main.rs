@@ -1133,9 +1133,13 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                 }
                 for entry in entries {
                     let present = logical_present(&entry);
-                    if entry.missing == 0 && entry.unexpected == 0 && entry.mismatched == 0 {
+                    if entry.missing == 0
+                        && entry.unexpected == 0
+                        && entry.mismatched == 0
+                        && entry.scan_issues.is_empty()
+                    {
                         println!(
-                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean\tstopped={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tcontent_bytes={}\tdigest={}",
+                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean\tscan_issues=none\tstopped={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tcontent_bytes={}\tdigest={}",
                             entry.name,
                             entry.folder,
                             entry.policy,
@@ -1161,7 +1165,7 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                         );
                     } else {
                         println!(
-                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}\tstopped={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tcontent_bytes={}\tdigest={}",
+                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}\tscan_issues={}\tstopped={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tcontent_bytes={}\tdigest={}",
                             entry.name,
                             entry.folder,
                             entry.policy,
@@ -1171,6 +1175,7 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                             entry.missing,
                             entry.unexpected,
                             entry.mismatched,
+                            scan_issues_token(&entry),
                             stopped_token(&entry),
                             entry.sync_passes,
                             entry.full_scans,
@@ -1223,6 +1228,7 @@ struct SyncLsJsonEntry<'a> {
     missing: usize,
     unexpected: usize,
     mismatched: usize,
+    scan_issues: &'a [(String, String)],
     /// Calls to `sync_once`. NOT `full_scans`, which is two per call.
     sync_passes: u64,
     full_scans: u64,
@@ -1267,10 +1273,14 @@ impl<'a> From<&'a fabric::control::SyncEntryStatus> for SyncLsJsonEntry<'a> {
             present: logical_present(entry),
             tombstones: entry.tombstones,
             observed: entry.observed,
-            drift: entry.missing != 0 || entry.unexpected != 0 || entry.mismatched != 0,
+            drift: entry.missing != 0
+                || entry.unexpected != 0
+                || entry.mismatched != 0
+                || !entry.scan_issues.is_empty(),
             missing: entry.missing,
             unexpected: entry.unexpected,
             mismatched: entry.mismatched,
+            scan_issues: &entry.scan_issues,
             stopped_peers: entry
                 .stopped_peers
                 .iter()
@@ -1458,6 +1468,18 @@ fn stopped_token(entry: &fabric::control::SyncEntryStatus) -> String {
         .stopped_peers
         .iter()
         .map(|(peer, reason)| format!("{peer}:{reason}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn scan_issues_token(entry: &fabric::control::SyncEntryStatus) -> String {
+    if entry.scan_issues.is_empty() {
+        return "none".to_string();
+    }
+    entry
+        .scan_issues
+        .iter()
+        .map(|(path, reason)| format!("{path}:{reason}"))
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -1697,6 +1719,7 @@ mod sync_ls_tests {
             missing: 0,
             unexpected: 2,
             mismatched: 0,
+            scan_issues: vec![("large.bin".into(), "too-large".into())],
             sync_passes: 9,
             full_scans: 17,
             inbound_noop_transactions: 11,
@@ -1729,6 +1752,7 @@ mod sync_ls_tests {
                 "missing": 0,
                 "unexpected": 2,
                 "mismatched": 0,
+                "scan_issues": [["large.bin", "too-large"]],
                 "full_scans": 17,
                 "inbound_noop_transactions": 11,
                 "inbound_guarded_transactions": 3,

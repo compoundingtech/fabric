@@ -16,9 +16,9 @@
 //! versions stay monotonic across daemon restarts.
 
 use std::{
-    collections::BTreeMap,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     future::Future,
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex as StdMutex,
@@ -40,6 +40,7 @@ use crate::config::FabricHome;
 use super::config::{PolicyRules, SyncBook, SyncEntry, SyncPeers};
 use super::manifest::{Author, ContentHash, Entry, FileMeta, Manifest};
 use super::node::{Reconciled, SweepEvidence, SyncNode, content_hash};
+use super::wire::MAX_BLOB;
 
 /// How long to wait after a filesystem event settles before syncing, so a burst
 /// of writes coalesces into one reconcile.
@@ -509,6 +510,9 @@ struct EntryState {
     observed: Arc<StdMutex<HashMap<String, ContentHash>>>,
     /// Local hash cache, keyed on this machine's own disk facts. Never sent.
     scan_cache: Arc<StdMutex<HashMap<String, ScanCacheEntry>>>,
+    /// Paths the last scan saw but could not read as syncable regular files.
+    /// Never sent and never used as deletion evidence.
+    scan_issues: Arc<StdMutex<BTreeMap<String, ScanIssue>>>,
     /// Local wall-clock time of the last reconcile this node completed with
     /// each peer, keyed by peer id. Never sent; it is this node's own evidence
     /// of what a peer has been told, and the tombstone sweep will not forget a
@@ -611,6 +615,10 @@ pub enum PeerSyncState {
     /// The selector names no peer in `peers.toml`. Not a refusal and not the
     /// network: a name nobody answers to, which a person has to fix in a file.
     Unknown,
+    /// The remote daemon has no configured entry with this shared name.
+    MissingEntry,
+    /// Local or remote sync data exceeds a wire limit.
+    TooLarge,
 }
 
 impl PeerSyncState {
@@ -620,7 +628,23 @@ impl PeerSyncState {
             PeerSyncState::Refused => "denied",
             PeerSyncState::Unreachable => "unreachable",
             PeerSyncState::Unknown => "unknown",
+            PeerSyncState::MissingEntry => "missing-entry",
+            PeerSyncState::TooLarge => "too-large",
         }
+    }
+}
+
+fn classify_reconcile_error(message: &str) -> PeerSyncState {
+    if crate::config::Denied::is_refusal(message) {
+        PeerSyncState::Refused
+    } else if message.contains("no local sync entry named") {
+        PeerSyncState::MissingEntry
+    } else if message.contains("sync")
+        && (message.contains("exceeds limit") || message.contains("-byte limit"))
+    {
+        PeerSyncState::TooLarge
+    } else {
+        PeerSyncState::Unreachable
     }
 }
 
@@ -731,13 +755,14 @@ impl<T: SyncTransport> SyncEngine<T> {
                 .unwrap_or_else(EntryWork::new);
             // Reuse an existing node for an unchanged entry so in-memory content
             // survives a reload; otherwise start one from the persisted manifest.
-            let (node, operation, observed, scan_cache, peer_acks, expired_since) =
+            let (node, operation, observed, scan_cache, scan_issues, peer_acks, expired_since) =
                 match entries.get(&cfg.name) {
                     Some(existing) if existing.config == *cfg => (
                         existing.node.clone(),
                         existing.operation.clone(),
                         existing.observed.clone(),
                         existing.scan_cache.clone(),
+                        existing.scan_issues.clone(),
                         existing.peer_acks.clone(),
                         existing.expired_since.clone(),
                     ),
@@ -751,6 +776,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                             Arc::new(Mutex::new(())),
                             Arc::new(StdMutex::new(observed)),
                             Arc::new(StdMutex::new(scan_cache)),
+                            Arc::new(StdMutex::new(BTreeMap::new())),
                             Arc::new(StdMutex::new(peer_acks)),
                             Arc::new(StdMutex::new(HashMap::new())),
                         )
@@ -771,6 +797,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                     persisted_observed,
                     observed,
                     scan_cache,
+                    scan_issues,
                     peer_acks,
                     expired_since,
                     last_sweep: Arc::new(StdMutex::new(None)),
@@ -1009,6 +1036,13 @@ impl<T: SyncTransport> SyncEngine<T> {
                         .is_some_and(|hash| hash != &meta.hash)
                 })
                 .count();
+            let scan_issues = entry
+                .scan_issues
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(path, issue)| (path.clone(), issue.token().to_string()))
+                .collect();
             out.push(SyncStatus {
                 digest: manifest.digest(),
                 name: name.clone(),
@@ -1021,6 +1055,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                 missing,
                 unexpected,
                 mismatched,
+                scan_issues,
                 full_scans: entry.work.full_scans.load(Ordering::Relaxed),
                 inbound_noop_transactions: entry
                     .work
@@ -1168,11 +1203,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                 Err(error) => {
                     // Refused and unreachable are different answers. One waits
                     // for a person, the other waits for the network.
-                    let state = if crate::config::Denied::is_refusal(&format!("{error:#}")) {
-                        PeerSyncState::Refused
-                    } else {
-                        PeerSyncState::Unreachable
-                    };
+                    let state = classify_reconcile_error(&format!("{error:#}"));
                     entry
                         .peer_state
                         .lock()
@@ -1251,7 +1282,17 @@ impl<T: SyncTransport> SyncEngine<T> {
         let mut node = entry.node.lock().await;
         let mut observed = entry.observed.lock().unwrap();
         let mut cache = entry.scan_cache.lock().unwrap();
-        scan_into_node_observed(&mut node, &root, &cfg, policy, &mut observed, &mut cache)
+        let mut issues = entry.scan_issues.lock().unwrap();
+        scan_into_node_observed_with_limit(
+            &mut node,
+            &root,
+            &cfg,
+            policy,
+            &mut observed,
+            &mut cache,
+            &mut issues,
+            MAX_BLOB as u64,
+        )
     }
 
     async fn materialize_entry_state(
@@ -1264,9 +1305,10 @@ impl<T: SyncTransport> SyncEngine<T> {
         let generation = entry.work.mutation_generation.load(Ordering::Acquire);
         let mut node = entry.node.lock().await;
         let mut observed = entry.observed.lock().unwrap();
-        // Same lock order as `scan_entry`: node, then observed, then cache.
+        // Same lock order as `scan_entry`: node, observed, cache, then issues.
         let cache = entry.scan_cache.lock().unwrap();
-        materialize_tracked(
+        let issues = entry.scan_issues.lock().unwrap();
+        materialize_tracked_with_issues(
             &mut node,
             &root,
             &entry.config,
@@ -1274,6 +1316,7 @@ impl<T: SyncTransport> SyncEngine<T> {
             protected,
             &mut observed,
             &cache,
+            &issues,
             Some((&entry.work, generation)),
         )
     }
@@ -1994,6 +2037,9 @@ pub struct SyncStatus {
     pub missing: usize,
     pub unexpected: usize,
     pub mismatched: usize,
+    /// Paths that exist but the last scan could not read as syncable files.
+    /// Each pair is `path:reason`, where reason is a stable short token.
+    pub scan_issues: Vec<(String, String)>,
     /// Completed or attempted full folder scans since this entry instance was
     /// loaded. Monotonic while the name remains continuously configured in the
     /// same daemon.
@@ -2041,6 +2087,167 @@ pub struct SyncStatus {
 
 // ---- filesystem scan / materialize (sync helpers, unit-testable) ----
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScanIssue {
+    TooLarge,
+    Unreadable,
+    Unsupported,
+}
+
+impl ScanIssue {
+    fn token(&self) -> &'static str {
+        match self {
+            Self::TooLarge => "too-large",
+            Self::Unreadable => "unreadable",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanPathState {
+    Present,
+    AffirmativelyGone,
+    Unknown,
+}
+
+/// One folder walk and the evidence it can give about every tracked path.
+///
+/// A path is gone only when a complete parent listing proves that its next
+/// component is absent. An unreadable directory, file, or unsupported object
+/// is present but unknown. This distinction lets the walk continue without
+/// turning a skipped path into a deletion.
+#[derive(Default)]
+struct FolderScan {
+    files: Vec<ScannedFile>,
+    present_paths: HashSet<String>,
+    seen_paths: HashSet<String>,
+    complete_dirs: HashSet<String>,
+    opaque_paths: HashSet<String>,
+    issues: BTreeMap<String, ScanIssue>,
+}
+
+impl FolderScan {
+    fn iter(&self) -> std::slice::Iter<'_, ScannedFile> {
+        self.files.iter()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    fn record_issue(&mut self, path: String, issue: ScanIssue) {
+        self.opaque_paths.insert(path.clone());
+        let display = if path.is_empty() {
+            ".".to_string()
+        } else {
+            path
+        };
+        self.issues.insert(display, issue);
+    }
+
+    fn state(&self, path: &str) -> ScanPathState {
+        if self.present_paths.contains(path) {
+            return ScanPathState::Present;
+        }
+        if path_ancestor_in_set(path, &self.opaque_paths).is_some() {
+            return ScanPathState::Unknown;
+        }
+
+        let mut parent = String::new();
+        for component in path.split('/') {
+            if !self.complete_dirs.contains(&parent) {
+                return ScanPathState::Unknown;
+            }
+            let child = if parent.is_empty() {
+                component.to_string()
+            } else {
+                format!("{parent}/{component}")
+            };
+            if !self.seen_paths.contains(&child) {
+                return ScanPathState::AffirmativelyGone;
+            }
+            parent = child;
+        }
+        // The name exists, but it is not a readable regular file.
+        ScanPathState::Unknown
+    }
+
+    fn has_presence_evidence(&self, path: &str) -> bool {
+        self.seen_paths.contains(path)
+            || path_ancestor_in_set(path, &self.opaque_paths).is_some_and(|path| !path.is_empty())
+    }
+}
+
+impl IntoIterator for FolderScan {
+    type Item = ScannedFile;
+    type IntoIter = std::vec::IntoIter<ScannedFile>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.files.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a FolderScan {
+    type Item = &'a ScannedFile;
+    type IntoIter = std::slice::Iter<'a, ScannedFile>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.files.iter()
+    }
+}
+
+fn path_ancestor_in_set<'a>(path: &str, paths: &'a HashSet<String>) -> Option<&'a str> {
+    let mut candidate = path;
+    loop {
+        if let Some(found) = paths.get(candidate) {
+            return Some(found);
+        }
+        let Some(index) = candidate.rfind('/') else {
+            break;
+        };
+        candidate = &candidate[..index];
+    }
+    paths.get("").map(String::as_str)
+}
+
+fn path_has_issue(path: &str, issues: &BTreeMap<String, ScanIssue>) -> bool {
+    if issues.contains_key(".") {
+        return true;
+    }
+    let mut candidate = path;
+    loop {
+        if issues.contains_key(candidate) {
+            return true;
+        }
+        let Some(index) = candidate.rfind('/') else {
+            return false;
+        };
+        candidate = &candidate[..index];
+    }
+}
+
+enum BoundedRead {
+    Bytes(Vec<u8>),
+    TooLarge(u64),
+}
+
+fn read_file_bounded(path: &Path, limit: u64) -> std::io::Result<BoundedRead> {
+    let file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    if size > limit {
+        return Ok(BoundedRead::TooLarge(size));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        Ok(BoundedRead::TooLarge(bytes.len() as u64))
+    } else {
+        Ok(BoundedRead::Bytes(bytes))
+    }
+}
+
 struct ScannedFile {
     rel: String,
     path: PathBuf,
@@ -2063,8 +2270,35 @@ impl ScannedFile {
     fn read_bytes(&self) -> Result<Vec<u8>> {
         match &self.bytes {
             Some(bytes) => Ok(bytes.clone()),
-            None => std::fs::read(&self.path)
-                .with_context(|| format!("failed to read {}", self.path.display())),
+            None => match read_file_bounded(&self.path, MAX_BLOB as u64)
+                .with_context(|| format!("failed to read {}", self.path.display()))?
+            {
+                BoundedRead::Bytes(bytes) => Ok(bytes),
+                BoundedRead::TooLarge(size) => anyhow::bail!(
+                    "sync file {} has {size} bytes, above the {MAX_BLOB}-byte limit",
+                    self.path.display()
+                ),
+            },
+        }
+    }
+}
+
+fn scanned_bytes_or_unknown(
+    file: &ScannedFile,
+    previous: &HashMap<String, ContentHash>,
+    current: &mut HashMap<String, ContentHash>,
+    issues: &mut BTreeMap<String, ScanIssue>,
+) -> Option<Vec<u8>> {
+    match file.read_bytes() {
+        Ok(bytes) => Some(bytes),
+        Err(_) => {
+            issues.insert(file.rel.clone(), ScanIssue::Unreadable);
+            if let Some(hash) = previous.get(&file.rel) {
+                current.insert(file.rel.clone(), *hash);
+            } else {
+                current.remove(&file.rel);
+            }
+            None
         }
     }
 }
@@ -2090,23 +2324,61 @@ impl ScannedFile {
 /// keying it on the manifest made a local caching decision from a value another
 /// machine chose, so two contending entries of equal size could collide on size
 /// plus mtime and the cache then reported content the file did not hold.
+#[cfg(test)]
 fn scan_folder(
     root: &Path,
     entry: &SyncEntry,
     cache: &HashMap<String, ScanCacheEntry>,
-) -> Result<Vec<ScannedFile>> {
-    let mut out = Vec::new();
+) -> Result<FolderScan> {
+    scan_folder_with_limit(root, entry, cache, MAX_BLOB as u64)
+}
+
+fn scan_folder_with_limit(
+    root: &Path,
+    entry: &SyncEntry,
+    cache: &HashMap<String, ScanCacheEntry>,
+    max_blob: u64,
+) -> Result<FolderScan> {
+    let mut scan = FolderScan::default();
     if !root.exists() {
-        return Ok(out);
+        return Ok(scan);
     }
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for child in
-            std::fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))?
-        {
-            let child = child?;
-            let file_type = child.file_type()?;
+    let mut stack = vec![(root.to_path_buf(), String::new())];
+    while let Some((dir, dir_rel)) = stack.pop() {
+        let children = match std::fs::read_dir(&dir) {
+            Ok(children) => children,
+            Err(_) => {
+                scan.record_issue(dir_rel, ScanIssue::Unreadable);
+                continue;
+            }
+        };
+        let mut complete = true;
+        for child in children {
+            let child = match child {
+                Ok(child) => child,
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
+            };
             let path = child.path();
+            let Ok(rel) = path.strip_prefix(root) else {
+                complete = false;
+                continue;
+            };
+            let rel = rel.to_string_lossy();
+            let Some(norm) = Manifest::normalize_path(&rel) else {
+                complete = false;
+                continue;
+            };
+            scan.seen_paths.insert(norm.clone());
+            let file_type = match child.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => {
+                    scan.record_issue(norm, ScanIssue::Unreadable);
+                    continue;
+                }
+            };
             if file_type.is_symlink() {
                 // Git tracks a symlink as a first-class object; fabric does not
                 // yet, because a symlink is a different KIND of manifest entry
@@ -2116,22 +2388,23 @@ fn scan_folder(
                     "fabric: skipping symlink {} — fabric does not sync symlinks, git does",
                     path.display()
                 );
+                scan.opaque_paths.insert(norm.clone());
+                if entry.includes(&norm) {
+                    scan.record_issue(norm, ScanIssue::Unsupported);
+                }
                 continue; // never follow symlinks out of the folder
             }
             if file_type.is_dir() {
-                stack.push(path);
+                stack.push((path, norm));
                 continue;
             }
             if !file_type.is_file() {
+                scan.opaque_paths.insert(norm.clone());
+                if entry.includes(&norm) {
+                    scan.record_issue(norm, ScanIssue::Unsupported);
+                }
                 continue;
             }
-            let Ok(rel) = path.strip_prefix(root) else {
-                continue;
-            };
-            let rel = rel.to_string_lossy();
-            let Some(norm) = Manifest::normalize_path(&rel) else {
-                continue;
-            };
             if !entry.includes(&norm) {
                 continue;
             }
@@ -2140,13 +2413,20 @@ fn scan_folder(
             // inside `mtime_of` and again on the next line. `mtime_of_metadata`
             // already takes the result, so the single-call shape was in the
             // file the whole time.
-            let disk = child.metadata().ok();
-            let (mtime_secs, mtime_nanos) = disk
-                .as_ref()
-                .map(mtime_of_metadata)
-                .unwrap_or((0, 0));
-            let size = disk.as_ref().map(|meta| meta.len()).unwrap_or(u64::MAX);
-            let executable = disk.as_ref().is_some_and(is_executable);
+            let disk = match child.metadata() {
+                Ok(disk) => disk,
+                Err(_) => {
+                    scan.record_issue(norm, ScanIssue::Unreadable);
+                    continue;
+                }
+            };
+            let (mtime_secs, mtime_nanos) = mtime_of_metadata(&disk);
+            let size = disk.len();
+            let executable = is_executable(&disk);
+            if size > max_blob {
+                scan.record_issue(norm, ScanIssue::TooLarge);
+                continue;
+            }
             // Reuse the recorded hash when size and both mtime components are
             // byte-identical to what THIS MACHINE last observed. Anything that
             // differs, or is unknown, is read and hashed as before.
@@ -2157,14 +2437,23 @@ fn scan_folder(
             });
             let (bytes, hash) = match known {
                 Some(seen) => (None, seen.hash),
-                None => {
-                    let bytes = std::fs::read(&path)
-                        .with_context(|| format!("failed to read {}", path.display()))?;
-                    let hash = content_hash(&bytes);
-                    (Some(bytes), hash)
-                }
+                None => match read_file_bounded(&path, max_blob) {
+                    Ok(BoundedRead::Bytes(bytes)) => {
+                        let hash = content_hash(&bytes);
+                        (Some(bytes), hash)
+                    }
+                    Ok(BoundedRead::TooLarge(_)) => {
+                        scan.record_issue(norm, ScanIssue::TooLarge);
+                        continue;
+                    }
+                    Err(_) => {
+                        scan.record_issue(norm, ScanIssue::Unreadable);
+                        continue;
+                    }
+                },
             };
-            out.push(ScannedFile {
+            scan.present_paths.insert(norm.clone());
+            scan.files.push(ScannedFile {
                 rel: norm,
                 path,
                 bytes,
@@ -2175,8 +2464,13 @@ fn scan_folder(
                 executable,
             });
         }
+        if complete {
+            scan.complete_dirs.insert(dir_rel);
+        } else {
+            scan.record_issue(dir_rel, ScanIssue::Unreadable);
+        }
     }
-    Ok(out)
+    Ok(scan)
 }
 
 /// Scan `root` into `node`: record every file, and treat files that vanished
@@ -2212,8 +2506,18 @@ fn observed_from_disk(
     entry: &SyncEntry,
     cache: &mut HashMap<String, ScanCacheEntry>,
 ) -> Result<HashMap<String, ContentHash>> {
+    observed_from_disk_with_limit(manifest, entry, cache, MAX_BLOB as u64)
+}
+
+fn observed_from_disk_with_limit(
+    manifest: &Manifest,
+    entry: &SyncEntry,
+    cache: &mut HashMap<String, ScanCacheEntry>,
+    max_blob: u64,
+) -> Result<HashMap<String, ContentHash>> {
     let mut observed = HashMap::new();
-    for file in scan_folder(&entry.folder, entry, cache)? {
+    let scan = scan_folder_with_limit(&entry.folder, entry, cache, max_blob)?;
+    for file in &scan {
         let hash = file.hash;
         cache.insert(file.rel.clone(), file.cache_entry());
         if manifest
@@ -2221,7 +2525,16 @@ fn observed_from_disk(
             .and_then(|entry| entry.meta())
             .is_some_and(|meta| meta.hash == hash)
         {
-            observed.insert(file.rel, hash);
+            observed.insert(file.rel.clone(), hash);
+        }
+    }
+    // An oversized or unreadable path still gives presence evidence. Retain a
+    // manifest hash as the delete receipt, but only when the walk saw the path
+    // or a non-root opaque ancestor. A missing or unreadable root proves no
+    // local presence and must not arm a later mass delete.
+    for (path, meta) in manifest.present_paths() {
+        if scan.state(path) == ScanPathState::Unknown && scan.has_presence_evidence(path) {
+            observed.entry(path.clone()).or_insert(meta.hash);
         }
     }
     Ok(observed)
@@ -2230,6 +2543,7 @@ fn observed_from_disk(
 /// Scan against the last state actually observed on disk. Manifest-only Present
 /// entries may have arrived from a concurrent reconcile and must not become
 /// tombstones merely because they have not been materialized yet.
+#[cfg(test)]
 fn scan_into_node_observed(
     node: &mut SyncNode,
     root: &Path,
@@ -2237,6 +2551,29 @@ fn scan_into_node_observed(
     policy: PolicyRules,
     observed: &mut HashMap<String, ContentHash>,
     cache: &mut HashMap<String, ScanCacheEntry>,
+) -> Result<bool> {
+    let mut issues = BTreeMap::new();
+    scan_into_node_observed_with_limit(
+        node,
+        root,
+        entry,
+        policy,
+        observed,
+        cache,
+        &mut issues,
+        MAX_BLOB as u64,
+    )
+}
+
+fn scan_into_node_observed_with_limit(
+    node: &mut SyncNode,
+    root: &Path,
+    entry: &SyncEntry,
+    policy: PolicyRules,
+    observed: &mut HashMap<String, ContentHash>,
+    cache: &mut HashMap<String, ScanCacheEntry>,
+    issues: &mut BTreeMap<String, ScanIssue>,
+    max_blob: u64,
 ) -> Result<bool> {
     // A ROOT THAT IS NOT THERE IS NOT A FOLDER SOMEBODY EMPTIED.
     //
@@ -2253,9 +2590,11 @@ fn scan_into_node_observed(
     // Deleting the CONTENTS of a folder still propagates normally, because the
     // root survives that and the scan runs.
     if !root.exists() {
+        issues.clear();
         return Ok(false);
     }
-    let scanned = scan_folder(root, entry, cache)?;
+    let scanned = scan_folder_with_limit(root, entry, cache, max_blob)?;
+    *issues = scanned.issues.clone();
     // Refresh the cache from what this scan actually saw, so the next scan of an
     // untouched file is free. Rebuilt rather than merged, so a vanished path
     // does not leak an entry forever.
@@ -2282,9 +2621,13 @@ fn scan_into_node_observed(
                     .get(&file.rel)
                     .is_some_and(|entry| !entry.is_present())
             {
+                let Some(bytes) = scanned_bytes_or_unknown(file, &previous, &mut current, issues)
+                else {
+                    continue;
+                };
                 if node.local_write_with_mode(
                     &file.rel,
-                    &file.read_bytes()?,
+                    &bytes,
                     file.mtime_secs,
                     file.mtime_nanos,
                     file.executable,
@@ -2309,21 +2652,31 @@ fn scan_into_node_observed(
                     .and_then(|entry| entry.meta())
                     .is_some_and(|meta| meta.hash == hash)
             {
-                node.put_content(file.read_bytes()?);
+                let Some(bytes) = scanned_bytes_or_unknown(file, &previous, &mut current, issues)
+                else {
+                    continue;
+                };
+                node.put_content(bytes);
             }
-        } else if node.local_write_with_mode(
-            &file.rel,
-            &file.read_bytes()?,
-            file.mtime_secs,
-            file.mtime_nanos,
-            file.executable,
-        ) {
-            changed = true;
+        } else {
+            let Some(bytes) = scanned_bytes_or_unknown(file, &previous, &mut current, issues)
+            else {
+                continue;
+            };
+            if node.local_write_with_mode(
+                &file.rel,
+                &bytes,
+                file.mtime_secs,
+                file.mtime_nanos,
+                file.executable,
+            ) {
+                changed = true;
+            }
         }
     }
 
     let now = now_secs();
-    for path in previous.keys() {
+    for (path, previous_hash) in &previous {
         if current.contains_key(path) {
             continue;
         }
@@ -2340,6 +2693,29 @@ fn scan_into_node_observed(
         // Narrowing an include is a scope change. Nobody deleted anything.
         if !entry.includes(path) {
             continue;
+        }
+        match scanned.state(path) {
+            ScanPathState::Present => continue,
+            ScanPathState::Unknown => {
+                // Keep the last presence receipt. If this path later becomes
+                // affirmatively absent, that receipt remains the evidence that
+                // a real local delete occurred. The issue map prevents status
+                // from calling the unreadable or oversized path clean.
+                if let Some(opaque) = path_ancestor_in_set(path, &scanned.opaque_paths)
+                    .filter(|opaque| !opaque.is_empty())
+                {
+                    issues
+                        .entry(opaque.to_string())
+                        .or_insert(ScanIssue::Unsupported);
+                } else if scanned.seen_paths.contains(path) {
+                    issues
+                        .entry(path.clone())
+                        .or_insert(ScanIssue::Unsupported);
+                }
+                current.insert(path.clone(), *previous_hash);
+                continue;
+            }
+            ScanPathState::AffirmativelyGone => {}
         }
         if node.local_remove(path, policy, now) {
             changed = true;
@@ -2427,8 +2803,8 @@ fn materialize(node: &SyncNode, root: &Path, policy: PolicyRules) -> Result<()> 
 /// `materialization_does_not_manufacture_an_mtime_collision`, which pins that
 /// only this machine can create one, so no peer can manufacture a hit.
 ///
-/// Anything unknown, differing, or unreadable returns false and takes the full
-/// read-and-hash path exactly as before.
+/// Anything unknown or differing returns false. The caller performs a bounded
+/// read for a readable path and skips a path named by the scan issue map.
 fn already_materialized(
     path: &Path,
     rel: &str,
@@ -2449,6 +2825,7 @@ fn already_materialized(
     seen.size == disk.len() && seen.mtime_secs == mtime_secs && seen.mtime_nanos == mtime_nanos
 }
 
+#[cfg(test)]
 fn materialize_tracked(
     node: &mut SyncNode,
     root: &Path,
@@ -2457,6 +2834,30 @@ fn materialize_tracked(
     protected: &HashMap<String, ContentHash>,
     observed: &mut HashMap<String, ContentHash>,
     cache: &HashMap<String, ScanCacheEntry>,
+    daemon_writes: Option<(&EntryWork, u64)>,
+) -> Result<()> {
+    materialize_tracked_with_issues(
+        node,
+        root,
+        entry,
+        policy,
+        protected,
+        observed,
+        cache,
+        &BTreeMap::new(),
+        daemon_writes,
+    )
+}
+
+fn materialize_tracked_with_issues(
+    node: &mut SyncNode,
+    root: &Path,
+    entry: &SyncEntry,
+    policy: PolicyRules,
+    protected: &HashMap<String, ContentHash>,
+    observed: &mut HashMap<String, ContentHash>,
+    cache: &HashMap<String, ScanCacheEntry>,
+    scan_issues: &BTreeMap<String, ScanIssue>,
     daemon_writes: Option<(&EntryWork, u64)>,
 ) -> Result<()> {
     std::fs::create_dir_all(root)
@@ -2490,11 +2891,18 @@ fn materialize_tracked(
             continue;
         }
         let path = root.join(&rel);
+        if path_has_issue(&rel, scan_issues) {
+            continue;
+        }
         if already_materialized(&path, &rel, &meta, cache) {
             observed.insert(rel.clone(), meta.hash);
             continue;
         }
-        let existing = std::fs::read(&path);
+        let existing = match read_file_bounded(&path, MAX_BLOB as u64) {
+            Ok(BoundedRead::Bytes(bytes)) => Ok(bytes),
+            Ok(BoundedRead::TooLarge(_)) => continue,
+            Err(error) => Err(error),
+        };
         let protected_local_path = protected.contains_key(&rel);
         if policy.propagate_deletes
             && protected_local_path
@@ -2528,7 +2936,8 @@ fn materialize_tracked(
                     true
                 }
             }
-            Err(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => continue,
         };
         if needs_write {
             let Some(bytes) = node.get_content(&meta.hash) else {
@@ -4202,6 +4611,166 @@ mod tests {
             .map(|(p, _)| p.clone())
             .collect();
         assert_eq!(paths, vec!["agent.toml".to_string()]);
+    }
+
+    #[test]
+    fn an_incomplete_parent_makes_absence_unknown() {
+        let scan = FolderScan {
+            complete_dirs: HashSet::from([String::new()]),
+            seen_paths: HashSet::from(["locked".to_string()]),
+            opaque_paths: HashSet::from(["locked".to_string()]),
+            ..FolderScan::default()
+        };
+
+        assert!(matches!(
+            scan.state("gone.txt"),
+            ScanPathState::AffirmativelyGone
+        ));
+        assert!(matches!(
+            scan.state("locked/kept.txt"),
+            ScanPathState::Unknown
+        ));
+    }
+
+    #[test]
+    fn a_file_over_the_limit_is_unknown_until_a_real_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let entry = entry_with_policy("bus", root, SyncPolicy::Bus);
+        let rules = entry.policy.rules();
+        let old = b"old";
+        std::fs::write(root.join("large.bin"), old).unwrap();
+        std::fs::write(root.join("small.txt"), b"ok").unwrap();
+
+        let mut node = SyncNode::new(Author([1; 32]));
+        assert!(node.local_write("large.bin", old, 0, 0));
+        assert!(node.local_write("small.txt", b"ok", 0, 0));
+        let old_hash = content_hash(old);
+        let mut observed = HashMap::from([
+            ("large.bin".to_string(), old_hash),
+            ("small.txt".to_string(), content_hash(b"ok")),
+        ]);
+        let mut cache = HashMap::new();
+        let mut issues = BTreeMap::new();
+
+        std::fs::write(root.join("large.bin"), b"five!").unwrap();
+        let changed = scan_into_node_observed_with_limit(
+            &mut node,
+            root,
+            &entry,
+            rules,
+            &mut observed,
+            &mut cache,
+            &mut issues,
+            4,
+        )
+        .unwrap();
+        assert!(!changed, "an unsyncable file became a manifest change");
+        assert!(node.manifest().get("large.bin").unwrap().is_present());
+        assert_eq!(observed.get("large.bin"), Some(&old_hash));
+        assert_eq!(
+            issues.get("large.bin").map(ScanIssue::token),
+            Some("too-large")
+        );
+        assert!(node.manifest().get("small.txt").unwrap().is_present());
+
+        let mut restart_cache = HashMap::new();
+        let restart_observed = observed_from_disk_with_limit(
+            node.manifest(),
+            &entry,
+            &mut restart_cache,
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            restart_observed.get("large.bin"),
+            Some(&old_hash),
+            "a restart lost the presence receipt for the unsyncable file"
+        );
+
+        let protected = observed.clone();
+        materialize_tracked_with_issues(
+            &mut node,
+            root,
+            &entry,
+            rules,
+            &protected,
+            &mut observed,
+            &cache,
+            &issues,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(root.join("large.bin")).unwrap(),
+            b"five!",
+            "materialization overwrote a present but unsyncable file"
+        );
+
+        std::fs::remove_file(root.join("large.bin")).unwrap();
+        assert!(
+            scan_into_node_observed_with_limit(
+                &mut node,
+                root,
+                &entry,
+                rules,
+                &mut observed,
+                &mut cache,
+                &mut issues,
+                4,
+            )
+            .unwrap(),
+            "a complete parent scan must still prove the later delete"
+        );
+        assert!(!node.manifest().get("large.bin").unwrap().is_present());
+    }
+
+    #[test]
+    fn a_directory_replacing_a_tracked_file_is_named_as_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let entry = entry_with_policy("bus", root, SyncPolicy::Bus);
+        let rules = entry.policy.rules();
+        let old = b"old";
+        let hash = content_hash(old);
+        let mut node = SyncNode::new(Author([1; 32]));
+        assert!(node.local_write("path", old, 0, 0));
+        let mut observed = HashMap::from([("path".to_string(), hash)]);
+        let mut cache = HashMap::new();
+        let mut issues = BTreeMap::new();
+        std::fs::create_dir(root.join("path")).unwrap();
+
+        let changed = scan_into_node_observed_with_limit(
+            &mut node,
+            root,
+            &entry,
+            rules,
+            &mut observed,
+            &mut cache,
+            &mut issues,
+            4,
+        )
+        .unwrap();
+
+        assert!(!changed, "an unsupported replacement became a delete");
+        assert!(node.manifest().get("path").unwrap().is_present());
+        assert_eq!(observed.get("path"), Some(&hash));
+        assert_eq!(
+            issues.get("path").map(ScanIssue::token),
+            Some("unsupported")
+        );
+    }
+
+    #[test]
+    fn local_data_errors_are_not_network_weather() {
+        assert_eq!(
+            classify_reconcile_error("no local sync entry named \"catalog\""),
+            PeerSyncState::MissingEntry
+        );
+        assert_eq!(
+            classify_reconcile_error("sync frame of 536870913 bytes exceeds limit 536870912"),
+            PeerSyncState::TooLarge
+        );
     }
 
     /// A WATCHED FOLDER THAT IS NOT THERE IS NOT A FOLDER SOMEBODY EMPTIED.

@@ -109,6 +109,8 @@ pub struct SyncFact {
     pub folder: PathBuf,
     pub folder_exists: bool,
     pub drift_clean: bool,
+    /// Paths the last scan saw but could not read as syncable files.
+    pub scan_issues: Vec<(String, String)>,
     /// Peers this entry has stopped syncing with, and why.
     pub stopped: Vec<(String, String)>,
 }
@@ -390,6 +392,31 @@ fn sync_findings(sync: &SyncFact) -> Vec<Finding> {
         return out;
     }
 
+    for (path, reason) in &sync.scan_issues {
+        let finding = if reason == "too-large" {
+            Finding::new(
+                "sync",
+                Verdict::Problem,
+                format!(
+                    "{name} cannot sync {path}: the file exceeds 512 MiB. fabric still treats it as present"
+                ),
+            )
+            .with_action(format!(
+                "reduce {path} to 512 MiB or less, or exclude it from {name}"
+            ))
+        } else {
+            Finding::new(
+                "sync",
+                Verdict::Unknown,
+                format!(
+                    "{name} cannot read {path} as a syncable file. fabric will not treat it as deleted"
+                ),
+            )
+            .with_action(format!("make {path} a readable regular file, or exclude it from {name}"))
+        };
+        out.push(finding);
+    }
+
     for (peer, reason) in &sync.stopped {
         // Denied waits for a person; unreachable waits for the network. Telling
         // them apart is the difference between a chore and weather.
@@ -427,6 +454,26 @@ fn sync_findings(sync: &SyncFact) -> Vec<Finding> {
             .with_action(format!(
                 "on {peer}, add `sync` to this machine's allow list in peers.toml"
             ))
+        } else if reason == "missing-entry" {
+            Finding::new(
+                "sync",
+                Verdict::Problem,
+                format!(
+                    "{name} has stopped syncing with {peer}: {peer} has no local sync entry named {name}"
+                ),
+            )
+            .with_action(format!(
+                "on {peer}, add {name} to syncs.toml or fix the shared entry name"
+            ))
+        } else if reason == "too-large" {
+            Finding::new(
+                "sync",
+                Verdict::Problem,
+                format!("{name} has stopped syncing with {peer}: sync content exceeds 512 MiB"),
+            )
+            .with_action(format!(
+                "reduce the large file to 512 MiB or less, or exclude it from {name}"
+            ))
         } else {
             Finding::new(
                 "sync",
@@ -446,7 +493,7 @@ fn sync_findings(sync: &SyncFact) -> Vec<Finding> {
         ));
     }
 
-    if sync.stopped.is_empty() && sync.drift_clean {
+    if sync.stopped.is_empty() && sync.scan_issues.is_empty() && sync.drift_clean {
         out.push(Finding::new(
             "sync",
             Verdict::Ok,
@@ -580,6 +627,7 @@ mod tests {
                 folder: PathBuf::from("/tmp/bus"),
                 folder_exists: true,
                 drift_clean: true,
+                scan_issues: Vec::new(),
                 stopped: Vec::new(),
             }],
             ca: CaFact {
@@ -859,6 +907,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn local_sync_faults_do_not_read_as_unreachable() {
+        let mut facts = configured();
+        facts.syncs[0].stopped = vec![
+            ("droppy".to_string(), "missing-entry".to_string()),
+            ("hetz".to_string(), "too-large".to_string()),
+        ];
+        let findings = diagnose(&facts);
+        let syncs = find(&findings, "sync");
+
+        for peer in ["droppy", "hetz"] {
+            let finding = syncs
+                .iter()
+                .find(|finding| finding.detail.contains(peer))
+                .expect("no finding for the local sync fault");
+            assert!(!finding.detail.contains("unreachable"));
+            assert!(
+                !finding
+                    .action
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("comes back")
+            );
+        }
+        assert!(
+            syncs
+                .iter()
+                .find(|finding| finding.detail.contains("droppy"))
+                .unwrap()
+                .action
+                .as_deref()
+                .is_some_and(|action| action.contains("syncs.toml"))
+        );
+        assert!(
+            syncs
+                .iter()
+                .find(|finding| finding.detail.contains("hetz"))
+                .unwrap()
+                .action
+                .as_deref()
+                .is_some_and(|action| action.contains("512 MiB"))
+        );
+    }
+
+    #[test]
+    fn an_oversized_local_path_is_named_and_is_not_called_clean() {
+        let mut facts = configured();
+        facts.syncs[0].scan_issues = vec![("archive.bin".into(), "too-large".into())];
+        let findings = diagnose(&facts);
+        let syncs = find(&findings, "sync");
+        let issue = syncs
+            .iter()
+            .find(|finding| finding.detail.contains("archive.bin"))
+            .expect("the scan issue did not name its path");
+        assert!(issue.detail.contains("still treats it as present"));
+        assert!(
+            issue
+                .action
+                .as_deref()
+                .is_some_and(|action| action.contains("512 MiB"))
+        );
+        assert!(
+            !syncs
+                .iter()
+                .any(|finding| finding.detail.contains("clean and syncing"))
+        );
+    }
+
     /// The engine treats a missing folder as "wait", deliberately, so nothing
     /// else will ever mention it.
     #[test]
@@ -1115,7 +1231,10 @@ where
                 name: entry.name.clone(),
                 folder_exists: folder.exists(),
                 folder,
-                drift_clean: entry.missing == 0 && entry.mismatched == 0,
+                drift_clean: entry.missing == 0
+                    && entry.mismatched == 0
+                    && entry.scan_issues.is_empty(),
+                scan_issues: entry.scan_issues.clone(),
                 stopped: entry.stopped_peers.clone(),
             }
         })
