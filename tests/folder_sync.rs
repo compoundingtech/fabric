@@ -917,12 +917,11 @@ async fn a_path_outside_the_receivers_include_is_not_deleted() -> Result<()> {
     // Now the real question. B holds an entry it cannot scan. Give it many
     // passes to do the wrong thing.
     //
-    // B used to WRITE the path and never scan it, and this test recorded that
-    // as "not a fault". It was the setup for a fault: the written path stayed
-    // protected on B, so a later local delete of it on B tombstoned it for A.
-    // B now leaves a path outside its include alone in every direction. The
-    // entry still carries it in B's manifest, so widening B's include later
-    // materializes it without a resend.
+    // B does not adopt a path outside its include at all now (finding 8). It is
+    // not written, and it is not even recorded in B's manifest, so B can never
+    // relay it to a third peer. Before, B took it into its manifest and only
+    // declined to write it; a broad-include host could then spread its
+    // machine-local files across the whole mesh through B.
     for _ in 0..25 {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
@@ -932,15 +931,27 @@ async fn a_path_outside_the_receivers_include_is_not_deleted() -> Result<()> {
         );
         assert!(
             !b_folder.join("docs/pairing-api.md").exists(),
-            "B wrote a path outside its include. A written path is a protected \
-             path, and a protected path outside the include is the shape that \
-             turned a local delete into a fleet-wide one"
+            "B wrote a path outside its include"
         );
     }
     assert_eq!(
         std::fs::read(&doc)?,
         b"the shared document",
         "the document survived but its content changed"
+    );
+
+    // The receive-side boundary, end to end: B's manifest holds only the
+    // included path, so there is nothing outside the include for B to relay.
+    let b_status = sync_status_of(&b_home).await?;
+    let shared = b_status
+        .iter()
+        .find(|e| e.name == "shared")
+        .expect("B has no status for the shared entry");
+    assert_eq!(
+        shared.present, 1,
+        "B's manifest carries a path outside its include (present={}); it would \
+         relay that path to any third peer",
+        shared.present
     );
 
     node_b.shutdown().await?;

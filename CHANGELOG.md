@@ -257,6 +257,24 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **Include globs are now a receive-side boundary, not only a scan-side one.** A
+  node adopted every winning entry a peer sent, whatever its own include said, so
+  a host with a broad include (or a mistaken `["**"]`) had its machine-local
+  files taken into every peer's manifest and relayed onward across the mesh. The
+  README always said includes were the boundary; the code enforced it only on the
+  scan. `adopt_from_peer` now refuses a path outside the node's include, so it
+  never enters the manifest and never crosses the wire to a third peer. This is
+  the receive half of the same defect whose delete half was finding 2. Finding 8
+  of the 2026-08-29 review.
+
+  Kept distinct from loading a node's OWN durable state, which still adopts every
+  path it already held even outside a narrowed include, because that record is
+  the node's, not a peer's. **Behaviour change:** two peers whose includes differ
+  no longer converge on the excluded paths (which is the point), and widening a
+  receiver's include now re-adopts the newly-included paths from a peer on the
+  next reconcile rather than materialising them from a manifest it had already
+  taken.
+
 - **`send-file` streams instead of holding the whole file in memory on both
   daemons.** The sender read the file whole with `std::fs::read` and the receiver
   allocated `header.len` bytes up front, so a 1.5 GiB transfer cost about 1.5 GiB

@@ -222,7 +222,7 @@ where
     // 3. Adopt the server's winning entries and bundle what the server needs.
     let (pulled, blobs_for_server, fallback, landing) = {
         let mut node = node.lock().await;
-        let pulled = node.adopt(&reply.manifest);
+        let pulled = node.adopt_from_peer(&reply.manifest);
         // What content to push. `hashes_peer_needs` infers what the peer lacks
         // by diffing against what it sent, which is only sound when it sent
         // EVERYTHING. Against a delta, every path outside the delta looks
@@ -464,7 +464,7 @@ where
             }
         }
         let blobs = node.gather_content(&client_needs);
-        let pushed = node.adopt(&manifest);
+        let pushed = node.adopt_from_peer(&manifest);
 
         node.note_payload_sent(&server_payload);
 
