@@ -1430,6 +1430,37 @@ async fn stopped_peers_of(home: &FabricHome) -> Vec<(String, String)> {
     stopped
 }
 
+/// A reachable peer without the named entry has a configuration mismatch.
+/// Network retry cannot repair it, so status must not call it unreachable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_missing_remote_entry_reports_a_configuration_error() -> Result<()> {
+    let _guard = FOLDER_SYNC_LOCK.lock().await;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let a_home = FabricHome::new(a_dir.path());
+    let b_home = FabricHome::new(b_dir.path());
+    let a_folder = a_dir.path().join("shared");
+    std::fs::create_dir_all(&a_folder)?;
+    write_sync(a_dir.path(), &a_folder, "bus");
+
+    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_b = FabricNode::start(b_home.clone()).await?;
+    trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
+    trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
+
+    reload_sync(&a_home).await?;
+    let stopped = stopped_peers_of(&a_home).await;
+    assert_eq!(
+        stopped,
+        vec![("node-b".to_string(), "missing-entry".to_string())],
+        "a reachable peer without the entry reported {stopped:?}"
+    );
+
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
 /// Finding 3 of the 2026-08-29 review. A selector that matches no peer in
 /// `peers.toml` was dropped without a record. The engine looped over the peers
 /// that did resolve, recorded nothing for the one that did not, and every

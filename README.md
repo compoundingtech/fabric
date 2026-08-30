@@ -1009,6 +1009,14 @@ last durable local-disk receipt). `drift=clean` means the logical Present paths
 and observed bytes agree. A `drift=WARNING` names `missing` Present paths,
 `unexpected` observed paths whose manifest is tombstoned or absent, and
 `mismatched` paths whose observed content hash differs from the logical Present.
+`scan_issues` names existing paths that the last scan could not read as syncable
+regular files.
+
+A delete propagates only when a complete parent directory listing proves the
+path is absent. An unreadable path remains present with an unknown state. A file
+over 512 MiB is also present but not syncable: fabric does not read, hash,
+overwrite, or send it. Reduce it to 512 MiB or less, or exclude it from the sync
+entry. If it is later deleted, the next complete scan propagates that delete.
 The per-entry `full_scans`, `inbound_noop_transactions`, and
 `inbound_guarded_transactions` counters are monotonic while that name remains
 continuously configured in the same daemon process. They let operators measure

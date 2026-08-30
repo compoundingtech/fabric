@@ -269,6 +269,21 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **A delete now requires affirmative absence.** A scan distinguishes a present
+  file, a path absent from a completely read parent directory, and a path whose
+  state is unknown. Only the second state becomes a tombstone. An unreadable
+  file or directory no longer stops the whole entry, and skipping it cannot
+  turn it into a delete.
+
+  A file over 512 MiB is present but not syncable. Fabric does not read or hash
+  it, does not overwrite it during materialization, and reports its path under
+  `scan_issues`. If the file is later deleted, a complete parent scan still
+  proves that delete and propagates it normally.
+
+  `fabric doctor` also distinguishes a missing remote sync entry and residual
+  size-limit errors from an unreachable peer. These states need a configuration
+  or file change; waiting for the network cannot fix them.
+
 - **Include globs are now a receive-side boundary, not only a scan-side one.** A
   node adopted every winning entry a peer sent, whatever its own include said, so
   a host with a broad include (or a mistaken `["**"]`) had its machine-local
@@ -379,9 +394,6 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   file. `fabric sync ls` now prints `content_bytes`, which is the number that
   would have said so on 19 August.
 
-  Not changed here: a file over 512 MiB is still read into memory and refused by
-  every peer, and every present file's bytes are still held once. Both are
-  separate changes.
 - **A dial to a peer that cannot be reached no longer holds its permit after the
   consumer leaves.** Every local connection to a dial socket, and every `shell`
   and `exec`, holds one of 32 dial permits for the life of its session. A session

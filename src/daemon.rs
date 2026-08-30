@@ -2978,6 +2978,7 @@ async fn process_control_request(
                         missing: status.missing,
                         unexpected: status.unexpected,
                         mismatched: status.mismatched,
+                        scan_issues: status.scan_issues,
                         full_scans: status.full_scans,
                         inbound_noop_transactions: status.inbound_noop_transactions,
                         inbound_guarded_transactions: status.inbound_guarded_transactions,

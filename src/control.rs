@@ -194,6 +194,9 @@ pub struct SyncEntryStatus {
     pub unexpected: usize,
     #[serde(default)]
     pub mismatched: usize,
+    /// Existing paths the last scan could not read as syncable files.
+    #[serde(default)]
+    pub scan_issues: Vec<(String, String)>,
     /// Monotonic full-folder scan attempts for this entry instance.
     #[serde(default)]
     pub full_scans: u64,

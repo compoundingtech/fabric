@@ -35,7 +35,7 @@ use super::node::{Reconciled, SyncNode, content_hash};
 /// generous headroom, not a content limit).
 const MAX_JSON_FRAME: usize = 64 * 1024 * 1024;
 /// Largest single content blob accepted (per file).
-const MAX_BLOB: usize = 512 * 1024 * 1024;
+pub(crate) const MAX_BLOB: usize = 512 * 1024 * 1024;
 /// Largest blob count in one bundle.
 const MAX_BLOB_COUNT: u32 = 1_000_000;
 
@@ -67,6 +67,9 @@ struct HelloHeader {
 struct ReplyHeader {
     manifest: Manifest,
     wanted: Vec<ContentHash>,
+    /// A configuration or data error the initiator must act on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
     /// The responder's digest AFTER adopting what the initiator sent.
     ///
     /// This is the acknowledgement. The join is commutative, so once both sides
@@ -112,11 +115,43 @@ async fn write_blobs<W: AsyncWrite + Unpin>(
     w: &mut W,
     blobs: &[(ContentHash, Vec<u8>)],
 ) -> Result<()> {
+    validate_blobs(blobs)?;
     write_u32(w, blobs.len() as u32).await?;
     for (hash, bytes) in blobs {
         w.write_all(&hash.0).await?;
         write_len_bytes(w, bytes).await?;
     }
+    Ok(())
+}
+
+fn validate_blobs(blobs: &[(ContentHash, Vec<u8>)]) -> Result<()> {
+    if blobs.len() > MAX_BLOB_COUNT as usize {
+        bail!(
+            "sync bundle of {} blobs exceeds limit {MAX_BLOB_COUNT}",
+            blobs.len()
+        );
+    }
+    if let Some((_, bytes)) = blobs.iter().find(|(_, bytes)| bytes.len() > MAX_BLOB) {
+        bail!(
+            "sync content blob of {} bytes exceeds limit {MAX_BLOB}",
+            bytes.len()
+        );
+    }
+    Ok(())
+}
+
+async fn write_error_reply<W: AsyncWrite + Unpin>(w: &mut W, message: &str) -> Result<()> {
+    let reply = ReplyHeader {
+        manifest: Manifest::new(),
+        wanted: Vec::new(),
+        error: Some(message.to_string()),
+        digest: String::new(),
+        is_delta: false,
+    };
+    write_len_bytes(w, &serde_json::to_vec(&reply)?).await?;
+    // An older client ignores `error` and still expects the bundle count.
+    write_u32(w, 0).await?;
+    w.flush().await?;
     Ok(())
 }
 
@@ -216,6 +251,9 @@ where
     // The peer's whole manifest comes back the same way.
     wire_bytes += reply_frame.len();
     let reply: ReplyHeader = serde_json::from_slice(&reply_frame)?;
+    if let Some(error) = &reply.error {
+        bail!("{error}");
+    }
     let received = read_blobs_into(&mut stream, &node).await?;
     wire_bytes += received.bytes;
 
@@ -405,7 +443,9 @@ where
     })
     .await?
     else {
-        bail!("no local sync entry named {name:?}");
+        let message = format!("no local sync entry named {name:?}");
+        write_error_reply(&mut stream, &message).await?;
+        bail!(message);
     };
 
     // 2. Snapshot BEFORE adopting so the client still pushes the content we need,
@@ -473,6 +513,7 @@ where
         let reply = ReplyHeader {
             manifest: server_payload,
             wanted: node.missing_content_hashes(),
+            error: None,
             digest: node.manifest().digest(),
             is_delta: reply_is_delta,
         };
@@ -485,6 +526,11 @@ where
     };
 
     // 3. Send reply header + our content bundle, then read the client's push.
+    if let Err(error) = validate_blobs(&blobs_for_client) {
+        let message = format!("{error:#}");
+        write_error_reply(&mut stream, &message).await?;
+        return Err(error);
+    }
     write_len_bytes(&mut stream, &serde_json::to_vec(&reply)?).await?;
     write_blobs(&mut stream, &blobs_for_client).await?;
     stream.flush().await?;
@@ -555,6 +601,27 @@ mod tests {
         super::super::manifest::Author([n; 32])
     }
 
+    #[tokio::test]
+    async fn a_missing_remote_entry_reaches_the_initiator_as_a_configuration_error() {
+        let node = Arc::new(Mutex::new(SyncNode::new(author(1))));
+        let (client_end, server_end) = tokio::io::duplex(1 << 20);
+        let server = tokio::spawn(async move {
+            run_server(server_end, "peer-a", move |_| async move {
+                Ok::<_, anyhow::Error>(None::<(Arc<Mutex<SyncNode>>, ())>)
+            })
+            .await
+        });
+
+        let error = run_client(client_end, node, "catalog", "peer-b")
+            .await
+            .expect_err("a missing remote entry was accepted");
+        assert!(
+            format!("{error:#}").contains("no local sync entry named \"catalog\""),
+            "the initiator lost the remote configuration error: {error:#}"
+        );
+        assert!(server.await.unwrap().is_err());
+    }
+
     /// WHAT `delta_fallbacks` DOES NOT COUNT.
     ///
     /// An initiator that keeps being changed mid-exchange never reaches a
@@ -610,6 +677,7 @@ mod tests {
             let reply = ReplyHeader {
                 manifest: Manifest::new(),
                 wanted: Vec::new(),
+                error: None,
                 digest: hello.digest.clone(),
                 is_delta: true,
             };
@@ -847,6 +915,7 @@ mod tests {
         let reply = ReplyHeader {
             manifest: Manifest::new(),
             wanted: Vec::new(),
+            error: None,
             digest: converged.digest(),
             is_delta: true,
         };
@@ -1014,7 +1083,6 @@ mod tests {
 
 #[cfg(test)]
 mod wire_cost_tests {
-    use super::tests::*;
     use super::*;
 
     fn author(n: u8) -> super::super::manifest::Author {
