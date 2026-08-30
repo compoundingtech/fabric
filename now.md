@@ -4,9 +4,48 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-08-29 by Silber.fabric (Claude Fable). fabric 0.2.0; fleet on v0.2.0+4bc04af; handing off to Codex._
+_Last updated: 2026-08-30 by Silber.fabric-codex. Main is `593a3f7`.
+Release `v0.2.0+593a3f7` is published. droppy and hetz run it. Silber remains on
+`v0.2.0+4bc04af` during the staged rollout._
 
-## Handoff — 2026-08-29 (Fable session; fleet moving to Codex, context will be lost)
+## Current handoff — 2026-08-30
+
+The 2026-08-29 review chain is complete. PRs #91 through #98 merged in order.
+PR #100 added explicit peer ACL transcription and the exposure warning. PR #101
+added affirmative-absence deletes, bounded file reads, scan issue status, and
+actionable missing-entry and size-limit states. No review PR remains open.
+
+The full local suite passed for #101. Its Nix build passed in 7m28s, macOS passed
+in 5m24s, and deterministic Linux passed in 10m17s. It merged as `593a3f7`.
+
+Silber.cos opened the release gate at 14:46 Europe/Berlin on 2026-08-30. Four
+conditions had continuous 24-hour coverage. All seven conditions had continuous
+coverage for the final six hours. Silber.cos judged that the partial window did
+not require a restart. This soak measured `v0.2.0+4bc04af`; it did not measure
+the new commits.
+
+Release `v0.2.0+593a3f7` is published for all three targets. The verified Apple
+Silicon archive has SHA-256
+`7e6775ec031e7da4abcf135a3fe3d98854abf2270ad94d04199a745d32381c89`.
+The archive contains one member named `fabric`, and that binary reports
+`0.2.0+593a3f7`.
+
+droppy updated itself first. Silber.cos verified version `0.2.0+593a3f7`, clean
+drift, nothing stopped, and `delta_fallbacks=0`. All three machines agree on the
+digests and on 21,545 present paths and 14,819 tombstones across mixed versions.
+
+hetz persisted its Desk Set VNC exposure before it updated itself. After the
+update, both entries had clean drift, nothing stopped, and `delta_fallbacks=0`.
+No present count fell, and no tombstone count increased during the update.
+Silber.cos is checking the cross-fleet digests and the VNC tunnel.
+
+Silber remains last and can stay on the old release overnight if Nathan's
+demonstration continues. Cross-version digest agreement makes that hold safe.
+
+No additional code job is live. Do not resume an item from the historical notes
+unless a person assigns it on the bus and does not withdraw it.
+
+## Historical handoff — 2026-08-29 (Fable session; fleet moved to Codex)
 
 **Who wrote this and why.** A Claude Fable session spent 2026-08-29 on the fabric
 review (`../cos/notes/fabric/review-2026-08-29.md`, 15 findings). Workers are
