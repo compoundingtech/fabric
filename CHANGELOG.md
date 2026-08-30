@@ -257,6 +257,19 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **A lost network monitor no longer shuts the daemon down.** `serve()` runs
+  every background loop in one `select!` and ends when the first returns, so a
+  loop returning `Ok` shuts the daemon down. When the OS interface watcher
+  disconnected (a netlink or route-socket error, or a sleep/wake), the roaming
+  rehome loop printed "network monitor stopped; roaming rehome disabled" and
+  returned `Ok` — so the daemon exited with code 0, which neither supervisor
+  restarts (launchd `KeepAlive.SuccessfulExit=false`, systemd
+  `Restart=on-failure`). The daemon stayed down until a person noticed, and the
+  one log line blamed roaming rather than the exit. The loop now parks until the
+  daemon is cancelled, exactly like the monitor-unavailable-at-startup branch
+  already did; only roaming rehome is lost, and shell, exec and sync keep
+  serving. Finding 9 of the 2026-08-29 review.
+
 - **`fabric update` no longer rolls a good build back when systemd fires the
   restart late.** The update schedules the restart at +3s and a verifier at +12s
   that waits 45s for the new version and reinstalls the previous binary if it

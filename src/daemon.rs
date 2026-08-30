@@ -2236,7 +2236,37 @@ async fn run_network_rehome_loop(state: Arc<DaemonState>) -> Result<()> {
             return Ok(());
         }
     };
-    let mut interfaces = monitor.interface_state();
+    run_rehome_updates(state, monitor.interface_state()).await
+}
+
+/// The source of interface-change updates.
+///
+/// Abstracted for one reason: so the loop below can be driven by a fake that
+/// ends the stream on demand and the "monitor stopped" branch can be tested
+/// without waiting for a real OS network monitor to die. Production is the
+/// netwatch watcher.
+trait InterfaceUpdates: Send {
+    fn next_update(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<netwatch::interfaces::State>> + Send;
+}
+
+impl InterfaceUpdates for n0_watcher::Direct<netwatch::interfaces::State> {
+    async fn next_update(&mut self) -> Result<netwatch::interfaces::State> {
+        use n0_watcher::Watcher as _;
+        self.updated()
+            .await
+            .map_err(|_| anyhow::anyhow!("network monitor watcher disconnected"))
+    }
+}
+
+/// Drive roaming rehome from an interface-update stream until the daemon is
+/// cancelled. Split from `run_network_rehome_loop` so the monitor-stopped path
+/// is testable with an injected stream.
+async fn run_rehome_updates(
+    state: Arc<DaemonState>,
+    mut interfaces: impl InterfaceUpdates,
+) -> Result<()> {
     let mut debouncer = NetworkChangeDebouncer::new(NETWORK_CHANGE_DEBOUNCE);
 
     loop {
@@ -2265,9 +2295,21 @@ async fn run_network_rehome_loop(state: Arc<DaemonState>) -> Result<()> {
                         .await;
                 }
             }
-            update = interfaces.updated() => {
+            update = interfaces.next_update() => {
                 let Ok(network_state) = update else {
                     eprintln!("fabric: network monitor stopped; roaming rehome disabled");
+                    // PARK, do not exit. Returning Ok here would end serve()'s
+                    // select! and shut the daemon down with exit code 0, which
+                    // no supervisor restarts: the launchd plist sets
+                    // KeepAlive.SuccessfulExit=false and the systemd unit sets
+                    // Restart=on-failure. So the daemon would stay down until a
+                    // person noticed, and the one log line would say roaming was
+                    // disabled, not that the daemon exited. The daemon keeps
+                    // serving shell, exec and sync; only roaming rehome is lost.
+                    // Finding 9 of the 2026-08-29 review. This matches the
+                    // monitor-unavailable-at-startup branch above, which already
+                    // parks rather than returning.
+                    state.cancel.cancelled().await;
                     break;
                 };
                 let network_usable = network_state.default_route_interface.is_some()
@@ -6669,6 +6711,52 @@ mod tests {
 
         client.shutdown().await?;
         server.shutdown().await?;
+        Ok(())
+    }
+
+    /// Finding 9 of the 2026-08-29 review. When the OS network monitor stops,
+    /// the rehome loop must PARK, not return. `serve()` runs every background
+    /// loop in one `select!` and shuts the daemon down when the first one
+    /// returns, so a loop that returns `Ok` on "the monitor went away" exits the
+    /// whole daemon with code 0 — which neither supervisor restarts.
+    ///
+    /// The test drives the loop with an update source that reports the monitor
+    /// stopped, and asserts the loop does not return until the daemon is
+    /// cancelled. Without the fix the loop returns `Ok` at once and this fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stopped_network_monitor_parks_the_loop_instead_of_ending_the_daemon()
+    -> Result<()> {
+        struct MonitorStopped;
+        impl InterfaceUpdates for MonitorStopped {
+            async fn next_update(&mut self) -> Result<netwatch::interfaces::State> {
+                anyhow::bail!("the OS network monitor stopped")
+            }
+        }
+
+        let dir = tempfile::tempdir()?;
+        let cancel = CancellationToken::new();
+        let state =
+            DaemonState::new(FabricHome::new(dir.path()), cancel.clone(), DaemonOptions::default())
+                .await?;
+
+        let loop_task = tokio::spawn(run_rehome_updates(state.clone(), MonitorStopped));
+
+        // Long enough for the loop to hit the monitor-stopped branch several
+        // times over. With the bug it has already returned by now.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !loop_task.is_finished(),
+            "the rehome loop returned after the monitor stopped; serve() would \
+             treat that as a clean shutdown and the daemon would exit with code \
+             0, which no supervisor restarts"
+        );
+
+        // And it unwinds cleanly once the daemon really is cancelled, so the
+        // fix does not turn a lost monitor into a loop that never stops.
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), loop_task)
+            .await
+            .expect("the loop did not return after the daemon was cancelled")??;
         Ok(())
     }
 }
