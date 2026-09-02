@@ -4,7 +4,7 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `5c035dc`.
+_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `8eb296d`.
 Silber and hetz run `0.2.0+ae755c5`. Bluey is deferred to Nathan._
 
 ## Current handoff — 2026-09-02
@@ -127,6 +127,20 @@ passed in a 54-second window. All 29 daemon-slice tests passed in 210.80 seconds
 and all 409 active library tests passed in 24.38 seconds. The two measurement
 tests stayed ignored. This change is not deployed.
 
+The session totals in `fabric status` persist across daemon restarts. They do
+not cover only the current daemon uptime. The old output did not state this
+window and listed retained telemetry for removed peers without a marker. That
+made droppy's historical 10,885 attempts look like current dial activity.
+Droppy was already absent from both authoritative `peers.toml` files. Its last
+local log entry was August 12, and its last hetz log entry was August 20.
+
+PR #119 adds the missing context and merged at `8eb296d`. New telemetry
+snapshots record their exact UTC window start and retain it across restarts. An
+unreadable or incompatible snapshot reports its reset reason. An existing
+snapshot keeps its valid counters and states that its start is unknown. Session
+and path rows mark retained entries as `[not in peers.toml]`. This change is not
+deployed, and it must ride with a later release.
+
 PR #109 deterministic CI found two follow-up defects. A temporary debug tunnel
 block became a permanent mux denial, which returned early EOF in five recovery
 tests. A valid reconnect also retained the old outage backoff. PR #111 fixed
@@ -138,8 +152,8 @@ made a bare Git remote whose HEAD named `master`, while the test pushed only
 `main`. PR #112 points the bare HEAD at `main` and merged at `6ee46a8`.
 
 The strict ACL, Git transport, shared mux, mixed-version fallback, bounded
-fallback, and lost-wake fixes are complete. The current order has no remaining
-code job. Do not cut a release. Wait for a native job.
+fallback, lost-wake, and telemetry-context fixes are complete. The current
+order has no remaining code job. Do not cut a release. Wait for a native job.
 
 ## Historical handoff — 2026-08-29 (Fable session; fleet moved to Codex)
 
