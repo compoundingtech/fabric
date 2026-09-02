@@ -89,6 +89,9 @@ const SYNC_ACCEPT_INFO_SAMPLE_EVERY: usize = 128;
 static SYNC_ACCEPT_LOG_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 const ENDPOINT_ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
 const ENDPOINT_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// iroh normally drains an endpoint within three seconds. A transport defect
+/// must not make a recycle or daemon shutdown wait forever.
+const ENDPOINT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const ENDPOINT_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const ENDPOINT_HEALTH_POLL_FAILURES_BEFORE_RECYCLE: usize = 2;
 const ENDPOINT_DIAGNOSTIC_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
@@ -1921,7 +1924,7 @@ impl DaemonState {
         });
         *self.last_endpoint_recycle.lock().await = Some(Instant::now());
         self.drop_tunnel_connections();
-        old.endpoint.close().await;
+        close_endpoint_bounded(&old.endpoint, "endpoint recycle").await;
         let rss_after_close_bytes = current_rss_bytes();
         let trim_started = Instant::now();
         let allocator_trim = trim_process_allocator();
@@ -2228,7 +2231,7 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
     }
 
     state.cancel.cancel();
-    state.current_endpoint().close().await;
+    close_endpoint_bounded(&state.current_endpoint(), "daemon shutdown").await;
     let _ = fs::remove_file(control_path);
     let dial_sockets: Vec<DialSocket> = state
         .dial_sockets
@@ -2241,6 +2244,29 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
         socket.stop().await;
     }
     Ok(())
+}
+
+async fn wait_for_close<F>(close: F, bound: Duration) -> bool
+where
+    F: std::future::Future<Output = ()>,
+{
+    tokio::time::timeout(bound, close).await.is_ok()
+}
+
+async fn close_endpoint_bounded(endpoint: &Endpoint, context: &str) {
+    if !wait_for_close(endpoint.close(), ENDPOINT_CLOSE_TIMEOUT).await {
+        warn!(
+            target: VALIDATION_LOG_TARGET,
+            event = "endpoint_close_timeout",
+            context,
+            timeout_ms = ENDPOINT_CLOSE_TIMEOUT.as_millis() as u64,
+            "endpoint close exceeded its deadline"
+        );
+        eprintln!(
+            "fabric: endpoint close exceeded {:?} during {context}; continuing shutdown",
+            ENDPOINT_CLOSE_TIMEOUT
+        );
+    }
 }
 
 async fn run_network_rehome_loop(state: Arc<DaemonState>) -> Result<()> {
@@ -4475,6 +4501,23 @@ async fn pipe_unix_iroh(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn endpoint_close_wait_has_a_hard_deadline() {
+        let bound = Duration::from_millis(20);
+        let started = Instant::now();
+        let completed = wait_for_close(std::future::pending(), bound).await;
+
+        assert!(!completed, "a stuck close must report its timeout");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a stuck close escaped its {bound:?} deadline"
+        );
+        assert!(
+            wait_for_close(std::future::ready(()), bound).await,
+            "a completed close must not report a timeout"
+        );
+    }
 
     /// The default validation filter must PASS the level our diagnostics use.
     ///
