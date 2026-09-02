@@ -4,7 +4,7 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `bbd69bb`.
+_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `6ee46a8`.
 Silber and hetz run local build `0.2.0+4548b1e`. Bluey is deferred to Nathan._
 
 ## Current handoff — 2026-09-02
@@ -52,9 +52,25 @@ coordinated fleet restart because most new clients require `fabric/mux/1`.
 Silber.cos owns that deployment decision. Do not deploy or cut a release without
 a later native order.
 
-The next in-repository recovery slice is the measured retry rough edge. Five
-200-millisecond tunnel flaps can retain the widening backoff and delay recovery
-after the path heals. Fix it in a separate pull request with a red timing proof.
+PR #109 deterministic CI found two follow-up defects. A temporary debug tunnel
+block became a permanent mux denial, which returned early EOF in five recovery
+tests. A valid reconnect also retained the old outage backoff. PR #111 fixed
+both and merged at `ff03bfc`. The five-flap proof now has a 1.5-second budget and
+measured 315.95 ms locally after five 200-millisecond drops.
+
+The sixth CI failure was portable test setup, not transport behavior. Ubuntu
+made a bare Git remote whose HEAD named `master`, while the test pushed only
+`main`. PR #112 points the bare HEAD at `main` and merged at `6ee46a8`.
+
+The latest full local proof passes 407 library tests and all 29 daemon-slice
+tests. Let current Linux CI prove these two follow-ups together. Do not retry the
+failed PR #109 job.
+
+After green CI, the live work is the Silber-only soak that Silber.cos described.
+Measure real traffic for longer than the classifier window. Prove a false-redial
+loop cannot starve the peer. Keep a console rollback that needs only the old
+binary because these changes write no new state. Tell Silber.cos before any hetz
+step. Do not cut a release.
 
 ## Historical handoff — 2026-08-29 (Fable session; fleet moved to Codex)
 
