@@ -4,8 +4,8 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `7f4da21`.
-Silber and hetz run `0.2.0+ae755c5`. Bluey is deferred to Nathan._
+_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `2ce39b4`.
+Silber and hetz run `0.2.0+7f4da21`. Bluey is deferred to Nathan._
 
 ## Current handoff — 2026-09-02
 
@@ -52,19 +52,34 @@ Both proofs failed before their fixes. The old cached connection survived its
 generation change for more than one second. Four immediate duplicate refusals
 then escaped as `open mux stream after reconnect`. Both proofs now pass without
 a daemon restart. All 413 active library tests and all 15 binary tests pass.
-Two measurement tests stay ignored. PR #122 is MERGED AND NOT DEPLOYED. Do not
-deploy it tonight. Ask Silber.cos before any later release or deployment.
+Two measurement tests stay ignored. PR #122 is merged and deployed on Silber
+and hetz as `0.2.0+7f4da21`.
 
-Bluey is temporarily absent from Silber's live `peers.toml`. The file carries
-the reason and tells Nathan to re-add it after the strict allow-list migration.
-This removal makes the trigger rarer. It does not fix it. Silber now has one
-peer, so one missed hetz probe still means no reachable peer and can still
-recycle the endpoint.
+The rollout used Silber first and hetz second. Silber's arm64 binary has SHA-256
+`59794988e352df076e4ce44c949f334dce508362d3fe48eff6c05ec1d0f71b1e`.
+Hetz built exact commit `7f4da21293732e5be914e95cf16dbf54c248a705` natively.
+Its x86_64 binary has SHA-256
+`c9a890cfefc531f68847393e6cafca6abf0c1b4dbcb89ceb4041a35336137bc5`.
+The rollback paths on both machines report `0.2.0+ae755c5` and end with
+`fabric.rollback-ae755c5-pre-7f4da21`.
+
+Bluey returned during the final proof after Nathan updated it. One fresh-process
+ping hit `duplicate mux connection` during that real topology change. The next
+six fresh-process pings all passed direct in 36 to 128 milliseconds. An exec
+returned real remote output. Silber PID 26309 and hetz PID 3364283 stayed
+unchanged. The pair therefore reconverged without the daemon restart that the
+same failure required before PR #122. Do not run the synthetic recycle tonight.
+
+Bluey is temporarily absent from Silber's live `peers.toml`. Hetz still lists it
+as `air` because Nathan uses Bluey to reach hetz. Removing `air` locked Nathan
+out and was reverted from the fresh config backup before the hetz restart.
+Unreachable from Silber did not mean unused by hetz. Silber now has one peer, so
+one missed hetz probe can still recycle its endpoint.
 
 The incident `fabric restart` started a healthy daemon outside launchd. The
 orphan used the same home and node identity, so starting a second daemon beside
 it was unsafe. Silber stopped the orphan first and started the loaded launchd
-job once. Launchd owns PID 50433, and ping plus exec still work. This was the
+job once. Launchd owns PID 26309, and ping plus exec still work. This was the
 second critical process found without supervision tonight; the port 3080 relay
 was the other. Treat an unsupervised critical process as a shared host pattern,
 not as an isolated service detail.
@@ -114,7 +129,7 @@ permits one requested-stream re-probe so an upgraded peer cannot stay
 downgraded. It reports cumulative fallback uses at powers of two. This makes
 repeated use visible without noisy per-stream logging.
 
-Silber and hetz currently run `0.2.0+ae755c5`. The Silber updater kept
+Silber and hetz previously ran `0.2.0+ae755c5`. The Silber updater kept
 `/Users/myobie/.local/bin/fabric.rollback-1788366350`, which reports
 `0.2.0+36158f6`. Roll Silber back without asking if control to hetz fails, the
 st2 bus stops crossing machines, or the per-stream cost grows beyond the
@@ -195,11 +210,15 @@ The sixth CI failure was portable test setup, not transport behavior. Ubuntu
 made a bare Git remote whose HEAD named `master`, while the test pushed only
 `main`. PR #112 points the bare HEAD at `main` and merged at `6ee46a8`.
 
+The hetz fabric checkout had a stale SSH origin at the old `myobie/fabric`
+repository. Hetz has no GitHub SSH key, so fetch had failed for an unknown time.
+Its origin now uses `https://github.com/compoundingtech/fabric.git`, matching
+the other working hetz checkouts.
+
 The strict ACL, Git transport, shared mux, mixed-version fallback, bounded
 fallback, lost-wake, telemetry-context, and recycle-convergence fixes are
-complete. The next fleet task is a supervised PR #122 rollout when Nathan is
-present. Update Silber first and hetz second. Ask Silber.cos before the rollout.
-Do not infer deployment from the merge.
+complete. The PR #122 rollout and its live convergence proof are complete.
+No deployment action remains from this handoff.
 
 ## Historical handoff — 2026-08-29 (Fable session; fleet moved to Codex)
 
