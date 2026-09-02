@@ -184,6 +184,78 @@ pub fn version_for_tag(tag: &str) -> &str {
     tag.strip_prefix('v').unwrap_or(tag)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseDirection {
+    Current,
+    Upgrade,
+    Downgrade,
+    Diverged,
+}
+
+fn release_commit(version: &str) -> Result<&str> {
+    let commit = version
+        .rsplit_once('+')
+        .map(|(_, commit)| commit)
+        .context("the version has no build commit")?;
+    if !(7..=40).contains(&commit.len()) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("the version build commit is not a Git commit: {version}");
+    }
+    Ok(commit)
+}
+
+fn release_direction_from_compare(status: &str) -> Result<ReleaseDirection> {
+    match status {
+        "identical" => Ok(ReleaseDirection::Current),
+        "ahead" => Ok(ReleaseDirection::Upgrade),
+        "behind" => Ok(ReleaseDirection::Downgrade),
+        "diverged" => Ok(ReleaseDirection::Diverged),
+        other => bail!("the release API returned an unknown comparison status: {other}"),
+    }
+}
+
+async fn release_direction(installed: &str, available: &str) -> Result<ReleaseDirection> {
+    if installed == available {
+        return Ok(ReleaseDirection::Current);
+    }
+    let installed_commit = release_commit(installed)?;
+    let available_commit = release_commit(available)?;
+    let url = format!(
+        "https://api.github.com/repos/{RELEASE_REPO}/compare/{installed_commit}...{available_commit}"
+    );
+    let body = fetch(&url).await?;
+    let json: serde_json::Value = serde_json::from_slice(&body)
+        .context("the release comparison API returned something that is not JSON")?;
+    let status = json
+        .get("status")
+        .and_then(|status| status.as_str())
+        .context("the release comparison API returned no status")?;
+    release_direction_from_compare(status)
+}
+
+fn enforce_release_direction(
+    installed: &str,
+    available: &str,
+    direction: ReleaseDirection,
+    allow_downgrade: bool,
+) -> Result<()> {
+    if matches!(
+        direction,
+        ReleaseDirection::Downgrade | ReleaseDirection::Diverged
+    ) && !allow_downgrade
+    {
+        let relation = if direction == ReleaseDirection::Downgrade {
+            "is older than"
+        } else {
+            "does not contain"
+        };
+        bail!(
+            "refusing to replace {installed} with {available}: the release {relation} the installed build. \
+             Pass --allow-downgrade to replace it explicitly; nothing was installed"
+        );
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Everything below touches the network, the filesystem or the service manager.
 // ---------------------------------------------------------------------------
@@ -624,6 +696,7 @@ pub struct UpdateOptions {
     pub dry_run: bool,
     pub no_restart: bool,
     pub rollback: bool,
+    pub allow_downgrade: bool,
 }
 
 /// Run an update. Returns the process exit code, which only `--check` uses for
@@ -638,9 +711,34 @@ pub async fn run(home: &crate::config::FabricHome, options: UpdateOptions) -> Re
         return roll_back(home, &installed_path, &options).await;
     }
 
-    let source = resolve_source(options.tag.clone(), options.url.clone(), options.sha256.clone())?;
+    let source = resolve_source(
+        options.tag.clone(),
+        options.url.clone(),
+        options.sha256.clone(),
+    )?;
     let (url, expected_hash, expected_version) = resolve_artifact(&source).await?;
     println!("source\t{url}");
+
+    let release_direction = if let Some(available) = &expected_version {
+        match release_direction(&installed, available).await {
+            Ok(direction) => Some(direction),
+            Err(error) if options.allow_downgrade => {
+                eprintln!(
+                    "WARNING: cannot compare {installed} with {available}: {error:#}. \
+                     --allow-downgrade permits the replacement."
+                );
+                None
+            }
+            Err(error) => {
+                return Err(error.context(format!(
+                    "cannot prove that {available} is newer than {installed}. \
+                     Pass --allow-downgrade to replace it explicitly"
+                )));
+            }
+        }
+    } else {
+        None
+    };
 
     if options.check {
         let Some(available) = expected_version else {
@@ -650,12 +748,39 @@ pub async fn run(home: &crate::config::FabricHome, options: UpdateOptions) -> Re
             );
         };
         println!("available\t{available}");
-        if installed == available {
+        if release_direction == Some(ReleaseDirection::Current) {
             println!("up to date");
             return Ok(CHECK_EXIT_CURRENT);
         }
+        if release_direction == Some(ReleaseDirection::Downgrade) {
+            println!("installed build is ahead of the latest release");
+            return Ok(CHECK_EXIT_CURRENT);
+        }
+        if release_direction == Some(ReleaseDirection::Diverged) {
+            println!("latest release diverges from the installed build");
+            return Ok(CHECK_EXIT_ERROR);
+        }
         println!("update available");
         return Ok(CHECK_EXIT_AVAILABLE);
+    }
+
+    if release_direction == Some(ReleaseDirection::Current) {
+        println!("up to date");
+        return Ok(0);
+    }
+    if let (Some(available), Some(direction)) = (&expected_version, release_direction) {
+        enforce_release_direction(&installed, available, direction, options.allow_downgrade)?;
+    }
+    if matches!(
+        release_direction,
+        Some(ReleaseDirection::Downgrade | ReleaseDirection::Diverged)
+    ) {
+        eprintln!(
+            "WARNING: replacing {installed} with {} because --allow-downgrade was set",
+            expected_version
+                .as_deref()
+                .expect("a release has a version")
+        );
     }
 
     let archive = fetch(&url).await?;
@@ -831,6 +956,52 @@ mod tests {
     }
 
     const HASH: &str = "e6aac12fcf8be256aa713a017cfcd8d4e258f5f9f42e5bf8911ff189b73a1214";
+
+    #[test]
+    fn an_older_release_is_refused_with_both_versions_named() {
+        let error = enforce_release_direction(
+            "0.2.0+7f4da21",
+            "0.2.0+593a3f7",
+            ReleaseDirection::Downgrade,
+            false,
+        )
+        .expect_err("a downgrade was accepted without an override");
+        let message = error.to_string();
+        assert!(message.contains("0.2.0+7f4da21"));
+        assert!(message.contains("0.2.0+593a3f7"));
+        assert!(message.contains("--allow-downgrade"));
+    }
+
+    #[test]
+    fn an_explicit_downgrade_override_is_accepted() {
+        enforce_release_direction(
+            "0.2.0+7f4da21",
+            "0.2.0+593a3f7",
+            ReleaseDirection::Downgrade,
+            true,
+        )
+        .expect("the explicit downgrade override was refused");
+    }
+
+    #[test]
+    fn github_compare_status_has_one_unambiguous_direction() {
+        assert_eq!(
+            release_direction_from_compare("ahead").unwrap(),
+            ReleaseDirection::Upgrade
+        );
+        assert_eq!(
+            release_direction_from_compare("behind").unwrap(),
+            ReleaseDirection::Downgrade
+        );
+        assert_eq!(
+            release_direction_from_compare("identical").unwrap(),
+            ReleaseDirection::Current
+        );
+        assert_eq!(
+            release_direction_from_compare("diverged").unwrap(),
+            ReleaseDirection::Diverged
+        );
+    }
 
     /// The one refusal that matters. `--url` with no hash means running bytes
     /// nobody checked, and there is nothing to default to: the whole point of

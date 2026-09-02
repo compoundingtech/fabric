@@ -82,6 +82,20 @@ fn the_help_does_not_oversell_the_checksum() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn the_help_names_the_explicit_downgrade_override() -> Result<()> {
+    let help = String::from_utf8(
+        Command::new(fabric_bin())
+            .args(["update", "--help"])
+            .output()
+            .context("failed to run fabric update --help")?
+            .stdout,
+    )?;
+    assert!(help.contains("--allow-downgrade"));
+    assert!(help.contains("older than or diverges"));
+    Ok(())
+}
+
 /// The refusal that matters most, seen the way a caller sees it.
 #[test]
 fn an_explicit_url_without_a_hash_is_refused_and_says_why() -> Result<()> {
