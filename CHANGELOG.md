@@ -73,6 +73,15 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Changed
 
+- **Durable connection totals now include their window and roster context.**
+  `fabric status` prints when the cumulative telemetry window started. It keeps
+  that start across daemon restarts. An unreadable or incompatible snapshot
+  prints its reset reason. A legacy snapshot with no recorded start says that
+  the start is unknown instead of inventing one. Session and path rows mark a
+  retained telemetry peer as `[not in peers.toml]` when the current allow-list
+  no longer contains it. A retired peer's historical retry total therefore no
+  longer looks like current dial activity.
+
 - **Tunnel writers cannot miss a session-state wake.** The writer and buffer
   wait loops create their notification futures before they inspect session
   state. Data or acknowledgements that arrive between the state check and the

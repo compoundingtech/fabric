@@ -37,7 +37,7 @@ toml = "0.9"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-time = { version = "0.3", default-features = false, features = ["std"] }
+time = { version = "0.3", default-features = false, features = ["std", "formatting"] }
 rcgen = { version = "0.14.9", default-features = false, features = ["pem", "ring", "x509-parser"] }
 
 [patch.crates-io]

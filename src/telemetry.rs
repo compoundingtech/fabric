@@ -27,7 +27,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -173,12 +173,46 @@ pub struct PeerTelemetry {
     pub probes_unreachable: u64,
 }
 
+/// The context needed to read every cumulative telemetry counter.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryWindow {
+    /// The start of this counter window as Unix seconds.
+    ///
+    /// This is optional because version 1 snapshots written before this field
+    /// existed contain valid counters but no honest start time.
+    #[serde(default)]
+    pub started_unix_seconds: Option<u64>,
+    /// Why the current window started over, or why its start is unknown.
+    #[serde(default)]
+    pub reset_reason: Option<String>,
+}
+
+impl TelemetryWindow {
+    fn started_now(reset_reason: Option<String>) -> Self {
+        Self {
+            started_unix_seconds: Some(unix_seconds_now()),
+            reset_reason,
+        }
+    }
+
+    fn legacy_unknown() -> Self {
+        Self {
+            started_unix_seconds: None,
+            reset_reason: Some(
+                "window start unknown: snapshot predates window tracking".to_string(),
+            ),
+        }
+    }
+}
+
 /// The persisted form. Versioned so a later shape change can be detected rather
 /// than silently misread.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TelemetrySnapshot {
     #[serde(default)]
     pub version: u32,
+    #[serde(default)]
+    pub window: TelemetryWindow,
     #[serde(default)]
     pub peers: BTreeMap<String, PeerTelemetry>,
 }
@@ -187,6 +221,7 @@ const SNAPSHOT_VERSION: u32 = 1;
 
 #[derive(Debug, Default)]
 struct Inner {
+    window: TelemetryWindow,
     peers: BTreeMap<String, PeerTelemetry>,
     /// When each peer's current loss started. Deliberately not persisted: a
     /// restart destroys the sessions these refer to, so a stale start time
@@ -231,9 +266,18 @@ impl TelemetryStore {
     /// Refusing a foreign version is what keeps that from being silent.
     pub fn load(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
-        let peers = match std::fs::read(&path) {
+        let (peers, window) = match std::fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<TelemetrySnapshot>(&bytes) {
-                Ok(snapshot) if snapshot.version == SNAPSHOT_VERSION => snapshot.peers,
+                Ok(snapshot) if snapshot.version == SNAPSHOT_VERSION => {
+                    let window = if snapshot.window.started_unix_seconds.is_none()
+                        && snapshot.window.reset_reason.is_none()
+                    {
+                        TelemetryWindow::legacy_unknown()
+                    } else {
+                        snapshot.window
+                    };
+                    (snapshot.peers, window)
+                }
                 Ok(snapshot) => {
                     eprintln!(
                         "fabric: telemetry at {} is version {}, expected {}; starting the counts over rather than misreading its latency buckets",
@@ -241,21 +285,47 @@ impl TelemetryStore {
                         snapshot.version,
                         SNAPSHOT_VERSION
                     );
-                    BTreeMap::new()
+                    (
+                        BTreeMap::new(),
+                        TelemetryWindow::started_now(Some(format!(
+                            "reset: snapshot version {} did not match version {}",
+                            snapshot.version, SNAPSHOT_VERSION
+                        ))),
+                    )
                 }
                 Err(error) => {
                     eprintln!(
                         "fabric: ignoring unreadable telemetry at {}: {error}",
                         path.display()
                     );
-                    BTreeMap::new()
+                    (
+                        BTreeMap::new(),
+                        TelemetryWindow::started_now(Some(
+                            "reset: telemetry snapshot was unreadable".to_string(),
+                        )),
+                    )
                 }
             },
-            Err(_) => BTreeMap::new(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (BTreeMap::new(), TelemetryWindow::started_now(None))
+            }
+            Err(error) => {
+                eprintln!(
+                    "fabric: could not read telemetry at {}: {error}; starting the counts over",
+                    path.display()
+                );
+                (
+                    BTreeMap::new(),
+                    TelemetryWindow::started_now(Some(
+                        "reset: telemetry snapshot could not be read".to_string(),
+                    )),
+                )
+            }
         };
         Self {
             path: Some(path),
             inner: Mutex::new(Inner {
+                window,
                 peers,
                 losses_in_flight: BTreeMap::new(),
             }),
@@ -267,7 +337,10 @@ impl TelemetryStore {
     pub fn ephemeral() -> Self {
         Self {
             path: None,
-            inner: Mutex::new(Inner::default()),
+            inner: Mutex::new(Inner {
+                window: TelemetryWindow::started_now(None),
+                ..Inner::default()
+            }),
         }
     }
 
@@ -363,6 +436,7 @@ impl TelemetryStore {
         let inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         TelemetrySnapshot {
             version: SNAPSHOT_VERSION,
+            window: inner.window.clone(),
             peers: inner.peers.clone(),
         }
     }
@@ -380,6 +454,7 @@ impl TelemetryStore {
         };
         let snapshot = TelemetrySnapshot {
             version: SNAPSHOT_VERSION,
+            window: inner.window.clone(),
             peers: inner.peers.clone(),
         };
         if let Err(error) = write_snapshot(path, &snapshot) {
@@ -389,6 +464,13 @@ impl TelemetryStore {
             );
         }
     }
+}
+
+fn unix_seconds_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn duration_micros(duration: Duration) -> u64 {
@@ -535,6 +617,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("telemetry.json");
         let base = Instant::now();
+        let window;
         {
             let store = TelemetryStore::load(&path);
             store.record_loss("droppy", Some("direct"), 1, base);
@@ -545,15 +628,37 @@ mod tests {
                 Some("relay"),
                 Some(Duration::from_millis(64)),
             );
+            window = store.snapshot().window;
         }
 
         let reloaded = TelemetryStore::load(&path);
+        assert_eq!(
+            reloaded.snapshot().window,
+            window,
+            "a daemon restart must not make old totals look new"
+        );
         let peer = reloaded.peer("droppy").expect("counts survive a restart");
         assert_eq!(peer.losses, 1);
         assert_eq!(peer.resumes, 1);
         assert_eq!(peer.resumes_by_path.get("relay"), Some(&1));
         assert_eq!(peer.reconnect.samples, 1);
         assert_eq!(peer.probe_latency.get("relay").map(|l| l.samples), Some(1));
+    }
+
+    /// A durable total without its measurement window looks like current rate.
+    /// The snapshot must carry enough context for `fabric status` to separate
+    /// a long-lived total from events since the latest daemon restart.
+    #[test]
+    fn a_snapshot_declares_when_its_counter_window_started() {
+        let store = TelemetryStore::ephemeral();
+        let encoded = serde_json::to_value(store.snapshot()).expect("snapshot serializes");
+        assert!(
+            encoded
+                .pointer("/window/started_unix_seconds")
+                .and_then(serde_json::Value::as_u64)
+                .is_some(),
+            "a durable counter snapshot must carry its window start: {encoded}"
+        );
     }
 
     #[test]
@@ -673,9 +778,38 @@ mod tests {
         let path = dir.path().join("telemetry.json");
         std::fs::write(&path, b"{ this is not json").expect("write");
         let store = TelemetryStore::load(&path);
-        assert!(store.snapshot().peers.is_empty());
+        let snapshot = store.snapshot();
+        assert!(snapshot.peers.is_empty());
+        assert_eq!(
+            snapshot.window.reset_reason.as_deref(),
+            Some("reset: telemetry snapshot was unreadable")
+        );
+        assert!(snapshot.window.started_unix_seconds.is_some());
         store.record_loss("droppy", Some("direct"), 1, Instant::now());
         assert_eq!(store.peer("droppy").unwrap().losses, 1);
+    }
+
+    #[test]
+    fn a_legacy_snapshot_keeps_its_counts_and_admits_its_window_is_unknown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("telemetry.json");
+        let store = TelemetryStore::load(&path);
+        store.record_loss("droppy", Some("direct"), 1, Instant::now());
+
+        let mut encoded = serde_json::to_value(store.snapshot()).expect("snapshot serializes");
+        encoded
+            .as_object_mut()
+            .expect("snapshot is an object")
+            .remove("window");
+        std::fs::write(&path, serde_json::to_vec(&encoded).unwrap()).unwrap();
+
+        let reloaded = TelemetryStore::load(&path);
+        assert_eq!(reloaded.peer("droppy").map(|peer| peer.losses), Some(1));
+        assert_eq!(
+            reloaded.snapshot().window,
+            TelemetryWindow::legacy_unknown(),
+            "fabric must not invent a start time for existing totals"
+        );
     }
 
     #[test]
