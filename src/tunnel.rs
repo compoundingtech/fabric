@@ -37,7 +37,6 @@ const MAX_FRAME_LEN: usize = 1024 * 1024;
 const LOCAL_READ_BUF: usize = 8192;
 const MAX_BUFFERED_BYTES: usize = 4 * 1024 * 1024;
 const SERVER_SESSION_REAP_INTERVAL: Duration = Duration::from_secs(60);
-const ATTACH_STABLE_AFTER: Duration = Duration::from_secs(2);
 /// A new local request must fail before its caller's ordinary five-second
 /// timeout. Once a session attached, it retries without this deadline.
 const INITIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -1132,13 +1131,13 @@ async fn run_client_attach_loop(
             return Ok(());
         }
 
-        let attach_started = Instant::now();
         let result = if let Some(stream) = initial_stream.take() {
             attach_stream(
                 session.clone(),
                 stream,
                 drop_rx.clone(),
                 notices.as_ref(),
+                &mut backoff,
             )
             .await
         } else {
@@ -1152,14 +1151,10 @@ async fn run_client_attach_loop(
                 connections.clone(),
                 drop_rx.clone(),
                 notices.as_ref(),
+                &mut backoff,
             )
             .await
         };
-
-        if attach_started.elapsed() >= ATTACH_STABLE_AFTER {
-            backoff.reset();
-            session.clear_reconnect_error().await;
-        }
 
         match result {
             Ok(()) if session.is_complete().await => return Ok(()),
@@ -1289,6 +1284,7 @@ async fn connect_and_attach(
     connections: Arc<PeerConnections>,
     drop_rx: watch::Receiver<u64>,
     notices: Option<&ClientConnectionNotices>,
+    backoff: &mut Backoff,
 ) -> Result<()> {
     // A connect to a peer that is away can take the whole handshake timeout
     // to fail. The consumer may leave during it, and then the rest of the
@@ -1319,7 +1315,7 @@ async fn connect_and_attach(
         }
         error = session.watch_local_endpoint() => return Err(error),
     };
-    attach_stream(session, stream, drop_rx, notices).await
+    attach_stream(session, stream, drop_rx, notices, backoff).await
 }
 
 async fn attach_stream(
@@ -1327,6 +1323,7 @@ async fn attach_stream(
     stream: MuxStream,
     drop_rx: watch::Receiver<u64>,
     notices: Option<&ClientConnectionNotices>,
+    backoff: &mut Backoff,
 ) -> Result<()> {
     let MuxStream {
         connection,
@@ -1360,6 +1357,10 @@ async fn attach_stream(
     if session_id != session.id() {
         bail!("tunnel server replied with wrong session id {session_id}");
     }
+    // A valid Hello proves that the peer accepted this exact durable session.
+    // A later drop is a new outage and must not inherit an older outage's delay.
+    backoff.reset();
+    session.clear_reconnect_error().await;
     if resume && let Some(notices) = notices {
         notices.emit(&session, ClientConnectionEvent::Resumed).await;
     }
@@ -1431,7 +1432,7 @@ impl std::error::Error for LocalEndpointGone {
 pub(crate) fn is_permanent_failure(error: &anyhow::Error) -> bool {
     if error.downcast_ref::<ServerRejected>().is_some()
         || error.downcast_ref::<LocalEndpointGone>().is_some()
-        || crate::mux::is_stream_denied(error)
+        || crate::mux::is_permanent_stream_denial(error)
     {
         return true;
     }

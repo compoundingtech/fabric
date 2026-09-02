@@ -289,6 +289,11 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **Repeated short tunnel drops no longer retain a 15-second retry delay.** A
+  valid tunnel Hello resets the old outage backoff. Five 200-millisecond drops
+  now resume within a fresh three-step retry budget after the path heals.
+  Temporary tunnel blocks remain retryable, while ACL denials remain permanent.
+
 - **A delete now requires affirmative absence.** A scan distinguishes a present
   file, a path absent from a completely read parent directory, and a path whose
   state is unknown. Only the second state becomes a tombstone. An unreadable

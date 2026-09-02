@@ -2087,30 +2087,28 @@ async fn flapping_does_not_make_recovery_slower_than_the_outage() -> Result<()> 
 
     // The held connection must still be usable after five flaps.
     //
-    // MEASURED, AND THIS IS THE FINDING: flapping DOES make recovery slower
-    // than the outage. A single partition resumes in about 20 ms. Five 200 ms
-    // flaps resume in 1.2 to 1.9 seconds, and sometimes much longer.
+    // RED measurement before the fix: a single partition resumed in about 20
+    // ms. Five 200 ms flaps resumed in 1.2 to 1.9 seconds, and sometimes took
+    // the full 15-second backoff step.
     //
     // The cause is not mysterious. `next_delay` walks
     // 100, 250, 500, 1000, 2000, 5000, 10000, 15000 ms and only resets once an
-    // attach has been stable for `ATTACH_STABLE_AFTER`, which is 2 seconds. A
-    // tunnel that flaps faster than that never resets, so a series of brief
-    // outages is treated exactly like one long dead peer.
+    // attach had been stable for two seconds. A tunnel that flapped faster than
+    // that never reset, so brief independent outages became one long outage.
     //
-    // The budget here is derived from that ceiling rather than chosen: 15 s is
-    // the widest single delay, and a couple of steps can land on top of each
-    // other, so 45 s. An earlier version used the 60 s round-trip helper and
-    // failed one run in four, which is the flake this replaces.
+    // A successful protocol attach proves that the peer is back. The next loss
+    // must therefore restart at the 100 ms step. A 1.5 second budget allows the
+    // complete first three-step sequence, including maximum jitter, without
+    // permitting a retained 2, 5, 10, or 15 second delay.
     let resumed = std::time::Instant::now();
-    let live_took = tokio::time::timeout(Duration::from_secs(45), async {
+    tokio::time::timeout(Duration::from_millis(1500), async {
         live.write_all(b"after-flapping").await?;
         read_expected_tcp(&mut live, b"after-flapping").await?;
         Ok::<(), anyhow::Error>(())
     })
     .await
     .context("the LIVE connection never resumed after flapping, even allowing for \
-              the full backoff ceiling")??;
-    let _ = live_took;
+              a fresh three-step reconnect sequence")??;
     let live_took = resumed.elapsed();
 
     let took = time_until_tunnel_carries(&local_addr, b"new-after-flapping").await?;

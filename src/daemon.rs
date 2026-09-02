@@ -3708,7 +3708,7 @@ async fn handle_mux_stream(
         }
     }
     if state.tunnel_blocked.load(Ordering::SeqCst) && exposure.is_some() {
-        mux::write_denied(&mut send, "fabric tunnel blocked").await?;
+        mux::write_denied(&mut send, mux::TEMPORARY_TUNNEL_BLOCK).await?;
         return Ok(());
     }
 

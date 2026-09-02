@@ -34,6 +34,8 @@ use tokio::{
 
 /// The reserved ALPN for the multiplexed per-peer connection.
 pub const MUX_ALPN: &[u8] = b"fabric/mux/1";
+/// A diagnostic block that can clear without a config change.
+pub(crate) const TEMPORARY_TUNNEL_BLOCK: &str = "fabric tunnel blocked";
 
 /// Largest protocol name accepted in a stream header (ALPN-scale).
 const MAX_PROTOCOL_LEN: usize = 255;
@@ -68,6 +70,13 @@ impl std::error::Error for StreamDenied {}
 /// True when the peer admitted the connection but refused this logical stream.
 pub(crate) fn is_stream_denied(error: &anyhow::Error) -> bool {
     error.downcast_ref::<StreamDenied>().is_some()
+}
+
+/// True when retrying cannot change this stream admission decision.
+pub(crate) fn is_permanent_stream_denial(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<StreamDenied>()
+        .is_some_and(|denied| denied.0 != TEMPORARY_TUNNEL_BLOCK)
 }
 
 /// The first bytes of every mux stream: which exposure it targets, replacing the
@@ -390,6 +399,19 @@ mod tests {
         // len(2) + "pty-view"(8) = 10.
         assert_eq!(bytes.len(), 2 + 8);
         assert_eq!(&bytes[0..2], &8u16.to_be_bytes());
+    }
+
+    #[test]
+    fn only_the_debug_tunnel_block_is_a_retryable_admission_denial() {
+        let temporary = anyhow::Error::new(StreamDenied(TEMPORARY_TUNNEL_BLOCK.to_string()));
+        assert!(is_stream_denied(&temporary));
+        assert!(!is_permanent_stream_denial(&temporary));
+
+        let acl = anyhow::Error::new(StreamDenied(
+            "peer not permitted for service \"web\"".to_string(),
+        ));
+        assert!(is_stream_denied(&acl));
+        assert!(is_permanent_stream_denial(&acl));
     }
 
     /// A mux server that reads each stream's header and echoes the rest, counting
