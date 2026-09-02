@@ -26,8 +26,8 @@ use anyhow::{Context, Result, bail};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId,
     endpoint::{
-        ConnectError, ConnectingError, Connection, ConnectionError, RecvStream, SendStream, Side,
-        TransportErrorCode,
+        ConnectError, ConnectingError, Connection, ConnectionError, ReadError, RecvStream,
+        SendStream, Side, TransportErrorCode, WriteError,
     },
 };
 use tokio::{
@@ -44,9 +44,14 @@ pub(crate) const TEMPORARY_TUNNEL_BLOCK: &str = "fabric tunnel blocked";
 const MAX_PROTOCOL_LEN: usize = 255;
 const MAX_RESPONSE_LEN: usize = 4096;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
+const OPEN_ATTEMPTS: usize = 4;
+const DUPLICATE_OPEN_ATTEMPTS: usize = 8;
+const DUPLICATE_RETRY_DELAY: Duration = Duration::from_millis(100);
 const LEGACY_MUX_REPROBE_INTERVAL: Duration = Duration::from_secs(60);
 const VALIDATION_LOG_TARGET: &str = "fabric::validation";
 const NO_APPLICATION_PROTOCOL_ALERT: u8 = 0x78;
+const DUPLICATE_CONNECTION_REASON: &[u8] = b"duplicate mux connection";
+const STALE_GENERATION_REASON: &[u8] = b"endpoint generation changed";
 
 /// One admitted logical stream on the shared peer connection.
 pub struct MuxStream {
@@ -110,6 +115,32 @@ fn is_no_application_protocol(error: &ConnectionError) -> bool {
             if close.error_code
                 == TransportErrorCode::crypto(NO_APPLICATION_PROTOCOL_ALERT)
     )
+}
+
+fn is_duplicate_connection(error: &anyhow::Error) -> bool {
+    fn is_duplicate_close(error: &ConnectionError) -> bool {
+        matches!(
+            error,
+            ConnectionError::ApplicationClosed(close)
+                if close.reason.as_ref() == DUPLICATE_CONNECTION_REASON
+        )
+    }
+
+    error.chain().any(|source| {
+        source
+            .downcast_ref::<ConnectionError>()
+            .is_some_and(is_duplicate_close)
+            || source
+                .downcast_ref::<ReadError>()
+                .is_some_and(|error| {
+                    matches!(error, ReadError::ConnectionLost(reason) if is_duplicate_close(reason))
+                })
+            || source
+                .downcast_ref::<WriteError>()
+                .is_some_and(|error| {
+                    matches!(error, WriteError::ConnectionLost(reason) if is_duplicate_close(reason))
+                })
+    })
 }
 
 /// The first bytes of every mux stream: which exposure it targets, replacing the
@@ -254,9 +285,10 @@ impl PeerConnections {
     }
 
     /// Open a mux stream to `peer_addr`'s exposure `protocol`, reusing the peer's
-    /// shared connection (opening it if needed, re-opening it once if the cached
-    /// one has died). Returns the stream with its header already written, ready
-    /// for the tunnel framing.
+    /// shared connection (opening it if needed and replacing a dead cached one).
+    /// A duplicate close gets a short bounded convergence window because a peer
+    /// can still hold the old canonical connection during an endpoint recycle.
+    /// Returns the stream with its header already written for tunnel framing.
     pub async fn open_stream(
         &self,
         endpoint: &Endpoint,
@@ -266,8 +298,9 @@ impl PeerConnections {
         activity: StreamActivity,
     ) -> Result<MuxStream> {
         let header = MuxStreamHeader::new(protocol.to_string());
-        let mut last_error = None;
-        for _ in 0..4 {
+        let mut attempts = 0usize;
+        let last_error = loop {
+            attempts += 1;
             let connection = match self
                 .get_or_open(endpoint, generation, peer_addr, protocol, activity)
                 .await
@@ -288,13 +321,19 @@ impl PeerConnections {
                         return Err(error);
                     }
                     self.forget_if(peer_addr.id, connection.stable_id()).await;
-                    last_error = Some(error);
+                    let duplicate = is_duplicate_connection(&error);
+                    if duplicate && attempts < DUPLICATE_OPEN_ATTEMPTS {
+                        tokio::time::sleep(DUPLICATE_RETRY_DELAY).await;
+                        continue;
+                    }
+                    if attempts >= OPEN_ATTEMPTS {
+                        break error;
+                    }
                     tokio::task::yield_now().await;
                 }
             }
-        }
-        Err(last_error.expect("a mux stream attempt ran"))
-            .context("open mux stream after reconnect")
+        };
+        Err(last_error).context("open mux stream after reconnect")
     }
 
     /// Open one direct legacy ALPN connection without caching a downgrade.
@@ -440,6 +479,23 @@ impl PeerConnections {
             }
             return Ok(Some(existing.connection.clone()));
         }
+        if let Some(existing) = conns.get(&peer_addr.id)
+            && existing.generation > generation
+        {
+            bail!(
+                "endpoint generation changed before mux open: requested {generation}, current {}",
+                existing.generation
+            );
+        }
+        if let Some(stale) = conns.remove(&peer_addr.id)
+            && stale.generation != generation
+            && stale.connection.close_reason().is_none()
+        {
+            // A generation change replaces the endpoint itself. Close its mux
+            // connections before the new endpoint dials, so the peer does not
+            // retain the old canonical connection and reject the replacement.
+            stale.connection.close(0u32.into(), STALE_GENERATION_REASON);
+        }
         if self.mux_probe_deferred(peer_addr.id, generation).await {
             return Ok(None);
         }
@@ -511,7 +567,7 @@ impl PeerConnections {
         if replace {
             if let Some(old) = conns.remove(&peer) {
                 old.connection
-                    .close(0u32.into(), b"duplicate mux connection");
+                    .close(0u32.into(), DUPLICATE_CONNECTION_REASON);
             }
             conns.insert(
                 peer,
@@ -522,7 +578,7 @@ impl PeerConnections {
                 },
             );
         } else {
-            connection.close(0u32.into(), b"duplicate mux connection");
+            connection.close(0u32.into(), DUPLICATE_CONNECTION_REASON);
         }
     }
 
@@ -628,6 +684,124 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    /// A peer can retain the old canonical connection briefly while the other
+    /// endpoint changes generation. It rejects each new connection as a
+    /// duplicate until the old close reaches it.
+    #[derive(Debug, Clone)]
+    struct TransientDuplicateMux {
+        connections: Arc<AtomicUsize>,
+        reject: usize,
+    }
+
+    impl ProtocolHandler for TransientDuplicateMux {
+        async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+            let attempt = self.connections.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt <= self.reject {
+                connection.close(0u32.into(), DUPLICATE_CONNECTION_REASON);
+                return Ok(());
+            }
+            loop {
+                let (mut send, mut recv) = match connection.accept_bi().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    if MuxStreamHeader::read(&mut recv).await.is_ok() {
+                        let _ = write_ready(&mut send).await;
+                        let _ = tokio::io::copy(&mut recv, &mut send).await;
+                        let _ = send.finish();
+                    }
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transient_duplicate_connection_converges_without_a_daemon_restart() -> Result<()> {
+        let connections = Arc::new(AtomicUsize::new(0));
+        let server_ep = Endpoint::bind(presets::N0).await?;
+        let router = Router::builder(server_ep)
+            .accept(
+                MUX_ALPN,
+                TransientDuplicateMux {
+                    connections: connections.clone(),
+                    reject: 4,
+                },
+            )
+            .spawn();
+        router.endpoint().online().await;
+
+        let client = Endpoint::bind(presets::N0).await?;
+        let (opened_tx, _opened_rx) = mpsc::unbounded_channel();
+        let manager = PeerConnections::new(client.id(), opened_tx);
+        let stream = manager
+            .open_stream(
+                &client,
+                1,
+                &router.endpoint().addr(),
+                "probe",
+                StreamActivity::Probe,
+            )
+            .await?;
+        assert_echo(stream, b"after-recycle").await?;
+        assert_eq!(connections.load(Ordering::SeqCst), 5);
+
+        router.shutdown().await?;
+        client.close().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_endpoint_generation_closes_its_cached_mux_connection() -> Result<()> {
+        let connections = Arc::new(AtomicUsize::new(0));
+        let server_ep = Endpoint::bind(presets::N0).await?;
+        let router = Router::builder(server_ep)
+            .accept(
+                MUX_ALPN,
+                MuxEcho {
+                    connections: connections.clone(),
+                    headers: Arc::new(Mutex::new(Vec::new())),
+                },
+            )
+            .spawn();
+        router.endpoint().online().await;
+
+        let client = Endpoint::bind(presets::N0).await?;
+        let (opened_tx, _opened_rx) = mpsc::unbounded_channel();
+        let manager = PeerConnections::new(client.id(), opened_tx);
+        let first = manager
+            .open_stream(
+                &client,
+                0,
+                &router.endpoint().addr(),
+                "probe",
+                StreamActivity::Probe,
+            )
+            .await?;
+        let old_connection = first.connection.clone();
+        assert_echo(first, b"old-generation").await?;
+
+        let second = manager
+            .open_stream(
+                &client,
+                1,
+                &router.endpoint().addr(),
+                "probe",
+                StreamActivity::Probe,
+            )
+            .await?;
+        assert_echo(second, b"new-generation").await?;
+        tokio::time::timeout(Duration::from_secs(1), old_connection.closed())
+            .await
+            .context("the old mux connection survived the endpoint generation change")?;
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+
+        router.shutdown().await?;
+        client.close().await;
+        Ok(())
     }
 
     /// An old-style server that accepts a service as its connection ALPN.
