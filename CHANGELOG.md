@@ -11,8 +11,12 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 - **Peer traffic shares one multipath connection.** Fabric carries each Git,
   sync, shell, exec, send-file, echo, and exposed-service session as a stream on
   one authenticated connection per peer pair. Simultaneous cross-dials select
-  one connection and close the duplicate. Stage this build on every peer before
-  a coordinated restart because most new clients require `fabric/mux/1`.
+  one connection and close the duplicate. A new client tries `fabric/mux/1`
+  first. It uses an uncached direct ALPN only when the peer explicitly rejects
+  mux. Other connection failures do not cause a downgrade. Each later stream
+  retries mux, so upgraded peers converge without a coordinated restart. The
+  validation log records the fallback reason once per peer and endpoint
+  generation. New servers continue to accept old direct-ALPN clients.
 
 - **Persistently slow paths recover without a daemon restart.** The peer health
   loop records every selected path and its RTT. It redials a shared connection

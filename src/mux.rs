@@ -17,7 +17,7 @@
 //! without dropping the connection.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     time::{Duration, Instant},
 };
@@ -25,7 +25,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId,
-    endpoint::{Connection, RecvStream, SendStream, Side},
+    endpoint::{
+        ConnectError, ConnectingError, Connection, ConnectionError, RecvStream, SendStream, Side,
+        TransportErrorCode,
+    },
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -41,6 +44,8 @@ pub(crate) const TEMPORARY_TUNNEL_BLOCK: &str = "fabric tunnel blocked";
 const MAX_PROTOCOL_LEN: usize = 255;
 const MAX_RESPONSE_LEN: usize = 4096;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
+const VALIDATION_LOG_TARGET: &str = "fabric::validation";
+const NO_APPLICATION_PROTOCOL_ALERT: u8 = 0x78;
 
 /// One admitted logical stream on the shared peer connection.
 pub struct MuxStream {
@@ -77,6 +82,33 @@ pub(crate) fn is_permanent_stream_denial(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<StreamDenied>()
         .is_some_and(|denied| denied.0 != TEMPORARY_TUNNEL_BLOCK)
+}
+
+/// True only when the peer explicitly rejects the offered mux ALPN.
+fn is_mux_unsupported(error: &anyhow::Error) -> bool {
+    let Some(error) = error.downcast_ref::<ConnectError>() else {
+        return false;
+    };
+    matches!(
+        error,
+        ConnectError::Connecting {
+            source:
+                ConnectingError::ConnectionError {
+                    source,
+                    ..
+                },
+            ..
+        } if is_no_application_protocol(source)
+    )
+}
+
+fn is_no_application_protocol(error: &ConnectionError) -> bool {
+    matches!(
+        error,
+        ConnectionError::ConnectionClosed(close)
+            if close.error_code
+                == TransportErrorCode::crypto(NO_APPLICATION_PROTOCOL_ALERT)
+    )
 }
 
 /// The first bytes of every mux stream: which exposure it targets, replacing the
@@ -194,6 +226,7 @@ struct PeerConn {
 pub struct PeerConnections {
     local_id: EndpointId,
     conns: Mutex<HashMap<EndpointId, PeerConn>>,
+    legacy_notices: Mutex<HashSet<(EndpointId, u64)>>,
     opened_tx: mpsc::UnboundedSender<Connection>,
 }
 
@@ -202,6 +235,7 @@ impl PeerConnections {
         Self {
             local_id,
             conns: Mutex::new(HashMap::new()),
+            legacy_notices: Mutex::new(HashSet::new()),
             opened_tx,
         }
     }
@@ -221,9 +255,18 @@ impl PeerConnections {
         let header = MuxStreamHeader::new(protocol.to_string());
         let mut last_error = None;
         for _ in 0..4 {
-            let connection = self
+            let connection = match self
                 .get_or_open(endpoint, generation, peer_addr, activity)
-                .await?;
+                .await
+            {
+                Ok(connection) => connection,
+                Err(error) if is_mux_unsupported(&error) => {
+                    return self
+                        .open_legacy(endpoint, generation, peer_addr, protocol, &error)
+                        .await;
+                }
+                Err(error) => return Err(error),
+            };
             match self.open_on(&connection, &header).await {
                 Ok(stream) => return Ok(stream),
                 Err(error) => {
@@ -238,6 +281,59 @@ impl PeerConnections {
         }
         Err(last_error.expect("a mux stream attempt ran"))
             .context("open mux stream after reconnect")
+    }
+
+    /// Open one direct legacy ALPN connection without caching a downgrade.
+    async fn open_legacy(
+        &self,
+        endpoint: &Endpoint,
+        generation: u64,
+        peer_addr: &EndpointAddr,
+        protocol: &str,
+        mux_error: &anyhow::Error,
+    ) -> Result<MuxStream> {
+        self.note_legacy_fallback(peer_addr.id, generation, protocol, mux_error)
+            .await;
+        let connection = endpoint
+            .connect(peer_addr.clone(), protocol.as_bytes())
+            .await
+            .with_context(|| format!("connect legacy protocol {protocol}"))?;
+        let (send, recv) = connection
+            .open_bi()
+            .await
+            .with_context(|| format!("open_bi on legacy protocol {protocol}"))?;
+        Ok(MuxStream {
+            connection,
+            send,
+            recv,
+        })
+    }
+
+    async fn note_legacy_fallback(
+        &self,
+        peer: EndpointId,
+        generation: u64,
+        protocol: &str,
+        reason: &anyhow::Error,
+    ) {
+        let first_for_generation = {
+            let mut notices = self.legacy_notices.lock().await;
+            notices.retain(|(logged_peer, logged_generation)| {
+                *logged_peer != peer || *logged_generation == generation
+            });
+            notices.insert((peer, generation))
+        };
+        if first_for_generation {
+            tracing::warn!(
+                target: VALIDATION_LOG_TARGET,
+                event = "mux_legacy_fallback",
+                peer = %peer.fmt_short(),
+                endpoint_generation = generation,
+                protocol,
+                reason = %format!("{reason:#}"),
+                "peer rejected the mux ALPN; using an uncached direct ALPN connection"
+            );
+        }
     }
 
     async fn open_on(
@@ -392,6 +488,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    const LEGACY_ECHO_ALPN: &[u8] = b"fabric/test-legacy-echo/1";
+
     #[test]
     fn header_round_trips_through_bytes() {
         let header = MuxStreamHeader::new("pty-view");
@@ -412,6 +510,16 @@ mod tests {
         ));
         assert!(is_stream_denied(&acl));
         assert!(is_permanent_stream_denial(&acl));
+    }
+
+    #[test]
+    fn network_failures_do_not_mean_mux_is_unsupported() {
+        for error in [ConnectionError::TimedOut, ConnectionError::Reset] {
+            assert!(!is_no_application_protocol(&error));
+        }
+        assert!(!is_mux_unsupported(&anyhow::anyhow!(
+            "peer route is unavailable"
+        )));
     }
 
     /// A mux server that reads each stream's header and echoes the rest, counting
@@ -442,6 +550,130 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    /// An old-style server that accepts a service as its connection ALPN.
+    #[derive(Debug, Clone)]
+    struct LegacyEcho {
+        connections: Arc<AtomicUsize>,
+    }
+
+    impl ProtocolHandler for LegacyEcho {
+        async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+            self.connections.fetch_add(1, Ordering::SeqCst);
+            loop {
+                let (mut send, mut recv) = match connection.accept_bi().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    let _ = tokio::io::copy(&mut recv, &mut send).await;
+                    let _ = send.finish();
+                });
+            }
+            Ok(())
+        }
+    }
+
+    async fn assert_echo(mut stream: MuxStream, message: &[u8]) -> Result<()> {
+        stream.send.write_all(message).await?;
+        stream.send.finish()?;
+        let mut echoed = vec![0; message.len()];
+        stream.recv.read_exact(&mut echoed).await?;
+        assert_eq!(echoed, message);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mixed_versions_work_both_ways_then_converge_to_mux() -> Result<()> {
+        let mux_connections = Arc::new(AtomicUsize::new(0));
+        let legacy_connections = Arc::new(AtomicUsize::new(0));
+        let headers = Arc::new(Mutex::new(Vec::new()));
+        let server_ep = Endpoint::bind(presets::N0).await?;
+        let router = Router::builder(server_ep)
+            .accept(
+                MUX_ALPN,
+                MuxEcho {
+                    connections: mux_connections.clone(),
+                    headers,
+                },
+            )
+            .accept(
+                LEGACY_ECHO_ALPN,
+                LegacyEcho {
+                    connections: legacy_connections.clone(),
+                },
+            )
+            .spawn();
+        router.endpoint().online().await;
+        let server_addr = router.endpoint().addr();
+
+        // The same peer first behaves like an old build with no mux ALPN.
+        router.endpoint().set_alpns(vec![LEGACY_ECHO_ALPN.to_vec()]);
+        let new_client = Endpoint::bind(presets::N0).await?;
+        let (opened_tx, _opened_rx) = mpsc::unbounded_channel();
+        let manager = PeerConnections::new(new_client.id(), opened_tx);
+        for message in [b"new-to-old-1".as_slice(), b"new-to-old-2".as_slice()] {
+            let stream = manager
+                .open_stream(
+                    &new_client,
+                    0,
+                    &server_addr,
+                    str::from_utf8(LEGACY_ECHO_ALPN)?,
+                    StreamActivity::Application,
+                )
+                .await?;
+            assert_echo(stream, message).await?;
+        }
+        assert_eq!(legacy_connections.load(Ordering::SeqCst), 2);
+        assert_eq!(mux_connections.load(Ordering::SeqCst), 0);
+        assert_eq!(manager.peer_count().await, 0, "fallback must not be cached");
+        assert_eq!(
+            manager.legacy_notices.lock().await.len(),
+            1,
+            "repeated fallback must log once per peer and generation"
+        );
+
+        // An old-style client can still use a direct ALPN on a new server.
+        let old_client = Endpoint::bind(presets::N0).await?;
+        let old_connection = old_client
+            .connect(server_addr.clone(), LEGACY_ECHO_ALPN)
+            .await?;
+        let (send, recv) = old_connection.open_bi().await?;
+        assert_echo(
+            MuxStream {
+                connection: old_connection,
+                send,
+                recv,
+            },
+            b"old-to-new",
+        )
+        .await?;
+        assert_eq!(legacy_connections.load(Ordering::SeqCst), 3);
+
+        // Once the peer supports mux, the next stream upgrades and stays muxed.
+        router
+            .endpoint()
+            .set_alpns(vec![MUX_ALPN.to_vec(), LEGACY_ECHO_ALPN.to_vec()]);
+        for message in [b"upgraded-1".as_slice(), b"upgraded-2".as_slice()] {
+            let stream = manager
+                .open_stream(
+                    &new_client,
+                    0,
+                    &server_addr,
+                    str::from_utf8(LEGACY_ECHO_ALPN)?,
+                    StreamActivity::Application,
+                )
+                .await?;
+            assert_echo(stream, message).await?;
+        }
+        assert_eq!(mux_connections.load(Ordering::SeqCst), 1);
+        assert_eq!(manager.peer_count().await, 1);
+
+        router.shutdown().await?;
+        new_client.close().await;
+        old_client.close().await;
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
