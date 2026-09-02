@@ -4,7 +4,7 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `6ee46a8`.
+_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `36da539`.
 Silber and hetz run local build `0.2.0+4548b1e`. Bluey is deferred to Nathan._
 
 ## Current handoff — 2026-09-02
@@ -47,10 +47,20 @@ resets on endpoint generation changes and has a 60-second per-peer cooldown.
 The full local proof passed: 406 library tests, 29 daemon-slice tests, 18
 folder-sync tests, 12 shell tests, and all smaller integration slices.
 
-The live WAN proof and the 24-hour idle-cost window remain. PR #109 requires a
-coordinated fleet restart because most new clients require `fabric/mux/1`.
-Silber.cos owns that deployment decision. Do not deploy or cut a release without
-a later native order.
+The live WAN proof and the 24-hour idle-cost window remain. A compatibility
+follow-up is in flight before any deployment. A new client must use an uncached
+direct ALPN only after an explicit mux ALPN rejection. It must retry mux on each
+later stream. Old clients must remain compatible with new servers. Silber.cos
+owns the deployment decision. Do not deploy or cut a release without a later
+native order.
+
+The compatibility candidate passed an actual two-build proof in isolated
+homes. Build `0.2.0+4548b1e` and the new candidate exchanged ping and exec
+traffic in both directions. The new side wrote one fallback event across both
+services. After the old side changed to the new candidate, two pings and one
+exec passed, and the fallback count stayed at one. The in-process proof also
+shows zero cached peers during fallback and one shared connection after mux
+becomes available.
 
 PR #109 deterministic CI found two follow-up defects. A temporary debug tunnel
 block became a permanent mux denial, which returned early EOF in five recovery
