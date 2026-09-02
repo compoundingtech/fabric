@@ -44,6 +44,7 @@ pub(crate) const TEMPORARY_TUNNEL_BLOCK: &str = "fabric tunnel blocked";
 const MAX_PROTOCOL_LEN: usize = 255;
 const MAX_RESPONSE_LEN: usize = 4096;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
+const LEGACY_MUX_REPROBE_INTERVAL: Duration = Duration::from_secs(60);
 const VALIDATION_LOG_TARGET: &str = "fabric::validation";
 const NO_APPLICATION_PROTOCOL_ALERT: u8 = 0x78;
 
@@ -221,13 +222,22 @@ struct PeerConn {
     last_application_activity: Option<Instant>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LegacyFallback {
+    retry_after: Instant,
+    uses: u64,
+}
+
 /// Manages exactly one multipath QUIC connection per peer, opening streams on it.
 #[derive(Debug)]
 pub struct PeerConnections {
     local_id: EndpointId,
     conns: Mutex<HashMap<EndpointId, PeerConn>>,
     legacy_notices: Mutex<HashSet<(EndpointId, u64)>>,
+    legacy_fallbacks: Mutex<HashMap<(EndpointId, u64), LegacyFallback>>,
     opened_tx: mpsc::UnboundedSender<Connection>,
+    #[cfg(test)]
+    mux_connect_attempts: std::sync::atomic::AtomicUsize,
 }
 
 impl PeerConnections {
@@ -236,7 +246,10 @@ impl PeerConnections {
             local_id,
             conns: Mutex::new(HashMap::new()),
             legacy_notices: Mutex::new(HashSet::new()),
+            legacy_fallbacks: Mutex::new(HashMap::new()),
             opened_tx,
+            #[cfg(test)]
+            mux_connect_attempts: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -256,17 +269,18 @@ impl PeerConnections {
         let mut last_error = None;
         for _ in 0..4 {
             let connection = match self
-                .get_or_open(endpoint, generation, peer_addr, activity)
+                .get_or_open(endpoint, generation, peer_addr, protocol, activity)
                 .await
             {
-                Ok(connection) => connection,
-                Err(error) if is_mux_unsupported(&error) => {
-                    return self
-                        .open_legacy(endpoint, generation, peer_addr, protocol, &error)
+                Ok(Some(connection)) => connection,
+                Ok(None) => {
+                    self.note_legacy_use(peer_addr.id, generation, protocol)
                         .await;
+                    return self.open_legacy(endpoint, peer_addr, protocol).await;
                 }
                 Err(error) => return Err(error),
             };
+            self.clear_legacy_retry(peer_addr.id, generation).await;
             match self.open_on(&connection, &header).await {
                 Ok(stream) => return Ok(stream),
                 Err(error) => {
@@ -287,13 +301,9 @@ impl PeerConnections {
     async fn open_legacy(
         &self,
         endpoint: &Endpoint,
-        generation: u64,
         peer_addr: &EndpointAddr,
         protocol: &str,
-        mux_error: &anyhow::Error,
     ) -> Result<MuxStream> {
-        self.note_legacy_fallback(peer_addr.id, generation, protocol, mux_error)
-            .await;
         let connection = endpoint
             .connect(peer_addr.clone(), protocol.as_bytes())
             .await
@@ -316,6 +326,21 @@ impl PeerConnections {
         protocol: &str,
         reason: &anyhow::Error,
     ) {
+        let key = (peer, generation);
+        let retry_after = Instant::now() + LEGACY_MUX_REPROBE_INTERVAL;
+        let mut fallbacks = self.legacy_fallbacks.lock().await;
+        fallbacks.retain(|(logged_peer, logged_generation), _| {
+            *logged_peer != peer || *logged_generation == generation
+        });
+        fallbacks
+            .entry(key)
+            .and_modify(|fallback| fallback.retry_after = retry_after)
+            .or_insert(LegacyFallback {
+                retry_after,
+                uses: 0,
+            });
+        drop(fallbacks);
+
         let first_for_generation = {
             let mut notices = self.legacy_notices.lock().await;
             notices.retain(|(logged_peer, logged_generation)| {
@@ -330,10 +355,48 @@ impl PeerConnections {
                 peer = %peer.fmt_short(),
                 endpoint_generation = generation,
                 protocol,
+                reprobe_after_seconds = LEGACY_MUX_REPROBE_INTERVAL.as_secs(),
                 reason = %format!("{reason:#}"),
                 "peer rejected the mux ALPN; using an uncached direct ALPN connection"
             );
         }
+    }
+
+    async fn note_legacy_use(&self, peer: EndpointId, generation: u64, protocol: &str) {
+        let uses = {
+            let mut fallbacks = self.legacy_fallbacks.lock().await;
+            let Some(fallback) = fallbacks.get_mut(&(peer, generation)) else {
+                return;
+            };
+            fallback.uses = fallback.uses.saturating_add(1);
+            fallback.uses
+        };
+        if uses > 1 && uses.is_power_of_two() {
+            tracing::info!(
+                target: VALIDATION_LOG_TARGET,
+                event = "mux_legacy_fallback_uses",
+                peer = %peer.fmt_short(),
+                endpoint_generation = generation,
+                protocol,
+                fallback_uses = uses,
+                "legacy fallback remains active"
+            );
+        }
+    }
+
+    async fn mux_probe_deferred(&self, peer: EndpointId, generation: u64) -> bool {
+        self.legacy_fallbacks
+            .lock()
+            .await
+            .get(&(peer, generation))
+            .is_some_and(|fallback| fallback.retry_after > Instant::now())
+    }
+
+    async fn clear_legacy_retry(&self, peer: EndpointId, generation: u64) {
+        self.legacy_fallbacks
+            .lock()
+            .await
+            .remove(&(peer, generation));
     }
 
     async fn open_on(
@@ -364,8 +427,9 @@ impl PeerConnections {
         endpoint: &Endpoint,
         generation: u64,
         peer_addr: &EndpointAddr,
+        protocol: &str,
         activity: StreamActivity,
-    ) -> Result<Connection> {
+    ) -> Result<Option<Connection>> {
         let mut conns = self.conns.lock().await;
         if let Some(existing) = conns.get_mut(&peer_addr.id)
             && existing.generation == generation
@@ -374,12 +438,26 @@ impl PeerConnections {
             if activity == StreamActivity::Application {
                 existing.last_application_activity = Some(Instant::now());
             }
-            return Ok(existing.connection.clone());
+            return Ok(Some(existing.connection.clone()));
         }
-        let connection = endpoint
-            .connect(peer_addr.clone(), MUX_ALPN)
-            .await
-            .context("connect mux connection")?;
+        if self.mux_probe_deferred(peer_addr.id, generation).await {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        self.mux_connect_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let connection = match endpoint.connect(peer_addr.clone(), MUX_ALPN).await {
+            Ok(connection) => connection,
+            Err(connect_error) => {
+                let error = anyhow::Error::new(connect_error).context("connect mux connection");
+                if is_mux_unsupported(&error) {
+                    self.note_legacy_fallback(peer_addr.id, generation, protocol, &error)
+                        .await;
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+        };
         conns.insert(
             peer_addr.id,
             PeerConn {
@@ -390,7 +468,7 @@ impl PeerConnections {
             },
         );
         let _ = self.opened_tx.send(connection.clone());
-        Ok(connection)
+        Ok(Some(connection))
     }
 
     async fn forget_if(&self, peer: EndpointId, stable_id: usize) {
@@ -613,21 +691,43 @@ mod tests {
         let new_client = Endpoint::bind(presets::N0).await?;
         let (opened_tx, _opened_rx) = mpsc::unbounded_channel();
         let manager = PeerConnections::new(new_client.id(), opened_tx);
-        for message in [b"new-to-old-1".as_slice(), b"new-to-old-2".as_slice()] {
-            let stream = manager
-                .open_stream(
-                    &new_client,
-                    0,
-                    &server_addr,
-                    str::from_utf8(LEGACY_ECHO_ALPN)?,
-                    StreamActivity::Application,
-                )
-                .await?;
-            assert_echo(stream, message).await?;
-        }
+        let legacy_protocol = str::from_utf8(LEGACY_ECHO_ALPN)?;
+        let (first, second) = tokio::join!(
+            manager.open_stream(
+                &new_client,
+                0,
+                &server_addr,
+                legacy_protocol,
+                StreamActivity::Application,
+            ),
+            manager.open_stream(
+                &new_client,
+                0,
+                &server_addr,
+                legacy_protocol,
+                StreamActivity::Application,
+            ),
+        );
+        assert_echo(first?, b"new-to-old-1").await?;
+        assert_echo(second?, b"new-to-old-2").await?;
         assert_eq!(legacy_connections.load(Ordering::SeqCst), 2);
         assert_eq!(mux_connections.load(Ordering::SeqCst), 0);
         assert_eq!(manager.peer_count().await, 0, "fallback must not be cached");
+        assert_eq!(
+            manager.mux_connect_attempts.load(Ordering::SeqCst),
+            1,
+            "the compatibility window must suppress repeated rejected mux handshakes"
+        );
+        assert_eq!(
+            manager
+                .legacy_fallbacks
+                .lock()
+                .await
+                .get(&(server_addr.id, 0))
+                .map(|fallback| fallback.uses),
+            Some(2),
+            "every direct fallback use must be countable"
+        );
         assert_eq!(
             manager.legacy_notices.lock().await.len(),
             1,
@@ -651,10 +751,17 @@ mod tests {
         .await?;
         assert_eq!(legacy_connections.load(Ordering::SeqCst), 3);
 
-        // Once the peer supports mux, the next stream upgrades and stays muxed.
+        // Once the bounded re-probe is due, an upgraded peer returns to mux.
         router
             .endpoint()
             .set_alpns(vec![MUX_ALPN.to_vec(), LEGACY_ECHO_ALPN.to_vec()]);
+        manager
+            .legacy_fallbacks
+            .lock()
+            .await
+            .get_mut(&(server_addr.id, 0))
+            .expect("the old peer must have a fallback record")
+            .retry_after = Instant::now();
         for message in [b"upgraded-1".as_slice(), b"upgraded-2".as_slice()] {
             let stream = manager
                 .open_stream(
@@ -669,6 +776,7 @@ mod tests {
         }
         assert_eq!(mux_connections.load(Ordering::SeqCst), 1);
         assert_eq!(manager.peer_count().await, 1);
+        assert_eq!(manager.mux_connect_attempts.load(Ordering::SeqCst), 2);
 
         router.shutdown().await?;
         new_client.close().await;
