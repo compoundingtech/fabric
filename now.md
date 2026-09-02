@@ -4,7 +4,7 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `4548b1e`.
+_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `bbd69bb`.
 Silber and hetz run local build `0.2.0+4548b1e`. Bluey is deferred to Nathan._
 
 ## Current handoff — 2026-09-02
@@ -38,14 +38,23 @@ PR #108 added Git remotes and merged at `4548b1e`. Silber and hetz run that
 build. Each has the relative `git-remote-fabric -> fabric` helper and zero Git
 remotes. Nathan owns the first live share and grant.
 
-Degraded-path recovery is live work on branch `fix/degraded-path-recovery`.
-All outbound services now use `fabric/mux/1` streams on one shared multipath
-connection per peer pair. Simultaneous cross-dials converge on one connection.
-The health loop skips a redundant probe after recent application traffic. Three
-samples above one second and eight times baseline redial the peer connection.
-The classifier resets on endpoint generation changes and has a 60-second
-per-peer cooldown. Unit and focused two-daemon tests pass. Finish the full proof,
-review, and merge this slice. Do not deploy it without a later native order.
+PR #109 added degraded-path recovery and merged at `bbd69bb`. All outbound
+services now use `fabric/mux/1` streams on one shared multipath connection per
+peer pair. Simultaneous cross-dials converge on one connection. The health loop
+skips a redundant probe after recent application traffic. Three samples above
+one second and eight times baseline redial the peer connection. The classifier
+resets on endpoint generation changes and has a 60-second per-peer cooldown.
+The full local proof passed: 406 library tests, 29 daemon-slice tests, 18
+folder-sync tests, 12 shell tests, and all smaller integration slices.
+
+The live WAN proof and the 24-hour idle-cost window remain. PR #109 requires a
+coordinated fleet restart because most new clients require `fabric/mux/1`.
+Silber.cos owns that deployment decision. Do not deploy or cut a release without
+a later native order.
+
+The next in-repository recovery slice is the measured retry rough edge. Five
+200-millisecond tunnel flaps can retain the widening backoff and delay recovery
+after the path heals. Fix it in a separate pull request with a red timing proof.
 
 ## Historical handoff — 2026-08-29 (Fable session; fleet moved to Codex)
 
