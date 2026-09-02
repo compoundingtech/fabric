@@ -8,6 +8,13 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Added
 
+- **Git remotes work through Fabric.** A `fabric://<peer>/<remote>` URL uses
+  Git's smart protocol over an authenticated Fabric connection. The host checks
+  an exact per-repository read or write grant before it starts `git
+  upload-pack` or `git receive-pack`. The installer and updater install the
+  `git-remote-fabric` helper link. Session limits, a ten-second first-answer
+  deadline, separate stderr framing, and child cleanup bound the service.
+
 - **The executable bit is replicated.** Fabric now syncs the attributes git
   syncs. A file arrives executable if it was executable at its origin, applied
   before the atomic rename so it is never briefly visible with the wrong mode.

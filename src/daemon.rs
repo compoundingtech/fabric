@@ -43,7 +43,7 @@ use crate::{
         validate_server_session_config, validate_tcp_addr,
     },
     control::{ControlRequest, ControlResponse, PeerReachability, SyncEntryStatus},
-    exec, pathwatch, shell,
+    exec, gitremote, pathwatch, shell,
     sync::{
         self,
         config::SyncPeers,
@@ -399,6 +399,7 @@ pub struct DaemonState {
     dial_failures: Arc<FailureBackoff>,
     incoming_slots: Arc<Semaphore>,
     dial_slots: Arc<Semaphore>,
+    git_sessions: gitremote::GitSessionLimits,
     cancel: CancellationToken,
     /// Durable loss/resume counters. Survives a restart, unlike the log lines
     /// that were previously the only record.
@@ -904,6 +905,7 @@ impl DaemonState {
             ),
             incoming_slots: Arc::new(Semaphore::new(MAX_INCOMING_HANDLERS)),
             dial_slots: Arc::new(Semaphore::new(MAX_DIAL_HANDLERS)),
+            git_sessions: gitremote::GitSessionLimits::default(),
             cancel,
             telemetry,
             last_probe_transport: Arc::new(StdRwLock::new(HashMap::new())),
@@ -1258,7 +1260,10 @@ impl DaemonState {
         // Built-in exec and legacy shell/0 remain one-shot raw framed streams.
         // Resumable shell/1 negotiates its own tunnel path and falls back to
         // shell/0 when the peer does not advertise the new ALPN.
-        let listener_task = if alpn == exec::EXEC_ALPN || alpn == shell::SHELL_ALPN {
+        let listener_task = if alpn == exec::EXEC_ALPN
+            || alpn == shell::SHELL_ALPN
+            || alpn == gitremote::GIT_ALPN
+        {
             tokio::spawn(run_raw_dial_socket(
                 listener,
                 self.endpoint_rx(),
@@ -2925,6 +2930,17 @@ async fn process_control_request(
                 .await?;
             ControlResponse::Exec { socket }
         }
+        ControlRequest::Git { peer } => {
+            let socket = state
+                .dial_alpn(
+                    &peer,
+                    gitremote::GIT_PROTOCOL,
+                    gitremote::GIT_ALPN.to_vec(),
+                    true,
+                )
+                .await?;
+            ControlResponse::Git { socket }
+        }
         ControlRequest::DropTunnelConnections => {
             state.drop_tunnel_connections();
             ControlResponse::Ok
@@ -3246,8 +3262,16 @@ async fn process_incoming_iroh(
 
     let connection = handshake_and_identify(accepting, identity).await?;
 
-    // ONE GATE. Every service reaches it: echo, both shells, exec, sync, and
-    // every generic exposure. One place to get right and one place to test.
+    // Git checks its qualified grant after it reads the requested remote and
+    // operation. The handshake already proved that the peer is trusted.
+    if alpn == gitremote::GIT_ALPN {
+        log_connection_paths("builtin_git_accept", &connection);
+        handle_git(connection, state).await?;
+        return Ok(());
+    }
+
+    // ONE GATE for ordinary services: echo, both shells, exec, sync, and every
+    // generic exposure. Git uses the exact repository grant above.
     //
     // Trusted and permitted are two different questions. `AllowListHook`
     // answered the first at handshake; this answers the second, and it needs
@@ -3424,6 +3448,15 @@ async fn handle_builtin_exec(connection: Connection, state: Arc<DaemonState>) ->
     Ok(())
 }
 
+async fn handle_git(connection: Connection, state: Arc<DaemonState>) -> Result<()> {
+    let peer = connection.remote_id();
+    let (send, recv) = connection.accept_bi().await?;
+    let book = state.peer_book.read().await.clone();
+    gitremote::serve_session(recv, send, book, peer, state.git_sessions.clone()).await?;
+    connection.closed().await;
+    Ok(())
+}
+
 /// Serve the accepting side of a `fabric/sync` reconcile: run the wire server
 /// against the engine's node for the requested sync, then materialize what the
 /// peer pushed us to disk.
@@ -3469,13 +3502,14 @@ async fn handle_sync(connection: Connection, state: Arc<DaemonState>) -> Result<
 }
 
 fn accepted_alpns(exposures: &HashMap<Vec<u8>, Exposure>) -> Vec<Vec<u8>> {
-    let mut alpns = Vec::with_capacity(exposures.len() + 5);
+    let mut alpns = Vec::with_capacity(exposures.len() + 7);
     alpns.push(BUILTIN_ECHO_ALPN.to_vec());
     alpns.push(shell::SHELL_ALPN.to_vec());
     alpns.push(shell::RESUMABLE_SHELL_ALPN.to_vec());
     alpns.push(exec::EXEC_ALPN.to_vec());
     alpns.push(SYNC_ALPN.to_vec());
     alpns.push(crate::sendfile::SEND_FILE_ALPN.to_vec());
+    alpns.push(gitremote::GIT_ALPN.to_vec());
     alpns.extend(exposures.keys().cloned());
     alpns
 }
@@ -3487,6 +3521,7 @@ fn matches_reserved_alpn(alpn: &[u8]) -> bool {
         || alpn == shell::RESUMABLE_SHELL_ALPN
         || alpn == exec::EXEC_ALPN
         || alpn == SYNC_ALPN
+        || alpn == gitremote::GIT_ALPN
 }
 
 /// The iroh-backed sync transport: resolves peers from `peers.toml` and dials the

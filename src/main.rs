@@ -333,6 +333,8 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum GitCommands {
+    /// Install or repair the git-remote-fabric helper beside this binary.
+    InstallHelper,
     /// Declare a local Git repository. This grants no peer access.
     Share {
         remote: String,
@@ -471,6 +473,11 @@ enum DebugCommands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if fabric::gitremote::invoked_as_remote_helper() {
+        let code = fabric::gitremote::run_remote_helper().await?;
+        std::process::exit(code);
+    }
+
     let cli = Cli::parse();
     if cli.version {
         println!("{}", fabric::version_string());
@@ -548,6 +555,12 @@ async fn main() -> Result<()> {
                     }
                 }
                 Commands::Git { command } => match command {
+                    GitCommands::InstallHelper => {
+                        let binary = std::env::current_exe()
+                            .context("cannot resolve the running Fabric binary")?;
+                        let helper = fabric::gitremote::install_helper_for(&binary)?;
+                        println!("installed\t{}", helper.display());
+                    }
                     GitCommands::Share { remote, repository } => {
                         let path = canonical_git_directory(&repository)?;
                         let mut book = PeerBook::load(&home)?;
@@ -1464,13 +1477,23 @@ async fn print_git_status(home: &FabricHome, book: &PeerBook) {
         _ => println!("git\tproblem\tGit is not available"),
     }
 
-    let helper = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join("git-remote-fabric")));
-    match helper {
-        Some(path) if path.exists() => println!("helper\tok\t{}", path.display()),
-        Some(path) => println!("helper\tproblem\tmissing {}", path.display()),
-        None => println!("helper\tunknown\tcannot resolve the Fabric binary directory"),
+    match std::env::current_exe() {
+        Ok(binary) => {
+            let helper = fabric::gitremote::helper_path_for(&binary);
+            match (
+                helper,
+                fabric::gitremote::helper_is_installed_for(&binary),
+            ) {
+                (Ok(path), Ok(true)) => println!("helper\tok\t{}", path.display()),
+                (Ok(path), Ok(false)) => println!(
+                    "helper\tproblem\tmissing or unrelated {}; run fabric git install-helper",
+                    path.display()
+                ),
+                (_, Err(error)) => println!("helper\tproblem\t{error:#}"),
+                (Err(error), _) => println!("helper\tunknown\t{error:#}"),
+            }
+        }
+        Err(error) => println!("helper\tunknown\tcannot resolve the Fabric binary: {error}"),
     }
 
     match send_control(home, ControlRequest::Status).await {

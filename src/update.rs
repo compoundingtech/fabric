@@ -447,6 +447,9 @@ pub async fn supervise_restart(
     let stamp = timestamp();
     let staged = stage_binary(&installed_path, &bytes, &stamp)?;
     commit_staged(&staged, &installed_path, &stamp)?;
+    if let Err(error) = crate::gitremote::install_helper_for(&installed_path) {
+        eprintln!("supervise\tGit helper repair failed: {error:#}");
+    }
 
     restart_service()?;
     if crate::service::wait_for_control_socket(home, SUPERVISE_READY_TIMEOUT) {
@@ -691,8 +694,15 @@ pub async fn run(home: &crate::config::FabricHome, options: UpdateOptions) -> Re
         return Ok(0);
     }
 
+    if let Err(error) = crate::gitremote::validate_helper_install(&installed_path) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error.context("the Git helper path is unsafe, so nothing was installed"));
+    }
+
     let rollback = commit_staged(&staged, &installed_path, &stamp)?;
+    let helper = crate::gitremote::install_helper_for(&installed_path)?;
     println!("installed\t{}", binary_version(&installed_path)?);
+    println!("helper\t{}", helper.display());
     if rollback.exists() {
         println!("rollback\t{}", rollback.display());
     }
@@ -741,8 +751,14 @@ async fn roll_back(
         .with_context(|| format!("failed to read {}", rollback.display()))?;
     let stamp = timestamp();
     let staged = stage_binary(installed_path, &bytes, &stamp)?;
+    if let Err(error) = crate::gitremote::validate_helper_install(installed_path) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error.context("the Git helper path is unsafe, so nothing was installed"));
+    }
     let previous = commit_staged(&staged, installed_path, &stamp)?;
+    let helper = crate::gitremote::install_helper_for(installed_path)?;
     println!("installed\t{}", binary_version(installed_path)?);
+    println!("helper\t{}", helper.display());
     if previous.exists() {
         println!("rollback\t{}", previous.display());
     }

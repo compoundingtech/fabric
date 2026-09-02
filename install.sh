@@ -116,12 +116,19 @@ require_cargo() {
 install_binary() {
   src="$1"
   target="$INSTALL_DIR/fabric"
+  helper="$INSTALL_DIR/git-remote-fabric"
   mkdir -p "$INSTALL_DIR"
 
   if [ -e "$target" ] || [ -L "$target" ]; then
     if ! "$target" --help 2>/dev/null | grep -q "Local socket facade for iroh-backed cross-machine transports"; then
       die "refusing to overwrite non-fabric file at $target"
     fi
+  fi
+
+  if [ -L "$helper" ]; then
+    [ "$(readlink "$helper")" = "fabric" ] || die "refusing to replace unrelated Git helper at $helper"
+  elif [ -e "$helper" ]; then
+    die "refusing to replace unrelated Git helper at $helper"
   fi
 
   # Install atomically via a temp file in the same directory, then rename over
@@ -133,8 +140,12 @@ install_binary() {
   cp "$src" "$tmp"
   chmod 755 "$tmp"
   mv -f "$tmp" "$target"
+  if [ ! -L "$helper" ]; then
+    ln -s fabric "$helper"
+  fi
   INSTALLED_TARGET="$target"
   echo "installed: $target"
+  echo "installed: $helper -> fabric"
   echo "ensure $INSTALL_DIR is on PATH"
 
   if found=$(command -v fabric 2>/dev/null); then
