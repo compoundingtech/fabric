@@ -37,6 +37,9 @@ const LOCAL_READ_BUF: usize = 8192;
 const MAX_BUFFERED_BYTES: usize = 4 * 1024 * 1024;
 const SERVER_SESSION_REAP_INTERVAL: Duration = Duration::from_secs(60);
 const ATTACH_STABLE_AFTER: Duration = Duration::from_secs(2);
+/// A new local request must fail before its caller's ordinary five-second
+/// timeout. Once a session attached, it retries without this deadline.
+const INITIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// How often a session whose local input has ended asks the kernel whether the
 /// consumer is still there. Only such sessions probe, so the cost is one
 /// zero-length write per second per half-closed or abandoned session.
@@ -1178,7 +1181,7 @@ async fn run_client_attach_loop(
             }
             Err(error) => {
                 let message = format!("{error:#}");
-                if is_permanent_failure(&error) {
+                if !session.has_attached().await || is_permanent_failure(&error) {
                     return fail_permanently(&session, notices.as_ref(), error).await;
                 }
                 let attempt = session
@@ -1278,9 +1281,22 @@ async fn connect_and_attach(
     // A connect to a peer that is away can take the whole handshake timeout
     // to fail. The consumer may leave during it, and then the rest of the
     // attempt is for nobody.
+    let initial = !session.has_attached().await;
     let connection = tokio::select! {
         connected = endpoint.connect(peer_addr, alpn) => {
-            connected.with_context(|| "failed to reconnect tunnel")?
+            connected.with_context(|| {
+                if initial {
+                    "failed to connect tunnel"
+                } else {
+                    "failed to reconnect tunnel"
+                }
+            })?
+        }
+        _ = tokio::time::sleep(INITIAL_CONNECT_TIMEOUT), if initial => {
+            bail!(
+                "peer did not accept the initial tunnel within {:?}",
+                INITIAL_CONNECT_TIMEOUT
+            )
         }
         error = session.watch_local_endpoint() => return Err(error),
     };
