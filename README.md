@@ -497,10 +497,16 @@ says so rather than stopping the daemon. Delete the file to reset the counts.
 `fabric status` answers this from counters that survive a daemon restart:
 
 ```text
-sessions
+sessions	since 2026-08-24T14:12:09Z
   hetz	lost=4 resumed=4 failed=0 attempts=7 reconnect_p50=2.0s reconnect_max=4.5s
     lost_on=direct=3,relay=1 resumed_on=direct=2,relay=2
+  droppy [not in peers.toml]	lost=3 resumed=0 failed=1 attempts=10885 reconnect_p50=- reconnect_max=-
 ```
+
+The heading gives the start of the cumulative counter window. A daemon restart
+does not reset it. A reset caused by an unreadable or incompatible snapshot says
+why on the same line. A snapshot from before window tracking says that its start
+is unknown instead of inventing a time.
 
 Read the pair, not either number alone: 4 resumed out of 4 lost and 4 out of 40
 are very different systems. `attempts` counts every retry, so it exceeds `lost`
@@ -514,13 +520,15 @@ resumes on `relay` is fabric falling back correctly. If that becomes the normal
 outcome for a peer, the direct path to it is unhealthy even though the peer
 still reports reachable.
 
-A peer with no recorded loss is omitted, and `sessions no losses recorded`
-means nothing has dropped since the counters were last reset.
+A peer with no recorded loss is omitted. A separate `no losses recorded` line
+means nothing has dropped during the displayed window. A telemetry peer that is
+absent from the current allow-list is marked `[not in peers.toml]`. Its totals
+are history, not evidence that Fabric still dials the removed peer.
 
 ### Which path is this peer actually using?
 
 The peer table above shows one instantaneous ping. `fabric status` also reports
-what every probe since daemon start has measured, split by path:
+what every probe during the displayed telemetry window measured, split by path:
 
 ```text
 paths

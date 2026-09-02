@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::IsTerminal,
     path::PathBuf,
@@ -21,10 +21,11 @@ use fabric::{
     service::{self, ServiceInstallOptions},
     shell::{self, ServerFrame},
     sync::config::{SyncBook, SyncEntry, SyncPeers, SyncPolicy},
-    telemetry::PeerTelemetry,
+    telemetry::{PeerTelemetry, TelemetryWindow},
     terminal::TerminalModeGuard,
     update,
 };
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug, Parser)]
@@ -523,6 +524,7 @@ async fn main() -> Result<()> {
                             allow_exec,
                             peers,
                             connection_telemetry,
+                            connection_telemetry_window,
                             active_dial_handlers,
                             max_dial_handlers,
                         } => {
@@ -536,6 +538,7 @@ async fn main() -> Result<()> {
                                 allow_exec,
                                 &peers,
                                 &connection_telemetry,
+                                &connection_telemetry_window,
                                 (active_dial_handlers, max_dial_handlers),
                             )?;
                         }
@@ -1679,6 +1682,17 @@ mod connection_telemetry_tests {
     use super::*;
     use fabric::telemetry::LatencySummary;
 
+    fn current(peers: &[&str]) -> BTreeSet<String> {
+        peers.iter().map(|peer| (*peer).to_string()).collect()
+    }
+
+    fn test_window() -> TelemetryWindow {
+        TelemetryWindow {
+            started_unix_seconds: Some(0),
+            reset_reason: None,
+        }
+    }
+
     fn peer_with_losses() -> PeerTelemetry {
         let mut reconnect = LatencySummary::default();
         reconnect.record(1_500_000);
@@ -1726,7 +1740,10 @@ mod connection_telemetry_tests {
     fn a_peer_with_probes_and_no_losses_still_shows_its_paths() {
         let peer = probed_peer(&[80_000, 90_000], &[60_000, 64_000, 66_000]);
         assert_eq!(peer.losses, 0, "this fixture must be the healthy case");
-        let lines = path_latency_lines(&BTreeMap::from([("droppy".to_string(), peer)]));
+        let lines = path_latency_lines(
+            &BTreeMap::from([("droppy".to_string(), peer)]),
+            &current(&["droppy"]),
+        );
 
         assert_eq!(lines[0], "paths");
         assert!(
@@ -1748,7 +1765,10 @@ mod connection_telemetry_tests {
     #[test]
     fn the_busiest_path_is_listed_first() {
         let peer = probed_peer(&[80_000], &[60_000, 61_000, 62_000]);
-        let lines = path_latency_lines(&BTreeMap::from([("droppy".to_string(), peer)]));
+        let lines = path_latency_lines(
+            &BTreeMap::from([("droppy".to_string(), peer)]),
+            &current(&["droppy"]),
+        );
         let relay = lines.iter().position(|l| l.contains("relay")).unwrap();
         let direct = lines.iter().position(|l| l.contains("direct")).unwrap();
         assert!(relay < direct, "relay carried 3 of 4 probes: {lines:?}");
@@ -1769,7 +1789,10 @@ mod connection_telemetry_tests {
         // 40ms and 680ms sit in different buckets; their mean, 360ms, sits in
         // neither, so a bucketed statistic could not produce this number.
         let peer = probed_peer(&[40_000, 680_000], &[]);
-        let lines = path_latency_lines(&BTreeMap::from([("droppy".to_string(), peer)]));
+        let lines = path_latency_lines(
+            &BTreeMap::from([("droppy".to_string(), peer)]),
+            &current(&["droppy"]),
+        );
         let direct = lines.iter().find(|l| l.contains("direct")).unwrap();
         assert!(
             direct.contains("mean=360.0ms"),
@@ -1793,7 +1816,10 @@ mod connection_telemetry_tests {
             probes_unreachable: 243,
             ..PeerTelemetry::default()
         };
-        let lines = path_latency_lines(&BTreeMap::from([("bluey".to_string(), peer)]));
+        let lines = path_latency_lines(
+            &BTreeMap::from([("bluey".to_string(), peer)]),
+            &current(&["bluey"]),
+        );
         assert!(
             lines
                 .iter()
@@ -1805,7 +1831,7 @@ mod connection_telemetry_tests {
     #[test]
     fn no_probes_at_all_says_so_rather_than_printing_an_empty_heading() {
         assert_eq!(
-            path_latency_lines(&BTreeMap::new()),
+            path_latency_lines(&BTreeMap::new(), &BTreeSet::new()),
             vec!["paths\tno probes recorded".to_string()]
         );
     }
@@ -1815,8 +1841,8 @@ mod connection_telemetry_tests {
     #[test]
     fn the_rendered_shape_matches_the_documented_one() {
         let telemetry = BTreeMap::from([("hetz".to_string(), peer_with_losses())]);
-        let lines = connection_telemetry_lines(&telemetry);
-        assert_eq!(lines[0], "sessions");
+        let lines = connection_telemetry_lines(&telemetry, &test_window(), &current(&["hetz"]));
+        assert_eq!(lines[0], "sessions\tsince 1970-01-01T00:00:00Z");
         assert_eq!(
             lines[1],
             // p50 is a bucket bound, because a histogram cannot report better
@@ -1837,15 +1863,21 @@ mod connection_telemetry_tests {
             ("quiet".to_string(), PeerTelemetry::default()),
             ("hetz".to_string(), peer_with_losses()),
         ]);
-        let lines = connection_telemetry_lines(&telemetry);
+        let lines = connection_telemetry_lines(&telemetry, &test_window(), &current(&["hetz"]));
         assert!(lines.iter().all(|line| !line.contains("quiet")));
         assert!(lines.iter().any(|line| line.contains("hetz")));
     }
 
     #[test]
     fn no_losses_at_all_says_so_rather_than_printing_an_empty_heading() {
-        let lines = connection_telemetry_lines(&BTreeMap::new());
-        assert_eq!(lines, vec!["sessions\tno losses recorded".to_string()]);
+        let lines = connection_telemetry_lines(&BTreeMap::new(), &test_window(), &BTreeSet::new());
+        assert_eq!(
+            lines,
+            vec![
+                "sessions\tsince 1970-01-01T00:00:00Z".to_string(),
+                "  no losses recorded".to_string(),
+            ]
+        );
     }
 
     /// A loss that never came back has no duration, and a dash is honest where
@@ -1861,11 +1893,52 @@ mod connection_telemetry_tests {
                 ..PeerTelemetry::default()
             },
         )]);
-        let lines = connection_telemetry_lines(&telemetry);
+        let lines = connection_telemetry_lines(&telemetry, &test_window(), &current(&["bluey"]));
         assert!(
             lines[1].contains("reconnect_p50=- reconnect_max=-"),
             "unexpected line: {}",
             lines[1]
+        );
+    }
+
+    #[test]
+    fn a_removed_peer_is_marked_in_every_durable_telemetry_block() {
+        let mut peer = peer_with_losses();
+        let mut latency = LatencySummary::default();
+        latency.record(64_000);
+        peer.probes_reachable = 1;
+        peer.probe_latency.insert("relay".to_string(), latency);
+        let telemetry = BTreeMap::from([("droppy".to_string(), peer)]);
+        let current = current(&["hetz"]);
+
+        let sessions = connection_telemetry_lines(&telemetry, &test_window(), &current);
+        assert!(
+            sessions
+                .iter()
+                .any(|line| line.contains("droppy [not in peers.toml]")),
+            "a durable session total must not look current: {sessions:?}"
+        );
+
+        let paths = path_latency_lines(&telemetry, &current);
+        assert!(
+            paths
+                .iter()
+                .any(|line| line.contains("droppy [not in peers.toml]")),
+            "durable path totals need the same roster context: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_legacy_window_says_why_it_is_unknown() {
+        let line = telemetry_window_line(&TelemetryWindow {
+            started_unix_seconds: None,
+            reset_reason: Some(
+                "window start unknown: snapshot predates window tracking".to_string(),
+            ),
+        });
+        assert_eq!(
+            line,
+            "sessions\twindow start unknown: snapshot predates window tracking"
         );
     }
 }
@@ -2028,6 +2101,7 @@ fn print_status(
     allow_exec: bool,
     peers: &[PeerReachability],
     connection_telemetry: &BTreeMap<String, PeerTelemetry>,
+    connection_telemetry_window: &TelemetryWindow,
     dial_handlers: (usize, usize),
 ) -> Result<()> {
     println!("version\t{version}");
@@ -2049,8 +2123,16 @@ fn print_status(
     let (active, max) = dial_handlers;
     println!("dial handlers\t{active}/{max} in use");
     print_peer_reachability(peers);
-    print_connection_telemetry(connection_telemetry);
-    print_path_latency(connection_telemetry);
+    let current_peers = peers
+        .iter()
+        .map(|peer| peer.name.clone().unwrap_or_else(|| peer.id.clone()))
+        .collect::<BTreeSet<_>>();
+    print_connection_telemetry(
+        connection_telemetry,
+        connection_telemetry_window,
+        &current_peers,
+    );
+    print_path_latency(connection_telemetry, &current_peers);
     Ok(())
 }
 
@@ -2060,8 +2142,12 @@ fn print_status(
 /// whether resumption works, because 9 resumes out of 10 losses and 9 out of 90
 /// are very different systems. The path breakdown answers "came back how", and
 /// the measured median answers "came back how fast".
-fn print_connection_telemetry(telemetry: &BTreeMap<String, PeerTelemetry>) {
-    for line in connection_telemetry_lines(telemetry) {
+fn print_connection_telemetry(
+    telemetry: &BTreeMap<String, PeerTelemetry>,
+    window: &TelemetryWindow,
+    current_peers: &BTreeSet<String>,
+) {
+    for line in connection_telemetry_lines(telemetry, window, current_peers) {
         println!("{line}");
     }
 }
@@ -2071,19 +2157,25 @@ fn print_connection_telemetry(telemetry: &BTreeMap<String, PeerTelemetry>) {
 /// The peer table above shows one instantaneous ping. That single sample cannot
 /// answer the question that matters for a machine that moves networks: is the
 /// direct path to this peer actually better than the relay, and which one is it
-/// spending its time on? The daemon has measured that on every probe since it
-/// started, and until now the only way to read it was to parse `telemetry.json`
+/// spending its time on? The daemon has measured that on every probe in the
+/// durable window, and the only way to read it was to parse `telemetry.json`
 /// by hand — the exact grepping these counters exist to end.
 ///
 /// This reports facts and reaches no verdict. It does not label a path degraded
 /// and it changes no routing.
-fn print_path_latency(telemetry: &BTreeMap<String, PeerTelemetry>) {
-    for line in path_latency_lines(telemetry) {
+fn print_path_latency(
+    telemetry: &BTreeMap<String, PeerTelemetry>,
+    current_peers: &BTreeSet<String>,
+) {
+    for line in path_latency_lines(telemetry, current_peers) {
         println!("{line}");
     }
 }
 
-fn path_latency_lines(telemetry: &BTreeMap<String, PeerTelemetry>) -> Vec<String> {
+fn path_latency_lines(
+    telemetry: &BTreeMap<String, PeerTelemetry>,
+    current_peers: &BTreeSet<String>,
+) -> Vec<String> {
     // A peer is included on probe evidence alone. Keying this off losses, the
     // way the sessions block does, would blank the healthy peer — and healthy is
     // the normal state, so it is the one that must never be empty.
@@ -2097,6 +2189,7 @@ fn path_latency_lines(telemetry: &BTreeMap<String, PeerTelemetry>) -> Vec<String
 
     let mut lines = vec!["paths".to_string()];
     for (peer, stats) in measured {
+        let peer = telemetry_peer_label(peer, current_peers);
         let total = stats.probes_reachable + stats.probes_unreachable;
         lines.push(format!(
             "  {peer}\treachable {}/{}",
@@ -2146,17 +2239,23 @@ fn format_micros(micros: Option<u64>) -> String {
     }
 }
 
-fn connection_telemetry_lines(telemetry: &BTreeMap<String, PeerTelemetry>) -> Vec<String> {
+fn connection_telemetry_lines(
+    telemetry: &BTreeMap<String, PeerTelemetry>,
+    window: &TelemetryWindow,
+    current_peers: &BTreeSet<String>,
+) -> Vec<String> {
     let recorded: Vec<_> = telemetry
         .iter()
         .filter(|(_, stats)| stats.losses > 0 || stats.resumes > 0 || stats.resume_failures > 0)
         .collect();
+    let mut lines = vec![telemetry_window_line(window)];
     if recorded.is_empty() {
-        return vec!["sessions\tno losses recorded".to_string()];
+        lines.push("  no losses recorded".to_string());
+        return lines;
     }
 
-    let mut lines = vec!["sessions".to_string()];
     for (peer, stats) in recorded {
+        let peer = telemetry_peer_label(peer, current_peers);
         let median = stats
             .reconnect
             .quantile_micros(0.5)
@@ -2180,6 +2279,29 @@ fn connection_telemetry_lines(telemetry: &BTreeMap<String, PeerTelemetry>) -> Ve
         }
     }
     lines
+}
+
+fn telemetry_window_line(window: &TelemetryWindow) -> String {
+    let started = window.started_unix_seconds.and_then(|seconds| {
+        i64::try_from(seconds)
+            .ok()
+            .and_then(|seconds| OffsetDateTime::from_unix_timestamp(seconds).ok())
+            .and_then(|timestamp| timestamp.format(&Rfc3339).ok())
+    });
+    match (started, window.reset_reason.as_deref()) {
+        (Some(started), Some(reason)) => format!("sessions\tsince {started}; {reason}"),
+        (Some(started), None) => format!("sessions\tsince {started}"),
+        (None, Some(reason)) => format!("sessions\t{reason}"),
+        (None, None) => "sessions\twindow unknown: daemon did not report it".to_string(),
+    }
+}
+
+fn telemetry_peer_label(peer: &str, current_peers: &BTreeSet<String>) -> String {
+    if current_peers.contains(peer) {
+        peer.to_string()
+    } else {
+        format!("{peer} [not in peers.toml]")
+    }
 }
 
 fn format_seconds(micros: u64) -> String {

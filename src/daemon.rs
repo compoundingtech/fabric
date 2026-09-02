@@ -1412,6 +1412,7 @@ impl DaemonState {
         let (node_id, endpoint_addr, exposed_protocols, dial_sockets) =
             self.local_status_fields().await?;
         let peers = self.peer_reachability().await;
+        let telemetry = self.telemetry.snapshot();
         Ok(ControlResponse::ReachabilityStatus {
             version: crate::version_string(),
             node_id,
@@ -1421,7 +1422,8 @@ impl DaemonState {
             allow_shell: self.allow_shell,
             allow_exec: self.allow_exec,
             peers,
-            connection_telemetry: self.telemetry.snapshot().peers,
+            connection_telemetry: telemetry.peers,
+            connection_telemetry_window: telemetry.window,
             active_dial_handlers: self.active_dial_handlers(),
             max_dial_handlers: self.max_dial_handlers(),
         })

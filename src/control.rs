@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::telemetry::PeerTelemetry;
+use crate::telemetry::{PeerTelemetry, TelemetryWindow};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -123,6 +123,10 @@ pub enum ControlResponse {
         /// older client still decodes a newer daemon's reply.
         #[serde(default)]
         connection_telemetry: BTreeMap<String, PeerTelemetry>,
+        /// The time range and reset context for the cumulative counters.
+        /// Defaulted so a new client still decodes an older daemon's reply.
+        #[serde(default)]
+        connection_telemetry_window: TelemetryWindow,
         /// Dial permits in use and the cap. Every shell, exec and dial holds
         /// one for the life of its session, and when all are held every new
         /// one waits with no error. Defaulted for an older daemon's reply.
@@ -333,6 +337,10 @@ mod tests {
             allow_exec: false,
             peers: Vec::new(),
             connection_telemetry: BTreeMap::from([("droppy".to_string(), populated_peer())]),
+            connection_telemetry_window: TelemetryWindow {
+                started_unix_seconds: Some(1_788_369_000),
+                reset_reason: None,
+            },
             active_dial_handlers: 0,
             max_dial_handlers: 32,
         };
@@ -345,6 +353,7 @@ mod tests {
         match decoded {
             ControlResponse::ReachabilityStatus {
                 connection_telemetry,
+                connection_telemetry_window,
                 ..
             } => {
                 let peer = &connection_telemetry["droppy"];
@@ -355,6 +364,11 @@ mod tests {
                     "the measured total must cross the wire, not just its count"
                 );
                 assert_eq!(peer.probe_latency["relay"].samples, 1);
+                assert_eq!(
+                    connection_telemetry_window.started_unix_seconds,
+                    Some(1_788_369_000),
+                    "the counter window must cross the real control wire"
+                );
             }
             other => panic!("wrong variant: {other:?}"),
         }
