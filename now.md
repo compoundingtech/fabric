@@ -4,7 +4,7 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `421eb45`.
+_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `7f4da21`.
 Silber and hetz run `0.2.0+ae755c5`. Bluey is deferred to Nathan._
 
 ## Current handoff — 2026-09-02
@@ -39,8 +39,21 @@ Tailscale in 62 milliseconds, but its Fabric endpoint stopped answering at
 18:23Z. This absence matters. When hetz missed a probe, the health loop saw no
 reachable peer and let Bluey's old failure count trigger an endpoint recycle.
 The same condition caused generation 2 to 3 at 18:40Z and generation 4 to 5 at
-18:50Z. The active investigation must separate this recycle trigger from the
-mux state that did not converge after recycling.
+18:50Z. This recycle trigger and the mux convergence defect are separate.
+
+PR #122 fixes the mux defect and merged at `7f4da21`. A generation change
+ignored the cached old connection but did not close it before the new endpoint
+dialed. The peer retained that canonical connection and rejected the replacement
+as a duplicate. The fix closes old-generation cached state before redial. It
+also gives an explicit duplicate refusal eight attempts with 100-millisecond
+delays. The total added wait is bounded at 700 milliseconds.
+
+Both proofs failed before their fixes. The old cached connection survived its
+generation change for more than one second. Four immediate duplicate refusals
+then escaped as `open mux stream after reconnect`. Both proofs now pass without
+a daemon restart. All 413 active library tests and all 15 binary tests pass.
+Two measurement tests stay ignored. PR #122 is MERGED AND NOT DEPLOYED. Do not
+deploy it tonight. Ask Silber.cos before any later release or deployment.
 
 Bluey is temporarily absent from Silber's live `peers.toml`. The file carries
 the reason and tells Nathan to re-add it after the strict allow-list migration.
@@ -183,8 +196,10 @@ made a bare Git remote whose HEAD named `master`, while the test pushed only
 `main`. PR #112 points the bare HEAD at `main` and merged at `6ee46a8`.
 
 The strict ACL, Git transport, shared mux, mixed-version fallback, bounded
-fallback, lost-wake, and telemetry-context fixes are complete. The current
-order has no remaining code job. Do not cut a release. Wait for a native job.
+fallback, lost-wake, telemetry-context, and recycle-convergence fixes are
+complete. The next fleet task is a supervised PR #122 rollout when Nathan is
+present. Update Silber first and hetz second. Ask Silber.cos before the rollout.
+Do not infer deployment from the merge.
 
 ## Historical handoff — 2026-08-29 (Fable session; fleet moved to Codex)
 
