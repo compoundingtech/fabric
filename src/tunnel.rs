@@ -573,13 +573,18 @@ impl TunnelSession {
 
     async fn wait_for_buffer_space(&self) {
         loop {
+            // `notify_waiters` does not keep a permit. Create the waiter before
+            // checking the state so an acknowledgement cannot drain the buffer
+            // between the check and waiter creation, then leave this reader
+            // asleep until some unrelated session change.
+            let changed = self.notify.notified();
             {
                 let state = self.state.lock().await;
                 if state.buffered_bytes < MAX_BUFFERED_BYTES || state.send_closed.is_some() {
                     return;
                 }
             }
-            self.notify.notified().await;
+            changed.await;
         }
     }
 
@@ -881,6 +886,12 @@ async fn write_attach_loop(session: Arc<TunnelSession>, mut send: SendStream) ->
     let mut close_sent = None;
 
     loop {
+        // `notify_waiters` wakes futures created before the call, even when the
+        // future has not been polled. Create this waiter before the state
+        // snapshot. Otherwise local data can arrive after the snapshot and
+        // before `select!` creates its waiter, leaving the writer asleep with
+        // bytes ready to send.
+        let changed = session.notify.notified();
         let (ack, data, close, complete) = {
             let state = session.state.lock().await;
             let ack = (last_ack_sent != Some(state.recv_next)).then_some(state.recv_next);
@@ -925,7 +936,7 @@ async fn write_attach_loop(session: Arc<TunnelSession>, mut send: SendStream) ->
         }
 
         tokio::select! {
-            _ = session.notify.notified() => {}
+            _ = changed => {}
             _ = session.done.cancelled() => return Ok(()),
             // A silent remote never writes, so a write failure can never tell
             // this loop the consumer left. Ask instead.
