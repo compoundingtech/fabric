@@ -4,8 +4,8 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `36158f6`.
-Silber runs `0.2.0+36158f6`; hetz runs `0.2.0+4548b1e`. Bluey is deferred to Nathan._
+_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `ae755c5`.
+Silber and hetz run `0.2.0+ae755c5`. Bluey is deferred to Nathan._
 
 ## Current handoff — 2026-09-02
 
@@ -34,9 +34,10 @@ Bluey is Nathan's deferred task. It must run the old `make-explicit` helper and
 preserve its full ALPN matrix before it receives a strict binary. Do not wait for
 Bluey and do not count it as verified.
 
-PR #108 added Git remotes and merged at `4548b1e`. Silber and hetz run that
-build. Each has the relative `git-remote-fabric -> fabric` helper and zero Git
-remotes. Nathan owns the first live share and grant.
+PR #108 added Git remotes and merged at `4548b1e`. Silber and hetz ran that
+build before the degraded-path rollout. Each has the relative
+`git-remote-fabric -> fabric` helper and zero Git remotes. Nathan owns the first
+live share and grant.
 
 PR #109 added degraded-path recovery and merged at `bbd69bb`. All outbound
 services now use `fabric/mux/1` streams on one shared multipath connection per
@@ -50,8 +51,8 @@ folder-sync tests, 12 shell tests, and all smaller integration slices.
 The live WAN proof and the 24-hour idle-cost window remain. PR #114 added the
 mixed-version compatibility fallback and merged at `36158f6`. A new client uses
 an uncached direct ALPN only after an explicit mux ALPN rejection. Old clients
-remain compatible with new servers. Silber deployed `0.2.0+36158f6`; hetz still
-runs `0.2.0+4548b1e`.
+remain compatible with new servers. Silber first deployed `0.2.0+36158f6`, while
+hetz stayed on `0.2.0+4548b1e` for the mixed-version soak.
 
 The compatibility candidate passed an actual two-build proof in isolated
 homes. Build `0.2.0+4548b1e` and the new candidate exchanged ping and exec
@@ -63,17 +64,15 @@ becomes available.
 
 The first Silber soak found that each new stream repeated the rejected mux
 handshake. The log stayed at one event, but manual pings periodically took 2.3
-to 2.9 seconds. No path-quality redial occurred. A follow-up now suppresses mux
-re-probes for 60 seconds after an explicit rejection. It then permits one
-re-probe so an upgraded peer cannot stay downgraded. It reports cumulative
-fallback uses at powers of two. This makes repeated use visible without noisy
-per-stream logging. Hetz must not deploy until this follow-up passes CI and a
-new Silber soak passes.
+to 2.9 seconds. No path-quality redial occurred. PR #115 suppresses mux re-probes
+for 60 seconds after an explicit rejection and merged at `ae755c5`. It then
+permits one requested-stream re-probe so an upgraded peer cannot stay
+downgraded. It reports cumulative fallback uses at powers of two. This makes
+repeated use visible without noisy per-stream logging.
 
-Silber currently runs `0.2.0+36158f6`. Hetz currently runs
-`0.2.0+4548b1e`. The Silber updater kept
-`/Users/myobie/.local/bin/fabric.rollback-1788361408`, which reports
-`0.2.0+4548b1e`. Roll Silber back without asking if control to hetz fails, the
+Silber and hetz currently run `0.2.0+ae755c5`. The Silber updater kept
+`/Users/myobie/.local/bin/fabric.rollback-1788366350`, which reports
+`0.2.0+36158f6`. Roll Silber back without asking if control to hetz fails, the
 st2 bus stops crossing machines, or the per-stream cost grows beyond the
 measured cost.
 
@@ -84,18 +83,45 @@ ping samples cost 2.3 to 2.9 seconds. Use the same command and the same local
 Silber-to-hetz direction after the fix. Report the first probe separately from
 the later samples in the 60-second negative-capability window.
 
-Branch `fix/mux-legacy-reprobe` contains the follow-up. It serializes the first
-capability check, suppresses rejected mux probes for 60 seconds, and counts
-direct fallback uses. The daemon writes cumulative use summaries at powers of
-two. The full library proof passes 409 active tests, with two ignored tests.
-The isolated scratch proof starts old and new daemons in temporary homes. It
-runs eight rapid new-to-old pings plus an exec. Candidate `0.2.0+5b8056d`
-completed all eight pings in 0.01 seconds each. The old daemon recorded one
-rejected mux handshake. The new validation log recorded one fallback entry and
-cumulative use summaries at 2, 4, and 8 uses. The in-process capability-flip
-proof expires the window, enables mux on the old peer, and proves two requested
-streams converge on one cached mux connection. The live Silber-to-hetz
-measurement remains.
+PR #115 serializes the first capability check and counts direct fallback uses.
+The full library proof passes 409 active tests, with two ignored tests. The
+isolated proof ran eight rapid new-to-old pings plus an exec. Candidate
+`0.2.0+361e581` reported 3.3 to 7.7 milliseconds per ping. The old daemon
+recorded one rejected mux handshake. The new validation log recorded one
+fallback entry and cumulative use summaries at 2, 4, and 8 uses. The
+in-process capability-flip proof expires the window, enables mux on the old
+peer, and proves two requested streams converge on one cached mux connection.
+
+The exact merged archive has SHA-256
+`4eaf590ab6f559ac36f8e390a2a2196ff0f6c008cdab61c9481026f336e9bfdf`.
+After the Silber update, 28 fresh-process pings ran from 16:26:24Z to
+16:26:28Z. Real time ranged from 0.04 to 1.09 seconds. The median was 0.05
+seconds, and the 95th percentile was 0.47 seconds. The daemon logged one hetz
+fallback window, summaries at 2, 4, 8, 16, and 32 uses, and no hetz redial.
+Control, ping, and exec work.
+
+Silber.cos authorized the hetz update after that measurement. Hetz built exact
+commit `ae755c5` on x86_64 Linux. Its one-member archive has SHA-256
+`4222b76bbe50ad3de5dea1c96e2b3501d68c7ad3181387e0ca751d951508772e`.
+Before replacement, `/home/myobie/.local/bin/fabric.rollback-4548b1e-pre-ae755c5`
+ran and reported `0.2.0+4548b1e`. The updater staged beside the live path and
+renamed the new binary into place. Its additional rollback path is
+`/home/myobie/.local/bin/fabric.rollback-1788366755`.
+
+The ordered post-update checks passed. Silber-to-hetz ping took 333
+milliseconds. Hetz-to-Silber ping took 36 milliseconds. Exec reported
+`0.2.0+ae755c5`, and `hetz.root` returned a native bus probe. The pair produced
+one `mux_accept` event at 16:32:40Z. The last fallback-use summary was 128 before
+the update. All 140 later ping streams passed from 16:34:58Z to 16:35:08Z, and
+no use-256 summary appeared. Neither machine logged a post-update fallback for
+the other. Hetz is active, enabled, and uses `KillMode=process`.
+
+The first PR #115 deterministic job exposed an unreliable existing recovery
+test. `a_tunnel_recovers_from_an_asymmetric_partition` stalled after a live
+session resumed. The other 28 daemon tests passed. Two targeted local runs
+passed, and the third reproduced the 60-second stall. The one allowed CI retry
+passed all 29 tests. The test is unreliable, not proven unrelated. Diagnose it
+next as a separate fix.
 
 PR #109 deterministic CI found two follow-up defects. A temporary debug tunnel
 block became a permanent mux denial, which returned early EOF in five recovery
@@ -107,15 +133,9 @@ The sixth CI failure was portable test setup, not transport behavior. Ubuntu
 made a bare Git remote whose HEAD named `master`, while the test pushed only
 `main`. PR #112 points the bare HEAD at `main` and merged at `6ee46a8`.
 
-The latest full local proof passes 407 library tests and all 29 daemon-slice
-tests. Let current Linux CI prove these two follow-ups together. Do not retry the
-failed PR #109 job.
-
-After green CI, the live work is the Silber-only soak that Silber.cos described.
-Measure real traffic for longer than the classifier window. Prove a false-redial
-loop cannot starve the peer. Keep a console rollback that needs only the old
-binary because these changes write no new state. Tell Silber.cos before any hetz
-step. Do not cut a release.
+The completed follow-up proof passes 409 active library tests, with two ignored
+tests. Its final CI retry passed all 29 daemon-slice tests. The next code fix is
+the unreliable asymmetric-partition recovery test above. Do not cut a release.
 
 ## Historical handoff — 2026-08-29 (Fable session; fleet moved to Codex)
 
