@@ -760,6 +760,7 @@ Description=fabric iroh transport daemon\n\
 \n\
 [Service]\n\
 Type=simple\n\
+KillMode=process\n\
 ExecStart={exec_start}\n\
 Restart=on-failure\n\
 RestartSec=5s\n\
@@ -1257,6 +1258,25 @@ mod tests {
         assert!(unit.contains("RestartSec=5s"));
         assert!(unit.contains("MemoryMax=512M"));
         assert!(unit.contains("WantedBy=default.target"));
+        Ok(())
+    }
+
+    #[test]
+    fn systemd_restart_stops_only_the_daemon_process() -> Result<()> {
+        let spec = ServiceSpec::new(
+            "/usr/local/bin/fabric",
+            "/home/nathan/.local/share/fabric",
+            true,
+            true,
+            None,
+        )?;
+
+        let unit = render_systemd_user_unit(&spec);
+
+        assert!(
+            unit.contains("\nKillMode=process\n"),
+            "systemd would kill every process in the service cgroup:\n{unit}"
+        );
         Ok(())
     }
 
