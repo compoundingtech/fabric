@@ -304,6 +304,28 @@ pub struct Peer {
     pub allow: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitRemote {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitAccess {
+    Read,
+    Write,
+}
+
+impl GitAccess {
+    pub fn permission(self, remote: &str) -> String {
+        let operation = match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        };
+        format!("git/{remote}/{operation}")
+    }
+}
+
 /// Why an incoming connection was refused, in the words a person should read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Denied {
@@ -356,6 +378,8 @@ impl std::fmt::Display for Denied {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct PeerBook {
     peers: Vec<Peer>,
+    #[serde(default)]
+    git_remotes: Vec<GitRemote>,
 }
 
 impl PeerBook {
@@ -376,6 +400,7 @@ impl PeerBook {
 
         let book = Self {
             peers: std::mem::take(&mut config.peers),
+            git_remotes: Vec::new(),
         };
         book.validate()?;
         book.write_peer_file(home)?;
@@ -417,8 +442,11 @@ impl PeerBook {
 #        that depends on a name.
 # allow  which services this peer may reach, by the name a person types:
 #        shell, exec, sync, echo, or any protocol you expose such as web.
+#        Git grants are git/<remote>/read and git/<remote>/write.
 #        Fabric is an allow list. Anything unlisted is refused, including a
 #        service you expose later. Omit this field to grant no services.
+# git_remotes  host-local repository names and absolute Git directory paths.
+#        A declaration grants nothing until a peer allow list names it.
 #
 # A service is a NAME, not a port. The port belongs to whichever side runs
 # `fabric expose`, and it never crosses the wire.
@@ -429,7 +457,7 @@ impl PeerBook {
         home.prepare()?;
         let path = home.peers_path();
         let raw = format!("{}{}", Self::PEER_FILE_HEADER, toml::to_string_pretty(self)?);
-        fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))
+        write_atomic(&path, raw.as_bytes())
     }
 
     fn remove_embedded_config_peers(home: &FabricHome) -> Result<()> {
@@ -446,6 +474,92 @@ impl PeerBook {
 
     pub fn peers(&self) -> &[Peer] {
         &self.peers
+    }
+
+    pub fn git_remotes(&self) -> &[GitRemote] {
+        &self.git_remotes
+    }
+
+    pub fn git_remote(&self, name: &str) -> Option<&GitRemote> {
+        self.git_remotes.iter().find(|remote| remote.name == name)
+    }
+
+    pub fn share_git_remote(&mut self, name: &str, path: PathBuf) -> Result<()> {
+        validate_git_remote_name(name)?;
+        if !path.is_absolute() {
+            bail!("Git remote path must be absolute: {}", path.display());
+        }
+        if self.git_remote(name).is_some() {
+            bail!(
+                "Git remote {name:?} is already shared; unshare it before changing its path"
+            );
+        }
+        self.git_remotes.push(GitRemote {
+            name: name.to_string(),
+            path,
+        });
+        self.git_remotes.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(())
+    }
+
+    pub fn unshare_git_remote(&mut self, name: &str) -> Result<()> {
+        validate_git_remote_name(name)?;
+        let before = self.git_remotes.len();
+        self.git_remotes.retain(|remote| remote.name != name);
+        if self.git_remotes.len() == before {
+            bail!("Git remote {name:?} is not shared");
+        }
+        let prefix = format!("git/{name}/");
+        for peer in &mut self.peers {
+            peer.allow.retain(|permission| !permission.starts_with(&prefix));
+        }
+        Ok(())
+    }
+
+    pub fn grant_git_remote(
+        &mut self,
+        remote: &str,
+        peer: &str,
+        access: GitAccess,
+    ) -> Result<bool> {
+        self.require_git_remote(remote)?;
+        let permission = access.permission(remote);
+        let peer = self.peer_mut(peer)?;
+        if peer.allow.contains(&permission) {
+            return Ok(false);
+        }
+        peer.allow.push(permission);
+        peer.allow.sort();
+        peer.allow.dedup();
+        Ok(true)
+    }
+
+    pub fn revoke_git_remote(
+        &mut self,
+        remote: &str,
+        peer: &str,
+        access: GitAccess,
+    ) -> Result<bool> {
+        self.require_git_remote(remote)?;
+        let permission = access.permission(remote);
+        let peer = self.peer_mut(peer)?;
+        let before = peer.allow.len();
+        peer.allow.retain(|allowed| allowed != &permission);
+        Ok(peer.allow.len() != before)
+    }
+
+    fn require_git_remote(&self, name: &str) -> Result<&GitRemote> {
+        validate_git_remote_name(name)?;
+        self.git_remote(name)
+            .with_context(|| format!("Git remote {name:?} is not shared"))
+    }
+
+    fn peer_mut(&mut self, peer: &str) -> Result<&mut Peer> {
+        let id = EndpointId::from_str(peer).ok();
+        self.peers
+            .iter_mut()
+            .find(|entry| id == Some(entry.id) || entry.name.as_deref() == Some(peer))
+            .with_context(|| format!("unknown peer {peer:?}; add it before granting Git access"))
     }
 
     /// May `id` reach `service`? The ONLY place this question is answered.
@@ -577,8 +691,98 @@ impl PeerBook {
                 bail!("address hint for {} points at {}", peer.id, addr.id);
             }
         }
+        let mut remote_names = HashSet::new();
+        for remote in &self.git_remotes {
+            validate_git_remote_name(&remote.name)?;
+            if !remote.path.is_absolute() {
+                bail!(
+                    "Git remote {:?} path must be absolute: {}",
+                    remote.name,
+                    remote.path.display()
+                );
+            }
+            if !remote_names.insert(remote.name.as_str()) {
+                bail!("duplicate Git remote name {:?}", remote.name);
+            }
+        }
+        for peer in &self.peers {
+            for permission in &peer.allow {
+                let Some(rest) = permission.strip_prefix("git/") else {
+                    continue;
+                };
+                let Some((remote, operation)) = rest.rsplit_once('/') else {
+                    bail!("invalid Git permission {permission:?}");
+                };
+                validate_git_remote_name(remote)?;
+                if !matches!(operation, "read" | "write") {
+                    bail!("invalid Git permission {permission:?}");
+                }
+                if !remote_names.contains(remote) {
+                    bail!(
+                        "Git permission {permission:?} names an unshared remote {remote:?}"
+                    );
+                }
+            }
+        }
         Ok(())
     }
+}
+
+pub fn validate_git_remote_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("Git remote name cannot be empty");
+    }
+    if name.len() > 64 {
+        bail!("Git remote name must be 64 bytes or less");
+    }
+    if matches!(name, "." | "..") {
+        bail!("Git remote name cannot be a dot segment");
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!(
+            "Git remote name may contain only ASCII letters, digits, dot, underscore, and dash"
+        );
+    }
+    Ok(())
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let permissions = fs::metadata(path).ok().map(|metadata| metadata.permissions());
+    let temp = path.with_extension(format!(
+        "toml.fabric-tmp-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let written = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .with_context(|| format!("failed to create {}", temp.display()))?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)
+                .with_context(|| format!("failed to preserve permissions on {}", temp.display()))?;
+        }
+        file.write_all(bytes)
+            .with_context(|| format!("failed to write {}", temp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to flush {}", temp.display()))?;
+        fs::rename(&temp, path)
+            .with_context(|| format!("failed to rename into {}", path.display()))?;
+        if let Some(parent) = path.parent()
+            && let Ok(directory) = fs::File::open(parent)
+        {
+            let _ = directory.sync_all();
+        }
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    written
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -755,6 +959,7 @@ impl FabricConfig {
     fn validate(&self) -> Result<()> {
         PeerBook {
             peers: self.peers.clone(),
+            git_remotes: Vec::new(),
         }
         .validate()?;
 
@@ -880,6 +1085,9 @@ pub fn validate_protocol(protocol: &str) -> Result<Vec<u8>> {
     if protocol.bytes().any(|byte| byte == 0 || byte == b'\n') {
         bail!("protocol cannot contain NUL or newline bytes");
     }
+    if protocol.starts_with("git/") {
+        bail!("the git/ protocol namespace is reserved for Fabric Git remotes");
+    }
     Ok(protocol.as_bytes().to_vec())
 }
 
@@ -935,6 +1143,129 @@ mod tests {
             written.contains("allow = []"),
             "saving did not make the empty allow list explicit: {written}"
         );
+    }
+
+    #[test]
+    fn git_remote_and_peer_grants_round_trip_in_one_file() {
+        let id = an_id(2);
+        let mut book = PeerBook::default();
+        book.add(id, Some("friend".into()), None);
+        book.share_git_remote("mandat", PathBuf::from("/srv/git/mandat.git"))
+            .unwrap();
+        book.grant_git_remote("mandat", "friend", GitAccess::Read)
+            .unwrap();
+
+        let raw = toml::to_string_pretty(&book).unwrap();
+        let restored: PeerBook = toml::from_str(&raw).unwrap();
+        assert_eq!(
+            restored.git_remote("mandat").unwrap().path,
+            PathBuf::from("/srv/git/mandat.git")
+        );
+        assert_eq!(restored.may(&id, "git/mandat/read"), Ok(()));
+        assert!(restored.may(&id, "git/mandat/write").is_err());
+    }
+
+    #[test]
+    fn ordinary_service_grants_do_not_grant_git_access() {
+        let id = an_id(3);
+        let mut book = PeerBook::default();
+        book.add_with_allow(
+            id,
+            Some("friend".into()),
+            None,
+            Some(vec!["shell".into(), "exec".into(), "pty-view".into()]),
+        );
+        book.share_git_remote("mandat", PathBuf::from("/srv/git/mandat.git"))
+            .unwrap();
+
+        assert!(book.may(&id, "git/mandat/read").is_err());
+        assert!(book.may(&id, "git/mandat/write").is_err());
+    }
+
+    #[test]
+    fn unsharing_removes_only_that_remotes_grants() {
+        let id = an_id(4);
+        let mut book = PeerBook::default();
+        book.add(id, Some("friend".into()), None);
+        for remote in ["mandat", "other"] {
+            book.share_git_remote(remote, PathBuf::from(format!("/srv/git/{remote}.git")))
+                .unwrap();
+            book.grant_git_remote(remote, "friend", GitAccess::Read)
+                .unwrap();
+        }
+
+        book.unshare_git_remote("mandat").unwrap();
+        assert!(book.git_remote("mandat").is_none());
+        assert!(book.may(&id, "git/mandat/read").is_err());
+        assert_eq!(book.may(&id, "git/other/read"), Ok(()));
+    }
+
+    #[test]
+    fn git_remote_names_and_paths_are_strict() {
+        let mut book = PeerBook::default();
+        for name in ["", ".", "..", "has/slash", "percent%20name"] {
+            assert!(
+                book.share_git_remote(name, PathBuf::from("/srv/git/repo.git"))
+                    .is_err(),
+                "invalid remote name {name:?} was accepted"
+            );
+        }
+        assert!(
+            book.share_git_remote("mandat", PathBuf::from("relative/repo.git"))
+                .is_err()
+        );
+        book.share_git_remote("mandat", PathBuf::from("/srv/git/mandat.git"))
+            .unwrap();
+        assert!(
+            book.share_git_remote("mandat", PathBuf::from("/srv/git/other.git"))
+                .is_err(),
+            "a share was silently rebound"
+        );
+    }
+
+    #[test]
+    fn git_permissions_must_name_a_declared_remote_and_exact_operation() {
+        let id = an_id(5);
+        for permission in ["git/missing/read", "git/mandat/admin", "git/mandat"] {
+            let mut book = PeerBook::default();
+            book.share_git_remote("mandat", PathBuf::from("/srv/git/mandat.git"))
+                .unwrap();
+            book.add_with_allow(
+                id,
+                Some("friend".into()),
+                None,
+                Some(vec![permission.into()]),
+            );
+            assert!(
+                book.validate().is_err(),
+                "invalid Git permission {permission:?} passed validation"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_peer_save_preserves_existing_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let home = FabricHome::new(directory.path());
+        let mut book = PeerBook::default();
+        book.save(&home).unwrap();
+        fs::set_permissions(home.peers_path(), fs::Permissions::from_mode(0o640)).unwrap();
+
+        book.share_git_remote("mandat", PathBuf::from("/srv/git/mandat.git"))
+            .unwrap();
+        book.save(&home).unwrap();
+
+        let mode = fs::metadata(home.peers_path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+    }
+
+    #[test]
+    fn generic_exposures_cannot_take_the_git_namespace() {
+        let error = validate_protocol("git/mandat/read").unwrap_err().to_string();
+        assert!(error.contains("reserved"), "wrong refusal: {error}");
     }
 
     /// A peer WITH a list is deny by default, including for services this

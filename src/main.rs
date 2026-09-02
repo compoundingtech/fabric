@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use fabric::{
     config::{
-        DEFAULT_EXEC_MAX_CHILDREN, FabricHome, PeerBook, generate_identity_file,
+        DEFAULT_EXEC_MAX_CHILDREN, FabricHome, GitAccess, PeerBook, generate_identity_file,
         load_or_create_identity, parse_addr_json, parse_node_id,
     },
     control::{ControlRequest, ControlResponse, PeerReachability},
@@ -77,6 +77,11 @@ enum Commands {
     Status,
     /// List trusted peers and their service grants.
     Peers,
+    /// Share Git repositories with exact per-peer read and write grants.
+    Git {
+        #[command(subcommand)]
+        command: GitCommands,
+    },
     /// Reload peers.toml into the running daemon.
     ReloadPeers,
     /// Trust a peer NodeID and optionally assign a local name.
@@ -327,6 +332,43 @@ enum Commands {
 }
 
 #[derive(Debug, Subcommand)]
+enum GitCommands {
+    /// Declare a local Git repository. This grants no peer access.
+    Share {
+        remote: String,
+        repository: PathBuf,
+    },
+    /// Remove a declaration and every peer grant for it.
+    Unshare { remote: String },
+    /// Add exact read or write access for one trusted peer.
+    Grant {
+        remote: String,
+        peer: String,
+        #[arg(long, conflicts_with_all = ["write", "read_write"])]
+        read: bool,
+        #[arg(long, conflicts_with_all = ["read", "read_write"])]
+        write: bool,
+        #[arg(long = "read-write", conflicts_with_all = ["read", "write"])]
+        read_write: bool,
+    },
+    /// Remove exact read or write access from one trusted peer.
+    Revoke {
+        remote: String,
+        peer: String,
+        #[arg(long, conflicts_with_all = ["write", "all"])]
+        read: bool,
+        #[arg(long, conflicts_with_all = ["read", "all"])]
+        write: bool,
+        #[arg(long, conflicts_with_all = ["read", "write"])]
+        all: bool,
+    },
+    /// List every local declaration and its effective grants.
+    Ls,
+    /// Check Git, the helper link, the daemon, and each declaration.
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
 enum KeyCommands {
     /// Generate an identity file without starting a daemon.
     Gen {
@@ -505,6 +547,76 @@ async fn main() -> Result<()> {
                         println!("{}\t{}\t{}", peer.id, name, policy);
                     }
                 }
+                Commands::Git { command } => match command {
+                    GitCommands::Share { remote, repository } => {
+                        let path = canonical_git_directory(&repository)?;
+                        let mut book = PeerBook::load(&home)?;
+                        book.share_git_remote(&remote, path.clone())?;
+                        book.save(&home)?;
+                        let _ = send_control(&home, ControlRequest::ReloadPeers).await;
+                        println!("shared\t{remote}");
+                        println!("path\t{}", path.display());
+                        println!("access\tno peers");
+                        println!("next\tfabric git grant {remote} <peer> --read");
+                    }
+                    GitCommands::Unshare { remote } => {
+                        let mut book = PeerBook::load(&home)?;
+                        book.unshare_git_remote(&remote)?;
+                        book.save(&home)?;
+                        let _ = send_control(&home, ControlRequest::ReloadPeers).await;
+                        println!("unshared\t{remote}");
+                        println!("grants removed\tall");
+                    }
+                    GitCommands::Grant {
+                        remote,
+                        peer,
+                        read,
+                        write,
+                        read_write,
+                    } => {
+                        let accesses = git_accesses(read, write, read_write, false)?;
+                        if accesses.contains(&GitAccess::Write) {
+                            eprintln!(
+                                "fabric: write access can update every ref that Git accepts and can run repository receive hooks"
+                            );
+                        }
+                        let mut book = PeerBook::load(&home)?;
+                        for access in &accesses {
+                            book.grant_git_remote(&remote, &peer, *access)?;
+                        }
+                        book.save(&home)?;
+                        let _ = send_control(&home, ControlRequest::ReloadPeers).await;
+                        println!("granted\t{}", git_access_names(&accesses));
+                        println!("remote\t{remote}");
+                        println!("peer\t{peer}");
+                    }
+                    GitCommands::Revoke {
+                        remote,
+                        peer,
+                        read,
+                        write,
+                        all,
+                    } => {
+                        let accesses = git_accesses(read, write, all, true)?;
+                        let mut book = PeerBook::load(&home)?;
+                        for access in &accesses {
+                            book.revoke_git_remote(&remote, &peer, *access)?;
+                        }
+                        book.save(&home)?;
+                        let _ = send_control(&home, ControlRequest::ReloadPeers).await;
+                        println!("revoked\t{}", git_access_names(&accesses));
+                        println!("remote\t{remote}");
+                        println!("peer\t{peer}");
+                    }
+                    GitCommands::Ls => {
+                        let book = PeerBook::load(&home)?;
+                        print_git_remotes(&book);
+                    }
+                    GitCommands::Status => {
+                        let book = PeerBook::load(&home)?;
+                        print_git_status(&home, &book).await;
+                    }
+                },
                 Commands::ReloadPeers => {
                     send_control(&home, ControlRequest::ReloadPeers).await?;
                     println!("reloaded");
@@ -1259,10 +1371,126 @@ impl<'a> From<&'a fabric::control::SyncEntryStatus> for SyncLsJsonEntry<'a> {
     }
 }
 
-/// The sweep reason, or a placeholder when the daemon has not decided one yet.
-///
-/// An older daemon sends nothing here, so this must not render an empty string
-/// as if it were a state.
+fn canonical_git_directory(repository: &PathBuf) -> Result<PathBuf> {
+    let output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["rev-parse", "--absolute-git-dir"])
+        .output()
+        .context("failed to run Git; install Git before sharing a repository")?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "{} is not a Git repository: {}",
+            repository.display(),
+            detail.trim()
+        );
+    }
+    let raw = String::from_utf8(output.stdout).context("Git returned a non-UTF-8 directory")?;
+    let path = PathBuf::from(raw.trim());
+    fs::canonicalize(&path)
+        .with_context(|| format!("failed to resolve Git directory {}", path.display()))
+}
+
+fn git_accesses(read: bool, write: bool, both: bool, revoke: bool) -> Result<Vec<GitAccess>> {
+    match (read, write, both) {
+        (true, false, false) => Ok(vec![GitAccess::Read]),
+        (false, true, false) => Ok(vec![GitAccess::Write]),
+        (false, false, true) => Ok(vec![GitAccess::Read, GitAccess::Write]),
+        _ if revoke => bail!("choose exactly one of --read, --write, or --all"),
+        _ => bail!("choose exactly one of --read, --write, or --read-write"),
+    }
+}
+
+fn git_access_names(accesses: &[GitAccess]) -> &'static str {
+    match accesses {
+        [GitAccess::Read] => "read",
+        [GitAccess::Write] => "write",
+        _ => "read,write",
+    }
+}
+
+fn git_grant_labels(book: &PeerBook, remote: &str, access: GitAccess) -> Vec<String> {
+    let permission = access.permission(remote);
+    let mut labels = book
+        .peers()
+        .iter()
+        .filter(|peer| peer.allow.contains(&permission))
+        .map(|peer| peer.name.clone().unwrap_or_else(|| peer.id.to_string()))
+        .collect::<Vec<_>>();
+    labels.sort();
+    labels
+}
+
+fn git_repository_kind(path: &PathBuf) -> &'static str {
+    let output = ProcessCommand::new("git")
+        .arg("--git-dir")
+        .arg(path)
+        .args(["rev-parse", "--is-bare-repository"])
+        .output();
+    match output {
+        Ok(output) if output.status.success() && output.stdout.starts_with(b"true") => "bare",
+        Ok(output) if output.status.success() => "worktree",
+        _ => "unavailable",
+    }
+}
+
+fn comma_list(values: Vec<String>) -> String {
+    if values.is_empty() {
+        "none".to_string()
+    } else {
+        values.join(",")
+    }
+}
+
+fn print_git_remotes(book: &PeerBook) {
+    for remote in book.git_remotes() {
+        println!(
+            "{}\t{}\t{}\tread={}\twrite={}",
+            remote.name,
+            remote.path.display(),
+            git_repository_kind(&remote.path),
+            comma_list(git_grant_labels(book, &remote.name, GitAccess::Read)),
+            comma_list(git_grant_labels(book, &remote.name, GitAccess::Write)),
+        );
+    }
+}
+
+async fn print_git_status(home: &FabricHome, book: &PeerBook) {
+    match ProcessCommand::new("git").arg("--version").output() {
+        Ok(output) if output.status.success() => {
+            println!("git\tok\t{}", String::from_utf8_lossy(&output.stdout).trim())
+        }
+        _ => println!("git\tproblem\tGit is not available"),
+    }
+
+    let helper = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join("git-remote-fabric")));
+    match helper {
+        Some(path) if path.exists() => println!("helper\tok\t{}", path.display()),
+        Some(path) => println!("helper\tproblem\tmissing {}", path.display()),
+        None => println!("helper\tunknown\tcannot resolve the Fabric binary directory"),
+    }
+
+    match send_control(home, ControlRequest::Status).await {
+        Ok(_) => println!("daemon\tok\trunning"),
+        Err(error) => println!("daemon\tproblem\t{error:#}"),
+    }
+
+    println!("configuration\tok\t{} Git remotes", book.git_remotes().len());
+    for remote in book.git_remotes() {
+        let kind = git_repository_kind(&remote.path);
+        let verdict = if kind == "unavailable" { "problem" } else { "ok" };
+        println!(
+            "remote {}\t{}\t{} ({kind})",
+            remote.name,
+            verdict,
+            remote.path.display()
+        );
+    }
+}
+
 /// Say so BEFORE writing a permission that would stop a sync entry.
 ///
 /// Every other signal about a denied sync arrives after the mistake and only
@@ -1403,6 +1631,10 @@ fn scan_issues_token(entry: &fabric::control::SyncEntryStatus) -> String {
         .join(",")
 }
 
+/// The sweep reason, or a placeholder when the daemon has not decided one yet.
+///
+/// An older daemon sends nothing here, so this must not render an empty string
+/// as if it were a state.
 fn sweep_token(entry: &fabric::control::SyncEntryStatus) -> &str {
     if entry.sweep.is_empty() {
         "unknown"

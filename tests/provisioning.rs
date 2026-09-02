@@ -124,6 +124,102 @@ fn peers_lists_declarative_config_without_add() -> Result<()> {
 }
 
 #[test]
+fn git_shares_and_peer_grants_live_in_peers_toml() -> Result<()> {
+    let temp = TempDir::new()?;
+    let home = temp.path().join("home");
+    let repository = temp.path().join("mandat.git");
+    fs::create_dir_all(&home)?;
+    stdout(
+        Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&repository)
+            .output()
+            .context("failed to create the bare Git repository")?,
+    )?;
+
+    let peer_key = temp.path().join("peer-key.toml");
+    let peer_id = stdout(
+        Command::new(fabric_bin())
+            .args(["key", "gen", "--out"])
+            .arg(&peer_key)
+            .output()?,
+    )?;
+    stdout(
+        Command::new(fabric_bin())
+            .arg("--home")
+            .arg(&home)
+            .args(["add", &peer_id, "friend", "--allow", "shell"])
+            .output()?,
+    )?;
+
+    let shared = stdout(
+        Command::new(fabric_bin())
+            .arg("--home")
+            .arg(&home)
+            .args(["git", "share", "mandat"])
+            .arg(&repository)
+            .output()?,
+    )?;
+    assert!(shared.contains("access\tno peers"));
+
+    stdout(
+        Command::new(fabric_bin())
+            .arg("--home")
+            .arg(&home)
+            .args(["git", "grant", "mandat", "friend", "--read-write"])
+            .output()?,
+    )?;
+    let listed = stdout(
+        Command::new(fabric_bin())
+            .arg("--home")
+            .arg(&home)
+            .args(["git", "ls"])
+            .output()?,
+    )?;
+    assert!(listed.contains("mandat"));
+    assert!(listed.contains("bare"));
+    assert!(listed.contains("read=friend"));
+    assert!(listed.contains("write=friend"));
+
+    stdout(
+        Command::new(fabric_bin())
+            .arg("--home")
+            .arg(&home)
+            .args(["git", "revoke", "mandat", "friend", "--read"])
+            .output()?,
+    )?;
+    let raw = fs::read_to_string(home.join("peers.toml"))?;
+    assert!(raw.contains("[[git_remotes]]"));
+    assert!(raw.contains("git/mandat/write"));
+    assert!(!raw.contains("git/mandat/read"));
+    assert!(raw.contains("shell"));
+
+    stdout(
+        Command::new(fabric_bin())
+            .arg("--home")
+            .arg(&home)
+            .args(["git", "unshare", "mandat"])
+            .output()?,
+    )?;
+    let raw = fs::read_to_string(home.join("peers.toml"))?;
+    assert!(!raw.contains("[[git_remotes]]"));
+    assert!(!raw.contains("git/mandat/"));
+    assert!(raw.contains("shell"));
+    assert!(
+        fs::read_dir(&home)?.all(|entry| {
+            !entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("fabric-tmp")
+        }),
+        "an atomic peers.toml temporary file remained"
+    );
+    Ok(())
+}
+
+#[test]
 fn default_home_reads_peers_from_config_dir() -> Result<()> {
     let temp = TempDir::new()?;
     let fake_home = temp.path().join("user-home");
