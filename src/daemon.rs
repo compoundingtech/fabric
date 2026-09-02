@@ -29,7 +29,7 @@ use n0_watcher::Watcher as _;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, UnixListener, UnixStream},
-    sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, watch},
+    sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -43,7 +43,7 @@ use crate::{
         validate_server_session_config, validate_tcp_addr,
     },
     control::{ControlRequest, ControlResponse, PeerReachability, SyncEntryStatus},
-    exec, gitremote, pathwatch, shell,
+    exec, gitremote, mux, pathwatch, shell,
     sync::{
         self,
         config::SyncPeers,
@@ -115,6 +115,11 @@ const PEER_HEALTH_ATTEMPTS_BEFORE_RECYCLE: usize = 3;
 /// peer, so a genuinely-down peer does not cause recovery thrash.
 const PEER_HEALTH_RECOVER_INITIAL_BACKOFF: Duration = Duration::from_secs(30);
 const PEER_HEALTH_RECOVER_MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
+const PATH_QUALITY_ABSOLUTE_FLOOR: Duration = Duration::from_secs(1);
+const PATH_QUALITY_BASELINE_MULTIPLIER: u32 = 8;
+const PATH_QUALITY_CONSECUTIVE_SAMPLES: usize = 3;
+const PATH_QUALITY_WARMUP_SAMPLES: usize = 2;
+const PATH_QUALITY_REDIAL_COOLDOWN: Duration = Duration::from_secs(60);
 /// The validation log target. `pub(crate)` because `sync::engine` writes to the
 /// same log and a second copy of the literal is a string that drifts.
 pub(crate) const VALIDATION_LOG_TARGET: &str = "fabric::validation";
@@ -399,6 +404,9 @@ pub struct DaemonState {
     dial_failures: Arc<FailureBackoff>,
     incoming_slots: Arc<Semaphore>,
     dial_slots: Arc<Semaphore>,
+    mux_stream_slots: Arc<Semaphore>,
+    peer_connections: Arc<mux::PeerConnections>,
+    opened_mux_connections: Mutex<Option<mpsc::UnboundedReceiver<Connection>>>,
     git_sessions: gitremote::GitSessionLimits,
     cancel: CancellationToken,
     /// Durable loss/resume counters. Survives a restart, unlike the log lines
@@ -873,6 +881,8 @@ impl DaemonState {
             tunnel::ServerSessionStore::new(tunnel_session_limits, tunnel_session_detached_ttl);
         tunnel::spawn_server_session_reaper(tunnel_sessions.clone(), cancel.clone());
         let telemetry = Arc::new(TelemetryStore::load(home.telemetry_path()));
+        let local_id = endpoint_tx.borrow().endpoint.id();
+        let (opened_mux_tx, opened_mux_rx) = mpsc::unbounded_channel();
 
         Ok(Arc::new(Self {
             home,
@@ -905,6 +915,9 @@ impl DaemonState {
             ),
             incoming_slots: Arc::new(Semaphore::new(MAX_INCOMING_HANDLERS)),
             dial_slots: Arc::new(Semaphore::new(MAX_DIAL_HANDLERS)),
+            mux_stream_slots: Arc::new(Semaphore::new(MAX_INCOMING_HANDLERS)),
+            peer_connections: Arc::new(mux::PeerConnections::new(local_id, opened_mux_tx)),
+            opened_mux_connections: Mutex::new(Some(opened_mux_rx)),
             git_sessions: gitremote::GitSessionLimits::default(),
             cancel,
             telemetry,
@@ -931,6 +944,10 @@ impl DaemonState {
         MAX_INCOMING_HANDLERS.saturating_sub(self.incoming_slots.available_permits())
     }
 
+    pub async fn peer_connection_count(&self) -> usize {
+        self.peer_connections.peer_count().await
+    }
+
     pub(crate) fn telemetry(&self) -> Arc<TelemetryStore> {
         self.telemetry.clone()
     }
@@ -953,6 +970,24 @@ impl DaemonState {
 
     fn endpoint_rx(&self) -> watch::Receiver<CurrentEndpoint> {
         self.endpoint_tx.subscribe()
+    }
+
+    async fn open_peer_stream(
+        &self,
+        peer_addr: &EndpointAddr,
+        protocol: &str,
+        activity: mux::StreamActivity,
+    ) -> Result<mux::MuxStream> {
+        let endpoint = self.endpoint_handle();
+        self.peer_connections
+            .open_stream(
+                &endpoint.endpoint,
+                endpoint.generation,
+                peer_addr,
+                protocol,
+                activity,
+            )
+            .await
     }
 
     pub fn id(&self) -> EndpointId {
@@ -1125,23 +1160,32 @@ impl DaemonState {
     }
 
     async fn ping_addr(&self, peer: &str, peer_addr: EndpointAddr) -> Result<PingOutcome> {
-        let endpoint = self.current_endpoint();
+        let endpoint = self.endpoint_handle();
         self.ping_addr_on_endpoint(endpoint, peer, peer_addr).await
     }
 
     async fn ping_addr_on_endpoint(
         &self,
-        endpoint: Endpoint,
+        endpoint: CurrentEndpoint,
         peer: &str,
         peer_addr: EndpointAddr,
     ) -> Result<PingOutcome> {
         let nonce = rand::random::<[u8; 32]>();
         let started = std::time::Instant::now();
-        let connection = endpoint
-            .connect(peer_addr.clone(), BUILTIN_ECHO_ALPN)
+        let stream = self
+            .peer_connections
+            .open_stream(
+                &endpoint.endpoint,
+                endpoint.generation,
+                &peer_addr,
+                std::str::from_utf8(BUILTIN_ECHO_ALPN).expect("built-in ALPN is UTF-8"),
+                mux::StreamActivity::Probe,
+            )
             .await
             .with_context(|| format!("failed to connect to {peer:?} built-in echo"))?;
-        let (mut send, mut recv) = connection.open_bi().await?;
+        let connection = stream.connection;
+        let mut send = stream.send;
+        let mut recv = stream.recv;
 
         send.write_all(&nonce).await?;
         send.finish()?;
@@ -1150,7 +1194,7 @@ impl DaemonState {
         let round_trip = started.elapsed();
         let mut transport = classify_connection_transport(&connection);
         if transport.is_none()
-            && let Some(info) = endpoint.remote_info(peer_addr.id).await
+            && let Some(info) = endpoint.endpoint.remote_info(peer_addr.id).await
         {
             transport = classify_remote_transport(&info);
         }
@@ -1209,6 +1253,7 @@ impl DaemonState {
             self.tunnel_drop_rx(),
             self.dial_failures.clone(),
             self.dial_slots.clone(),
+            self.peer_connections.clone(),
             self.client_attaches.clone(),
             self.connection_recorder(),
         ));
@@ -1273,6 +1318,7 @@ impl DaemonState {
                 self.cancel.clone(),
                 self.dial_failures.clone(),
                 self.dial_slots.clone(),
+                self.peer_connections.clone(),
                 lease,
             ))
         } else if alpn == shell::RESUMABLE_SHELL_ALPN {
@@ -1287,6 +1333,7 @@ impl DaemonState {
                 self.tunnel_drop_rx(),
                 self.dial_failures.clone(),
                 self.dial_slots.clone(),
+                self.peer_connections.clone(),
                 lease,
                 self.client_attaches.clone(),
                 self.connection_recorder(),
@@ -1303,6 +1350,7 @@ impl DaemonState {
                 self.tunnel_drop_rx(),
                 self.dial_failures.clone(),
                 self.dial_slots.clone(),
+                self.peer_connections.clone(),
                 lease,
                 self.client_attaches.clone(),
                 self.connection_recorder(),
@@ -1440,12 +1488,10 @@ impl DaemonState {
         statuses
     }
 
-    /// One real ALPN connect against a peer, then close. This is a probe, not a
-    /// dial: it creates no listener and no dial socket, keeps no state, never
-    /// retries, and deliberately does not consult `dial_failures`, because a
-    /// probe that inherited the shared backoff could not answer the question it
-    /// is asked. The caller's deadline bounds it, and so does this side, so a
-    /// slow peer cannot leave a connect pending after the answer is returned.
+    /// Open one logical stream against a peer's shared connection. This creates
+    /// no listener or dial socket. It does not consult `dial_failures`, because
+    /// shared dial backoff cannot answer whether a service is available now.
+    /// The caller's deadline bounds the attempt.
     async fn probe_service(
         &self,
         peer: &str,
@@ -1454,11 +1500,20 @@ impl DaemonState {
     ) -> Result<ServiceProbe> {
         let addr = self.peer_book.read().await.resolve(peer)?;
         let peer_id = addr.id.to_string();
-        let endpoint = self.current_endpoint();
-        let alpn = protocol.as_bytes().to_vec();
+        let endpoint = self.endpoint_handle();
 
         let started = Instant::now();
-        let attempt = tokio::time::timeout(timeout, endpoint.connect(addr, &alpn)).await;
+        let attempt = tokio::time::timeout(
+            timeout,
+            self.peer_connections.open_stream(
+                &endpoint.endpoint,
+                endpoint.generation,
+                &addr,
+                protocol,
+                mux::StreamActivity::Probe,
+            ),
+        )
+        .await;
         let (outcome, round_trip, transport, error) = match attempt {
             Err(_elapsed) => (
                 ProbeOutcome::Timeout,
@@ -1466,15 +1521,17 @@ impl DaemonState {
                 None,
                 Some(format!("no answer within {:?}", timeout)),
             ),
-            Ok(Ok(connection)) => {
+            Ok(Ok(stream)) => {
                 let elapsed = started.elapsed();
-                let transport = classify_connection_transport(&connection);
-                connection.close(0u32.into(), b"probe complete");
+                let transport = classify_connection_transport(&stream.connection);
                 (ProbeOutcome::Supported, Some(elapsed), transport, None)
             }
             Ok(Err(error)) => {
-                let error = anyhow::Error::new(error);
-                if shell_resumable_alpn_unsupported(&error) {
+                if shell_resumable_alpn_unsupported(&error)
+                    || error
+                        .chain()
+                        .any(|cause| cause.to_string().contains("is not exposed"))
+                {
                     (ProbeOutcome::Unsupported, None, None, None)
                 } else {
                     (
@@ -1722,7 +1779,7 @@ impl DaemonState {
 
         let peer_reachable = tokio::time::timeout(
             ENDPOINT_HEALTH_TIMEOUT,
-            self.any_peer_reachable_on_endpoint(endpoint.endpoint, context),
+            self.any_peer_reachable_on_endpoint(endpoint.clone(), context),
         )
         .await
         .unwrap_or(false);
@@ -1740,7 +1797,11 @@ impl DaemonState {
         peer_reachable
     }
 
-    async fn any_peer_reachable_on_endpoint(&self, endpoint: Endpoint, context: &str) -> bool {
+    async fn any_peer_reachable_on_endpoint(
+        &self,
+        endpoint: CurrentEndpoint,
+        context: &str,
+    ) -> bool {
         let peers = self.peer_book.read().await.peers().to_vec();
         for peer in peers {
             let addr = peer
@@ -2017,7 +2078,7 @@ impl FabricNode {
             }
         });
 
-        spawn_path_probes(&state).await;
+        spawn_outgoing_mux_accepts(&state).await?;
 
         let task = tokio::spawn(serve(state.clone()));
         Ok(Self { state, task })
@@ -2101,6 +2162,34 @@ impl FabricNode {
     pub async fn wait(self) -> Result<()> {
         self.task.await?
     }
+}
+
+async fn spawn_outgoing_mux_accepts(state: &Arc<DaemonState>) -> Result<()> {
+    let mut receiver = state
+        .opened_mux_connections
+        .lock()
+        .await
+        .take()
+        .context("outgoing mux accept loop already started")?;
+    let state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            let connection = tokio::select! {
+                _ = state.cancel.cancelled() => return,
+                connection = receiver.recv() => connection,
+            };
+            let Some(connection) = connection else {
+                return;
+            };
+            let state = state.clone();
+            tokio::spawn(async move {
+                if let Err(error) = handle_mux_connection(connection, state, false).await {
+                    debug!(%error, "outgoing mux accept loop failed");
+                }
+            });
+        }
+    });
+    Ok(())
 }
 
 pub async fn run_daemon(home: FabricHome, allow_shell: bool) -> Result<()> {
@@ -2530,6 +2619,14 @@ async fn run_peer_health_loop_with(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     interval.tick().await;
     let mut tracker = PeerHealthTracker::new(failures_before_recover, initial_backoff, max_backoff);
+    let mut path_quality = pathwatch::PathQualityTracker::new(
+        PATH_QUALITY_ABSOLUTE_FLOOR,
+        PATH_QUALITY_BASELINE_MULTIPLIER,
+        PATH_QUALITY_CONSECUTIVE_SAMPLES,
+        PATH_QUALITY_WARMUP_SAMPLES,
+        PATH_QUALITY_REDIAL_COOLDOWN,
+    );
+    let mut selected_paths = HashMap::<EndpointId, Option<String>>::new();
 
     loop {
         tokio::select! {
@@ -2551,6 +2648,23 @@ async fn run_peer_health_loop_with(
                 for peer in peers {
                     let peer_id = peer.id;
                     let label = peer.name.clone().unwrap_or_else(|| peer_id.to_string());
+                    if state
+                        .peer_connections
+                        .recently_active(peer_id, probe_interval)
+                        .await
+                    {
+                        info!(
+                            target: VALIDATION_LOG_TARGET,
+                            event = "peer_health_probe_skipped",
+                            peer = %label,
+                            recent_application_traffic = true,
+                            window_ms = probe_interval.as_millis() as u64,
+                            "recent application traffic proved peer liveness"
+                        );
+                        reachable_peers += 1;
+                        round.push((peer_id, label, true));
+                        continue;
+                    }
                     let health = state.check_peer_reachability(peer).await;
                     info!(
                         target: VALIDATION_LOG_TARGET,
@@ -2571,10 +2685,50 @@ async fn run_peer_health_loop_with(
                         health.transport.as_deref(),
                         health.round_trip_micros.map(Duration::from_micros),
                     );
+                    if let Some(round_trip_micros) = health.round_trip_micros
+                        && let Some(connection) = state.peer_connections.connection(peer_id).await
+                    {
+                        pathwatch::log_paths(
+                            &connection,
+                            &label,
+                            Duration::from_micros(round_trip_micros),
+                            selected_paths.entry(peer_id).or_default(),
+                        );
+                    }
                     if let Some(transport) = health.transport.as_deref()
                         && let Ok(mut seen) = state.last_probe_transport.write()
                     {
                         seen.insert(label.clone(), transport.to_string());
+                    }
+                    if health.reachable
+                        && let (Some(round_trip_micros), Some(transport)) =
+                            (health.round_trip_micros, health.transport.as_deref())
+                        && let pathwatch::PathQualityAction::Redial {
+                            class,
+                            baseline,
+                            observed,
+                        } = path_quality.on_sample(
+                            peer_id,
+                            state.endpoint_handle().generation,
+                            transport,
+                            Duration::from_micros(round_trip_micros),
+                            Instant::now(),
+                        )
+                    {
+                        let redialled = state
+                            .peer_connections
+                            .redial(peer_id, b"path quality degraded")
+                            .await;
+                        warn!(
+                            target: VALIDATION_LOG_TARGET,
+                            event = "path_quality_redial",
+                            peer = %label,
+                            class = %class,
+                            baseline_ms = baseline.as_secs_f64() * 1000.0,
+                            observed_ms = observed.as_secs_f64() * 1000.0,
+                            redialled,
+                            "persistent path degradation closed the shared peer connection"
+                        );
                     }
                     if health.reachable {
                         reachable_peers += 1;
@@ -3262,6 +3416,12 @@ async fn process_incoming_iroh(
 
     let connection = handshake_and_identify(accepting, identity).await?;
 
+    if alpn == mux::MUX_ALPN {
+        log_connection_paths("mux_accept", &connection);
+        handle_mux_connection(connection, state, true).await?;
+        return Ok(());
+    }
+
     // Git checks its qualified grant after it reads the requested remote and
     // operation. The handshake already proved that the peer is trusted.
     if alpn == gitremote::GIT_ALPN {
@@ -3358,16 +3518,17 @@ async fn send_file_to_peer(
             .clone()
             .unwrap_or_else(|| EndpointAddr::new(found.id))
     };
-    let endpoint = state.current_endpoint();
-    let connection = endpoint
-        .connect(addr, crate::sendfile::SEND_FILE_ALPN)
+    let stream = state
+        .open_peer_stream(
+            &addr,
+            std::str::from_utf8(crate::sendfile::SEND_FILE_ALPN)
+                .expect("send-file ALPN is UTF-8"),
+            mux::StreamActivity::Application,
+        )
         .await
         .with_context(|| format!("dialling {peer}"))?;
-    let (send, recv) = connection.open_bi().await?;
-    let stream = tokio::io::join(recv, send);
-    let result = crate::sendfile::send_file(stream, name, path).await;
-    connection.close(0u32.into(), b"done");
-    result
+    let joined = tokio::io::join(stream.recv, stream.send);
+    crate::sendfile::send_file(joined, name, path).await
 }
 
 /// Accept one file into this peer's inbox.
@@ -3375,10 +3536,21 @@ async fn send_file_to_peer(
 /// The peer's own id names the inbox, taken from the CONNECTION rather than
 /// from anything the sender said, so a peer cannot choose where its files land.
 async fn handle_send_file(connection: Connection, state: Arc<DaemonState>) -> Result<()> {
-    let peer = connection.remote_id().to_string();
+    let peer = connection.remote_id();
     let (send, recv) = connection.accept_bi().await?;
+    receive_file_stream(peer, send, recv, state).await?;
+    connection.closed().await;
+    Ok(())
+}
+
+async fn receive_file_stream(
+    peer: EndpointId,
+    send: SendStream,
+    recv: RecvStream,
+    state: Arc<DaemonState>,
+) -> Result<()> {
     let stream = tokio::io::join(recv, send);
-    match crate::sendfile::receive(stream, &state.home, &peer).await {
+    match crate::sendfile::receive(stream, &state.home, &peer.to_string()).await {
         Ok(path) => {
             info!(peer = %peer, path = %path.display(), "received a file");
         }
@@ -3386,7 +3558,6 @@ async fn handle_send_file(connection: Connection, state: Arc<DaemonState>) -> Re
             debug!(peer = %peer, %error, "refused or failed to receive a file");
         }
     }
-    connection.closed().await;
     Ok(())
 }
 
@@ -3457,18 +3628,187 @@ async fn handle_git(connection: Connection, state: Arc<DaemonState>) -> Result<(
     Ok(())
 }
 
+async fn handle_mux_connection(
+    connection: Connection,
+    state: Arc<DaemonState>,
+    register_incoming: bool,
+) -> Result<()> {
+    if register_incoming {
+        let generation = state.endpoint_handle().generation;
+        state
+            .peer_connections
+            .register_incoming(&connection, generation)
+            .await;
+    }
+    loop {
+        let permit = tokio::select! {
+            _ = state.cancel.cancelled() => return Ok(()),
+            _ = connection.closed() => return Ok(()),
+            permit = state.mux_stream_slots.clone().acquire_owned() => {
+                permit.context("mux stream semaphore closed")?
+            }
+        };
+        let accepted = tokio::select! {
+            _ = state.cancel.cancelled() => return Ok(()),
+            _ = connection.closed() => return Ok(()),
+            accepted = connection.accept_bi() => accepted,
+        };
+        let (send, recv) = match accepted {
+            Ok(streams) => streams,
+            Err(_) => return Ok(()),
+        };
+        let connection = connection.clone();
+        let state = state.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(error) = handle_mux_stream(connection, send, recv, state).await {
+                debug!(%error, "mux stream failed");
+            }
+        });
+    }
+}
+
+async fn handle_mux_stream(
+    connection: Connection,
+    mut send: SendStream,
+    mut recv: RecvStream,
+    state: Arc<DaemonState>,
+) -> Result<()> {
+    let header = tokio::time::timeout(
+        Duration::from_secs(10),
+        mux::MuxStreamHeader::read(&mut recv),
+    )
+    .await
+    .context("the peer did not send a mux header within 10 seconds")??;
+    let alpn = header.protocol.as_bytes();
+    if alpn == mux::MUX_ALPN {
+        mux::write_denied(&mut send, "fabric/mux/1 cannot target itself").await?;
+        return Ok(());
+    }
+
+    let exposure = if matches_reserved_alpn(alpn) {
+        None
+    } else {
+        state.exposures.read().await.get(alpn).cloned()
+    };
+    if !matches_reserved_alpn(alpn) && exposure.is_none() {
+        mux::write_denied(
+            &mut send,
+            &format!("service {:?} is not exposed", header.protocol),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if alpn != gitremote::GIT_ALPN {
+        let service = service_name_for_alpn(alpn);
+        if let Err(denied) = state.may(&connection.remote_id(), &service).await {
+            mux::write_denied(&mut send, &denied.to_string()).await?;
+            return Ok(());
+        }
+    }
+    if state.tunnel_blocked.load(Ordering::SeqCst) && exposure.is_some() {
+        mux::write_denied(&mut send, "fabric tunnel blocked").await?;
+        return Ok(());
+    }
+
+    if alpn != BUILTIN_ECHO_ALPN {
+        state
+            .peer_connections
+            .note_application_activity(connection.remote_id())
+            .await;
+    }
+    mux::write_ready(&mut send).await?;
+
+    if alpn == BUILTIN_ECHO_ALPN {
+        state.builtin_echo_hits.fetch_add(1, Ordering::SeqCst);
+        tokio::io::copy(&mut recv, &mut send).await?;
+        send.finish()?;
+    } else if alpn == shell::SHELL_ALPN {
+        let peer = connection.remote_id().to_string();
+        if state.allow_shell {
+            shell::serve_shell_session(&mut recv, &mut send, &peer).await?;
+        } else {
+            shell::serve_shell_disabled(&mut send).await?;
+        }
+        send.finish()?;
+    } else if alpn == shell::RESUMABLE_SHELL_ALPN {
+        let peer = connection.remote_id();
+        tunnel::serve_connection(
+            connection,
+            send,
+            recv,
+            peer,
+            tunnel::ServerTarget::Shell {
+                allowed: state.allow_shell,
+            },
+            state.tunnel_sessions.clone(),
+            state.tunnel_drop_rx(),
+        )
+        .await?;
+    } else if alpn == exec::EXEC_ALPN {
+        let peer = connection.remote_id().to_string();
+        if state.allow_exec {
+            exec::serve_exec_session(&mut recv, &mut send, &peer).await?;
+        } else {
+            exec::serve_exec_disabled(&mut send).await?;
+        }
+        send.finish()?;
+    } else if alpn == gitremote::GIT_ALPN {
+        let book = state.peer_book.read().await.clone();
+        gitremote::serve_session(
+            recv,
+            send,
+            book,
+            connection.remote_id(),
+            state.git_sessions.clone(),
+        )
+        .await?;
+    } else if alpn == SYNC_ALPN {
+        handle_sync_stream(connection.remote_id(), send, recv, state).await?;
+    } else if alpn == crate::sendfile::SEND_FILE_ALPN {
+        receive_file_stream(connection.remote_id(), send, recv, state).await?;
+    } else if let Some(exposure) = exposure {
+        let peer = connection.remote_id();
+        tunnel::serve_connection(
+            connection,
+            send,
+            recv,
+            peer,
+            exposure.to_server_target(),
+            state.tunnel_sessions.clone(),
+            state.tunnel_drop_rx(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// Serve the accepting side of a `fabric/sync` reconcile: run the wire server
 /// against the engine's node for the requested sync, then materialize what the
 /// peer pushed us to disk.
 async fn handle_sync(connection: Connection, state: Arc<DaemonState>) -> Result<()> {
+    let peer = connection.remote_id();
+    let (send, recv) = connection.accept_bi().await?;
+    handle_sync_stream(peer, send, recv, state).await?;
+    connection.closed().await;
+    Ok(())
+}
+
+async fn handle_sync_stream(
+    peer: EndpointId,
+    send: SendStream,
+    recv: RecvStream,
+    state: Arc<DaemonState>,
+) -> Result<()> {
     let Some(engine) = state.sync_engine() else {
-        connection.close(0u32.into(), b"sync not enabled");
+        let mut send = send;
+        send.reset(0u32.into())?;
         return Ok(());
     };
-    let (send, recv) = connection.accept_bi().await?;
     let stream = tokio::io::join(recv, send);
     let resolver_engine = engine.clone();
-    let peer = connection.remote_id().to_string();
+    let peer = peer.to_string();
     let outcome = sync::wire::run_server(stream, &peer, move |hello| {
         let engine = resolver_engine.clone();
         async move {
@@ -3497,12 +3837,12 @@ async fn handle_sync(connection: Connection, state: Arc<DaemonState>) -> Result<
         }
         Err(error) => debug!(%error, "sync serve failed"),
     }
-    connection.closed().await;
     Ok(())
 }
 
 fn accepted_alpns(exposures: &HashMap<Vec<u8>, Exposure>) -> Vec<Vec<u8>> {
-    let mut alpns = Vec::with_capacity(exposures.len() + 7);
+    let mut alpns = Vec::with_capacity(exposures.len() + 8);
+    alpns.push(mux::MUX_ALPN.to_vec());
     alpns.push(BUILTIN_ECHO_ALPN.to_vec());
     alpns.push(shell::SHELL_ALPN.to_vec());
     alpns.push(shell::RESUMABLE_SHELL_ALPN.to_vec());
@@ -3515,7 +3855,8 @@ fn accepted_alpns(exposures: &HashMap<Vec<u8>, Exposure>) -> Vec<Vec<u8>> {
 }
 
 fn matches_reserved_alpn(alpn: &[u8]) -> bool {
-    alpn == crate::sendfile::SEND_FILE_ALPN
+    alpn == mux::MUX_ALPN
+        || alpn == crate::sendfile::SEND_FILE_ALPN
         || alpn == BUILTIN_ECHO_ALPN
         || alpn == shell::SHELL_ALPN
         || alpn == shell::RESUMABLE_SHELL_ALPN
@@ -3603,13 +3944,15 @@ impl SyncTransport for IrohSyncTransport {
         if let Err(denied) = state.may(&addr.id, "sync").await {
             bail!("{denied}");
         }
-        let endpoint = state.current_endpoint();
-        let connection = endpoint.connect(addr, SYNC_ALPN).await?;
-        let (send, recv) = connection.open_bi().await?;
-        let stream = tokio::io::join(recv, send);
-        let stats = sync::wire::run_client(stream, node, &name, &peer.id).await?;
-        connection.close(0u32.into(), b"done");
-        Ok(stats)
+        let stream = state
+            .open_peer_stream(
+                &addr,
+                std::str::from_utf8(SYNC_ALPN).expect("sync ALPN is UTF-8"),
+                mux::StreamActivity::Application,
+            )
+            .await?;
+        let joined = tokio::io::join(stream.recv, stream.send);
+        sync::wire::run_client(joined, node, &name, &peer.id).await
     }
 }
 
@@ -3627,46 +3970,6 @@ fn peer_ref(peer: &Peer) -> PeerRef {
 
 fn sync_author(id: EndpointId) -> SyncAuthor {
     SyncAuthor(*id.as_bytes())
-}
-
-/// Spawn a background path-quality probe per trusted peer when
-/// `FABRIC_PATHWATCH_SECS` is set (diagnostic instrumentation; default off). Each
-/// probe holds a long-lived echo connection and logs per-path RTT + selection to
-/// the validation log, so a degraded-but-connected direct path (the 5s-RTT
-/// repro) becomes visible instead of a blind spot.
-async fn spawn_path_probes(state: &Arc<DaemonState>) {
-    let Some(secs) = std::env::var("FABRIC_PATHWATCH_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
-    else {
-        return;
-    };
-    let interval = Duration::from_secs(secs);
-    let peers = state.peer_book.read().await.peers().to_vec();
-    for peer in peers {
-        let label = peer.name.clone().unwrap_or_else(|| peer.id.to_string());
-        let addr = peer
-            .addr
-            .clone()
-            .unwrap_or_else(|| EndpointAddr::new(peer.id));
-        let endpoint_state = state.clone();
-        let cancel = state.cancel.clone();
-        info!(
-            target: VALIDATION_LOG_TARGET,
-            event = "pathwatch_started",
-            peer = %label,
-            interval_secs = secs,
-        );
-        tokio::spawn(pathwatch::probe_peer_paths(
-            move || Some(endpoint_state.current_endpoint()),
-            label,
-            addr,
-            BUILTIN_ECHO_ALPN.to_vec(),
-            interval,
-            cancel,
-        ));
-    }
 }
 
 fn current_rss_bytes() -> Option<u64> {
@@ -3877,6 +4180,7 @@ async fn run_dial_socket(
     drop_rx: watch::Receiver<u64>,
     dial_failures: Arc<FailureBackoff>,
     dial_slots: Arc<Semaphore>,
+    peer_connections: Arc<mux::PeerConnections>,
     _lease: DialListenerLease,
     gauge: Arc<tunnel::ClientAttachGauge>,
     recorder: ConnectionRecorder,
@@ -3910,6 +4214,7 @@ async fn run_dial_socket(
                 let drop_rx = drop_rx.clone();
                 let dial_failures = dial_failures.clone();
                 let backoff_key = backoff_key.clone();
+                let peer_connections = peer_connections.clone();
                 let notices = Some(generic_dial_notices(
                     peer.clone(),
                     String::from_utf8_lossy(&alpn).to_string(),
@@ -3925,6 +4230,7 @@ async fn run_dial_socket(
                         tunnel::run_client_connection(
                             local,
                             endpoint_rx,
+                            peer_connections,
                             home,
                             peer,
                             alpn,
@@ -3958,6 +4264,7 @@ async fn run_shell_dial_socket(
     drop_rx: watch::Receiver<u64>,
     dial_failures: Arc<FailureBackoff>,
     dial_slots: Arc<Semaphore>,
+    peer_connections: Arc<mux::PeerConnections>,
     _lease: DialListenerLease,
     gauge: Arc<tunnel::ClientAttachGauge>,
     recorder: ConnectionRecorder,
@@ -3991,6 +4298,7 @@ async fn run_shell_dial_socket(
                 let drop_rx = drop_rx.clone();
                 let dial_failures = dial_failures.clone();
                 let backoff_key = backoff_key.clone();
+                let peer_connections = peer_connections.clone();
                 let gauge = gauge.clone();
                 let recorder = recorder.clone();
                 tokio::spawn(async move {
@@ -4001,6 +4309,7 @@ async fn run_shell_dial_socket(
                     match handle_shell_dial_socket_connection(
                         local,
                         endpoint_rx,
+                        peer_connections,
                         home,
                         peer,
                         peer_addr,
@@ -4028,6 +4337,7 @@ async fn run_shell_dial_socket(
 async fn handle_shell_dial_socket_connection(
     mut local: UnixStream,
     mut endpoint_rx: watch::Receiver<CurrentEndpoint>,
+    peer_connections: Arc<mux::PeerConnections>,
     home: FabricHome,
     peer: String,
     peer_addr: EndpointAddr,
@@ -4041,10 +4351,11 @@ async fn handle_shell_dial_socket_connection(
         let current_peer_addr = PeerBook::load(&home)
             .and_then(|book| book.resolve(&peer))
             .unwrap_or_else(|_| peer_addr.clone());
-        let (endpoint, generation) = {
+        let endpoint = {
             let current = endpoint_rx.borrow();
-            (current.endpoint.clone(), current.generation)
+            current.clone()
         };
+        let generation = endpoint.generation;
         let connected = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Ok(()),
@@ -4054,9 +4365,13 @@ async fn handle_shell_dial_socket_connection(
                 }
                 continue;
             }
-            connected = endpoint.connect(
-                current_peer_addr.clone(),
-                shell::RESUMABLE_SHELL_ALPN,
+            connected = peer_connections.open_stream(
+                &endpoint.endpoint,
+                endpoint.generation,
+                &current_peer_addr,
+                std::str::from_utf8(shell::RESUMABLE_SHELL_ALPN)
+                    .expect("shell ALPN is UTF-8"),
+                mux::StreamActivity::Application,
             ) => connected,
         };
         match connected {
@@ -4069,6 +4384,7 @@ async fn handle_shell_dial_socket_connection(
                 return tunnel::run_client_connection_with_initial(
                     local,
                     endpoint_rx,
+                    peer_connections,
                     home,
                     peer,
                     shell::RESUMABLE_SHELL_ALPN.to_vec(),
@@ -4080,7 +4396,9 @@ async fn handle_shell_dial_socket_connection(
                 .await;
             }
             Err(error) => {
-                let error = anyhow::Error::new(error);
+                if tunnel::is_permanent_failure(&error) {
+                    return Err(error.context("peer refused resumable shell"));
+                }
                 if shell_resumable_alpn_unsupported(&error) {
                     write_shell_protocol_status(
                         &mut local,
@@ -4388,6 +4706,7 @@ async fn run_dial_tcp_listener(
     drop_rx: watch::Receiver<u64>,
     dial_failures: Arc<FailureBackoff>,
     dial_slots: Arc<Semaphore>,
+    peer_connections: Arc<mux::PeerConnections>,
     gauge: Arc<tunnel::ClientAttachGauge>,
     recorder: ConnectionRecorder,
 ) {
@@ -4416,6 +4735,7 @@ async fn run_dial_tcp_listener(
                 let drop_rx = drop_rx.clone();
                 let dial_failures = dial_failures.clone();
                 let backoff_key = backoff_key.clone();
+                let peer_connections = peer_connections.clone();
                 let notices = Some(generic_dial_notices(
                     peer.clone(),
                     String::from_utf8_lossy(&alpn).to_string(),
@@ -4428,7 +4748,17 @@ async fn run_dial_tcp_listener(
                         return;
                     }
                     match
-                        tunnel::run_client_tcp_connection(local, endpoint_rx, home, peer, alpn, cancel, drop_rx, notices)
+                        tunnel::run_client_tcp_connection(
+                            local,
+                            endpoint_rx,
+                            peer_connections,
+                            home,
+                            peer,
+                            alpn,
+                            cancel,
+                            drop_rx,
+                            notices,
+                        )
                             .await
                     {
                         Ok(()) => dial_failures.record_success(&backoff_key).await,
@@ -4453,6 +4783,7 @@ async fn run_raw_dial_socket(
     daemon_cancel: CancellationToken,
     dial_failures: Arc<FailureBackoff>,
     dial_slots: Arc<Semaphore>,
+    peer_connections: Arc<mux::PeerConnections>,
     _lease: DialListenerLease,
 ) {
     let backoff_key = BackoffKey::dial(&peer_addr.id.to_string(), &alpn);
@@ -4476,18 +4807,27 @@ async fn run_raw_dial_socket(
                         permit
                     }
                 };
-                let endpoint = endpoint_rx.borrow().endpoint.clone();
+                let endpoint = endpoint_rx.borrow().clone();
                 let peer_addr = peer_addr.clone();
                 let alpn = alpn.clone();
                 let cancel = daemon_cancel.clone();
                 let dial_failures = dial_failures.clone();
                 let backoff_key = backoff_key.clone();
+                let peer_connections = peer_connections.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     if !dial_failures.wait(&backoff_key, &cancel).await {
                         return;
                     }
-                    match handle_raw_dial_socket_connection(local, endpoint, peer_addr, alpn).await {
+                    match handle_raw_dial_socket_connection(
+                        local,
+                        endpoint,
+                        peer_addr,
+                        alpn,
+                        peer_connections,
+                    )
+                    .await
+                    {
                         Ok(()) => dial_failures.record_success(&backoff_key).await,
                         Err(error) => {
                             dial_failures
@@ -4503,13 +4843,22 @@ async fn run_raw_dial_socket(
 
 async fn handle_raw_dial_socket_connection(
     local: UnixStream,
-    endpoint: Endpoint,
+    endpoint: CurrentEndpoint,
     peer_addr: EndpointAddr,
     alpn: Vec<u8>,
+    peer_connections: Arc<mux::PeerConnections>,
 ) -> Result<()> {
-    let connection = endpoint.connect(peer_addr, &alpn).await?;
-    let (send, recv) = connection.open_bi().await?;
-    pipe_unix_iroh(local, send, recv).await?;
+    let protocol = std::str::from_utf8(&alpn).context("protocol is not UTF-8")?;
+    let stream = peer_connections
+        .open_stream(
+            &endpoint.endpoint,
+            endpoint.generation,
+            &peer_addr,
+            protocol,
+            mux::StreamActivity::Application,
+        )
+        .await?;
+    pipe_unix_iroh(local, stream.send, stream.recv).await?;
     Ok(())
 }
 

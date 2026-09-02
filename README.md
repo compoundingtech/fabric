@@ -547,8 +547,17 @@ reported here — the latency buckets double in width, so around 50–200ms two
 genuinely different paths fall into the same bucket and print identical
 percentiles, hiding the difference this table exists to show.
 
-This reports facts and reaches no verdict. Nothing here labels a path degraded,
-and nothing changes routing based on it.
+Fabric also uses this evidence conservatively. Three consecutive samples must
+exceed both one second and eight times that transport class's baseline before
+Fabric closes the shared peer connection. The next stream creates a fresh
+multipath connection, so iroh can select direct or relay again. A 60-second
+per-peer cooldown prevents a redial storm. An endpoint generation change clears
+the old evidence.
+
+Git, sync, shell, exec, send-file, echo, and exposed services share this one
+connection as separate streams. Simultaneous cross-dials converge on one
+connection. Recent application traffic proves liveness, so Fabric skips the
+next redundant health probe for that peer.
 
 A peer is listed on probe evidence alone, so a healthy peer that has never
 dropped a session still shows its paths.

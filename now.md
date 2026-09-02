@@ -4,8 +4,8 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `f2c964a`.
-Silber and hetz run local build `0.2.0+f2c964a`. Bluey is deferred to Nathan._
+_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `4548b1e`.
+Silber and hetz run local build `0.2.0+4548b1e`. Bluey is deferred to Nathan._
 
 ## Current handoff — 2026-09-02
 
@@ -34,17 +34,18 @@ Bluey is Nathan's deferred task. It must run the old `make-explicit` helper and
 preserve its full ALPN matrix before it receives a strict binary. Do not wait for
 Bluey and do not count it as verified.
 
-The Git transport is live work on branch `feat/git-remote-transport`. The branch
-already has the `fabric/git/1` daemon path, the `git-remote-fabric` helper,
-bounded and separate output framing, an eight-session total limit, a four-session
-peer limit, and installer and updater helper repair. Its real two-node proof
-clones a 256 KiB object, denies a write under a read grant without running the
-receive hook, permits the same push after a write grant, and denies the next push
-after revocation.
+PR #108 added Git remotes and merged at `4548b1e`. Silber and hetz run that
+build. Each has the relative `git-remote-fabric -> fabric` helper and zero Git
+remotes. Nathan owns the first live share and grant.
 
-Finish, review, and merge the Git transport next. Then start the assigned
-degraded-path recovery slice. Do not deploy either slice unless a later native
-order says to change the live fleet.
+Degraded-path recovery is live work on branch `fix/degraded-path-recovery`.
+All outbound services now use `fabric/mux/1` streams on one shared multipath
+connection per peer pair. Simultaneous cross-dials converge on one connection.
+The health loop skips a redundant probe after recent application traffic. Three
+samples above one second and eight times baseline redial the peer connection.
+The classifier resets on endpoint generation changes and has a 60-second
+per-peer cooldown. Unit and focused two-daemon tests pass. Finish the full proof,
+review, and merge this slice. Do not deploy it without a later native order.
 
 ## Historical handoff — 2026-08-29 (Fable session; fleet moved to Codex)
 
