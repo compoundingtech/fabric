@@ -296,8 +296,11 @@ enum Commands {
         #[arg(long)]
         no_restart: bool,
         /// Put the most recent rollback binary back and restart.
-        #[arg(long, conflicts_with_all = ["tag", "url", "check", "dry_run"])]
+        #[arg(long, conflicts_with_all = ["tag", "url", "check", "dry_run", "allow_downgrade"])]
         rollback: bool,
+        /// Permit a release that is older than or diverges from this build.
+        #[arg(long)]
+        allow_downgrade: bool,
     },
     /// Internal/debug commands for transport testing.
     #[command(hide = true)]
@@ -1041,6 +1044,7 @@ async fn main() -> Result<()> {
                     dry_run,
                     no_restart,
                     rollback,
+                    allow_downgrade,
                 } => {
                     let result = update::run(
                         &home,
@@ -1052,6 +1056,7 @@ async fn main() -> Result<()> {
                             dry_run,
                             no_restart,
                             rollback,
+                            allow_downgrade,
                         },
                     )
                     .await;
