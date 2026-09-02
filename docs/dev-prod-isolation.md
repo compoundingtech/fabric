@@ -110,11 +110,10 @@ orphan (a minor leak) instead of being force-killed — an acceptable trade agai
 killing unrelated neighbors. (`mixed` is not enough: it still SIGKILLs the whole
 cgroup at the end, so a stuck neighbor still dies.)
 
-Two places to apply it (fold into the isolation follow-up, currently doc-only):
+Two places need it:
 
-- fabric's **generated** unit — `render_systemd_user_unit` in `src/service.rs`
-  currently sets no `KillMode` (defaults to `control-group`); add
-  `KillMode=process` there (+ a unit-render test).
+- fabric's **generated** unit uses `KillMode=process`. Its unit-render test
+  prevents the default cgroup-wide stop behavior from returning.
 - **hand-written** units like hetz's `fabric-keepalive.service` — an ops change,
   not fabric code; flag to add `KillMode=process` when convenient.
 
