@@ -4,7 +4,7 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `ae755c5`.
+_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `5c035dc`.
 Silber and hetz run `0.2.0+ae755c5`. Bluey is deferred to Nathan._
 
 ## Current handoff — 2026-09-02
@@ -116,12 +116,16 @@ the update. All 140 later ping streams passed from 16:34:58Z to 16:35:08Z, and
 no use-256 summary appeared. Neither machine logged a post-update fallback for
 the other. Hetz is active, enabled, and uses `KillMode=process`.
 
-The first PR #115 deterministic job exposed an unreliable existing recovery
-test. `a_tunnel_recovers_from_an_asymmetric_partition` stalled after a live
-session resumed. The other 28 daemon tests passed. Two targeted local runs
-passed, and the third reproduced the 60-second stall. The one allowed CI retry
-passed all 29 tests. The test is unreliable, not proven unrelated. Diagnose it
-next as a separate fix.
+The first PR #115 deterministic job exposed a lost tunnel notification wake.
+`a_tunnel_recovers_from_an_asymmetric_partition` stalled after a live session
+resumed. The writer checked state before it created its notification future.
+Data could arrive and notify existing waiters in that gap, then leave the
+writer asleep with bytes ready. PR #117 creates each future before the state
+check and merged at `5c035dc`. Before the fix, two targeted runs passed and the
+third reproduced the 63.56-second failure. After the fix, ten consecutive runs
+passed in a 54-second window. All 29 daemon-slice tests passed in 210.80 seconds,
+and all 409 active library tests passed in 24.38 seconds. The two measurement
+tests stayed ignored. This change is not deployed.
 
 PR #109 deterministic CI found two follow-up defects. A temporary debug tunnel
 block became a permanent mux denial, which returned early EOF in five recovery
@@ -133,9 +137,9 @@ The sixth CI failure was portable test setup, not transport behavior. Ubuntu
 made a bare Git remote whose HEAD named `master`, while the test pushed only
 `main`. PR #112 points the bare HEAD at `main` and merged at `6ee46a8`.
 
-The completed follow-up proof passes 409 active library tests, with two ignored
-tests. Its final CI retry passed all 29 daemon-slice tests. The next code fix is
-the unreliable asymmetric-partition recovery test above. Do not cut a release.
+The strict ACL, Git transport, shared mux, mixed-version fallback, bounded
+fallback, and lost-wake fixes are complete. The current order has no remaining
+code job. Do not cut a release. Wait for a native job.
 
 ## Historical handoff — 2026-08-29 (Fable session; fleet moved to Codex)
 
