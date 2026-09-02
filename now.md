@@ -4,7 +4,7 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `8eb296d`.
+_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `421eb45`.
 Silber and hetz run `0.2.0+ae755c5`. Bluey is deferred to Nathan._
 
 ## Current handoff — 2026-09-02
@@ -24,6 +24,37 @@ machine ran `fabric peers make-explicit` with old build `0.2.0+593a3f7` before
 its binary changed. The pre-migration, post-migration, and post-swap ALPN
 matrices are identical. Two-way exec works. Both sync entries are clean on both
 machines. Both services are active and enabled. Hetz has `KillMode=process`.
+
+At 18:42Z, Silber lost ping and exec control to hetz while the st2 bus still
+crossed the same peer pair. A dial failed after four mux reopen attempts because
+hetz closed a connection as a duplicate. Silber recycled its endpoint from
+generation 2 through generation 5. Hetz stayed active on generation 0 during
+the incident. One LOCAL Silber daemon restart restored a direct ping and exec
+at 18:51Z. If control fails again with `duplicate mux connection`, restart the
+local daemon first. If this failure recurs on `0.2.0+ae755c5`, roll Silber back
+without asking. Do not repeatedly restart it.
+
+Bluey was not a closed laptop during the incident. Its host answered over
+Tailscale in 62 milliseconds, but its Fabric endpoint stopped answering at
+18:23Z. This absence matters. When hetz missed a probe, the health loop saw no
+reachable peer and let Bluey's old failure count trigger an endpoint recycle.
+The same condition caused generation 2 to 3 at 18:40Z and generation 4 to 5 at
+18:50Z. The active investigation must separate this recycle trigger from the
+mux state that did not converge after recycling.
+
+Bluey is temporarily absent from Silber's live `peers.toml`. The file carries
+the reason and tells Nathan to re-add it after the strict allow-list migration.
+This removal makes the trigger rarer. It does not fix it. Silber now has one
+peer, so one missed hetz probe still means no reachable peer and can still
+recycle the endpoint.
+
+The incident `fabric restart` started a healthy daemon outside launchd. The
+orphan used the same home and node identity, so starting a second daemon beside
+it was unsafe. Silber stopped the orphan first and started the loaded launchd
+job once. Launchd owns PID 50433, and ping plus exec still work. This was the
+second critical process found without supervision tonight; the port 3080 relay
+was the other. Treat an unsupervised critical process as a shared host pattern,
+not as an isolated service detail.
 
 Silber permits the five service names `echo`, `exec`, `send-file`, `shell`, and
 `sync` for both peers. Hetz permits those five names plus `deskset-vnc`,
