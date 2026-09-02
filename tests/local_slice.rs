@@ -52,10 +52,7 @@ async fn git_clone_push_and_revocation_use_exact_repository_grants() -> Result<(
     let clone = clone_root.path().join("clone");
 
     git_ok(None, &["init", "--bare", remote.to_str().unwrap()])?;
-    git_ok(
-        Some(&remote),
-        &["symbolic-ref", "HEAD", "refs/heads/main"],
-    )?;
+    git_ok(Some(&remote), &["symbolic-ref", "HEAD", "refs/heads/main"])?;
     git_ok(Some(source), &["init"])?;
     git_ok(Some(source), &["config", "user.name", "Fabric Test"])?;
     git_ok(
@@ -120,11 +117,7 @@ async fn git_clone_push_and_revocation_use_exact_repository_grants() -> Result<(
 
     let cloned = run_git_process(
         None,
-        &[
-            "clone",
-            "fabric://server/mandat",
-            clone.to_str().unwrap(),
-        ],
+        &["clone", "fabric://server/mandat", clone.to_str().unwrap()],
         &fabric_env,
     )?;
     assert_process_ok("fabric clone", &cloned)?;
@@ -192,7 +185,10 @@ async fn git_clone_push_and_revocation_use_exact_repository_grants() -> Result<(
         &["push", "origin", "HEAD:refs/heads/main"],
         &fabric_env,
     )?;
-    assert!(!revoked.status.success(), "a revoked write grant still pushed");
+    assert!(
+        !revoked.status.success(),
+        "a revoked write grant still pushed"
+    );
     assert_eq!(git_bare_head(&remote)?, second);
 
     client.shutdown().await?;
@@ -896,6 +892,7 @@ async fn separate_peer_and_daemon_configs_restore_on_restart() -> Result<()> {
     let node_a_home = FabricHome::new(node_a_dir.path());
     let node_b_home = FabricHome::new(node_b_dir.path());
 
+    set_machine_services(&node_a_home, true, false)?;
     let node_a = FabricNode::start_with_options(node_a_home.clone(), true).await?;
     let node_b = FabricNode::start(node_b_home.clone()).await?;
 
@@ -926,10 +923,11 @@ async fn separate_peer_and_daemon_configs_restore_on_restart() -> Result<()> {
         "daemon config should be persisted to config.toml"
     );
     let raw_config = fs::read_to_string(node_a_home.config_path())?;
-    assert!(raw_config.contains("allow_shell = true"));
+    assert!(!raw_config.contains("allow_shell"));
     assert!(raw_config.contains("stdio-cat"));
     assert!(!raw_config.contains("node-b"));
     let raw_peers = fs::read_to_string(node_a_home.peers_path())?;
+    assert!(raw_peers.contains("allow_shell = true"));
     assert!(raw_peers.contains("node-b"));
 
     node_a.shutdown().await?;
@@ -1353,7 +1351,7 @@ async fn declarative_peer_config_can_be_reloaded_without_restart() -> Result<()>
     fs::write(
         node_a_home.peers_path(),
         format!(
-            "[[peers]]\nid = \"{}\"\nname = \"node-b\"\nallow = [\"echo\"]\n",
+            "allow_shell = true\nallow_exec = false\n\n[[peers]]\nid = \"{}\"\nname = \"node-b\"\nallow = [\"echo\"]\n",
             node_b.id()
         ),
     )?;
@@ -1379,7 +1377,7 @@ async fn peer_file_remains_authoritative_when_daemon_config_is_created() -> Resu
     fs::write(
         node_a_home.peers_path(),
         format!(
-            "[[peers]]\nid = \"{}\"\nname = \"node-b\"\nallow = [\"echo\"]\n",
+            "allow_shell = true\n\n[[peers]]\nid = \"{}\"\nname = \"node-b\"\nallow = [\"echo\"]\n",
             node_b.id()
         ),
     )?;
@@ -1397,9 +1395,7 @@ async fn peer_file_remains_authoritative_when_daemon_config_is_created() -> Resu
     assert_status_shell_allowed(&node_a_home).await?;
     let ping = node_b.ping("node-a").await?;
     assert_eq!(ping.bytes, 32);
-    let raw_config = fs::read_to_string(node_a_home.config_path())?;
-    assert!(raw_config.contains("allow_shell = true"));
-    assert!(!raw_config.contains("node-b"));
+    assert!(!node_a_home.config_path().exists());
     assert!(
         node_a_home.peers_path().exists(),
         "peers.toml should remain the authoritative allow-list"
@@ -1555,6 +1551,13 @@ async fn trust_peer(
     Ok(())
 }
 
+fn set_machine_services(home: &FabricHome, allow_shell: bool, allow_exec: bool) -> Result<()> {
+    let mut peers = PeerBook::load(home)?;
+    peers.set_allow_shell(allow_shell);
+    peers.set_allow_exec(allow_exec);
+    peers.save(home)
+}
+
 async fn exposed_protocols(home: &FabricHome) -> Result<Vec<String>> {
     let response = wait_for_status(home).await?;
     let ControlResponse::Status {
@@ -1655,7 +1658,10 @@ fn run_git_process(
     env: &[(&str, &OsStr)],
 ) -> Result<std::process::Output> {
     let mut command = Command::new("git");
-    command.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -1985,8 +1991,22 @@ async fn tcp_tunnel_pair() -> Result<(
     let b_home = FabricHome::new(b_dir.path());
     let node_a = FabricNode::start(a_home.clone()).await?;
     let node_b = FabricNode::start(b_home.clone()).await?;
-    trust_peer(&a_home, &node_a, node_b.id(), Some("node-b"), Some(node_b.addr())).await?;
-    trust_peer(&b_home, &node_b, node_a.id(), Some("node-a"), Some(node_a.addr())).await?;
+    trust_peer(
+        &a_home,
+        &node_a,
+        node_b.id(),
+        Some("node-b"),
+        Some(node_b.addr()),
+    )
+    .await?;
+    trust_peer(
+        &b_home,
+        &node_b,
+        node_a.id(),
+        Some("node-a"),
+        Some(node_a.addr()),
+    )
+    .await?;
 
     let (echo_addr, hits, task) = spawn_tcp_echo_service().await?;
     run_fabric(&a_home, &["expose", "web", "--tcp", echo_addr.as_str()])?;
@@ -1997,7 +2017,9 @@ async fn tcp_tunnel_pair() -> Result<(
     // the resulting timeout looks like a recovery failure in whichever test
     // happens to be running.
     time_until_tunnel_carries(&local_addr, b"ready").await?;
-    Ok((a_dir, b_dir, a_home, b_home, node_a, node_b, local_addr, hits, task))
+    Ok((
+        a_dir, b_dir, a_home, b_home, node_a, node_b, local_addr, hits, task,
+    ))
 }
 
 /// MODE 3: ASYMMETRIC. The exposing side stops accepting, while its own
@@ -2111,8 +2133,10 @@ async fn flapping_does_not_make_recovery_slower_than_the_outage() -> Result<()> 
         Ok::<(), anyhow::Error>(())
     })
     .await
-    .context("the LIVE connection never resumed after flapping, even allowing for \
-              a fresh three-step reconnect sequence")??;
+    .context(
+        "the LIVE connection never resumed after flapping, even allowing for \
+              a fresh three-step reconnect sequence",
+    )??;
     let live_took = resumed.elapsed();
 
     let took = time_until_tunnel_carries(&local_addr, b"new-after-flapping").await?;
@@ -2176,7 +2200,14 @@ async fn a_peer_not_permitted_for_a_service_cannot_reach_it() -> Result<()> {
         &["echo"],
     )
     .await?;
-    trust_peer(&b_home, &node_b, node_a.id(), Some("node-a"), Some(node_a.addr())).await?;
+    trust_peer(
+        &b_home,
+        &node_b,
+        node_a.id(),
+        Some("node-a"),
+        Some(node_a.addr()),
+    )
+    .await?;
 
     let (echo_addr, hits, task) = spawn_tcp_echo_service().await?;
     run_fabric(&a_home, &["expose", "web", "--tcp", echo_addr.as_str()])?;
@@ -2253,8 +2284,22 @@ async fn a_peer_restarting_mid_session_restores_service_without_intervention() -
     let b_home = FabricHome::new(b_dir.path());
     let node_a = FabricNode::start(a_home.clone()).await?;
     let node_b = FabricNode::start(b_home.clone()).await?;
-    trust_peer(&a_home, &node_a, node_b.id(), Some("node-b"), Some(node_b.addr())).await?;
-    trust_peer(&b_home, &node_b, node_a.id(), Some("node-a"), Some(node_a.addr())).await?;
+    trust_peer(
+        &a_home,
+        &node_a,
+        node_b.id(),
+        Some("node-b"),
+        Some(node_b.addr()),
+    )
+    .await?;
+    trust_peer(
+        &b_home,
+        &node_b,
+        node_a.id(),
+        Some("node-a"),
+        Some(node_a.addr()),
+    )
+    .await?;
 
     let (echo_addr, hits, task) = spawn_tcp_echo_service().await?;
     run_fabric(&a_home, &["expose", "web", "--tcp", echo_addr.as_str()])?;
@@ -2312,7 +2357,14 @@ async fn a_peer_restarting_mid_session_restores_service_without_intervention() -
     );
 
     let node_a = FabricNode::start(a_home.clone()).await?;
-    trust_peer(&a_home, &node_a, node_b.id(), Some("node-b"), Some(node_b.addr())).await?;
+    trust_peer(
+        &a_home,
+        &node_a,
+        node_b.id(),
+        Some("node-b"),
+        Some(node_b.addr()),
+    )
+    .await?;
 
     // Half one: a NEW request, which is a person reloading the page.
     let fresh = time_until_tunnel_carries(&local_addr, b"after-restart").await?;

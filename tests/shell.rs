@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use fabric::{
     config::{FabricHome, PeerBook},
-    daemon::FabricNode,
+    daemon::{DaemonOptions, FabricNode},
     shell::{self, ServerFrame},
 };
 use iroh::{
@@ -24,6 +24,18 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 fn fabric_bin() -> &'static str {
     env!("CARGO_BIN_EXE_fabric")
+}
+
+fn set_machine_services(home: &FabricHome, allow_shell: bool, allow_exec: bool) -> Result<()> {
+    let mut book = PeerBook::load(home)?;
+    book.set_allow_shell(allow_shell);
+    book.set_allow_exec(allow_exec);
+    book.save(home)
+}
+
+async fn start_shell_server(home: FabricHome) -> Result<FabricNode> {
+    set_machine_services(&home, true, false)?;
+    FabricNode::start_with_options(home, true).await
 }
 
 fn run_shell(home: &FabricHome, peer: &str, input: &str) -> Result<Output> {
@@ -210,7 +222,7 @@ async fn unavailable_old_peer_later_falls_back_to_raw_shell_zero() -> Result<()>
 async fn legacy_raw_shell_zero_client_talks_to_new_server() -> Result<()> {
     let server_dir = TempDir::new()?;
     let server_home = FabricHome::new(server_dir.path());
-    let server = FabricNode::start_with_options(server_home.clone(), true).await?;
+    let server = start_shell_server(server_home.clone()).await?;
     let legacy_client = Endpoint::bind(presets::N0).await?;
     trust_peer(
         &server_home,
@@ -263,7 +275,7 @@ async fn resumable_shell_one_survives_transport_drop() -> Result<()> {
     let client_dir = TempDir::new()?;
     let server_home = FabricHome::new(server_dir.path());
     let client_home = FabricHome::new(client_dir.path());
-    let server = FabricNode::start_with_options(server_home.clone(), true).await?;
+    let server = start_shell_server(server_home.clone()).await?;
     let client = FabricNode::start(client_home.clone()).await?;
     trust_peer(
         &server_home,
@@ -358,7 +370,7 @@ async fn shell_past_detached_ttl_reports_the_session_is_gone() -> Result<()> {
     let client_dir = TempDir::new()?;
     let server_home = FabricHome::new(server_dir.path());
     let client_home = FabricHome::new(client_dir.path());
-    let server = FabricNode::start_with_options(server_home.clone(), true).await?;
+    let server = start_shell_server(server_home.clone()).await?;
     let client = FabricNode::start(client_home.clone()).await?;
     trust_peer(
         &server_home,
@@ -403,7 +415,7 @@ async fn shell_past_detached_ttl_reports_the_session_is_gone() -> Result<()> {
     // Lose the session for real: the restarted daemon keeps its identity and
     // its allow-list, and has no memory of any session.
     server.shutdown().await?;
-    let server = FabricNode::start_with_options(server_home.clone(), true).await?;
+    let server = start_shell_server(server_home.clone()).await?;
     trust_peer(
         &client_home,
         &client,
@@ -459,7 +471,7 @@ async fn shell_sigterm_restores_exact_terminal_mode() -> Result<()> {
     let client_dir = TempDir::new()?;
     let server_home = FabricHome::new(server_dir.path());
     let client_home = FabricHome::new(client_dir.path());
-    let server = FabricNode::start_with_options(server_home.clone(), true).await?;
+    let server = start_shell_server(server_home.clone()).await?;
     let client = FabricNode::start(client_home.clone()).await?;
     trust_peer(
         &server_home,
@@ -536,6 +548,7 @@ async fn restart_from_remote_shell_detaches_and_preserves_allow_shell() -> Resul
     let node_b_home = FabricHome::new(node_b_dir.path());
     let _node_a_guard = CliDaemonGuard::new(node_a_home.clone());
 
+    set_machine_services(&node_a_home, true, false)?;
     let output = fabric_output(&node_a_home, &["up", "--allow-shell"])?;
     assert_success(&output, "fabric up --allow-shell");
     wait_for_cli_status(&node_a_home, true).await?;
@@ -635,7 +648,7 @@ async fn trusted_peer_with_allow_shell_runs_remote_shell_and_propagates_exit() -
     let node_a_home = FabricHome::new(node_a_dir.path());
     let node_b_home = FabricHome::new(node_b_dir.path());
 
-    let node_a = FabricNode::start_with_options(node_a_home.clone(), true).await?;
+    let node_a = start_shell_server(node_a_home.clone()).await?;
     let node_b = FabricNode::start(node_b_home.clone()).await?;
     trust_peer(
         &node_a_home,
@@ -679,7 +692,7 @@ async fn remote_shell_exposes_fabric_marker_env() -> Result<()> {
     let node_a_home = FabricHome::new(node_a_dir.path());
     let node_b_home = FabricHome::new(node_b_dir.path());
 
-    let node_a = FabricNode::start_with_options(node_a_home.clone(), true).await?;
+    let node_a = start_shell_server(node_a_home.clone()).await?;
     let node_b = FabricNode::start(node_b_home.clone()).await?;
     trust_peer(
         &node_a_home,
@@ -726,7 +739,16 @@ async fn trusted_peer_without_allow_shell_is_refused() -> Result<()> {
     let node_a_home = FabricHome::new(node_a_dir.path());
     let node_b_home = FabricHome::new(node_b_dir.path());
 
-    let node_a = FabricNode::start(node_a_home.clone()).await?;
+    // The compatibility flags cannot override the closed machine settings.
+    let node_a = FabricNode::start_with_daemon_options(
+        node_a_home.clone(),
+        DaemonOptions {
+            allow_shell: true,
+            allow_exec: true,
+            ..DaemonOptions::default()
+        },
+    )
+    .await?;
     let node_b = FabricNode::start(node_b_home.clone()).await?;
     trust_peer(
         &node_a_home,
@@ -744,6 +766,15 @@ async fn trusted_peer_without_allow_shell_is_refused() -> Result<()> {
         Some(node_a.addr()),
     )
     .await?;
+    let mut node_a_peers = PeerBook::load(&node_a_home)?;
+    node_a_peers.add_with_allow(
+        node_b.id(),
+        Some("node-b".to_string()),
+        Some(node_b.addr()),
+        Some(vec!["shell".to_string(), "exec".to_string()]),
+    );
+    node_a_peers.save(&node_a_home)?;
+    node_a.state().reload_peers().await?;
     wait_for_cli_status(&node_b_home, false).await?;
 
     let output = run_shell(&node_b_home, "node-a", "exit 0\n")?;
@@ -753,6 +784,18 @@ async fn trusted_peer_without_allow_shell_is_refused() -> Result<()> {
         "stderr was: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+
+    let marker = node_a_dir.path().join("exec-must-not-run");
+    let marker_arg = marker.to_string_lossy();
+    let output = fabric_output(
+        &node_b_home,
+        &["exec", "node-a", "--", "/usr/bin/touch", &marker_arg],
+    )?;
+    assert!(
+        !output.status.success(),
+        "a compatibility flag opened remote exec"
+    );
+    assert!(!marker.exists(), "the refused remote command ran");
 
     node_b.shutdown().await?;
     node_a.shutdown().await?;
@@ -766,7 +809,7 @@ async fn untrusted_peer_is_refused_even_when_shell_is_allowed() -> Result<()> {
     let node_a_home = FabricHome::new(node_a_dir.path());
     let node_c_home = FabricHome::new(node_c_dir.path());
 
-    let node_a = FabricNode::start_with_options(node_a_home.clone(), true).await?;
+    let node_a = start_shell_server(node_a_home.clone()).await?;
     let node_c = FabricNode::start(node_c_home.clone()).await?;
     trust_peer(
         &node_c_home,

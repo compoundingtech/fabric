@@ -49,7 +49,7 @@ where
     write_server_frame(
         send,
         ServerFrame::Error(
-            "remote shell is disabled; start the server with `fabric up --allow-shell`".to_string(),
+            "remote shell is disabled; set allow_shell = true in peers.toml".to_string(),
         ),
     )
     .await?;

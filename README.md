@@ -118,7 +118,7 @@ while st2/PTY owns the PTY child, terminal policy, and lifecycle/expiry.
 ```sh
 curl -sSf https://raw.githubusercontent.com/compoundingtech/fabric/main/install.sh | sh
 fabric --version
-fabric service install --allow-shell   # launchd/systemd daemon; survives reboot + sleep/wake
+fabric service install                 # launchd/systemd daemon; survives reboot + sleep/wake
 fabric id                               # copy this — the NEW machine's NodeID
 ```
 
@@ -152,15 +152,15 @@ fabric exec server -- ~/.local/bin/fabric add <NEW_NODEID> laptop
 fabric exec server -- ~/.local/bin/fabric reload-peers
 ```
 
-(`fabric exec` requires the server to have opted in with `--allow-exec`; otherwise
-`ssh` in and run the same two commands.)
+(`fabric exec` requires `allow_exec = true` in the server's `peers.toml`.
+Otherwise, use SSH to run the same two commands.)
 
 ### 4. Verify from the new machine
 
 ```sh
 fabric status                     # each peer should show as reachable
 fabric ping server                # prints pong + latency + transport (direct/relay)
-fabric exec server -- echo ok     # if that peer enabled --allow-exec; prints ok, exit 0
+fabric exec server -- echo ok     # if that peer enables exec; prints ok, exit 0
 ```
 
 If `ping`/`status` shows a peer unreachable, the usual cause is one-sided trust —
@@ -269,40 +269,38 @@ lets the OS kill fabric during a successful self-heal.
 ### Enabling remote shell and exec
 
 Both remote shell (`fabric shell <peer>`) and non-interactive remote exec
-(`fabric exec <peer> -- <cmd>`) are **default-deny** — a peer serves them only if
-it has opted in. They are independent (allowing one does not allow the other):
-`fabric shell` needs `allow_shell`, `fabric exec` needs `allow_exec`.
+(`fabric exec <peer> -- <cmd>`) are **default-deny**. The top-level
+`allow_shell` and `allow_exec` settings in `peers.toml` control what this
+machine serves. A missing setting is false.
 
 **Check what a daemon serves** by running `fabric status` on it — it prints
 `shell allowed` / `disabled` and `exec allowed` / `disabled`.
 
-These flags are **daemon-global** and only subtract access. A peer also needs its
-own `peers.toml` `allow` list to contain `shell` or `exec`. A peer with no
-`allow` field has no grants. The daemon-global flag must also enable that
-capability.
+Each peer also needs an `allow` list that contains `shell` or `exec`. A peer
+with no `allow` field has no grants. Both the machine setting and the peer grant
+must permit the service.
 
-Enable them with flags on `fabric service install`:
+Set the machine policy at the top of `peers.toml`:
 
-```sh
-fabric service install --allow-shell                # serve remote shell
-fabric service install --allow-shell --allow-exec   # serve both
-fabric service install --no-allow-shell             # persist shell OFF (also --no-allow-exec)
+```toml
+allow_shell = true
+allow_exec = true
+
+[[peers]]
+id = "<peer-node-id>"
+name = "desktop"
+allow = ["echo", "shell", "exec"]
 ```
 
-**On an already-installed daemon, enable the same way** — just re-run
-`fabric service install` with the flags you want:
+Reload the file after each policy change:
 
 ```sh
-fabric service install --allow-shell --allow-exec
+fabric reload-peers
 ```
 
-The allow flags are read when the daemon **starts**, so re-installing restarts the
-managed daemon to apply them (a brief interruption to any connections currently
-going through it). Run it **locally or from an independent shell — not over a
-`fabric shell` to that same machine**, which would sever the connection driving
-the restart. Confirm afterward with `fabric status`, which prints `shell allowed`
-and `exec allowed`. (For an unmanaged `fabric up` daemon, use
-`fabric restart --allow-shell` instead of re-installing.)
+The daemon applies both machine settings during `reload-peers`. Confirm the
+result with `fabric status`. The old command flags remain accepted for
+compatibility, but they do not decide the policy.
 
 If `fabric shell <peer>` or `fabric exec <peer> -- …` fails with
 `unknown peer <peer>`, the problem is on the **calling** side, not the target: the
@@ -736,8 +734,8 @@ daemon and logs to `<home>/logs/daemon.log`. After the daemon is ready, `fabric
 up` runs the same echo-ping reachability check used by `fabric status` and
 prints one line per trusted peer.
 
-`--allow-shell` opts this daemon into serving remote shells for trusted peers.
-It is off by default.
+`--allow-shell` remains accepted for compatibility. It does not change the
+policy. Set the top-level `allow_shell` field in `peers.toml` instead.
 
 ```sh
 fabric down
@@ -754,9 +752,8 @@ before the running daemon goes down. This is safe to run over `fabric shell`: th
 helper writes progress to `<home>/logs/restart.log`, stops the old daemon, and
 starts a fresh one even if the invoking shell connection drops.
 
-Plain `fabric restart` preserves the running daemon's flags, including
-`--allow-shell`. Use `--allow-shell` or `--no-allow-shell` to force the restarted
-daemon's shell policy.
+The `--allow-shell` and `--no-allow-shell` options remain accepted for
+compatibility. They do not change the policy in `peers.toml`.
 
 ```sh
 fabric addr
@@ -849,19 +846,16 @@ machine.
 fabric shell <peer>
 ```
 
-Open an interactive remote shell on a trusted peer over fabric. The server side
-must have been started with `fabric up --allow-shell`; a default `fabric up`
-refuses shell requests. The shell runs as the remote daemon's user and uses the
-remote user's `$SHELL`. Current peers negotiate resumable `fabric/shell/1`, so
-the same remote PTY survives a transient transport drop. A new client
+Open an interactive remote shell on a trusted peer over fabric. The server needs
+top-level `allow_shell = true` and a `shell` grant for the caller in
+`peers.toml`. The shell runs as the remote daemon's user and uses the remote
+user's `$SHELL`. Current peers negotiate resumable `fabric/shell/1`, so the
+same remote PTY survives a transient transport drop. A new client
 automatically falls back to the byte-compatible one-shot `fabric/shell/0`
 protocol when the peer is running an older Fabric release.
 
-Enabling shell is a security-sensitive opt-in: every trusted peer in
-`peers.toml` can obtain a remote shell while `--allow-shell` is active. Keep the
-allow-list tight, enable shell only on machines where that access is intended,
-and use `fabric restart --no-allow-shell` to turn it back off without risking a
-lockout.
+Enabling shell is a security-sensitive opt-in. Keep each peer's `allow` list
+tight. Set `allow_shell = false` and reload the file to turn shell off.
 
 ```sh
 fabric service install [--allow-shell | --no-allow-shell] [--memory-max-mb N]
@@ -876,8 +870,9 @@ delegates to `systemctl --user status fabric.service --no-pager` on Linux and
 managed service and removes only the systemd/launchd artifact; it leaves the
 fabric home, identity, peers, logs, and config in place. No memory ceiling is
 set unless `--memory-max-mb` is passed, and `--no-memory-max-mb` removes one
-that was. Set one only after validating that endpoint recycle can complete
-below that cap on the target machine.
+that was. The shell and exec flags remain accepted for compatibility, but they
+do not decide policy. Set one memory limit only after validating that endpoint
+recycle can complete below that cap on the target machine.
 
 ### Debug Transport Test Commands
 
@@ -1197,8 +1192,9 @@ and retry; do not weaken the include lists to make the proof pass.
 ## Declarative Peer Config
 
 `peers.toml` is Fabric's allow-list file. It is intentionally
-human-editable and can be provisioned before Fabric ever runs. Each
-`[[peers]]` entry accepts:
+human-editable and can be provisioned before Fabric ever runs. The top-level
+`allow_shell` and `allow_exec` fields control the services this machine offers.
+Each field defaults to false. Each `[[peers]]` entry accepts:
 
 - `id` (required): the peer's 64-character hexadecimal iroh NodeID.
 - `name` (optional): a non-empty, unique local alias for commands such as
@@ -1217,7 +1213,7 @@ maps a logical remote name to an absolute host-local Git directory.
 Trust is local and based on NodeID, not alias: `name` is only a command-line
 label. Each machine must independently list the other NodeID. The `allow` list
 grants named services such as `sync`, `shell`, `exec`, or an exposure name.
-Anything unlisted is refused. The daemon-global shell and exec flags still
+Anything unlisted is refused. The machine-level shell and exec settings also
 apply and cannot be overridden by a peer entry.
 
 A file can grant no services to one peer and exact services to another:

@@ -377,6 +377,15 @@ impl std::fmt::Display for Denied {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct PeerBook {
+    /// Does this machine serve remote shells at all?
+    ///
+    /// This is separate from each peer's grant. Both gates must permit the
+    /// service. Absence defaults closed, like an omitted peer grant.
+    #[serde(default)]
+    allow_shell: bool,
+    /// Does this machine serve remote command execution at all?
+    #[serde(default)]
+    allow_exec: bool,
     peers: Vec<Peer>,
     #[serde(default)]
     git_remotes: Vec<GitRemote>,
@@ -399,6 +408,8 @@ impl PeerBook {
         }
 
         let book = Self {
+            allow_shell: config.allow_shell().unwrap_or(false),
+            allow_exec: config.allow_exec().unwrap_or(false),
             peers: std::mem::take(&mut config.peers),
             git_remotes: Vec::new(),
         };
@@ -436,6 +447,12 @@ impl PeerBook {
     const PEER_FILE_HEADER: &'static str = "\
 # fabric peers. Written by `fabric add` and `fabric remove`; safe to edit.
 #
+# allow_shell  whether this machine serves remote shells.
+# allow_exec   whether this machine serves remote command execution.
+#        Both settings default to false when absent. The command-line flags
+#        with the same names are accepted for compatibility but do not change
+#        these settings. Each peer also needs the matching service grant.
+#
 # id     the peer's identity. PERMISSIONS KEY ON THIS AND ONLY THIS.
 # name   a local label for your convenience. You can rename it at any time,
 #        and nothing about permissions follows the rename. Never write a rule
@@ -456,7 +473,11 @@ impl PeerBook {
     fn write_peer_file(&self, home: &FabricHome) -> Result<()> {
         home.prepare()?;
         let path = home.peers_path();
-        let raw = format!("{}{}", Self::PEER_FILE_HEADER, toml::to_string_pretty(self)?);
+        let raw = format!(
+            "{}{}",
+            Self::PEER_FILE_HEADER,
+            toml::to_string_pretty(self)?
+        );
         write_atomic(&path, raw.as_bytes())
     }
 
@@ -476,6 +497,22 @@ impl PeerBook {
         &self.peers
     }
 
+    pub fn allow_shell(&self) -> bool {
+        self.allow_shell
+    }
+
+    pub fn allow_exec(&self) -> bool {
+        self.allow_exec
+    }
+
+    pub fn set_allow_shell(&mut self, allow_shell: bool) {
+        self.allow_shell = allow_shell;
+    }
+
+    pub fn set_allow_exec(&mut self, allow_exec: bool) {
+        self.allow_exec = allow_exec;
+    }
+
     pub fn git_remotes(&self) -> &[GitRemote] {
         &self.git_remotes
     }
@@ -490,15 +527,14 @@ impl PeerBook {
             bail!("Git remote path must be absolute: {}", path.display());
         }
         if self.git_remote(name).is_some() {
-            bail!(
-                "Git remote {name:?} is already shared; unshare it before changing its path"
-            );
+            bail!("Git remote {name:?} is already shared; unshare it before changing its path");
         }
         self.git_remotes.push(GitRemote {
             name: name.to_string(),
             path,
         });
-        self.git_remotes.sort_by(|left, right| left.name.cmp(&right.name));
+        self.git_remotes
+            .sort_by(|left, right| left.name.cmp(&right.name));
         Ok(())
     }
 
@@ -511,7 +547,8 @@ impl PeerBook {
         }
         let prefix = format!("git/{name}/");
         for peer in &mut self.peers {
-            peer.allow.retain(|permission| !permission.starts_with(&prefix));
+            peer.allow
+                .retain(|permission| !permission.starts_with(&prefix));
         }
         Ok(())
     }
@@ -567,10 +604,8 @@ impl PeerBook {
     /// Trusted and permitted are two different answers. A peer absent from the
     /// book is `NotTrusted`; a peer present but restricted is `NotPermitted`.
     ///
-    /// This does NOT consult the daemon-wide `allow_shell` / `allow_exec`
-    /// flags. Those are a blanket that subtracts and never adds, applied by the
-    /// caller, so that a machine saying "no incoming exec, ever" cannot be
-    /// overridden by an entry in a file.
+    /// This checks the per-peer grant. The caller applies the machine-level
+    /// `allow_shell` and `allow_exec` settings from this same file.
     pub fn may(&self, id: &EndpointId, service: &str) -> Result<(), Denied> {
         let Some(peer) = self.peers.iter().find(|peer| peer.id == *id) else {
             return Err(Denied::NotTrusted);
@@ -718,9 +753,7 @@ impl PeerBook {
                     bail!("invalid Git permission {permission:?}");
                 }
                 if !remote_names.contains(remote) {
-                    bail!(
-                        "Git permission {permission:?} names an unshared remote {remote:?}"
-                    );
+                    bail!("Git permission {permission:?} names an unshared remote {remote:?}");
                 }
             }
         }
@@ -742,15 +775,15 @@ pub fn validate_git_remote_name(name: &str) -> Result<()> {
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     {
-        bail!(
-            "Git remote name may contain only ASCII letters, digits, dot, underscore, and dash"
-        );
+        bail!("Git remote name may contain only ASCII letters, digits, dot, underscore, and dash");
     }
     Ok(())
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let permissions = fs::metadata(path).ok().map(|metadata| metadata.permissions());
+    let permissions = fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions());
     let temp = path.with_extension(format!(
         "toml.fabric-tmp-{}-{}",
         std::process::id(),
@@ -958,6 +991,8 @@ impl FabricConfig {
 
     fn validate(&self) -> Result<()> {
         PeerBook {
+            allow_shell: false,
+            allow_exec: false,
             peers: self.peers.clone(),
             git_remotes: Vec::new(),
         }
@@ -1129,9 +1164,8 @@ mod tests {
         let id = an_id(1);
         let omitted: PeerBook = toml::from_str(&format!("[[peers]]\nid = \"{id}\"\n"))
             .expect("an omitted allow field must parse");
-        let explicit: PeerBook =
-            toml::from_str(&format!("[[peers]]\nid = \"{id}\"\nallow = []\n"))
-                .expect("an explicit empty allow field must parse");
+        let explicit: PeerBook = toml::from_str(&format!("[[peers]]\nid = \"{id}\"\nallow = []\n"))
+            .expect("an explicit empty allow field must parse");
 
         for service in ["sync", "shell", "anything-exposed-later"] {
             assert_eq!(omitted.may(&id, service), explicit.may(&id, service));
@@ -1258,13 +1292,19 @@ mod tests {
             .unwrap();
         book.save(&home).unwrap();
 
-        let mode = fs::metadata(home.peers_path()).unwrap().permissions().mode() & 0o777;
+        let mode = fs::metadata(home.peers_path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o640);
     }
 
     #[test]
     fn generic_exposures_cannot_take_the_git_namespace() {
-        let error = validate_protocol("git/mandat/read").unwrap_err().to_string();
+        let error = validate_protocol("git/mandat/read")
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("reserved"), "wrong refusal: {error}");
     }
 
@@ -1322,7 +1362,12 @@ mod tests {
     fn re_adding_a_peer_keeps_its_permissions() {
         let mut book = PeerBook::default();
         let droppy = an_id(4);
-        book.add_with_allow(droppy, Some("droppy".into()), None, Some(vec!["web".into()]));
+        book.add_with_allow(
+            droppy,
+            Some("droppy".into()),
+            None,
+            Some(vec!["web".into()]),
+        );
         book.add(droppy, Some("droppy".into()), None);
         assert_eq!(
             book.may(&droppy, "shell"),
@@ -1501,6 +1546,23 @@ mod tests {
         book.validate().unwrap();
         assert_eq!(book.peers().len(), 1);
         assert_eq!(book.peers()[0].addr.as_ref().unwrap().id, id);
+    }
+
+    #[test]
+    fn machine_service_settings_default_closed_and_round_trip() {
+        let mut book = PeerBook::default();
+        assert!(!book.allow_shell());
+        assert!(!book.allow_exec());
+
+        book.set_allow_shell(true);
+        book.set_allow_exec(true);
+        let raw = toml::to_string_pretty(&book).unwrap();
+        assert!(raw.contains("allow_shell = true"));
+        assert!(raw.contains("allow_exec = true"));
+
+        let loaded: PeerBook = toml::from_str(&raw).unwrap();
+        assert!(loaded.allow_shell());
+        assert!(loaded.allow_exec());
     }
 
     #[test]
