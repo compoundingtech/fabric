@@ -13,10 +13,13 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   one authenticated connection per peer pair. Simultaneous cross-dials select
   one connection and close the duplicate. A new client tries `fabric/mux/1`
   first. It uses an uncached direct ALPN only when the peer explicitly rejects
-  mux. Other connection failures do not cause a downgrade. Each later stream
-  retries mux, so upgraded peers converge without a coordinated restart. The
-  validation log records the fallback reason once per peer and endpoint
-  generation. New servers continue to accept old direct-ALPN clients.
+  mux. Other connection failures do not cause a downgrade. Later streams skip
+  the rejected mux handshake for 60 seconds. One stream then re-probes mux, so
+  upgraded peers converge without a coordinated restart. The validation log
+  records the fallback reason once per peer and endpoint generation. It records
+  cumulative fallback use at powers of two, so repeated use stays visible
+  without one log line per stream. New servers continue to accept old
+  direct-ALPN clients.
 
 - **Persistently slow paths recover without a daemon restart.** The peer health
   loop records every selected path and its RTT. It redials a shared connection

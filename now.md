@@ -4,8 +4,8 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `36da539`.
-Silber and hetz run local build `0.2.0+4548b1e`. Bluey is deferred to Nathan._
+_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `36158f6`.
+Silber runs `0.2.0+36158f6`; hetz runs `0.2.0+4548b1e`. Bluey is deferred to Nathan._
 
 ## Current handoff — 2026-09-02
 
@@ -47,12 +47,11 @@ resets on endpoint generation changes and has a 60-second per-peer cooldown.
 The full local proof passed: 406 library tests, 29 daemon-slice tests, 18
 folder-sync tests, 12 shell tests, and all smaller integration slices.
 
-The live WAN proof and the 24-hour idle-cost window remain. A compatibility
-follow-up is in flight before any deployment. A new client must use an uncached
-direct ALPN only after an explicit mux ALPN rejection. It must retry mux on each
-later stream. Old clients must remain compatible with new servers. Silber.cos
-owns the deployment decision. Do not deploy or cut a release without a later
-native order.
+The live WAN proof and the 24-hour idle-cost window remain. PR #114 added the
+mixed-version compatibility fallback and merged at `36158f6`. A new client uses
+an uncached direct ALPN only after an explicit mux ALPN rejection. Old clients
+remain compatible with new servers. Silber deployed `0.2.0+36158f6`; hetz still
+runs `0.2.0+4548b1e`.
 
 The compatibility candidate passed an actual two-build proof in isolated
 homes. Build `0.2.0+4548b1e` and the new candidate exchanged ping and exec
@@ -61,6 +60,42 @@ services. After the old side changed to the new candidate, two pings and one
 exec passed, and the fallback count stayed at one. The in-process proof also
 shows zero cached peers during fallback and one shared connection after mux
 becomes available.
+
+The first Silber soak found that each new stream repeated the rejected mux
+handshake. The log stayed at one event, but manual pings periodically took 2.3
+to 2.9 seconds. No path-quality redial occurred. A follow-up now suppresses mux
+re-probes for 60 seconds after an explicit rejection. It then permits one
+re-probe so an upgraded peer cannot stay downgraded. It reports cumulative
+fallback uses at powers of two. This makes repeated use visible without noisy
+per-stream logging. Hetz must not deploy until this follow-up passes CI and a
+new Silber soak passes.
+
+Silber currently runs `0.2.0+36158f6`. Hetz currently runs
+`0.2.0+4548b1e`. The Silber updater kept
+`/Users/myobie/.local/bin/fabric.rollback-1788361408`, which reports
+`0.2.0+4548b1e`. Roll Silber back without asking if control to hetz fails, the
+st2 bus stops crossing machines, or the per-stream cost grows beyond the
+measured cost.
+
+The latency sample used a fresh CLI process for each requested stream. Run
+`/usr/bin/time -p fabric ping hetz` repeatedly from Silber and record the
+`real` value. The first soak ran 28 successful ping and exec samples. Periodic
+ping samples cost 2.3 to 2.9 seconds. Use the same command and the same local
+Silber-to-hetz direction after the fix. Report the first probe separately from
+the later samples in the 60-second negative-capability window.
+
+Branch `fix/mux-legacy-reprobe` contains the follow-up. It serializes the first
+capability check, suppresses rejected mux probes for 60 seconds, and counts
+direct fallback uses. The daemon writes cumulative use summaries at powers of
+two. The full library proof passes 409 active tests, with two ignored tests.
+The isolated scratch proof starts old and new daemons in temporary homes. It
+runs eight rapid new-to-old pings plus an exec. Candidate `0.2.0+5b8056d`
+completed all eight pings in 0.01 seconds each. The old daemon recorded one
+rejected mux handshake. The new validation log recorded one fallback entry and
+cumulative use summaries at 2, 4, and 8 uses. The in-process capability-flip
+proof expires the window, enables mux on the old peer, and proves two requested
+streams converge on one cached mux connection. The live Silber-to-hetz
+measurement remains.
 
 PR #109 deterministic CI found two follow-up defects. A temporary debug tunnel
 block became a permanent mux denial, which returned early EOF in five recovery
