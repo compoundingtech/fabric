@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId,
+    EndpointAddr, EndpointId,
     endpoint::{Connection, RecvStream, SendStream},
 };
 use tokio::{
@@ -26,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     config::{FabricHome, PeerBook},
     daemon::CurrentEndpoint,
+    mux::{MuxStream, PeerConnections, StreamActivity},
     shell,
 };
 
@@ -993,6 +994,7 @@ impl Backoff {
 pub async fn run_client_connection(
     local: UnixStream,
     endpoint_rx: watch::Receiver<CurrentEndpoint>,
+    connections: Arc<PeerConnections>,
     home: FabricHome,
     peer: String,
     alpn: Vec<u8>,
@@ -1005,6 +1007,7 @@ pub async fn run_client_connection(
         Box::new(read),
         Box::new(write),
         endpoint_rx,
+        connections,
         home,
         peer,
         alpn,
@@ -1019,26 +1022,28 @@ pub async fn run_client_connection(
 pub async fn run_client_connection_with_initial(
     local: UnixStream,
     endpoint_rx: watch::Receiver<CurrentEndpoint>,
+    connections: Arc<PeerConnections>,
     home: FabricHome,
     peer: String,
     alpn: Vec<u8>,
     cancel: CancellationToken,
     drop_rx: watch::Receiver<u64>,
     notices: Option<ClientConnectionNotices>,
-    initial_connection: Connection,
+    initial_stream: MuxStream,
 ) -> Result<()> {
     let (read, write) = local.into_split();
     run_client_connection_parts(
         Box::new(read),
         Box::new(write),
         endpoint_rx,
+        connections,
         home,
         peer,
         alpn,
         cancel,
         drop_rx,
         notices,
-        Some(initial_connection),
+        Some(initial_stream),
     )
     .await
 }
@@ -1047,6 +1052,7 @@ pub async fn run_client_connection_with_initial(
 pub async fn run_client_tcp_connection(
     local: TcpStream,
     endpoint_rx: watch::Receiver<CurrentEndpoint>,
+    connections: Arc<PeerConnections>,
     home: FabricHome,
     peer: String,
     alpn: Vec<u8>,
@@ -1059,6 +1065,7 @@ pub async fn run_client_tcp_connection(
         Box::new(read),
         Box::new(write),
         endpoint_rx,
+        connections,
         home,
         peer,
         alpn,
@@ -1074,13 +1081,14 @@ async fn run_client_connection_parts(
     local_read: LocalRead,
     local_write: LocalWrite,
     endpoint_rx: watch::Receiver<CurrentEndpoint>,
+    connections: Arc<PeerConnections>,
     home: FabricHome,
     peer: String,
     alpn: Vec<u8>,
     cancel: CancellationToken,
     drop_rx: watch::Receiver<u64>,
     notices: Option<ClientConnectionNotices>,
-    initial_connection: Option<Connection>,
+    initial_stream: Option<MuxStream>,
 ) -> Result<()> {
     let peer_id = PeerBook::load(&home)?.resolve(&peer)?.id;
     let session_id = TunnelSessionId::random();
@@ -1090,13 +1098,14 @@ async fn run_client_connection_parts(
     let result = run_client_attach_loop(
         session.clone(),
         endpoint_rx,
+        connections,
         home,
         peer,
         alpn,
         cancel,
         drop_rx,
         notices,
-        initial_connection,
+        initial_stream,
     )
     .await;
     reader.abort();
@@ -1107,13 +1116,14 @@ async fn run_client_connection_parts(
 async fn run_client_attach_loop(
     session: Arc<TunnelSession>,
     mut endpoint_rx: watch::Receiver<CurrentEndpoint>,
+    connections: Arc<PeerConnections>,
     home: FabricHome,
     peer: String,
     alpn: Vec<u8>,
     cancel: CancellationToken,
     mut drop_rx: watch::Receiver<u64>,
     notices: Option<ClientConnectionNotices>,
-    mut initial_connection: Option<Connection>,
+    mut initial_stream: Option<MuxStream>,
 ) -> Result<()> {
     let mut backoff = Backoff::new();
 
@@ -1123,22 +1133,23 @@ async fn run_client_attach_loop(
         }
 
         let attach_started = Instant::now();
-        let result = if let Some(connection) = initial_connection.take() {
-            attach_connection(
+        let result = if let Some(stream) = initial_stream.take() {
+            attach_stream(
                 session.clone(),
-                connection,
+                stream,
                 drop_rx.clone(),
                 notices.as_ref(),
             )
             .await
         } else {
             let peer_addr = resolve_peer_for_attempt(&home, &peer, session.peer_id()).await;
-            let endpoint = endpoint_rx.borrow().endpoint.clone();
+            let endpoint = endpoint_rx.borrow().clone();
             connect_and_attach(
                 session.clone(),
                 endpoint,
                 peer_addr,
                 &alpn,
+                connections.clone(),
                 drop_rx.clone(),
                 notices.as_ref(),
             )
@@ -1272,9 +1283,10 @@ async fn resolve_peer_for_attempt(
 
 async fn connect_and_attach(
     session: Arc<TunnelSession>,
-    endpoint: Endpoint,
+    endpoint: CurrentEndpoint,
     peer_addr: EndpointAddr,
     alpn: &[u8],
+    connections: Arc<PeerConnections>,
     drop_rx: watch::Receiver<u64>,
     notices: Option<&ClientConnectionNotices>,
 ) -> Result<()> {
@@ -1282,8 +1294,15 @@ async fn connect_and_attach(
     // to fail. The consumer may leave during it, and then the rest of the
     // attempt is for nobody.
     let initial = !session.has_attached().await;
-    let connection = tokio::select! {
-        connected = endpoint.connect(peer_addr, alpn) => {
+    let protocol = std::str::from_utf8(alpn).context("tunnel protocol is not UTF-8")?;
+    let stream = tokio::select! {
+        connected = connections.open_stream(
+            &endpoint.endpoint,
+            endpoint.generation,
+            &peer_addr,
+            protocol,
+            StreamActivity::Application,
+        ) => {
             connected.with_context(|| {
                 if initial {
                     "failed to connect tunnel"
@@ -1300,17 +1319,21 @@ async fn connect_and_attach(
         }
         error = session.watch_local_endpoint() => return Err(error),
     };
-    attach_connection(session, connection, drop_rx, notices).await
+    attach_stream(session, stream, drop_rx, notices).await
 }
 
-async fn attach_connection(
+async fn attach_stream(
     session: Arc<TunnelSession>,
-    connection: Connection,
+    stream: MuxStream,
     drop_rx: watch::Receiver<u64>,
     notices: Option<&ClientConnectionNotices>,
 ) -> Result<()> {
+    let MuxStream {
+        connection,
+        mut send,
+        mut recv,
+    } = stream;
     attach_drop_closer(&connection, drop_rx);
-    let (mut send, mut recv) = connection.open_bi().await?;
 
     let resume = session.has_attached().await;
     write_frame(
@@ -1405,9 +1428,10 @@ impl std::error::Error for LocalEndpointGone {
 /// the same dead socket, and sleeps. That is issue 51 — the loop cannot end,
 /// because a pty never closes its side and `is_complete` waits for a remote
 /// close that will never come.
-fn is_permanent_failure(error: &anyhow::Error) -> bool {
+pub(crate) fn is_permanent_failure(error: &anyhow::Error) -> bool {
     if error.downcast_ref::<ServerRejected>().is_some()
         || error.downcast_ref::<LocalEndpointGone>().is_some()
+        || crate::mux::is_stream_denied(error)
     {
         return true;
     }

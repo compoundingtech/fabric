@@ -1,7 +1,5 @@
-//! Path-quality instrumentation: hold a long-lived connection to a peer and log
-//! per-path state over time, so a degraded-but-connected direct path (the
-//! documented 5s-RTT-for-30-min repro) is visible in the data instead of a blind
-//! spot.
+//! Path-quality classification and instrumentation for the shared peer
+//! connection.
 //!
 //! iroh 1.0 connections are **multipath**: `Connection::paths()` yields several
 //! concurrent paths (direct IPv4, direct IPv6, relay), one of which is
@@ -11,28 +9,134 @@
 //! (which stays true through a degradation) and the endpoint snapshot logs only
 //! address *counts* — neither can show which path is hot or how slow it is.
 //!
-//! This probe closes that gap without acting on it (diagnosis, not a fix): it
-//! keeps one echo connection alive per peer and, every interval, logs every
-//! path's `{id, selected, ip/relay, remote_addr, local_addr, rtt}` plus an
-//! aggregate, and flags when the *selected* path changes. Point it at a peer for
-//! hours to capture the per-path RTT and selection behaviour across a
-//! degradation — the data that shows whether iroh sticks to a degraded selected
-//! path instead of re-selecting a healthy one.
+//! The daemon samples the real shared connection. It records every path and
+//! redials only after a high absolute and relative delay persists.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
-use anyhow::{Context, Result};
-use iroh::{Endpoint, EndpointAddr, endpoint::Connection};
-use tokio_util::sync::CancellationToken;
+use iroh::{EndpointId, endpoint::Connection};
 use tracing::info;
-
-/// Reconnect backoff after a probe connection drops.
-const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
-/// Keepalive/RTT nonce size.
-const NONCE_LEN: usize = 8;
 
 /// The validation-log target, matching the daemon's other diagnostics.
 const PATHWATCH_TARGET: &str = "fabric::validation";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathQualityAction {
+    None,
+    Redial {
+        class: String,
+        baseline: Duration,
+        observed: Duration,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct ClassQuality {
+    baseline: Duration,
+    consecutive_degraded: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PeerQuality {
+    generation: u64,
+    warmup_remaining: usize,
+    classes: HashMap<String, ClassQuality>,
+    cooldown_until: Option<Instant>,
+}
+
+/// A conservative per-peer degraded-path classifier.
+pub struct PathQualityTracker {
+    absolute_floor: Duration,
+    baseline_multiplier: u32,
+    consecutive_required: usize,
+    warmup_samples: usize,
+    cooldown: Duration,
+    peers: HashMap<EndpointId, PeerQuality>,
+}
+
+impl PathQualityTracker {
+    pub fn new(
+        absolute_floor: Duration,
+        baseline_multiplier: u32,
+        consecutive_required: usize,
+        warmup_samples: usize,
+        cooldown: Duration,
+    ) -> Self {
+        Self {
+            absolute_floor,
+            baseline_multiplier: baseline_multiplier.max(1),
+            consecutive_required: consecutive_required.max(1),
+            warmup_samples,
+            cooldown,
+            peers: HashMap::new(),
+        }
+    }
+
+    pub fn on_sample(
+        &mut self,
+        peer: EndpointId,
+        generation: u64,
+        class: &str,
+        observed: Duration,
+        now: Instant,
+    ) -> PathQualityAction {
+        let state = self.peers.entry(peer).or_insert_with(|| PeerQuality {
+            generation,
+            warmup_remaining: self.warmup_samples,
+            classes: HashMap::new(),
+            cooldown_until: None,
+        });
+        if state.generation != generation {
+            *state = PeerQuality {
+                generation,
+                warmup_remaining: self.warmup_samples,
+                classes: HashMap::new(),
+                cooldown_until: None,
+            };
+        }
+
+        let quality = state
+            .classes
+            .entry(class.to_string())
+            .or_insert(ClassQuality {
+                baseline: observed,
+                consecutive_degraded: 0,
+            });
+        if state.warmup_remaining > 0 {
+            state.warmup_remaining -= 1;
+            quality.baseline = quality.baseline.min(observed);
+            quality.consecutive_degraded = 0;
+            return PathQualityAction::None;
+        }
+        if state.cooldown_until.is_some_and(|until| now < until) {
+            quality.consecutive_degraded = 0;
+            return PathQualityAction::None;
+        }
+
+        let degraded = observed >= self.absolute_floor
+            && observed >= quality.baseline.saturating_mul(self.baseline_multiplier);
+        if !degraded {
+            quality.baseline = quality.baseline.min(observed);
+            quality.consecutive_degraded = 0;
+            return PathQualityAction::None;
+        }
+        quality.consecutive_degraded = quality.consecutive_degraded.saturating_add(1);
+        if quality.consecutive_degraded < self.consecutive_required {
+            return PathQualityAction::None;
+        }
+
+        quality.consecutive_degraded = 0;
+        state.cooldown_until = Some(now + self.cooldown);
+        PathQualityAction::Redial {
+            class: class.to_string(),
+            baseline: quality.baseline,
+            observed,
+        }
+    }
+}
 
 /// A snapshot of one iroh path at one instant.
 #[derive(Debug, Clone)]
@@ -85,116 +189,8 @@ pub fn observe_paths(connection: &Connection) -> PathObservations {
     out
 }
 
-/// Continuously probe one peer's path quality until `cancel` fires. Holds an
-/// echo connection, sends a keepalive nonce each interval to keep paths warm and
-/// measure application RTT, and logs per-path + aggregate state. Reconnects with
-/// backoff on any connection error, re-reading the current endpoint each time so
-/// it follows endpoint recycles.
-pub async fn probe_peer_paths<F>(
-    endpoint_of: F,
-    peer_label: String,
-    peer_addr: EndpointAddr,
-    alpn: Vec<u8>,
-    interval: Duration,
-    cancel: CancellationToken,
-) where
-    F: Fn() -> Option<Endpoint>,
-{
-    loop {
-        if cancel.is_cancelled() {
-            return;
-        }
-        let Some(endpoint) = endpoint_of() else {
-            if wait_or_cancelled(&cancel, RECONNECT_BACKOFF).await {
-                return;
-            }
-            continue;
-        };
-        match probe_once(&endpoint, &peer_label, &peer_addr, &alpn, interval, &cancel).await {
-            Ok(()) => {} // cancelled cleanly
-            Err(error) => {
-                info!(
-                    target: PATHWATCH_TARGET,
-                    event = "pathwatch_disconnected",
-                    peer = %peer_label,
-                    %error,
-                    "path probe connection ended; will reconnect"
-                );
-            }
-        }
-        if wait_or_cancelled(&cancel, RECONNECT_BACKOFF).await {
-            return;
-        }
-    }
-}
-
-/// One connect-and-observe cycle. Returns `Ok` when cancelled, `Err` on a
-/// connection problem (so the caller reconnects).
-async fn probe_once(
-    endpoint: &Endpoint,
-    peer_label: &str,
-    peer_addr: &EndpointAddr,
-    alpn: &[u8],
-    interval: Duration,
-    cancel: &CancellationToken,
-) -> Result<()> {
-    let connection = endpoint
-        .connect(peer_addr.clone(), alpn)
-        .await
-        .context("connect for path probe")?;
-    info!(
-        target: PATHWATCH_TARGET,
-        event = "pathwatch_connected",
-        peer = %peer_label,
-        remote_id = %connection.remote_id(),
-        "path probe connected"
-    );
-
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .context("open_bi for path probe")?;
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut last_selected: Option<String> = None;
-    let mut nonce: u64 = 0;
-
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                connection.close(0u32.into(), b"pathwatch done");
-                return Ok(());
-            }
-            _ = ticker.tick() => {
-                // Keepalive + application RTT: echo a nonce.
-                nonce = nonce.wrapping_add(1);
-                let app_rtt = echo_round_trip(&mut send, &mut recv, nonce).await?;
-                log_paths(&connection, peer_label, app_rtt, &mut last_selected);
-            }
-        }
-    }
-}
-
-/// Write an 8-byte nonce and read it back from the peer's echo, returning the
-/// application-level round-trip time.
-async fn echo_round_trip(
-    send: &mut iroh::endpoint::SendStream,
-    recv: &mut iroh::endpoint::RecvStream,
-    nonce: u64,
-) -> Result<Duration> {
-    let started = Instant::now();
-    send.write_all(&nonce.to_be_bytes())
-        .await
-        .context("pathwatch keepalive write")?;
-    let mut buf = [0u8; NONCE_LEN];
-    recv.read_exact(&mut buf)
-        .await
-        .context("pathwatch keepalive read")?;
-    Ok(started.elapsed())
-}
-
 /// Log every path's state plus an aggregate, flagging a selected-path change.
-fn log_paths(
+pub fn log_paths(
     connection: &Connection,
     peer_label: &str,
     app_rtt: Duration,
@@ -236,9 +232,144 @@ fn log_paths(
     *last_selected = observed.selected;
 }
 
-async fn wait_or_cancelled(cancel: &CancellationToken, dur: Duration) -> bool {
-    tokio::select! {
-        _ = cancel.cancelled() => true,
-        _ = tokio::time::sleep(dur) => false,
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh::SecretKey;
+
+    fn tracker() -> PathQualityTracker {
+        PathQualityTracker::new(Duration::from_secs(1), 8, 3, 2, Duration::from_secs(60))
+    }
+
+    #[test]
+    fn normal_direct_path_jitter_keeps_a_stable_baseline() {
+        let peer = SecretKey::generate().public();
+        let now = Instant::now();
+        let mut tracker = tracker();
+        for (offset, rtt) in [40, 150, 70, 110].into_iter().enumerate() {
+            assert_eq!(
+                tracker.on_sample(
+                    peer,
+                    1,
+                    "direct",
+                    Duration::from_millis(rtt),
+                    now + Duration::from_secs(offset as u64),
+                ),
+                PathQualityAction::None
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_five_second_latency_requests_one_redial() {
+        let peer = SecretKey::generate().public();
+        let now = Instant::now();
+        let mut tracker = tracker();
+        for offset in 0..2 {
+            assert_eq!(
+                tracker.on_sample(
+                    peer,
+                    4,
+                    "direct",
+                    Duration::from_millis(50),
+                    now + Duration::from_secs(offset),
+                ),
+                PathQualityAction::None
+            );
+        }
+        for offset in 2..4 {
+            assert_eq!(
+                tracker.on_sample(
+                    peer,
+                    4,
+                    "direct",
+                    Duration::from_secs(5),
+                    now + Duration::from_secs(offset),
+                ),
+                PathQualityAction::None
+            );
+        }
+        assert!(matches!(
+            tracker.on_sample(
+                peer,
+                4,
+                "direct",
+                Duration::from_secs(5),
+                now + Duration::from_secs(4),
+            ),
+            PathQualityAction::Redial { .. }
+        ));
+    }
+
+    #[test]
+    fn an_endpoint_generation_change_suppresses_old_degradation() {
+        let peer = SecretKey::generate().public();
+        let now = Instant::now();
+        let mut tracker = tracker();
+        for offset in 0..2 {
+            tracker.on_sample(
+                peer,
+                8,
+                "direct",
+                Duration::from_millis(50),
+                now + Duration::from_secs(offset),
+            );
+        }
+        for offset in 2..4 {
+            tracker.on_sample(
+                peer,
+                8,
+                "direct",
+                Duration::from_secs(5),
+                now + Duration::from_secs(offset),
+            );
+        }
+        assert_eq!(
+            tracker.on_sample(
+                peer,
+                9,
+                "direct",
+                Duration::from_secs(5),
+                now + Duration::from_secs(4),
+            ),
+            PathQualityAction::None
+        );
+    }
+
+    #[test]
+    fn the_redial_cooldown_prevents_a_peer_storm() {
+        let peer = SecretKey::generate().public();
+        let now = Instant::now();
+        let mut tracker = tracker();
+        for offset in 0..2 {
+            tracker.on_sample(
+                peer,
+                1,
+                "relay",
+                Duration::from_millis(100),
+                now + Duration::from_secs(offset),
+            );
+        }
+        for offset in 2..=4 {
+            tracker.on_sample(
+                peer,
+                1,
+                "relay",
+                Duration::from_secs(5),
+                now + Duration::from_secs(offset),
+            );
+        }
+        for offset in 5..20 {
+            assert_eq!(
+                tracker.on_sample(
+                    peer,
+                    1,
+                    "relay",
+                    Duration::from_secs(5),
+                    now + Duration::from_secs(offset),
+                ),
+                PathQualityAction::None
+            );
+        }
     }
 }

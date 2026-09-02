@@ -82,7 +82,7 @@ async fn git_clone_push_and_revocation_use_exact_repository_grants() -> Result<(
         client.id(),
         Some("client".into()),
         Some(client.addr()),
-        Some(Vec::new()),
+        Some(vec!["echo".into()]),
     );
     server_book.share_git_remote("mandat", remote.clone())?;
     server_book.grant_git_remote("mandat", "client", GitAccess::Read)?;
@@ -98,6 +98,8 @@ async fn git_clone_push_and_revocation_use_exact_repository_grants() -> Result<(
     );
     client_book.save(&client_home)?;
     client.state().reload_peers().await?;
+
+    assert_eq!(client.ping("server").await?.bytes, 32);
 
     let helper = helper_dir.path().join("git-remote-fabric");
     symlink(fabric_bin(), &helper)?;
@@ -124,6 +126,11 @@ async fn git_clone_push_and_revocation_use_exact_repository_grants() -> Result<(
     assert_process_ok("fabric clone", &cloned)?;
     assert_eq!(git_ok(Some(&clone), &["rev-parse", "HEAD"])?, initial);
     assert_eq!(fs::read(clone.join("large.bin"))?, large);
+    assert_eq!(
+        client.state().peer_connection_count().await,
+        1,
+        "echo and Git must share one peer connection"
+    );
 
     git_ok(Some(&clone), &["config", "user.name", "Fabric Test"])?;
     git_ok(
@@ -1130,6 +1137,44 @@ async fn ping_round_trips_builtin_echo() -> Result<()> {
     let ping = node_b.ping("node-a").await?;
     assert_eq!(ping.bytes, 32);
     assert_eq!(node_a.state().builtin_echo_hits(), before + 1);
+
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn simultaneous_peer_traffic_converges_to_one_shared_connection() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let node_a_dir = TempDir::new()?;
+    let node_b_dir = TempDir::new()?;
+    let node_a_home = FabricHome::new(node_a_dir.path());
+    let node_b_home = FabricHome::new(node_b_dir.path());
+    let node_a = FabricNode::start(node_a_home.clone()).await?;
+    let node_b = FabricNode::start(node_b_home.clone()).await?;
+
+    trust_peer(
+        &node_a_home,
+        &node_a,
+        node_b.id(),
+        Some("node-b"),
+        Some(node_b.addr()),
+    )
+    .await?;
+    trust_peer(
+        &node_b_home,
+        &node_b,
+        node_a.id(),
+        Some("node-a"),
+        Some(node_a.addr()),
+    )
+    .await?;
+
+    let (from_a, from_b) = tokio::join!(node_a.ping("node-b"), node_b.ping("node-a"));
+    assert_eq!(from_a?.bytes, 32);
+    assert_eq!(from_b?.bytes, 32);
+    assert_eq!(node_a.state().peer_connection_count().await, 1);
+    assert_eq!(node_b.state().peer_connection_count().await, 1);
 
     node_b.shutdown().await?;
     node_a.shutdown().await?;

@@ -8,6 +8,19 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Added
 
+- **Peer traffic shares one multipath connection.** Fabric carries each Git,
+  sync, shell, exec, send-file, echo, and exposed-service session as a stream on
+  one authenticated connection per peer pair. Simultaneous cross-dials select
+  one connection and close the duplicate. Stage this build on every peer before
+  a coordinated restart because most new clients require `fabric/mux/1`.
+
+- **Persistently slow paths recover without a daemon restart.** The peer health
+  loop records every selected path and its RTT. It redials a shared connection
+  after three samples exceed both one second and eight times that path class's
+  baseline. A generation change resets the evidence. A 60-second per-peer
+  cooldown prevents redial storms. Recent application traffic skips a redundant
+  liveness probe.
+
 - **Git remotes work through Fabric.** A `fabric://<peer>/<remote>` URL uses
   Git's smart protocol over an authenticated Fabric connection. The host checks
   an exact per-repository read or write grant before it starts `git

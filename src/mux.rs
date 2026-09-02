@@ -1,11 +1,10 @@
 //! Connection multiplexing: exactly one QUIC connection per machine-pair, with
 //! every logical socket carried as a QUIC bi-stream on it.
 //!
-//! Today fabric opens one iroh connection per tunnel (N per peer, each itself
-//! multipath), so there are N independent path-states to health-check and N
-//! connection handles to leak. This module consolidates to one persistent,
-//! multipath connection per peer: a [`PeerConnections`] manager opens it on
-//! demand, caches it, and hands out streams. Each stream begins with a
+//! Fabric previously opened one iroh connection per tunnel. That created many
+//! independent path states and connection handles. This module keeps one
+//! persistent multipath connection per peer. A [`PeerConnections`] manager
+//! opens it on demand, caches it, and hands out streams. Each stream begins with a
 //! [`MuxStreamHeader`] naming the target protocol, so the accepting side routes
 //! the stream to the right exposure — subsuming the old per-ALPN dispatch into
 //! per-stream routing. (The tunnel session id and resume offset ride in the
@@ -17,20 +16,59 @@
 //! which is rarer than per-tunnel drops because iroh multipath migrates paths
 //! without dropping the connection.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    fmt,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId,
-    endpoint::{Connection, RecvStream, SendStream},
+    endpoint::{Connection, RecvStream, SendStream, Side},
 };
-use tokio::sync::Mutex;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::{Mutex, mpsc},
+};
 
 /// The reserved ALPN for the multiplexed per-peer connection.
 pub const MUX_ALPN: &[u8] = b"fabric/mux/1";
 
 /// Largest protocol name accepted in a stream header (ALPN-scale).
 const MAX_PROTOCOL_LEN: usize = 255;
+const MAX_RESPONSE_LEN: usize = 4096;
+const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// One admitted logical stream on the shared peer connection.
+pub struct MuxStream {
+    pub connection: Connection,
+    pub send: SendStream,
+    pub recv: RecvStream,
+}
+
+/// Whether opening this stream proves normal application activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamActivity {
+    Application,
+    Probe,
+}
+
+#[derive(Debug)]
+struct StreamDenied(String);
+
+impl fmt::Display for StreamDenied {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StreamDenied {}
+
+/// True when the peer admitted the connection but refused this logical stream.
+pub(crate) fn is_stream_denied(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<StreamDenied>().is_some()
+}
 
 /// The first bytes of every mux stream: which exposure it targets, replacing the
 /// old per-ALPN dispatch with per-stream routing. Wire format:
@@ -96,20 +134,67 @@ impl MuxStreamHeader {
     }
 }
 
+/// Admit a stream after its header passed the peer and service checks.
+pub async fn write_ready(send: &mut SendStream) -> Result<()> {
+    send.write_u8(0).await.context("write mux ready status")?;
+    send.write_u16(0).await.context("write mux ready length")?;
+    send.flush().await.context("flush mux ready status")?;
+    Ok(())
+}
+
+/// Refuse only this stream. The shared connection stays usable.
+pub async fn write_denied(send: &mut SendStream, reason: &str) -> Result<()> {
+    let bytes = reason.as_bytes();
+    let bytes = &bytes[..bytes.len().min(MAX_RESPONSE_LEN)];
+    send.write_u8(1).await.context("write mux denial status")?;
+    send.write_u16(bytes.len() as u16)
+        .await
+        .context("write mux denial length")?;
+    send.write_all(bytes).await.context("write mux denial")?;
+    send.finish().context("finish mux denial")?;
+    Ok(())
+}
+
+async fn read_admission(recv: &mut RecvStream) -> Result<()> {
+    let status = recv.read_u8().await.context("read mux admission status")?;
+    let len = recv.read_u16().await.context("read mux admission length")? as usize;
+    if len > MAX_RESPONSE_LEN {
+        bail!("mux admission message too long: {len}");
+    }
+    let mut message = vec![0; len];
+    recv.read_exact(&mut message)
+        .await
+        .context("read mux admission message")?;
+    match status {
+        0 if message.is_empty() => Ok(()),
+        1 => Err(StreamDenied(String::from_utf8_lossy(&message).into_owned()).into()),
+        _ => bail!("invalid mux admission status {status}"),
+    }
+}
+
 /// One peer's cached shared connection.
+#[derive(Debug)]
 struct PeerConn {
     connection: Connection,
+    generation: u64,
+    last_application_activity: Option<Instant>,
 }
 
 /// Manages exactly one multipath QUIC connection per peer, opening streams on it.
-#[derive(Default)]
+#[derive(Debug)]
 pub struct PeerConnections {
+    local_id: EndpointId,
     conns: Mutex<HashMap<EndpointId, PeerConn>>,
+    opened_tx: mpsc::UnboundedSender<Connection>,
 }
 
 impl PeerConnections {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(local_id: EndpointId, opened_tx: mpsc::UnboundedSender<Connection>) -> Self {
+        Self {
+            local_id,
+            conns: Mutex::new(HashMap::new()),
+            opened_tx,
+        }
     }
 
     /// Open a mux stream to `peer_addr`'s exposure `protocol`, reusing the peer's
@@ -119,69 +204,167 @@ impl PeerConnections {
     pub async fn open_stream(
         &self,
         endpoint: &Endpoint,
+        generation: u64,
         peer_addr: &EndpointAddr,
         protocol: &str,
-    ) -> Result<(SendStream, RecvStream)> {
+        activity: StreamActivity,
+    ) -> Result<MuxStream> {
         let header = MuxStreamHeader::new(protocol.to_string());
-
-        // First attempt on the cached (or freshly opened) connection.
-        let connection = self.get_or_open(endpoint, peer_addr).await?;
-        match self.open_on(&connection, &header).await {
-            Ok(streams) => Ok(streams),
-            Err(_first) => {
-                // The cached connection was likely dead; drop it, re-open once.
-                self.forget(peer_addr.id).await;
-                let connection = self.get_or_open(endpoint, peer_addr).await?;
-                self.open_on(&connection, &header)
-                    .await
-                    .context("open mux stream after reconnect")
+        let mut last_error = None;
+        for _ in 0..4 {
+            let connection = self
+                .get_or_open(endpoint, generation, peer_addr, activity)
+                .await?;
+            match self.open_on(&connection, &header).await {
+                Ok(stream) => return Ok(stream),
+                Err(error) => {
+                    if is_stream_denied(&error) {
+                        return Err(error);
+                    }
+                    self.forget_if(peer_addr.id, connection.stable_id()).await;
+                    last_error = Some(error);
+                    tokio::task::yield_now().await;
+                }
             }
         }
+        Err(last_error.expect("a mux stream attempt ran"))
+            .context("open mux stream after reconnect")
     }
 
     async fn open_on(
         &self,
         connection: &Connection,
         header: &MuxStreamHeader,
-    ) -> Result<(SendStream, RecvStream)> {
-        let (mut send, recv) = connection
-            .open_bi()
-            .await
-            .context("open_bi on mux connection")?;
-        header.write(&mut send).await?;
-        Ok((send, recv))
+    ) -> Result<MuxStream> {
+        tokio::time::timeout(OPEN_TIMEOUT, async {
+            let (mut send, mut recv) = connection
+                .open_bi()
+                .await
+                .context("open_bi on mux connection")?;
+            header.write(&mut send).await?;
+            read_admission(&mut recv).await?;
+            Ok(MuxStream {
+                connection: connection.clone(),
+                send,
+                recv,
+            })
+        })
+        .await
+        .context("mux stream received no admission answer within 3 seconds")?
     }
 
     /// Get the peer's cached connection, or open a fresh mux connection.
     async fn get_or_open(
         &self,
         endpoint: &Endpoint,
+        generation: u64,
         peer_addr: &EndpointAddr,
+        activity: StreamActivity,
     ) -> Result<Connection> {
+        let mut conns = self.conns.lock().await;
+        if let Some(existing) = conns.get_mut(&peer_addr.id)
+            && existing.generation == generation
+            && existing.connection.close_reason().is_none()
         {
-            let conns = self.conns.lock().await;
-            if let Some(existing) = conns.get(&peer_addr.id)
-                && existing.connection.close_reason().is_none()
-            {
-                return Ok(existing.connection.clone());
+            if activity == StreamActivity::Application {
+                existing.last_application_activity = Some(Instant::now());
             }
+            return Ok(existing.connection.clone());
         }
         let connection = endpoint
             .connect(peer_addr.clone(), MUX_ALPN)
             .await
             .context("connect mux connection")?;
-        let mut conns = self.conns.lock().await;
         conns.insert(
             peer_addr.id,
             PeerConn {
                 connection: connection.clone(),
+                generation,
+                last_application_activity: (activity == StreamActivity::Application)
+                    .then(Instant::now),
             },
         );
+        let _ = self.opened_tx.send(connection.clone());
         Ok(connection)
     }
 
-    async fn forget(&self, peer: EndpointId) {
-        self.conns.lock().await.remove(&peer);
+    async fn forget_if(&self, peer: EndpointId, stable_id: usize) {
+        let mut connections = self.conns.lock().await;
+        if connections
+            .get(&peer)
+            .is_some_and(|current| current.connection.stable_id() == stable_id)
+        {
+            connections.remove(&peer);
+        }
+    }
+
+    /// Make one peer use a fresh multipath connection on its next stream.
+    pub async fn redial(&self, peer: EndpointId, reason: &[u8]) -> bool {
+        let removed = self.conns.lock().await.remove(&peer);
+        if let Some(removed) = removed {
+            removed.connection.close(0u32.into(), reason);
+            return true;
+        }
+        false
+    }
+
+    /// Cache an accepted peer connection for traffic in the reverse direction.
+    pub async fn register_incoming(&self, connection: &Connection, generation: u64) {
+        let peer = connection.remote_id();
+        let mut conns = self.conns.lock().await;
+        let replace = match conns.get(&peer) {
+            None => true,
+            Some(current)
+                if current.generation != generation
+                    || current.connection.close_reason().is_some() =>
+            {
+                true
+            }
+            Some(current) => {
+                current.connection.side() == Side::Server
+                    || (self.local_id > peer && current.connection.side() == Side::Client)
+            }
+        };
+        if replace {
+            if let Some(old) = conns.remove(&peer) {
+                old.connection
+                    .close(0u32.into(), b"duplicate mux connection");
+            }
+            conns.insert(
+                peer,
+                PeerConn {
+                    connection: connection.clone(),
+                    generation,
+                    last_application_activity: None,
+                },
+            );
+        } else {
+            connection.close(0u32.into(), b"duplicate mux connection");
+        }
+    }
+
+    /// Record an admitted inbound application stream.
+    pub async fn note_application_activity(&self, peer: EndpointId) {
+        if let Some(connection) = self.conns.lock().await.get_mut(&peer) {
+            connection.last_application_activity = Some(Instant::now());
+        }
+    }
+
+    /// Recent application traffic makes a separate liveness probe redundant.
+    pub async fn recently_active(&self, peer: EndpointId, within: Duration) -> bool {
+        self.conns
+            .lock()
+            .await
+            .get(&peer)
+            .and_then(|connection| connection.last_application_activity)
+            .is_some_and(|last| last.elapsed() <= within)
+    }
+
+    /// Return the live shared connection for path inspection.
+    pub async fn connection(&self, peer: EndpointId) -> Option<Connection> {
+        self.conns.lock().await.get(&peer).and_then(|current| {
+            (current.connection.close_reason().is_none()).then(|| current.connection.clone())
+        })
     }
 
     /// Number of peers with a cached connection (diagnostics).
@@ -229,6 +412,7 @@ mod tests {
                 tokio::spawn(async move {
                     if let Ok(header) = MuxStreamHeader::read(&mut recv).await {
                         headers.lock().await.push(header);
+                        let _ = write_ready(&mut send).await;
                         let _ = tokio::io::copy(&mut recv, &mut send).await;
                         let _ = send.finish();
                     }
@@ -256,11 +440,27 @@ mod tests {
         let server_addr = router.endpoint().addr();
 
         let client = Endpoint::bind(presets::N0).await?;
-        let manager = PeerConnections::new();
+        let (opened_tx, _opened_rx) = mpsc::unbounded_channel();
+        let manager = PeerConnections::new(client.id(), opened_tx);
+
+        let probe = manager
+            .open_stream(&client, 0, &server_addr, "probe", StreamActivity::Probe)
+            .await?;
+        drop(probe);
+        assert!(
+            !manager
+                .recently_active(server_addr.id, Duration::from_secs(1))
+                .await,
+            "a health probe must not count as application traffic"
+        );
 
         // Open two logical streams with different protocols on the same peer.
         for proto in ["pty-view", "demo-http"] {
-            let (mut send, mut recv) = manager.open_stream(&client, &server_addr, proto).await?;
+            let stream = manager
+                .open_stream(&client, 0, &server_addr, proto, StreamActivity::Application)
+                .await?;
+            let mut send = stream.send;
+            let mut recv = stream.recv;
             send.write_all(b"ping").await?;
             send.finish()?;
             let mut buf = [0u8; 4];
@@ -276,9 +476,28 @@ mod tests {
         );
         assert_eq!(manager.peer_count().await, 1);
         let seen = headers.lock().await;
-        assert_eq!(seen.len(), 2);
+        assert_eq!(seen.len(), 3);
         assert!(seen.iter().any(|h| h.protocol == "pty-view"));
         assert!(seen.iter().any(|h| h.protocol == "demo-http"));
+        drop(seen);
+
+        assert!(
+            manager
+                .recently_active(server_addr.id, Duration::from_secs(1))
+                .await
+        );
+        assert!(manager.redial(server_addr.id, b"test degradation").await);
+        let stream = manager
+            .open_stream(
+                &client,
+                0,
+                &server_addr,
+                "after-redial",
+                StreamActivity::Application,
+            )
+            .await?;
+        drop(stream);
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
 
         router.shutdown().await?;
         client.close().await;
