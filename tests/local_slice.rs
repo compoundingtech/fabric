@@ -42,58 +42,6 @@ impl Drop for LocalSliceGuard {
     }
 }
 
-/// The ACL transcription must read the daemon's live exposure list. Reading
-/// only config.toml would omit an ephemeral exposure and narrow access now.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn make_explicit_keeps_every_service_exposed_on_this_machine_now() -> Result<()> {
-    let _guard = local_slice_guard().await;
-    let node_a_dir = TempDir::new()?;
-    let node_b_dir = TempDir::new()?;
-    let node_a_home = FabricHome::new(node_a_dir.path());
-    let node_b_home = FabricHome::new(node_b_dir.path());
-    let node_a = FabricNode::start(node_a_home.clone()).await?;
-    let node_b = FabricNode::start(node_b_home.clone()).await?;
-
-    trust_peer(
-        &node_a_home,
-        &node_a,
-        node_b.id(),
-        Some("node-b"),
-        Some(node_b.addr()),
-    )
-    .await?;
-
-    let socket = node_a_dir.path().join("ephemeral.sock");
-    run_fabric(
-        &node_a_home,
-        &[
-            "expose",
-            "ephemeral-web",
-            "--socket",
-            socket.to_str().context("the socket path is not UTF-8")?,
-            "--ephemeral",
-        ],
-    )?;
-    run_fabric(&node_a_home, &["peers", "make-explicit"])?;
-
-    let book = PeerBook::load(&node_a_home)?;
-    for service in ["shell", "exec", "sync", "echo", "send-file", "ephemeral-web"] {
-        assert_eq!(
-            book.may(&node_b.id(), service),
-            Ok(()),
-            "the transcription omitted the live service {service:?}"
-        );
-    }
-    assert!(
-        book.may(&node_b.id(), "exposed-tomorrow").is_err(),
-        "the legacy entry stayed unrestricted instead of becoming explicit"
-    );
-
-    node_b.shutdown().await?;
-    node_a.shutdown().await?;
-    Ok(())
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_expose_dial_round_trips_and_acl_rejects_unknown_node() -> Result<()> {
     let _guard = local_slice_guard().await;
@@ -1150,13 +1098,18 @@ async fn declarative_peer_config_is_loaded_on_start() -> Result<()> {
     let node_b_id = generate_identity_file(&node_b_home.identity_path())?;
     fs::write(
         node_a_home.peers_path(),
-        format!("[[peers]]\nid = \"{node_b_id}\"\nname = \"node-b\"\n"),
+        format!("[[peers]]\nid = \"{node_b_id}\"\nname = \"node-b\"\nallow = [\"echo\"]\n"),
     )?;
 
     let node_a = FabricNode::start(node_a_home.clone()).await?;
 
     let mut node_b_peers = PeerBook::default();
-    node_b_peers.add(node_a.id(), Some("node-a".to_string()), Some(node_a.addr()));
+    node_b_peers.add_with_allow(
+        node_a.id(),
+        Some("node-a".to_string()),
+        Some(node_a.addr()),
+        Some(vec!["echo".to_string()]),
+    );
     node_b_peers.save(&node_b_home)?;
 
     let node_b = FabricNode::start(node_b_home).await?;
@@ -1195,7 +1148,10 @@ async fn declarative_peer_config_can_be_reloaded_without_restart() -> Result<()>
     );
     fs::write(
         node_a_home.peers_path(),
-        format!("[[peers]]\nid = \"{}\"\nname = \"node-b\"\n", node_b.id()),
+        format!(
+            "[[peers]]\nid = \"{}\"\nname = \"node-b\"\nallow = [\"echo\"]\n",
+            node_b.id()
+        ),
     )?;
     assert_eq!(run_fabric(&node_a_home, &["reload-peers"])?, "reloaded");
 
@@ -1218,7 +1174,10 @@ async fn peer_file_remains_authoritative_when_daemon_config_is_created() -> Resu
     let node_b = FabricNode::start(node_b_home.clone()).await?;
     fs::write(
         node_a_home.peers_path(),
-        format!("[[peers]]\nid = \"{}\"\nname = \"node-b\"\n", node_b.id()),
+        format!(
+            "[[peers]]\nid = \"{}\"\nname = \"node-b\"\nallow = [\"echo\"]\n",
+            node_b.id()
+        ),
     )?;
 
     let node_a = FabricNode::start_with_options(node_a_home.clone(), true).await?;
@@ -1364,7 +1323,29 @@ async fn trust_peer(
     addr: Option<iroh::EndpointAddr>,
 ) -> Result<()> {
     let mut peers = PeerBook::load(home)?;
-    peers.add(id, name.map(str::to_string), addr);
+    peers.add_with_allow(
+        id,
+        name.map(str::to_string),
+        addr,
+        Some(
+            [
+                "shell",
+                "exec",
+                "sync",
+                "echo",
+                "send-file",
+                "pty-view",
+                "stdio-cat",
+                "limited-cat",
+                "bad-exec",
+                "tcp-echo",
+                "web",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        ),
+    );
     peers.save(home)?;
     node.state().reload_peers().await?;
     Ok(())

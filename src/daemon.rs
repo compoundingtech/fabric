@@ -5483,10 +5483,11 @@ mod tests {
     /// to fall through to its deadline rather than answering quickly.
     async fn unroutable_peer(home: &FabricHome, node: &FabricNode, name: &str) -> Result<String> {
         let mut peers = PeerBook::load(home)?;
-        peers.add(
+        peers.add_with_allow(
             iroh::SecretKey::generate().public(),
             Some(name.to_string()),
             None,
+            Some(vec!["echo".to_string()]),
         );
         peers.save(home)?;
         node.state().reload_peers().await?;
@@ -5501,7 +5502,26 @@ mod tests {
         addr: EndpointAddr,
     ) -> Result<()> {
         let mut peers = PeerBook::load(home)?;
-        peers.add(id, Some(name.to_string()), Some(addr));
+        peers.add_with_allow(
+            id,
+            Some(name.to_string()),
+            Some(addr),
+            Some(
+                [
+                    "shell",
+                    "exec",
+                    "sync",
+                    "echo",
+                    "send-file",
+                    "audit/echo",
+                    "audit/sink",
+                    "test/reused/1",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            ),
+        );
         peers.save(home)?;
         node.state().reload_peers().await
     }
