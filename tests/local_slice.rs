@@ -1996,6 +1996,51 @@ async fn a_peer_restarting_mid_session_restores_service_without_intervention() -
 
     // The dev server's machine restarts fabric. Same identity, new process.
     node_a.shutdown().await?;
+
+    // WHOSE PROBLEM IS IT? A successful request after recovery cannot say.
+    //
+    // A live-reload socket dying when the server restarts is normal and is not
+    // fabric's doing: run the same dev server locally with no fabric involved
+    // and the socket dies too, because the process that owned it is gone. What
+    // makes it a non-event locally is that the CLIENT RECONNECTS, which vite and
+    // webpack both do within a second or two.
+    //
+    // So the question is what happens to that reconnect through the tunnel. It
+    // has two parts a real client cares about:
+    //
+    //   1. How long until a reconnect succeeds after the peer returns.
+    //   2. What a reconnect attempted DURING the outage does. A prompt failure
+    //      lets a retrying client try again; a hang holds it until its own
+    //      timeout, which for a browser can be tens of seconds.
+    //
+    // Keep the peer down while measuring the second part. The old test started
+    // this measurement after recovery, so its name and its proof disagreed.
+    let during = std::time::Instant::now();
+    let attempted_during_outage = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut probe = TcpStream::connect(&local_addr).await?;
+        tcp_stream_round_trip(&mut probe, b"reconnect-during-outage").await
+    })
+    .await;
+    let during_took = during.elapsed();
+    let outcome = match &attempted_during_outage {
+        Ok(Ok(_)) => "succeeded",
+        Ok(Err(_)) => "failed promptly, so a retrying client retries",
+        Err(_) => "HUNG, which holds a retrying client until its own timeout",
+    };
+
+    // A reconnect must not hang. If it does, a client that retries is punished
+    // for retrying and the failure IS fabric's.
+    assert!(
+        during_took < Duration::from_secs(5),
+        "a reconnect attempted during the outage hung for {during_took:?}. A \
+         client that retries would be held until its own timeout, and that makes \
+         this fabric's problem rather than the application's"
+    );
+    assert!(
+        matches!(attempted_during_outage, Ok(Err(_))),
+        "a request succeeded while the peer was stopped: {attempted_during_outage:?}"
+    );
+
     let node_a = FabricNode::start(a_home.clone()).await?;
     trust_peer(&a_home, &node_a, node_b.id(), Some("node-b"), Some(node_b.addr())).await?;
 
@@ -2013,50 +2058,10 @@ async fn a_peer_restarting_mid_session_restores_service_without_intervention() -
     .map(|r| r.is_ok())
     .unwrap_or(false);
 
-    // WHOSE PROBLEM IS IT? The two halves above cannot say.
-    //
-    // A live-reload socket dying when the server restarts is normal and is not
-    // fabric's doing: run the same dev server locally with no fabric involved
-    // and the socket dies too, because the process that owned it is gone. What
-    // makes it a non-event locally is that the CLIENT RECONNECTS, which vite and
-    // webpack both do within a second or two.
-    //
-    // So the question is what happens to that reconnect through the tunnel, and
-    // it has two parts a real client cares about:
-    //
-    //   1. How long until a reconnect succeeds. That is `fresh` above.
-    //   2. What a reconnect attempted DURING the outage does. A prompt failure
-    //      lets a retrying client try again; a hang holds it until its own
-    //      timeout, which for a browser can be tens of seconds.
-    //
-    // The second is measured here rather than assumed, because "it does not
-    // work yet" and "it hangs" are different products.
-    let during = std::time::Instant::now();
-    let attempted_during_outage = tokio::time::timeout(Duration::from_secs(5), async {
-        let mut probe = TcpStream::connect(&local_addr).await?;
-        tcp_stream_round_trip(&mut probe, b"reconnect-during-outage").await
-    })
-    .await;
-    let during_took = during.elapsed();
-    let outcome = match attempted_during_outage {
-        Ok(Ok(_)) => "succeeded",
-        Ok(Err(_)) => "failed promptly, so a retrying client retries",
-        Err(_) => "HUNG, which holds a retrying client until its own timeout",
-    };
-
     println!(
-        "MODE 5 peer restart: a reconnect succeeded {fresh:?} after the restart; \
-         a reconnect attempted during the outage {outcome} in {during_took:?}; \
+        "MODE 5 peer restart: a reconnect attempted during the outage {outcome} \
+         in {during_took:?}; a new request succeeded {fresh:?} after the restart; \
          the already-open connection survived: {live_survived}"
-    );
-
-    // A reconnect must not hang. If it does, a client that retries is punished
-    // for retrying and the failure IS fabric's.
-    assert!(
-        during_took < Duration::from_secs(5),
-        "a reconnect attempted during the outage hung for {during_took:?}. A \
-         client that retries would be held until its own timeout, and that makes \
-         this fabric's problem rather than the application's"
     );
 
     // The property that must hold either way: service is restored with nothing
