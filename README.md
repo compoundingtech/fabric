@@ -650,6 +650,19 @@ fabric peers
 Read and list the entries in the authoritative `peers.toml`.
 
 ```sh
+fabric git share <remote> <repository>
+fabric git grant <remote> <peer> --read|--write|--read-write
+fabric git revoke <remote> <peer> --read|--write|--all
+fabric git unshare <remote>
+fabric git ls
+fabric git status
+```
+
+Store a local Git directory and its exact peer grants in `peers.toml`. A share
+starts with no access. Read and write are separate grants. The configuration
+slice does not yet provide the `fabric://` network transport.
+
+```sh
 fabric reload-peers
 ```
 
@@ -667,12 +680,13 @@ iroh exposes it, the active transport path: `direct`, `relay`, or `mixed`.
 Status also prints the daemon build version.
 
 ```sh
-fabric add <nodeid> [name] [--addr-json JSON]
+fabric add <nodeid> [name] [--addr-json JSON] [--allow service,...]
 ```
 
 Trust a peer NodeID and optionally assign a human name. `--addr-json` is an
 optional local/direct address hint for deterministic same-machine testing; normal
 key-only dialing relies on iroh address lookup.
+An omitted `--allow` grants no service.
 
 ```sh
 fabric remove <nodeid-or-name>
@@ -1164,6 +1178,9 @@ human-editable and can be provisioned before Fabric ever runs. Each
 NodeIDs and names must be unique. Normal cross-machine setup should omit
 `addr`; NodeID-based iroh discovery supplies the current addresses.
 
+The same file accepts top-level `[[git_remotes]]` declarations. Each declaration
+maps a logical remote name to an absolute host-local Git directory.
+
 Trust is local and based on NodeID, not alias: `name` is only a command-line
 label. Each machine must independently list the other NodeID. The `allow` list
 grants named services such as `sync`, `shell`, `exec`, or an exposure name.
@@ -1181,8 +1198,16 @@ allow = []
 [[peers]]
 id = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 name = "server"
-allow = ["echo", "exec", "send-file", "shell", "sync", "web"]
+allow = ["echo", "exec", "git/mandat/read", "send-file", "shell", "sync", "web"]
+
+[[git_remotes]]
+name = "mandat"
+path = "/srv/git/mandat.git"
 ```
+
+Git grants use `git/<remote>/read` and `git/<remote>/write`. A shell, exec, or
+pty grant gives no Git access. The `git/` namespace is reserved and cannot be
+used by `fabric expose`.
 
 An explicit address hint, mainly useful for deterministic tests, has this exact
 TOML shape:
