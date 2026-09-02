@@ -18,15 +18,15 @@ The total estimate is 14 to 20 focused engineering days. CI, review, fleet coord
 
 Silber.cos owns every release cut. Ask it for the current fleet build and release gate before each cut.
 
-## Decision for Nathan
+## Allow-list decision
 
-After migration, a peer entry without `allow` must not mean unrestricted.
+Nathan decided that Fabric is an allow list. A peer gets exactly the listed services and no other service.
 
-I recommend that the missing field becomes a configuration error. This result is safer than treating omission as no services.
+An absent `allow` field means an empty list. Fabric has no unrestricted peer state.
 
-Default-deny would turn a typing error into a quiet fleet outage. A parse error can keep the last valid `PeerBook` active.
+The empty state must be obvious. `fabric peers` and `fabric doctor` must identify each peer that has no grants.
 
-The error must name the peer and the missing field. Nathan must confirm this choice before implementation.
+A refused connection must say that the peer has no grant. It must not look like a network fault.
 
 ## 1. Remove all compatibility code
 
@@ -43,21 +43,27 @@ Run these steps on Silber, hetz, and bluey before the removal release:
 1. Ask Silber.cos for the exact running build on each machine.
 2. Save each canonical `peers.toml`, `config.toml`, `syncs.toml`, identity file, and sync state directory.
 3. Record the built-in services and every persisted or ephemeral exposure on each machine.
-4. Run `fabric peers make-explicit` on each machine with the current binary.
-5. Confirm that every peer entry now has an explicit `allow` list.
-6. Reload peers and test every granted service in both directions.
-7. Confirm that canonical sync `state.json` exists for each entry.
-8. Run a successful sync pass where needed, then confirm that no `manifest.json` projection remains.
-9. Confirm that no old peer file or embedded peer list remains.
-10. Record a 15-minute CPU, write-volume, memory, probe, sync-wire, and reconnect baseline.
+4. Measure the exact reachable service set for every peer pair and save the result.
+5. Run `fabric peers make-explicit` on each machine with the current binary.
+6. Confirm that every peer entry now has an explicit `allow` list.
+7. Reload peers and measure the exact reachable service set again.
+8. Prove that each before and after set is identical. Investigate any difference before the release continues.
+9. Confirm that canonical sync `state.json` exists for each entry.
+10. Run a successful sync pass where needed, then confirm that no `manifest.json` projection remains.
+11. Confirm that no old peer file or embedded peer list remains.
+12. Record a 15-minute CPU, write-volume, memory, probe, sync-wire, and reconnect baseline.
 
-Every measurement must include its start, end, and build. Nathan already authorized the goal, but Silber.cos must coordinate live changes.
+Every measurement must include its start, end, machine, peer pair, and build.
+
+The migration is part of this release. It must cover Silber, hetz, and bluey without a manual edit by Nathan.
+
+Nathan authorized the migration. Silber.cos must coordinate the live changes and approve the release cut.
 
 ### Code deletion
 
 Delete these compatibility surfaces after the preflight is complete:
 
-1. Make `Peer.allow` required and explicit. Delete unrestricted omission and `peers make-explicit`.
+1. Make `Peer.allow` a default-empty list. Delete unrestricted omission and `peers make-explicit` after the fleet migration.
 2. Delete the old state-root peer file migration and embedded `config.toml` peer migration.
 3. Delete the one-shot `fabric/shell/0` server, client fallback, wire constants, and compatibility tests.
 4. Keep only the resumable shell protocol. A peer that lacks it is an error.
@@ -70,7 +76,9 @@ Delete these compatibility surfaces after the preflight is complete:
 
 Do not delete defaults that express a current optional setting. This work removes compatibility, not valid configuration choices.
 
-Use red tests first. Missing `allow`, shell version zero, old sync payloads, and old state files must all fail clearly.
+Use red tests first. Missing `allow` must grant nothing and report the empty state clearly.
+
+Shell version zero, old sync payloads, and old state files must all fail clearly.
 
 ### Rollout shape
 
@@ -81,6 +89,8 @@ Build and verify every target first. Stage the same release binary on all three 
 Use local access or SSH for the coordinated restart. Do not depend on the Fabric process that the restart replaces.
 
 Verify NodeIDs, explicit ACLs, sync digests, exposures, shell, exec, and status after all machines start.
+
+Repeat the service-set measurement. The result on each peer pair must match its pre-migration result.
 
 Rollback restores the saved configuration, state, and prior binary as one set. A partial rollback is not supported.
 
@@ -151,7 +161,11 @@ Fix F14 in the inbound sync service. A stalled peer must not hold an entry opera
 
 Apply a bounded wire-session deadline outside the guard. Prove that another reconcile can continue after expiry.
 
-Add `KillMode=process` to generated systemd units. Prove a Fabric restart cannot kill an unrelated process in its cgroup.
+Add `KillMode=process` to generated systemd units.
+
+This setting tells systemd to stop only the daemon. Systemd then leaves other processes in the service cgroup alive.
+
+Prove that a Fabric restart cannot kill an unrelated process in its cgroup.
 
 ### Reconnect cost
 
@@ -177,7 +191,9 @@ Merge the compatibility deletion and bug fixes as small reviewed pull requests. 
 
 The release gate requires all CI jobs, repeated former-flake runs, the executable-bit proof, and the three live network proofs.
 
-The release also requires explicit peer entries and current state on Silber, hetz, and bluey.
+The release includes the peer migration on Silber, hetz, and bluey.
+
+The release requires identical reachable service sets before and after that migration.
 
 Estimated cost: 7 to 10 engineering days, including audit cleanup but excluding soak and coordination.
 
@@ -212,10 +228,11 @@ Dual-path bonding stays abandoned for this release sequence. It has no usable ir
 The programme is complete when all these statements are true:
 
 1. No current source, test, config, state, wire, or documentation path supports an older Fabric layout or protocol.
-2. Every peer entry has an explicit ACL, and omission fails with an actionable error.
-3. Every known flake has a fixed cause and a repeated bounded proof.
-4. Issues #21, #27, #50, #52, and #54 have evidence-backed final states.
-5. The stale branch note names every exact replacement, and only live branches remain.
-6. Git clone, fetch, pull, and push work through explicit repository grants.
-7. A persistently degraded selected path recovers without a daemon restart.
-8. Silber.cos approves each release cut and records the fleet build that each soak measured.
+2. Every migrated peer entry has an explicit ACL, and an omitted ACL grants nothing.
+3. `fabric peers`, `fabric doctor`, and connection errors make an empty ACL obvious.
+4. Every known flake has a fixed cause and a repeated bounded proof.
+5. Issues #21, #27, #50, #52, and #54 have evidence-backed final states.
+6. The stale branch note names every exact replacement, and only live branches remain.
+7. Git clone, fetch, pull, and push work through explicit repository grants.
+8. A persistently degraded selected path recovers without a daemon restart.
+9. Silber.cos approves each release cut and records the fleet build that each soak measured.

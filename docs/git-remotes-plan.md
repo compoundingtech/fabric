@@ -54,6 +54,8 @@ The command stopped only because that helper does not exist yet. This measuremen
 
 Fabric stores peer trust, service permissions, and local Git remote declarations in one `peers.toml` file.
 
+Fabric is an allow list. A peer gets exactly the listed services and no other service.
+
 ```toml
 [[peers]]
 id = "<peer-node-id>"
@@ -117,7 +119,11 @@ Every incoming operation must pass these checks in this order:
 2. The peer's `allow` list contains the exact remote and operation permission.
 3. The named top-level `[[git_remotes]]` entry resolves to a host-local repository path.
 
-Every peer has an explicit `allow` list before this work starts. A missing list is a configuration error.
+Every peer has an explicit `allow` list before this work starts. The baseline release migrates all fleet files first.
+
+An absent `allow` field means an empty list. It grants no ordinary service and no Git operation.
+
+`fabric peers` and `fabric doctor` identify a peer with no grants. A denial names the missing grant instead of a network fault.
 
 Only an exact `git/<remote>/<operation>` item permits that Git operation. Read and write never imply each other.
 
@@ -178,6 +184,7 @@ The helper writes helper control output only to Git. It writes all human text to
 | The remote daemon is old | Say that the peer does not support Git remotes. |
 | The peer gives no answer in 10 seconds | Name the peer as unreachable and exit nonzero. Do not retry forever. |
 | The remote is absent or hidden by the ACL | Say that the peer did not permit the requested access. |
+| The peer has no grants | Say that the peer has no grants and name the required Git grant. |
 | The peer has read but a push starts | Name the denied write access and print the host-side grant command. |
 | The stored path is unavailable | Say that the granted remote is unavailable on the peer. |
 | The Git child cannot start | Name the host-side Git failure. |
@@ -239,7 +246,7 @@ Each behavioral test must fail before its implementation lands.
 
 1. Confirm installed Git invokes `git-remote-fabric` for a `fabric://` URL.
 2. Test the helper command transcript for `capabilities` and both `connect` services.
-3. Property-test ACL decisions across peers, remotes, operations, explicit entries, and peer renames.
+3. Property-test ACL decisions across peers, remotes, operations, omitted lists, empty lists, and peer renames.
 4. Prove that pty, shell, and exec grants do not grant any Git remote.
 5. Start two temporary Fabric nodes and two temporary Git repositories.
 6. Clone through `fabric://` with a read grant and compare the exact commit and object hashes.
@@ -256,6 +263,7 @@ Each behavioral test must fail before its implementation lands.
 17. Transfer a pack larger than every frame and prove the bounded path does not retain the pack.
 18. Test the installer, updater, manual repair, and refusal to replace an unrelated helper file.
 19. Run the full local suite, Nix build, macOS job, and deterministic Linux job.
+20. Prove that `fabric peers`, `fabric doctor`, and a denied connection clearly report a peer with no grants.
 
 The live proof uses a temporary bare repository first. It then uses a non-bare test repository and keeps Git's native push rules.
 
