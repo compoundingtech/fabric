@@ -73,6 +73,12 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Changed
 
+- **Tunnel writers cannot miss a session-state wake.** The writer and buffer
+  wait loops create their notification futures before they inspect session
+  state. Data or acknowledgements that arrive between the state check and the
+  wait now wake the loop. A recovered live tunnel no longer stalls after it
+  carries its first replayed payload.
+
 - **The scan cache is keyed on local disk facts, not on the replicated
   manifest.** The cache reused a recorded hash when size and mtime matched what
   the *manifest* held — but the manifest crosses the wire, so a local caching
