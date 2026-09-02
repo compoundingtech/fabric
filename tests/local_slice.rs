@@ -52,6 +52,10 @@ async fn git_clone_push_and_revocation_use_exact_repository_grants() -> Result<(
     let clone = clone_root.path().join("clone");
 
     git_ok(None, &["init", "--bare", remote.to_str().unwrap()])?;
+    git_ok(
+        Some(&remote),
+        &["symbolic-ref", "HEAD", "refs/heads/main"],
+    )?;
     git_ok(Some(source), &["init"])?;
     git_ok(Some(source), &["config", "user.name", "Fabric Test"])?;
     git_ok(
