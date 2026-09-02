@@ -4,46 +4,47 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-08-30 by Silber.fabric-codex. Main is `593a3f7`.
-Release `v0.2.0+593a3f7` is published. droppy and hetz run it. Silber remains on
-`v0.2.0+4bc04af` during the staged rollout._
+_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `f2c964a`.
+Silber and hetz run local build `0.2.0+f2c964a`. Bluey is deferred to Nathan._
 
-## Current handoff — 2026-08-30
+## Current handoff — 2026-09-02
 
-The 2026-08-29 review chain is complete. PRs #91 through #98 merged in order.
-PR #100 added explicit peer ACL transcription and the exposure warning. PR #101
-added affirmative-absence deletes, bounded file reads, scan issue status, and
-actionable missing-entry and size-limit states. No review PR remains open.
+Nathan ordered the release backlog completed without approval stops. The active
+order is strict ACL baseline, Git remotes, then degraded-path recovery. A release
+cut is not the current task.
 
-The full local suite passed for #101. Its Nix build passed in 7m28s, macOS passed
-in 5m24s, and deterministic Linux passed in 10m17s. It merged as `593a3f7`.
+PR #103 added `KillMode=process` to the Linux service. PR #104 bounded initial
+tunnel dials. PR #105 made omitted and empty peer grants deny every service. PR
+#106 added Git share declarations and exact read and write grants to
+`peers.toml`. PR #107 bounded iroh endpoint close waits after deterministic CI
+hung for ten minutes in a half-close recycle test.
 
-Silber.cos opened the release gate at 14:46 Europe/Berlin on 2026-08-30. Four
-conditions had continuous 24-hour coverage. All seven conditions had continuous
-coverage for the final six hours. Silber.cos judged that the partial window did
-not require a restart. This soak measured `v0.2.0+4bc04af`; it did not measure
-the new commits.
+The strict ACL migration and rollout are complete on Silber and hetz. Each
+machine ran `fabric peers make-explicit` with old build `0.2.0+593a3f7` before
+its binary changed. The pre-migration, post-migration, and post-swap ALPN
+matrices are identical. Two-way exec works. Both sync entries are clean on both
+machines. Both services are active and enabled. Hetz has `KillMode=process`.
 
-Release `v0.2.0+593a3f7` is published for all three targets. The verified Apple
-Silicon archive has SHA-256
-`7e6775ec031e7da4abcf135a3fe3d98854abf2270ad94d04199a745d32381c89`.
-The archive contains one member named `fabric`, and that binary reports
-`0.2.0+593a3f7`.
+Silber permits the five service names `echo`, `exec`, `send-file`, `shell`, and
+`sync` for both peers. Hetz permits those five names plus `deskset-vnc`,
+`pty-remote`, and `st-sync` for both peers. The strict daemon starts with an
+omitted allow list and grants nothing. It does not refuse startup.
 
-droppy updated itself first. Silber.cos verified version `0.2.0+593a3f7`, clean
-drift, nothing stopped, and `delta_fallbacks=0`. All three machines agree on the
-digests and on 21,545 present paths and 14,819 tombstones across mixed versions.
+Bluey is Nathan's deferred task. It must run the old `make-explicit` helper and
+preserve its full ALPN matrix before it receives a strict binary. Do not wait for
+Bluey and do not count it as verified.
 
-hetz persisted its Desk Set VNC exposure before it updated itself. After the
-update, both entries had clean drift, nothing stopped, and `delta_fallbacks=0`.
-No present count fell, and no tombstone count increased during the update.
-Silber.cos is checking the cross-fleet digests and the VNC tunnel.
+The Git transport is live work on branch `feat/git-remote-transport`. The branch
+already has the `fabric/git/1` daemon path, the `git-remote-fabric` helper,
+bounded and separate output framing, an eight-session total limit, a four-session
+peer limit, and installer and updater helper repair. Its real two-node proof
+clones a 256 KiB object, denies a write under a read grant without running the
+receive hook, permits the same push after a write grant, and denies the next push
+after revocation.
 
-Silber remains last and can stay on the old release overnight if Nathan's
-demonstration continues. Cross-version digest agreement makes that hold safe.
-
-No additional code job is live. Do not resume an item from the historical notes
-unless a person assigns it on the bus and does not withdraw it.
+Finish, review, and merge the Git transport next. Then start the assigned
+degraded-path recovery slice. Do not deploy either slice unless a later native
+order says to change the live fleet.
 
 ## Historical handoff — 2026-08-29 (Fable session; fleet moved to Codex)
 

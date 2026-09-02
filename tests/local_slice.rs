@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsStr,
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -13,10 +14,13 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use fabric::{
-    config::{FabricHome, PeerBook, generate_identity_file},
+    config::{FabricHome, GitAccess, PeerBook, generate_identity_file},
     control::{ControlRequest, ControlResponse},
     daemon::{FabricNode, send_control},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::{PermissionsExt, symlink};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -33,6 +37,157 @@ const FABRIC_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 const LOCAL_IO_TIMEOUT: Duration = Duration::from_secs(60);
 const LARGE_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const LOCAL_SLICE_SETTLE: Duration = Duration::from_millis(500);
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn git_clone_push_and_revocation_use_exact_repository_grants() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let server_dir = TempDir::new()?;
+    let client_dir = TempDir::new()?;
+    let source_dir = TempDir::new()?;
+    let clone_root = TempDir::new()?;
+    let helper_dir = TempDir::new()?;
+    let remote = server_dir.path().join("mandat.git");
+    let source = source_dir.path();
+    let clone = clone_root.path().join("clone");
+
+    git_ok(None, &["init", "--bare", remote.to_str().unwrap()])?;
+    git_ok(Some(source), &["init"])?;
+    git_ok(Some(source), &["config", "user.name", "Fabric Test"])?;
+    git_ok(
+        Some(source),
+        &["config", "user.email", "fabric@example.invalid"],
+    )?;
+    let large = (0..(256 * 1024))
+        .map(|offset| (offset % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(source.join("large.bin"), &large)?;
+    fs::write(source.join("README.md"), b"first\n")?;
+    git_ok(Some(source), &["add", "."])?;
+    git_ok(Some(source), &["commit", "-m", "First"])?;
+    git_ok(
+        Some(source),
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    )?;
+    git_ok(Some(source), &["push", "origin", "HEAD:refs/heads/main"])?;
+    let initial = git_ok(Some(source), &["rev-parse", "HEAD"])?;
+
+    let server_home = FabricHome::new(server_dir.path());
+    let client_home = FabricHome::new(client_dir.path());
+    let server = FabricNode::start(server_home.clone()).await?;
+    let client = FabricNode::start(client_home.clone()).await?;
+
+    let mut server_book = PeerBook::load(&server_home)?;
+    server_book.add_with_allow(
+        client.id(),
+        Some("client".into()),
+        Some(client.addr()),
+        Some(Vec::new()),
+    );
+    server_book.share_git_remote("mandat", remote.clone())?;
+    server_book.grant_git_remote("mandat", "client", GitAccess::Read)?;
+    server_book.save(&server_home)?;
+    server.state().reload_peers().await?;
+
+    let mut client_book = PeerBook::load(&client_home)?;
+    client_book.add_with_allow(
+        server.id(),
+        Some("server".into()),
+        Some(server.addr()),
+        Some(vec!["echo".into()]),
+    );
+    client_book.save(&client_home)?;
+    client.state().reload_peers().await?;
+
+    let helper = helper_dir.path().join("git-remote-fabric");
+    symlink(fabric_bin(), &helper)?;
+    let mut paths = vec![helper_dir.path().to_path_buf()];
+    if let Some(inherited) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&inherited));
+    }
+    let path = std::env::join_paths(paths)?;
+    let fabric_env = [
+        ("FABRIC_HOME", client_home.root().as_os_str()),
+        ("PATH", path.as_os_str()),
+        ("GIT_TERMINAL_PROMPT", OsStr::new("0")),
+    ];
+
+    let cloned = run_git_process(
+        None,
+        &[
+            "clone",
+            "fabric://server/mandat",
+            clone.to_str().unwrap(),
+        ],
+        &fabric_env,
+    )?;
+    assert_process_ok("fabric clone", &cloned)?;
+    assert_eq!(git_ok(Some(&clone), &["rev-parse", "HEAD"])?, initial);
+    assert_eq!(fs::read(clone.join("large.bin"))?, large);
+
+    git_ok(Some(&clone), &["config", "user.name", "Fabric Test"])?;
+    git_ok(
+        Some(&clone),
+        &["config", "user.email", "fabric@example.invalid"],
+    )?;
+    fs::write(clone.join("README.md"), b"second\n")?;
+    git_ok(Some(&clone), &["add", "README.md"])?;
+    git_ok(Some(&clone), &["commit", "-m", "Second"])?;
+    let second = git_ok(Some(&clone), &["rev-parse", "HEAD"])?;
+    let marker = remote.join("fabric-hook-ran");
+    let hook = remote.join("hooks/pre-receive");
+    fs::write(
+        &hook,
+        b"#!/bin/sh\ntest \"$FABRIC_GIT_REMOTE\" = mandat || exit 90\ntest \"$FABRIC_GIT_ACCESS\" = write || exit 91\ntest -n \"$FABRIC_PEER\" || exit 92\nprintf ran > \"$GIT_DIR/fabric-hook-ran\"\n",
+    )?;
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))?;
+
+    let denied = run_git_process(
+        Some(&clone),
+        &["push", "origin", "HEAD:refs/heads/main"],
+        &fabric_env,
+    )?;
+    assert!(!denied.status.success(), "a read grant allowed a push");
+    let denial = String::from_utf8_lossy(&denied.stderr);
+    assert!(
+        denial.contains("did not grant write access"),
+        "the denial was not actionable: {denial}"
+    );
+    assert_eq!(git_bare_head(&remote)?, initial);
+    assert!(!marker.exists(), "a denied push started Git or its hook");
+
+    let mut server_book = PeerBook::load(&server_home)?;
+    server_book.grant_git_remote("mandat", "client", GitAccess::Write)?;
+    server_book.save(&server_home)?;
+    server.state().reload_peers().await?;
+    let pushed = run_git_process(
+        Some(&clone),
+        &["push", "origin", "HEAD:refs/heads/main"],
+        &fabric_env,
+    )?;
+    assert_process_ok("granted fabric push", &pushed)?;
+    assert_eq!(git_bare_head(&remote)?, second);
+    assert_eq!(fs::read(&marker)?, b"ran");
+
+    let mut server_book = PeerBook::load(&server_home)?;
+    server_book.revoke_git_remote("mandat", "client", GitAccess::Write)?;
+    server_book.save(&server_home)?;
+    server.state().reload_peers().await?;
+    fs::write(clone.join("README.md"), b"third\n")?;
+    git_ok(Some(&clone), &["add", "README.md"])?;
+    git_ok(Some(&clone), &["commit", "-m", "Third"])?;
+    let revoked = run_git_process(
+        Some(&clone),
+        &["push", "origin", "HEAD:refs/heads/main"],
+        &fabric_env,
+    )?;
+    assert!(!revoked.status.success(), "a revoked write grant still pushed");
+    assert_eq!(git_bare_head(&remote)?, second);
+
+    client.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
 
 struct LocalSliceGuard;
 
@@ -1422,6 +1577,93 @@ async fn local_slice_guard() -> LocalSliceGuard {
 
 fn fabric_bin() -> &'static str {
     env!("CARGO_BIN_EXE_fabric")
+}
+
+#[cfg(unix)]
+fn git_ok(cwd: Option<&Path>, args: &[&str]) -> Result<String> {
+    let output = run_git_process(cwd, args, &[])?;
+    assert_process_ok(&format!("git {args:?}"), &output)?;
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+}
+
+#[cfg(unix)]
+fn git_bare_head(repository: &Path) -> Result<String> {
+    git_ok(
+        None,
+        &[
+            "--git-dir",
+            repository.to_str().unwrap(),
+            "rev-parse",
+            "refs/heads/main",
+        ],
+    )
+}
+
+#[cfg(unix)]
+fn run_git_process(
+    cwd: Option<&Path>,
+    args: &[&str],
+    env: &[(&str, &OsStr)],
+) -> Result<std::process::Output> {
+    let mut command = Command::new("git");
+    command.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn git {args:?}"))?;
+    let started = Instant::now();
+    let (status, timed_out) = loop {
+        if let Some(status) = child.try_wait()? {
+            break (status, false);
+        }
+        if started.elapsed() >= Duration::from_secs(60) {
+            let _ = child.kill();
+            break (child.wait()?, true);
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let mut stdout = Vec::new();
+    child
+        .stdout
+        .take()
+        .context("Git stdout was not piped")?
+        .read_to_end(&mut stdout)?;
+    let mut stderr = Vec::new();
+    child
+        .stderr
+        .take()
+        .context("Git stderr was not piped")?
+        .read_to_end(&mut stderr)?;
+    if timed_out {
+        bail!(
+            "git {args:?} timed out after 60 seconds\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+#[cfg(unix)]
+fn assert_process_ok(label: &str, output: &std::process::Output) -> Result<()> {
+    if output.status.success() {
+        return Ok(());
+    }
+    bail!(
+        "{label} failed with {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
 }
 
 fn run_fabric(home: &FabricHome, args: &[&str]) -> Result<String> {

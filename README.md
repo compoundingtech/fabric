@@ -650,17 +650,33 @@ fabric peers
 Read and list the entries in the authoritative `peers.toml`.
 
 ```sh
+fabric git install-helper
 fabric git share <remote> <repository>
 fabric git grant <remote> <peer> --read|--write|--read-write
 fabric git revoke <remote> <peer> --read|--write|--all
 fabric git unshare <remote>
 fabric git ls
 fabric git status
+
+git clone fabric://<peer>/<remote>
+git remote add <name> fabric://<peer>/<remote>
 ```
 
 Store a local Git directory and its exact peer grants in `peers.toml`. A share
-starts with no access. Read and write are separate grants. The configuration
-slice does not yet provide the `fabric://` network transport.
+starts with no access. Read and write are separate grants. A read grant serves
+`git upload-pack`. A write grant serves `git receive-pack`, can update every ref
+that Git accepts, and can run the repository's receive hooks.
+
+Git finds `git-remote-fabric` on `PATH` for each `fabric://` URL. The installer
+and updater place that relative helper link beside the `fabric` binary. Run
+`fabric git install-helper` to repair a missing link. The command refuses to
+replace an unrelated file.
+
+The URL contains only a peer name and a declared remote name. It never contains
+a host filesystem path. Fabric authenticates the peer, reads the requested
+remote and operation, and checks the exact `git/<remote>/read` or
+`git/<remote>/write` grant before it starts a Git process. Fabric runs Git with
+direct arguments and no shell.
 
 ```sh
 fabric reload-peers

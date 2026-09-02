@@ -11,6 +11,7 @@ pub mod control;
 pub mod daemon;
 pub mod doctor;
 pub mod exec;
+pub mod gitremote;
 pub mod mux;
 pub mod pathwatch;
 pub mod sendfile;

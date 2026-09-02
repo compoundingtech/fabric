@@ -59,6 +59,10 @@ pub enum ControlRequest {
     Exec {
         peer: String,
     },
+    /// Open a reusable local socket for the Fabric Git smart protocol.
+    Git {
+        peer: String,
+    },
     DropTunnelConnections,
     SetTunnelBlocked {
         blocked: bool,
@@ -141,6 +145,9 @@ pub enum ControlResponse {
         socket: PathBuf,
     },
     Exec {
+        socket: PathBuf,
+    },
+    Git {
         socket: PathBuf,
     },
     Pong {
