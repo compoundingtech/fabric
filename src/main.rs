@@ -16,7 +16,9 @@ use fabric::{
         load_or_create_identity, parse_addr_json, parse_node_id,
     },
     control::{ControlRequest, ControlResponse, PeerReachability},
-    daemon::{DaemonOptions, FabricNode, init_daemon_tracing, run_daemon_with_options, send_control},
+    daemon::{
+        DaemonOptions, FabricNode, init_daemon_tracing, run_daemon_with_options, send_control,
+    },
     exec,
     service::{self, ServiceInstallOptions},
     shell::{self, ServerFrame},
@@ -136,11 +138,10 @@ enum Commands {
         /// Run in the foreground instead of spawning a background daemon.
         #[arg(long)]
         foreground: bool,
-        /// Serve remote shells to trusted peers.
+        /// Accepted for compatibility. peers.toml decides shell availability.
         #[arg(long)]
         allow_shell: bool,
-        /// Serve non-interactive remote command execution (`fabric exec`) to
-        /// trusted peers. Default-deny — arbitrary remote code, opt-in only.
+        /// Accepted for compatibility. peers.toml decides exec availability.
         #[arg(long)]
         allow_exec: bool,
         /// Maximum total server-side tunnel sessions.
@@ -157,10 +158,10 @@ enum Commands {
     Down,
     /// Restart the local fabric daemon through a detached helper.
     Restart {
-        /// Force the restarted daemon to serve remote shells.
+        /// Accepted for compatibility. peers.toml decides shell availability.
         #[arg(long, conflicts_with = "no_allow_shell")]
         allow_shell: bool,
-        /// Force the restarted daemon to reject remote shells.
+        /// Accepted for compatibility. peers.toml decides shell availability.
         #[arg(long)]
         no_allow_shell: bool,
     },
@@ -337,10 +338,7 @@ enum GitCommands {
     /// Install or repair the git-remote-fabric helper beside this binary.
     InstallHelper,
     /// Declare a local Git repository. This grants no peer access.
-    Share {
-        remote: String,
-        repository: PathBuf,
-    },
+    Share { remote: String, repository: PathBuf },
     /// Remove a declaration and every peer grant for it.
     Unshare { remote: String },
     /// Add exact read or write access for one trusted peer.
@@ -385,17 +383,16 @@ enum KeyCommands {
 enum ServiceCommands {
     /// Install and start a user service for the foreground daemon.
     Install {
-        /// Start the managed daemon with remote shell serving enabled.
+        /// Accepted for compatibility. peers.toml decides shell availability.
         #[arg(long, conflicts_with = "no_allow_shell")]
         allow_shell: bool,
-        /// Persist remote shell serving as disabled for the managed daemon.
+        /// Accepted for compatibility. peers.toml decides shell availability.
         #[arg(long)]
         no_allow_shell: bool,
-        /// Start the managed daemon with non-interactive remote exec enabled
-        /// (`fabric exec`). Default-deny — opt-in only.
+        /// Accepted for compatibility. peers.toml decides exec availability.
         #[arg(long, conflicts_with = "no_allow_exec")]
         allow_exec: bool,
-        /// Persist remote exec serving as disabled for the managed daemon.
+        /// Accepted for compatibility. peers.toml decides exec availability.
         #[arg(long)]
         no_allow_exec: bool,
         /// Memory ceiling applied by systemd/launchd, in MiB. Unset by default:
@@ -547,6 +544,19 @@ async fn main() -> Result<()> {
                 }
                 Commands::Peers => {
                     let book = PeerBook::load(&home)?;
+                    println!(
+                        "machine\tshell={}\texec={}",
+                        if book.allow_shell() {
+                            "allowed"
+                        } else {
+                            "disabled"
+                        },
+                        if book.allow_exec() {
+                            "allowed"
+                        } else {
+                            "disabled"
+                        }
+                    );
                     for peer in book.peers() {
                         let name = peer.name.clone().unwrap_or_default();
                         let policy = if peer.allow.is_empty() {
@@ -824,8 +834,7 @@ async fn main() -> Result<()> {
                         command,
                     )?;
                     send_control(&home, request).await?;
-                    if let Err(error) =
-                        warn_if_no_trusted_peer_can_reach(&home, &exposed_protocol)
+                    if let Err(error) = warn_if_no_trusted_peer_can_reach(&home, &exposed_protocol)
                     {
                         eprintln!(
                             "fabric: exposure succeeded, but its peer permissions could not be checked: {error:#}"
@@ -1475,7 +1484,10 @@ fn print_git_remotes(book: &PeerBook) {
 async fn print_git_status(home: &FabricHome, book: &PeerBook) {
     match ProcessCommand::new("git").arg("--version").output() {
         Ok(output) if output.status.success() => {
-            println!("git\tok\t{}", String::from_utf8_lossy(&output.stdout).trim())
+            println!(
+                "git\tok\t{}",
+                String::from_utf8_lossy(&output.stdout).trim()
+            )
         }
         _ => println!("git\tproblem\tGit is not available"),
     }
@@ -1483,10 +1495,7 @@ async fn print_git_status(home: &FabricHome, book: &PeerBook) {
     match std::env::current_exe() {
         Ok(binary) => {
             let helper = fabric::gitremote::helper_path_for(&binary);
-            match (
-                helper,
-                fabric::gitremote::helper_is_installed_for(&binary),
-            ) {
+            match (helper, fabric::gitremote::helper_is_installed_for(&binary)) {
                 (Ok(path), Ok(true)) => println!("helper\tok\t{}", path.display()),
                 (Ok(path), Ok(false)) => println!(
                     "helper\tproblem\tmissing or unrelated {}; run fabric git install-helper",
@@ -1504,10 +1513,17 @@ async fn print_git_status(home: &FabricHome, book: &PeerBook) {
         Err(error) => println!("daemon\tproblem\t{error:#}"),
     }
 
-    println!("configuration\tok\t{} Git remotes", book.git_remotes().len());
+    println!(
+        "configuration\tok\t{} Git remotes",
+        book.git_remotes().len()
+    );
     for remote in book.git_remotes() {
         let kind = git_repository_kind(&remote.path);
-        let verdict = if kind == "unavailable" { "problem" } else { "ok" };
+        let verdict = if kind == "unavailable" {
+            "problem"
+        } else {
+            "ok"
+        };
         println!(
             "remote {}\t{}\t{} ({kind})",
             remote.name,
@@ -1593,14 +1609,14 @@ mod permission_helpers_tests {
             first,
             Some("droppy".into()),
             None,
-            Some(first_allow.iter().map(|service| (*service).into()).collect()),
+            Some(
+                first_allow
+                    .iter()
+                    .map(|service| (*service).into())
+                    .collect(),
+            ),
         );
-        book.add_with_allow(
-            second,
-            Some("hetz".into()),
-            None,
-            Some(vec!["sync".into()]),
-        );
+        book.add_with_allow(second, Some("hetz".into()), None, Some(vec!["sync".into()]));
         book
     }
 

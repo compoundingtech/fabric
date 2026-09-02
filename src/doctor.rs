@@ -361,7 +361,7 @@ fn version_findings(facts: &Facts) -> Vec<Finding> {
             );
             if reason.contains("exec is disabled") {
                 finding = finding.with_action(format!(
-                    "on {}, run: fabric service install --allow-exec",
+                    "on {}, set allow_exec = true in peers.toml, then run: fabric reload-peers",
                     peer.label
                 ));
             }
@@ -1115,7 +1115,7 @@ mod tests {
             versions[0]
                 .action
                 .as_deref()
-                .is_some_and(|a| a.contains("--allow-exec")),
+                .is_some_and(|a| a.contains("allow_exec = true") && !a.contains("--allow-exec")),
             "it did not say what to change"
         );
     }

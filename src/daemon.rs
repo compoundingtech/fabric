@@ -398,8 +398,8 @@ pub struct DaemonState {
     tunnel_blocked: AtomicBool,
     network_usable: AtomicBool,
     builtin_echo_hits: AtomicUsize,
-    allow_shell: bool,
-    allow_exec: bool,
+    allow_shell: AtomicBool,
+    allow_exec: AtomicBool,
     incoming_failures: Arc<FailureBackoff>,
     dial_failures: Arc<FailureBackoff>,
     incoming_slots: Arc<Semaphore>,
@@ -585,18 +585,6 @@ fn load_persisted_exposures(home: &FabricHome) -> Result<HashMap<Vec<u8>, Exposu
         exposures.insert(alpn, exposure);
     }
     Ok(exposures)
-}
-
-fn set_config_allow_shell(home: &FabricHome, allow_shell: bool) -> Result<()> {
-    let mut config = FabricConfig::load(home)?;
-    config.set_allow_shell(allow_shell);
-    config.save(home)
-}
-
-fn set_config_allow_exec(home: &FabricHome, allow_exec: bool) -> Result<()> {
-    let mut config = FabricConfig::load(home)?;
-    config.set_allow_exec(allow_exec);
-    config.save(home)
 }
 
 #[derive(Debug)]
@@ -857,18 +845,15 @@ impl DaemonState {
         options: DaemonOptions,
     ) -> Result<Arc<Self>> {
         home.prepare()?;
-        if options.allow_shell {
-            set_config_allow_shell(&home, true)?;
-        }
-        if options.allow_exec {
-            set_config_allow_exec(&home, true)?;
-        }
         let config = FabricConfig::load(&home)?;
-        let allow_shell = options.allow_shell || config.allow_shell().unwrap_or(false);
-        let allow_exec = options.allow_exec || config.allow_exec().unwrap_or(false);
         let (tunnel_session_limits, tunnel_session_detached_ttl) =
             resolve_server_session_settings(&config, options)?;
         let peer_book = PeerBook::load(&home)?;
+        // The command-line flags remain accepted while existing launchd and
+        // systemd definitions still pass them. Machine policy lives only in
+        // peers.toml, so the flags cannot open or close either service.
+        let allow_shell = peer_book.allow_shell();
+        let allow_exec = peer_book.allow_exec();
         let exposures = load_persisted_exposures(&home)?;
         let allowed = Arc::new(RwLock::new(peer_book.trusted_ids()));
         let endpoint = build_daemon_endpoint(&home, allowed.clone(), &exposures).await?;
@@ -901,8 +886,8 @@ impl DaemonState {
             tunnel_blocked: AtomicBool::new(false),
             network_usable: AtomicBool::new(true),
             builtin_echo_hits: AtomicUsize::new(0),
-            allow_shell,
-            allow_exec,
+            allow_shell: AtomicBool::new(allow_shell),
+            allow_exec: AtomicBool::new(allow_exec),
             incoming_failures: FailureBackoff::new(
                 INCOMING_FAILURE_INITIAL_BACKOFF,
                 INCOMING_FAILURE_MAX_BACKOFF,
@@ -1000,6 +985,10 @@ impl DaemonState {
 
     pub async fn reload_peers(&self) -> Result<()> {
         let peer_book = PeerBook::load(&self.home)?;
+        self.allow_shell
+            .store(peer_book.allow_shell(), Ordering::SeqCst);
+        self.allow_exec
+            .store(peer_book.allow_exec(), Ordering::SeqCst);
         *self.allowed.write().await = peer_book.trusted_ids();
         *self.peer_book.write().await = peer_book;
         Ok(())
@@ -1403,8 +1392,8 @@ impl DaemonState {
             endpoint_addr,
             exposed_protocols,
             dial_sockets,
-            allow_shell: self.allow_shell,
-            allow_exec: self.allow_exec,
+            allow_shell: self.allow_shell.load(Ordering::SeqCst),
+            allow_exec: self.allow_exec.load(Ordering::SeqCst),
         })
     }
 
@@ -1419,8 +1408,8 @@ impl DaemonState {
             endpoint_addr,
             exposed_protocols,
             dial_sockets,
-            allow_shell: self.allow_shell,
-            allow_exec: self.allow_exec,
+            allow_shell: self.allow_shell.load(Ordering::SeqCst),
+            allow_exec: self.allow_exec.load(Ordering::SeqCst),
             peers,
             connection_telemetry: telemetry.peers,
             connection_telemetry_window: telemetry.window,
@@ -1429,11 +1418,8 @@ impl DaemonState {
         })
     }
 
-    fn schedule_restart(&self, requested_allow_shell: Option<bool>) -> Result<RestartPlan> {
-        if let Some(allow_shell) = requested_allow_shell {
-            set_config_allow_shell(&self.home, allow_shell)?;
-        }
-        let allow_shell = requested_allow_shell.unwrap_or(self.allow_shell);
+    fn schedule_restart(&self, _requested_allow_shell: Option<bool>) -> Result<RestartPlan> {
+        let allow_shell = self.allow_shell.load(Ordering::SeqCst);
         self.home.prepare()?;
         let log_path = self.home.restart_log_path();
         let mut log = OpenOptions::new()
@@ -3143,11 +3129,7 @@ async fn process_control_request(
                 }
             };
             match send_file_to_peer(&state, &peer, &name, &path).await {
-                Ok(()) => ControlResponse::SentFile {
-                    peer,
-                    name,
-                    bytes,
-                },
+                Ok(()) => ControlResponse::SentFile { peer, name, bytes },
                 Err(error) => ControlResponse::Error {
                     message: format!("{error:#}"),
                 },
@@ -3327,8 +3309,8 @@ async fn handshake_and_identify(
 impl DaemonState {
     /// May this peer reach this service? PER-PEER policy only.
     ///
-    /// The daemon-wide `allow_shell` / `allow_exec` blanket is deliberately NOT
-    /// applied here, and that is a correction rather than an omission. It is
+    /// The machine-wide `allow_shell` / `allow_exec` setting is deliberately NOT
+    /// applied here. The protocol handler applies it after this check. It is
     /// already enforced further in, by `serve_shell_disabled` and its exec
     /// twin, which refuse at the protocol level with a readable sentence and
     /// exit 126 — the conventional "found but not permitted to run".
@@ -3338,8 +3320,8 @@ impl DaemonState {
     /// subtracts is right; subtracting it twice, in the place with the poorer
     /// message, is not.
     ///
-    /// The ordering property still holds: no `allow` list can lift the blanket,
-    /// because the blanket refuses after this check passes.
+    /// The ordering property still holds: no peer grant can lift the machine
+    /// setting, because the machine setting refuses after this check passes.
     pub async fn may(
         &self,
         peer: &iroh::EndpointId,
@@ -3523,8 +3505,7 @@ async fn send_file_to_peer(
     let stream = state
         .open_peer_stream(
             &addr,
-            std::str::from_utf8(crate::sendfile::SEND_FILE_ALPN)
-                .expect("send-file ALPN is UTF-8"),
+            std::str::from_utf8(crate::sendfile::SEND_FILE_ALPN).expect("send-file ALPN is UTF-8"),
             mux::StreamActivity::Application,
         )
         .await
@@ -3578,7 +3559,7 @@ async fn handle_builtin_legacy_shell(
 ) -> Result<()> {
     let peer = connection.remote_id().to_string();
     let (mut send, mut recv) = connection.accept_bi().await?;
-    if state.allow_shell {
+    if state.allow_shell.load(Ordering::SeqCst) {
         shell::serve_shell_session(&mut recv, &mut send, &peer).await?;
     } else {
         shell::serve_shell_disabled(&mut send).await?;
@@ -3600,7 +3581,7 @@ async fn handle_builtin_resumable_shell(
         recv,
         peer_id,
         tunnel::ServerTarget::Shell {
-            allowed: state.allow_shell,
+            allowed: state.allow_shell.load(Ordering::SeqCst),
         },
         state.tunnel_sessions.clone(),
         state.tunnel_drop_rx(),
@@ -3611,7 +3592,7 @@ async fn handle_builtin_resumable_shell(
 async fn handle_builtin_exec(connection: Connection, state: Arc<DaemonState>) -> Result<()> {
     let peer = connection.remote_id().to_string();
     let (mut send, mut recv) = connection.accept_bi().await?;
-    if state.allow_exec {
+    if state.allow_exec.load(Ordering::SeqCst) {
         exec::serve_exec_session(&mut recv, &mut send, &peer).await?;
     } else {
         exec::serve_exec_disabled(&mut send).await?;
@@ -3728,7 +3709,7 @@ async fn handle_mux_stream(
         send.finish()?;
     } else if alpn == shell::SHELL_ALPN {
         let peer = connection.remote_id().to_string();
-        if state.allow_shell {
+        if state.allow_shell.load(Ordering::SeqCst) {
             shell::serve_shell_session(&mut recv, &mut send, &peer).await?;
         } else {
             shell::serve_shell_disabled(&mut send).await?;
@@ -3742,7 +3723,7 @@ async fn handle_mux_stream(
             recv,
             peer,
             tunnel::ServerTarget::Shell {
-                allowed: state.allow_shell,
+                allowed: state.allow_shell.load(Ordering::SeqCst),
             },
             state.tunnel_sessions.clone(),
             state.tunnel_drop_rx(),
@@ -3750,7 +3731,7 @@ async fn handle_mux_stream(
         .await?;
     } else if alpn == exec::EXEC_ALPN {
         let peer = connection.remote_id().to_string();
-        if state.allow_exec {
+        if state.allow_exec.load(Ordering::SeqCst) {
             exec::serve_exec_session(&mut recv, &mut send, &peer).await?;
         } else {
             exec::serve_exec_disabled(&mut send).await?;
@@ -5805,6 +5786,7 @@ mod tests {
         let client_dir = tempfile::tempdir()?;
         let server_home = FabricHome::new(server_dir.path());
         let client_home = FabricHome::new(client_dir.path());
+        set_machine_services(&server_home, false, true)?;
         let server = FabricNode::start_with_daemon_options(
             server_home.clone(),
             DaemonOptions {
@@ -5895,6 +5877,32 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn command_flags_cannot_open_machine_services() -> Result<()> {
+        let server_dir = tempfile::tempdir()?;
+        let server_home = FabricHome::new(server_dir.path());
+        let server = FabricNode::start_with_daemon_options(
+            server_home.clone(),
+            DaemonOptions {
+                allow_shell: true,
+                allow_exec: true,
+                ..DaemonOptions::default()
+            },
+        )
+        .await?;
+
+        assert!(!server.state.allow_shell.load(Ordering::SeqCst));
+        assert!(!server.state.allow_exec.load(Ordering::SeqCst));
+
+        set_machine_services(&server_home, true, true)?;
+        server.state().reload_peers().await?;
+        assert!(server.state.allow_shell.load(Ordering::SeqCst));
+        assert!(server.state.allow_exec.load(Ordering::SeqCst));
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
     /// Two mutually trusting nodes, the shape every probe test needs.
     async fn probe_pair(
         root: &std::path::Path,
@@ -5955,6 +5963,18 @@ mod tests {
         node.state().reload_peers().await
     }
 
+    fn set_machine_services(home: &FabricHome, allow_shell: bool, allow_exec: bool) -> Result<()> {
+        let mut peers = PeerBook::load(home)?;
+        peers.set_allow_shell(allow_shell);
+        peers.set_allow_exec(allow_exec);
+        peers.save(home)
+    }
+
+    async fn start_shell_server(home: FabricHome) -> Result<FabricNode> {
+        set_machine_services(&home, true, false)?;
+        FabricNode::start_with_options(home, true).await
+    }
+
     async fn collect_exec(stream: &mut UnixStream) -> Result<(Vec<u8>, i32)> {
         let mut stdout = Vec::new();
         loop {
@@ -6007,7 +6027,7 @@ mod tests {
         let client_dir = tempfile::tempdir()?;
         let server_home = FabricHome::new(server_dir.path());
         let client_home = FabricHome::new(client_dir.path());
-        let server = FabricNode::start_with_options(server_home.clone(), true).await?;
+        let server = start_shell_server(server_home.clone()).await?;
         let client = FabricNode::start(client_home.clone()).await?;
         trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
         trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
@@ -6121,7 +6141,7 @@ mod tests {
         let client_dir = tempfile::tempdir()?;
         let server_home = FabricHome::new(server_dir.path());
         let client_home = FabricHome::new(client_dir.path());
-        let server = FabricNode::start_with_options(server_home.clone(), true).await?;
+        let server = start_shell_server(server_home.clone()).await?;
         let client = FabricNode::start(client_home.clone()).await?;
         trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
         trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
@@ -6351,7 +6371,7 @@ mod tests {
         let client_dir = tempfile::tempdir()?;
         let server_home = FabricHome::new(server_dir.path());
         let client_home = FabricHome::new(client_dir.path());
-        let server = FabricNode::start_with_options(server_home.clone(), true).await?;
+        let server = start_shell_server(server_home.clone()).await?;
         let client = FabricNode::start(client_home.clone()).await?;
         trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
         trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
@@ -6422,7 +6442,7 @@ mod tests {
         let client_dir = tempfile::tempdir()?;
         let server_home = FabricHome::new(server_dir.path());
         let client_home = FabricHome::new(client_dir.path());
-        let server = FabricNode::start_with_options(server_home.clone(), true).await?;
+        let server = start_shell_server(server_home.clone()).await?;
         let client = FabricNode::start(client_home.clone()).await?;
         trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
         trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
@@ -6751,7 +6771,7 @@ mod tests {
         let shell_home = FabricHome::new(shell_dir.path());
         let echo_home = FabricHome::new(echo_dir.path());
         let client = FabricNode::start(client_home.clone()).await?;
-        let shell_peer = FabricNode::start_with_options(shell_home.clone(), true).await?;
+        let shell_peer = start_shell_server(shell_home.clone()).await?;
         let echo_peer = FabricNode::start(echo_home.clone()).await?;
 
         for (home, node, name) in [
@@ -7005,7 +7025,7 @@ mod tests {
         let client_dir = tempfile::tempdir()?;
         let server_home = FabricHome::new(server_dir.path());
         let client_home = FabricHome::new(client_dir.path());
-        let server = FabricNode::start_with_options(server_home.clone(), true).await?;
+        let server = start_shell_server(server_home.clone()).await?;
         let client = FabricNode::start(client_home.clone()).await?;
         trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
         trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
@@ -7209,8 +7229,7 @@ mod tests {
     /// stopped, and asserts the loop does not return until the daemon is
     /// cancelled. Without the fix the loop returns `Ok` at once and this fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_stopped_network_monitor_parks_the_loop_instead_of_ending_the_daemon()
-    -> Result<()> {
+    async fn a_stopped_network_monitor_parks_the_loop_instead_of_ending_the_daemon() -> Result<()> {
         struct MonitorStopped;
         impl InterfaceUpdates for MonitorStopped {
             async fn next_update(&mut self) -> Result<netwatch::interfaces::State> {
@@ -7220,9 +7239,12 @@ mod tests {
 
         let dir = tempfile::tempdir()?;
         let cancel = CancellationToken::new();
-        let state =
-            DaemonState::new(FabricHome::new(dir.path()), cancel.clone(), DaemonOptions::default())
-                .await?;
+        let state = DaemonState::new(
+            FabricHome::new(dir.path()),
+            cancel.clone(),
+            DaemonOptions::default(),
+        )
+        .await?;
 
         let loop_task = tokio::spawn(run_rehome_updates(state.clone(), MonitorStopped));
 

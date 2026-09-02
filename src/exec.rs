@@ -9,9 +9,9 @@
 //!
 //! Security mirrors `shell`: this is arbitrary remote command execution, so it is
 //! **default-deny per machine**. A daemon only runs an incoming exec if its own
-//! config enables it (`allow_exec`, set via `--allow-exec`). Trust (`peers.toml`)
-//! gates *who* may connect; `allow_exec` gates *whether* this node runs remote
-//! commands at all. Both are required.
+//! `peers.toml` enables it with the machine-level `allow_exec` setting. Each
+//! peer's allow list gates *who* may connect. The machine setting gates
+//! *whether* this node runs remote commands at all. Both are required.
 
 use anyhow::{Context, Result, bail};
 use tokio::{
@@ -50,7 +50,7 @@ where
     write_server_frame(
         send,
         ServerFrame::Error(
-            "remote exec is disabled on this peer; enable it with `--allow-exec`".to_string(),
+            "remote exec is disabled on this peer; set allow_exec = true in peers.toml".to_string(),
         ),
     )
     .await?;
