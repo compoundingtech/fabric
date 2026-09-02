@@ -277,9 +277,9 @@ it has opted in. They are independent (allowing one does not allow the other):
 `shell allowed` / `disabled` and `exec allowed` / `disabled`.
 
 These flags are **daemon-global** and only subtract access. A peer also needs its
-own `peers.toml` `allow` list to contain `shell` or `exec`. A legacy peer with no
-`allow` field remains unrestricted at this gate for compatibility. It still
-cannot use shell or exec unless the daemon-global flag enables that capability.
+own `peers.toml` `allow` list to contain `shell` or `exec`. A peer with no
+`allow` field has no grants. The daemon-global flag must also enable that
+capability.
 
 Enable them with flags on `fabric service install`:
 
@@ -648,17 +648,6 @@ fabric peers
 ```
 
 Read and list the entries in the authoritative `peers.toml`.
-
-```sh
-fabric peers make-explicit
-```
-
-Replace each legacy unrestricted peer with an explicit list that preserves all
-services available now. The command reads the running daemon's status, so the
-list includes the five built-ins and every persisted or ephemeral exposure on
-this machine. It then writes `peers.toml` and reloads the daemon. Existing
-explicit lists stay unchanged. A service exposed later is denied until it is
-added to that peer's list.
 
 ```sh
 fabric reload-peers
@@ -1160,7 +1149,7 @@ and retry; do not weaken the include lists to make the proof pass.
 
 ## Declarative Peer Config
 
-`peers.toml` is Fabric's authorized-keys file. It is intentionally
+`peers.toml` is Fabric's allow-list file. It is intentionally
 human-editable and can be provisioned before Fabric ever runs. Each
 `[[peers]]` entry accepts:
 
@@ -1169,25 +1158,25 @@ human-editable and can be provisioned before Fabric ever runs. Each
   `fabric ping workstation`.
 - `addr` (optional): an iroh `EndpointAddr` hint whose `id` must match the
   peer's `id`.
-- `allow` (optional): the service names this peer may reach. Omit it for legacy
-  unrestricted behavior. An empty list permits no service.
+- `allow` (optional): the service names this peer may reach. An omitted or
+  empty list permits no service.
 
 NodeIDs and names must be unique. Normal cross-machine setup should omit
 `addr`; NodeID-based iroh discovery supplies the current addresses.
 
 Trust is local and based on NodeID, not alias: `name` is only a command-line
-label. Each machine must independently list the other NodeID. An optional
-`allow` list limits that peer to named services such as `sync`, `shell`, `exec`,
-or an exposure name. A missing list keeps the legacy unrestricted behavior. The
-daemon-global shell and exec flags still apply and cannot be overridden by a
-peer entry.
+label. Each machine must independently list the other NodeID. The `allow` list
+grants named services such as `sync`, `shell`, `exec`, or an exposure name.
+Anything unlisted is refused. The daemon-global shell and exec flags still
+apply and cannot be overridden by a peer entry.
 
-A file can mix legacy entries with explicit permissions:
+A file can grant no services to one peer and exact services to another:
 
 ```toml
 [[peers]]
 id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 name = "workstation"
+allow = []
 
 [[peers]]
 id = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"

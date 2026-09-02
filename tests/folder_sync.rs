@@ -74,7 +74,12 @@ async fn trust_peer(
     addr: iroh::EndpointAddr,
 ) -> Result<()> {
     let mut peers = PeerBook::load(home)?;
-    peers.add(id, Some(name.to_string()), Some(addr));
+    peers.add_with_allow(
+        id,
+        Some(name.to_string()),
+        Some(addr),
+        Some(vec!["sync".to_string()]),
+    );
     peers.save(home)?;
     node.state().reload_peers().await?;
     Ok(())

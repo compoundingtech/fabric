@@ -802,7 +802,12 @@ async fn trust_peer(
     addr: Option<iroh::EndpointAddr>,
 ) -> Result<()> {
     let mut peers = PeerBook::load(home)?;
-    peers.add(id, name.map(str::to_string), addr);
+    peers.add_with_allow(
+        id,
+        name.map(str::to_string),
+        addr,
+        Some(vec!["shell".to_string()]),
+    );
     peers.save(home)?;
     node.state().reload_peers().await?;
     Ok(())
@@ -873,6 +878,8 @@ fn cli_add_peer(
         .arg(name)
         .arg("--addr-json")
         .arg(addr_json)
+        .arg("--allow")
+        .arg("shell")
         .output()
         .context("failed to run fabric add")?;
     assert_success(&output, "fabric add");

@@ -293,15 +293,15 @@ pub struct Peer {
     /// crosses the wire. A permission naming a port would name something the
     /// peer cannot see and this machine can change without telling anyone.
     ///
-    /// `None` means UNRESTRICTED, which is how every peer written before this
-    /// existed behaves and keeps behaving. `Some` means deny by default: a
-    /// service not in the list is refused, including one exposed later.
+    /// Fabric is an allow list. A service not in this list is refused,
+    /// including one exposed later. An omitted field becomes an empty list and
+    /// grants nothing.
     ///
     /// Policy keys on `id` and never on `name`. A name is a local label that
     /// can be changed at any time, and a permission that follows a rename is a
     /// permission granted to whoever inherits the label.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub allow: Option<Vec<String>>,
+    #[serde(default)]
+    pub allow: Vec<String>,
 }
 
 /// Why an incoming connection was refused, in the words a person should read.
@@ -309,6 +309,8 @@ pub struct Peer {
 pub enum Denied {
     /// The node is not in the allow-list at all.
     NotTrusted,
+    /// The node is trusted, but it has no service grants.
+    NoGrants { service: String },
     /// The node is trusted, but not for this service.
     NotPermitted { service: String },
 }
@@ -338,6 +340,12 @@ impl std::fmt::Display for Denied {
             // denial from a network fault, or one kind of denial from the
             // other, will turn the whole thing off.
             Denied::NotTrusted => write!(f, "peer is not trusted by this node"),
+            Denied::NoGrants { service } => {
+                write!(
+                    f,
+                    "peer has no grants; not permitted for service {service:?}"
+                )
+            }
             Denied::NotPermitted { service } => {
                 write!(f, "peer not permitted for service {service:?}")
             }
@@ -409,9 +417,8 @@ impl PeerBook {
 #        that depends on a name.
 # allow  which services this peer may reach, by the name a person types:
 #        shell, exec, sync, echo, or any protocol you expose such as web.
-#        Omit it and the peer is unrestricted, which is how peers behaved
-#        before this field existed. Include it and anything unlisted is
-#        refused, including a service you expose later.
+#        Fabric is an allow list. Anything unlisted is refused, including a
+#        service you expose later. Omit this field to grant no services.
 #
 # A service is a NAME, not a port. The port belongs to whichever side runs
 # `fabric expose`, and it never crosses the wire.
@@ -455,11 +462,11 @@ impl PeerBook {
             return Err(Denied::NotTrusted);
         };
         match &peer.allow {
-            // Written before permissions existed. Unrestricted, and shown as
-            // legacy by `fabric peers` so it is visible rather than assumed.
-            None => Ok(()),
-            Some(allowed) if allowed.iter().any(|s| s == service) => Ok(()),
-            Some(_) => Err(Denied::NotPermitted {
+            allowed if allowed.is_empty() => Err(Denied::NoGrants {
+                service: service.to_string(),
+            }),
+            allowed if allowed.iter().any(|s| s == service) => Ok(()),
+            _ => Err(Denied::NotPermitted {
                 service: service.to_string(),
             }),
         }
@@ -485,12 +492,14 @@ impl PeerBook {
         addr: Option<EndpointAddr>,
         allow: Option<Vec<String>>,
     ) {
-        let allow = allow.or_else(|| {
-            self.peers
-                .iter()
-                .find(|peer| peer.id == id)
-                .and_then(|peer| peer.allow.clone())
-        });
+        let allow = allow
+            .or_else(|| {
+                self.peers
+                    .iter()
+                    .find(|peer| peer.id == id)
+                    .map(|peer| peer.allow.clone())
+            })
+            .unwrap_or_default();
         self.peers.retain(|peer| peer.id != id);
         if let Some(name) = &name {
             self.peers
@@ -504,25 +513,6 @@ impl PeerBook {
         });
         self.peers
             .sort_by_key(|peer| (peer.name.clone().unwrap_or_default(), peer.id.to_string()));
-    }
-
-    /// Replace each legacy unrestricted entry with today's explicit services.
-    ///
-    /// Existing explicit entries stay unchanged. The caller must supply the
-    /// built-in names and the daemon's live exposure names. This preserves all
-    /// access that exists now while making a later service opt-in.
-    pub fn make_legacy_permissions_explicit(&mut self, services: &[String]) -> usize {
-        let mut explicit = services.to_vec();
-        explicit.sort();
-        explicit.dedup();
-        let mut changed = 0;
-        for peer in &mut self.peers {
-            if peer.allow.is_none() {
-                peer.allow = Some(explicit.clone());
-                changed += 1;
-            }
-        }
-        changed
     }
 
     pub fn remove(&mut self, peer: &str) -> bool {
@@ -909,103 +899,42 @@ mod tests {
         SecretKey::generate().public()
     }
 
-    /// A peer written before permissions existed stays unrestricted. This is the
-    /// compatibility rule the whole fleet depends on today.
+    /// Fabric is an allow list. An omitted list grants nothing.
     #[test]
-    fn a_peer_without_an_allow_list_may_reach_everything() {
+    fn a_peer_without_an_allow_list_may_reach_nothing() {
         let mut book = PeerBook::default();
         let hetz = an_id(1);
         book.add(hetz, Some("hetz".into()), None);
-        assert_eq!(book.may(&hetz, "sync"), Ok(()));
-        assert_eq!(book.may(&hetz, "shell"), Ok(()));
-        assert_eq!(book.may(&hetz, "anything-exposed-later"), Ok(()));
+        for service in ["sync", "shell", "anything-exposed-later"] {
+            let denied = book
+                .may(&hetz, service)
+                .expect_err("an omitted allow list granted a service");
+            assert!(
+                denied.to_string().contains("no grants"),
+                "the refusal hid the empty allow list: {denied}"
+            );
+        }
     }
 
-    /// The 0.10 groundwork property, proven rather than asserted: writing a
-    /// legacy entry out as an explicit list of every service that exists TODAY
-    /// preserves every one of them, and changes exactly one thing — a service
-    /// exposed AFTER the transcription is no longer auto-granted.
-    ///
-    /// The second half is the half that matters. Every-current-service-still-Ok
-    /// would pass even if `may` ignored the allow field; the future service
-    /// being Ok under legacy and Denied under the explicit list is what proves
-    /// the gate is live and the transcription is real. This is the spec the
-    /// make-explicit helper must satisfy: the list it writes is exactly the
-    /// service names `service_name_for_alpn` produces plus this machine's
-    /// current exposures, and nothing narrows.
     #[test]
-    fn an_explicit_list_of_todays_services_preserves_today_and_makes_tomorrow_opt_in() {
-        // The built-in service vocabulary the gate checks (see
-        // daemon::service_name_for_alpn). A real transcription also appends this
-        // machine's `fabric expose` names; omitting one of those would narrow by
-        // omission, which is why the helper reads them rather than hard-coding.
-        let today = ["shell", "exec", "sync", "echo", "send-file"];
+    fn omitted_and_explicit_empty_lists_have_the_same_policy() {
         let id = an_id(1);
+        let omitted: PeerBook = toml::from_str(&format!("[[peers]]\nid = \"{id}\"\n"))
+            .expect("an omitted allow field must parse");
+        let explicit: PeerBook =
+            toml::from_str(&format!("[[peers]]\nid = \"{id}\"\nallow = []\n"))
+                .expect("an explicit empty allow field must parse");
 
-        let mut legacy = PeerBook::default();
-        legacy.add(id, Some("hetz".into()), None); // allow = None, unrestricted
-        let mut explicit = PeerBook::default();
-        explicit.add_with_allow(
-            id,
-            Some("hetz".into()),
-            None,
-            Some(today.iter().map(|s| s.to_string()).collect()),
-        );
-
-        for service in today {
-            assert_eq!(
-                legacy.may(&id, service),
-                Ok(()),
-                "legacy must reach {service} today"
-            );
-            assert_eq!(
-                explicit.may(&id, service),
-                Ok(()),
-                "the transcription must still reach {service}; it narrowed by omission"
-            );
+        for service in ["sync", "shell", "anything-exposed-later"] {
+            assert_eq!(omitted.may(&id, service), explicit.may(&id, service));
+            assert!(omitted.may(&id, service).is_err());
         }
 
-        // The one real difference, made visible instead of hidden.
-        assert_eq!(
-            legacy.may(&id, "exposed-tomorrow"),
-            Ok(()),
-            "legacy auto-grants a future service"
+        let written = toml::to_string_pretty(&omitted).expect("the peer book must serialize");
+        assert!(
+            written.contains("allow = []"),
+            "saving did not make the empty allow list explicit: {written}"
         );
-        assert_eq!(
-            explicit.may(&id, "exposed-tomorrow"),
-            Err(Denied::NotPermitted {
-                service: "exposed-tomorrow".into()
-            }),
-            "the explicit list must make tomorrow opt-in — this is what proves the gate is live"
-        );
-    }
-
-    #[test]
-    fn make_explicit_changes_only_legacy_entries_and_keeps_every_named_service() {
-        let legacy = an_id(1);
-        let restricted = an_id(2);
-        let mut book = PeerBook::default();
-        book.add(legacy, Some("legacy".into()), None);
-        book.add_with_allow(
-            restricted,
-            Some("restricted".into()),
-            None,
-            Some(vec!["sync".into()]),
-        );
-
-        let changed = book.make_legacy_permissions_explicit(&[
-            "sync".into(),
-            "shell".into(),
-            "ephemeral-web".into(),
-            "sync".into(),
-        ]);
-        assert_eq!(changed, 1);
-        for service in ["sync", "shell", "ephemeral-web"] {
-            assert_eq!(book.may(&legacy, service), Ok(()));
-        }
-        assert!(book.may(&legacy, "exposed-tomorrow").is_err());
-        assert_eq!(book.may(&restricted, "sync"), Ok(()));
-        assert!(book.may(&restricted, "shell").is_err());
     }
 
     /// A peer WITH a list is deny by default, including for services this
@@ -1107,6 +1036,13 @@ mod tests {
         assert!(Denied::is_refusal(
             "connection lost: closed by peer: peer not permitted for service \"web\" (code 403)"
         ));
+        let no_grants = Denied::NoGrants {
+            service: "web".into(),
+        };
+        assert!(
+            Denied::is_refusal(&no_grants.to_string()),
+            "the empty-grant sentence looks like a network fault: {no_grants}"
+        );
         // Not everything is a refusal. A peer that is simply away must NOT be
         // reported as one, or a person goes looking for a permission problem
         // that does not exist.

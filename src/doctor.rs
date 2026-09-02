@@ -93,6 +93,9 @@ impl Finding {
 pub struct PeerFact {
     pub label: String,
     pub has_address: bool,
+    /// Whether this peer has at least one incoming service grant here.
+    /// `None` means the peer configuration could not be read.
+    pub has_grants: Option<bool>,
     /// `None` when the check could not run at all.
     pub reachable: Option<bool>,
     /// What the peer reports as its version, if it could be asked.
@@ -255,6 +258,16 @@ pub fn diagnose(facts: &Facts) -> Vec<Finding> {
 
 fn peer_finding(peer: &PeerFact) -> Finding {
     let label = &peer.label;
+    if peer.has_grants == Some(false) {
+        return Finding::new(
+            "peer",
+            Verdict::Problem,
+            format!("{label} has no grants on this machine, so it cannot reach any service"),
+        )
+        .with_action(format!(
+            "edit peers.toml and add the required services to {label}'s allow list"
+        ));
+    }
     match peer.reachable {
         Some(true) => Finding::new("peer", Verdict::Ok, format!("{label} is reachable")),
         Some(false) if !peer.has_address => Finding::new(
@@ -618,6 +631,7 @@ mod tests {
             peers: vec![PeerFact {
                 label: "hetz".to_string(),
                 has_address: true,
+                has_grants: Some(true),
                 reachable: Some(true),
                 version: Some("0.2.0+abc".to_string()),
                 version_error: None,
@@ -656,6 +670,25 @@ mod tests {
         );
         assert_eq!(exit_code(&findings), 0);
         assert!(opening(&configured()).is_none());
+    }
+
+    #[test]
+    fn a_peer_with_no_grants_is_an_actionable_problem() {
+        let mut facts = configured();
+        facts.peers[0].has_grants = Some(false);
+
+        let findings = diagnose(&facts);
+        let peer = find(&findings, "peer")[0];
+
+        assert_eq!(peer.verdict, Verdict::Problem);
+        assert!(peer.detail.contains("no grants"), "wrong detail: {}", peer.detail);
+        assert!(
+            peer.action
+                .as_deref()
+                .is_some_and(|action| action.contains("peers.toml")),
+            "the finding did not say where to add a grant: {:?}",
+            peer.action
+        );
     }
 
     /// The first run. Nothing is wrong, and the words have to say so, or a
@@ -1094,6 +1127,7 @@ mod tests {
         facts.peers.push(PeerFact {
             label: "droppy".to_string(),
             has_address: true,
+            has_grants: Some(true),
             reachable: Some(true),
             version: None,
             version_error: Some("remote exec is disabled".to_string()),
@@ -1156,7 +1190,7 @@ use anyhow::Result;
 
 use crate::ca;
 use crate::service::ServiceEnablement;
-use crate::config::FabricHome;
+use crate::config::{FabricHome, PeerBook};
 use crate::control::{ControlRequest, ControlResponse, PeerReachability, SyncEntryStatus};
 
 /// Where the OS service definition would live on this platform.
@@ -1188,6 +1222,7 @@ where
         reachability = peers;
     }
 
+    let peer_book = PeerBook::load(home).ok();
     let peers = reachability
         .iter()
         .map(|peer| {
@@ -1210,6 +1245,12 @@ where
                     .error
                     .as_deref()
                     .is_some_and(|e| e.contains("no address") || e.contains("no addr")),
+                has_grants: peer_book.as_ref().and_then(|book| {
+                    book.peers()
+                        .iter()
+                        .find(|configured| configured.id.to_string() == peer.id)
+                        .map(|configured| !configured.allow.is_empty())
+                }),
                 reachable: Some(peer.reachable),
                 label,
             }

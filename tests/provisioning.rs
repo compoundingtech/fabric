@@ -119,10 +119,7 @@ fn peers_lists_declarative_config_without_add() -> Result<()> {
             .output()
             .context("failed to run fabric peers")?,
     )?;
-    // `fabric peers` gained a third column: the effective policy. A peer
-    // written before permissions existed reads as `unrestricted (legacy)`
-    // rather than leaving a reader to infer what an absent field means.
-    assert_eq!(peers, format!("{peer_id}\tbox-a\tunrestricted (legacy)"));
+    assert_eq!(peers, format!("{peer_id}\tbox-a\tno services"));
     Ok(())
 }
 
@@ -155,7 +152,7 @@ fn default_home_reads_peers_from_config_dir() -> Result<()> {
             .output()
             .context("failed to run fabric peers")?,
     )?;
-    assert_eq!(peers, format!("{peer_id}\tconfig-peer\tunrestricted (legacy)"));
+    assert_eq!(peers, format!("{peer_id}\tconfig-peer\tno services"));
     Ok(())
 }
 
@@ -189,7 +186,7 @@ fn default_home_moves_legacy_peer_file_to_config_dir() -> Result<()> {
             .output()
             .context("failed to run fabric peers")?,
     )?;
-    assert_eq!(peers, format!("{peer_id}\tlegacy-peer\tunrestricted (legacy)"));
+    assert_eq!(peers, format!("{peer_id}\tlegacy-peer\tno services"));
     let migrated_config = fs::read_to_string(fabric_home.join("config.toml"))?;
     assert!(migrated_config.contains("allow_shell = true"));
     assert!(!migrated_config.contains("legacy-peer"));
@@ -228,7 +225,7 @@ fn default_home_moves_embedded_peers_to_authoritative_peer_file() -> Result<()> 
             .output()
             .context("failed to run fabric peers")?,
     )?;
-    assert_eq!(peers, format!("{peer_id}\tembedded-peer\tunrestricted (legacy)"));
+    assert_eq!(peers, format!("{peer_id}\tembedded-peer\tno services"));
 
     let migrated_config = fs::read_to_string(fabric_home.join("config.toml"))?;
     assert!(migrated_config.contains("allow_shell = true"));
@@ -281,7 +278,7 @@ fn default_home_peer_file_overrides_embedded_config_peers() -> Result<()> {
             .output()
             .context("failed to run fabric peers")?,
     )?;
-    assert_eq!(peers, format!("{new_id}\tnew-peer\tunrestricted (legacy)"));
+    assert_eq!(peers, format!("{new_id}\tnew-peer\tno services"));
     let migrated_config = fs::read_to_string(fabric_home.join("config.toml"))?;
     assert!(!migrated_config.contains("old-peer"));
     assert!(fs::read_to_string(config_dir.join("peers.toml"))?.contains("new-peer"));
