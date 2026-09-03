@@ -4,8 +4,27 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-02 by Silber.fabric-codex. Main is `2ce39b4`.
-Silber and hetz run `0.2.0+7f4da21`. Bluey is deferred to Nathan._
+_Last updated: 2026-09-03 by Silber.fabric-codex. Main is `ebca516`.
+Silber and hetz run `0.2.0+ebca516`. Bluey will receive the mux hotfix next._
+
+## Current incident — 2026-09-03
+
+Release `v0.2.0+ebca516` is published with Apple arm64 and both Linux assets.
+The required ACL migration and downgrade warnings lead its release notes.
+
+A matched mux pair again retained a stale canonical connection after Silber
+replaced its endpoint. Hetz has the lower NodeID, so both tie-break decisions
+correctly select the hetz-client to Silber-server connection. Silber closed its
+server-side cache and dialed a fresh noncanonical connection. Hetz retained the
+old canonical client handle and rejected every fresh connection as a duplicate.
+The bounded retry cannot clear a durable stale handle. A Silber daemon restart
+fully closed the old endpoint and restored control.
+
+The active hotfix quarantines mux in both directions. Production dials use the
+existing direct service ALPNs, and production endpoints do not advertise mux.
+This keeps all services, including Git, and removes the stale shared state.
+Focused tests still exercise the mux implementation for a later correct repair.
+Do not enable mux again without a matched-pair endpoint replacement test.
 
 ## Current handoff — 2026-09-02
 

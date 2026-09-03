@@ -125,8 +125,8 @@ async fn git_clone_push_and_revocation_use_exact_repository_grants() -> Result<(
     assert_eq!(fs::read(clone.join("large.bin"))?, large);
     assert_eq!(
         client.state().peer_connection_count().await,
-        1,
-        "echo and Git must share one peer connection"
+        0,
+        "Git used the quarantined shared mux instead of direct ALPN"
     );
 
     git_ok(Some(&clone), &["config", "user.name", "Fabric Test"])?;
@@ -1146,7 +1146,7 @@ async fn ping_round_trips_builtin_echo() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn simultaneous_peer_traffic_converges_to_one_shared_connection() -> Result<()> {
+async fn simultaneous_peer_traffic_avoids_the_quarantined_shared_connection() -> Result<()> {
     let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
     let node_b_dir = TempDir::new()?;
@@ -1175,8 +1175,8 @@ async fn simultaneous_peer_traffic_converges_to_one_shared_connection() -> Resul
     let (from_a, from_b) = tokio::join!(node_a.ping("node-b"), node_b.ping("node-a"));
     assert_eq!(from_a?.bytes, 32);
     assert_eq!(from_b?.bytes, 32);
-    assert_eq!(node_a.state().peer_connection_count().await, 1);
-    assert_eq!(node_b.state().peer_connection_count().await, 1);
+    assert_eq!(node_a.state().peer_connection_count().await, 0);
+    assert_eq!(node_b.state().peer_connection_count().await, 0);
 
     node_b.shutdown().await?;
     node_a.shutdown().await?;
