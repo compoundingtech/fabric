@@ -1299,4 +1299,218 @@ mod tests {
         client.close().await;
         Ok(())
     }
+
+    #[derive(Debug, Clone, Copy)]
+    struct ProcessSample {
+        cpu_seconds: f64,
+        rss_bytes: u64,
+        package_idle_wakes: u64,
+        interrupt_wakes: u64,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn process_sample() -> Result<ProcessSample> {
+        let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+        // SAFETY: proc_pid_rusage writes one rusage_info_v4 into this aligned,
+        // zeroed buffer. A zero return confirms that it initialized the buffer.
+        let status = unsafe {
+            libc::proc_pid_rusage(
+                libc::getpid(),
+                libc::RUSAGE_INFO_V4,
+                info.as_mut_ptr().cast(),
+            )
+        };
+        if status != 0 {
+            return Err(std::io::Error::last_os_error()).context("read process resource use");
+        }
+        // SAFETY: the successful call initialized the complete version 4 value.
+        let info = unsafe { info.assume_init() };
+        Ok(ProcessSample {
+            cpu_seconds: (info.ri_user_time + info.ri_system_time) as f64 / 1_000_000_000.0,
+            rss_bytes: info.ri_resident_size,
+            package_idle_wakes: info.ri_pkg_idle_wkups,
+            interrupt_wakes: info.ri_interrupt_wkups,
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn process_sample() -> Result<ProcessSample> {
+        bail!("the wake-frequency measurement requires macOS process counters")
+    }
+
+    fn unique_connections(streams: &[MuxStream]) -> Vec<Connection> {
+        let mut seen = HashSet::new();
+        streams
+            .iter()
+            .filter_map(|stream| {
+                seen.insert(stream.connection.stable_id())
+                    .then(|| stream.connection.clone())
+            })
+            .collect()
+    }
+
+    fn network_totals(connections: &[Connection]) -> (u64, u64, u64) {
+        connections.iter().fold((0, 0, 0), |totals, connection| {
+            let stats = connection.stats();
+            (
+                totals.0 + stats.udp_tx.bytes + stats.udp_rx.bytes,
+                totals.1 + stats.udp_tx.datagrams + stats.udp_rx.datagrams,
+                totals.2 + stats.udp_tx.ios + stats.udp_rx.ios,
+            )
+        })
+    }
+
+    async fn open_measurement_stream(
+        mode: &str,
+        manager: &PeerConnections,
+        client: &Endpoint,
+        server: &EndpointAddr,
+    ) -> Result<MuxStream> {
+        if mode == "mux" {
+            manager
+                .open_mux_stream(client, 1, server, "measure", StreamActivity::Application)
+                .await
+        } else {
+            manager.open_legacy(client, server, "measure").await
+        }
+    }
+
+    async fn prove_measurement_stream(stream: &mut MuxStream) -> Result<()> {
+        stream.send.write_all(b"x").await?;
+        let mut reply = [0u8; 1];
+        stream.recv.read_exact(&mut reply).await?;
+        assert_eq!(&reply, b"x");
+        Ok(())
+    }
+
+    /// Compare the idle cost of 16 mux streams against 16 direct connections.
+    ///
+    /// Run each mode in a fresh process. The default window is 30 minutes:
+    /// `FABRIC_MUX_MEASURE_MODE=mux cargo test --lib idle_mux_value_measurement -- --ignored --nocapture`
+    /// Repeat with `FABRIC_MUX_MEASURE_MODE=direct`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "30-minute mux value measurement"]
+    async fn idle_mux_value_measurement() -> Result<()> {
+        let mode = std::env::var("FABRIC_MUX_MEASURE_MODE")
+            .context("set FABRIC_MUX_MEASURE_MODE to mux or direct")?;
+        if mode != "mux" && mode != "direct" {
+            bail!("FABRIC_MUX_MEASURE_MODE must be mux or direct");
+        }
+        let window_seconds = std::env::var("FABRIC_MUX_MEASURE_SECONDS")
+            .ok()
+            .map(|value| value.parse::<u64>())
+            .transpose()?
+            .unwrap_or(30 * 60);
+        if window_seconds == 0 {
+            bail!("FABRIC_MUX_MEASURE_SECONDS must be greater than zero");
+        }
+
+        let mux_connections = Arc::new(AtomicUsize::new(0));
+        let legacy_connections = Arc::new(AtomicUsize::new(0));
+        let server_endpoint = Endpoint::bind(presets::N0).await?;
+        let router = Router::builder(server_endpoint)
+            .accept(
+                MUX_ALPN,
+                MuxEcho {
+                    connections: mux_connections,
+                    headers: Arc::new(Mutex::new(Vec::new())),
+                },
+            )
+            .accept(
+                b"measure",
+                LegacyEcho {
+                    connections: legacy_connections,
+                },
+            )
+            .spawn();
+        router.endpoint().online().await;
+        let server = router.endpoint().addr();
+        let client = Endpoint::bind(presets::N0).await?;
+        let (opened_tx, _opened_rx) = mpsc::unbounded_channel();
+        let manager = Arc::new(PeerConnections::new(client.id(), opened_tx));
+
+        let mut streams = Vec::with_capacity(16);
+        for _ in 0..16 {
+            let mut stream = open_measurement_stream(&mode, &manager, &client, &server).await?;
+            prove_measurement_stream(&mut stream).await?;
+            streams.push(stream);
+        }
+        let idle_connections = unique_connections(&streams);
+        let network_start = network_totals(&idle_connections);
+        let process_start = process_sample()?;
+        println!(
+            "measurement_start mode={mode} window_seconds={window_seconds} logical_sessions=16 connections={} pid={} cpu_seconds={:.6} rss_bytes={} package_idle_wakes={} interrupt_wakes={} network_bytes={} datagrams={} ios={}",
+            idle_connections.len(),
+            std::process::id(),
+            process_start.cpu_seconds,
+            process_start.rss_bytes,
+            process_start.package_idle_wakes,
+            process_start.interrupt_wakes,
+            network_start.0,
+            network_start.1,
+            network_start.2,
+        );
+
+        tokio::time::sleep(Duration::from_secs(window_seconds)).await;
+
+        let process_end = process_sample()?;
+        let network_end = network_totals(&idle_connections);
+        let cpu_seconds = process_end.cpu_seconds - process_start.cpu_seconds;
+        let package_idle_wakes = process_end
+            .package_idle_wakes
+            .saturating_sub(process_start.package_idle_wakes);
+        let interrupt_wakes = process_end
+            .interrupt_wakes
+            .saturating_sub(process_start.interrupt_wakes);
+        let network_bytes = network_end.0.saturating_sub(network_start.0);
+        println!(
+            "measurement_idle mode={mode} window_seconds={window_seconds} connections={} cpu_seconds={cpu_seconds:.6} cpu_one_core_percent={:.6} rss_start_bytes={} rss_end_bytes={} package_idle_wakes={package_idle_wakes} package_idle_wakes_per_second={:.6} interrupt_wakes={interrupt_wakes} interrupt_wakes_per_second={:.6} network_bytes={network_bytes} network_bytes_per_second={:.3} datagrams={} ios={}",
+            idle_connections.len(),
+            cpu_seconds / window_seconds as f64 * 100.0,
+            process_start.rss_bytes,
+            process_end.rss_bytes,
+            package_idle_wakes as f64 / window_seconds as f64,
+            interrupt_wakes as f64 / window_seconds as f64,
+            network_bytes as f64 / window_seconds as f64,
+            network_end.1.saturating_sub(network_start.1),
+            network_end.2.saturating_sub(network_start.2),
+        );
+
+        let mut recovery_micros = Vec::with_capacity(160);
+        for _ in 0..10 {
+            for connection in unique_connections(&streams) {
+                connection.close(0u32.into(), b"mux value recovery sample");
+            }
+            let mut attempts = tokio::task::JoinSet::new();
+            for _ in 0..16 {
+                let mode = mode.clone();
+                let manager = manager.clone();
+                let client = client.clone();
+                let server = server.clone();
+                attempts.spawn(async move {
+                    let started = Instant::now();
+                    let stream = open_measurement_stream(&mode, &manager, &client, &server).await?;
+                    Ok::<_, anyhow::Error>((started.elapsed(), stream))
+                });
+            }
+            streams.clear();
+            while let Some(result) = attempts.join_next().await {
+                let (duration, mut stream) = result??;
+                prove_measurement_stream(&mut stream).await?;
+                recovery_micros.push(duration.as_micros() as u64);
+                streams.push(stream);
+            }
+        }
+        recovery_micros.sort_unstable();
+        let p95 = recovery_micros[(recovery_micros.len() * 95).div_ceil(100) - 1];
+        println!(
+            "measurement_recovery mode={mode} samples={} p95_micros={p95} final_connections={}",
+            recovery_micros.len(),
+            unique_connections(&streams).len(),
+        );
+
+        router.shutdown().await?;
+        client.close().await;
+        Ok(())
+    }
 }
