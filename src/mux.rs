@@ -15,6 +15,11 @@
 //! connection drop re-opens the shared connection and re-attaches its streams,
 //! which is rarer than per-tunnel drops because iroh multipath migrates paths
 //! without dropping the connection.
+//!
+//! Production currently uses direct per-service ALPN connections. A matched mux
+//! pair retained a canonical connection to a replaced endpoint and refused each
+//! fresh connection as a duplicate. The mux implementation stays here with its
+//! focused tests until the wire contract can distinguish an endpoint generation.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -37,6 +42,9 @@ use tokio::{
 
 /// The reserved ALPN for the multiplexed per-peer connection.
 pub const MUX_ALPN: &[u8] = b"fabric/mux/1";
+/// The shared mux transport is quarantined after a matched pair retained a
+/// stale canonical connection and rejected every replacement connection.
+pub const MUX_ENABLED: bool = false;
 /// A diagnostic block that can clear without a config change.
 pub(crate) const TEMPORARY_TUNNEL_BLOCK: &str = "fabric tunnel blocked";
 
@@ -290,6 +298,24 @@ impl PeerConnections {
     /// can still hold the old canonical connection during an endpoint recycle.
     /// Returns the stream with its header already written for tunnel framing.
     pub async fn open_stream(
+        &self,
+        endpoint: &Endpoint,
+        generation: u64,
+        peer_addr: &EndpointAddr,
+        protocol: &str,
+        activity: StreamActivity,
+    ) -> Result<MuxStream> {
+        if MUX_ENABLED {
+            self.open_mux_stream(endpoint, generation, peer_addr, protocol, activity)
+                .await
+        } else {
+            self.open_legacy(endpoint, peer_addr, protocol).await
+        }
+    }
+
+    /// Open through the quarantined shared transport for its focused tests.
+    /// Production calls [`Self::open_stream`], which selects the safe transport.
+    async fn open_mux_stream(
         &self,
         endpoint: &Endpoint,
         generation: u64,
@@ -738,7 +764,7 @@ mod tests {
         let (opened_tx, _opened_rx) = mpsc::unbounded_channel();
         let manager = PeerConnections::new(client.id(), opened_tx);
         let stream = manager
-            .open_stream(
+            .open_mux_stream(
                 &client,
                 1,
                 &router.endpoint().addr(),
@@ -773,7 +799,7 @@ mod tests {
         let (opened_tx, _opened_rx) = mpsc::unbounded_channel();
         let manager = PeerConnections::new(client.id(), opened_tx);
         let first = manager
-            .open_stream(
+            .open_mux_stream(
                 &client,
                 0,
                 &router.endpoint().addr(),
@@ -785,7 +811,7 @@ mod tests {
         assert_echo(first, b"old-generation").await?;
 
         let second = manager
-            .open_stream(
+            .open_mux_stream(
                 &client,
                 1,
                 &router.endpoint().addr(),
@@ -825,6 +851,50 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn production_streams_use_legacy_while_mux_is_quarantined() -> Result<()> {
+        let mux_connections = Arc::new(AtomicUsize::new(0));
+        let legacy_connections = Arc::new(AtomicUsize::new(0));
+        let server_ep = Endpoint::bind(presets::N0).await?;
+        let router = Router::builder(server_ep)
+            .accept(
+                MUX_ALPN,
+                MuxEcho {
+                    connections: mux_connections.clone(),
+                    headers: Arc::new(Mutex::new(Vec::new())),
+                },
+            )
+            .accept(
+                LEGACY_ECHO_ALPN,
+                LegacyEcho {
+                    connections: legacy_connections.clone(),
+                },
+            )
+            .spawn();
+        router.endpoint().online().await;
+
+        let client = Endpoint::bind(presets::N0).await?;
+        let (opened_tx, _opened_rx) = mpsc::unbounded_channel();
+        let manager = PeerConnections::new(client.id(), opened_tx);
+        let stream = manager
+            .open_stream(
+                &client,
+                0,
+                &router.endpoint().addr(),
+                str::from_utf8(LEGACY_ECHO_ALPN)?,
+                StreamActivity::Application,
+            )
+            .await?;
+        assert_echo(stream, b"stable-legacy").await?;
+
+        assert_eq!(legacy_connections.load(Ordering::SeqCst), 1);
+        assert_eq!(mux_connections.load(Ordering::SeqCst), 0);
+
+        router.shutdown().await?;
+        client.close().await;
+        Ok(())
     }
 
     async fn assert_echo(mut stream: MuxStream, message: &[u8]) -> Result<()> {
@@ -867,14 +937,14 @@ mod tests {
         let manager = PeerConnections::new(new_client.id(), opened_tx);
         let legacy_protocol = str::from_utf8(LEGACY_ECHO_ALPN)?;
         let (first, second) = tokio::join!(
-            manager.open_stream(
+            manager.open_mux_stream(
                 &new_client,
                 0,
                 &server_addr,
                 legacy_protocol,
                 StreamActivity::Application,
             ),
-            manager.open_stream(
+            manager.open_mux_stream(
                 &new_client,
                 0,
                 &server_addr,
@@ -938,7 +1008,7 @@ mod tests {
             .retry_after = Instant::now();
         for message in [b"upgraded-1".as_slice(), b"upgraded-2".as_slice()] {
             let stream = manager
-                .open_stream(
+                .open_mux_stream(
                     &new_client,
                     0,
                     &server_addr,
@@ -980,7 +1050,7 @@ mod tests {
         let manager = PeerConnections::new(client.id(), opened_tx);
 
         let probe = manager
-            .open_stream(&client, 0, &server_addr, "probe", StreamActivity::Probe)
+            .open_mux_stream(&client, 0, &server_addr, "probe", StreamActivity::Probe)
             .await?;
         drop(probe);
         assert!(
@@ -993,7 +1063,7 @@ mod tests {
         // Open two logical streams with different protocols on the same peer.
         for proto in ["pty-view", "demo-http"] {
             let stream = manager
-                .open_stream(&client, 0, &server_addr, proto, StreamActivity::Application)
+                .open_mux_stream(&client, 0, &server_addr, proto, StreamActivity::Application)
                 .await?;
             let mut send = stream.send;
             let mut recv = stream.recv;
@@ -1024,7 +1094,7 @@ mod tests {
         );
         assert!(manager.redial(server_addr.id, b"test degradation").await);
         let stream = manager
-            .open_stream(
+            .open_mux_stream(
                 &client,
                 0,
                 &server_addr,

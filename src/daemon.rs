@@ -3825,7 +3825,9 @@ async fn handle_sync_stream(
 
 fn accepted_alpns(exposures: &HashMap<Vec<u8>, Exposure>) -> Vec<Vec<u8>> {
     let mut alpns = Vec::with_capacity(exposures.len() + 8);
-    alpns.push(mux::MUX_ALPN.to_vec());
+    if mux::MUX_ENABLED {
+        alpns.push(mux::MUX_ALPN.to_vec());
+    }
     alpns.push(BUILTIN_ECHO_ALPN.to_vec());
     alpns.push(shell::SHELL_ALPN.to_vec());
     alpns.push(shell::RESUMABLE_SHELL_ALPN.to_vec());
@@ -4957,6 +4959,15 @@ mod tests {
         assert!(sync_accept_is_info_sample(128));
         assert!(!sync_accept_is_info_sample(127));
         assert!(!sync_accept_is_info_sample(129));
+    }
+
+    #[test]
+    fn a_production_endpoint_does_not_advertise_quarantined_mux() {
+        let alpns = accepted_alpns(&HashMap::new());
+
+        assert!(!alpns.iter().any(|alpn| alpn == mux::MUX_ALPN));
+        assert!(alpns.iter().any(|alpn| alpn == BUILTIN_ECHO_ALPN));
+        assert!(alpns.iter().any(|alpn| alpn == exec::EXEC_ALPN));
     }
 
     #[test]
