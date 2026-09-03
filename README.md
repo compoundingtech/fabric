@@ -758,6 +758,7 @@ This command is only for an unsupervised daemon started by `fabric up`. It
 refuses when the selected default home has an installed launchd or systemd
 service, before it schedules the helper. The refusal names the native restart
 command so the service manager stays responsible for the replacement process.
+If ownership cannot be read, it also names the native status command to run.
 
 The `--allow-shell` and `--no-allow-shell` options remain accepted for
 compatibility. They do not change the policy in `peers.toml`.

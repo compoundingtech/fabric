@@ -337,12 +337,14 @@ pub fn ensure_unsupervised_restart(home: &FabricHome) -> Result<()> {
     restart_ownership_decision(
         service_enablement(),
         &native_service_restart_command()?,
+        &native_service_status_command()?,
     )
 }
 
 fn restart_ownership_decision(
     enablement: ServiceEnablement,
     native_restart_command: &str,
+    native_status_command: &str,
 ) -> Result<()> {
     if enablement == ServiceEnablement::NotInstalled {
         return Ok(());
@@ -354,8 +356,15 @@ fn restart_ownership_decision(
         ServiceEnablement::Unknown => "present but not readable",
         ServiceEnablement::NotInstalled => unreachable!(),
     };
+    let inspection = if enablement == ServiceEnablement::Unknown {
+        format!(
+            "\nInspect native ownership with `{native_status_command}` and fix that error before retrying."
+        )
+    } else {
+        String::new()
+    };
     bail!(
-        "refusing `fabric restart`: the native Fabric service is {ownership} for the selected home.\n\
+        "refusing `fabric restart`: the native Fabric service is {ownership} for the selected home.{inspection}\n\
          Restart it with `{native_restart_command}` so the service manager keeps ownership.\n\
          `fabric restart` is only for an unsupervised daemon started by `fabric up`."
     )
@@ -369,6 +378,23 @@ fn native_service_restart_command() -> Result<String> {
     #[cfg(target_os = "macos")]
     {
         return Ok(format!("launchctl kickstart -k {}", launchd_service_target()));
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        bail!("fabric service is currently supported on Linux systemd-user and macOS launchd");
+    }
+}
+
+fn native_service_status_command() -> Result<String> {
+    #[cfg(target_os = "linux")]
+    {
+        return Ok(format!(
+            "systemctl --user status {SERVICE_NAME} --no-pager"
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return Ok(format!("launchctl print {}", launchd_service_target()));
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -1012,6 +1038,7 @@ mod tests {
         restart_ownership_decision(
             ServiceEnablement::NotInstalled,
             "systemctl --user restart fabric.service",
+            "systemctl --user status fabric.service --no-pager",
         )
         .expect("an absent service must leave the unsupervised restart usable");
     }
@@ -1019,17 +1046,23 @@ mod tests {
     #[test]
     fn every_possible_native_owner_refuses_the_standalone_restart() {
         let command = "systemctl --user restart fabric.service";
+        let status = "systemctl --user status fabric.service --no-pager";
         for enablement in [
             ServiceEnablement::Enabled,
             ServiceEnablement::PresentNotEnabled,
             ServiceEnablement::Unknown,
         ] {
-            let error = restart_ownership_decision(enablement, command)
+            let error = restart_ownership_decision(enablement, command, status)
                 .expect_err("a possible native owner must stop the standalone helper");
             let message = format!("{error:#}");
             assert!(message.contains("refusing `fabric restart`"), "{message}");
             assert!(message.contains(command), "{message}");
             assert!(message.contains("service manager keeps ownership"), "{message}");
+            assert_eq!(
+                message.contains(status),
+                enablement == ServiceEnablement::Unknown,
+                "only an unreadable ownership check needs the diagnostic command: {message}"
+            );
         }
     }
 
@@ -1044,6 +1077,13 @@ mod tests {
                 unsafe { libc::geteuid() }
             )
         );
+        assert_eq!(
+            native_service_status_command().unwrap(),
+            format!(
+                "launchctl print gui/{}/com.compoundingtech.fabric",
+                unsafe { libc::geteuid() }
+            )
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1052,6 +1092,10 @@ mod tests {
         assert_eq!(
             native_service_restart_command().unwrap(),
             "systemctl --user restart fabric.service"
+        );
+        assert_eq!(
+            native_service_status_command().unwrap(),
+            "systemctl --user status fabric.service --no-pager"
         );
     }
 
