@@ -4,8 +4,8 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-03 by Silber.fabric-codex. Main is `f0f99f6`; its last
-code commit is deployed as `0.2.1+6e856c4` on Silber and hetz._
+_Last updated: 2026-09-03 by Silber.fabric-codex. Main's last code commit is
+deployed as `0.2.1+6e856c4` on Silber and hetz._
 
 ## Current incident — 2026-09-03
 
