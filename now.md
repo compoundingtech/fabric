@@ -5,7 +5,7 @@ current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
 _Last updated: 2026-09-03 by Silber.fabric-codex. Main and the deployed code
-are `f806142`. Silber and hetz run `0.2.1+f806142`._
+are `6e856c4`. Silber and hetz run `0.2.1+6e856c4`._
 
 ## Current incident — 2026-09-03
 
@@ -13,12 +13,30 @@ Release `v0.2.0+ebca516` is published with Apple arm64 and both Linux assets.
 The required ACL migration and downgrade warnings lead its release notes.
 
 Release `v0.2.1+f806142` is published with Apple arm64 and both Linux assets.
-Silber and hetz run that exact build. Two-way ping passes. Both sync entries
-have matching digests and zero drift fields on both hosts.
+It was the first v0.2.1 fleet build and remains available for rollback.
 
-Doctor passes every local, peer-reachability, and sync check on both hosts.
-It reports Bluey's version as unknown because remote exec to Bluey exits 1.
-Bluey remains reachable from both hosts.
+Release `v0.2.1+6e856c4` is published with Apple arm64 and both Linux assets.
+Silber and hetz run that exact build. The rollout updated Silber first. During
+the mixed-version window, ping and exec passed in both directions. Final direct
+pings took 43.052 milliseconds from Silber to hetz and 73.589 milliseconds from
+hetz to Silber.
+
+Both sync entries have matching digests and zero drift, missing, unexpected,
+mismatched, scan-issue, reconcile-failure, stopped, away, and delta-fallback
+fields on both hosts. The bus digest is
+`e4f9dcf36ccd848bb13d7b3b460b800048f170713c6007598276b9c08a5b7119`.
+It has 27,278 present records, 17,141 tombstones, and 27,278 observed paths.
+The declarations digest is
+`988df23311e2421ebd54723207c618975a089bf87fbcec61abbbdca6a45d9444`.
+It has 125 present records, 34 tombstones, and 125 observed paths.
+
+Doctor passes every local, peer-reachability, version, and sync check on both
+hosts. It keeps Bluey's unreadable version visible as `unknown, roaming` and
+does not fail the fleet check. Bluey remains reachable from both hosts.
+
+The two updater rollback binaries made during this deployment were deleted
+after verification. Both exact paths are absent. Older builds remain available
+through their published release assets.
 
 Nathan removed the release hold on 2026-09-03. Daily builds must include the
 features on main. A later public 0.9.0 release is a separate act, and unfinished
@@ -111,9 +129,16 @@ it `bluey`; hetz names it `air`. Both old daemons reloaded the file, but build
 
 PR #135 adds strict cross-file validation for explicit sync selectors. It
 rejects an unknown selector during `sync add`, sync reload, and peer reload.
-At daemon start, it keeps the transport up, warns once, and stops only the bad
-entry. A rejected reload keeps the last valid in-memory configuration. The live
-hetz migration is complete, so its deployment precondition is met.
+At daemon start, it keeps the transport up, warns once per affected entry,
+reconciles selectors that resolve, and reports unresolved selectors as stopped.
+A rejected reload keeps the last valid in-memory configuration. The live hetz
+migration was complete before deployment. PR #135 merged at
+`6e856c4e6b75fb960f8c1df570f001cad85ba31c` and is deployed on both hosts.
+
+PR #136 makes an unreadable roaming peer version visible without failing
+doctor. A normal peer with an unreadable version still fails. It merged at
+`eecf28d3d9ae90829f9a2d3ed2a547f81763405f` and is included in the deployed
+build.
 
 Do not merge your own pull requests without the required pull-request approval.
 Do not create peer-file backup copies. Put non-secret configuration history in
