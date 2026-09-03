@@ -5,7 +5,7 @@ current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
 _Last updated: 2026-09-03 by Silber.fabric-codex. Main's last code commit is
-deployed as `0.2.1+88ab09f` on Silber and hetz._
+deployed as `0.2.1+f2757f0` on Silber and hetz._
 
 ## Current incident — 2026-09-03
 
@@ -15,19 +15,19 @@ The required ACL migration and downgrade warnings lead its release notes.
 Release `v0.2.1+f806142` is published with Apple arm64 and both Linux assets.
 It was the first v0.2.1 fleet build and remains available for rollback.
 
-Release `v0.2.1+88ab09f` is published with Apple arm64 and both Linux assets.
+Release `v0.2.1+f2757f0` is published with Apple arm64 and both Linux assets.
 All four release jobs passed. Silber and hetz run that exact build. The rollout
 updated Silber first. During the mixed-version window, ping and exec passed in
-both directions. Final direct pings took 63.903 milliseconds from Silber to hetz
-and 38.483 milliseconds from hetz to Silber.
+both directions. Final direct pings took 84.211 milliseconds from Silber to hetz
+and 53.214 milliseconds from hetz to Silber.
 
 Both sync entries have matching digests and zero drift, missing, unexpected,
 mismatched, scan-issue, reconcile-failure, stopped, away, and delta-fallback
 fields on both hosts. The bus digest is
-`6de63bbefa7ccb500dcbe4a25c127dedec0443145dc336acdd20cf44db752bba`.
-It has 27,608 present records, 17,234 tombstones, and 27,608 observed paths.
+`09e8c17517fd15ee8aedf6240997aaedc81a16dfbc20d0c7b6d841ad5cba0f32`.
+It has 27,777 present records, 17,288 tombstones, and 27,777 observed paths.
 The declarations digest is
-`2592161b803c9150b3a34f0d78ea0006fc0074fa0a5eea06ca2d7d26985b14db`.
+`fb911eaa327d3c2d560da299c25f4f877d1ce07913266a00cefbe6ef11d63ba1`.
 It has 118 present records, 41 tombstones, and 118 observed paths.
 
 Doctor passes every local, peer-reachability, version, and sync check on both
@@ -35,7 +35,7 @@ hosts. It keeps Bluey's unreadable version visible as `unknown, roaming` and
 does not fail the fleet check. Bluey remains reachable from both hosts.
 
 The two updater rollback binaries made during this deployment were deleted
-after verification. Both contained `0.2.1+6e856c4`, and both exact paths are
+after verification. Both contained `0.2.1+88ab09f`, and both exact paths are
 absent. Older builds remain available through their published release assets.
 
 PR #138 makes `fabric restart` refuse when the default home has an enabled or
@@ -45,10 +45,18 @@ restart test now proves shell and exec in both directions after a restart. It
 merged at `88ab09fac284c737bc15e83b6fa0df52fef23496` and is deployed on both
 hosts. Live refusal checks kept the launchd PID 30532 and systemd PID 1924193.
 
-The next order from Silber.cos is the missing Linux integration targets, the
-three known flakes, F13, and F14. The Linux CI change must run `lifecycle`,
-`pathwatch_slice`, and `shell`. It must also correct the stale CI description in
-`docs/known-flaky-tests.md`.
+PR #139 runs `lifecycle`, `pathwatch_slice`, and `shell` in Linux CI. PR #76
+excluded them because they passed locally on macOS but had never run on Linux
+CI. It recorded no Linux failure. All three passed unchanged on the first Linux
+CI run. The target-accounting check now rejects every excluded integration
+target. The PR also corrects the stale CI description in
+`docs/known-flaky-tests.md`. It merged at
+`f2757f09bad8275d69f0ca11c399cb725f477dc2` and is deployed on both hosts.
+
+The next order from Silber.cos is the three known flakes, F13, and F14. The
+unchanged ledger test passed 20 of 20 local runs after the #139 merge. The
+unchanged ACL test passed five of five local runs. Continue the reproduction
+pass before changing either test.
 
 Nathan removed the release hold on 2026-09-03. Daily builds must include the
 features on main. A later public 0.9.0 release is a separate act, and unfinished
