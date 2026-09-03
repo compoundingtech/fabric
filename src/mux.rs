@@ -52,6 +52,8 @@ const MAX_RESPONSE_LEN: usize = 4096;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 const GENERATION_PREFACE_TIMEOUT: Duration = Duration::from_secs(3);
 const OPEN_ATTEMPTS: usize = 4;
+// Keep one bounded attempt for a replacement connection.
+const UNKNOWN_CONNECTION_FAILURES_BEFORE_REPLACE: usize = OPEN_ATTEMPTS - 1;
 const DUPLICATE_OPEN_ATTEMPTS: usize = 8;
 const DUPLICATE_RETRY_DELAY: Duration = Duration::from_millis(100);
 const LEGACY_MUX_REPROBE_INTERVAL: Duration = Duration::from_secs(60);
@@ -59,6 +61,7 @@ const VALIDATION_LOG_TARGET: &str = "fabric::validation";
 const NO_APPLICATION_PROTOCOL_ALERT: u8 = 0x78;
 const DUPLICATE_CONNECTION_REASON: &[u8] = b"duplicate mux connection";
 const STALE_GENERATION_REASON: &[u8] = b"endpoint generation changed";
+const REPEATED_STREAM_FAILURE_REASON: &[u8] = b"repeated mux stream failures";
 
 /// One admitted logical stream on the shared peer connection.
 pub struct MuxStream {
@@ -148,6 +151,12 @@ fn is_duplicate_connection(error: &anyhow::Error) -> bool {
                     matches!(error, WriteError::ConnectionLost(reason) if is_duplicate_close(reason))
                 })
     })
+}
+
+fn is_connection_lost(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|source| source.downcast_ref::<ConnectionError>().is_some())
 }
 
 /// The first bytes of every mux stream: which exposure it targets, replacing the
@@ -325,6 +334,7 @@ impl PeerConnections {
     ) -> Result<MuxStream> {
         let header = MuxStreamHeader::new(protocol.to_string());
         let mut attempts = 0usize;
+        let mut failed_connection = None;
         let last_error = loop {
             attempts += 1;
             let connection = match self
@@ -352,7 +362,21 @@ impl PeerConnections {
                     if is_stream_denied(&error) {
                         return Err(error);
                     }
-                    self.forget_if(peer_addr.id, connection.stable_id()).await;
+                    let stable_id = connection.stable_id();
+                    let failures = match failed_connection {
+                        Some((failed_id, failures)) if failed_id == stable_id => failures + 1,
+                        _ => 1,
+                    };
+                    failed_connection = Some((stable_id, failures));
+                    // One logical stream can fail beside healthy siblings. A
+                    // repeated unknown state must not preserve a dead handle.
+                    if connection.close_reason().is_some()
+                        || is_connection_lost(&error)
+                        || failures >= UNKNOWN_CONNECTION_FAILURES_BEFORE_REPLACE
+                    {
+                        self.close_and_forget_if(peer_addr.id, stable_id).await;
+                        failed_connection = None;
+                    }
                     let duplicate = is_duplicate_connection(&error);
                     if duplicate && attempts < DUPLICATE_OPEN_ATTEMPTS {
                         tokio::time::sleep(DUPLICATE_RETRY_DELAY).await;
@@ -605,13 +629,18 @@ impl PeerConnections {
         Ok(Some(connection))
     }
 
-    async fn forget_if(&self, peer: EndpointId, stable_id: usize) {
+    async fn close_and_forget_if(&self, peer: EndpointId, stable_id: usize) {
         let mut connections = self.conns.lock().await;
         if connections
             .get(&peer)
             .is_some_and(|current| current.connection.stable_id() == stable_id)
         {
-            connections.remove(&peer);
+            let failed = connections
+                .remove(&peer)
+                .expect("the matched mux connection disappeared while locked");
+            failed
+                .connection
+                .close(0u32.into(), REPEATED_STREAM_FAILURE_REASON);
         }
     }
 
@@ -811,6 +840,129 @@ mod tests {
         }
     }
 
+    async fn finish_streams_then_echo(connection: Connection, failures: usize) {
+        let mut streams = 0usize;
+        loop {
+            let (mut send, mut recv) = match connection.accept_bi().await {
+                Ok(pair) => pair,
+                Err(_) => break,
+            };
+            streams += 1;
+            tokio::spawn(async move {
+                if MuxStreamHeader::read(&mut recv).await.is_err() {
+                    return;
+                }
+                if streams <= failures {
+                    let _ = send.finish();
+                    return;
+                }
+                let _ = write_ready(&mut send).await;
+                let _ = tokio::io::copy(&mut recv, &mut send).await;
+                let _ = send.finish();
+            });
+        }
+    }
+
+    async fn assert_stream_failure_recovery(
+        failures: usize,
+        expect_same_connection: bool,
+    ) -> Result<()> {
+        let first = iroh::SecretKey::generate();
+        let second = iroh::SecretKey::generate();
+        let (lower_key, higher_key) = if first.public() < second.public() {
+            (first, second)
+        } else {
+            (second, first)
+        };
+
+        let lower_endpoint = Endpoint::builder(presets::N0)
+            .secret_key(lower_key)
+            .alpns(vec![MUX_ALPN.to_vec()])
+            .bind()
+            .await?;
+        let (lower_opened_tx, mut lower_opened_rx) = mpsc::unbounded_channel();
+        let lower_manager = Arc::new(PeerConnections::new(
+            lower_endpoint.id(),
+            lower_opened_tx,
+        ));
+        let lower_router = Router::builder(lower_endpoint)
+            .accept(
+                MUX_ALPN,
+                ManagedMuxEcho {
+                    manager: lower_manager.clone(),
+                    generation: 5,
+                },
+            )
+            .spawn();
+        let lower_reverse_streams = tokio::spawn(async move {
+            if let Some(connection) = lower_opened_rx.recv().await {
+                finish_streams_then_echo(connection, failures).await;
+            }
+        });
+
+        let higher_endpoint = Endpoint::builder(presets::N0)
+            .secret_key(higher_key)
+            .alpns(vec![MUX_ALPN.to_vec()])
+            .bind()
+            .await?;
+        let (higher_opened_tx, _higher_opened_rx) = mpsc::unbounded_channel();
+        let higher_manager = Arc::new(PeerConnections::new(
+            higher_endpoint.id(),
+            higher_opened_tx,
+        ));
+        let higher_router = Router::builder(higher_endpoint)
+            .accept(
+                MUX_ALPN,
+                ManagedMuxEcho {
+                    manager: higher_manager.clone(),
+                    generation: 6,
+                },
+            )
+            .spawn();
+        lower_router.endpoint().online().await;
+        higher_router.endpoint().online().await;
+
+        let sibling = lower_manager
+            .open_mux_stream(
+                lower_router.endpoint(),
+                5,
+                &higher_router.endpoint().addr(),
+                "probe",
+                StreamActivity::Probe,
+            )
+            .await?;
+
+        let canonical = higher_manager
+            .connection(lower_router.endpoint().id())
+            .await
+            .context("the higher peer did not cache the canonical incoming connection")?;
+
+        let replacement = higher_manager
+            .open_mux_stream(
+                higher_router.endpoint(),
+                6,
+                &lower_router.endpoint().addr(),
+                "probe",
+                StreamActivity::Probe,
+            )
+            .await
+            .context("stream failures did not converge on a usable connection")?;
+        assert_eq!(
+            replacement.connection.stable_id() == canonical.stable_id(),
+            expect_same_connection,
+            "the recovery selected the wrong shared connection"
+        );
+        assert_echo(replacement, b"replacement").await?;
+        if expect_same_connection {
+            assert_echo(sibling, b"sibling-survived").await?;
+        }
+
+        lower_router.shutdown().await?;
+        higher_router.shutdown().await?;
+        lower_reverse_streams.await?;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_new_endpoint_generation_replaces_a_live_stale_canonical_connection() -> Result<()> {
         let first = iroh::SecretKey::generate();
@@ -895,6 +1047,16 @@ mod tests {
         lower_router.shutdown().await?;
         higher_new_endpoint.close().await;
         Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_failed_mux_stream_keeps_its_siblings_and_canonical_connection() -> Result<()> {
+        assert_stream_failure_recovery(1, true).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repeated_unknown_mux_failures_replace_the_connection() -> Result<()> {
+        assert_stream_failure_recovery(usize::MAX, false).await
     }
 
     /// A peer can retain the old canonical connection briefly while the other
