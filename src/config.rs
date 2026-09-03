@@ -162,6 +162,11 @@ impl FabricHome {
         self.root.join("telemetry.json")
     }
 
+    /// Monotonic endpoint generation owned by this node identity.
+    pub fn endpoint_generation_path(&self) -> PathBuf {
+        self.root.join("endpoint-generation")
+    }
+
     fn existing_peers_path(&self) -> Option<PathBuf> {
         if self.peer_config_path.exists() {
             return Some(self.peer_config_path.clone());
@@ -780,7 +785,7 @@ pub fn validate_git_remote_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let permissions = fs::metadata(path)
         .ok()
         .map(|metadata| metadata.permissions());
