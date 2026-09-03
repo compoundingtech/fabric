@@ -14,6 +14,11 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_EXEC_MAX_CHILDREN: usize = 32;
 pub const DEFAULT_SERVER_SESSION_MAX_TOTAL: usize = 64;
 pub const DEFAULT_SERVER_SESSION_MAX_PER_PEER: usize = 16;
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// How long a detached shell or tunnel session is kept before its PTY is reaped.
 ///
 /// Fifteen minutes, chosen from measurement rather than taste. The cost of a
@@ -290,6 +295,10 @@ pub struct Peer {
     pub id: EndpointId,
     pub name: Option<String>,
     pub addr: Option<EndpointAddr>,
+    /// This peer is expected to disconnect and return, such as a laptop.
+    /// Its absence is normal and must not drive failure recovery.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub roaming: bool,
     /// Which services this peer may reach, by the NAME a person types:
     /// `shell`, `exec`, `sync`, `echo`, or any exposed protocol such as `web`.
     ///
@@ -462,6 +471,8 @@ impl PeerBook {
 # name   a local label for your convenience. You can rename it at any time,
 #        and nothing about permissions follows the rename. Never write a rule
 #        that depends on a name.
+# roaming  whether this peer is expected to disconnect and return. Defaults
+#        to false. An absent roaming peer is away, not failed.
 # allow  which services this peer may reach, by the name a person types:
 #        shell, exec, sync, echo, or any protocol you expose such as web.
 #        Git grants are git/<remote>/read and git/<remote>/write.
@@ -646,6 +657,11 @@ impl PeerBook {
         addr: Option<EndpointAddr>,
         allow: Option<Vec<String>>,
     ) {
+        let roaming = self
+            .peers
+            .iter()
+            .find(|peer| peer.id == id)
+            .is_some_and(|peer| peer.roaming);
         let allow = allow
             .or_else(|| {
                 self.peers
@@ -663,6 +679,7 @@ impl PeerBook {
             id,
             name,
             addr,
+            roaming,
             allow,
         });
         self.peers
@@ -1568,6 +1585,22 @@ mod tests {
         let loaded: PeerBook = toml::from_str(&raw).unwrap();
         assert!(loaded.allow_shell());
         assert!(loaded.allow_exec());
+    }
+
+    #[test]
+    fn roaming_peer_setting_survives_a_peer_file_round_trip() {
+        let id = SecretKey::generate().public();
+        let book: PeerBook = toml::from_str(&format!(
+            "[[peers]]\nid = \"{id}\"\nname = \"laptop\"\nroaming = true\n"
+        ))
+        .unwrap();
+
+        let raw = toml::to_string_pretty(&book).unwrap();
+
+        assert!(
+            raw.contains("roaming = true"),
+            "saving peers.toml dropped the roaming contract: {raw}"
+        );
     }
 
     #[test]

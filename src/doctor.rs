@@ -92,6 +92,8 @@ impl Finding {
 #[derive(Debug, Clone)]
 pub struct PeerFact {
     pub label: String,
+    /// This peer is expected to disconnect and return.
+    pub roaming: bool,
     pub has_address: bool,
     /// Whether this peer has at least one incoming service grant here.
     /// `None` means the peer configuration could not be read.
@@ -270,6 +272,11 @@ fn peer_finding(peer: &PeerFact) -> Finding {
     }
     match peer.reachable {
         Some(true) => Finding::new("peer", Verdict::Ok, format!("{label} is reachable")),
+        Some(false) if peer.roaming => Finding::new(
+            "peer",
+            Verdict::Ok,
+            format!("{label} is away as expected for a roaming peer"),
+        ),
         Some(false) if !peer.has_address => Finding::new(
             "peer",
             Verdict::Problem,
@@ -630,6 +637,7 @@ mod tests {
             own_version: "0.2.0+abc".to_string(),
             peers: vec![PeerFact {
                 label: "hetz".to_string(),
+                roaming: false,
                 has_address: true,
                 has_grants: Some(true),
                 reachable: Some(true),
@@ -803,6 +811,22 @@ mod tests {
             );
         }
         assert_eq!(exit_code(&findings), 1, "unknown must count as attention");
+    }
+
+    #[test]
+    fn an_absent_roaming_peer_is_a_normal_finding() {
+        let mut facts = configured();
+        facts.peers[0].label = "bluey".to_string();
+        facts.peers[0].roaming = true;
+        facts.peers[0].reachable = Some(false);
+        facts.peers[0].version = None;
+
+        let findings = diagnose(&facts);
+        let peers = find(&findings, "peer");
+
+        assert_eq!(peers[0].verdict, Verdict::Ok);
+        assert!(peers[0].detail.contains("away"));
+        assert_eq!(exit_code(&findings), 0);
     }
 
     /// Finding 3 of the 2026-08-29 review. A peer named in `syncs.toml` that is
@@ -1126,6 +1150,7 @@ mod tests {
         let mut facts = configured();
         facts.peers.push(PeerFact {
             label: "droppy".to_string(),
+            roaming: false,
             has_address: true,
             has_grants: Some(true),
             reachable: Some(true),
@@ -1239,6 +1264,7 @@ where
             PeerFact {
                 version,
                 version_error,
+                roaming: peer.roaming,
                 // "no address" is how an unreachable peer with nowhere to dial
                 // reports itself; the error text is the only signal we have.
                 has_address: !peer

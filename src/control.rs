@@ -283,6 +283,9 @@ pub struct SyncEntryStatus {
 pub struct PeerReachability {
     pub id: String,
     pub name: Option<String>,
+    /// This peer is expected to disconnect and return.
+    #[serde(default)]
+    pub roaming: bool,
     pub reachable: bool,
     pub bytes: Option<usize>,
     pub round_trip_micros: Option<u64>,

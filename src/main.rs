@@ -1703,6 +1703,44 @@ mod connection_telemetry_tests {
     use super::*;
     use fabric::telemetry::LatencySummary;
 
+    #[test]
+    fn an_absent_roaming_peer_is_away_not_unreachable() {
+        let peer = PeerReachability {
+            id: "node-id".to_string(),
+            name: Some("bluey".to_string()),
+            roaming: true,
+            reachable: false,
+            bytes: None,
+            round_trip_micros: None,
+            transport: None,
+            error: Some("timed out".to_string()),
+        };
+
+        assert_eq!(
+            format_peer_reachability(&peer),
+            "bluey\tnode-id\taway\troaming peer"
+        );
+    }
+
+    #[test]
+    fn an_old_status_without_roaming_keeps_unreachable_behavior() {
+        let peer: PeerReachability = serde_json::from_value(serde_json::json!({
+            "id": "node-id",
+            "name": "server",
+            "reachable": false,
+            "bytes": null,
+            "round_trip_micros": null,
+            "transport": null,
+            "error": "timed out"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            format_peer_reachability(&peer),
+            "server\tnode-id\tunreachable\ttimed out"
+        );
+    }
+
     fn current(peers: &[&str]) -> BTreeSet<String> {
         peers.iter().map(|peer| (*peer).to_string()).collect()
     }
@@ -2383,6 +2421,8 @@ fn format_peer_reachability(peer: &PeerReachability) -> String {
             peer.id,
             peer.bytes.unwrap_or_default()
         )
+    } else if peer.roaming {
+        format!("{label}\t{}\taway\troaming peer", peer.id)
     } else {
         let error = peer.error.as_deref().unwrap_or("unreachable");
         format!("{label}\t{}\tunreachable\t{error}", peer.id)
