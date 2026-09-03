@@ -93,11 +93,17 @@ and sync log only away and return transitions. `fabric status` reports `away`.
 the peer and its paused sync as OK.
 
 The Bluey NodeID now has `roaming = true` in both live peer files. Silber names
-it `bluey`; hetz names it `air`. Both files have a sibling backup named
-`peers.toml.pre-roaming-20260903T1213Z`. Both old daemons reloaded the file, but
-build `353de6b` ignores the new field. Bluey was reachable from both machines at
-12:15Z, so no real away or return transition has been observed. The deployment
-gate is with Silber.cos. Do not deploy or cut a release without its answer.
+it `bluey`; hetz names it `air`. Both old daemons reloaded the file, but build
+`353de6b` ignores the new field. Bluey was reachable from both machines at
+12:15Z, so no real away or return transition has been observed.
+
+Silber.cos held deployment. Prepare v0.2.1 with the roaming change, but do not
+release or deploy it. Nathan wants to use the current stable v0.2.0 fleet before
+the 0.9.0 work starts. Silber.cos will ask when he wants v0.2.1.
+
+Do not merge your own pull requests. Mark each pull request ready and wait for
+Nathan to review and merge it. Do not create peer-file backup copies. Put
+non-secret configuration history in git instead.
 
 ## Current handoff — 2026-09-02
 
