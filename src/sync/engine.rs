@@ -745,6 +745,10 @@ impl<T: SyncTransport> SyncEngine<T> {
     /// that are unchanged and dropping entries no longer configured.
     pub async fn load_from_config(&self) -> Result<()> {
         let book = SyncBook::load(&self.home)?;
+        self.load_book(book).await
+    }
+
+    async fn load_book(&self, book: SyncBook) -> Result<()> {
         let mut entries = self.entries.write().await;
         let mut next: HashMap<String, Arc<EntryState>> = HashMap::new();
         for cfg in book.entries() {
@@ -1922,6 +1926,13 @@ impl<T: SyncTransport> SyncEngine<T> {
     /// restart to re-point its watcher.)
     pub async fn reload(self: &Arc<Self>) -> Result<()> {
         self.load_from_config().await?;
+        self.ensure_watching().await;
+        Ok(())
+    }
+
+    /// Apply one already validated config snapshot.
+    pub async fn reload_book(self: &Arc<Self>, book: SyncBook) -> Result<()> {
+        self.load_book(book).await?;
         self.ensure_watching().await;
         Ok(())
     }

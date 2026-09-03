@@ -661,6 +661,7 @@ async fn main() -> Result<()> {
                     let mut book = PeerBook::load(&home)?;
                     warn_if_permissions_would_stop_a_sync(&home, &allow)?;
                     book.add_with_allow(id, name, addr, allow);
+                    SyncBook::load(&home)?.validate_against(&book)?;
                     book.save(&home)?;
                     let _ = send_control(&home, ControlRequest::ReloadPeers).await;
                 }
@@ -759,6 +760,7 @@ async fn main() -> Result<()> {
                     if !book.remove(&peer) {
                         bail!("peer {peer:?} is not trusted");
                     }
+                    SyncBook::load(&home)?.validate_against(&book)?;
                     book.save(&home)?;
                     let _ = send_control(&home, ControlRequest::ReloadPeers).await;
                 }
@@ -1212,6 +1214,8 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
             };
             let mut book = SyncBook::load(home)?;
             book.upsert(entry);
+            let peers = PeerBook::load(home)?;
+            book.validate_against(&peers)?;
             book.save(home)?;
             // Apply live if the daemon is running; harmless if it is not.
             let _ = send_control(home, ControlRequest::SyncReload).await;
@@ -1311,6 +1315,34 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod sync_command_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sync_add_rejects_an_unknown_explicit_selector_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = FabricHome::new(dir.path());
+        let folder = dir.path().join("catalog");
+
+        let error = run_sync(
+            &home,
+            SyncCommands::Add {
+                folder: folder.display().to_string(),
+                name: "catalog".into(),
+                peers: "mac".into(),
+                policy: "catalog".into(),
+                include: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("unknown peer selector \"mac\""));
+        assert!(!home.syncs_path().exists());
+    }
 }
 
 #[derive(serde::Serialize)]

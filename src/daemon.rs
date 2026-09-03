@@ -46,7 +46,7 @@ use crate::{
     exec, gitremote, mux, pathwatch, shell,
     sync::{
         self,
-        config::SyncPeers,
+        config::{SyncBook, SyncPeers},
         engine::{PeerRef, ResolvedPeers, SyncEngine, SyncTransport},
         manifest::Author as SyncAuthor,
         node::SyncNode,
@@ -866,6 +866,7 @@ impl DaemonState {
         let (tunnel_session_limits, tunnel_session_detached_ttl) =
             resolve_server_session_settings(&config, options)?;
         let peer_book = PeerBook::load(&home)?;
+        SyncBook::load(&home)?.validate_against(&peer_book)?;
         // The command-line flags remain accepted while existing launchd and
         // systemd definitions still pass them. Machine policy lives only in
         // peers.toml, so the flags cannot open or close either service.
@@ -1003,6 +1004,7 @@ impl DaemonState {
 
     pub async fn reload_peers(&self) -> Result<()> {
         let peer_book = PeerBook::load(&self.home)?;
+        SyncBook::load(&self.home)?.validate_against(&peer_book)?;
         self.allow_shell
             .store(peer_book.allow_shell(), Ordering::SeqCst);
         self.allow_exec
@@ -3157,7 +3159,11 @@ async fn process_control_request(
         }
         ControlRequest::SyncReload => {
             if let Some(engine) = state.sync_engine() {
-                engine.reload().await?;
+                let book = SyncBook::load(&state.home)?;
+                let peers = state.peer_book.read().await;
+                book.validate_against(&peers)?;
+                drop(peers);
+                engine.reload_book(book).await?;
                 for name in engine.names().await {
                     let _ = engine.sync_once(&name).await;
                 }
@@ -4920,6 +4926,87 @@ async fn pipe_unix_iroh(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::config::{SyncEntry, SyncPolicy};
+
+    fn write_test_sync(home: &FabricHome, folder: PathBuf, selector: &str) -> Result<()> {
+        fs::create_dir_all(&folder)?;
+        let mut book = SyncBook::default();
+        book.upsert(SyncEntry {
+            name: "catalog".into(),
+            folder,
+            peers: SyncPeers::List(vec![selector.into()]),
+            policy: SyncPolicy::Catalog,
+            include: None,
+        });
+        book.save(home)
+    }
+
+    fn trust_named_peer(home: &FabricHome, name: &str) -> Result<EndpointId> {
+        let id = iroh::SecretKey::generate().public();
+        let mut peers = PeerBook::default();
+        peers.add_with_allow(id, Some(name.into()), None, Some(vec!["sync".into()]));
+        peers.save(home)?;
+        Ok(id)
+    }
+
+    #[tokio::test]
+    async fn daemon_start_rejects_an_unknown_explicit_sync_selector() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        write_test_sync(&home, dir.path().join("catalog"), "mac")?;
+
+        let error = match FabricNode::start(home).await {
+            Ok(node) => {
+                node.shutdown().await?;
+                panic!("the daemon accepted an unknown explicit sync selector");
+            }
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("sync \"catalog\" names unknown peer selector \"mac\""),
+            "unexpected error: {error:#}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_sync_reload_keeps_the_last_valid_engine_config() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        trust_named_peer(&home, "silber")?;
+        write_test_sync(&home, dir.path().join("catalog"), "silber")?;
+        let node = FabricNode::start(home.clone()).await?;
+
+        write_test_sync(&home, dir.path().join("catalog"), "mac")?;
+        let error = process_control_request(ControlRequest::SyncReload, node.state())
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("unknown peer selector \"mac\""));
+
+        let status = node.state().sync_engine().unwrap().status().await;
+        assert_eq!(status[0].peers.selectors(), &["silber"]);
+        node.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn rejected_peer_reload_keeps_the_last_valid_peer_book() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let id = trust_named_peer(&home, "silber")?;
+        write_test_sync(&home, dir.path().join("catalog"), "silber")?;
+        let node = FabricNode::start(home.clone()).await?;
+
+        PeerBook::default().save(&home)?;
+        let error = node.state().reload_peers().await.unwrap_err();
+        assert!(format!("{error:#}").contains("unknown peer selector \"silber\""));
+
+        let state = node.state();
+        let peers = state.peer_book.read().await;
+        assert_eq!(peers.peers().len(), 1);
+        assert_eq!(peers.peers()[0].id, id);
+        drop(peers);
+        node.shutdown().await
+    }
 
     #[tokio::test]
     async fn endpoint_close_wait_has_a_hard_deadline() {
