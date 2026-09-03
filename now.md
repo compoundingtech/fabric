@@ -5,7 +5,7 @@ current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
 _Last updated: 2026-09-03 by Silber.fabric-codex. Main's last code commit is
-deployed as `0.2.1+6e856c4` on Silber and hetz._
+deployed as `0.2.1+88ab09f` on Silber and hetz._
 
 ## Current incident — 2026-09-03
 
@@ -15,28 +15,40 @@ The required ACL migration and downgrade warnings lead its release notes.
 Release `v0.2.1+f806142` is published with Apple arm64 and both Linux assets.
 It was the first v0.2.1 fleet build and remains available for rollback.
 
-Release `v0.2.1+6e856c4` is published with Apple arm64 and both Linux assets.
-Silber and hetz run that exact build. The rollout updated Silber first. During
-the mixed-version window, ping and exec passed in both directions. Final direct
-pings took 43.052 milliseconds from Silber to hetz and 73.589 milliseconds from
-hetz to Silber.
+Release `v0.2.1+88ab09f` is published with Apple arm64 and both Linux assets.
+All four release jobs passed. Silber and hetz run that exact build. The rollout
+updated Silber first. During the mixed-version window, ping and exec passed in
+both directions. Final direct pings took 63.903 milliseconds from Silber to hetz
+and 38.483 milliseconds from hetz to Silber.
 
 Both sync entries have matching digests and zero drift, missing, unexpected,
 mismatched, scan-issue, reconcile-failure, stopped, away, and delta-fallback
 fields on both hosts. The bus digest is
-`e4f9dcf36ccd848bb13d7b3b460b800048f170713c6007598276b9c08a5b7119`.
-It has 27,278 present records, 17,141 tombstones, and 27,278 observed paths.
+`6de63bbefa7ccb500dcbe4a25c127dedec0443145dc336acdd20cf44db752bba`.
+It has 27,608 present records, 17,234 tombstones, and 27,608 observed paths.
 The declarations digest is
-`988df23311e2421ebd54723207c618975a089bf87fbcec61abbbdca6a45d9444`.
-It has 125 present records, 34 tombstones, and 125 observed paths.
+`2592161b803c9150b3a34f0d78ea0006fc0074fa0a5eea06ca2d7d26985b14db`.
+It has 118 present records, 41 tombstones, and 118 observed paths.
 
 Doctor passes every local, peer-reachability, version, and sync check on both
 hosts. It keeps Bluey's unreadable version visible as `unknown, roaming` and
 does not fail the fleet check. Bluey remains reachable from both hosts.
 
 The two updater rollback binaries made during this deployment were deleted
-after verification. Both exact paths are absent. Older builds remain available
-through their published release assets.
+after verification. Both contained `0.2.1+6e856c4`, and both exact paths are
+absent. Older builds remain available through their published release assets.
+
+PR #138 makes `fabric restart` refuse when the default home has an enabled or
+installed native service. It names the exact launchd or systemd restart command.
+An unknown service state also names the exact native status command. The shell
+restart test now proves shell and exec in both directions after a restart. It
+merged at `88ab09fac284c737bc15e83b6fa0df52fef23496` and is deployed on both
+hosts. Live refusal checks kept the launchd PID 30532 and systemd PID 1924193.
+
+The next order from Silber.cos is the missing Linux integration targets, the
+three known flakes, F13, and F14. The Linux CI change must run `lifecycle`,
+`pathwatch_slice`, and `shell`. It must also correct the stale CI description in
+`docs/known-flaky-tests.md`.
 
 Nathan removed the release hold on 2026-09-03. Daily builds must include the
 features on main. A later public 0.9.0 release is a separate act, and unfinished
@@ -495,9 +507,10 @@ the fleet. Also merged: #89 (finding 3), #90 (finding 15, README).
   exec_expose_reconnect_keeps_child_bound_to_tunnel_session, and
   production_status_exposes_exact_inbound_scan_ledger. See `docs/known-flaky-tests.md`
   (PR #92). Rerun the `deterministic` job; a real regression also fails on rerun.
-- **main and PR CI run DIFFERENT job sets** (main: Nix, test; PR: build, macos,
-  deterministic). A green main may never have run the job a PR runs, so it cannot
-  clear a merge of a `deterministic` failure.
+- **The main and pull-request CI job sets are identical.** Runs 33767026944 and
+  33767494392 confirmed the same `macos` and `deterministic` jobs. The current
+  gap is narrower: Linux excludes `lifecycle`, `pathwatch_slice`, and `shell`,
+  and no other CI job runs those integration targets.
 - **Stacked-PR chains squash-merge IN ORDER.** Each branch contains its
   predecessors, so a 3-way merge folds the identical changes (it does not rely on
   ancestry, which squash breaks). Merging out of order conflicts.
