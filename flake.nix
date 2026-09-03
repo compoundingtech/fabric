@@ -23,7 +23,7 @@
 
           fabric = pkgs.rustPlatform.buildRustPackage {
             pname = "fabric";
-            version = "0.2.0";
+            version = "0.2.1";
 
             src = ./.;
 
@@ -34,7 +34,7 @@
             };
 
             # build.rs stamps FABRIC_BUILD_SHA from git; the nix build has no git,
-            # so it falls back to "unknown" (version reads e.g. `0.2.0+unknown`).
+            # so it falls back to "unknown" (version reads e.g. `0.2.1+unknown`).
 
             # The test suite includes integration tests that dial real iroh over
             # the network, which the sandboxed build cannot reach. The library

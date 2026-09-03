@@ -6,20 +6,30 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-03
+
 ### Added
+
+- **A roaming peer can stay away without disrupting the rest of the mesh.** Set
+  `roaming = true` on a peer in `peers.toml`. The default stays `false`. Fabric
+  still probes and syncs with an away roaming peer, so it detects the peer's
+  return. Failed attempts do not start recovery or increase failure counters.
+  Status, doctor, and sync output report the peer as away. The daemon logs only
+  the away and returned transitions.
+
+  A peer can have a different local name on each machine. The same NodeID is
+  `bluey` on Silber and `air` on hetz. The roaming setting follows the NodeID's
+  peer entry, not its local name.
 
 - **Peer traffic shares one multipath connection.** Fabric carries each Git,
   sync, shell, exec, send-file, echo, and exposed-service session as a stream on
   one authenticated connection per peer pair. Simultaneous cross-dials select
-  one connection and close the duplicate. A new client tries `fabric/mux/1`
-  first. It uses an uncached direct ALPN only when the peer explicitly rejects
-  mux. Other connection failures do not cause a downgrade. Later streams skip
-  the rejected mux handshake for 60 seconds. One stream then re-probes mux, so
-  upgraded peers converge without a coordinated restart. The validation log
-  records the fallback reason once per peer and endpoint generation. It records
-  cumulative fallback use at powers of two, so repeated use stays visible
-  without one log line per stream. New servers continue to accept old
-  direct-ALPN clients.
+  one connection and close the duplicate. Mux version 2 exchanges endpoint
+  generations before it registers the connection. A newer generation replaces
+  stale cached state without a daemon restart. A peer that does not support
+  `fabric/mux/2` uses the existing direct service protocol until both builds
+  support mux version 2. Other connection failures do not cause a downgrade.
+  New servers continue to accept old direct-protocol clients.
 
 - **Persistently slow paths recover without a daemon restart.** The peer health
   loop records every selected path and its RTT. It redials a shared connection
@@ -72,6 +82,15 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   mechanism that prevents infinite echo — a core engine change.
 
 ### Changed
+
+- **Peer permissions use a strict allow list.** An omitted or empty `allow`
+  field in `peers.toml` denies every service. The machine-level shell and exec
+  gates still apply. The daemon starts with an empty list so an operator can
+  inspect and migrate the configuration with `fabric peers make-explicit`.
+
+- **The updater refuses an older or unrelated release by default.** It names
+  both versions and leaves the installed binary unchanged. An operator must
+  pass `--allow-downgrade` to replace it explicitly.
 
 - **Durable connection totals now include their window and roster context.**
   `fabric status` prints when the cumulative telemetry window started. It keeps
