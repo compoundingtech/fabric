@@ -33,12 +33,14 @@ reruns are expected.
    known flake passes on the rerun.
 3. If it fails again on the rerun, it is not this. Stop treating it as a flake.
 
-## Why the main branch cannot answer "did my merge cause this"
+## Main and pull-request coverage
 
-The `main` workflow and the pull-request workflow run different job sets. A pull
-request runs `build`, `macos`, and `deterministic`; `main` runs `Nix` and
-`test`. So a green `main` may never have run the `deterministic` job a pull
-request runs, and cannot on its own clear a merge of having caused a
-`deterministic` failure. A squashed merge commit sometimes carries the pull
-request's own check-runs, which is the only reason the check has been possible
-after the fact. Aligning the two job sets would close that gap.
+The same test workflow runs on pull requests and pushes to `main`. Both events
+run its `macos` and `deterministic` jobs. Pull-request run 33767026944 and main
+run 33767494392 confirm that job parity.
+
+PR 76 excluded the `lifecycle`, `pathwatch_slice`, and `shell` integration
+targets. All three passed locally on macOS, but none had run on Linux CI. The
+history records no Linux failure. No other job ran them. The accounting step
+accepted that gap, so a green result did not test those targets. The workflow
+now runs all three targets and rejects every unlisted integration target.
