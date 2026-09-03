@@ -4,8 +4,8 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-03 by Silber.fabric-codex. The deployed code is `353de6b`.
-Silber and hetz run `0.2.0+353de6b`. Bluey remains wire-compatible._
+_Last updated: 2026-09-03 by Silber.fabric-codex. Main is `17a7bb5`. The
+deployed code is `353de6b`. Silber and hetz run `0.2.0+353de6b`._
 
 ## Current incident — 2026-09-03
 
@@ -80,6 +80,54 @@ The main win is battery life. Fabric is idle for most of its life on Nathan's
 laptops. With 16 idle sessions, mux gave the machine substantially fewer reasons
 to wake and reduced network bytes by 89.5 percent. Mux earns its place because
 it substantially reduces every measured idle cost, with a small recovery cost.
+
+PR #131 records the repeatable mux and direct harness and the result above. It
+merged at `edd1c80169e7b856407df3c9fb17accc83dfe371`.
+
+PR #132 adds the per-peer `roaming = true` contract. It merged at
+`17a7bb53b80d8a79c46ab4f8a8adcd7fe3c2f69c`. An absent roaming peer still gets
+health probes and normal sync attempts. The absence does not enter either
+failure counter, close a peer connection, or appear as a stopped sync. Health
+and sync log only away and return transitions. `fabric status` reports `away`.
+`fabric sync ls` reports `stopped=none` and `away=<peer>`. Doctor reports both
+the peer and its paused sync as OK.
+
+The Bluey NodeID now has `roaming = true` in both live peer files. Silber names
+it `bluey`; hetz names it `air`. Both old daemons reloaded the file, but build
+`353de6b` ignores the new field. Bluey was reachable from both machines at
+12:15Z, so no real away or return transition has been observed.
+
+Silber.cos held deployment. Prepare v0.2.1 with the roaming change, but do not
+release or deploy it. Nathan wants to use the current stable v0.2.0 fleet before
+the 0.9.0 work starts. Silber.cos will ask when he wants v0.2.1.
+
+Do not merge your own pull requests. Mark each pull request ready and wait for
+Nathan to review and merge it. Do not create peer-file backup copies. Put
+non-secret configuration history in git instead.
+
+Six dated peer and sync copies on Silber and ten on hetz were deleted on
+2026-09-03. The deletions are not recoverable. The four live files remain
+intact. Do not create replacement copies.
+
+The private catalog now owns their version history under
+`docs/fabric/<host>/peers.toml` and `docs/fabric/<host>/syncs.toml`.
+Silber.catalog committed Silber's files at `7add563` and hetz's files at
+`e1ff3b1`. The two hetz blobs match the two live host files by SHA-256.
+Silber.catalog is the only writer for that folder. Send it changed bytes, then
+review its commit before it pushes.
+
+The tracked file is a snapshot, not a live configuration source. Nothing
+checks it against the host yet. Compare it with the live host file before using
+it as current state. Never add `~/.local/share/fabric/identity.toml`; it holds
+the machine's private identity key.
+
+The first cross-host review found both hetz sync entries select `mac`.
+Hetz's peer file defines only `air` and `silber`. Fabric resolves a selector
+only as an exact NodeID or local peer name. The live hetz daemon reports
+`mac:unknown`, zero reconcile time, and zero outbound wire bytes for both
+entries. Replication works because Silber starts a bidirectional reconcile.
+Hetz's outbound half is inert. Do not change the live selector without Nathan's
+decision; it changes live replication behavior.
 
 ## Current handoff — 2026-09-02
 
