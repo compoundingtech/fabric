@@ -90,12 +90,13 @@ needed** and a roaming laptop reconnects on its own as its network changes.
 
 ### Presence, partitions, and local ownership
 
-Fabric reports shipped connection facts about each trusted peer by canonical
-NodeID: whether it is currently reachable and the connection/backoff state. An
-offline peer is not inherently unhealthy and may remain offline indefinitely;
-Fabric does not assign peer health types or act as a global availability
-authority. A durable `last_seen` status surface is a desired observability gap,
-not a current guarantee.
+Fabric reports connection facts about each trusted peer by canonical NodeID.
+It reports a normal peer as reachable or unreachable. Set `roaming = true` for
+a peer that is expected to disconnect, such as a laptop. Fabric reports that
+peer as away while it is offline. Its absence does not add failures or cause
+endpoint recovery. Each health or sync path logs only its away and return
+transitions. It does not log each failed probe or pass. A durable `last_seen`
+status surface remains a desired gap.
 
 The architecture MUST isolate network partitions from unrelated local work:
 each machine and its local processes continue from their last instructions
@@ -705,10 +706,10 @@ fails.
 fabric status
 ```
 
-Show the running daemon's local state and echo-ping every trusted peer. Each
-peer is reported as reachable or unreachable with round-trip latency and, when
-iroh exposes it, the active transport path: `direct`, `relay`, or `mixed`.
-Status also prints the daemon build version.
+Show the running daemon's local state and echo-ping every trusted peer. A normal
+peer is reachable or unreachable. An offline peer with `roaming = true` is
+away. Reachable peers include latency and the `direct`, `relay`, or `mixed`
+transport path when iroh supplies it. Status also prints the daemon build.
 
 ```sh
 fabric add <nodeid> [name] [--addr-json JSON] [--allow service,...]
@@ -1041,7 +1042,9 @@ and observed bytes agree. A `drift=WARNING` names `missing` Present paths,
 `unexpected` observed paths whose manifest is tombstoned or absent, and
 `mismatched` paths whose observed content hash differs from the logical Present.
 `scan_issues` names existing paths that the last scan could not read as syncable
-regular files.
+regular files. `stopped` names faults. `away` names roaming peers that the entry
+will retry on its normal sync schedule. An away attempt does not add to
+`reconcile_failures`.
 
 A delete propagates only when a complete parent directory listing proves the
 path is absent. An unreadable path remains present with an unknown state. A file
@@ -1201,6 +1204,8 @@ Each field defaults to false. Each `[[peers]]` entry accepts:
   `fabric ping workstation`.
 - `addr` (optional): an iroh `EndpointAddr` hint whose `id` must match the
   peer's `id`.
+- `roaming` (optional): whether this peer is expected to disconnect and return.
+  It defaults to false.
 - `allow` (optional): the service names this peer may reach. An omitted or
   empty list permits no service.
 
@@ -1221,7 +1226,8 @@ A file can grant no services to one peer and exact services to another:
 ```toml
 [[peers]]
 id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-name = "workstation"
+name = "laptop"
+roaming = true
 allow = []
 
 [[peers]]

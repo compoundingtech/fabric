@@ -195,6 +195,7 @@ impl DaemonWriteJournal {
 pub struct PeerRef {
     pub id: String,
     pub addr: Option<EndpointAddr>,
+    pub roaming: bool,
 }
 
 /// The swappable transport that carries a client-side reconcile to a peer. The
@@ -610,6 +611,7 @@ const LOG_COMPACTION_DIVISOR: u64 = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerSyncState {
     Ok,
+    Away,
     Refused,
     Unreachable,
     /// The selector names no peer in `peers.toml`. Not a refusal and not the
@@ -625,6 +627,7 @@ impl PeerSyncState {
     fn token(self) -> &'static str {
         match self {
             PeerSyncState::Ok => "ok",
+            PeerSyncState::Away => "away",
             PeerSyncState::Refused => "denied",
             PeerSyncState::Unreachable => "unreachable",
             PeerSyncState::Unknown => "unknown",
@@ -1174,8 +1177,26 @@ impl<T: SyncTransport> SyncEngine<T> {
                 .transport
                 .reconcile(peer.clone(), name.to_string(), entry.node.clone())
                 .await;
-            // Per peer, every pass, whether or not it changed anything. The
-            // aggregate reconcile counter says the peer step is 91% of a pass;
+            let observed_state = match &outcome {
+                Ok(_) => PeerSyncState::Ok,
+                Err(error) => {
+                    let state = classify_reconcile_error(&format!("{error:#}"));
+                    if peer.roaming && state == PeerSyncState::Unreachable {
+                        PeerSyncState::Away
+                    } else {
+                        state
+                    }
+                }
+            };
+            let previous_state = entry
+                .peer_state
+                .lock()
+                .unwrap()
+                .get(&peer.id)
+                .copied();
+            let elapsed_micros = peer_started.elapsed().as_micros() as u64;
+            // Per normal peer, every pass, whether or not it changed anything.
+            // The aggregate reconcile counter says the peer step is 91% of a pass;
             // it cannot say whether both peers cost the same. A relay-routed
             // peer and a direct one in the same window are the case that
             // matters, and the aggregate hides it.
@@ -1183,34 +1204,39 @@ impl<T: SyncTransport> SyncEngine<T> {
             // `fabric=info` (see `validation_log_filter`), so a `debug!` here is
             // dropped and the diagnostic is SILENT rather than quiet. It shipped
             // that way in #69 and emitted nothing at all on the live daemon.
-            tracing::info!(
-                target: VALIDATION_LOG_TARGET,
-                event = "reconcile_peer",
-                sync = name,
-                peer = peer.id,
-                micros = peer_started.elapsed().as_micros() as u64,
-                failed = outcome.is_err(),
-                "per-peer reconcile cost"
-            );
-            match &outcome {
-                Ok(_) => {
-                    entry
-                        .peer_state
-                        .lock()
-                        .unwrap()
-                        .insert(peer.id.clone(), PeerSyncState::Ok);
-                }
-                Err(error) => {
-                    // Refused and unreachable are different answers. One waits
-                    // for a person, the other waits for the network.
-                    let state = classify_reconcile_error(&format!("{error:#}"));
-                    entry
-                        .peer_state
-                        .lock()
-                        .unwrap()
-                        .insert(peer.id.clone(), state);
-                }
+            match (previous_state, observed_state) {
+                (Some(PeerSyncState::Away), PeerSyncState::Away) => {}
+                (_, PeerSyncState::Away) => tracing::info!(
+                    target: VALIDATION_LOG_TARGET,
+                    event = "sync_peer_away",
+                    sync = name,
+                    peer = peer.id,
+                    micros = elapsed_micros,
+                    "roaming sync peer is away"
+                ),
+                (Some(PeerSyncState::Away), PeerSyncState::Ok) => tracing::info!(
+                    target: VALIDATION_LOG_TARGET,
+                    event = "sync_peer_returned",
+                    sync = name,
+                    peer = peer.id,
+                    micros = elapsed_micros,
+                    "roaming sync peer returned"
+                ),
+                _ => tracing::info!(
+                    target: VALIDATION_LOG_TARGET,
+                    event = "reconcile_peer",
+                    sync = name,
+                    peer = peer.id,
+                    micros = elapsed_micros,
+                    failed = outcome.is_err(),
+                    "per-peer reconcile cost"
+                ),
             }
+            entry
+                .peer_state
+                .lock()
+                .unwrap()
+                .insert(peer.id.clone(), observed_state);
             match outcome {
                 Ok(stats) => {
                     entry
@@ -1232,6 +1258,9 @@ impl<T: SyncTransport> SyncEngine<T> {
                         .lock()
                         .unwrap()
                         .insert(peer.id.clone(), now_secs());
+                }
+                Err(error) if observed_state == PeerSyncState::Away => {
+                    tracing::debug!(sync = name, peer = peer.id, %error, "roaming sync peer is away");
                 }
                 Err(error) => {
                     entry
@@ -2068,8 +2097,8 @@ pub struct SyncStatus {
     /// Bytes of file content this entry holds in memory right now. Bounded by
     /// the manifest: every Present entry's bytes at most, never every version.
     pub content_bytes: u64,
-    /// Peers this entry is NOT currently syncing with, and why, as
-    /// `peer:reason` pairs. Empty is healthy.
+    /// Peers this entry is not currently syncing with, and why.
+    /// `away` is expected. Other reasons need attention or recovery.
     ///
     /// Separate from `drift` on purpose. `drift` answers "does my disk match my
     /// manifest", and a stopped entry has not diverged, it has stopped. Two
@@ -3616,6 +3645,7 @@ mod tests {
         PeerRef {
             id: id.to_string(),
             addr: None,
+            roaming: false,
         }
     }
 
@@ -5094,13 +5124,16 @@ mod tests {
     /// named in the config that no peer actually served, so every pass dialled
     /// and every dial failed.
     #[derive(Default)]
-    struct AlwaysFailingTransport;
+    struct AlwaysFailingTransport {
+        roaming: bool,
+    }
 
     impl SyncTransport for AlwaysFailingTransport {
         async fn peers_for(&self, _peers: &SyncPeers) -> ResolvedPeers {
             ResolvedPeers::all(vec![PeerRef {
                 id: "a-peer-that-does-not-serve-this-entry".to_string(),
                 addr: None,
+                roaming: self.roaming,
             }])
         }
 
@@ -5135,6 +5168,7 @@ mod tests {
                 .map(|peer| PeerRef {
                     id: peer.id.clone(),
                     addr: None,
+                    roaming: false,
                 })
                 .collect(),
             )
@@ -5217,6 +5251,7 @@ mod tests {
                 .map(|peer| PeerRef {
                     id: peer.id.clone(),
                     addr: None,
+                    roaming: false,
                 })
                 .collect(),
             )
@@ -5354,7 +5389,7 @@ mod tests {
         let engine = SyncEngine::new(
             FabricHome::new(dir.path()),
             Author([1; 32]),
-            Arc::new(AlwaysFailingTransport),
+            Arc::new(AlwaysFailingTransport { roaming: false }),
             CancellationToken::new(),
         )
         .await
@@ -5379,6 +5414,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_absent_roaming_peer_is_away_and_does_not_add_sync_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.md"), b"seed").unwrap();
+        write_bus_sync(dir.path(), &root);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(AlwaysFailingTransport { roaming: true }),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        for _ in 0..3 {
+            engine.sync_once("bus").await.unwrap();
+        }
+
+        let status = engine
+            .status()
+            .await
+            .into_iter()
+            .find(|entry| entry.name == "bus")
+            .expect("no status for the entry");
+
+        assert_eq!(status.reconcile_failures, 0);
+        assert_eq!(
+            status.stopped_peers,
+            vec![(
+                "a-peer-that-does-not-serve-this-entry".to_string(),
+                "away".to_string()
+            )]
+        );
+    }
 
     /// Finding 3 of the 2026-08-29 review, at the engine. A transport that
     /// resolves one selector and not the other must leave the entry reporting

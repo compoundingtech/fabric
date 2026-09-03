@@ -1489,7 +1489,7 @@ impl DaemonState {
         let peers = self.peer_book.read().await.peers().to_vec();
         let mut statuses = Vec::with_capacity(peers.len());
         for peer in peers {
-            statuses.push(self.check_peer_reachability(peer).await);
+            statuses.push(self.check_peer_reachability(&peer).await);
         }
         statuses
     }
@@ -1570,7 +1570,8 @@ impl DaemonState {
         })
     }
 
-    async fn check_peer_reachability(&self, peer: Peer) -> PeerReachability {
+    async fn check_peer_reachability(&self, peer: &Peer) -> PeerReachability {
+        let roaming = peer.roaming;
         let addr = peer
             .addr
             .clone()
@@ -1580,7 +1581,8 @@ impl DaemonState {
         match tokio::time::timeout(REACHABILITY_TIMEOUT, self.ping_addr(&label, addr)).await {
             Ok(Ok(pong)) => PeerReachability {
                 id: peer.id.to_string(),
-                name: peer.name,
+                name: peer.name.clone(),
+                roaming,
                 reachable: true,
                 bytes: Some(pong.bytes),
                 round_trip_micros: Some(pong.round_trip.as_micros().try_into().unwrap_or(u64::MAX)),
@@ -1589,7 +1591,8 @@ impl DaemonState {
             },
             Ok(Err(error)) => PeerReachability {
                 id: peer.id.to_string(),
-                name: peer.name,
+                name: peer.name.clone(),
+                roaming,
                 reachable: false,
                 bytes: None,
                 round_trip_micros: None,
@@ -1598,7 +1601,8 @@ impl DaemonState {
             },
             Err(_) => PeerReachability {
                 id: peer.id.to_string(),
-                name: peer.name,
+                name: peer.name.clone(),
+                roaming,
                 reachable: false,
                 bytes: None,
                 round_trip_micros: None,
@@ -2593,6 +2597,7 @@ async fn run_peer_health_loop_with(
         PATH_QUALITY_REDIAL_COOLDOWN,
     );
     let mut selected_paths = HashMap::<EndpointId, Option<String>>::new();
+    let mut roaming_away = HashSet::<EndpointId>::new();
 
     loop {
         tokio::select! {
@@ -2616,37 +2621,75 @@ async fn run_peer_health_loop_with(
                         .recently_active(peer_id, probe_interval)
                         .await
                     {
-                        info!(
-                            target: VALIDATION_LOG_TARGET,
-                            event = "peer_health_probe_skipped",
-                            peer = %label,
-                            recent_application_traffic = true,
-                            window_ms = probe_interval.as_millis() as u64,
-                            "recent application traffic proved peer liveness"
-                        );
-                        round.push((peer_id, label, true));
+                        match peer_probe_log_action(
+                            &mut roaming_away,
+                            peer_id,
+                            peer.roaming,
+                            true,
+                        ) {
+                            PeerProbeLogAction::RoamingReturned => info!(
+                                target: VALIDATION_LOG_TARGET,
+                                event = "peer_roaming_returned",
+                                peer = %label,
+                                recent_application_traffic = true,
+                                "roaming peer returned"
+                            ),
+                            _ => info!(
+                                target: VALIDATION_LOG_TARGET,
+                                event = "peer_health_probe_skipped",
+                                peer = %label,
+                                recent_application_traffic = true,
+                                window_ms = probe_interval.as_millis() as u64,
+                                "recent application traffic proved peer liveness"
+                            ),
+                        }
+                        round.push((peer_id, label, true, peer.roaming));
                         continue;
                     }
-                    let health = state.check_peer_reachability(peer).await;
-                    info!(
-                        target: VALIDATION_LOG_TARGET,
-                        event = "peer_health_probe",
-                        peer = %label,
-                        reachable = health.reachable,
-                        rtt_us = health.round_trip_micros.unwrap_or(0),
-                        transport = health.transport.as_deref().unwrap_or("none"),
-                        "peer liveness probe"
-                    );
+                    let health = state.check_peer_reachability(&peer).await;
+                    match peer_probe_log_action(
+                        &mut roaming_away,
+                        peer_id,
+                        peer.roaming,
+                        health.reachable,
+                    ) {
+                        PeerProbeLogAction::Probe => info!(
+                            target: VALIDATION_LOG_TARGET,
+                            event = "peer_health_probe",
+                            peer = %label,
+                            reachable = health.reachable,
+                            rtt_us = health.round_trip_micros.unwrap_or(0),
+                            transport = health.transport.as_deref().unwrap_or("none"),
+                            "peer liveness probe"
+                        ),
+                        PeerProbeLogAction::RoamingAway => info!(
+                            target: VALIDATION_LOG_TARGET,
+                            event = "peer_roaming_away",
+                            peer = %label,
+                            "roaming peer is away"
+                        ),
+                        PeerProbeLogAction::RoamingReturned => info!(
+                            target: VALIDATION_LOG_TARGET,
+                            event = "peer_roaming_returned",
+                            peer = %label,
+                            rtt_us = health.round_trip_micros.unwrap_or(0),
+                            transport = health.transport.as_deref().unwrap_or("none"),
+                            "roaming peer returned"
+                        ),
+                        PeerProbeLogAction::None => {}
+                    }
                     // Keep what the probe measured. Before this it computed a
                     // round trip time and a path and discarded both, so the only
                     // way to compare direct against relay was to parse days of
                     // log text.
-                    state.telemetry.record_probe(
-                        &label,
-                        health.reachable,
-                        health.transport.as_deref(),
-                        health.round_trip_micros.map(Duration::from_micros),
-                    );
+                    if health.reachable || !peer.roaming {
+                        state.telemetry.record_probe(
+                            &label,
+                            health.reachable,
+                            health.transport.as_deref(),
+                            health.round_trip_micros.map(Duration::from_micros),
+                        );
+                    }
                     if let Some(round_trip_micros) = health.round_trip_micros
                         && let Some(connection) = state.peer_connections.connection(peer_id).await
                     {
@@ -2692,11 +2735,11 @@ async fn run_peer_health_loop_with(
                             "persistent path degradation closed the shared peer connection"
                         );
                     }
-                    round.push((peer_id, label, health.reachable));
+                    round.push((peer_id, label, health.reachable, peer.roaming));
                 }
-                for (peer_id, label, reachable) in round {
+                for (peer_id, label, reachable, roaming) in round {
                     if let PeerHealthAction::Recover { attempt } =
-                        tracker.on_probe(peer_id, reachable, Instant::now())
+                        tracker.on_probe(peer_id, reachable, roaming, Instant::now())
                     {
                         state
                             .recover_unreachable_peer(peer_id, &label, attempt)
@@ -2718,6 +2761,38 @@ enum PeerHealthAction {
     /// Drive recovery for this peer now. `attempt` is the 1-based recovery attempt
     /// since the peer last answered, with escalating backoff between attempts.
     Recover { attempt: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerProbeLogAction {
+    Probe,
+    RoamingAway,
+    RoamingReturned,
+    None,
+}
+
+fn peer_probe_log_action(
+    away: &mut HashSet<EndpointId>,
+    peer: EndpointId,
+    roaming: bool,
+    reachable: bool,
+) -> PeerProbeLogAction {
+    if !roaming {
+        away.remove(&peer);
+        return PeerProbeLogAction::Probe;
+    }
+    if reachable {
+        return if away.remove(&peer) {
+            PeerProbeLogAction::RoamingReturned
+        } else {
+            PeerProbeLogAction::Probe
+        };
+    }
+    if away.insert(peer) {
+        PeerProbeLogAction::RoamingAway
+    } else {
+        PeerProbeLogAction::None
+    }
 }
 
 /// Per-peer liveness bookkeeping feeding [`PeerHealthTracker`].
@@ -2756,12 +2831,18 @@ impl PeerHealthTracker {
     /// state; a failure counts toward the threshold and, once reached, fires
     /// `Recover` — then gates further fires behind an escalating backoff so a
     /// genuinely-down peer is retried periodically instead of on every probe.
-    fn on_probe(&mut self, peer: EndpointId, reachable: bool, now: Instant) -> PeerHealthAction {
-        let state = self.peers.entry(peer).or_default();
-        if reachable {
-            *state = PeerHealthState::default();
+    fn on_probe(
+        &mut self,
+        peer: EndpointId,
+        reachable: bool,
+        roaming: bool,
+        now: Instant,
+    ) -> PeerHealthAction {
+        if reachable || roaming {
+            self.peers.remove(&peer);
             return PeerHealthAction::None;
         }
+        let state = self.peers.entry(peer).or_default();
         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
         if state.consecutive_failures < self.failures_before_recover {
             return PeerHealthAction::None;
@@ -3918,6 +3999,7 @@ fn peer_ref(peer: &Peer) -> PeerRef {
     PeerRef {
         id: label,
         addr: Some(addr),
+        roaming: peer.roaming,
     }
 }
 
@@ -4987,43 +5069,43 @@ mod tests {
             PeerHealthTracker::new(3, Duration::from_secs(30), Duration::from_secs(600));
 
         // Below threshold: no recovery yet.
-        assert_eq!(tracker.on_probe(peer, false, t0), PeerHealthAction::None);
-        assert_eq!(tracker.on_probe(peer, false, t0), PeerHealthAction::None);
+        assert_eq!(tracker.on_probe(peer, false, false, t0), PeerHealthAction::None);
+        assert_eq!(tracker.on_probe(peer, false, false, t0), PeerHealthAction::None);
         // Threshold (3 consecutive failures) reached: fire attempt 1.
         assert_eq!(
-            tracker.on_probe(peer, false, t0),
+            tracker.on_probe(peer, false, false, t0),
             PeerHealthAction::Recover { attempt: 1 }
         );
         // Still failing but inside the 30s backoff window: must NOT re-fire (no thrash).
         assert_eq!(
-            tracker.on_probe(peer, false, t0 + Duration::from_secs(5)),
+            tracker.on_probe(peer, false, false, t0 + Duration::from_secs(5)),
             PeerHealthAction::None
         );
         assert_eq!(
-            tracker.on_probe(peer, false, t0 + Duration::from_secs(29)),
+            tracker.on_probe(peer, false, false, t0 + Duration::from_secs(29)),
             PeerHealthAction::None
         );
         // Backoff elapsed, still failing: fire attempt 2.
         assert_eq!(
-            tracker.on_probe(peer, false, t0 + Duration::from_secs(31)),
+            tracker.on_probe(peer, false, false, t0 + Duration::from_secs(31)),
             PeerHealthAction::Recover { attempt: 2 }
         );
         // A reachable probe fully resets the peer.
         assert_eq!(
-            tracker.on_probe(peer, true, t0 + Duration::from_secs(40)),
+            tracker.on_probe(peer, true, false, t0 + Duration::from_secs(40)),
             PeerHealthAction::None
         );
         // Fresh failures must re-climb the threshold from zero (attempt back to 1).
         assert_eq!(
-            tracker.on_probe(peer, false, t0 + Duration::from_secs(50)),
+            tracker.on_probe(peer, false, false, t0 + Duration::from_secs(50)),
             PeerHealthAction::None
         );
         assert_eq!(
-            tracker.on_probe(peer, false, t0 + Duration::from_secs(50)),
+            tracker.on_probe(peer, false, false, t0 + Duration::from_secs(50)),
             PeerHealthAction::None
         );
         assert_eq!(
-            tracker.on_probe(peer, false, t0 + Duration::from_secs(50)),
+            tracker.on_probe(peer, false, false, t0 + Duration::from_secs(50)),
             PeerHealthAction::Recover { attempt: 1 }
         );
     }
@@ -5038,18 +5120,67 @@ mod tests {
         let mut tracker =
             PeerHealthTracker::new(2, Duration::from_secs(30), Duration::from_secs(600));
 
-        assert_eq!(tracker.on_probe(a, false, t0), PeerHealthAction::None);
-        assert_eq!(tracker.on_probe(b, true, t0), PeerHealthAction::None);
+        assert_eq!(tracker.on_probe(a, false, false, t0), PeerHealthAction::None);
+        assert_eq!(tracker.on_probe(b, true, false, t0), PeerHealthAction::None);
         // A reaches its threshold and recovers; B, interleaved, is unaffected.
         assert_eq!(
-            tracker.on_probe(a, false, t0),
+            tracker.on_probe(a, false, false, t0),
             PeerHealthAction::Recover { attempt: 1 }
         );
-        assert_eq!(tracker.on_probe(b, true, t0), PeerHealthAction::None);
-        assert_eq!(tracker.on_probe(b, false, t0), PeerHealthAction::None);
+        assert_eq!(tracker.on_probe(b, true, false, t0), PeerHealthAction::None);
+        assert_eq!(tracker.on_probe(b, false, false, t0), PeerHealthAction::None);
         assert_eq!(
-            tracker.on_probe(b, false, t0),
+            tracker.on_probe(b, false, false, t0),
             PeerHealthAction::Recover { attempt: 1 }
+        );
+    }
+
+    #[test]
+    fn an_absent_roaming_peer_never_enters_failure_recovery() {
+        use iroh::SecretKey;
+        let peer = SecretKey::generate().public();
+        let t0 = Instant::now();
+        let mut tracker =
+            PeerHealthTracker::new(2, Duration::from_secs(30), Duration::from_secs(600));
+
+        for elapsed in [0, 1, 2, 30, 90, 600] {
+            assert_eq!(
+                tracker.on_probe(peer, false, true, t0 + Duration::from_secs(elapsed)),
+                PeerHealthAction::None
+            );
+        }
+
+        assert!(
+            !tracker.peers.contains_key(&peer),
+            "an away roaming peer acquired failure or backoff state"
+        );
+    }
+
+    #[test]
+    fn a_roaming_peer_logs_only_presence_transitions_while_it_is_away() {
+        use iroh::SecretKey;
+        let peer = SecretKey::generate().public();
+        let mut away = HashSet::new();
+
+        assert_eq!(
+            peer_probe_log_action(&mut away, peer, true, false),
+            PeerProbeLogAction::RoamingAway
+        );
+        assert_eq!(
+            peer_probe_log_action(&mut away, peer, true, false),
+            PeerProbeLogAction::None
+        );
+        assert_eq!(
+            peer_probe_log_action(&mut away, peer, true, true),
+            PeerProbeLogAction::RoamingReturned
+        );
+        assert_eq!(
+            peer_probe_log_action(&mut away, peer, true, true),
+            PeerProbeLogAction::Probe
+        );
+        assert_eq!(
+            peer_probe_log_action(&mut away, peer, false, false),
+            PeerProbeLogAction::Probe
         );
     }
 
@@ -5386,10 +5517,18 @@ mod tests {
         let now = Instant::now();
         let before = state.endpoint_handle().generation;
 
-        assert_eq!(tracker.on_probe(bluey, false, now), PeerHealthAction::None);
-        assert_eq!(tracker.on_probe(bluey, false, now), PeerHealthAction::None);
+        assert_eq!(
+            tracker.on_probe(bluey, false, false, now),
+            PeerHealthAction::None
+        );
+        assert_eq!(
+            tracker.on_probe(bluey, false, false, now),
+            PeerHealthAction::None
+        );
         for expected_attempt in 1..OLD_RECYCLE_ATTEMPT {
-            let PeerHealthAction::Recover { attempt } = tracker.on_probe(bluey, false, now) else {
+            let PeerHealthAction::Recover { attempt } =
+                tracker.on_probe(bluey, false, false, now)
+            else {
                 panic!("bluey did not request recovery attempt {expected_attempt}");
             };
             assert_eq!(attempt, expected_attempt);
@@ -5399,11 +5538,13 @@ mod tests {
         }
 
         assert_eq!(
-            tracker.on_probe(hetz, false, now),
+            tracker.on_probe(hetz, false, false, now),
             PeerHealthAction::None,
             "one missed hetz probe must stay below its own threshold"
         );
-        let PeerHealthAction::Recover { attempt } = tracker.on_probe(bluey, false, now) else {
+        let PeerHealthAction::Recover { attempt } =
+            tracker.on_probe(bluey, false, false, now)
+        else {
             panic!("bluey did not retain its independent failure history");
         };
         assert_eq!(attempt, OLD_RECYCLE_ATTEMPT);

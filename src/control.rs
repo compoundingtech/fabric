@@ -249,9 +249,8 @@ pub struct SyncEntryStatus {
     pub sweep: String,
     /// Peers this entry is NOT syncing with, and why, as `peer:reason`.
     ///
-    /// Empty is healthy. `denied` means a person must edit `peers.toml`;
-    /// `unreachable` means the network will fix itself. A reader must be able to
-    /// tell a chore from weather without running a second command.
+    /// `away` is an expected roaming-peer absence. `denied` means a person must
+    /// edit `peers.toml`; `unreachable` means the network will fix itself.
     #[serde(default)]
     pub stopped_peers: Vec<(String, String)>,
     /// Payloads this node SENT carrying its whole manifest, whatever the
@@ -283,6 +282,9 @@ pub struct SyncEntryStatus {
 pub struct PeerReachability {
     pub id: String,
     pub name: Option<String>,
+    /// This peer is expected to disconnect and return.
+    #[serde(default)]
+    pub roaming: bool,
     pub reachable: bool,
     pub bytes: Option<usize>,
     pub round_trip_micros: Option<u64>,

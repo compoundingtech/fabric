@@ -1235,7 +1235,7 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                         && entry.scan_issues.is_empty()
                     {
                         println!(
-                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean\tscan_issues=none\tstopped={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tcontent_bytes={}\tdigest={}",
+                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean\tscan_issues=none\tstopped={}\taway={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tcontent_bytes={}\tdigest={}",
                             entry.name,
                             entry.folder,
                             entry.policy,
@@ -1243,6 +1243,7 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                             entry.tombstones,
                             entry.observed,
                             stopped_token(&entry),
+                            away_token(&entry),
                             entry.sync_passes,
                             entry.full_scans,
                             entry.inbound_noop_transactions,
@@ -1261,7 +1262,7 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                         );
                     } else {
                         println!(
-                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}\tscan_issues={}\tstopped={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tcontent_bytes={}\tdigest={}",
+                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}\tscan_issues={}\tstopped={}\taway={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tcontent_bytes={}\tdigest={}",
                             entry.name,
                             entry.folder,
                             entry.policy,
@@ -1273,6 +1274,7 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                             entry.mismatched,
                             scan_issues_token(&entry),
                             stopped_token(&entry),
+                            away_token(&entry),
                             entry.sync_passes,
                             entry.full_scans,
                             entry.inbound_noop_transactions,
@@ -1343,6 +1345,8 @@ struct SyncLsJsonEntry<'a> {
     sweep: &'a str,
     /// Peers this entry is NOT syncing with, and why. Empty is healthy.
     stopped_peers: Vec<String>,
+    /// Roaming peers that this entry is waiting for. Empty is normal.
+    away_peers: Vec<String>,
     /// Payloads this node SENT carrying its whole manifest, whatever the reason.
     /// High `reconcile_wire_bytes` with a low count here means this machine is
     /// RECEIVING full payloads rather than sending them.
@@ -1380,7 +1384,14 @@ impl<'a> From<&'a fabric::control::SyncEntryStatus> for SyncLsJsonEntry<'a> {
             stopped_peers: entry
                 .stopped_peers
                 .iter()
+                .filter(|(_, reason)| reason != "away")
                 .map(|(peer, reason)| format!("{peer}:{reason}"))
+                .collect(),
+            away_peers: entry
+                .stopped_peers
+                .iter()
+                .filter(|(_, reason)| reason == "away")
+                .map(|(peer, _)| peer.clone())
                 .collect(),
             full_payload_sends: entry.full_payload_sends,
             content_bytes: entry.content_bytes,
@@ -1655,15 +1666,31 @@ fn short_digest(digest: &str) -> &str {
 /// entry that converges with two machines and is cut off from a third is not a
 /// healthy entry and an entry-wide flag would call it one.
 fn stopped_token(entry: &fabric::control::SyncEntryStatus) -> String {
-    if entry.stopped_peers.is_empty() {
-        return "none".to_string();
-    }
-    entry
+    let stopped = entry
         .stopped_peers
         .iter()
+        .filter(|(_, reason)| reason != "away")
         .map(|(peer, reason)| format!("{peer}:{reason}"))
-        .collect::<Vec<_>>()
-        .join(",")
+        .collect::<Vec<_>>();
+    if stopped.is_empty() {
+        "none".to_string()
+    } else {
+        stopped.join(",")
+    }
+}
+
+fn away_token(entry: &fabric::control::SyncEntryStatus) -> String {
+    let away = entry
+        .stopped_peers
+        .iter()
+        .filter(|(_, reason)| reason == "away")
+        .map(|(peer, _)| peer.as_str())
+        .collect::<Vec<_>>();
+    if away.is_empty() {
+        "none".to_string()
+    } else {
+        away.join(",")
+    }
 }
 
 fn scan_issues_token(entry: &fabric::control::SyncEntryStatus) -> String {
@@ -1702,6 +1729,44 @@ fn logical_present(entry: &fabric::control::SyncEntryStatus) -> usize {
 mod connection_telemetry_tests {
     use super::*;
     use fabric::telemetry::LatencySummary;
+
+    #[test]
+    fn an_absent_roaming_peer_is_away_not_unreachable() {
+        let peer = PeerReachability {
+            id: "node-id".to_string(),
+            name: Some("bluey".to_string()),
+            roaming: true,
+            reachable: false,
+            bytes: None,
+            round_trip_micros: None,
+            transport: None,
+            error: Some("timed out".to_string()),
+        };
+
+        assert_eq!(
+            format_peer_reachability(&peer),
+            "bluey\tnode-id\taway\troaming peer"
+        );
+    }
+
+    #[test]
+    fn an_old_status_without_roaming_keeps_unreachable_behavior() {
+        let peer: PeerReachability = serde_json::from_value(serde_json::json!({
+            "id": "node-id",
+            "name": "server",
+            "reachable": false,
+            "bytes": null,
+            "round_trip_micros": null,
+            "transport": null,
+            "error": "timed out"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            format_peer_reachability(&peer),
+            "server\tnode-id\tunreachable\ttimed out"
+        );
+    }
 
     fn current(peers: &[&str]) -> BTreeSet<String> {
         peers.iter().map(|peer| (*peer).to_string()).collect()
@@ -1974,7 +2039,10 @@ mod sync_ls_tests {
             delta_fallbacks: 0,
             full_payload_sends: 0,
             content_bytes: 0,
-            stopped_peers: vec![("hetz".into(), "denied".into())],
+            stopped_peers: vec![
+                ("hetz".into(), "denied".into()),
+                ("bluey".into(), "away".into()),
+            ],
             digest: "lattice-point-aaaa".into(),
             name: "catalog".to_string(),
             folder: "/catalog".to_string(),
@@ -2036,9 +2104,12 @@ mod sync_ls_tests {
                 "full_payload_sends": 0,
                 "content_bytes": 0,
                 "stopped_peers": ["hetz:denied"],
+                "away_peers": ["bluey"],
                 "digest": "lattice-point-aaaa"
             })
         );
+        assert_eq!(stopped_token(&status), "hetz:denied");
+        assert_eq!(away_token(&status), "bluey");
     }
 
     #[test]
@@ -2383,6 +2454,8 @@ fn format_peer_reachability(peer: &PeerReachability) -> String {
             peer.id,
             peer.bytes.unwrap_or_default()
         )
+    } else if peer.roaming {
+        format!("{label}\t{}\taway\troaming peer", peer.id)
     } else {
         let error = peer.error.as_deref().unwrap_or("unreachable");
         format!("{label}\t{}\tunreachable\t{error}", peer.id)
