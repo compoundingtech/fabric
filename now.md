@@ -4,7 +4,7 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-03 by Silber.fabric-codex. Main is `353de6b`.
+_Last updated: 2026-09-03 by Silber.fabric-codex. The deployed code is `353de6b`.
 Silber and hetz run `0.2.0+353de6b`. Bluey remains wire-compatible._
 
 ## Current incident — 2026-09-03
@@ -55,9 +55,26 @@ and remote exec passed. Neither log contains a new duplicate refusal.
 The matched-fleet soak starts at 2026-09-03 10:32Z. A release is not cut. Bluey
 needs no compatibility action because mux/2 falls back to direct service ALPNs.
 It needs a future release update only to receive the isolation and generation
-fixes. The mux value measurement also remains: compare mux and direct ALPN with
-16 idle sessions for 30 minutes. Report CPU, RSS, network bytes, wake frequency,
-connection count, and p95 recovery.
+fixes.
+
+The mux value measurement is complete. Two fresh processes ran the exact same
+test binary. Each process held 16 proven idle logical sessions for 1,800
+seconds. Mux used one connection, and direct ALPN used 16 connections.
+
+Mux used 0.604104 CPU seconds. Direct used 1.274088 CPU seconds, so mux used
+52.6 percent less CPU during the 1,800-second window. Mux caused 100 package
+idle wakeups and 8,336 interrupt wakeups. Direct caused 373 package idle wakeups
+and 23,700 interrupt wakeups. Mux reduced those wake counts by 73.2 percent and
+64.8 percent during the window.
+
+Mux transferred 327,020 QUIC UDP bytes. Direct transferred 3,101,070 bytes, so
+mux reduced idle network bytes by 89.5 percent during the window. Mux RSS moved
+from 42.406 MiB to 41.406 MiB. Direct RSS moved from 44.875 MiB to 45.047 MiB.
+
+Direct won the recovery measurement. Across 160 concurrent logical-session
+samples, mux p95 was 44.026 milliseconds and direct p95 was 36.476 milliseconds.
+Mux recovery was 7.550 milliseconds slower. Mux earns its place because it
+substantially reduces every measured idle cost, with a small recovery cost.
 
 ## Current handoff — 2026-09-02
 
