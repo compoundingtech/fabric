@@ -105,6 +105,21 @@ Do not merge your own pull requests. Mark each pull request ready and wait for
 Nathan to review and merge it. Do not create peer-file backup copies. Put
 non-secret configuration history in git instead.
 
+Six dated peer and sync copies on Silber and ten on hetz were deleted on
+2026-09-03. The deletions are not recoverable. The four live files remain
+intact. Do not create replacement copies.
+
+The private catalog now owns their version history under
+`docs/fabric/<host>/peers.toml` and `docs/fabric/<host>/syncs.toml`.
+Silber.catalog committed Silber's files at `7add563`. It is adding the two live
+hetz files from host-local reads. Silber.catalog is the only writer for that
+folder. Send it changed bytes, then review its commit before it pushes.
+
+The tracked file is a snapshot, not a live configuration source. Nothing
+checks it against the host yet. Compare it with the live host file before using
+it as current state. Never add `~/.local/share/fabric/identity.toml`; it holds
+the machine's private identity key.
+
 ## Current handoff — 2026-09-02
 
 Nathan ordered the release backlog completed without approval stops. The active
