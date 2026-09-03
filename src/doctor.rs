@@ -440,7 +440,13 @@ fn sync_findings(sync: &SyncFact) -> Vec<Finding> {
     for (peer, reason) in &sync.stopped {
         // Denied waits for a person; unreachable waits for the network. Telling
         // them apart is the difference between a chore and weather.
-        let finding = if reason == "unknown" && peer == "*" {
+        let finding = if reason == "away" {
+            Finding::new(
+                "sync",
+                Verdict::Ok,
+                format!("{name} is waiting for roaming peer {peer}, which is away"),
+            )
+        } else if reason == "unknown" && peer == "*" {
             Finding::new(
                 "sync",
                 Verdict::Problem,
@@ -820,12 +826,16 @@ mod tests {
         facts.peers[0].roaming = true;
         facts.peers[0].reachable = Some(false);
         facts.peers[0].version = None;
+        facts.syncs[0].stopped = vec![("bluey".to_string(), "away".to_string())];
 
         let findings = diagnose(&facts);
         let peers = find(&findings, "peer");
+        let syncs = find(&findings, "sync");
 
         assert_eq!(peers[0].verdict, Verdict::Ok);
         assert!(peers[0].detail.contains("away"));
+        assert_eq!(syncs[0].verdict, Verdict::Ok);
+        assert!(syncs[0].detail.contains("away"));
         assert_eq!(exit_code(&findings), 0);
     }
 

@@ -3999,6 +3999,7 @@ fn peer_ref(peer: &Peer) -> PeerRef {
     PeerRef {
         id: label,
         addr: Some(addr),
+        roaming: peer.roaming,
     }
 }
 

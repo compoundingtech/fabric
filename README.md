@@ -94,8 +94,9 @@ Fabric reports connection facts about each trusted peer by canonical NodeID.
 It reports a normal peer as reachable or unreachable. Set `roaming = true` for
 a peer that is expected to disconnect, such as a laptop. Fabric reports that
 peer as away while it is offline. Its absence does not add failures or cause
-endpoint recovery. Fabric logs one away event and one return event instead of
-logging each failed probe. A durable `last_seen` status surface remains a desired gap.
+endpoint recovery. Each health or sync path logs only its away and return
+transitions. It does not log each failed probe or pass. A durable `last_seen`
+status surface remains a desired gap.
 
 The architecture MUST isolate network partitions from unrelated local work:
 each machine and its local processes continue from their last instructions
@@ -1041,7 +1042,9 @@ and observed bytes agree. A `drift=WARNING` names `missing` Present paths,
 `unexpected` observed paths whose manifest is tombstoned or absent, and
 `mismatched` paths whose observed content hash differs from the logical Present.
 `scan_issues` names existing paths that the last scan could not read as syncable
-regular files.
+regular files. `stopped` names faults. `away` names roaming peers that the entry
+will retry on its normal sync schedule. An away attempt does not add to
+`reconcile_failures`.
 
 A delete propagates only when a complete parent directory listing proves the
 path is absent. An unreadable path remains present with an unknown state. A file
