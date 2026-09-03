@@ -4,8 +4,8 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-03 by Silber.fabric-codex. Main and the deployed code
-are `6e856c4`. Silber and hetz run `0.2.1+6e856c4`._
+_Last updated: 2026-09-03 by Silber.fabric-codex. Main is `f0f99f6`; its last
+code commit is deployed as `0.2.1+6e856c4` on Silber and hetz._
 
 ## Current incident — 2026-09-03
 
@@ -140,9 +140,10 @@ doctor. A normal peer with an unreadable version still fails. It merged at
 `eecf28d3d9ae90829f9a2d3ed2a547f81763405f` and is included in the deployed
 build.
 
-Do not merge your own pull requests without the required pull-request approval.
-Do not create peer-file backup copies. Put non-secret configuration history in
-git instead.
+Code, config, test, CI, and mixed changes need a pull request and specific
+Silber.cos approval before merge. Changes that touch only `now.md` go directly
+to main without a pull request or approval. Do not create peer-file backup
+copies. Put non-secret configuration history in git instead.
 
 Six dated peer and sync copies on Silber and ten on hetz were deleted on
 2026-09-03. The deletions are not recoverable. The four live files remain
