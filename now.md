@@ -73,8 +73,13 @@ from 42.406 MiB to 41.406 MiB. Direct RSS moved from 44.875 MiB to 45.047 MiB.
 
 Direct won the recovery measurement. Across 160 concurrent logical-session
 samples, mux p95 was 44.026 milliseconds and direct p95 was 36.476 milliseconds.
-Mux recovery was 7.550 milliseconds slower. Mux earns its place because it
-substantially reduces every measured idle cost, with a small recovery cost.
+Mux recovery was 7.550 milliseconds, or 20.7 percent, slower. The percentage is
+large, but the absolute recovery cost is not perceptible.
+
+The main win is battery life. Fabric is idle for most of its life on Nathan's
+laptops. With 16 idle sessions, mux gave the machine substantially fewer reasons
+to wake and reduced network bytes by 89.5 percent. Mux earns its place because
+it substantially reduces every measured idle cost, with a small recovery cost.
 
 ## Current handoff — 2026-09-02
 
