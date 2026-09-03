@@ -1390,6 +1390,7 @@ mod tests {
             None,
             Some(vec!["web".into()]),
         );
+        book.peers[0].roaming = true;
         book.add(droppy, Some("droppy".into()), None);
         assert_eq!(
             book.may(&droppy, "shell"),
@@ -1397,6 +1398,10 @@ mod tests {
                 service: "shell".into()
             }),
             "re-adding a peer widened its permissions"
+        );
+        assert!(
+            book.peers()[0].roaming,
+            "re-adding a peer erased its roaming setting"
         );
     }
 
