@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::FabricHome;
+use crate::config::{FabricHome, PeerBook};
 
 /// Named policy preset for a sync entry.
 ///
@@ -250,6 +250,48 @@ impl SyncBook {
             }
         }
         Ok(())
+    }
+
+    /// Validate explicit sync selectors against the trusted peer allow list.
+    ///
+    /// The wildcard remains valid when the peer list is empty. An explicit
+    /// selector must match one peer by its local name or exact NodeID.
+    pub fn validate_against(&self, peers: &PeerBook) -> Result<()> {
+        self.validate()?;
+        if let Some((entry, selectors)) = self.unknown_explicit_selectors(peers).first() {
+            bail!(
+                "sync {:?} names unknown peer selector {:?}",
+                entry,
+                selectors[0]
+            );
+        }
+        Ok(())
+    }
+
+    /// Group unknown explicit selectors by sync entry for one startup warning.
+    pub fn unknown_explicit_selectors<'a>(
+        &'a self,
+        peers: &PeerBook,
+    ) -> Vec<(&'a str, Vec<&'a str>)> {
+        self.entries
+            .iter()
+            .filter_map(|entry| {
+                let unknown = entry
+                    .peers
+                    .selectors()
+                    .iter()
+                    .filter(|selector| {
+                        let selector = selector.as_str();
+                        !peers.peers().iter().any(|peer| {
+                            peer.name.as_deref() == Some(selector)
+                                || peer.id.to_string() == selector
+                        })
+                    })
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                (!unknown.is_empty()).then_some((entry.name.as_str(), unknown))
+            })
+            .collect()
     }
 }
 
@@ -619,5 +661,68 @@ mod tests {
                 || format!("{error:#}").contains("unknown variant"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn explicit_selectors_must_name_a_trusted_peer() {
+        let mut peers = PeerBook::default();
+        let id = iroh::SecretKey::generate().public();
+        peers.add(id, Some("silber".into()), None);
+
+        let by_name = parse(
+            r#"
+            [[sync]]
+            name = "catalog"
+            folder = "/catalog"
+            peers = ["silber"]
+            policy = "catalog"
+            "#,
+        )
+        .unwrap();
+        by_name.validate_against(&peers).unwrap();
+
+        let by_id = parse(&format!(
+            r#"
+            [[sync]]
+            name = "catalog"
+            folder = "/catalog"
+            peers = ["{id}"]
+            policy = "catalog"
+            "#
+        ))
+        .unwrap();
+        by_id.validate_against(&peers).unwrap();
+
+        let unknown = parse(
+            r#"
+            [[sync]]
+            name = "catalog"
+            folder = "/catalog"
+            peers = ["mac"]
+            policy = "catalog"
+            "#,
+        )
+        .unwrap();
+        let error = unknown.validate_against(&peers).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "sync \"catalog\" names unknown peer selector \"mac\""
+        );
+    }
+
+    #[test]
+    fn a_wildcard_is_valid_with_no_trusted_peers() {
+        let book = parse(
+            r#"
+            [[sync]]
+            name = "catalog"
+            folder = "/catalog"
+            peers = "*"
+            policy = "catalog"
+            "#,
+        )
+        .unwrap();
+
+        book.validate_against(&PeerBook::default()).unwrap();
     }
 }

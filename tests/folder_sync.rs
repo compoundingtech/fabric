@@ -56,7 +56,7 @@ use std::{path::Path, time::Duration};
 
 use anyhow::Result;
 use fabric::{
-    config::{FabricHome, PeerBook},
+    config::{FabricHome, PeerBook, generate_identity_file},
     control::ControlRequest,
     daemon::{FabricNode, send_control},
 };
@@ -1491,14 +1491,38 @@ async fn an_entry_that_names_an_unknown_peer_says_so() -> Result<()> {
     // A names a real peer and one that is nowhere in its peers.toml.
     write_sync_with_peers(a_dir.path(), &a_folder, "bus", &["node-b", "nobody"]);
     write_sync(b_dir.path(), &b_folder, "bus");
+    std::fs::write(a_folder.join("arrives.md"), b"via node-b")?;
+
+    // Trust A on B before A starts, so A's initial sync has a receiver that
+    // will accept it. This also avoids depending on whether a post-start write
+    // lands before or after the watcher is installed.
+    let node_a_id = generate_identity_file(&a_home.identity_path())?;
+    let mut b_peers = PeerBook::load(&b_home)?;
+    b_peers.add_with_allow(
+        node_a_id,
+        Some("node-a".to_string()),
+        None,
+        Some(vec!["sync".to_string()]),
+    );
+    b_peers.save(&b_home)?;
+
+    let node_b = FabricNode::start(b_home.clone()).await?;
+
+    // Put the resolvable peer in A's allow list before A starts. A must start
+    // with the whole candidate config, keep transport available for node-b,
+    // and expose the unresolved selector as stopped. Adding node-b after start
+    // would correctly reject the still-invalid candidate during peer reload.
+    let mut a_peers = PeerBook::load(&a_home)?;
+    a_peers.add_with_allow(
+        node_b.id(),
+        Some("node-b".to_string()),
+        Some(node_b.addr()),
+        Some(vec!["sync".to_string()]),
+    );
+    a_peers.save(&a_home)?;
 
     let node_a = FabricNode::start(a_home.clone()).await?;
-    let node_b = FabricNode::start(b_home.clone()).await?;
-    trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
-    trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
 
-    std::fs::write(a_folder.join("arrives.md"), b"via node-b")?;
-    reload_sync(&a_home).await?;
     assert!(
         wait_for_file(&b_folder.join("arrives.md"), b"via node-b").await,
         "POSITIVE CONTROL FAILED: the resolvable peer never received the file, \

@@ -4,13 +4,25 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-03 by Silber.fabric-codex. Main is `17a7bb5`. The
-deployed code is `353de6b`. Silber and hetz run `0.2.0+353de6b`._
+_Last updated: 2026-09-03 by Silber.fabric-codex. Main and the deployed code
+are `f806142`. Silber and hetz run `0.2.1+f806142`._
 
 ## Current incident — 2026-09-03
 
 Release `v0.2.0+ebca516` is published with Apple arm64 and both Linux assets.
 The required ACL migration and downgrade warnings lead its release notes.
+
+Release `v0.2.1+f806142` is published with Apple arm64 and both Linux assets.
+Silber and hetz run that exact build. Two-way ping passes. Both sync entries
+have matching digests and zero drift fields on both hosts.
+
+Doctor passes every local, peer-reachability, and sync check on both hosts.
+It reports Bluey's version as unknown because remote exec to Bluey exits 1.
+Bluey remains reachable from both hosts.
+
+Nathan removed the release hold on 2026-09-03. Daily builds must include the
+features on main. A later public 0.9.0 release is a separate act, and unfinished
+public features stay behind flags instead of staying off main.
 
 A matched mux pair again retained a stale canonical connection after Silber
 replaced its endpoint. Hetz has the lower NodeID, so both tie-break decisions
@@ -97,13 +109,15 @@ it `bluey`; hetz names it `air`. Both old daemons reloaded the file, but build
 `353de6b` ignores the new field. Bluey was reachable from both machines at
 12:15Z, so no real away or return transition has been observed.
 
-Silber.cos held deployment. Prepare v0.2.1 with the roaming change, but do not
-release or deploy it. Nathan wants to use the current stable v0.2.0 fleet before
-the 0.9.0 work starts. Silber.cos will ask when he wants v0.2.1.
+PR #135 adds strict cross-file validation for explicit sync selectors. It
+rejects an unknown selector during `sync add`, sync reload, and peer reload.
+At daemon start, it keeps the transport up, warns once, and stops only the bad
+entry. A rejected reload keeps the last valid in-memory configuration. The live
+hetz migration is complete, so its deployment precondition is met.
 
-Do not merge your own pull requests. Mark each pull request ready and wait for
-Nathan to review and merge it. Do not create peer-file backup copies. Put
-non-secret configuration history in git instead.
+Do not merge your own pull requests without the required pull-request approval.
+Do not create peer-file backup copies. Put non-secret configuration history in
+git instead.
 
 Six dated peer and sync copies on Silber and ten on hetz were deleted on
 2026-09-03. The deletions are not recoverable. The four live files remain
@@ -112,7 +126,7 @@ intact. Do not create replacement copies.
 The private catalog now owns their version history under
 `docs/fabric/<host>/peers.toml` and `docs/fabric/<host>/syncs.toml`.
 Silber.catalog committed Silber's files at `7add563` and hetz's files at
-`e1ff3b1`. The two hetz blobs match the two live host files by SHA-256.
+`acbd847`. The two hetz blobs match the two live host files by SHA-256.
 Silber.catalog is the only writer for that folder. Send it changed bytes, then
 review its commit before it pushes.
 
@@ -121,13 +135,14 @@ checks it against the host yet. Compare it with the live host file before using
 it as current state. Never add `~/.local/share/fabric/identity.toml`; it holds
 the machine's private identity key.
 
-The first cross-host review found both hetz sync entries select `mac`.
-Hetz's peer file defines only `air` and `silber`. Fabric resolves a selector
-only as an exact NodeID or local peer name. The live hetz daemon reports
-`mac:unknown`, zero reconcile time, and zero outbound wire bytes for both
-entries. Replication works because Silber starts a bidirectional reconcile.
-Hetz's outbound half is inert. Do not change the live selector without Nathan's
-decision; it changes live replication behavior.
+The first cross-host review found both hetz sync entries selected the unknown
+name `mac`. Both entries now select Silber's exact NodeID. Hetz has nonzero
+outbound time and wire bytes, and no stopped peers.
+
+The migration recovered no missing data. Present, tombstone, and observed
+counts were unchanged across the migration. The first outbound pass found no
+missing records. It restored watcher-driven outbound delivery and the symmetric
+design, which closes a future gap during a Silber outage.
 
 ## Current handoff — 2026-09-02
 
