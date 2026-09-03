@@ -4,8 +4,8 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-03 by Silber.fabric-codex. The deployed code is `353de6b`.
-Silber and hetz run `0.2.0+353de6b`. Bluey remains wire-compatible._
+_Last updated: 2026-09-03 by Silber.fabric-codex. Main is `17a7bb5`. The
+deployed code is `353de6b`. Silber and hetz run `0.2.0+353de6b`._
 
 ## Current incident — 2026-09-03
 
@@ -80,6 +80,24 @@ The main win is battery life. Fabric is idle for most of its life on Nathan's
 laptops. With 16 idle sessions, mux gave the machine substantially fewer reasons
 to wake and reduced network bytes by 89.5 percent. Mux earns its place because
 it substantially reduces every measured idle cost, with a small recovery cost.
+
+PR #131 records the repeatable mux and direct harness and the result above. It
+merged at `edd1c80169e7b856407df3c9fb17accc83dfe371`.
+
+PR #132 adds the per-peer `roaming = true` contract. It merged at
+`17a7bb53b80d8a79c46ab4f8a8adcd7fe3c2f69c`. An absent roaming peer still gets
+health probes and normal sync attempts. The absence does not enter either
+failure counter, close a peer connection, or appear as a stopped sync. Health
+and sync log only away and return transitions. `fabric status` reports `away`.
+`fabric sync ls` reports `stopped=none` and `away=<peer>`. Doctor reports both
+the peer and its paused sync as OK.
+
+The Bluey NodeID now has `roaming = true` in both live peer files. Silber names
+it `bluey`; hetz names it `air`. Both files have a sibling backup named
+`peers.toml.pre-roaming-20260903T1213Z`. Both old daemons reloaded the file, but
+build `353de6b` ignores the new field. Bluey was reachable from both machines at
+12:15Z, so no real away or return transition has been observed. The deployment
+gate is with Silber.cos. Do not deploy or cut a release without its answer.
 
 ## Current handoff — 2026-09-02
 
