@@ -100,13 +100,22 @@ jobs:
       - name: Serial local multi-node daemon slice
         run: timeout 15m cargo test --locked --test local_slice -- --test-threads=1
 
+      - name: Daemon lifecycle contract
+        run: timeout 10m cargo test --locked --test lifecycle -- --test-threads=1
+
+      - name: Path watcher contract
+        run: timeout 5m cargo test --locked --test pathwatch_slice -- --test-threads=1
+
+      - name: Shell and restart contract
+        run: timeout 15m cargo test --locked --test shell -- --test-threads=1
+
       # A NEW FILE IN tests/ DOES NOT RUN HERE UNLESS SOMEBODY ADDS A STEP FOR
       # IT, and forgetting is silent: the suite goes green while the new tests
       # never execute. That has now happened twice, once for the binary's own
       # tests and once for the delete matrix.
       #
-      # So every target must be either RUN above or named below with a reason.
-      # Adding a test file and nothing else fails this step, which is the point.
+      # So every target must RUN above. Adding a test file and nothing else
+      # fails this step, which is the point.
       - name: Every test target is accounted for
         run: |
           set -euo pipefail
@@ -115,25 +124,17 @@ jobs:
           # for two days at a green commit. The `macos` job above is the other
           # half and it is deliberately narrower than this one.
           #
-          # Named here, deliberately not run, with the reason. Shorten this list.
-          not_yet_verified_on_linux="lifecycle pathwatch_slice shell"
           missing=""
           for path in tests/*.rs; do
             target="$(basename "$path" .rs)"
             if grep -q -- "--test $target" .github/workflows/test.yml; then
               continue
             fi
-            case " $not_yet_verified_on_linux " in
-              *" $target "*)
-                echo "known gap, not run here: $target"
-                continue
-                ;;
-            esac
             missing="$missing $target"
           done
           if [ -n "$missing" ]; then
             echo "these test targets never run in CI:$missing" >&2
-            echo "add a step for each, or name it in not_yet_verified_on_linux with a reason" >&2
+            echo "add a step for each target" >&2
             exit 1
           fi
-          echo "every tests/*.rs target is run or explicitly accounted for"
+          echo "every tests/*.rs target runs in Linux CI"
