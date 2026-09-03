@@ -100,6 +100,8 @@ jobs:
       - name: Serial local multi-node daemon slice
         run: timeout 15m cargo test --locked --test local_slice -- --test-threads=1
 
+      # PR 76 excluded these three only because they had passed on macOS but had
+      # never run on Linux CI. It did not record a Linux failure.
       - name: Daemon lifecycle contract
         run: timeout 10m cargo test --locked --test lifecycle -- --test-threads=1
 

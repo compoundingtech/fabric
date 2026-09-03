@@ -39,7 +39,8 @@ The same test workflow runs on pull requests and pushes to `main`. Both events
 run its `macos` and `deterministic` jobs. Pull-request run 33767026944 and main
 run 33767494392 confirm that job parity.
 
-The Linux job previously excluded the `lifecycle`, `pathwatch_slice`, and
-`shell` integration targets. No other job ran them. The accounting step accepted
-that gap, so a green result did not test those targets. The workflow now runs
-all three targets and rejects every unlisted integration target.
+PR 76 excluded the `lifecycle`, `pathwatch_slice`, and `shell` integration
+targets. All three passed locally on macOS, but none had run on Linux CI. The
+history records no Linux failure. No other job ran them. The accounting step
+accepted that gap, so a green result did not test those targets. The workflow
+now runs all three targets and rejects every unlisted integration target.
