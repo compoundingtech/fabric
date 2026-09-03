@@ -5,9 +5,71 @@ current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
 _Last updated: 2026-09-03 by Silber.fabric-codex. Main's last code commit is
-deployed as `0.2.1+f2757f0` on Silber and hetz._
+deployed as `0.2.1+a49be9c` on Silber and hetz._
 
 ## Current incident — 2026-09-03
+
+### Resolved mux stream outage and rollout
+
+At 15:14Z, Silber lost every Silber-initiated Fabric operation to hetz. Ping,
+exec, and send-file failed after a remote-generation read error and duplicate
+mux refusals. Hetz-initiated sync continued in both directions, so the pair was
+degraded but not partitioned.
+
+Silber ran endpoint generation 6, and hetz ran generation 5. Hetz correctly
+retained its canonical client connection to Silber generation 6. Silber removed
+its live shared connection from the local cache without closing it. New
+noncanonical connections then received correct duplicate refusals from hetz.
+The generation comparison and equal-generation tie-break were not defective.
+
+A Silber-only daemon restart at 15:57Z moved Silber to generation 7. Hetz then
+replaced its generation 6 belief, and all control operations recovered. This
+restart was the incident workaround, not the fix.
+
+The root cause was `open_mux_stream` cleanup after a logical stream failure.
+It called `forget_if`, which removed the shared QUIC connection without closing
+it. Closing that connection after every stream failure was also wrong because
+one failed logical stream does not make its healthy sibling streams defective.
+
+PR #140 adds three bounded cleanup states. One unknown stream failure keeps the
+shared connection. A concrete `ConnectionError` or visible close reason closes
+and removes the exact connection. Three consecutive unknown failures on one
+stable connection close and remove it, so attempt four opens a replacement.
+The unknown-failure count exists only inside one `open_mux_stream` call. A
+stable-ID guard prevents late cleanup from closing a newer replacement.
+
+The first red proof reproduced the production duplicate refusal and orphaned
+connection with the old cleanup. The second red proof stayed on the wrong
+connection without the unknown-failure bound. Both proofs passed 20 of 20 paired
+runs after the fix. The library suite passed 440 tests, with three ignored. The
+binary suite passed all 18 tests.
+
+PR #140 merged as `a49be9ca65eee694abd70d3e3985b5a157fe72ed`. Main's Nix,
+macOS, and complete Linux matrix passed. Release `v0.2.1+a49be9c` published
+three binaries and three checksum files. All four release jobs passed. All six
+assets downloaded, and each archive matched its checksum and contained only a
+`fabric` binary. The Apple binary reported `0.2.1+a49be9c` before deployment.
+
+The rollout updated hetz first and Silber second. Both daemons now report
+`0.2.1+a49be9c`. Doctor passes on both hosts. Ping and exec passed in both
+directions. The final measured pings took 42.135 milliseconds from Silber to
+hetz and 51.568 milliseconds from hetz to Silber, both through the relay.
+Bidirectional send-file hashes matched.
+
+Both sync entries have matching cross-host digests. Both hosts report zero
+drift, missing, unexpected, mismatched, scan issues, reconcile failures, stopped
+peers, away peers, and delta fallbacks. The bus digest is
+`6064612b8cbeba371f98ed50c0d4b348d5df3960a8e710fc55f9b92d62f32dae`.
+The declarations digest is
+`670d67f124156732a44bec0427958950a8944465ec7720dc6c65a839d1907d55`.
+
+The two transfer test files were deleted after their hashes matched. The exact
+rollout rollback binaries were also deleted after verification. They were
+`/Users/myobie/.local/bin/fabric.rollback-1788454031` and
+`/home/myobie/.local/bin/fabric.rollback-1788454008`.
+
+Silber.cos ordered this rollout complete and ordered Silber.fabric to stop for
+the night. The three known flakes, F13, and F14 wait for the next work period.
 
 Release `v0.2.0+ebca516` is published with Apple arm64 and both Linux assets.
 The required ACL migration and downgrade warnings lead its release notes.
@@ -53,10 +115,9 @@ target. The PR also corrects the stale CI description in
 `docs/known-flaky-tests.md`. It merged at
 `f2757f09bad8275d69f0ca11c399cb725f477dc2` and is deployed on both hosts.
 
-The next order from Silber.cos is the three known flakes, F13, and F14. The
-unchanged ledger test passed 20 of 20 local runs after the #139 merge. The
+The unchanged ledger test passed 20 of 20 local runs after the #139 merge. The
 unchanged ACL test passed five of five local runs. Continue the reproduction
-pass before changing either test.
+pass before changing either test when Silber.cos starts the next work period.
 
 Nathan removed the release hold on 2026-09-03. Daily builds must include the
 features on main. A later public 0.9.0 release is a separate act, and unfinished
