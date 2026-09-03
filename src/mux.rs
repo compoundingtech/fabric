@@ -16,10 +16,9 @@
 //! which is rarer than per-tunnel drops because iroh multipath migrates paths
 //! without dropping the connection.
 //!
-//! Production currently uses direct per-service ALPN connections. A matched mux
-//! pair retained a canonical connection to a replaced endpoint and refused each
-//! fresh connection as a duplicate. The mux implementation stays here with its
-//! focused tests until the wire contract can distinguish an endpoint generation.
+//! Mux version 2 exchanges each endpoint owner's generation before logical
+//! stream admission. This lets a peer replace stale canonical state without
+//! weakening the simultaneous-open tie-break for equal generations.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -41,10 +40,9 @@ use tokio::{
 };
 
 /// The reserved ALPN for the multiplexed per-peer connection.
-pub const MUX_ALPN: &[u8] = b"fabric/mux/1";
-/// The shared mux transport is quarantined after a matched pair retained a
-/// stale canonical connection and rejected every replacement connection.
-pub const MUX_ENABLED: bool = false;
+pub const MUX_ALPN: &[u8] = b"fabric/mux/2";
+/// Mux version 2 exchanges endpoint generations before it admits streams.
+pub const MUX_ENABLED: bool = true;
 /// A diagnostic block that can clear without a config change.
 pub(crate) const TEMPORARY_TUNNEL_BLOCK: &str = "fabric tunnel blocked";
 
@@ -52,6 +50,7 @@ pub(crate) const TEMPORARY_TUNNEL_BLOCK: &str = "fabric tunnel blocked";
 const MAX_PROTOCOL_LEN: usize = 255;
 const MAX_RESPONSE_LEN: usize = 4096;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
+const GENERATION_PREFACE_TIMEOUT: Duration = Duration::from_secs(3);
 const OPEN_ATTEMPTS: usize = 4;
 const DUPLICATE_OPEN_ATTEMPTS: usize = 8;
 const DUPLICATE_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -257,6 +256,8 @@ async fn read_admission(recv: &mut RecvStream) -> Result<()> {
 #[derive(Debug)]
 struct PeerConn {
     connection: Connection,
+    /// The generation owned by the remote endpoint.
+    remote_generation: u64,
     generation: u64,
     last_application_activity: Option<Instant>,
 }
@@ -313,8 +314,7 @@ impl PeerConnections {
         }
     }
 
-    /// Open through the quarantined shared transport for its focused tests.
-    /// Production calls [`Self::open_stream`], which selects the safe transport.
+    /// Open through the shared transport for focused tests.
     async fn open_mux_stream(
         &self,
         endpoint: &Endpoint,
@@ -337,7 +337,13 @@ impl PeerConnections {
                         .await;
                     return self.open_legacy(endpoint, peer_addr, protocol).await;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if is_duplicate_connection(&error) && attempts < DUPLICATE_OPEN_ATTEMPTS {
+                        tokio::time::sleep(DUPLICATE_RETRY_DELAY).await;
+                        continue;
+                    }
+                    return Err(error);
+                }
             };
             self.clear_legacy_retry(peer_addr.id, generation).await;
             match self.open_on(&connection, &header).await {
@@ -486,6 +492,50 @@ impl PeerConnections {
         .context("mux stream received no admission answer within 3 seconds")?
     }
 
+    async fn exchange_generations(connection: &Connection, local_generation: u64) -> Result<u64> {
+        tokio::time::timeout(GENERATION_PREFACE_TIMEOUT, async {
+            let (mut send, mut recv) = connection
+                .open_bi()
+                .await
+                .context("open mux generation preface")?;
+            send.write_u64(local_generation)
+                .await
+                .context("write local endpoint generation")?;
+            send.flush()
+                .await
+                .context("flush local endpoint generation")?;
+            let remote_generation = recv
+                .read_u64()
+                .await
+                .context("read remote endpoint generation")?;
+            send.finish().context("finish mux generation preface")?;
+            Ok(remote_generation)
+        })
+        .await
+        .context("mux generation exchange timed out")?
+    }
+
+    /// Read the dialler's endpoint generation and return this endpoint's value.
+    pub async fn accept_generation(connection: &Connection, local_generation: u64) -> Result<u64> {
+        tokio::time::timeout(GENERATION_PREFACE_TIMEOUT, async {
+            let (mut send, mut recv) = connection
+                .accept_bi()
+                .await
+                .context("accept mux generation preface")?;
+            let remote_generation = recv
+                .read_u64()
+                .await
+                .context("read remote endpoint generation")?;
+            send.write_u64(local_generation)
+                .await
+                .context("write local endpoint generation")?;
+            send.finish().context("finish mux generation reply")?;
+            Ok(remote_generation)
+        })
+        .await
+        .context("mux generation preface timed out")?
+    }
+
     /// Get the peer's cached connection, or open a fresh mux connection.
     async fn get_or_open(
         &self,
@@ -540,10 +590,12 @@ impl PeerConnections {
                 return Err(error);
             }
         };
+        let remote_generation = Self::exchange_generations(&connection, generation).await?;
         conns.insert(
             peer_addr.id,
             PeerConn {
                 connection: connection.clone(),
+                remote_generation,
                 generation,
                 last_application_activity: (activity == StreamActivity::Application)
                     .then(Instant::now),
@@ -574,7 +626,12 @@ impl PeerConnections {
     }
 
     /// Cache an accepted peer connection for traffic in the reverse direction.
-    pub async fn register_incoming(&self, connection: &Connection, generation: u64) {
+    pub async fn register_incoming(
+        &self,
+        connection: &Connection,
+        generation: u64,
+        remote_generation: u64,
+    ) {
         let peer = connection.remote_id();
         let mut conns = self.conns.lock().await;
         let replace = match conns.get(&peer) {
@@ -585,6 +642,8 @@ impl PeerConnections {
             {
                 true
             }
+            Some(current) if remote_generation > current.remote_generation => true,
+            Some(current) if remote_generation < current.remote_generation => false,
             Some(current) => {
                 current.connection.side() == Side::Server
                     || (self.local_id > peer && current.connection.side() == Side::Client)
@@ -599,6 +658,7 @@ impl PeerConnections {
                 peer,
                 PeerConn {
                     connection: connection.clone(),
+                    remote_generation,
                     generation,
                     last_application_activity: None,
                 },
@@ -693,6 +753,11 @@ mod tests {
     impl ProtocolHandler for MuxEcho {
         async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
             self.connections.fetch_add(1, Ordering::SeqCst);
+            PeerConnections::accept_generation(&connection, 0)
+                .await
+                .map_err(|error| {
+                    AcceptError::from_err(std::io::Error::other(format!("{error:#}")))
+                })?;
             loop {
                 let (mut send, mut recv) = match connection.accept_bi().await {
                     Ok(pair) => pair,
@@ -712,6 +777,126 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct ManagedMuxEcho {
+        manager: Arc<PeerConnections>,
+        generation: u64,
+    }
+
+    impl ProtocolHandler for ManagedMuxEcho {
+        async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+            let remote_generation =
+                PeerConnections::accept_generation(&connection, self.generation)
+                    .await
+                    .map_err(|error| {
+                        AcceptError::from_err(std::io::Error::other(format!("{error:#}")))
+                    })?;
+            self.manager
+                .register_incoming(&connection, self.generation, remote_generation)
+                .await;
+            loop {
+                let (mut send, mut recv) = match connection.accept_bi().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    if MuxStreamHeader::read(&mut recv).await.is_ok() {
+                        let _ = write_ready(&mut send).await;
+                        let _ = tokio::io::copy(&mut recv, &mut send).await;
+                        let _ = send.finish();
+                    }
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_new_endpoint_generation_replaces_a_live_stale_canonical_connection() -> Result<()> {
+        let first = iroh::SecretKey::generate();
+        let second = iroh::SecretKey::generate();
+        let (lower_key, higher_key) = if first.public() < second.public() {
+            (first, second)
+        } else {
+            (second, first)
+        };
+
+        let lower_endpoint = Endpoint::builder(presets::N0)
+            .secret_key(lower_key)
+            .alpns(vec![MUX_ALPN.to_vec()])
+            .bind()
+            .await?;
+        let (lower_opened_tx, _lower_opened_rx) = mpsc::unbounded_channel();
+        let lower_manager = Arc::new(PeerConnections::new(
+            lower_endpoint.id(),
+            lower_opened_tx,
+        ));
+        let lower_router = Router::builder(lower_endpoint)
+            .accept(
+                MUX_ALPN,
+                ManagedMuxEcho {
+                    manager: lower_manager.clone(),
+                    generation: 0,
+                },
+            )
+            .spawn();
+        lower_router.endpoint().online().await;
+
+        let higher_old_endpoint = Endpoint::builder(presets::N0)
+            .secret_key(higher_key.clone())
+            .alpns(vec![MUX_ALPN.to_vec()])
+            .bind()
+            .await?;
+        let higher_old_router = Router::builder(higher_old_endpoint)
+            .accept(
+                MUX_ALPN,
+                MuxEcho {
+                    connections: Arc::new(AtomicUsize::new(0)),
+                    headers: Arc::new(Mutex::new(Vec::new())),
+                },
+            )
+            .spawn();
+        higher_old_router.endpoint().online().await;
+
+        let first_stream = lower_manager
+            .open_mux_stream(
+                lower_router.endpoint(),
+                0,
+                &higher_old_router.endpoint().addr(),
+                "probe",
+                StreamActivity::Probe,
+            )
+            .await?;
+        assert_eq!(first_stream.connection.side(), Side::Client);
+        assert_echo(first_stream, b"old-generation").await?;
+
+        let higher_new_endpoint = Endpoint::builder(presets::N0)
+            .secret_key(higher_key)
+            .alpns(vec![MUX_ALPN.to_vec()])
+            .bind()
+            .await?;
+        higher_new_endpoint.online().await;
+        let (higher_opened_tx, _higher_opened_rx) = mpsc::unbounded_channel();
+        let higher_new_manager = PeerConnections::new(higher_new_endpoint.id(), higher_opened_tx);
+
+        let replacement = higher_new_manager
+            .open_mux_stream(
+                &higher_new_endpoint,
+                1,
+                &lower_router.endpoint().addr(),
+                "probe",
+                StreamActivity::Probe,
+            )
+            .await
+            .context("the peer retained generation 0 and refused generation 1 as a duplicate")?;
+        assert_echo(replacement, b"new-generation").await?;
+
+        higher_old_router.shutdown().await?;
+        lower_router.shutdown().await?;
+        higher_new_endpoint.close().await;
+        Ok(())
+    }
+
     /// A peer can retain the old canonical connection briefly while the other
     /// endpoint changes generation. It rejects each new connection as a
     /// duplicate until the old close reaches it.
@@ -728,6 +913,11 @@ mod tests {
                 connection.close(0u32.into(), DUPLICATE_CONNECTION_REASON);
                 return Ok(());
             }
+            PeerConnections::accept_generation(&connection, 0)
+                .await
+                .map_err(|error| {
+                    AcceptError::from_err(std::io::Error::other(format!("{error:#}")))
+                })?;
             loop {
                 let (mut send, mut recv) = match connection.accept_bi().await {
                     Ok(pair) => pair,
@@ -854,7 +1044,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn production_streams_use_legacy_while_mux_is_quarantined() -> Result<()> {
+    async fn production_streams_use_generation_aware_mux() -> Result<()> {
         let mux_connections = Arc::new(AtomicUsize::new(0));
         let legacy_connections = Arc::new(AtomicUsize::new(0));
         let server_ep = Endpoint::bind(presets::N0).await?;
@@ -889,8 +1079,8 @@ mod tests {
             .await?;
         assert_echo(stream, b"stable-legacy").await?;
 
-        assert_eq!(legacy_connections.load(Ordering::SeqCst), 1);
-        assert_eq!(mux_connections.load(Ordering::SeqCst), 0);
+        assert_eq!(legacy_connections.load(Ordering::SeqCst), 0);
+        assert_eq!(mux_connections.load(Ordering::SeqCst), 1);
 
         router.shutdown().await?;
         client.close().await;

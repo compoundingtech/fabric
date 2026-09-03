@@ -40,7 +40,7 @@ use crate::{
     config::{
         DEFAULT_EXEC_MAX_CHILDREN, FabricConfig, FabricHome, Peer, PeerBook, PersistedExpose,
         PersistedExposeTarget, load_or_create_identity, validate_protocol,
-        validate_server_session_config, validate_tcp_addr,
+        validate_server_session_config, validate_tcp_addr, write_atomic,
     },
     control::{ControlRequest, ControlResponse, PeerReachability, SyncEntryStatus},
     exec, gitremote, mux, pathwatch, shell,
@@ -107,10 +107,6 @@ const NETWORK_CHANGE_DEBOUNCE: Duration = Duration::from_millis(140);
 const PEER_HEALTH_PROBE_INTERVAL: Duration = Duration::from_secs(20);
 /// Consecutive failed peer probes before the daemon drives recovery for that peer.
 const PEER_HEALTH_FAILURES_BEFORE_RECOVER: usize = 3;
-/// Recovery attempts (cheap re-probe nudges) for a still-unreachable peer before
-/// escalating to a full endpoint recycle — the heavy hammer a manual restart used
-/// to require.
-const PEER_HEALTH_ATTEMPTS_BEFORE_RECYCLE: usize = 3;
 /// Escalating backoff between repeated recovery attempts for a still-unreachable
 /// peer, so a genuinely-down peer does not cause recovery thrash.
 const PEER_HEALTH_RECOVER_INITIAL_BACKOFF: Duration = Duration::from_secs(30);
@@ -655,6 +651,27 @@ async fn build_daemon_endpoint(
     Ok(endpoint)
 }
 
+fn next_endpoint_generation(home: &FabricHome, after: u64) -> Result<u64> {
+    home.prepare()?;
+    let path = home.endpoint_generation_path();
+    let stored = match fs::read_to_string(&path) {
+        Ok(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .with_context(|| format!("failed to parse {}", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let generation = stored
+        .max(after)
+        .checked_add(1)
+        .context("endpoint generation exhausted")?;
+    write_atomic(&path, format!("{generation}\n").as_bytes())?;
+    Ok(generation)
+}
+
 /// How many daily validation logs to keep before the oldest is deleted.
 ///
 /// Derived from the job the logs have to do, not rounded to look tidy. An
@@ -857,8 +874,9 @@ impl DaemonState {
         let exposures = load_persisted_exposures(&home)?;
         let allowed = Arc::new(RwLock::new(peer_book.trusted_ids()));
         let endpoint = build_daemon_endpoint(&home, allowed.clone(), &exposures).await?;
+        let generation = next_endpoint_generation(&home, 0)?;
         let (endpoint_tx, _) = watch::channel(CurrentEndpoint {
-            generation: 0,
+            generation,
             endpoint,
         });
         let (tunnel_drop_tx, _) = watch::channel(0);
@@ -1667,66 +1685,26 @@ impl DaemonState {
         }
     }
 
-    /// Drive recovery for a peer our active liveness probe found unreachable, even
-    /// though no local network change fired (the roaming case). Cheap first: tell
-    /// iroh to re-discover + re-probe all paths and drop stale tunnels so a roamed
-    /// peer settles onto relay / its new direct address. Escalates to a full
-    /// endpoint recycle only after repeated nudges have not brought it back — the
-    /// same effect as the manual restart this replaces. `attempt` is the 1-based
-    /// recovery attempt since the peer last answered.
-    /// Recover one unreachable peer. `healthy_elsewhere` is how many OTHER peers
-    /// answered in the same probe round: if any did, the endpoint is demonstrably
-    /// working and this peer is simply away, so recovery stays cheap and local
-    /// instead of recycling the endpoint out from under everyone else.
-    async fn recover_unreachable_peer(
-        &self,
-        label: &str,
-        attempt: usize,
-        healthy_elsewhere: usize,
-    ) {
+    /// Close only the failed peer's cached connection. The next probe opens a new
+    /// connection and refreshes discovery without touching any other peer.
+    async fn recover_unreachable_peer(&self, peer_id: EndpointId, label: &str, attempt: usize) {
         let endpoint = self.endpoint_handle();
-        let attempts_exhausted = attempt >= PEER_HEALTH_ATTEMPTS_BEFORE_RECYCLE;
-        let escalate_recycle = attempts_exhausted && healthy_elsewhere == 0;
+        let redialled = self
+            .peer_connections
+            .redial(peer_id, b"peer health recovery")
+            .await;
         warn!(
             target: VALIDATION_LOG_TARGET,
             event = "peer_health_recover",
             peer = %label,
             generation = endpoint.generation,
             attempt,
-            healthy_elsewhere,
-            attempts_exhausted,
-            escalate_recycle,
-            "peer unreachable; re-probing paths"
+            redialled,
+            "peer unreachable; resetting only this peer's connection"
         );
         eprintln!(
-            "fabric: peer {label:?} unreachable (recovery attempt {attempt}, {healthy_elsewhere} other peers healthy); re-probing paths{}",
-            if escalate_recycle {
-                " + recycling endpoint"
-            } else if attempts_exhausted {
-                " (endpoint left alone: other peers are reachable)"
-            } else {
-                ""
-            }
+            "fabric: peer {label:?} unreachable (recovery attempt {attempt}); resetting only this peer's connection"
         );
-
-        endpoint.endpoint.network_change().await;
-
-        if escalate_recycle {
-            // Only tear down live tunnels when the endpoint itself is suspect. One
-            // roaming peer being away is no reason to drop everyone's sessions.
-            self.drop_tunnel_connections();
-            if let Err(error) = self
-                .recycle_endpoint_if_generation(
-                    endpoint.generation,
-                    "peer unreachable after repeated re-probes",
-                )
-                .await
-            {
-                eprintln!(
-                    "fabric: failed to recycle endpoint recovering peer {label:?}: {error:#}"
-                );
-            }
-        }
     }
 
     async fn endpoint_health_recovered(&self, endpoint: CurrentEndpoint, context: &str) -> bool {
@@ -1971,7 +1949,7 @@ impl DaemonState {
             );
         }
 
-        let new_generation = old.generation.wrapping_add(1);
+        let new_generation = next_endpoint_generation(&self.home, old.generation)?;
         self.endpoint_tx.send_replace(CurrentEndpoint {
             generation: new_generation,
             endpoint: new_endpoint,
@@ -2627,12 +2605,9 @@ async fn run_peer_health_loop_with(
                     continue;
                 }
                 let peers = state.peer_book.read().await.peers().to_vec();
-                // Probe the whole round before recovering anything. A single absent
-                // roaming peer must not be able to order a global endpoint recycle
-                // while other peers are answering fine, so the recovery decision
-                // needs to know how the rest of the network looked this round.
+                // Probe the whole round before recovery, so every status sample
+                // describes the same interval.
                 let mut round = Vec::with_capacity(peers.len());
-                let mut reachable_peers = 0usize;
                 for peer in peers {
                     let peer_id = peer.id;
                     let label = peer.name.clone().unwrap_or_else(|| peer_id.to_string());
@@ -2649,7 +2624,6 @@ async fn run_peer_health_loop_with(
                             window_ms = probe_interval.as_millis() as u64,
                             "recent application traffic proved peer liveness"
                         );
-                        reachable_peers += 1;
                         round.push((peer_id, label, true));
                         continue;
                     }
@@ -2718,22 +2692,14 @@ async fn run_peer_health_loop_with(
                             "persistent path degradation closed the shared peer connection"
                         );
                     }
-                    if health.reachable {
-                        reachable_peers += 1;
-                    }
                     round.push((peer_id, label, health.reachable));
                 }
                 for (peer_id, label, reachable) in round {
                     if let PeerHealthAction::Recover { attempt } =
                         tracker.on_probe(peer_id, reachable, Instant::now())
                     {
-                        let healthy_elsewhere = if reachable {
-                            reachable_peers.saturating_sub(1)
-                        } else {
-                            reachable_peers
-                        };
                         state
-                            .recover_unreachable_peer(&label, attempt, healthy_elsewhere)
+                            .recover_unreachable_peer(peer_id, &label, attempt)
                             .await;
                     }
                 }
@@ -2750,7 +2716,7 @@ enum PeerHealthAction {
     /// Peer is healthy or not yet past the failure threshold — do nothing.
     None,
     /// Drive recovery for this peer now. `attempt` is the 1-based recovery attempt
-    /// since the peer last answered, driving escalating backoff + recycle escalation.
+    /// since the peer last answered, with escalating backoff between attempts.
     Recover { attempt: usize },
 }
 
@@ -3618,9 +3584,11 @@ async fn handle_mux_connection(
 ) -> Result<()> {
     if register_incoming {
         let generation = state.endpoint_handle().generation;
+        let remote_generation =
+            mux::PeerConnections::accept_generation(&connection, generation).await?;
         state
             .peer_connections
-            .register_incoming(&connection, generation)
+            .register_incoming(&connection, generation, remote_generation)
             .await;
     }
     loop {
@@ -4962,12 +4930,24 @@ mod tests {
     }
 
     #[test]
-    fn a_production_endpoint_does_not_advertise_quarantined_mux() {
+    fn a_production_endpoint_advertises_generation_aware_mux() {
         let alpns = accepted_alpns(&HashMap::new());
 
-        assert!(!alpns.iter().any(|alpn| alpn == mux::MUX_ALPN));
+        assert!(alpns.iter().any(|alpn| alpn == mux::MUX_ALPN));
         assert!(alpns.iter().any(|alpn| alpn == BUILTIN_ECHO_ALPN));
         assert!(alpns.iter().any(|alpn| alpn == exec::EXEC_ALPN));
+    }
+
+    #[test]
+    fn endpoint_generations_increase_across_process_state() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = FabricHome::new(temp.path());
+
+        assert_eq!(next_endpoint_generation(&home, 0)?, 1);
+        assert_eq!(next_endpoint_generation(&home, 0)?, 2);
+        assert_eq!(next_endpoint_generation(&home, 20)?, 21);
+        assert_eq!(fs::read_to_string(home.endpoint_generation_path())?, "21\n");
+        Ok(())
     }
 
     #[test]
@@ -5373,28 +5353,104 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_absent_peer_does_not_recycle_while_others_are_healthy() -> Result<()> {
+    async fn peer_recovery_never_recycles_the_shared_endpoint() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let node = FabricNode::start(FabricHome::new(temp.path())).await?;
         let state = node.state();
+        let bluey = iroh::SecretKey::generate().public();
         let before = state.endpoint_handle().generation;
 
-        // Attempts exhausted, but another peer answered this round: the endpoint is
-        // demonstrably working, so the roaming peer must not take it down.
-        state
-            .recover_unreachable_peer("bluey", PEER_HEALTH_ATTEMPTS_BEFORE_RECYCLE, 1)
-            .await;
+        state.recover_unreachable_peer(bluey, "bluey", 3).await;
         assert_eq!(
             state.endpoint_handle().generation,
             before,
-            "a healthy peer elsewhere must protect the endpoint"
+            "one peer's absence must never replace the shared endpoint"
         );
 
-        // Below the escalation threshold with nobody else healthy: still no recycle.
-        state.recover_unreachable_peer("bluey", 1, 0).await;
+        state.recover_unreachable_peer(bluey, "bluey", 100).await;
         assert_eq!(state.endpoint_handle().generation, before);
 
         node.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_old_absence_and_one_fresh_miss_do_not_recycle_the_shared_endpoint() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let node = FabricNode::start(FabricHome::new(temp.path())).await?;
+        let state = node.state();
+        let bluey = iroh::SecretKey::generate().public();
+        let hetz = iroh::SecretKey::generate().public();
+        let mut tracker = PeerHealthTracker::new(3, Duration::ZERO, Duration::ZERO);
+        const OLD_RECYCLE_ATTEMPT: usize = 3;
+        let now = Instant::now();
+        let before = state.endpoint_handle().generation;
+
+        assert_eq!(tracker.on_probe(bluey, false, now), PeerHealthAction::None);
+        assert_eq!(tracker.on_probe(bluey, false, now), PeerHealthAction::None);
+        for expected_attempt in 1..OLD_RECYCLE_ATTEMPT {
+            let PeerHealthAction::Recover { attempt } = tracker.on_probe(bluey, false, now) else {
+                panic!("bluey did not request recovery attempt {expected_attempt}");
+            };
+            assert_eq!(attempt, expected_attempt);
+            state
+                .recover_unreachable_peer(bluey, "bluey", attempt)
+                .await;
+        }
+
+        assert_eq!(
+            tracker.on_probe(hetz, false, now),
+            PeerHealthAction::None,
+            "one missed hetz probe must stay below its own threshold"
+        );
+        let PeerHealthAction::Recover { attempt } = tracker.on_probe(bluey, false, now) else {
+            panic!("bluey did not retain its independent failure history");
+        };
+        assert_eq!(attempt, OLD_RECYCLE_ATTEMPT);
+        state
+            .recover_unreachable_peer(bluey, "bluey", attempt)
+            .await;
+
+        assert_eq!(
+            state.endpoint_handle().generation,
+            before,
+            "bluey's old absence replaced the shared endpoint after one hetz miss"
+        );
+
+        node.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_endpoint_replacement_reconverges_without_restarting_either_daemon() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (server, client, _server_home, _client_home) = probe_pair(temp.path()).await?;
+        let (lower, higher, lower_target, higher_target) = if server.id() < client.id() {
+            (&server, &client, "client", "server")
+        } else {
+            (&client, &server, "server", "client")
+        };
+
+        lower.ping(lower_target).await?;
+        let lower_generation = lower.state().endpoint_handle().generation;
+        let higher_generation = higher.state().endpoint_handle().generation;
+        let lower_id = lower.id();
+        let higher_id = higher.id();
+
+        higher
+            .state()
+            .force_endpoint_recycle("test endpoint replacement")
+            .await?;
+
+        higher.ping(higher_target).await?;
+        lower.ping(lower_target).await?;
+        assert_eq!(lower.id(), lower_id);
+        assert_eq!(higher.id(), higher_id);
+        assert_eq!(lower.state().endpoint_handle().generation, lower_generation);
+        assert!(higher.state().endpoint_handle().generation > higher_generation);
+
+        client.shutdown().await?;
+        server.shutdown().await?;
         Ok(())
     }
 
@@ -6246,11 +6302,9 @@ mod tests {
         Ok(())
     }
 
-    /// The recovery path that genuinely needs a teardown must keep doing it.
-    /// Not dropping tunnels on a noisy notice is only safe if a suspect endpoint
-    /// still gets an explicit close.
+    /// Peer recovery must not close a tunnel that belongs to another peer.
     #[tokio::test]
-    async fn endpoint_recovery_still_closes_tunnels_explicitly() -> Result<()> {
+    async fn peer_recovery_never_closes_other_tunnels() -> Result<()> {
         let home_dir = tempfile::tempdir()?;
         let home = FabricHome::new(home_dir.path());
         let node = FabricNode::start(home.clone()).await?;
@@ -6262,17 +6316,13 @@ mod tests {
         // test would fail for the wrong reason.
         let _tunnel = state.tunnel_drop_rx();
 
-        // A peer that stayed unreachable with no other peer answering: the
-        // endpoint itself is suspect, which is what escalation means.
+        let absent = iroh::SecretKey::generate().public();
         let drops_before = *state.tunnel_drop_tx.borrow();
         state
-            .recover_unreachable_peer("absent-peer", PEER_HEALTH_ATTEMPTS_BEFORE_RECYCLE, 0)
+            .recover_unreachable_peer(absent, "absent-peer", 100)
             .await;
         let drops_after = *state.tunnel_drop_tx.borrow();
-        assert!(
-            drops_after > drops_before,
-            "an escalated endpoint recovery must still close tunnels explicitly"
-        );
+        assert_eq!(drops_after, drops_before);
 
         node.shutdown().await?;
         Ok(())
@@ -6860,7 +6910,7 @@ mod tests {
             .await;
         // One peer away while the other answers: cheap recovery, no teardown.
         state
-            .recover_unreachable_peer("absent", PEER_HEALTH_ATTEMPTS_BEFORE_RECYCLE, 1)
+            .recover_unreachable_peer(iroh::SecretKey::generate().public(), "absent", 3)
             .await;
         // And a recycle attempt, which is what a failed health poll ends in.
         let outcome = state

@@ -4,8 +4,8 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-03 by Silber.fabric-codex. Main is `ebca516`.
-Silber and hetz run `0.2.0+ebca516`. Bluey will receive the mux hotfix next._
+_Last updated: 2026-09-03 by Silber.fabric-codex. Main is `8c64581`.
+Silber and hetz run `0.2.0+8c64581`. Bluey remains wire-compatible._
 
 ## Current incident — 2026-09-03
 
@@ -20,11 +20,29 @@ old canonical client handle and rejected every fresh connection as a duplicate.
 The bounded retry cannot clear a durable stale handle. A Silber daemon restart
 fully closed the old endpoint and restored control.
 
-The active hotfix quarantines mux in both directions. Production dials use the
+PR #128 quarantines mux in both directions. Production dials use the
 existing direct service ALPNs, and production endpoints do not advertise mux.
 This keeps all services, including Git, and removes the stale shared state.
-Focused tests still exercise the mux implementation for a later correct repair.
-Do not enable mux again without a matched-pair endpoint replacement test.
+It merged at `8c6458146ee50ef57f134ba47e747cbe5990482b`. Silber and
+hetz run the exact merge. Two-way exec passed after each service restart.
+
+The full repair is in flight on `fix/peer-isolation-generation`. The first red
+test preloads Bluey's old recovery state, misses one hetz probe, and observes a
+shared endpoint replacement. The isolated recovery fix now closes only the
+failed peer's cached connection. It never changes the shared endpoint or drops
+another peer's tunnel.
+
+The second red test holds the old canonical connection while a new endpoint
+generation dials. The old mux code refuses all eight replacement attempts. Mux
+version 2 exchanges durable endpoint generations before it registers a shared
+connection. A higher remote generation replaces stale canonical state. An old
+peer rejects the new mux ALPN, so the new peer uses the existing direct service
+ALPN until both builds support mux version 2.
+
+Both original red tests now pass. A full daemon test also replaces the higher
+NodeID endpoint and proves two-way ping reconverges without restarting either
+daemon. Finish the full suite, review the diff, then merge and deploy Silber
+before hetz. Tell Nathan the exact Bluey update command after the release exists.
 
 ## Current handoff — 2026-09-02
 
