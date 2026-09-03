@@ -111,14 +111,23 @@ intact. Do not create replacement copies.
 
 The private catalog now owns their version history under
 `docs/fabric/<host>/peers.toml` and `docs/fabric/<host>/syncs.toml`.
-Silber.catalog committed Silber's files at `7add563`. It is adding the two live
-hetz files from host-local reads. Silber.catalog is the only writer for that
-folder. Send it changed bytes, then review its commit before it pushes.
+Silber.catalog committed Silber's files at `7add563` and hetz's files at
+`e1ff3b1`. The two hetz blobs match the two live host files by SHA-256.
+Silber.catalog is the only writer for that folder. Send it changed bytes, then
+review its commit before it pushes.
 
 The tracked file is a snapshot, not a live configuration source. Nothing
 checks it against the host yet. Compare it with the live host file before using
 it as current state. Never add `~/.local/share/fabric/identity.toml`; it holds
 the machine's private identity key.
+
+The first cross-host review found both hetz sync entries select `mac`.
+Hetz's peer file defines only `air` and `silber`. Fabric resolves a selector
+only as an exact NodeID or local peer name. The live hetz daemon reports
+`mac:unknown`, zero reconcile time, and zero outbound wire bytes for both
+entries. Replication works because Silber starts a bidirectional reconcile.
+Hetz's outbound half is inert. Do not change the live selector without Nathan's
+decision; it changes live replication behavior.
 
 ## Current handoff — 2026-09-02
 
