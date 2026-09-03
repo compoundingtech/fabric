@@ -6,6 +6,15 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fabric restart` cannot replace a supervised daemon with an unmanaged
+  process.** If the selected default home has an installed launchd or systemd
+  service, the command refuses before it schedules a helper and names the
+  correct native restart command. An unsupervised daemon remains restartable.
+  Shell and exec policy comes back from `peers.toml`, and the restart test proves
+  both capabilities in both traffic directions.
+
 ## [0.2.1] - 2026-09-03
 
 ### Added

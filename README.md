@@ -437,8 +437,9 @@ connection.
      A detached helper stops the old daemon and starts a fresh one and survives
      the invoking shell disconnecting.
 
-   Do **not** use `fabric restart` under systemd or launchd supervision: a clean
-   exit can leave the supervised job stopped while an unmanaged daemon runs.
+   `fabric restart` refuses under systemd or launchd supervision: a clean exit
+   could otherwise leave the supervised job stopped while an unmanaged daemon
+   runs.
    And **never** run a naked `fabric down` then `fabric up` over a remote shell —
    if the shell drops in between, the daemon is down with no supervisor and you
    are locked out.
@@ -752,6 +753,11 @@ Schedule a lockout-safe daemon restart through a detached helper and return
 before the running daemon goes down. This is safe to run over `fabric shell`: the
 helper writes progress to `<home>/logs/restart.log`, stops the old daemon, and
 starts a fresh one even if the invoking shell connection drops.
+
+This command is only for an unsupervised daemon started by `fabric up`. It
+refuses when the selected default home has an installed launchd or systemd
+service, before it schedules the helper. The refusal names the native restart
+command so the service manager stays responsible for the replacement process.
 
 The `--allow-shell` and `--no-allow-shell` options remain accepted for
 compatibility. They do not change the policy in `peers.toml`.

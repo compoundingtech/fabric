@@ -324,6 +324,58 @@ pub fn service_enablement() -> ServiceEnablement {
     }
 }
 
+/// Refuse the standalone restart helper when the native service owns this home.
+///
+/// The helper starts an unmanaged daemon. If it stops a launchd- or
+/// systemd-owned daemon first, the service manager can remain loaded while no
+/// longer supervising the replacement. A crash then stays down. Only an absent
+/// native service proves that the standalone helper is the right owner.
+pub fn ensure_unsupervised_restart(home: &FabricHome) -> Result<()> {
+    if !home.is_default_state_root() {
+        return Ok(());
+    }
+    restart_ownership_decision(
+        service_enablement(),
+        &native_service_restart_command()?,
+    )
+}
+
+fn restart_ownership_decision(
+    enablement: ServiceEnablement,
+    native_restart_command: &str,
+) -> Result<()> {
+    if enablement == ServiceEnablement::NotInstalled {
+        return Ok(());
+    }
+
+    let ownership = match enablement {
+        ServiceEnablement::Enabled => "enabled",
+        ServiceEnablement::PresentNotEnabled => "installed",
+        ServiceEnablement::Unknown => "present but not readable",
+        ServiceEnablement::NotInstalled => unreachable!(),
+    };
+    bail!(
+        "refusing `fabric restart`: the native Fabric service is {ownership} for the selected home.\n\
+         Restart it with `{native_restart_command}` so the service manager keeps ownership.\n\
+         `fabric restart` is only for an unsupervised daemon started by `fabric up`."
+    )
+}
+
+fn native_service_restart_command() -> Result<String> {
+    #[cfg(target_os = "linux")]
+    {
+        return Ok(format!("systemctl --user restart {SERVICE_NAME}"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return Ok(format!("launchctl kickstart -k {}", launchd_service_target()));
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        bail!("fabric service is currently supported on Linux systemd-user and macOS launchd");
+    }
+}
+
 /// Interpret `systemctl --user is-enabled fabric.service`.
 ///
 /// `present` is whether the unit file exists, `ran` whether the query executed,
@@ -954,6 +1006,54 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn an_absent_native_service_permits_the_standalone_restart() {
+        restart_ownership_decision(
+            ServiceEnablement::NotInstalled,
+            "systemctl --user restart fabric.service",
+        )
+        .expect("an absent service must leave the unsupervised restart usable");
+    }
+
+    #[test]
+    fn every_possible_native_owner_refuses_the_standalone_restart() {
+        let command = "systemctl --user restart fabric.service";
+        for enablement in [
+            ServiceEnablement::Enabled,
+            ServiceEnablement::PresentNotEnabled,
+            ServiceEnablement::Unknown,
+        ] {
+            let error = restart_ownership_decision(enablement, command)
+                .expect_err("a possible native owner must stop the standalone helper");
+            let message = format!("{error:#}");
+            assert!(message.contains("refusing `fabric restart`"), "{message}");
+            assert!(message.contains(command), "{message}");
+            assert!(message.contains("service manager keeps ownership"), "{message}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_refusal_names_the_exact_launchd_restart() {
+        let command = native_service_restart_command().unwrap();
+        assert_eq!(
+            command,
+            format!(
+                "launchctl kickstart -k gui/{}/com.compoundingtech.fabric",
+                unsafe { libc::geteuid() }
+            )
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_linux_refusal_names_the_exact_systemd_restart() {
+        assert_eq!(
+            native_service_restart_command().unwrap(),
+            "systemctl --user restart fabric.service"
+        );
+    }
 
     /// The unit must name the binary it was GIVEN, not the one rendering it.
     ///
