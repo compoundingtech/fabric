@@ -541,14 +541,15 @@ async fn shell_sigterm_restores_exact_terminal_mode() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn restart_from_remote_shell_detaches_and_preserves_allow_shell() -> Result<()> {
+async fn unsupervised_restart_preserves_shell_and_exec_in_both_directions() -> Result<()> {
     let node_a_dir = TempDir::new()?;
     let node_b_dir = TempDir::new()?;
     let node_a_home = FabricHome::new(node_a_dir.path());
     let node_b_home = FabricHome::new(node_b_dir.path());
     let _node_a_guard = CliDaemonGuard::new(node_a_home.clone());
 
-    set_machine_services(&node_a_home, true, false)?;
+    set_machine_services(&node_a_home, true, true)?;
+    set_machine_services(&node_b_home, true, true)?;
     let output = fabric_output(&node_a_home, &["up", "--allow-shell"])?;
     assert_success(&output, "fabric up --allow-shell");
     wait_for_cli_status(&node_a_home, true).await?;
@@ -562,15 +563,16 @@ async fn restart_from_remote_shell_detaches_and_preserves_allow_shell() -> Resul
         "node-b",
         serde_json::to_string(&node_b.addr())?,
     )?;
-    trust_peer(
+    trust_peer_allowing(
         &node_b_home,
         &node_b,
         node_a_id,
         Some("node-a"),
         Some(node_a_addr),
+        &["shell", "exec", "echo"],
     )
     .await?;
-    wait_for_cli_status(&node_b_home, false).await?;
+    wait_for_cli_status(&node_b_home, true).await?;
 
     let before = run_shell(
         &node_b_home,
@@ -603,14 +605,19 @@ async fn restart_from_remote_shell_detaches_and_preserves_allow_shell() -> Resul
         status.contains("shell\tallowed"),
         "status did not preserve allow_shell: {status}"
     );
+    assert!(
+        status.contains("exec\tallowed"),
+        "status did not preserve allow_exec: {status}"
+    );
 
     let restarted_addr = cli_addr(&node_a_home)?;
-    trust_peer(
+    trust_peer_allowing(
         &node_b_home,
         &node_b,
         node_a_id,
         Some("node-a"),
         Some(restarted_addr),
+        &["shell", "exec", "echo"],
     )
     .await?;
     let node_b_status = fabric_stdout(&node_b_home, &["status"])?;
@@ -630,6 +637,44 @@ async fn restart_from_remote_shell_detaches_and_preserves_allow_shell() -> Resul
         "stdout was: {}",
         String::from_utf8_lossy(&after.stdout)
     );
+
+    let exec_b_to_a = fabric_output(
+        &node_b_home,
+        &[
+            "exec",
+            "node-a",
+            "--",
+            "/usr/bin/printf",
+            "exec-b-to-a",
+        ],
+    )?;
+    assert_success(&exec_b_to_a, "post-restart exec from B to A");
+    assert_eq!(exec_b_to_a.stdout, b"exec-b-to-a");
+
+    let shell_a_to_b = run_shell(
+        &node_a_home,
+        "node-b",
+        "printf 'shell-a-to-b\\n'; exit 0\n",
+    )?;
+    assert_success(&shell_a_to_b, "post-restart shell from A to B");
+    assert!(
+        String::from_utf8_lossy(&shell_a_to_b.stdout).contains("shell-a-to-b"),
+        "stdout was: {}",
+        String::from_utf8_lossy(&shell_a_to_b.stdout)
+    );
+
+    let exec_a_to_b = fabric_output(
+        &node_a_home,
+        &[
+            "exec",
+            "node-b",
+            "--",
+            "/usr/bin/printf",
+            "exec-a-to-b",
+        ],
+    )?;
+    assert_success(&exec_a_to_b, "post-restart exec from A to B");
+    assert_eq!(exec_a_to_b.stdout, b"exec-a-to-b");
 
     let restart_log = fs::read_to_string(node_a_home.restart_log_path())?;
     assert!(
@@ -844,12 +889,23 @@ async fn trust_peer(
     name: Option<&str>,
     addr: Option<iroh::EndpointAddr>,
 ) -> Result<()> {
+    trust_peer_allowing(home, node, id, name, addr, &["shell"]).await
+}
+
+async fn trust_peer_allowing(
+    home: &FabricHome,
+    node: &FabricNode,
+    id: iroh::EndpointId,
+    name: Option<&str>,
+    addr: Option<iroh::EndpointAddr>,
+    allow: &[&str],
+) -> Result<()> {
     let mut peers = PeerBook::load(home)?;
     peers.add_with_allow(
         id,
         name.map(str::to_string),
         addr,
-        Some(vec!["shell".to_string()]),
+        Some(allow.iter().map(|service| (*service).to_string()).collect()),
     );
     peers.save(home)?;
     node.state().reload_peers().await?;
@@ -922,7 +978,7 @@ fn cli_add_peer(
         .arg("--addr-json")
         .arg(addr_json)
         .arg("--allow")
-        .arg("shell")
+        .arg("shell,exec,echo")
         .output()
         .context("failed to run fabric add")?;
     assert_success(&output, "fabric add");

@@ -1446,6 +1446,9 @@ impl DaemonState {
     }
 
     fn schedule_restart(&self, _requested_allow_shell: Option<bool>) -> Result<RestartPlan> {
+        // Check before opening the log or spawning either helper. A native
+        // service must remain the process owner for the whole restart.
+        crate::service::ensure_unsupervised_restart(&self.home)?;
         let allow_shell = self.allow_shell.load(Ordering::SeqCst);
         self.home.prepare()?;
         let log_path = self.home.restart_log_path();
