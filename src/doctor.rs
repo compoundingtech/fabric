@@ -356,17 +356,31 @@ fn version_findings(facts: &Facts) -> Vec<Finding> {
                 .version_error
                 .clone()
                 .unwrap_or_else(|| "it did not answer".to_string());
-            let mut finding = Finding::new(
-                "versions",
-                Verdict::Unknown,
+            let verdict = if peer.roaming {
+                Verdict::Ok
+            } else {
+                Verdict::Unknown
+            };
+            let detail = if peer.roaming {
+                format!(
+                    "{} build is unknown, roaming: {reason}. A peer on an older build makes \
+                     the whole fleet send whole manifests, and nothing else reports that",
+                    peer.label
+                )
+            } else {
                 format!(
                     "could not ask {} which build it is on: {reason}. A peer on an \
                      older build makes the whole fleet send whole manifests, and \
                      nothing else reports that",
                     peer.label
-                ),
+                )
+            };
+            let mut finding = Finding::new(
+                "versions",
+                verdict,
+                detail,
             );
-            if reason.contains("exec is disabled") {
+            if !peer.roaming && reason.contains("exec is disabled") {
                 finding = finding.with_action(format!(
                     "on {}, set allow_exec = true in peers.toml, then run: fabric reload-peers",
                     peer.label
@@ -1152,6 +1166,22 @@ mod tests {
                 .is_some_and(|a| a.contains("allow_exec = true") && !a.contains("--allow-exec")),
             "it did not say what to change"
         );
+    }
+
+    #[test]
+    fn an_unknown_roaming_peer_version_is_visible_without_failing_doctor() {
+        let mut facts = configured();
+        facts.peers[0].roaming = true;
+        facts.peers[0].version = None;
+        facts.peers[0].version_error = Some("the command failed".to_string());
+
+        let findings = diagnose(&facts);
+        let versions = find(&findings, "versions");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].verdict, Verdict::Ok);
+        assert!(versions[0].detail.contains("unknown, roaming"));
+        assert!(versions[0].detail.contains("whole manifests"));
+        assert_eq!(exit_code(&findings), 0);
     }
 
     /// "one peer could not be asked" does not say one of how many.
