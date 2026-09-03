@@ -110,9 +110,10 @@ it `bluey`; hetz names it `air`. Both old daemons reloaded the file, but build
 12:15Z, so no real away or return transition has been observed.
 
 PR #135 adds strict cross-file validation for explicit sync selectors. It
-rejects an unknown selector during `sync add`, daemon start, sync reload, and
-peer reload. A rejected reload keeps the last valid in-memory configuration.
-The live hetz migration is complete, so its deployment precondition is met.
+rejects an unknown selector during `sync add`, sync reload, and peer reload.
+At daemon start, it keeps the transport up, warns once, and stops only the bad
+entry. A rejected reload keeps the last valid in-memory configuration. The live
+hetz migration is complete, so its deployment precondition is met.
 
 Do not merge your own pull requests without the required pull-request approval.
 Do not create peer-file backup copies. Put non-secret configuration history in

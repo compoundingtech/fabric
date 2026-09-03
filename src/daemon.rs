@@ -866,7 +866,14 @@ impl DaemonState {
         let (tunnel_session_limits, tunnel_session_detached_ttl) =
             resolve_server_session_settings(&config, options)?;
         let peer_book = PeerBook::load(&home)?;
-        SyncBook::load(&home)?.validate_against(&peer_book)?;
+        let sync_book = SyncBook::load(&home)?;
+        for (sync, selectors) in sync_book.unknown_explicit_selectors(&peer_book) {
+            warn!(
+                %sync,
+                ?selectors,
+                "sync entry has unknown peer selectors and will stay stopped"
+            );
+        }
         // The command-line flags remain accepted while existing launchd and
         // systemd definitions still pass them. Machine policy lives only in
         // peers.toml, so the flags cannot open or close either service.
@@ -4950,23 +4957,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_start_rejects_an_unknown_explicit_sync_selector() -> Result<()> {
+    async fn daemon_start_keeps_transport_up_and_stops_an_unknown_sync_entry() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let home = FabricHome::new(dir.path());
         write_test_sync(&home, dir.path().join("catalog"), "mac")?;
 
-        let error = match FabricNode::start(home).await {
-            Ok(node) => {
-                node.shutdown().await?;
-                panic!("the daemon accepted an unknown explicit sync selector");
-            }
-            Err(error) => error,
-        };
-        assert!(
-            format!("{error:#}").contains("sync \"catalog\" names unknown peer selector \"mac\""),
-            "unexpected error: {error:#}"
+        let syncs = SyncBook::load(&home)?;
+        let warnings = syncs.unknown_explicit_selectors(&PeerBook::load(&home)?);
+        assert_eq!(warnings, vec![("catalog", vec!["mac"])]);
+
+        let node = FabricNode::start(home).await?;
+        let engine = node.state().sync_engine().unwrap();
+        engine.sync_once("catalog").await?;
+        let status = engine.status().await;
+        assert_eq!(
+            status[0].stopped_peers,
+            vec![("mac".to_string(), "unknown".to_string())]
         );
-        Ok(())
+        node.shutdown().await
     }
 
     #[tokio::test]

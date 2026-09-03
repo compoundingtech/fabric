@@ -258,22 +258,40 @@ impl SyncBook {
     /// selector must match one peer by its local name or exact NodeID.
     pub fn validate_against(&self, peers: &PeerBook) -> Result<()> {
         self.validate()?;
-        for entry in &self.entries {
-            for selector in entry.peers.selectors() {
-                let known = peers.peers().iter().any(|peer| {
-                    peer.name.as_deref() == Some(selector.as_str())
-                        || peer.id.to_string() == *selector
-                });
-                if !known {
-                    bail!(
-                        "sync {:?} names unknown peer selector {:?}",
-                        entry.name,
-                        selector
-                    );
-                }
-            }
+        if let Some((entry, selectors)) = self.unknown_explicit_selectors(peers).first() {
+            bail!(
+                "sync {:?} names unknown peer selector {:?}",
+                entry,
+                selectors[0]
+            );
         }
         Ok(())
+    }
+
+    /// Group unknown explicit selectors by sync entry for one startup warning.
+    pub fn unknown_explicit_selectors<'a>(
+        &'a self,
+        peers: &PeerBook,
+    ) -> Vec<(&'a str, Vec<&'a str>)> {
+        self.entries
+            .iter()
+            .filter_map(|entry| {
+                let unknown = entry
+                    .peers
+                    .selectors()
+                    .iter()
+                    .filter(|selector| {
+                        let selector = selector.as_str();
+                        !peers.peers().iter().any(|peer| {
+                            peer.name.as_deref() == Some(selector)
+                                || peer.id.to_string() == selector
+                        })
+                    })
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                (!unknown.is_empty()).then_some((entry.name.as_str(), unknown))
+            })
+            .collect()
     }
 }
 
