@@ -8,6 +8,18 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **A complete sync scan no longer stores an extra copy of every file path only
+  to prove absence.** A complete walk proves that an unscanned path is absent.
+  The scan now retains auxiliary path evidence only for directories and paths
+  it could not inspect completely. Unreadable and unsupported paths remain
+  unknown, so the lower allocation cost does not weaken delete safety.
+
+- **The Linux daemon returns allocator-retained pages without recycling its
+  endpoint.** Each new 128 MiB RSS growth step calls `malloc_trim(0)` on glibc.
+  The trim does not free live allocations or interrupt sessions. Fabric reports
+  the first routine success, then writes a 30-minute summary. Failed or
+  unavailable trims and missing follow-up samples still report immediately.
+
 - **A stalled inbound sync session cannot hold an entry guard forever.** The
   daemon ends an incomplete inbound wire session after 30 seconds without I/O
   progress. A progressing transfer can run longer. Timeout releases the scan

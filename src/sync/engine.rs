@@ -2157,12 +2157,21 @@ enum ScanPathState {
 /// component is absent. An unreadable directory, file, or unsupported object
 /// is present but unknown. This distinction lets the walk continue without
 /// turning a skipped path into a deletion.
+///
+/// A complete walk needs no retained copy of every name it saw. Any path that
+/// is not a scanned file and has no opaque ancestor is absent. Only directories,
+/// excluded files that block a tracked descendant, and paths that block
+/// complete evidence stay in the auxiliary sets.
 #[derive(Default)]
 struct FolderScan {
     files: Vec<ScannedFile>,
     present_paths: HashSet<String>,
-    seen_paths: HashSet<String>,
-    complete_dirs: HashSet<String>,
+    /// Directories, retained only because a directory can replace a tracked
+    /// file without proving that the tracked file was deleted.
+    non_file_paths: HashSet<String>,
+    /// Excluded regular files that can replace an included tracked directory.
+    blocking_file_paths: HashSet<String>,
+    /// Paths whose contents or type the walk could not inspect completely.
     opaque_paths: HashSet<String>,
     issues: BTreeMap<String, ScanIssue>,
 }
@@ -2175,6 +2184,11 @@ impl FolderScan {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.files.len()
+    }
+
+    #[cfg(test)]
+    fn absence_evidence_path_copies(&self) -> usize {
+        self.non_file_paths.len() + self.blocking_file_paths.len() + self.opaque_paths.len()
     }
 
     fn record_issue(&mut self, path: String, issue: ScanIssue) {
@@ -2191,31 +2205,26 @@ impl FolderScan {
         if self.present_paths.contains(path) {
             return ScanPathState::Present;
         }
+        if path_ancestor_in_set(path, &self.present_paths).is_some() {
+            // A regular file blocks a tracked descendant. Treat that
+            // unsupported replacement as unknown, not as a delete.
+            return ScanPathState::Unknown;
+        }
         if path_ancestor_in_set(path, &self.opaque_paths).is_some() {
             return ScanPathState::Unknown;
         }
-
-        let mut parent = String::new();
-        for component in path.split('/') {
-            if !self.complete_dirs.contains(&parent) {
-                return ScanPathState::Unknown;
-            }
-            let child = if parent.is_empty() {
-                component.to_string()
-            } else {
-                format!("{parent}/{component}")
-            };
-            if !self.seen_paths.contains(&child) {
-                return ScanPathState::AffirmativelyGone;
-            }
-            parent = child;
+        if path_ancestor_in_set(path, &self.blocking_file_paths).is_some() {
+            return ScanPathState::Unknown;
         }
-        // The name exists, but it is not a readable regular file.
-        ScanPathState::Unknown
+        if self.non_file_paths.contains(path) {
+            return ScanPathState::Unknown;
+        }
+        ScanPathState::AffirmativelyGone
     }
 
     fn has_presence_evidence(&self, path: &str) -> bool {
-        self.seen_paths.contains(path)
+        self.non_file_paths.contains(path)
+            || self.blocking_file_paths.contains(path)
             || path_ancestor_in_set(path, &self.opaque_paths).is_some_and(|path| !path.is_empty())
     }
 }
@@ -2411,7 +2420,6 @@ fn scan_folder_with_limit(
                 complete = false;
                 continue;
             };
-            scan.seen_paths.insert(norm.clone());
             let file_type = match child.file_type() {
                 Ok(file_type) => file_type,
                 Err(_) => {
@@ -2435,6 +2443,7 @@ fn scan_folder_with_limit(
                 continue; // never follow symlinks out of the folder
             }
             if file_type.is_dir() {
+                scan.non_file_paths.insert(norm.clone());
                 stack.push((path, norm));
                 continue;
             }
@@ -2446,6 +2455,7 @@ fn scan_folder_with_limit(
                 continue;
             }
             if !entry.includes(&norm) {
+                scan.blocking_file_paths.insert(norm);
                 continue;
             }
             // One stat per file, not two. `DirEntry::metadata` is a fresh
@@ -2504,9 +2514,7 @@ fn scan_folder_with_limit(
                 executable,
             });
         }
-        if complete {
-            scan.complete_dirs.insert(dir_rel);
-        } else {
+        if !complete {
             scan.record_issue(dir_rel, ScanIssue::Unreadable);
         }
     }
@@ -2747,7 +2755,7 @@ fn scan_into_node_observed_with_limit(
                     issues
                         .entry(opaque.to_string())
                         .or_insert(ScanIssue::Unsupported);
-                } else if scanned.seen_paths.contains(path) {
+                } else if scanned.non_file_paths.contains(path) {
                     issues
                         .entry(path.clone())
                         .or_insert(ScanIssue::Unsupported);
@@ -4656,8 +4664,6 @@ mod tests {
     #[test]
     fn an_incomplete_parent_makes_absence_unknown() {
         let scan = FolderScan {
-            complete_dirs: HashSet::from([String::new()]),
-            seen_paths: HashSet::from(["locked".to_string()]),
             opaque_paths: HashSet::from(["locked".to_string()]),
             ..FolderScan::default()
         };
@@ -4670,6 +4676,24 @@ mod tests {
             scan.state("locked/kept.txt"),
             ScanPathState::Unknown
         ));
+    }
+
+    #[test]
+    fn a_complete_scan_keeps_no_per_path_copy_only_to_prove_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for index in 0..100 {
+            std::fs::write(root.join(format!("file-{index}.txt")), b"x").unwrap();
+        }
+
+        let entry = entry_with_policy("bus", root, SyncPolicy::Bus);
+        let scan = scan_folder(root, &entry, &HashMap::new()).unwrap();
+
+        assert_eq!(
+            scan.absence_evidence_path_copies(),
+            0,
+            "a complete tree needs no retained path evidence beyond its scanned files"
+        );
     }
 
     #[test]
@@ -4799,6 +4823,46 @@ mod tests {
             issues.get("path").map(ScanIssue::token),
             Some("unsupported")
         );
+    }
+
+    #[test]
+    fn a_file_replacing_a_tracked_directory_does_not_delete_its_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut entry = entry_with_policy("bus", root, SyncPolicy::Bus);
+        entry.include = Some(vec!["path/**".to_string()]);
+        let rules = entry.policy.rules();
+        let child = "path/child.txt";
+        let child_hash = content_hash(b"child");
+        std::fs::create_dir(root.join("path")).unwrap();
+        std::fs::write(root.join(child), b"child").unwrap();
+
+        let mut node = SyncNode::new(Author([1; 32]));
+        assert!(node.local_write(child, b"child", 0, 0));
+        let mut observed = HashMap::from([(child.to_string(), child_hash)]);
+        let mut cache = HashMap::new();
+        let mut issues = BTreeMap::new();
+
+        std::fs::remove_file(root.join(child)).unwrap();
+        std::fs::remove_dir(root.join("path")).unwrap();
+        std::fs::write(root.join("path"), b"replacement").unwrap();
+        scan_into_node_observed_with_limit(
+            &mut node,
+            root,
+            &entry,
+            rules,
+            &mut observed,
+            &mut cache,
+            &mut issues,
+            MAX_BLOB as u64,
+        )
+        .unwrap();
+
+        assert!(
+            node.manifest().get(child).unwrap().is_present(),
+            "an unsupported ancestor replacement became a descendant delete"
+        );
+        assert_eq!(observed.get(child), Some(&child_hash));
     }
 
     #[test]
