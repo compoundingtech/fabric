@@ -5,7 +5,7 @@ current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
 _Last updated: 2026-09-04 by Silber.fabric-codex. Main's last code commit is
-deployed as `0.2.1+40d7aa6` on Silber and hetz._
+deployed as `0.2.1+71f3d06` on Silber and hetz._
 
 ## Current release — 2026-09-04
 
@@ -239,16 +239,73 @@ baseline fell by 11,622,488 bytes, or 44.9 percent. One changing call requested
 The rollout rollback binaries both reported `0.2.1+7bde48c`. The exact files
 were `/Users/myobie/.local/bin/fabric.rollback-1788537663` and
 `/home/myobie/.local/bin/fabric.rollback-1788537618`. Both paths and all exact
-release, preflight, and transfer paths are absent after verification. The local
-files remain recoverable in Trash.
+release, preflight, and transfer paths are absent after verification. The exact
+Trash cleanup directory was permanently deleted and is also absent.
 
-The next work is the pass-frequency question. Each host initiates one outbound
-pass about every 8.3 seconds. Each outbound pass causes two full scans. This is
-about 867 scans and 37.7 GB of requested allocation per hour before inbound
-work. Determine why the periodic reconciliation needs two full walks and
-whether an unchanged tree can stop after a cheap proof. Also test whether hetz
-guarded inbound work tracks changes originating on Silber. This explains only
-the measured guarded-work difference unless another measurement proves more.
+PR #150 made Linux atomic rename events eligible for daemon-write
+acknowledgement. A batch must pair a vanished `.fabric-tmp` path with its final
+path. The final path must then match the committed daemon fingerprint. Missing
+journal entries, unpaired renames, external atomic replacements, changed files,
+removed files, and dropped event generations all fail open to a normal scan.
+
+The modeled atomic-write contract failed at the acknowledgement assertion
+before the fix and passed after it. A Linux-only test exercised the real kernel
+watcher shape. An external atomic replacement with identical bytes remained
+dirty because its inode and change time differed.
+
+PR #150 merged as `71f3d06`. Pull-request test run `33894394190` and Nix run
+`33894394182` passed. Exact-main test run `33895554477` and Nix run
+`33895554472` passed. The local library suite passed 451 active tests, with
+three measurements ignored. The serial folder-sync suite passed 18 tests.
+
+Release `v0.2.1+71f3d06` passed all four jobs in run `33896872205`. The archive
+SHA-256 values are `88ca6ff57ee021ce6171249a5c8ee15322ef4d36ca5bd2999b3bf17a6d9d6852`
+for Apple arm64, `7541f83370bba3432411a33805483d89d7867a5e28a6dc98dd736587a5a98ab9`
+for Linux arm64, and `7dc4464a4519c99b7797a8df95a6f9f73e7983c2a92915d41dc96057da1dfff5`
+for Linux x86_64. Each archive matched its sidecar and contained only
+`fabric`. The Apple and Linux x86_64 binaries reported `0.2.1+71f3d06` before
+deployment.
+
+The rollout updated hetz first and Silber second. Mixed-version and final
+two-way ping and exec passed through direct paths. Doctor passed on both hosts.
+Two-way send-file hashes matched. The Silber-to-hetz hash was
+`d2c450b11ec2c0c87034569606e3d463e42b92f1cc01aa451fcf862be3bd362c`.
+The hetz-to-Silber hash was
+`c8f30d8d3113eacff05bd8ce2aabe0217edec1223761eed9c069be17fc33ad8d`.
+
+Both sync entries matched across hosts with clean drift and no scan issue,
+stopped peer, away peer, reconcile failure, or delta fallback. The bus digest
+prefix was `8414a8fb9fbe`. The declarations digest prefix was `3bc75951920a`.
+
+The predeployment 30-second hetz window fully attributed 12 scans. Two guarded
+inbound transactions took four required scans. Their two required forward
+passes took four scans. Their two redundant self-watcher passes took four scans.
+Every atomic final-write burst was under a Silber path. This proves that hetz
+does more guarded work because it receives more changes from Silber.
+
+The recorded prediction was 12 scans falling to 8 in a comparable window. The
+first postdeployment window had one guarded inbound transaction, two passes,
+and six scans. Four scans were predicted. The redundant pass remained, so the
+prediction failed. A second window had no guarded inbound transaction and
+attributed its two passes and four scans to real local hetz st2 writes.
+
+The remaining cause is now named. `complete_inbound` commits the daemon-write
+fingerprint. `note_inbound_adoption` then increments the same mutation
+generation to preserve forward work. The self-write acknowledgement requires
+the current generation to equal the watcher batch's last generation, so the
+intentional forward generation invalidates the exact receipt. Separate forward
+bookkeeping from watcher mutation generations. Preserve the periodic forward
+backstop and fail open on every missing or mismatched receipt.
+
+Immediately before the rollout, the old daemons had about 49 minutes of uptime.
+Silber used 280,032 kB RSS and had 76 guarded inbound transactions. Hetz used
+474,664 kB and had 127 guarded inbound transactions.
+
+The rollout rollback binaries both reported `0.2.1+40d7aa6`. The exact files
+were `/Users/myobie/.local/bin/fabric.rollback-1788540671` and
+`/home/myobie/.local/bin/fabric.rollback-1788540631`. Both paths and all exact
+release, preflight, and transfer paths were permanently deleted after
+verification and are absent.
 
 The rollout created two rollback binaries from `0.2.1+9d1c138`. They were
 `/Users/myobie/.local/bin/fabric.rollback-1788525446` and
