@@ -397,6 +397,43 @@ and 18 on hetz, or 23.4 percent. Hetz avoided four more scans because it
 received two more guarded transactions. This matches the predicted host
 direction, while the short RSS series shows no durable slope on either host.
 
+Allocator return-address probes then attributed the remaining rate. The probes
+covered malloc, calloc, realloc, and posix_memalign on the live hetz PID. A
+matched high 10-second window requested 406,458,691 bytes. In that window, the
+bus entry added two sync passes, four scans, and one inbound no-op transaction.
+It added no guarded transaction. The declarations entry did not move.
+
+Direct sync-tree callers requested at least 197,568,968 bytes, or 48.61 percent
+of that high window. Manifest `BTreeMap` subtree clones requested 52,970,256
+bytes. Scan-cache table reserves requested 51,118,192 bytes. Content-hash map
+clones requested 37,355,680 bytes. `opendir` and `Path::_join` requested
+56,124,840 bytes. Generic `String::clone` and `RawVec` callers account for much
+of the remainder, but the immediate caller cannot assign those bytes safely.
+
+A separate 30-second window requested 465,510,520 bytes and showed the same
+shape. Its 60 reported callers named 88.75 percent of all requested bytes.
+Conservative sync-tree names accounted for approximately 54 percent. This
+longer result confirms that the high-window result is not one callsite sample.
+
+The matched low 10-second window requested 6,918,599 bytes. The bus entry added
+no sync pass, two scans, and one guarded transaction. `netdev::recv_multi`
+requested 4,194,304 bytes, chiefly for the measurement connection. No manifest,
+scan-cache, or folder-walk caller reached the 31,360-byte top-20 cutoff. The
+high window requested 58.75 times more bytes than the low window.
+
+No QUIC or mux caller reached the 190,752-byte top-20 cutoff in the high window.
+Named QUIC, noq, and rustls callers were small in the low window. The transport
+is visible, but it does not create the large bursts. Whole-tree sync work does.
+
+The earlier 75.20 MB full-pass estimate covered the measured scan and
+materialize phase boundaries. It did not cover all engine baseline and final
+map clones or all wire work. The engine clones complete manifest and observed
+maps before and after guarded work and normal passes. The wire path can also
+clone or serialize a manifest payload. The direct-caller trace proves that the
+missing allocation is sync bookkeeping, but it does not yet split generic
+`String` and `RawVec` allocation among those parent operations. Do not reduce a
+new candidate until a red measurement isolates one of these operations.
+
 The rollout rollback binaries both reported `0.2.1+71f3d06`. Both exact
 rollback files and all release, instrumentation, preflight, and transfer files
 were permanently deleted after verification and are absent.
