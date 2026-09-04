@@ -21,11 +21,18 @@
 //! Content is framed as raw length-prefixed bytes — never JSON-encoded — so file
 //! payloads do not pay base64/array bloat.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    io,
+    pin::Pin,
+    sync::Arc,
+    task::{Context as TaskContext, Poll},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::Mutex;
 
 use super::manifest::{ContentHash, Manifest};
@@ -593,26 +600,157 @@ where
     ))
 }
 
-/// Run an inbound wire session with a hard deadline. The resolver context stays
-/// alive for the session, so timeout also releases its entry operation guard.
-pub(crate) async fn run_server_with_deadline<S, F, Fut, C>(
+struct IdleTimeoutStream<S> {
+    inner: S,
+    peer: String,
+    idle_timeout: Duration,
+    read_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    write_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<S> IdleTimeoutStream<S> {
+    fn new(inner: S, peer: &str, idle_timeout: Duration) -> Self {
+        Self {
+            inner,
+            peer: peer.to_string(),
+            idle_timeout,
+            read_deadline: None,
+            write_deadline: None,
+        }
+    }
+
+    fn timeout_error(&self) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "inbound sync session deadline elapsed for peer {}: no I/O progress for {} ms",
+                self.peer,
+                self.idle_timeout.as_millis()
+            ),
+        )
+    }
+}
+
+fn deadline_elapsed(
+    deadline: &mut Option<Pin<Box<tokio::time::Sleep>>>,
+    idle_timeout: Duration,
+    cx: &mut TaskContext<'_>,
+) -> bool {
+    deadline
+        .get_or_insert_with(|| Box::pin(tokio::time::sleep(idle_timeout)))
+        .as_mut()
+        .poll(cx)
+        .is_ready()
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for IdleTimeoutStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let filled_before = buf.filled().len();
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Ready(result) => {
+                if buf.filled().len() > filled_before {
+                    this.read_deadline = None;
+                }
+                Poll::Ready(result)
+            }
+            Poll::Pending => {
+                if deadline_elapsed(&mut this.read_deadline, this.idle_timeout, cx) {
+                    this.read_deadline = None;
+                    Poll::Ready(Err(this.timeout_error()))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for IdleTimeoutStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_write(cx, buf) {
+            Poll::Ready(result) => {
+                if matches!(&result, Ok(written) if *written > 0) {
+                    this.write_deadline = None;
+                }
+                Poll::Ready(result)
+            }
+            Poll::Pending => {
+                if deadline_elapsed(&mut this.write_deadline, this.idle_timeout, cx) {
+                    this.write_deadline = None;
+                    Poll::Ready(Err(this.timeout_error()))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_flush(cx) {
+            Poll::Ready(result) => {
+                this.write_deadline = None;
+                Poll::Ready(result)
+            }
+            Poll::Pending => {
+                if deadline_elapsed(&mut this.write_deadline, this.idle_timeout, cx) {
+                    this.write_deadline = None;
+                    Poll::Ready(Err(this.timeout_error()))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_shutdown(cx) {
+            Poll::Ready(result) => {
+                this.write_deadline = None;
+                Poll::Ready(result)
+            }
+            Poll::Pending => {
+                if deadline_elapsed(&mut this.write_deadline, this.idle_timeout, cx) {
+                    this.write_deadline = None;
+                    Poll::Ready(Err(this.timeout_error()))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+}
+
+/// Run an inbound wire session with an I/O progress deadline. The resolver
+/// context stays alive for the session, so timeout releases its operation guard.
+pub(crate) async fn run_server_with_idle_timeout<S, F, Fut, C>(
     stream: S,
     peer: &str,
     resolve: F,
-    deadline: Duration,
+    idle_timeout: Duration,
 ) -> Result<(String, Reconciled, C)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     F: FnOnce(HelloInfo) -> Fut,
     Fut: std::future::Future<Output = Result<Option<(Arc<Mutex<SyncNode>>, C)>>>,
 {
-    match tokio::time::timeout(deadline, run_server(stream, peer, resolve)).await {
-        Ok(result) => result,
-        Err(_) => bail!(
-            "inbound sync session deadline of {} ms elapsed",
-            deadline.as_millis()
-        ),
-    }
+    run_server(
+        IdleTimeoutStream::new(stream, peer, idle_timeout),
+        peer,
+        resolve,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -631,7 +769,7 @@ mod tests {
         let (guarded_tx, guarded_rx) = tokio::sync::oneshot::channel();
         let (mut client_end, server_end) = tokio::io::duplex(1 << 20);
         let mut server = tokio::spawn(async move {
-            run_server_with_deadline(
+            run_server_with_idle_timeout(
                 server_end,
                 "peer-a",
                 move |_| async move {
@@ -675,9 +813,59 @@ mod tests {
             format!("{error:#}").contains("inbound sync session deadline"),
             "the timeout error did not name the deadline: {error:#}"
         );
+        assert!(
+            format!("{error:#}").contains("peer-a"),
+            "the timeout error did not name the peer: {error:#}"
+        );
         let _guard = tokio::time::timeout(Duration::from_millis(100), guard_lock.lock())
             .await
             .expect("the inbound deadline did not release the resolver guard");
+    }
+
+    #[tokio::test]
+    async fn a_progressing_inbound_session_can_outlive_the_idle_deadline() {
+        let node = Arc::new(Mutex::new(SyncNode::new(author(1))));
+        let (guarded_tx, guarded_rx) = tokio::sync::oneshot::channel();
+        let (mut client_end, server_end) = tokio::io::duplex(1 << 20);
+        let server = tokio::spawn(async move {
+            run_server_with_idle_timeout(
+                server_end,
+                "slow-peer",
+                move |_| async move {
+                    let _ = guarded_tx.send(());
+                    Ok(Some((node, ())))
+                },
+                Duration::from_millis(200),
+            )
+            .await
+        });
+
+        let hello = HelloHeader {
+            name: "catalog".to_string(),
+            manifest: Manifest::new(),
+            wanted: Vec::new(),
+            digest: String::new(),
+            is_delta: false,
+        };
+        write_len_bytes(&mut client_end, &serde_json::to_vec(&hello).unwrap())
+            .await
+            .unwrap();
+        client_end.flush().await.unwrap();
+        guarded_rx.await.unwrap();
+
+        // The push count takes 320 ms to arrive, but every byte arrives within
+        // the 200 ms idle bound. Progress must keep the session alive.
+        for byte in 0u32.to_be_bytes() {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            client_end.write_all(&[byte]).await.unwrap();
+            client_end.flush().await.unwrap();
+        }
+
+        let _ = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("the progressing inbound session did not finish")
+            .expect("the inbound server task panicked")
+            .expect("the progressing inbound session exceeded its idle deadline");
     }
 
     #[tokio::test]
