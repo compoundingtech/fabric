@@ -2988,17 +2988,26 @@ async fn run_endpoint_rss_observe_loop_with_sampler(
                         rss_after_trim_bytes = rss_after_trim_bytes.unwrap_or(0),
                         "daemon RSS crossed a new growth step"
                     );
-                    if allocator_trim.attempted {
-                        eprintln!(
-                            "fabric: memory in use {} MiB (new growth step, endpoint generation {generation}); allocator trim left {} MiB",
-                            bytes_to_mib(rss_bytes),
-                            rss_after_trim_bytes.map(bytes_to_mib).unwrap_or(0),
-                        );
-                    } else {
-                        eprintln!(
-                            "fabric: memory in use {} MiB (new growth step, endpoint generation {generation}); allocator trim is unavailable",
-                            bytes_to_mib(rss_bytes),
-                        );
+                    match (allocator_trim.attempted, rss_after_trim_bytes) {
+                        (true, Some(rss_after_trim_bytes)) => {
+                            eprintln!(
+                                "fabric: memory in use {} MiB (new growth step, endpoint generation {generation}); allocator trim left {} MiB",
+                                bytes_to_mib(rss_bytes),
+                                bytes_to_mib(rss_after_trim_bytes),
+                            )
+                        }
+                        (true, None) => {
+                            eprintln!(
+                                "fabric: memory in use {} MiB (new growth step, endpoint generation {generation}); allocator trim completed, follow-up RSS unavailable",
+                                bytes_to_mib(rss_bytes),
+                            )
+                        }
+                        (false, _) => {
+                            eprintln!(
+                                "fabric: memory in use {} MiB (new growth step, endpoint generation {generation}); allocator trim is unavailable",
+                                bytes_to_mib(rss_bytes),
+                            )
+                        }
                     }
                 }
             }
