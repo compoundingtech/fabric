@@ -4,8 +4,63 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-04 by Silber.fabric-codex. Main's last code commit is
-deployed as `0.2.1+48208e4` on Silber and hetz._
+_Last updated: 2026-09-04 by Silber.fabric-codex. Main is ahead of the deployed
+`0.2.1+48208e4` build. Do not cut or deploy a release without Silber.cos._
+
+## Current main — 2026-09-04
+
+PR #153 grouped the sync disk state and merged as `7733e4b`. It is not released
+or deployed. The fleet remains on `0.2.1+48208e4`.
+
+One clean `sync_once` now publishes two full disk snapshots. It clones no
+manifest. The former pass built 13 full tree containers. One `DiskState` now
+owns disk evidence, observed receipts, cache facts, and scan issues.
+
+The review proofs cover every code-derived absence state, a real edit after the
+final scan, and every private manifest mutation API. The crash test killed eight
+child processes after the durable snapshot commit and recovered exact state.
+The durable JSON schema and the wire format are unchanged.
+
+All local targets passed in one serial run. GitHub Nix, macOS, and deterministic
+jobs passed. Five release-mode lock windows used 29,337 paths. The former
+clone-and-compare lock took 1,109 to 1,982 microseconds. The new capture lock
+took 587 to 1,319 microseconds. Serialization took 33,916 to 34,986 microseconds
+outside the node lock.
+
+Nathan reported periodic two-to-three-second freezes in two Bluey-to-hetz
+Fabric shells. Bluey, Silber, and hetz all run `0.2.1+48208e4`. No rollback
+occurred.
+
+A 60-second continuous Silber-to-hetz exec stream had three gaps above 300
+milliseconds. Each gap aligned with sync work. The gaps were 303, 334, and 342
+milliseconds. Three sync status reads blocked for 455 to 505 milliseconds.
+
+Direct hetz probes measured scan calls at 77 to 100 milliseconds. They measured
+materialization calls at 91 to 109 milliseconds. A later sync sequence produced
+five stream gaps from 238 to 370 milliseconds across 1.62 seconds.
+
+The shell task reads its PTY on the blocking pool. The async task then writes the
+QUIC stream. It does not read a sync entry or wait for a sync-entry lock. The
+deployed sync scanner and materializer run synchronous file work directly on
+Tokio workers. Bluey's external wake probe stayed on time. Thus Fabric runtime
+or transport scheduling couples pipe delivery to sync work.
+
+One later async-closure uprobe was too broad and added heavy trace load. Discard
+the live window from approximately epoch 1788554523 through 1788554553. The
+probe ended, no bpftrace process remains, and the daemon PID did not change.
+
+Nathan's requirement is that every Fabric pipe stays isolated from other work
+and has priority. Silber.cos requested three remaining measurements: the sync
+entry count on hetz and Bluey, the Tokio worker count on both, and whether entry
+tickers start together. Do not propose staggering. It spreads blocking and does
+not isolate a pipe.
+
+The next design decision compares two options. The smaller option stages sync
+work on the blocking pool with short commit locks. The stronger option also
+puts pipe delivery and its endpoint driver on a dedicated runtime. The stronger
+option adds threads, cross-runtime channels, shutdown work, and endpoint
+ownership rules. It protects the scheduler boundary, but not shared allocation,
+kernel scheduling, or network saturation.
 
 ## Current release — 2026-09-04
 
