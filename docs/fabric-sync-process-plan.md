@@ -23,8 +23,19 @@ The daemon resolves that name, applies the `sync` permission, and either opens a
 stream or returns a structured refusal.
 
 `syncs.toml` stays beside `peers.toml` in the existing config directory. The
-plan adds no config root and no `fabric-sync.toml`. The files stay separate
-because `fabric add` rewrites `peers.toml`.
+plan adds no config root and no `fabric-sync.toml`. The files stay separate so
+the config-format migration and the process migration remain independent.
+
+Format-preserving `peers.toml` upserts remove the data-loss reason against a
+literal one-file config. They do not make that move part of this extraction.
+Combining the file move with the process move would mix two migrations and make
+each rollback depend on the other.
+
+If Nathan later selects one literal file, do it in a separate change after the
+upsert work lands. The daemon must parse the complete file and send validated
+sync entries through IPC. `fabric-sync` must still not parse peer policy. Until
+then, two sibling files provide one Fabric-owned config authority without a
+second companion config surface.
 
 ## The permanent latency test
 
