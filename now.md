@@ -50,10 +50,25 @@ the live window from approximately epoch 1788554523 through 1788554553. The
 probe ended, no bpftrace process remains, and the daemon PID did not change.
 
 Nathan's requirement is that every Fabric pipe stays isolated from other work
-and has priority. Silber.cos requested three remaining measurements: the sync
-entry count on hetz and Bluey, the Tokio worker count on both, and whether entry
-tickers start together. Do not propose staggering. It spreads blocking and does
-not isolate a pipe.
+and has priority. The aligned-ticker hypothesis is false on hetz. Hetz has two
+sync entries and 16 core Tokio workers. A clean 30-second tick does not scan.
+The engine scans on dirty work or after the five-minute safety limit. During the
+live window, the bus entry added 76 passes and 240 scans. The declaration entry
+added only three passes and six scans. Bus traffic drives the scan frequency.
+
+The durable path-latency window has no known start. The bucketed Silber-to-Bluey
+direct path has p50 50 ms, p90 200 ms, and p99 1,000 ms. It has 158 of 26,491
+samples above one second, or 0.60 percent. The relay path has p50 200 ms, p90
+500 ms, and p99 2,000 ms. It has 96 of 7,845 samples above one second, or 1.22
+percent.
+
+The Silber-to-hetz direct path has p50 50 ms, p90 100 ms, and p99 500 ms. It has
+73 of 127,753 samples above one second, or 0.057 percent. The relay path has no
+sample above one second. These are not Bluey-to-hetz path measurements.
+
+The `droppy` status row is retained telemetry for a removed peer. Its 10,885
+reconnect attempts did not change during a 30-second window. The latest droppy
+validation event is from 2026-09-02T09:37:30Z. No current churn was measured.
 
 The next design decision compares two options. The smaller option stages sync
 work on the blocking pool with short commit locks. The stronger option also
