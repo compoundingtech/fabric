@@ -124,6 +124,7 @@ where
         // FABRIC_PEER is the connecting peer's NodeID — who ran this command.
         .env("FABRIC_EXEC", "1")
         .env("FABRIC_PEER", peer)
+        .kill_on_drop(true)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -144,12 +145,19 @@ where
     let mut stderr = child.stderr.take().context("child stderr missing")?;
     let mut out_buf = [0u8; 8192];
     let mut err_buf = [0u8; 8192];
+    let mut client_buf = [0u8; 1];
     let mut out_done = false;
     let mut err_done = false;
 
     // Drain both pipes concurrently so a chatty stderr can't deadlock stdout.
+    // Keep reading the client side after argv so a quiet child cannot hide a
+    // disconnected caller.
     while !out_done || !err_done {
         tokio::select! {
+            result = recv.read(&mut client_buf) => match result? {
+                0 => return Ok(()),
+                _ => bail!("unexpected exec client data after argv"),
+            },
             result = stdout.read(&mut out_buf), if !out_done => match result? {
                 0 => out_done = true,
                 n => write_server_frame(send, ServerFrame::Stdout(out_buf[..n].to_vec())).await?,
@@ -161,7 +169,13 @@ where
         }
     }
 
-    let status = child.wait().await.context("exec wait failed")?;
+    let status = tokio::select! {
+        result = child.wait() => result.context("exec wait failed")?,
+        result = recv.read(&mut client_buf) => match result? {
+            0 => return Ok(()),
+            _ => bail!("unexpected exec client data after argv"),
+        },
+    };
     // `code()` is None when the child was killed by a signal; report 1 there.
     write_server_frame(send, ServerFrame::Exit(status.code().unwrap_or(1))).await
 }
@@ -270,6 +284,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, time::Duration};
+    use tempfile::TempDir;
 
     // argv round-trips through the NUL-separated wire encoding, including args
     // that contain spaces and newlines (only NUL is disallowed).
@@ -303,11 +319,13 @@ mod tests {
             "-c".to_string(),
             "printf out; printf err 1>&2; exit 7".to_string(),
         ];
-        let mut client_to_server = Vec::new();
-        write_client_argv(&mut client_to_server, &argv).await.unwrap();
+        let (mut client_to_server, mut server_recv) = tokio::io::duplex(4096);
+        write_client_argv(&mut client_to_server, &argv)
+            .await
+            .unwrap();
 
         let mut server_to_client = Vec::new();
-        serve_exec_session(&mut client_to_server.as_slice(), &mut server_to_client, "test-peer")
+        serve_exec_session(&mut server_recv, &mut server_to_client, "test-peer")
             .await
             .unwrap();
 
@@ -340,11 +358,13 @@ mod tests {
             "-c".to_string(),
             "printf '%s:%s' \"$FABRIC_EXEC\" \"$FABRIC_PEER\"".to_string(),
         ];
-        let mut client_to_server = Vec::new();
-        write_client_argv(&mut client_to_server, &argv).await.unwrap();
+        let (mut client_to_server, mut server_recv) = tokio::io::duplex(4096);
+        write_client_argv(&mut client_to_server, &argv)
+            .await
+            .unwrap();
 
         let mut server_to_client = Vec::new();
-        serve_exec_session(&mut client_to_server.as_slice(), &mut server_to_client, "peer-abc123")
+        serve_exec_session(&mut server_recv, &mut server_to_client, "peer-abc123")
             .await
             .unwrap();
 
@@ -388,6 +408,60 @@ mod tests {
         }
         assert!(saw_error, "expected an error frame for a missing binary");
         assert_eq!(exit, Some(EXIT_SPAWN_FAILED));
+    }
+
+    #[tokio::test]
+    async fn serve_exec_session_reaps_a_quiet_child_after_client_disconnect() {
+        let dir = TempDir::new().unwrap();
+        let pid_file = dir.path().join("child.pid");
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf '%s' \"$$\" > \"$1\"; exec /bin/sleep 60".to_string(),
+            "fabric-test".to_string(),
+            pid_file.display().to_string(),
+        ];
+        let (mut client_send, mut server_recv) = tokio::io::duplex(4096);
+        let (mut server_send, _client_recv) = tokio::io::duplex(4096);
+        let mut server = tokio::spawn(async move {
+            serve_exec_session(&mut server_recv, &mut server_send, "test-peer").await
+        });
+
+        write_client_argv(&mut client_send, &argv).await.unwrap();
+        let pid = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(contents) = fs::read_to_string(&pid_file) {
+                    break contents.parse::<i32>().unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the quiet exec child did not write its pid");
+
+        drop(client_send);
+        let server_result = tokio::time::timeout(Duration::from_secs(1), &mut server).await;
+        let server_stopped = server_result.is_ok();
+        let child_stopped = tokio::time::timeout(Duration::from_secs(1), async {
+            while unsafe { libc::kill(pid, 0) == 0 } {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+
+        if !child_stopped {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        if !server_stopped {
+            server.abort();
+        }
+        assert!(server_stopped, "the exec session ignored client EOF");
+        assert!(child_stopped, "the disconnected exec child stayed alive");
+        server_result
+            .unwrap()
+            .expect("the exec server task panicked")
+            .expect("the exec server rejected client EOF");
     }
 
     #[tokio::test]
