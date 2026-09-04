@@ -1321,9 +1321,9 @@ impl<T: SyncTransport> SyncEngine<T> {
         self.materialize_entry_state(&entry, &baseline).await?;
         EntryWork::add_phase(&entry.work.materialize_micros, phase);
         self.sweep_entry_tombstones(&entry, &peers).await;
-        let final_manifest = entry.node.lock().await.manifest().clone();
-        let final_observed = entry.observed.lock().unwrap().clone();
-        if final_manifest != manifest || final_observed != baseline {
+        let manifest_changed = entry.node.lock().await.manifest() != &manifest;
+        let observed_changed = *entry.observed.lock().unwrap() != baseline;
+        if manifest_changed || observed_changed {
             let phase = Instant::now();
             self.persist_entry(&entry).await?;
             EntryWork::add_phase(&entry.work.persist_micros, phase);
@@ -6006,6 +6006,36 @@ mod tests {
             entry.work.persist_calls.load(Ordering::Relaxed),
             0,
             "a pass that changed nothing must not rewrite state"
+        );
+    }
+
+    /// A clean pass must carry one manifest across the unlocked peer step.
+    /// It must compare the final manifest by reference instead of cloning it.
+    #[tokio::test]
+    async fn a_clean_sync_pass_does_not_clone_its_final_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.md"), b"seed").unwrap();
+        write_bus_sync(dir.path(), &root);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+
+        Manifest::start_clone_measurement();
+        engine.sync_once("bus").await.unwrap();
+        let clones = Manifest::finish_clone_measurement();
+
+        assert_eq!(
+            clones, 1,
+            "a clean pass needs one baseline clone and no final comparison clone"
         );
     }
 

@@ -8,6 +8,11 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **A sync pass no longer clones the complete final manifest and observed map
+  only to compare them with its baseline.** The pass keeps the required
+  baseline across the unlocked peer step and compares the final state by
+  reference.
+
 - **Forwarding a peer's change no longer invalidates the watcher receipt for
   the same bytes.** Forward work now has a generation separate from disk
   mutations. A successful pass settles only the forward work it observed at
