@@ -25,6 +25,9 @@
 
 use std::collections::{BTreeMap, btree_map};
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use serde::{Deserialize, Serialize};
 
 /// A content identity — the BLAKE3 hash of a file's bytes. Two files with the
@@ -190,14 +193,43 @@ impl Entry {
 ///
 /// Paths are normalized to forward-slash relative strings (see
 /// [`Manifest::normalize_path`]); this is a portable key across macOS and Linux.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     entries: BTreeMap<String, Entry>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MEASURED_CLONES: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+impl Clone for Manifest {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        MEASURED_CLONES.with(|count| {
+            if let Some(current) = count.get() {
+                count.set(Some(current + 1));
+            }
+        });
+        Self {
+            entries: self.entries.clone(),
+        }
+    }
 }
 
 impl Manifest {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_clone_measurement() {
+        MEASURED_CLONES.with(|count| count.set(Some(0)));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finish_clone_measurement() -> usize {
+        MEASURED_CLONES.with(|count| count.replace(None).unwrap())
     }
 
     /// Normalize an arbitrary relative path into the canonical manifest key:
