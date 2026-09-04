@@ -2,7 +2,7 @@
 
 Date: 2026-09-04
 
-Status: proposed for Nathan's review. Do not implement the extraction until he approves this plan.
+Status: approved for implementation on 2026-09-04.
 
 ## Decisions
 
@@ -97,8 +97,13 @@ security boundary.
 The throughput cost is not measured because the bridge does not exist. Before
 activation, the same two-host workload measures both paths over a 10-minute
 window. It reports content bytes, wire bytes, wall time, daemon CPU,
-`fabric-sync` CPU, and peak resident memory. The report gives the delta and does
-not hide it behind a pass/fail label.
+`fabric-sync` CPU, and peak resident memory. The report gives every delta.
+
+The bridge path must deliver at least 90 percent of the embedded path's content
+throughput during that fixed window. This threshold is set before measurement.
+If the bridge loses more than 10 percent, work stops before activation. The
+transport decision then returns to Nathan through Silber.cos. CPU and memory
+remain reported costs, but this plan does not set their limits.
 
 ## Ownership
 
@@ -322,19 +327,27 @@ binary pair restores the embedded owner and reads the unchanged state.
 
 ### 8. Remove the dormant embedded engine
 
-After every supported machine has passed the mixed window and rollback period,
-remove the embedded startup and daemon-only sync transport implementation. Keep
-the shared wire server, config validation, bridge, status aggregation, and
-unavailable reply in `fabric`.
+After every non-roaming supported machine has passed the mixed window and
+rollback period, remove the embedded startup and daemon-only sync transport
+implementation. Keep the shared wire server, config validation, bridge, status
+aggregation, and unavailable reply in `fabric`.
+
+A roaming peer qualifies when either of two proofs passes. It can pass the live
+mixed window when it returns. It can also pass the automated two-direction
+mixed test against its exact deployed build. An absent roaming peer does not
+block this cleanup. If it stays behind indefinitely, it keeps embedded sync and
+uses the compatible `fabric/sync/1` wire path. Status continues to name its old
+build, and the machine updates when it returns. Step 8 does not remove that wire
+compatibility.
 
 Run the permanent latency test unchanged one final time. This removal is a code
 cleanup only. Reverting it does not change the active process architecture.
 
 ## Activation gates
 
-Nathan approves this plan before implementation starts. Silber.cos approves
-each pull request under the normal rule. Silber.cos also owns every release and
-deployment gate.
+Each implementation pull request merges when its required tests and CI pass.
+Silber.cos owns the step 7 activation gate and every release and deployment
+gate.
 
 The process-boundary release needs all of these results:
 
@@ -343,7 +356,9 @@ The process-boundary release needs all of these results:
 - A stopped, absent, and incompatible companion leaves the daemon healthy and
   appears in status and doctor.
 - A crash in each durable phase recovers without dual state ownership.
-- The 10-minute throughput report states the measured cost.
+- The bridge keeps at least 90 percent of embedded content throughput during the
+  fixed 10-minute comparison. A larger loss stops activation and reopens the
+  transport decision with Nathan.
 - The release archive and updater verify a matched binary pair.
 
 This plan changes where sync executes. It does not claim that the connection
