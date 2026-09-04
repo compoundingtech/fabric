@@ -1214,6 +1214,10 @@ human-editable and can be provisioned before Fabric ever runs. The top-level
 `allow_shell` and `allow_exec` fields control the services this machine offers.
 Each field defaults to false. Each `[[peers]]` entry accepts:
 
+Fabric commands update this file in place. They preserve comments, spacing,
+entry order, and changes to the generated header. Fabric writes the default
+header only when it creates a new file.
+
 - `id` (required): the peer's 64-character hexadecimal iroh NodeID.
 - `name` (optional): a non-empty, unique local alias for commands such as
   `fabric ping workstation`.

@@ -8,6 +8,10 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **Fabric commands no longer replace the formatting in `peers.toml`.** Add,
+  remove, policy, and Git remote changes update only the affected entries.
+  User comments, spacing, order, and an edited or removed file header remain.
+
 - **A failed tunnel no longer reuses one bad shared connection forever.**
   Fabric counts post-admission attach failures on the exact current connection.
   Three consecutive failures replace it. Only sustained application progress
