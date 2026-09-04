@@ -8,6 +8,10 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **A disconnected `fabric exec` caller cannot leave its remote child alive.**
+  The server now detects client EOF while the child runs or waits. It kills the
+  child when the session ends, even when the child produces no output.
+
 - **`fabric restart` cannot replace a supervised daemon with an unmanaged
   process.** If the selected default home has an installed launchd or systemd
   service, the command refuses before it schedules a helper and names the
