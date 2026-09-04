@@ -76,6 +76,10 @@ trim took 19.7 milliseconds, with a 10-to-35-millisecond range.
 Pre-trim RSS ranged from 284.0 MiB to 627.5 MiB. Post-trim RSS ranged from
 153.0 MiB to 247.6 MiB.
 
+The daemon allocated and freed at least 25.89 GiB during the 60.9-minute
+window. The trim manages the retained-memory symptom. The allocation rate is
+measured, but its necessity is not diagnosed.
+
 The deployment produced the predicted sawtooth instead of the old smooth rise.
 It also produced 115 warning records during 60.9 minutes. The trim calls used
 approximately 0.062 percent of the wall-clock window. The warning
