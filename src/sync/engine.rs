@@ -1,7 +1,7 @@
 //! The async sync engine: real folders on disk, kept converged with peers.
 //!
-//! The engine is the daemon-managed layer that turns the pure [`SyncNode`] and
-//! the on-wire backend into a live feature. Per configured entry it:
+//! The engine is the process-neutral layer that turns the pure [`SyncNode`] and
+//! a transport backend into a live feature. Per configured entry it:
 //! - **scans** the folder into the node (each file → `local_write`, missing files
 //!   → `local_remove` under policy),
 //! - **materializes** the node's manifest back to disk (writes present content,
@@ -9,11 +9,11 @@
 //! - **watches** the folder and re-syncs on change (near-instant, not a poll),
 //! - **reconciles** with each target peer over a swappable [`SyncTransport`].
 //!
-//! The transport is the seam that makes the backend swappable: the daemon plugs
-//! in an iroh transport (over the `fabric/sync` ALPN); the tests plug in an
+//! The transport is the seam that makes the host swappable. The daemon uses an
+//! iroh transport over the `fabric/sync` ALPN. Tests use an
 //! in-process loopback transport and exercise the whole engine against real
 //! temp folders with no network. Manifests are persisted per entry so logical
-//! versions stay monotonic across daemon restarts.
+//! versions stay monotonic across process restarts.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -29,18 +29,21 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use crate::daemon::VALIDATION_LOG_TARGET;
-use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize, ser::SerializeMap};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
 use crate::config::FabricHome;
 
 use super::config::{PolicyRules, SyncBook, SyncEntry, SyncPeers};
 use super::manifest::{Author, ContentHash, Entry, FileMeta, Manifest};
 use super::node::{Reconciled, SweepEvidence, SyncNode, content_hash};
+use super::paths::{SyncOwnerLease, SyncPaths};
 use super::wire::MAX_BLOB;
+
+/// Validation events emitted by the sync runtime in either host process.
+pub const SYNC_LOG_TARGET: &str = "fabric::sync";
 
 /// How long to wait after a filesystem event settles before syncing, so a burst
 /// of writes coalesces into one reconcile.
@@ -57,8 +60,8 @@ const PERIODIC_RESYNC: Duration = Duration::from_secs(30);
 const MISSED_EVENT_RESYNC: Duration = Duration::from_secs(5 * 60);
 /// Watcher notifications can arrive after the materialization that caused
 /// them. Remember only a bounded number of exact post-write identities so a
-/// delayed daemon-owned event can be acknowledged without another tree scan.
-const MAX_DAEMON_WRITE_FINGERPRINTS: usize = 4_096;
+/// delayed engine-owned event can be acknowledged without another tree scan.
+const MAX_ENGINE_WRITE_FINGERPRINTS: usize = 4_096;
 
 #[cfg(debug_assertions)]
 const DEBUG_WALK_HOLD_FILE: &str = ".fabric-test-walk-hold-ms";
@@ -116,7 +119,7 @@ impl FileFingerprint {
 }
 
 #[derive(Debug)]
-struct DaemonWriteFingerprint {
+struct EngineWriteFingerprint {
     fingerprint: FileFingerprint,
     generation: u64,
     sequence: u64,
@@ -124,19 +127,19 @@ struct DaemonWriteFingerprint {
 }
 
 #[derive(Debug, Default)]
-struct DaemonWriteJournal {
+struct EngineWriteJournal {
     next_sequence: u64,
-    entries: HashMap<PathBuf, DaemonWriteFingerprint>,
+    entries: HashMap<PathBuf, EngineWriteFingerprint>,
     order: VecDeque<(PathBuf, u64)>,
 }
 
-impl DaemonWriteJournal {
+impl EngineWriteJournal {
     fn record(&mut self, path: PathBuf, fingerprint: FileFingerprint, generation: u64) {
         self.next_sequence = self.next_sequence.wrapping_add(1);
         let sequence = self.next_sequence;
         self.entries.insert(
             path.clone(),
-            DaemonWriteFingerprint {
+            EngineWriteFingerprint {
                 fingerprint,
                 generation,
                 sequence,
@@ -144,7 +147,7 @@ impl DaemonWriteJournal {
             },
         );
         self.order.push_back((path, sequence));
-        while self.order.len() > MAX_DAEMON_WRITE_FINGERPRINTS {
+        while self.order.len() > MAX_ENGINE_WRITE_FINGERPRINTS {
             let Some((path, sequence)) = self.order.pop_front() else {
                 break;
             };
@@ -192,17 +195,20 @@ impl DaemonWriteJournal {
     }
 }
 
-/// A dialable peer for a reconcile: a display id and, for the iroh transport, its
-/// address. The loopback transport routes by `id` alone.
+/// A peer selected for a reconcile.
+///
+/// `key` is transport-owned and opaque to the engine. `id` is the display name
+/// used in status, logs, and sync cursors. No address or peer policy crosses
+/// this process-neutral boundary.
 #[derive(Debug, Clone)]
 pub struct PeerRef {
+    pub key: String,
     pub id: String,
-    pub addr: Option<EndpointAddr>,
     pub roaming: bool,
 }
 
-/// The swappable transport that carries a client-side reconcile to a peer. The
-/// daemon implements this over iroh; tests implement it in-process.
+/// The swappable transport that carries a client-side reconcile to a peer.
+/// A host process can implement it without giving the engine host state.
 /// What an entry's peer selector resolves to right now, INCLUDING what it did
 /// not resolve to.
 ///
@@ -258,7 +264,7 @@ struct EntryWork {
     /// The 30-second tick is a floor, not a delivery time. A change crossing a
     /// three-node line would take a tick per hop, and a longer line multiplies
     /// that. Nothing else wakes this loop on the inbound path: the watcher is
-    /// the only other source and the daemon deliberately suppresses the event
+    /// the only other source and the engine deliberately suppresses the event
     /// for its own materialization.
     forward: tokio::sync::Notify,
     /// Inbound adoptions that still need an outbound pass to every other peer.
@@ -270,9 +276,9 @@ struct EntryWork {
     mutation_generation: AtomicU64,
     durable_generation: AtomicU64,
     inbound_waiters: AtomicUsize,
-    daemon_writes: StdMutex<DaemonWriteJournal>,
+    engine_writes: StdMutex<EngineWriteJournal>,
     /// Monotonic while this name remains continuously configured in the same
-    /// daemon. Exposed through `fabric sync ls` so production can prove whether
+    /// engine. Exposed through `fabric sync ls` so production can prove whether
     /// an inbound transaction walked the tree.
     ///
     /// This counts EVERY `scan_entry` call, from all three of its callers, not
@@ -389,7 +395,7 @@ impl EntryWork {
             mutation_generation: AtomicU64::new(1),
             durable_generation: AtomicU64::new(0),
             inbound_waiters: AtomicUsize::new(0),
-            daemon_writes: StdMutex::new(DaemonWriteJournal::default()),
+            engine_writes: StdMutex::new(EngineWriteJournal::default()),
             full_scans: AtomicU64::new(0),
             inbound_noop_transactions: AtomicU64::new(0),
             inbound_guarded_transactions: AtomicU64::new(0),
@@ -443,35 +449,35 @@ impl EntryWork {
         !self.is_clean() || self.has_pending_forward()
     }
 
-    fn record_daemon_write(&self, path: &Path, hash: ContentHash, generation: u64) {
+    fn record_engine_write(&self, path: &Path, hash: ContentHash, generation: u64) {
         let Ok(fingerprint) = FileFingerprint::after_write(path, hash) else {
             return;
         };
-        self.daemon_writes
+        self.engine_writes
             .lock()
             .unwrap()
             .record(path.to_path_buf(), fingerprint, generation);
     }
 
-    fn commit_daemon_writes(&self) {
-        self.daemon_writes.lock().unwrap().commit_all();
+    fn commit_engine_writes(&self) {
+        self.engine_writes.lock().unwrap().commit_all();
     }
 
-    fn acknowledge_daemon_write_batch(&self, batch: &WatchEventBatch) -> bool {
-        if !batch.daemon_write_candidate
+    fn acknowledge_engine_write_batch(&self, batch: &WatchEventBatch) -> bool {
+        if !batch.engine_write_candidate
             || !batch.contiguous
             || batch.paths.is_empty()
             || self.mutation_generation.load(Ordering::Acquire) != batch.last_generation
         {
-            self.daemon_writes
+            self.engine_writes
                 .lock()
                 .unwrap()
                 .forget_paths(&batch.paths);
             return false;
         }
 
-        let Some(paths) = batch.daemon_write_paths() else {
-            self.daemon_writes
+        let Some(paths) = batch.engine_write_paths() else {
+            self.engine_writes
                 .lock()
                 .unwrap()
                 .forget_paths(&batch.paths);
@@ -480,7 +486,7 @@ impl EntryWork {
         let mut current = Vec::with_capacity(paths.len());
         for path in &paths {
             let Ok(fingerprint) = FileFingerprint::read(path) else {
-                self.daemon_writes
+                self.engine_writes
                     .lock()
                     .unwrap()
                     .forget_paths(&batch.paths);
@@ -489,13 +495,13 @@ impl EntryWork {
             current.push((path.clone(), fingerprint));
         }
         let matches = self
-            .daemon_writes
+            .engine_writes
             .lock()
             .unwrap()
             .consume_batch(&current, batch.first_generation);
         if matches {
             // The callback already advanced the mutation generation before
-            // queuing this batch. Exact daemon-owned bytes are already durable,
+            // queuing this batch. Exact engine-owned bytes are already durable,
             // so acknowledge only the generations represented by this batch.
             self.mark_generation_durable(batch.last_generation);
         }
@@ -785,7 +791,8 @@ impl<T: SyncTransport> std::fmt::Debug for SyncEngine<T> {
 
 /// The engine: owns every entry's node and drives scan/materialize/reconcile.
 pub struct SyncEngine<T: SyncTransport> {
-    home: FabricHome,
+    paths: SyncPaths,
+    _owner: SyncOwnerLease,
     author: Author,
     transport: Arc<T>,
     entries: RwLock<HashMap<String, Arc<EntryState>>>,
@@ -799,13 +806,19 @@ impl<T: SyncTransport> SyncEngine<T> {
     /// Build an engine from the current `syncs.toml`, loading any persisted
     /// manifests. Does not start watching; call [`SyncEngine::run`] for that.
     pub async fn new(
-        home: FabricHome,
+        paths: impl Into<SyncPaths>,
         author: Author,
         transport: Arc<T>,
         cancel: CancellationToken,
     ) -> Result<Arc<Self>> {
+        let paths = paths.into();
+        // Acquire ownership before config can lead us to durable state. A
+        // second process must fail before either engine starts a watcher or
+        // reads a manifest that the other process can mutate.
+        let owner = SyncOwnerLease::acquire(&paths)?;
         let engine = Arc::new(Self {
-            home,
+            paths,
+            _owner: owner,
             author,
             transport,
             entries: RwLock::new(HashMap::new()),
@@ -819,7 +832,7 @@ impl<T: SyncTransport> SyncEngine<T> {
     /// (Re)load entries from `syncs.toml`, keeping existing nodes for entries
     /// that are unchanged and dropping entries no longer configured.
     pub async fn load_from_config(&self) -> Result<()> {
-        let book = SyncBook::load(&self.home)?;
+        let book = SyncBook::load_path(self.paths.config_path())?;
         self.load_book(book).await
     }
 
@@ -1271,7 +1284,7 @@ impl<T: SyncTransport> SyncEngine<T> {
             match (previous_state, observed_state) {
                 (Some(PeerSyncState::Away), PeerSyncState::Away) => {}
                 (_, PeerSyncState::Away) => tracing::info!(
-                    target: VALIDATION_LOG_TARGET,
+                    target: SYNC_LOG_TARGET,
                     event = "sync_peer_away",
                     sync = name,
                     peer = peer.id,
@@ -1279,7 +1292,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                     "roaming sync peer is away"
                 ),
                 (Some(PeerSyncState::Away), PeerSyncState::Ok) => tracing::info!(
-                    target: VALIDATION_LOG_TARGET,
+                    target: SYNC_LOG_TARGET,
                     event = "sync_peer_returned",
                     sync = name,
                     peer = peer.id,
@@ -1287,7 +1300,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                     "roaming sync peer returned"
                 ),
                 _ => tracing::info!(
-                    target: VALIDATION_LOG_TARGET,
+                    target: SYNC_LOG_TARGET,
                     event = "reconcile_peer",
                     sync = name,
                     peer = peer.id,
@@ -1703,7 +1716,7 @@ impl<T: SyncTransport> SyncEngine<T> {
             // how it is dropped from the log and never written again.
             node.changes_mut().mark_durable(head);
             disk.mark_durable();
-            entry.work.commit_daemon_writes();
+            entry.work.commit_engine_writes();
             return Ok(());
         }
         anyhow::bail!("sync state changed during three persistence attempts")
@@ -1779,7 +1792,7 @@ impl<T: SyncTransport> SyncEngine<T> {
     /// `complete_inbound` ends by marking the disk generation durable, which is
     /// true and is the wrong answer to a different question. Durable means
     /// "written down". It does not mean "everybody has been told". Forward
-    /// debt therefore has its own generation. The daemon can suppress the
+    /// debt therefore has its own generation. The engine can suppress the
     /// watcher event for its own materialization without erasing that debt or
     /// making its exact write receipt look stale.
     ///
@@ -1828,9 +1841,8 @@ impl<T: SyncTransport> SyncEngine<T> {
     /// A missing snapshot forces one: an append log with nothing under it
     /// recovers nothing.
     fn log_path(&self, name: &str) -> PathBuf {
-        self.home
-            .root()
-            .join("sync")
+        self.paths
+            .state_root()
             .join(sanitize_name(name))
             .join("log.jsonl")
     }
@@ -1903,17 +1915,15 @@ impl<T: SyncTransport> SyncEngine<T> {
     }
 
     fn manifest_path(&self, name: &str) -> PathBuf {
-        self.home
-            .root()
-            .join("sync")
+        self.paths
+            .state_root()
             .join(sanitize_name(name))
             .join("manifest.json")
     }
 
     fn state_path(&self, name: &str) -> PathBuf {
-        self.home
-            .root()
-            .join("sync")
+        self.paths
+            .state_root()
             .join(sanitize_name(name))
             .join("state.json")
     }
@@ -2032,7 +2042,7 @@ impl<T: SyncTransport> SyncEngine<T> {
     }
 
     /// Re-read `syncs.toml` into the engine and start watching any newly added
-    /// entries. Mirrors `reload-peers`: a running daemon picks up the new file
+    /// entries. Mirrors `reload-peers`: a running sync owner picks up the file
     /// without a restart. (Changing an existing entry's folder still needs a
     /// restart to re-point its watcher.)
     pub async fn reload(self: &Arc<Self>) -> Result<()> {
@@ -2130,11 +2140,11 @@ impl<T: SyncTransport> SyncEngine<T> {
                     // Every materialization and its state persist hold this
                     // guard. Do not acknowledge a delayed self-event before
                     // the bytes it identifies are durably committed.
-                    let daemon_owned = {
+                    let engine_owned = {
                         let _operation = entry.operation.lock().await;
-                        entry.work.acknowledge_daemon_write_batch(&batch)
+                        entry.work.acknowledge_engine_write_batch(&batch)
                     };
-                    if daemon_owned {
+                    if engine_owned {
                         continue;
                     }
                     let forward_generation = entry
@@ -2298,7 +2308,7 @@ pub struct SyncStatus {
     pub scan_issues: Vec<(String, String)>,
     /// Completed or attempted full folder scans since this entry instance was
     /// loaded. Monotonic while the name remains continuously configured in the
-    /// same daemon.
+    /// same engine.
     pub full_scans: u64,
     /// Exact-manifest, complete-content inbound transactions that took the
     /// production no-scan fast path.
@@ -3618,7 +3628,7 @@ fn materialize_tracked(
     protected: &HashMap<String, ContentHash>,
     observed: &mut HashMap<String, ContentHash>,
     cache: &HashMap<String, ScanCacheEntry>,
-    daemon_writes: Option<(&EntryWork, u64)>,
+    engine_writes: Option<(&EntryWork, u64)>,
 ) -> Result<()> {
     let _ = materialize_tracked_with_issues(
         node,
@@ -3629,7 +3639,7 @@ fn materialize_tracked(
         observed,
         cache,
         &BTreeMap::new(),
-        daemon_writes,
+        engine_writes,
     )?;
     Ok(())
 }
@@ -3662,7 +3672,7 @@ fn materialize_tracked_disk(
     protected: &DiskView,
     current: &DiskView,
     disk: &mut DiskState,
-    daemon_writes: Option<(&EntryWork, u64)>,
+    engine_writes: Option<(&EntryWork, u64)>,
 ) -> Result<MaterializeAllocationEvidence> {
     if current.root_state == RootState::Missing && protected.observed_len() > 0 {
         return Ok(MaterializeAllocationEvidence::default());
@@ -3753,8 +3763,8 @@ fn materialize_tracked_disk(
                 std::fs::create_dir_all(parent)?;
             }
             write_atomic_with_mode(&path, bytes, meta.executable)?;
-            if let Some((work, generation)) = daemon_writes {
-                work.record_daemon_write(&path, meta.hash, generation);
+            if let Some((work, generation)) = engine_writes {
+                work.record_engine_write(&path, meta.hash, generation);
             }
             disk.set_observed(rel, Some(meta.hash));
         }
@@ -3795,7 +3805,7 @@ fn materialize_tracked_with_issues(
     observed: &mut HashMap<String, ContentHash>,
     cache: &HashMap<String, ScanCacheEntry>,
     scan_issues: &BTreeMap<String, ScanIssue>,
-    daemon_writes: Option<(&EntryWork, u64)>,
+    engine_writes: Option<(&EntryWork, u64)>,
 ) -> Result<MaterializeAllocationEvidence> {
     std::fs::create_dir_all(root)
         .with_context(|| format!("failed to create {}", root.display()))?;
@@ -3928,8 +3938,8 @@ fn materialize_tracked_with_issues(
             // so a peer's mtime cannot collide into it. Stamping is once again
             // just metadata preservation, which is what FileMeta always claimed.
             write_atomic_with_mode(&path, bytes, meta.executable)?;
-            if let Some((work, generation)) = daemon_writes {
-                work.record_daemon_write(&path, meta.hash, generation);
+            if let Some((work, generation)) = engine_writes {
+                work.record_engine_write(&path, meta.hash, generation);
             }
             record_observed(observed, rel, meta.hash);
         }
@@ -4266,7 +4276,7 @@ fn watcher_event_is_mutation(kind: &notify::EventKind) -> bool {
     )
 }
 
-fn watcher_event_can_match_daemon_write(kind: &notify::EventKind) -> bool {
+fn watcher_event_can_match_engine_write(kind: &notify::EventKind) -> bool {
     use notify::event::ModifyKind;
 
     matches!(
@@ -4299,7 +4309,7 @@ fn atomic_write_final_path(path: &Path) -> Option<PathBuf> {
 struct WatchEvent {
     paths: Vec<PathBuf>,
     generation: u64,
-    daemon_write_candidate: bool,
+    engine_write_candidate: bool,
     rename: bool,
 }
 
@@ -4309,7 +4319,7 @@ struct WatchEventBatch {
     first_generation: u64,
     last_generation: u64,
     contiguous: bool,
-    daemon_write_candidate: bool,
+    engine_write_candidate: bool,
     saw_rename: bool,
 }
 
@@ -4320,7 +4330,7 @@ impl WatchEventBatch {
             first_generation: event.generation,
             last_generation: event.generation,
             contiguous: true,
-            daemon_write_candidate: event.daemon_write_candidate,
+            engine_write_candidate: event.engine_write_candidate,
             saw_rename: event.rename,
         }
     }
@@ -4328,7 +4338,7 @@ impl WatchEventBatch {
     fn push(&mut self, event: WatchEvent) {
         self.contiguous &= self.last_generation.checked_add(1) == Some(event.generation);
         self.last_generation = event.generation;
-        self.daemon_write_candidate &= event.daemon_write_candidate;
+        self.engine_write_candidate &= event.engine_write_candidate;
         self.saw_rename |= event.rename;
         self.paths.extend(event.paths);
     }
@@ -4339,7 +4349,7 @@ impl WatchEventBatch {
     /// longer exists when the coalesced batch is handled, so only the paired
     /// final path can be fingerprinted. An unpaired rename is an external
     /// mutation and must fail open to the normal scan path.
-    fn daemon_write_paths(&self) -> Option<Vec<PathBuf>> {
+    fn engine_write_paths(&self) -> Option<Vec<PathBuf>> {
         let mut paired_temp = false;
         let mut paths = Vec::with_capacity(self.paths.len());
         for path in &self.paths {
@@ -4449,7 +4459,7 @@ fn spawn_watcher(
                 let _ = tx.try_send(WatchEvent {
                     paths,
                     generation,
-                    daemon_write_candidate: watcher_event_can_match_daemon_write(&event.kind),
+                    engine_write_candidate: watcher_event_can_match_engine_write(&event.kind),
                     rename: watcher_event_is_rename(&event.kind),
                 });
             }
@@ -4691,8 +4701,8 @@ mod tests {
 
     fn peer(id: &str) -> PeerRef {
         PeerRef {
+            key: id.to_string(),
             id: id.to_string(),
-            addr: None,
             roaming: false,
         }
     }
@@ -5081,13 +5091,13 @@ mod tests {
         assert!(watcher_event_is_mutation(&notify::EventKind::Remove(
             RemoveKind::Any
         )));
-        assert!(watcher_event_can_match_daemon_write(
+        assert!(watcher_event_can_match_engine_write(
             &notify::EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any))
         ));
-        assert!(watcher_event_can_match_daemon_write(
+        assert!(watcher_event_can_match_engine_write(
             &notify::EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Any))
         ));
-        assert!(!watcher_event_can_match_daemon_write(
+        assert!(!watcher_event_can_match_engine_write(
             &notify::EventKind::Remove(RemoveKind::Any)
         ));
     }
@@ -5383,7 +5393,7 @@ mod tests {
     }
 
     #[test]
-    fn delayed_daemon_materialization_event_is_acknowledged_without_rescan() {
+    fn delayed_engine_materialization_event_is_acknowledged_without_rescan() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let path = root.join("remote.md");
@@ -5404,7 +5414,7 @@ mod tests {
             Some((&work, generation)),
         )
         .unwrap();
-        work.commit_daemon_writes();
+        work.commit_engine_writes();
         work.mark_generation_durable(generation);
         assert_eq!(std::fs::read(&path).unwrap(), b"remote bytes");
 
@@ -5414,17 +5424,17 @@ mod tests {
         let mut batch = WatchEventBatch::new(WatchEvent {
             paths: vec![path.clone()],
             generation: first_event_generation,
-            daemon_write_candidate: true,
+            engine_write_candidate: true,
             rename: false,
         });
         let second_event_generation = work.record_mutation();
         batch.push(WatchEvent {
             paths: vec![path],
             generation: second_event_generation,
-            daemon_write_candidate: true,
+            engine_write_candidate: true,
             rename: false,
         });
-        assert!(work.acknowledge_daemon_write_batch(&batch));
+        assert!(work.acknowledge_engine_write_batch(&batch));
         assert_eq!(
             work.mutation_generation.load(Ordering::Acquire),
             work.durable_generation.load(Ordering::Acquire),
@@ -5433,16 +5443,16 @@ mod tests {
         assert_eq!(
             work.full_scans.load(Ordering::Relaxed),
             0,
-            "the delayed daemon-owned batch must not rescan the tree"
+            "the delayed engine-owned batch must not rescan the tree"
         );
     }
 
     /// Linux reports Fabric's atomic write as temp-file create and modify
     /// events followed by a rename from the temp path to the final path. The
-    /// final fingerprint is already in the daemon-write journal. The missing
+    /// final fingerprint is already in the engine-write journal. The missing
     /// temp path must not turn this exact receipt into another full sync pass.
     #[test]
-    fn an_atomic_daemon_rename_batch_is_acknowledged_without_rescan() {
+    fn an_atomic_engine_rename_batch_is_acknowledged_without_rescan() {
         use notify::event::{CreateKind, DataChange, ModifyKind, RenameMode};
 
         let dir = tempfile::tempdir().unwrap();
@@ -5451,8 +5461,8 @@ mod tests {
         std::fs::write(&final_path, b"daemon bytes").unwrap();
         let work = EntryWork::new();
         let generation = work.mutation_generation.load(Ordering::Acquire);
-        work.record_daemon_write(&final_path, content_hash(b"daemon bytes"), generation);
-        work.commit_daemon_writes();
+        work.record_engine_write(&final_path, content_hash(b"daemon bytes"), generation);
+        work.commit_engine_writes();
         work.mark_generation_durable(generation);
 
         let push =
@@ -5460,7 +5470,7 @@ mod tests {
                 let event = WatchEvent {
                     paths,
                     generation: work.record_mutation(),
-                    daemon_write_candidate: watcher_event_can_match_daemon_write(&kind),
+                    engine_write_candidate: watcher_event_can_match_engine_write(&kind),
                     rename: watcher_event_is_rename(&kind),
                 };
                 if let Some(batch) = batch {
@@ -5487,7 +5497,7 @@ mod tests {
         );
 
         assert!(
-            work.acknowledge_daemon_write_batch(&batch.unwrap()),
+            work.acknowledge_engine_write_batch(&batch.unwrap()),
             "an exact committed atomic write must not schedule another full sync pass"
         );
         assert_eq!(
@@ -5532,7 +5542,7 @@ mod tests {
             Some((&work, generation)),
         )
         .unwrap();
-        work.commit_daemon_writes();
+        work.commit_engine_writes();
         work.mark_generation_durable(generation);
 
         let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
@@ -5556,7 +5566,7 @@ mod tests {
                 .any(|path| { atomic_write_final_path(path).as_ref() == Some(&final_path) }),
             "the batch must contain the paired Fabric temp path"
         );
-        assert!(work.acknowledge_daemon_write_batch(&batch));
+        assert!(work.acknowledge_engine_write_batch(&batch));
         assert_eq!(
             work.mutation_generation.load(Ordering::Acquire),
             work.durable_generation.load(Ordering::Acquire)
@@ -5564,7 +5574,7 @@ mod tests {
         assert_eq!(work.full_scans.load(Ordering::Relaxed), 0);
     }
 
-    /// A temp-to-final rename is not enough to claim daemon ownership. An
+    /// A temp-to-final rename is not enough to claim engine ownership. An
     /// external writer can use the same atomic-write shape and the same bytes.
     /// Its inode and change time must keep the batch dirty.
     #[test]
@@ -5575,8 +5585,8 @@ mod tests {
         std::fs::write(&final_path, b"same bytes").unwrap();
         let work = EntryWork::new();
         let generation = work.mutation_generation.load(Ordering::Acquire);
-        work.record_daemon_write(&final_path, content_hash(b"same bytes"), generation);
-        work.commit_daemon_writes();
+        work.record_engine_write(&final_path, content_hash(b"same bytes"), generation);
+        work.commit_engine_writes();
         work.mark_generation_durable(generation);
 
         std::fs::write(&temp_path, b"same bytes").unwrap();
@@ -5585,11 +5595,11 @@ mod tests {
         let batch = WatchEventBatch::new(WatchEvent {
             paths: vec![temp_path, final_path],
             generation: event_generation,
-            daemon_write_candidate: true,
+            engine_write_candidate: true,
             rename: true,
         });
 
-        assert!(!work.acknowledge_daemon_write_batch(&batch));
+        assert!(!work.acknowledge_engine_write_batch(&batch));
         assert_ne!(
             work.mutation_generation.load(Ordering::Acquire),
             work.durable_generation.load(Ordering::Acquire),
@@ -5598,11 +5608,11 @@ mod tests {
     }
 
     /// Inbound adoption owes a pass to the other peers. That obligation is
-    /// independent of the watcher receipt for bytes the daemon just wrote.
+    /// independent of the watcher receipt for bytes the engine just wrote.
     /// Recording the forward obligation must not make the exact self-write
     /// batch look like a dropped external event.
     #[tokio::test]
-    async fn an_inbound_forward_marker_does_not_invalidate_its_daemon_write_receipt() {
+    async fn an_inbound_forward_marker_does_not_invalidate_its_engine_write_receipt() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("resources");
         let final_path = root.join("remote.md");
@@ -5622,15 +5632,15 @@ mod tests {
         let generation = entry.work.mutation_generation.load(Ordering::Acquire);
         entry
             .work
-            .record_daemon_write(&final_path, content_hash(b"daemon bytes"), generation);
-        entry.work.commit_daemon_writes();
+            .record_engine_write(&final_path, content_hash(b"daemon bytes"), generation);
+        entry.work.commit_engine_writes();
         entry.work.mark_generation_durable(generation);
 
         let event_generation = entry.work.record_mutation();
         let batch = WatchEventBatch::new(WatchEvent {
             paths: vec![temp_path, final_path],
             generation: event_generation,
-            daemon_write_candidate: true,
+            engine_write_candidate: true,
             rename: true,
         });
         engine
@@ -5644,8 +5654,8 @@ mod tests {
             .await;
 
         assert!(
-            entry.work.acknowledge_daemon_write_batch(&batch),
-            "forward work must not invalidate an exact daemon-write receipt"
+            entry.work.acknowledge_engine_write_batch(&batch),
+            "forward work must not invalidate an exact engine-write receipt"
         );
         assert_eq!(
             entry.work.mutation_generation.load(Ordering::Acquire),
@@ -5689,16 +5699,16 @@ mod tests {
         entry.work.full_scans.store(0, Ordering::Relaxed);
 
         // An external write lands before the delayed watcher event is handled.
-        // Its current identity no longer matches the daemon's post-write record.
+        // Its current identity no longer matches the engine's post-write record.
         std::fs::write(&path, b"external bytes").unwrap();
         let event_generation = entry.work.record_mutation();
         let batch = WatchEventBatch::new(WatchEvent {
             paths: vec![path],
             generation: event_generation,
-            daemon_write_candidate: true,
+            engine_write_candidate: true,
             rename: false,
         });
-        assert!(!entry.work.acknowledge_daemon_write_batch(&batch));
+        assert!(!entry.work.acknowledge_engine_write_batch(&batch));
         assert_ne!(
             entry.work.mutation_generation.load(Ordering::Acquire),
             entry.work.durable_generation.load(Ordering::Acquire),
@@ -5721,26 +5731,26 @@ mod tests {
     }
 
     #[test]
-    fn dropped_watcher_generation_cannot_suppress_daemon_write() {
+    fn dropped_watcher_generation_cannot_suppress_engine_write() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("remote.md");
         std::fs::write(&path, b"daemon bytes").unwrap();
         let work = EntryWork::new();
         let generation = work.mutation_generation.load(Ordering::Acquire);
-        work.record_daemon_write(&path, content_hash(b"daemon bytes"), generation);
-        work.commit_daemon_writes();
+        work.record_engine_write(&path, content_hash(b"daemon bytes"), generation);
+        work.commit_engine_writes();
         work.mark_generation_durable(generation);
 
         let delivered_generation = work.record_mutation();
         let batch = WatchEventBatch::new(WatchEvent {
             paths: vec![path],
             generation: delivered_generation,
-            daemon_write_candidate: true,
+            engine_write_candidate: true,
             rename: false,
         });
         let _dropped_generation = work.record_mutation();
 
-        assert!(!work.acknowledge_daemon_write_batch(&batch));
+        assert!(!work.acknowledge_engine_write_batch(&batch));
         assert_ne!(
             work.mutation_generation.load(Ordering::Acquire),
             work.durable_generation.load(Ordering::Acquire),
@@ -5749,7 +5759,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_write_journal_overflow_fails_open_to_dirty() {
+    fn engine_write_journal_overflow_fails_open_to_dirty() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("oldest.md");
         std::fs::write(&path, b"daemon bytes").unwrap();
@@ -5757,30 +5767,30 @@ mod tests {
         let generation = work.mutation_generation.load(Ordering::Acquire);
         let fingerprint = FileFingerprint::read(&path).unwrap();
         {
-            let mut journal = work.daemon_writes.lock().unwrap();
+            let mut journal = work.engine_writes.lock().unwrap();
             journal.record(path.clone(), fingerprint.clone(), generation);
-            for index in 0..MAX_DAEMON_WRITE_FINGERPRINTS {
+            for index in 0..MAX_ENGINE_WRITE_FINGERPRINTS {
                 journal.record(
                     dir.path().join(format!("newer-{index}.md")),
                     fingerprint.clone(),
                     generation,
                 );
             }
-            assert_eq!(journal.order.len(), MAX_DAEMON_WRITE_FINGERPRINTS);
-            assert_eq!(journal.entries.len(), MAX_DAEMON_WRITE_FINGERPRINTS);
+            assert_eq!(journal.order.len(), MAX_ENGINE_WRITE_FINGERPRINTS);
+            assert_eq!(journal.entries.len(), MAX_ENGINE_WRITE_FINGERPRINTS);
             assert!(!journal.entries.contains_key(&path));
         }
-        work.commit_daemon_writes();
+        work.commit_engine_writes();
         work.mark_generation_durable(generation);
 
         let event_generation = work.record_mutation();
         let batch = WatchEventBatch::new(WatchEvent {
             paths: vec![path],
             generation: event_generation,
-            daemon_write_candidate: true,
+            engine_write_candidate: true,
             rename: false,
         });
-        assert!(!work.acknowledge_daemon_write_batch(&batch));
+        assert!(!work.acknowledge_engine_write_batch(&batch));
         assert_ne!(
             work.mutation_generation.load(Ordering::Acquire),
             work.durable_generation.load(Ordering::Acquire)
@@ -5801,21 +5811,21 @@ mod tests {
             notify::EventKind::Remove(notify::event::RemoveKind::Any),
         ];
         for kind in unsafe_kinds {
-            let daemon_write_candidate = watcher_event_can_match_daemon_write(&kind);
+            let engine_write_candidate = watcher_event_can_match_engine_write(&kind);
             let rename = watcher_event_is_rename(&kind);
-            assert_eq!(daemon_write_candidate, rename);
+            assert_eq!(engine_write_candidate, rename);
             let generation = work.mutation_generation.load(Ordering::Acquire);
-            work.record_daemon_write(&path, content_hash(b"daemon bytes"), generation);
-            work.commit_daemon_writes();
+            work.record_engine_write(&path, content_hash(b"daemon bytes"), generation);
+            work.commit_engine_writes();
             work.mark_generation_durable(generation);
             let event_generation = work.record_mutation();
             let batch = WatchEventBatch::new(WatchEvent {
                 paths: vec![path.clone()],
                 generation: event_generation,
-                daemon_write_candidate,
+                engine_write_candidate,
                 rename,
             });
-            assert!(!work.acknowledge_daemon_write_batch(&batch));
+            assert!(!work.acknowledge_engine_write_batch(&batch));
             assert_ne!(
                 work.mutation_generation.load(Ordering::Acquire),
                 work.durable_generation.load(Ordering::Acquire)
@@ -5823,8 +5833,8 @@ mod tests {
         }
 
         let generation = work.mutation_generation.load(Ordering::Acquire);
-        work.record_daemon_write(&path, content_hash(b"daemon bytes"), generation);
-        work.commit_daemon_writes();
+        work.record_engine_write(&path, content_hash(b"daemon bytes"), generation);
+        work.commit_engine_writes();
         work.mark_generation_durable(generation);
         std::fs::remove_file(&path).unwrap();
         let event_generation = work.record_mutation();
@@ -5833,10 +5843,10 @@ mod tests {
             generation: event_generation,
             // Exercise the stat-failure branch independently of remove-kind
             // classification.
-            daemon_write_candidate: true,
+            engine_write_candidate: true,
             rename: false,
         });
-        assert!(!work.acknowledge_daemon_write_batch(&batch));
+        assert!(!work.acknowledge_engine_write_batch(&batch));
         assert_ne!(
             work.mutation_generation.load(Ordering::Acquire),
             work.durable_generation.load(Ordering::Acquire)
@@ -5852,7 +5862,7 @@ mod tests {
                     .send(WatchEvent {
                         paths: Vec::new(),
                         generation,
-                        daemon_write_candidate: false,
+                        engine_write_candidate: false,
                         rename: false,
                     })
                     .await;
@@ -6848,8 +6858,8 @@ mod tests {
     impl SyncTransport for AlwaysFailingTransport {
         async fn peers_for(&self, _peers: &SyncPeers) -> ResolvedPeers {
             ResolvedPeers::all(vec![PeerRef {
+                key: "a-peer-that-does-not-serve-this-entry".to_string(),
                 id: "a-peer-that-does-not-serve-this-entry".to_string(),
-                addr: None,
                 roaming: self.roaming,
             }])
         }
@@ -6883,8 +6893,8 @@ mod tests {
                     .unwrap()
                     .iter()
                     .map(|peer| PeerRef {
+                        key: peer.id.clone(),
                         id: peer.id.clone(),
-                        addr: None,
                         roaming: false,
                     })
                     .collect(),
@@ -6966,8 +6976,8 @@ mod tests {
                     .iter()
                     .filter(|peer| peer.engine.strong_count() > 0)
                     .map(|peer| PeerRef {
+                        key: peer.id.clone(),
                         id: peer.id.clone(),
-                        addr: None,
                         roaming: false,
                     })
                     .collect(),
@@ -7700,6 +7710,56 @@ mod tests {
         );
     }
 
+    /// The state owner must be exclusive before the engine reads durable
+    /// state. Otherwise an embedded engine and a companion can both mutate the
+    /// same manifest during a mixed-version start.
+    #[tokio::test]
+    async fn a_second_engine_fails_before_it_reads_state_and_release_allows_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        let home = FabricHome::new(dir.path());
+
+        let first = SyncEngine::new(
+            home.clone(),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        write_bus_sync(dir.path(), &root);
+        let state_dir = dir.path().join("sync/bus");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join("state.json"), b"not json").unwrap();
+
+        let error = SyncEngine::new(
+            home.clone(),
+            Author([2; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(
+            detail.contains("sync state owner lease is already held"),
+            "the second owner reached state instead of failing on the lease: {detail}"
+        );
+
+        std::fs::remove_file(state_dir.join("state.json")).unwrap();
+        drop(first);
+        SyncEngine::new(
+            home,
+            Author([3; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("dropping the engine did not release its owner lease");
+    }
+
     /// A FALLBACK TAKEN WHILE SERVING MUST BE COUNTED.
     ///
     /// It was not. `delta_fallbacks` was incremented only in the outbound peer
@@ -7883,8 +7943,17 @@ mod tests {
         let Some(home) = std::env::var_os("FABRIC_TEST_SNAPSHOT_CRASH_HOME") else {
             return;
         };
+        let home = FabricHome::new(PathBuf::from(home));
+        // The parent deliberately owns the real state lease while this crash
+        // helper stops at a write boundary. Use a test-only lease root so the
+        // helper can exercise that boundary without becoming a second engine.
+        let owner_paths = SyncPaths::new(
+            home.syncs_path(),
+            home.root().join("sync-crash-test-owner"),
+        );
         let engine = SyncEngine {
-            home: FabricHome::new(PathBuf::from(home)),
+            paths: SyncPaths::new(home.syncs_path(), home.root().join("sync")),
+            _owner: SyncOwnerLease::acquire(&owner_paths).unwrap(),
             author: Author([1; 32]),
             transport: Arc::new(LoopbackTransport::default()),
             entries: RwLock::new(HashMap::new()),

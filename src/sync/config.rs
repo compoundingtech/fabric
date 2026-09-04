@@ -162,6 +162,13 @@ impl SyncBook {
     /// Load and validate `syncs.toml`. A missing file is an empty book.
     pub fn load(home: &FabricHome) -> Result<Self> {
         let path = home.syncs_path();
+        Self::load_path(&path)
+    }
+
+    /// Load and validate a sync book from an explicit path.
+    ///
+    /// This is the process-neutral read API used by every sync state owner.
+    pub fn load_path(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -178,8 +185,23 @@ impl SyncBook {
         self.validate()?;
         home.prepare()?;
         let path = home.syncs_path();
+        self.write_path(&path)
+    }
+
+    /// Validate and write a sync book to an explicit path.
+    pub fn save_path(&self, path: &Path) -> Result<()> {
+        self.validate()?;
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        self.write_path(path)
+    }
+
+    fn write_path(&self, path: &Path) -> Result<()> {
         let raw = toml::to_string_pretty(self)?;
-        fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))
+        fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))
     }
 
     pub fn entries(&self) -> &[SyncEntry] {
@@ -407,6 +429,25 @@ mod tests {
         let reloaded = SyncBook::load(&home).unwrap();
         assert_eq!(reloaded.entries(), book.entries());
         assert_eq!(home.syncs_path(), dir.path().join("syncs.toml"));
+    }
+
+    #[test]
+    fn explicit_path_api_needs_no_fabric_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("companion/config/syncs.toml");
+        let mut book = SyncBook::default();
+        book.upsert(SyncEntry {
+            name: "catalog".into(),
+            folder: PathBuf::from("/srv/catalog"),
+            peers: SyncPeers::Wildcard("*".into()),
+            policy: SyncPolicy::Catalog,
+            include: None,
+        });
+
+        book.save_path(&path).unwrap();
+        let reloaded = SyncBook::load_path(&path).unwrap();
+
+        assert_eq!(reloaded.entries(), book.entries());
     }
 
     #[test]

@@ -21,10 +21,12 @@ pub mod engine;
 pub mod glob;
 pub mod manifest;
 pub mod node;
+pub mod paths;
 pub mod wire;
 
 pub use config::{PolicyRules, SyncBook, SyncEntry, SyncPeers, SyncPolicy};
 pub use delta::{ChangeBuffer, Cursor};
-pub use engine::{PeerRef, SyncEngine, SyncStatus, SyncTransport};
+pub use engine::{PeerRef, SYNC_LOG_TARGET, SyncEngine, SyncStatus, SyncTransport};
 pub use manifest::{FileMeta, Manifest, ManifestDiff};
 pub use node::{Reconciled, SyncNode, content_hash};
+pub use paths::{SyncOwnerLease, SyncPaths};

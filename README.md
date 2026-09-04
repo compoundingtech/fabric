@@ -968,6 +968,9 @@ sync-accept path snapshots are sampled in the default validation log.
 Folder scans, materialization, and state persistence run on Tokio's bounded
 blocking pool. Fabric holds the live node and disk locks only while it snapshots
 or applies a completed phase, so filesystem latency does not stop other streams.
+The sync engine receives explicit config and state paths instead of the daemon
+home. It holds `<home>/sync/owner.lock` for its lifetime, so a second engine
+fails before it reads or changes the same state.
 
 Entries live in an authoritative, hand-editable `syncs.toml` next to `peers.toml`
 (`~/.config/fabric/syncs.toml` for the default home, `<home>/syncs.toml` with
