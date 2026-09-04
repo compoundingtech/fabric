@@ -5,7 +5,7 @@ current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
 _Last updated: 2026-09-04 by Silber.fabric-codex. Main's last code commit is
-deployed as `0.2.1+7bde48c` on Silber and hetz._
+deployed as `0.2.1+40d7aa6` on Silber and hetz._
 
 ## Current release — 2026-09-04
 
@@ -196,6 +196,59 @@ Both hosts report zero drift, missing, unexpected, mismatched, scan issues,
 stopped peers, away peers, and delta fallbacks. Silber retains one cumulative
 reconcile failure from the rollout window. A later successful pass cleared the
 stopped state. Hetz reports zero reconcile failures.
+
+PR #149 removed the eager owned snapshot of every present manifest path during
+materialization. It borrows the manifest iteration and defers only node writes
+and deletes until that borrow ends. It also avoids replacing an observed hash
+with an identical clone.
+
+The red 100-file contract counted 100 eager path copies before the fix and zero
+after it. Two properties guard the deferral. A local edit and local delete both
+still outrank remote state. Content from a deferred local edit can still
+materialize a later path during the same pass.
+
+PR #149 merged as `40d7aa6`. Pull-request test run `33889458426` and Nix run
+`33889458423` passed. Exact-main test run `33890590443` and Nix run
+`33890590425` passed. The final library suite passed 449 active tests, with
+three measurements ignored. The serial folder-sync suite passed 18 tests.
+
+Release `v0.2.1+40d7aa6` passed all four jobs in run `33892068141`. The archive
+SHA-256 values are `36def117ff5f814609ad1e75b709408ae56908e13ae20a52a48ccbcdf2122256`
+for Apple arm64, `35fa2a169e09037c6044d7095b016fd11355e2fb8371ad29e000ecb35c1dae39`
+for Linux arm64, and `54835ea7e45a674fcd52a1fd29862f0b14e54a8bb10dd63ca74d21206f6524e6`
+for Linux x86_64. Each archive matched its sidecar and contained only
+`fabric`. The Apple and Linux x86_64 binaries reported `0.2.1+40d7aa6` before
+deployment.
+
+The rollout updated hetz first and Silber second. Mixed-version and final
+two-way ping and exec passed through direct paths. Doctor passed on both hosts.
+Two-way send-file hashes matched. The Silber-to-hetz hash was
+`d2c450b11ec2c0c87034569606e3d463e42b92f1cc01aa451fcf862be3bd362c`.
+The hetz-to-Silber hash was
+`c8f30d8d3113eacff05bd8ce2aabe0217edec1223761eed9c069be17fc33ad8d`.
+
+Both sync entries matched across hosts with clean drift and no scan issue,
+stopped peer, away peer, reconcile failure, or delta fallback. The bus digest
+prefix was `192bbb283031`. The declarations digest prefix was `7bbb8aa56243`.
+
+The deployed 20-second exact-symbol trace observed four converged
+materializations at exactly 14,249,092 requested bytes each. The 25,871,580-byte
+baseline fell by 11,622,488 bytes, or 44.9 percent. One changing call requested
+12,701,676 bytes. The trace counted five calls and 69,698,044 bytes total.
+
+The rollout rollback binaries both reported `0.2.1+7bde48c`. The exact files
+were `/Users/myobie/.local/bin/fabric.rollback-1788537663` and
+`/home/myobie/.local/bin/fabric.rollback-1788537618`. Both paths and all exact
+release, preflight, and transfer paths are absent after verification. The local
+files remain recoverable in Trash.
+
+The next work is the pass-frequency question. Each host initiates one outbound
+pass about every 8.3 seconds. Each outbound pass causes two full scans. This is
+about 867 scans and 37.7 GB of requested allocation per hour before inbound
+work. Determine why the periodic reconciliation needs two full walks and
+whether an unchanged tree can stop after a cheap proof. Also test whether hetz
+guarded inbound work tracks changes originating on Silber. This explains only
+the measured guarded-work difference unless another measurement proves more.
 
 The rollout created two rollback binaries from `0.2.1+9d1c138`. They were
 `/Users/myobie/.local/bin/fabric.rollback-1788525446` and
