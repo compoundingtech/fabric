@@ -258,6 +258,12 @@ struct EntryWork {
     /// the only other source and the daemon deliberately suppresses the event
     /// for its own materialization.
     forward: tokio::sync::Notify,
+    /// Inbound adoptions that still need an outbound pass to every other peer.
+    /// This is separate from disk mutation generations because a forward debt
+    /// must not invalidate the watcher receipt for bytes we just materialized.
+    forward_generation: AtomicU64,
+    /// The latest forward generation completed by a successful outbound pass.
+    forwarded_generation: AtomicU64,
     mutation_generation: AtomicU64,
     durable_generation: AtomicU64,
     inbound_waiters: AtomicUsize,
@@ -371,6 +377,8 @@ impl EntryWork {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             forward: tokio::sync::Notify::new(),
+            forward_generation: AtomicU64::new(0),
+            forwarded_generation: AtomicU64::new(0),
             // Generation one forces the first inbound session to scan even
             // before the watcher observes its first event.
             mutation_generation: AtomicU64::new(1),
@@ -406,6 +414,26 @@ impl EntryWork {
         self.mutation_generation
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1)
+    }
+
+    fn record_forward(&self) -> u64 {
+        self.forward_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
+    }
+
+    fn mark_forwarded(&self, generation: u64) {
+        self.forwarded_generation
+            .store(generation, Ordering::Release);
+    }
+
+    fn has_pending_forward(&self) -> bool {
+        self.forward_generation.load(Ordering::Acquire)
+            != self.forwarded_generation.load(Ordering::Acquire)
+    }
+
+    fn has_pending_work(&self) -> bool {
+        !self.is_clean() || self.has_pending_forward()
     }
 
     fn record_daemon_write(&self, path: &Path, hash: ContentHash, generation: u64) {
@@ -1566,6 +1594,16 @@ impl<T: SyncTransport> SyncEngine<T> {
         Ok(())
     }
 
+    /// Run one scheduled pass and settle only the forward work it observed at
+    /// the start. An adoption that arrives during the pass keeps a newer
+    /// generation and the held notify permit schedules another pass.
+    async fn sync_scheduled_work(&self, name: &str, work: &EntryWork) -> Result<()> {
+        let forward_generation = work.forward_generation.load(Ordering::Acquire);
+        self.sync_once_repairing(name).await?;
+        work.mark_forwarded(forward_generation);
+        Ok(())
+    }
+
     async fn delta_fallbacks_of(&self, name: &str) -> u64 {
         self.entries
             .read()
@@ -1593,22 +1631,21 @@ impl<T: SyncTransport> SyncEngine<T> {
     /// An entry that ADOPTED something while serving a peer still owes every
     /// OTHER peer that change.
     ///
-    /// `complete_inbound` ends by marking the generation durable, which is true
-    /// and is the wrong answer to a different question. Durable means "written
-    /// down". It does not mean "everybody has been told". Nothing else moves
-    /// the mutation generation on the inbound path — only the watcher and a
-    /// config reload do — and the daemon suppresses the watcher event for its
-    /// own materialization, correctly, so that a write we caused does not look
-    /// like a write somebody made.
+    /// `complete_inbound` ends by marking the disk generation durable, which is
+    /// true and is the wrong answer to a different question. Durable means
+    /// "written down". It does not mean "everybody has been told". Forward
+    /// debt therefore has its own generation. The daemon can suppress the
+    /// watcher event for its own materialization without erasing that debt or
+    /// making its exact write receipt look stale.
     ///
     /// The result was that a node in the middle of a line adopted a change,
     /// declared itself clean, and forwarded nothing until the five-minute
     /// safety scan. A fully-meshed fleet never notices, because no change ever
     /// needs a relay. Ours is fully meshed, which is why this shipped.
     ///
-    /// Marking it dirty costs one pass on the node that received something, and
-    /// nothing at all when nothing arrives. That is the propagation cost and
-    /// there is no cheaper honest version of it.
+    /// Recording forward debt costs one pass on the node that received
+    /// something, and nothing when nothing arrives. That is the propagation
+    /// cost and there is no cheaper honest version of it.
     pub async fn note_inbound_adoption(&self, name: &str, stats: &Reconciled) {
         if stats.pulled == 0 {
             return;
@@ -1618,7 +1655,7 @@ impl<T: SyncTransport> SyncEngine<T> {
             // the periodic tick a backstop if the wake is missed; the wake is
             // what makes a relayed change arrive in a second rather than in a
             // tick per hop.
-            entry.work.record_mutation();
+            entry.work.record_forward();
             entry.work.forward.notify_one();
         }
     }
@@ -1968,7 +2005,7 @@ impl<T: SyncTransport> SyncEngine<T> {
         let root = entry.config.folder.clone();
 
         // Best-effort initial sync.
-        if let Err(error) = self.sync_once_repairing(&name).await {
+        if let Err(error) = self.sync_scheduled_work(&name, &entry.work).await {
             tracing::warn!(sync = %name, %error, "initial sync failed");
         }
 
@@ -1991,17 +2028,21 @@ impl<T: SyncTransport> SyncEngine<T> {
                 // waiter is parked, so a wake raised while a pass is running is
                 // taken on the next turn rather than dropped.
                 _ = entry.work.forward.notified() => {
-                    if let Err(error) = self.sync_once_repairing(&name).await {
-                        tracing::debug!(sync = %name, %error, "forwarding sync failed");
+                    // Another trigger may already have completed the generation
+                    // represented by this held permit. Consuming that stale
+                    // permit must not create a redundant pass.
+                    if entry.work.has_pending_forward() {
+                        if let Err(error) = self.sync_scheduled_work(&name, &entry.work).await {
+                            tracing::debug!(sync = %name, %error, "forwarding sync failed");
+                        }
                     }
                 }
                 _ = ticker.tick() => {
-                    let dirty = entry.work.mutation_generation.load(Ordering::Acquire)
-                        != entry.work.durable_generation.load(Ordering::Acquire);
+                    let dirty = entry.work.has_pending_work();
                     let safety_due = last_safety_scan.elapsed() >= MISSED_EVENT_RESYNC;
                     if periodic_scan_due(dirty, safety_due) {
                         if safety_due { last_safety_scan = tokio::time::Instant::now(); }
-                        if let Err(error) = self.sync_once_repairing(&name).await {
+                        if let Err(error) = self.sync_scheduled_work(&name, &entry.work).await {
                             tracing::debug!(sync = %name, %error, "periodic sync failed");
                         }
                     }
@@ -2030,8 +2071,15 @@ impl<T: SyncTransport> SyncEngine<T> {
                     if daemon_owned {
                         continue;
                     }
-                    if let Err(error) = self.sync_once(&name).await {
-                        tracing::debug!(sync = %name, %error, "watch sync failed");
+                    let forward_generation = entry
+                        .work
+                        .forward_generation
+                        .load(Ordering::Acquire);
+                    match self.sync_once(&name).await {
+                        Ok(()) => entry.work.mark_forwarded(forward_generation),
+                        Err(error) => {
+                            tracing::debug!(sync = %name, %error, "watch sync failed");
+                        }
                     }
                 }
             }
@@ -3755,6 +3803,55 @@ mod tests {
         assert!(periodic_scan_due(false, true));
     }
 
+    #[test]
+    fn the_periodic_tick_backstops_a_missed_forward_wake() {
+        let work = EntryWork::new();
+        let mutation_generation = work.mutation_generation.load(Ordering::Acquire);
+        work.mark_generation_durable(mutation_generation);
+        assert!(!work.has_pending_work());
+
+        work.record_forward();
+
+        assert!(periodic_scan_due(work.has_pending_work(), false));
+    }
+
+    #[test]
+    fn a_forward_arriving_during_a_pass_remains_pending() {
+        let work = EntryWork::new();
+        let mutation_generation = work.mutation_generation.load(Ordering::Acquire);
+        work.mark_generation_durable(mutation_generation);
+
+        let first = work.record_forward();
+        let captured = work.forward_generation.load(Ordering::Acquire);
+        assert_eq!(captured, first);
+
+        let later = work.record_forward();
+        work.mark_forwarded(captured);
+        assert!(
+            work.has_pending_work(),
+            "finishing a pass must not erase forward work that arrived during it"
+        );
+
+        work.mark_forwarded(later);
+        assert!(!work.has_pending_work());
+    }
+
+    #[test]
+    fn a_forward_settled_by_another_trigger_makes_its_held_wake_free() {
+        let work = EntryWork::new();
+        let mutation_generation = work.mutation_generation.load(Ordering::Acquire);
+        work.mark_generation_durable(mutation_generation);
+
+        let forward_generation = work.record_forward();
+        work.forward.notify_one();
+        work.mark_forwarded(forward_generation);
+
+        assert!(
+            !work.has_pending_forward(),
+            "a held wake for completed forward work must not schedule another pass"
+        );
+    }
+
     fn entry_with_policy(name: &str, folder: &Path, policy: SyncPolicy) -> SyncEntry {
         SyncEntry {
             name: name.to_string(),
@@ -4675,6 +4772,67 @@ mod tests {
             work.mutation_generation.load(Ordering::Acquire),
             work.durable_generation.load(Ordering::Acquire),
             "an external atomic replacement must take the normal scan path"
+        );
+    }
+
+    /// Inbound adoption owes a pass to the other peers. That obligation is
+    /// independent of the watcher receipt for bytes the daemon just wrote.
+    /// Recording the forward obligation must not make the exact self-write
+    /// batch look like a dropped external event.
+    #[tokio::test]
+    async fn an_inbound_forward_marker_does_not_invalidate_its_daemon_write_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        let final_path = root.join("remote.md");
+        let temp_path = root.join("remote.md.fabric-tmp");
+        write_bus_sync(dir.path(), &root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&final_path, b"daemon bytes").unwrap();
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let entry = engine.entries.read().await.get("bus").cloned().unwrap();
+        let generation = entry.work.mutation_generation.load(Ordering::Acquire);
+        entry
+            .work
+            .record_daemon_write(&final_path, content_hash(b"daemon bytes"), generation);
+        entry.work.commit_daemon_writes();
+        entry.work.mark_generation_durable(generation);
+
+        let event_generation = entry.work.record_mutation();
+        let batch = WatchEventBatch::new(WatchEvent {
+            paths: vec![temp_path, final_path],
+            generation: event_generation,
+            daemon_write_candidate: true,
+            rename: true,
+        });
+        engine
+            .note_inbound_adoption(
+                "bus",
+                &Reconciled {
+                    pulled: 1,
+                    ..Reconciled::default()
+                },
+            )
+            .await;
+
+        assert!(
+            entry.work.acknowledge_daemon_write_batch(&batch),
+            "forward work must not invalidate an exact daemon-write receipt"
+        );
+        assert_eq!(
+            entry.work.mutation_generation.load(Ordering::Acquire),
+            entry.work.durable_generation.load(Ordering::Acquire),
+            "only watcher mutations belong in the disk-durability generation"
+        );
+        assert!(
+            is_dirty(&entry),
+            "acknowledging the self-write must not erase the forward obligation"
         );
     }
 
@@ -6153,6 +6311,14 @@ mod tests {
              so every peer other than the sender would wait for the safety scan"
         );
 
+        // Only a successful outbound pass settles that obligation. A later
+        // inbound transaction is not evidence that the other peers were told.
+        engine
+            .sync_scheduled_work("bus", &entry.work)
+            .await
+            .unwrap();
+        assert!(!is_dirty(&entry));
+
         // And adopting nothing must not manufacture work, or an idle fleet
         // starts paying for passes that carry nothing.
         let prepared = engine.prepare_inbound("bus").await.unwrap().unwrap();
@@ -6167,8 +6333,7 @@ mod tests {
     }
 
     fn is_dirty(entry: &EntryState) -> bool {
-        entry.work.mutation_generation.load(Ordering::Acquire)
-            != entry.work.durable_generation.load(Ordering::Acquire)
+        entry.work.has_pending_work()
     }
 
     /// `scan_entry` has three callers. `complete_inbound` runs it once per

@@ -8,6 +8,11 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **Forwarding a peer's change no longer invalidates the watcher receipt for
+  the same bytes.** Forward work now has a generation separate from disk
+  mutations. A successful pass settles only the forward work it observed at
+  its start, and the periodic tick still recovers a missed wake.
+
 - **Linux no longer treats Fabric's own atomic materialization rename as an
   external tree change.** The watcher pairs the vanished `.fabric-tmp` path
   with its final path and verifies the final file against the committed daemon
