@@ -64,14 +64,6 @@ jobs:
       - name: Library and model tests
         run: timeout 10m cargo test --locked --lib
 
-      # Temporary proof for PR 146. Remove this step after its Linux RSS number
-      # is recorded; the ignored measurement remains available for later use.
-      - name: Linux allocator trim measurement
-        run: >-
-          timeout 5m cargo test --locked --release --lib
-          concurrent_manifest_decode_resident_cost_before_and_after_trim
-          -- --ignored --nocapture
-
       # The binary's own tests were never built here, so a test in src/main.rs
       # could stop COMPILING and this workflow stayed green. One had: the
       # `sync ls --json` schema test missed the `sweep` field added in #61.

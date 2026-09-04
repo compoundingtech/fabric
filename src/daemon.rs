@@ -4067,11 +4067,6 @@ fn trim_process_allocator() -> AllocatorTrimResult {
     }
 }
 
-#[cfg(all(test, target_os = "linux", target_env = "gnu"))]
-pub(crate) fn trim_process_allocator_for_test() -> bool {
-    trim_process_allocator().succeeded
-}
-
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn trim_process_allocator() -> AllocatorTrimResult {
     AllocatorTrimResult {
