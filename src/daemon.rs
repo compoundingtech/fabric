@@ -50,6 +50,7 @@ use crate::{
         engine::{PeerRef, ResolvedPeers, SyncEngine, SyncTransport},
         manifest::Author as SyncAuthor,
         node::SyncNode,
+        paths::SyncPaths,
     },
     telemetry::TelemetryStore,
     tunnel,
@@ -2133,8 +2134,8 @@ impl FabricNode {
         // can dial peers) and start watching configured folders.
         let author = sync_author(state.id());
         let transport = IrohSyncTransport::new(Arc::downgrade(&state));
-        let engine =
-            SyncEngine::new(state.home.clone(), author, transport, state.cancel.clone()).await?;
+        let paths = SyncPaths::new(state.home.syncs_path(), state.home.root().join("sync"));
+        let engine = SyncEngine::new(paths, author, transport, state.cancel.clone()).await?;
         let _ = state.sync_engine.set(engine.clone());
         tokio::spawn(async move {
             if let Err(error) = engine.run().await {
@@ -4144,8 +4145,21 @@ impl SyncTransport for IrohSyncTransport {
         // So "this peer may not sync with me" also means "I will not sync with
         // it". The refusal carries the same wire phrase as a remote one, so it
         // is reported as `denied` rather than as a network fault.
-        let Some(addr) = peer.addr.clone() else {
-            bail!("sync peer {} has no address", peer.id);
+        let peer_id: EndpointId = peer
+            .key
+            .parse()
+            .with_context(|| format!("sync peer {} has an invalid transport key", peer.id))?;
+        let addr = {
+            let book = state.peer_book.read().await;
+            let configured = book
+                .peers()
+                .iter()
+                .find(|configured| configured.id == peer_id)
+                .with_context(|| format!("sync peer {} is no longer trusted", peer.id))?;
+            configured
+                .addr
+                .clone()
+                .unwrap_or_else(|| EndpointAddr::new(configured.id))
         };
         // The IDENTITY, from the address, NOT `peer.id`.
         //
@@ -4171,13 +4185,9 @@ impl SyncTransport for IrohSyncTransport {
 
 fn peer_ref(peer: &Peer) -> PeerRef {
     let label = peer.name.clone().unwrap_or_else(|| peer.id.to_string());
-    let addr = peer
-        .addr
-        .clone()
-        .unwrap_or_else(|| EndpointAddr::new(peer.id));
     PeerRef {
+        key: peer.id.to_string(),
         id: label,
-        addr: Some(addr),
         roaming: peer.roaming,
     }
 }

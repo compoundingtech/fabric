@@ -6,11 +6,22 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ## [Unreleased]
 
+### Changed
+
+- **The sync engine now has a process-neutral host boundary.** Its constructor
+  receives only the sync config path, state root, author, transport, and
+  cancellation token. Peer addresses and daemon state stay in the daemon
+  transport. The embedded engine remains the production owner.
+
 ### Fixed
 
 - **`fabric doctor` no longer calls an unverified peer build current.** An
   unreachable peer now makes the build check `unknown`, including a roaming
   peer. The closing summary counts that unknown result as needing attention.
+
+- **A second sync engine can no longer open the same durable state.** The engine
+  holds an operating-system lease under the sync state root for its complete
+  lifetime. A competing owner fails before it reads state or starts a watcher.
 
 - **A sync folder walk no longer stalls unrelated Fabric streams.** Scan,
   materialization, JSON encoding, metadata checks, and persistence now run on
