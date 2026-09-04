@@ -2159,9 +2159,9 @@ enum ScanPathState {
 /// turning a skipped path into a deletion.
 ///
 /// A complete walk needs no retained copy of every name it saw. Any path that
-/// is not a scanned file and has no opaque ancestor is absent. Only directories
-/// that can replace a tracked file and paths that block complete evidence stay
-/// in the auxiliary sets.
+/// is not a scanned file and has no opaque ancestor is absent. Only directories,
+/// excluded files that block a tracked descendant, and paths that block
+/// complete evidence stay in the auxiliary sets.
 #[derive(Default)]
 struct FolderScan {
     files: Vec<ScannedFile>,
@@ -2169,6 +2169,8 @@ struct FolderScan {
     /// Directories, retained only because a directory can replace a tracked
     /// file without proving that the tracked file was deleted.
     non_file_paths: HashSet<String>,
+    /// Excluded regular files that can replace an included tracked directory.
+    blocking_file_paths: HashSet<String>,
     /// Paths whose contents or type the walk could not inspect completely.
     opaque_paths: HashSet<String>,
     issues: BTreeMap<String, ScanIssue>,
@@ -2186,7 +2188,7 @@ impl FolderScan {
 
     #[cfg(test)]
     fn absence_evidence_path_copies(&self) -> usize {
-        self.non_file_paths.len() + self.opaque_paths.len()
+        self.non_file_paths.len() + self.blocking_file_paths.len() + self.opaque_paths.len()
     }
 
     fn record_issue(&mut self, path: String, issue: ScanIssue) {
@@ -2211,6 +2213,9 @@ impl FolderScan {
         if path_ancestor_in_set(path, &self.opaque_paths).is_some() {
             return ScanPathState::Unknown;
         }
+        if path_ancestor_in_set(path, &self.blocking_file_paths).is_some() {
+            return ScanPathState::Unknown;
+        }
         if self.non_file_paths.contains(path) {
             return ScanPathState::Unknown;
         }
@@ -2219,6 +2224,7 @@ impl FolderScan {
 
     fn has_presence_evidence(&self, path: &str) -> bool {
         self.non_file_paths.contains(path)
+            || self.blocking_file_paths.contains(path)
             || path_ancestor_in_set(path, &self.opaque_paths).is_some_and(|path| !path.is_empty())
     }
 }
@@ -2449,6 +2455,7 @@ fn scan_folder_with_limit(
                 continue;
             }
             if !entry.includes(&norm) {
+                scan.blocking_file_paths.insert(norm);
                 continue;
             }
             // One stat per file, not two. `DirEntry::metadata` is a fresh
@@ -4822,7 +4829,8 @@ mod tests {
     fn a_file_replacing_a_tracked_directory_does_not_delete_its_descendants() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let entry = entry_with_policy("bus", root, SyncPolicy::Bus);
+        let mut entry = entry_with_policy("bus", root, SyncPolicy::Bus);
+        entry.include = Some(vec!["path/**".to_string()]);
         let rules = entry.policy.rules();
         let child = "path/child.txt";
         let child_hash = content_hash(b"child");
