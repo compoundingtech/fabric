@@ -296,12 +296,31 @@ async fn production_status_exposes_exact_inbound_scan_ledger() -> Result<()> {
     );
 
     std::fs::write(&a_file, b"remote mutation")?;
-    reload_sync(&a_home).await?;
+    // The watcher is the one mutation trigger in this phase. An explicit
+    // reload here creates a second valid inbound transaction when it races the
+    // watcher, so an assertion that expects one becomes schedule-dependent.
     assert!(
         wait_for_file(&b_file, b"remote mutation").await,
         "ledger mutation did not converge"
     );
-    let mutated = sync_status(&b_home, "shared").await?;
+    // `sync_passes` counts a pass when it starts. Its second scan happens after
+    // the peer exchange, so a status sample can briefly see the pass without
+    // both scans. Wait for the counter relationship itself, not an arbitrary
+    // quiet interval.
+    let mut mutated = sync_status(&b_home, "shared").await?;
+    for _ in 0..50 {
+        let pass_scans = (mutated.sync_passes - converged.sync_passes) * 2;
+        let inbound_scans = mutated
+            .full_scans
+            .checked_sub(converged.full_scans + pass_scans);
+        if mutated.inbound_guarded_transactions == converged.inbound_guarded_transactions + 1
+            && inbound_scans.is_some_and(|scans| (1..=2).contains(&scans))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        mutated = sync_status(&b_home, "shared").await?;
+    }
     assert_eq!(
         mutated.inbound_guarded_transactions,
         converged.inbound_guarded_transactions + 1
@@ -309,7 +328,10 @@ async fn production_status_exposes_exact_inbound_scan_ledger() -> Result<()> {
     // The forward wake can start an outbound pass before this sample. Remove
     // its two scans before checking the guarded inbound transaction's cost.
     let pass_scans = (mutated.sync_passes - converged.sync_passes) * 2;
-    let inbound_scans = mutated.full_scans - converged.full_scans - pass_scans;
+    let inbound_scans = mutated
+        .full_scans
+        .checked_sub(converged.full_scans + pass_scans)
+        .unwrap_or_default();
     assert!(
         (1..=2).contains(&inbound_scans),
         "one guarded inbound transaction must add one or two scans, got {inbound_scans}"

@@ -110,16 +110,16 @@ test fails. A test that passes whether or not the feature works is worse than no
 test, because it reads as coverage.
 
 
-## Candidate finding: daemon-slice deadlines are tuned to a fast machine
+## Resolved finding: three failures did not share one deadline cause
 
-Three tests in the daemon slice fail under CI load and pass on a rerun of the
-same commit: see [known-flaky-tests.md](known-flaky-tests.md). They are timing
-failures, not logic failures, and they cluster on one cause. A deadline that
-holds locally and elapses under CI load is a property of the deadline in the
-code, not a defect in the test. The two round-trip timeouts
-(`a_peer_not_permitted_for_a_service_cannot_reach_it`,
-`exec_expose_reconnect_keeps_child_bound_to_tunnel_session`) and the ledger
-count race (`production_status_exposes_exact_inbound_scan_ledger`) are worth
-retuning or making load-tolerant, so a red `deterministic` always means a real
-regression. NOT PROVEN as a single root cause; recorded here so the next reader
-starts from the pattern rather than one instance.
+Three daemon-slice tests were classified as flaky after CI failures passed on a
+rerun. The classification guessed that CI load made their deadlines too short.
+The guess was not proved, and 300 attempts of each test on unchanged main did
+not reproduce it under parallel process load.
+
+The two transport failures preceded later tunnel and mux recovery repairs. The
+ledger failure remained current, but its cause was different. One file write
+started both a watcher pass and an explicit reload. Both were valid inbound
+transactions, while the test required exactly one. The test now uses one
+trigger for each exact expected count. See [known-flaky-tests.md](known-flaky-tests.md)
+for the measured retirement record.
