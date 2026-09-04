@@ -5,7 +5,7 @@ current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
 _Last updated: 2026-09-04 by Silber.fabric-codex. Main's last code commit is
-deployed as `0.2.1+aab58e5` on Silber and hetz._
+deployed as `0.2.1+6f90ccb` on Silber and hetz._
 
 ## Current release — 2026-09-04
 
@@ -85,6 +85,56 @@ It also produced 115 warning records during 60.9 minutes. The trim calls used
 approximately 0.062 percent of the wall-clock window. The warning
 frequency is the next measured quietness cost; do not weaken the memory fix to
 remove the notices.
+
+PR #147 keeps every allocator trim and bounds routine success notices. The
+first success reports immediately. Later successes form one aggregate summary
+every 30 minutes. A failed trim, an unavailable trim, or a missing follow-up
+RSS sample still reports immediately. PR #147 merged as `6f90ccb`.
+
+The same 115-event pattern now produces at most three default warnings during
+60.9 minutes. This is a 97.4 percent reduction. The summary keeps the success
+count, observed RSS reduction, total trim time, and latest RSS values. The full
+library suite passed 444 tests, with three measurements ignored. Pull-request
+test run `33880401744` and Nix run `33880401558` passed. Exact-main test run
+`33881547544` and Nix run `33881547475` passed.
+
+Release `v0.2.1+6f90ccb` passed all four jobs in run `33881590090`. The archive
+SHA-256 values are `8ee5ecc852120cb56dd626027b645aba44fc38270dd93c284396cd9ddd22c44f`
+for Apple arm64, `fb21a7354351547ab4dbc63aaac29fc79990b57d66d358f90e916a3868fc3676`
+for Linux arm64, and `055efbf2a7f0c7baf8b4e82b4fc3e1ad943ea9ffaf65790676ff2c3874dfafe5`
+for Linux x86_64. Each archive matched its sidecar and contained only
+`fabric`. The Apple and Linux x86_64 binaries reported `0.2.1+6f90ccb` before
+deployment.
+
+The rollout updated hetz first and Silber second. Mixed-version and final
+two-way ping and exec passed through direct paths. Two-way send-file hashes
+matched. Doctor passed on both hosts. Both sync entries had matching digests,
+clean drift, no scan issues, no stopped or away peer, and no delta fallback.
+
+The first production trim on the new build reduced RSS from 462,651,392 bytes
+to 168,275,968 bytes in 26 milliseconds. It wrote one success summary and kept
+endpoint generation 9. The rollout rollback binaries contained
+`0.2.1+aab58e5`. Both exact files were removed after verification.
+
+Nathan asked what creates the 25.89 GiB/hour allocation rate. The current scan
+does not reread unchanged file content. It reuses cached hashes when size and
+mtime match. A 30-second live bpftrace window on hetz measured 508 MB requested
+through malloc, calloc, realloc, and posix_memalign. This is 56.8 GiB/hour at
+that measured workload.
+
+A second 15-second live trace marked exact function boundaries. Ten folder
+walks requested 437.5 MB, or 43.75 MB each. Ten post-walk scan phases requested
+212.0 MB, or 21.20 MB each. Nine materialize phases requested 206.4 MB, or
+22.93 MB each. The repeated work creates and clones path strings, path sets,
+cache maps, observed maps, and manifest path vectors for approximately 29,000
+present files and 17,700 tombstones.
+
+This class of churn is not new. A repository measurement from 2026-08-19 found
+that materialization reread 70,157,702 bytes every 0.51 seconds. A 90-second
+test drove 12.5 GB of churn and left 2.2 GB resident and dirty. PR #59 removed
+the content reread. The current allocation rate is lower, but the full-tree
+metadata allocation remained. The next work must remove repeated full-tree
+allocation without weakening delete evidence or concurrent-edit guards.
 
 Two-way send-file hashes matched. The Silber-to-hetz hash was
 `ee03b206037ca54f4bdb7d56badc929dfabbcf938a20bae75615f4c673336339`.
