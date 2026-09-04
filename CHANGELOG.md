@@ -9,8 +9,9 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 ### Fixed
 
 - **A stalled inbound sync session cannot hold an entry guard forever.** The
-  daemon ends an incomplete inbound wire session after five minutes. Dropping
-  the session also releases its scan and materialization guard.
+  daemon ends an incomplete inbound wire session after 30 seconds without I/O
+  progress. A progressing transfer can run longer. Timeout releases the scan
+  and materialization guard.
 
 - **A disconnected `fabric exec` caller cannot leave its remote child alive.**
   The server now detects client EOF while the child runs or waits. It kills the
