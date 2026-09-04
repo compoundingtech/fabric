@@ -4,8 +4,77 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-03 by Silber.fabric-codex. Main's last code commit is
-deployed as `0.2.1+a49be9c` on Silber and hetz._
+_Last updated: 2026-09-04 by Silber.fabric-codex. Main's last code commit is
+deployed as `0.2.1+9d1c138` on Silber and hetz._
+
+## Current release — 2026-09-04
+
+PR #141 retired the stale ACL and exec reconnect flake classifications. Each
+unchanged test passed 300 of 300 runs. It also fixed two ledger test races
+without weakening the exact count checks. The ledger test passed 300 of 300
+runs under 12-way load. PR #141 merged as `9231e71`.
+
+PR #142 completed F13. Built-in exec now reads caller EOF and uses
+`kill_on_drop`. The red test proved that the server ignored EOF and a quiet
+child survived. The fixed server completes immediately, kills the child, and
+releases the handler permit. PR #142 merged as `5c96c30`.
+
+PR #143 added an initial five-minute inbound sync deadline for F14. The red
+test acquired the resolver guard, stalled before `Push`, and proved the guard
+remained held. PR #143 merged as `cddff58`.
+
+PR #144 replaced that total deadline with a 30-second I/O progress timeout. A
+valid 512 MiB transfer could need less than 1.71 MiB/s, so the total deadline
+could reject valid work. Progressing sessions now have unlimited total time.
+Only 30 seconds without bytes causes a timeout. PR #144 merged as `25abce1`.
+
+The final progress test sent one `Push` byte every 80 milliseconds. The
+320-millisecond transfer failed under a 200-millisecond total deadline and
+passed under the idle deadline. The stall test still reacquired the guard
+within 100 milliseconds. The library suite passed 443 tests, with three
+ignored.
+
+Exact-main macOS CI found an ordering defect in the symlink-root watcher test.
+The test captured its quiet generation before it drained setup events. A
+deterministic negative control made the old assertion fail. PR #145 moved the
+baseline read after the drain and merged as `9d1c138`.
+
+The corrected watcher test passed 300 of 300 runs under 12-way load. Exact-main
+test run `33864311707` passed on macOS and Linux. Exact-main Nix run
+`33864311805` also passed.
+
+Release `v0.2.1+9d1c138` passed all four release jobs in run `33865527858`.
+The release contains three archives and three checksum files. Every archive
+matched its checksum and contained only `fabric`. The Apple binary reported
+`0.2.1+9d1c138` before deployment.
+
+The rollout updated hetz first and Silber second. During the mixed-version
+window, ping and exec passed in both directions. Silber-to-hetz ping took
+38.860 milliseconds. Hetz-to-Silber ping took 40.025 milliseconds. Both paths
+were direct.
+
+Both binaries and both daemons now report `0.2.1+9d1c138`. Doctor passes on
+both hosts. Final two-way ping and exec also passed. The final pings took
+110.445 milliseconds from Silber and 37.012 milliseconds from hetz. Both paths
+were direct.
+
+Two-way send-file hashes matched. The Silber-to-hetz hash was
+`d2c450b11ec2c0c87034569606e3d463e42b92f1cc01aa451fcf862be3bd362c`.
+The hetz-to-Silber hash was
+`c8f30d8d3113eacff05bd8ce2aabe0217edec1223761eed9c069be17fc33ad8d`.
+The two transfer test files were deleted after verification.
+
+Both sync entries have matching cross-host digests. Both hosts report zero
+drift, missing, unexpected, mismatched, scan issues, reconcile failures,
+stopped peers, away peers, and delta fallbacks. The bus digest is
+`878ee23d35b412d04fe5e69d8e12fa4ac9324ebccd66f8a6eee1cc011412d6aa`.
+The declarations digest is
+`d4f0b8a0086206f18305f48c034534de1e03cbc7bd25fe41216712716c86e55e`.
+
+The rollout created two rollback binaries from `0.2.1+a49be9c`. They were
+`/Users/myobie/.local/bin/fabric.rollback-1788519741` and
+`/home/myobie/.local/bin/fabric.rollback-1788519706`. Both exact files were
+deleted after successful verification, and both paths are absent.
 
 ## Current incident — 2026-09-03
 
