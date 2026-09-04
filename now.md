@@ -5,7 +5,7 @@ current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
 _Last updated: 2026-09-04 by Silber.fabric-codex. Main's last code commit is
-deployed as `0.2.1+6f90ccb` on Silber and hetz._
+deployed as `0.2.1+7bde48c` on Silber and hetz._
 
 ## Current release — 2026-09-04
 
@@ -133,8 +133,54 @@ This class of churn is not new. A repository measurement from 2026-08-19 found
 that materialization reread 70,157,702 bytes every 0.51 seconds. A 90-second
 test drove 12.5 GB of churn and left 2.2 GB resident and dirty. PR #59 removed
 the content reread. The current allocation rate is lower, but the full-tree
-metadata allocation remained. The next work must remove repeated full-tree
-allocation without weakening delete evidence or concurrent-edit guards.
+metadata allocation remained.
+
+PR #148 removed path copies that a complete scan kept only to prove absence.
+It retains directories, excluded regular-file blockers, and uninspectable paths.
+These paths still make absence unknown and prevent unsafe descendant deletes.
+
+The red 100-file contract retained 103 auxiliary path copies before the fix.
+It retains zero after the fix. A negative control found an excluded regular-file
+blocker that the first implementation missed. The corrected control failed on
+the approved first head and passed on the final head.
+
+PR #148 merged as `7bde48c`. Pull-request test run `33884605125` and Nix run
+`33884605142` passed. Exact-main test run `33885893710` and Nix run
+`33885893645` passed.
+
+Release `v0.2.1+7bde48c` passed all four jobs in run `33886459496`. The archive
+SHA-256 values are `c63038c65dc2b485e1107fdb428c272e384f4e9321c56b44ebcec1aac12bfe70`
+for Apple arm64, `9f197d6425177b814c475304579f6fa0997ac19ac653c126d9de47e77f42e290`
+for Linux arm64, and `97732f91129cd611c4666f439d03e0ef5cea90c06bc660ea200e2d34aad1f432`
+for Linux x86_64. Each archive matched its sidecar and contained only
+`fabric`. The Apple and Linux x86_64 binaries reported `0.2.1+7bde48c` before
+deployment.
+
+The rollout updated hetz first and Silber second. Mixed-version and final
+two-way ping and exec passed through direct paths. Two-way send-file hashes
+matched. Doctor passed on both hosts. Both sync entries matched across hosts
+with no drift, scan issue, stopped peer, away peer, or delta fallback.
+
+The deployed 15-second trace measured 232,193,264 requested bytes across six
+folder walks. This is 38.70 MB per walk, down from 43.75 MB. The change removed
+5.05 MB per walk, or 11.5 percent. A second 20-second trace printed one full
+bus walk at 38,698,949 bytes. This result confirms the average is not a
+scan-mix artifact.
+
+The same full pass requested 22,246,378 bytes after the walk and 25,871,580
+bytes during materialization. The full pass still requests 86.82 MB. The next
+work must remove repeated post-walk and materialization allocation without
+weakening delete evidence or concurrent-edit guards.
+
+Before the rollout, both old daemons had approximately 44 minutes of uptime.
+Silber used 207,168 kB and hetz used 417,268 kB. The earlier 29-minute
+convergence did not hold. The hetz process was 2.01 times larger at the matched
+age, so the cross-host lead remains useful.
+
+The rollout rollback binaries both reported `0.2.1+6f90ccb`. The exact files
+were `/Users/myobie/.local/bin/fabric.rollback-1788534220` and
+`/home/myobie/.local/bin/fabric.rollback-1788534158`. Both paths and all
+release, preflight, and transfer files are absent after verification.
 
 Two-way send-file hashes matched. The Silber-to-hetz hash was
 `ee03b206037ca54f4bdb7d56badc929dfabbcf938a20bae75615f4c673336339`.
