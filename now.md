@@ -77,6 +77,40 @@ release files, transfer files, and measurement files were permanently deleted.
 No bpftrace or perf process remains. The old `fabric_alloc_863` probes and all
 known `863dc5b` trace paths are absent.
 
+The next count separates literal clones from all full-tree construction. One
+clean steady-state `sync_once` has five full-state `Clone` operations. They are
+one manifest clone and four observed-map clones. The observed clones are the
+protected receipt, the first scan's previous receipt, the peer-step baseline,
+and the second scan's previous receipt.
+
+Five is not the complete allocation shape. Each of the two scans also builds a
+new observed map, a new scan-cache map, and a present-path set. This gives 11
+full map or set collections per pass. Each scan also builds a `ScannedFile`
+vector, so one clean pass creates 13 tree-wide containers.
+
+The steady delta wire path does not add a whole manifest. It builds a delta and
+clones that delta into the header. A missing cursor changes this result because
+the wire path then clones the complete manifest.
+
+The live count confirmed the conditional paths. A 10-second window with two bus
+passes, four scans, one inbound no-op, and no guarded transaction made three
+full manifest clones and two small delta clones. Each full manifest clone
+requested about 13.51 MB. Five observed raw-table clones each requested about
+5.67 MB.
+
+A second 10-second window had one bus pass, four scans, one inbound no-op, and
+one guarded transaction. It made seven full manifest clones and one small delta
+clone. Eight observed raw-table clones each requested about 5.67 MB. A guarded
+inbound transaction can add pre-scan, baseline, completion, persistence, and
+wire snapshots, depending on durability and cursor state.
+
+A 30-second mixed window had four bus passes, 12 scans, three inbound no-ops,
+and two guarded transactions. It made 17 full manifest clones and four small
+delta clones. It also made 12 observed raw-table clones. Thus five is the exact
+clean-pass clone count, but 13 is the correct clean-pass whole-tree container
+count. The current shape needs a grouped design change instead of serial clone
+removal.
+
 PR #146 releases allocator-retained Linux pages without recycling an endpoint.
 Each new 128 MiB RSS growth step calls `malloc_trim(0)` on glibc Linux. Other
 platforms keep the RSS report without attempting the trim. The action cannot
