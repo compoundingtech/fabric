@@ -4204,10 +4204,6 @@ mod tests {
             spawn_watcher(root, tx, work.clone(), declarations_like_entry(root)).unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
 
-        // `EntryWork` starts at generation one on purpose, so compare against
-        // what it was, not against zero.
-        let quiet_generation = work.mutation_generation.load(Ordering::Acquire);
-
         // Setup created two directories. Their events are still in flight on a
         // slow machine, and one arriving inside the window below would read as
         // a filter failure while proving nothing. Take whatever setup produced
@@ -4219,6 +4215,9 @@ mod tests {
             .await
             .is_ok_and(|event| event.is_some())
         {}
+        // `EntryWork` starts at generation one on purpose, so compare against
+        // the generation after the drained setup events, not against zero.
+        let quiet_generation = work.mutation_generation.load(Ordering::Acquire);
 
         // Noise the entry does not sync. No event may reach the loop.
         let noise = root.join("agents/Silber/cos/status");
