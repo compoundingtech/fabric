@@ -34,6 +34,7 @@ use iroh::{
         SendStream, Side, TransportErrorCode, WriteError,
     },
 };
+use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::{Mutex, mpsc},
@@ -62,6 +63,14 @@ const NO_APPLICATION_PROTOCOL_ALERT: u8 = 0x78;
 const DUPLICATE_CONNECTION_REASON: &[u8] = b"duplicate mux connection";
 const STALE_GENERATION_REASON: &[u8] = b"endpoint generation changed";
 const REPEATED_STREAM_FAILURE_REASON: &[u8] = b"repeated mux stream failures";
+const REPEATED_ATTACH_FAILURE_REASON: &[u8] = b"repeated tunnel attach failures";
+const ATTACH_FAILURES_BEFORE_REPLACE: u32 = 3;
+const SUSTAINED_PROGRESS_DURATION: Duration = Duration::from_secs(5);
+const SUSTAINED_PROGRESS_MAX_GAP: Duration = Duration::from_secs(2);
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
+}
 
 /// One admitted logical stream on the shared peer connection.
 pub struct MuxStream {
@@ -75,6 +84,20 @@ pub struct MuxStream {
 pub enum StreamActivity {
     Application,
     Probe,
+}
+
+/// Health for the one shared connection that is current for a peer.
+///
+/// These values reset when that exact connection is replaced. They are not
+/// durable session totals.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentConnectionHealth {
+    pub connection_id: u64,
+    pub age_millis: u64,
+    pub consecutive_attach_failures: u32,
+    pub last_attach_failure_phase: Option<String>,
+    pub last_attach_failure_duration_millis: Option<u64>,
+    pub last_application_progress_millis_ago: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -268,7 +291,43 @@ struct PeerConn {
     /// The generation owned by the remote endpoint.
     remote_generation: u64,
     generation: u64,
-    last_application_activity: Option<Instant>,
+    opened_at: Instant,
+    health: ConnectionHealthState,
+}
+
+#[derive(Debug, Default)]
+struct ConnectionHealthState {
+    consecutive_attach_failures: u32,
+    last_attach_failure_phase: Option<String>,
+    last_attach_failure_duration: Option<Duration>,
+    last_application_progress: Option<Instant>,
+    sustained_progress_started: Option<Instant>,
+}
+
+impl ConnectionHealthState {
+    fn note_application_progress(&mut self, now: Instant) {
+        let continues = self
+            .last_application_progress
+            .is_some_and(|last| now.duration_since(last) <= SUSTAINED_PROGRESS_MAX_GAP);
+        if self.sustained_progress_started.is_none() || !continues {
+            self.sustained_progress_started = Some(now);
+        }
+        self.last_application_progress = Some(now);
+        if self
+            .sustained_progress_started
+            .is_some_and(|started| now.duration_since(started) >= SUSTAINED_PROGRESS_DURATION)
+        {
+            self.consecutive_attach_failures = 0;
+        }
+    }
+
+    fn note_attach_failure(&mut self, phase: &str, duration: Duration) -> u32 {
+        self.consecutive_attach_failures = self.consecutive_attach_failures.saturating_add(1);
+        self.last_attach_failure_phase = Some(phase.to_string());
+        self.last_attach_failure_duration = Some(duration);
+        self.sustained_progress_started = None;
+        self.consecutive_attach_failures
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -567,16 +626,13 @@ impl PeerConnections {
         generation: u64,
         peer_addr: &EndpointAddr,
         protocol: &str,
-        activity: StreamActivity,
+        _activity: StreamActivity,
     ) -> Result<Option<Connection>> {
         let mut conns = self.conns.lock().await;
-        if let Some(existing) = conns.get_mut(&peer_addr.id)
+        if let Some(existing) = conns.get(&peer_addr.id)
             && existing.generation == generation
             && existing.connection.close_reason().is_none()
         {
-            if activity == StreamActivity::Application {
-                existing.last_application_activity = Some(Instant::now());
-            }
             return Ok(Some(existing.connection.clone()));
         }
         if let Some(existing) = conns.get(&peer_addr.id)
@@ -621,8 +677,8 @@ impl PeerConnections {
                 connection: connection.clone(),
                 remote_generation,
                 generation,
-                last_application_activity: (activity == StreamActivity::Application)
-                    .then(Instant::now),
+                opened_at: Instant::now(),
+                health: ConnectionHealthState::default(),
             },
         );
         let _ = self.opened_tx.send(connection.clone());
@@ -630,6 +686,16 @@ impl PeerConnections {
     }
 
     async fn close_and_forget_if(&self, peer: EndpointId, stable_id: usize) {
+        self.close_and_forget_if_with_reason(peer, stable_id, REPEATED_STREAM_FAILURE_REASON)
+            .await;
+    }
+
+    async fn close_and_forget_if_with_reason(
+        &self,
+        peer: EndpointId,
+        stable_id: usize,
+        reason: &'static [u8],
+    ) {
         let mut connections = self.conns.lock().await;
         if connections
             .get(&peer)
@@ -638,9 +704,7 @@ impl PeerConnections {
             let failed = connections
                 .remove(&peer)
                 .expect("the matched mux connection disappeared while locked");
-            failed
-                .connection
-                .close(0u32.into(), REPEATED_STREAM_FAILURE_REASON);
+            failed.connection.close(0u32.into(), reason);
         }
     }
 
@@ -689,7 +753,8 @@ impl PeerConnections {
                     connection: connection.clone(),
                     remote_generation,
                     generation,
-                    last_application_activity: None,
+                    opened_at: Instant::now(),
+                    health: ConnectionHealthState::default(),
                 },
             );
         } else {
@@ -697,11 +762,42 @@ impl PeerConnections {
         }
     }
 
-    /// Record an admitted inbound application stream.
-    pub async fn note_application_activity(&self, peer: EndpointId) {
-        if let Some(connection) = self.conns.lock().await.get_mut(&peer) {
-            connection.last_application_activity = Some(Instant::now());
+    /// Record application bytes or an acknowledgement on one exact connection.
+    pub async fn note_application_progress(&self, peer: EndpointId, stable_id: usize) {
+        if let Some(connection) = self.conns.lock().await.get_mut(&peer)
+            && connection.connection.stable_id() == stable_id
+        {
+            connection.health.note_application_progress(Instant::now());
         }
+    }
+
+    /// Record a failed tunnel attach on one exact connection.
+    ///
+    /// Three consecutive failures replace that connection. Brief application
+    /// progress does not clear the count.
+    pub async fn note_attach_failure(
+        &self,
+        peer: EndpointId,
+        stable_id: usize,
+        phase: &str,
+        duration: Duration,
+    ) -> bool {
+        let replace = {
+            let mut connections = self.conns.lock().await;
+            let Some(connection) = connections.get_mut(&peer) else {
+                return false;
+            };
+            if connection.connection.stable_id() != stable_id {
+                return false;
+            }
+            connection.health.note_attach_failure(phase, duration)
+                >= ATTACH_FAILURES_BEFORE_REPLACE
+        };
+        if replace {
+            self.close_and_forget_if_with_reason(peer, stable_id, REPEATED_ATTACH_FAILURE_REASON)
+                .await;
+        }
+        replace
     }
 
     /// Recent application traffic makes a separate liveness probe redundant.
@@ -710,8 +806,44 @@ impl PeerConnections {
             .lock()
             .await
             .get(&peer)
-            .and_then(|connection| connection.last_application_activity)
+            .filter(|connection| connection.health.consecutive_attach_failures == 0)
+            .and_then(|connection| connection.health.last_application_progress)
             .is_some_and(|last| last.elapsed() <= within)
+    }
+
+    /// Snapshot current connection health. Replacement starts a new window.
+    pub async fn current_health(&self) -> HashMap<EndpointId, CurrentConnectionHealth> {
+        let now = Instant::now();
+        self.conns
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, connection)| connection.connection.close_reason().is_none())
+            .map(|(peer, connection)| {
+                (
+                    *peer,
+                    CurrentConnectionHealth {
+                        connection_id: connection.connection.stable_id() as u64,
+                        age_millis: duration_millis(now.duration_since(connection.opened_at)),
+                        consecutive_attach_failures: connection
+                            .health
+                            .consecutive_attach_failures,
+                        last_attach_failure_phase: connection
+                            .health
+                            .last_attach_failure_phase
+                            .clone(),
+                        last_attach_failure_duration_millis: connection
+                            .health
+                            .last_attach_failure_duration
+                            .map(duration_millis),
+                        last_application_progress_millis_ago: connection
+                            .health
+                            .last_application_progress
+                            .map(|last| duration_millis(now.duration_since(last))),
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Return the live shared connection for path inspection.
@@ -738,6 +870,38 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const LEGACY_ECHO_ALPN: &[u8] = b"fabric/test-legacy-echo/1";
+
+    #[test]
+    fn brief_progress_does_not_clear_consecutive_attach_failures() {
+        let start = Instant::now();
+        let mut health = ConnectionHealthState::default();
+        assert_eq!(health.note_attach_failure("hello", Duration::from_millis(10)), 1);
+        health.note_application_progress(start);
+        health.note_application_progress(
+            start + SUSTAINED_PROGRESS_DURATION - Duration::from_millis(1),
+        );
+        assert_eq!(
+            health.note_attach_failure("attached", Duration::from_millis(20)),
+            2,
+            "a short successful attach must not reset the current connection"
+        );
+    }
+
+    #[test]
+    fn sustained_progress_clears_consecutive_attach_failures() {
+        let start = Instant::now();
+        let mut health = ConnectionHealthState::default();
+        assert_eq!(health.note_attach_failure("hello", Duration::from_millis(10)), 1);
+        health.note_application_progress(start);
+        for second in 1..=SUSTAINED_PROGRESS_DURATION.as_secs() {
+            health.note_application_progress(start + Duration::from_secs(second));
+        }
+        assert_eq!(
+            health.note_attach_failure("attached", Duration::from_millis(20)),
+            1,
+            "sustained application progress must start a new failure sequence"
+        );
+    }
 
     #[test]
     fn header_round_trips_through_bytes() {
@@ -1426,6 +1590,21 @@ mod tests {
             assert_eq!(&buf, b"ping");
         }
 
+        assert!(
+            !manager
+                .recently_active(server_addr.id, Duration::from_secs(1))
+                .await,
+            "mux admission and raw stream bytes do not prove tunnel progress"
+        );
+        let stable_id = manager
+            .connection(server_addr.id)
+            .await
+            .expect("the shared connection is cached")
+            .stable_id();
+        manager
+            .note_application_progress(server_addr.id, stable_id)
+            .await;
+
         // Both streams rode ONE shared connection, and the manager cached one peer.
         assert_eq!(
             connections.load(Ordering::SeqCst),
@@ -1444,7 +1623,54 @@ mod tests {
                 .recently_active(server_addr.id, Duration::from_secs(1))
                 .await
         );
-        assert!(manager.redial(server_addr.id, b"test degradation").await);
+        assert!(
+            !manager
+                .note_attach_failure(
+                    server_addr.id,
+                    stable_id,
+                    "hello",
+                    Duration::from_millis(10),
+                )
+                .await
+        );
+        assert!(
+            !manager
+                .recently_active(server_addr.id, Duration::from_secs(1))
+                .await,
+            "a current attach failure must not hide behind older progress"
+        );
+        assert!(
+            !manager
+                .note_attach_failure(
+                    server_addr.id,
+                    stable_id,
+                    "attached",
+                    Duration::from_millis(20),
+                )
+                .await
+        );
+        assert_eq!(
+            manager.current_health().await[&server_addr.id]
+                .consecutive_attach_failures,
+            2
+        );
+        assert_eq!(
+            manager.current_health().await[&server_addr.id]
+                .last_attach_failure_phase
+                .as_deref(),
+            Some("attached")
+        );
+        assert!(
+            manager
+                .note_attach_failure(
+                    server_addr.id,
+                    stable_id,
+                    "hello",
+                    Duration::from_millis(30),
+                )
+                .await
+        );
+        assert_eq!(manager.peer_count().await, 0);
         let stream = manager
             .open_mux_stream(
                 &client,
@@ -1456,6 +1682,18 @@ mod tests {
             .await?;
         drop(stream);
         assert_eq!(connections.load(Ordering::SeqCst), 2);
+        assert!(
+            !manager
+                .note_attach_failure(
+                    server_addr.id,
+                    stable_id,
+                    "attached",
+                    Duration::from_millis(40),
+                )
+                .await,
+            "a late failure must not close the replacement connection"
+        );
+        assert_eq!(manager.peer_count().await, 1);
 
         router.shutdown().await?;
         client.close().await;

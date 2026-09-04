@@ -40,6 +40,7 @@ const SERVER_SESSION_REAP_INTERVAL: Duration = Duration::from_secs(60);
 /// A new local request must fail before its caller's ordinary five-second
 /// timeout. Once a session attached, it retries without this deadline.
 const INITIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const HEALTH_PROGRESS_REPORT_INTERVAL: Duration = Duration::from_millis(250);
 /// How often a session whose local input has ended asks the kernel whether the
 /// consumer is still there. Only such sessions probe, so the cost is one
 /// zero-length write per second per half-closed or abandoned session.
@@ -632,17 +633,20 @@ impl TunnelSession {
         state.attach_gauge = None;
     }
 
-    async fn apply_peer_ack(&self, recv_next: u64) {
+    async fn apply_peer_ack(&self, recv_next: u64) -> bool {
         let mut state = self.state.lock().await;
+        let previous = state.send_acked;
         if recv_next > state.send_acked {
             state.send_acked = recv_next.min(state.send_next);
             drop_acked_chunks(&mut state);
         }
+        let advanced = state.send_acked > previous;
         drop(state);
         self.notify.notify_waiters();
+        advanced
     }
 
-    async fn accept_data(&self, offset: u64, bytes: Vec<u8>) -> Result<()> {
+    async fn accept_data(&self, offset: u64, bytes: Vec<u8>) -> Result<bool> {
         let bytes = {
             let state = self.state.lock().await;
             if offset > state.recv_next {
@@ -656,7 +660,7 @@ impl TunnelSession {
             if already_have >= bytes.len() {
                 drop(state);
                 self.notify.notify_waiters();
-                return Ok(());
+                return Ok(false);
             }
             bytes[already_have..].to_vec()
         };
@@ -696,7 +700,7 @@ impl TunnelSession {
             self.shutdown_local_write().await?;
         }
         self.notify.notify_waiters();
-        Ok(())
+        Ok(!bytes.is_empty())
     }
 
     async fn accept_remote_close(&self, offset: u64) -> Result<()> {
@@ -828,18 +832,19 @@ impl TunnelSession {
         true
     }
 
-    pub async fn run_attach(
+    async fn run_attach(
         self: Arc<Self>,
         send: SendStream,
         recv: RecvStream,
         peer_recv_next: u64,
+        health: Option<AttachConnectionHealth>,
     ) -> Result<()> {
         self.begin_attach().await?;
         self.apply_peer_ack(peer_recv_next).await;
 
         let result = async {
             let mut writer = tokio::spawn(write_attach_loop(self.clone(), send));
-            let mut reader = tokio::spawn(read_attach_loop(self.clone(), recv));
+            let mut reader = tokio::spawn(read_attach_loop(self.clone(), recv, health));
 
             tokio::select! {
                 result = &mut writer => {
@@ -965,12 +970,28 @@ fn chunks_from(buffer: &VecDeque<BufferedChunk>, start: u64) -> Vec<BufferedChun
     chunks
 }
 
-async fn read_attach_loop(session: Arc<TunnelSession>, mut recv: RecvStream) -> Result<()> {
+async fn read_attach_loop(
+    session: Arc<TunnelSession>,
+    mut recv: RecvStream,
+    mut health: Option<AttachConnectionHealth>,
+) -> Result<()> {
     while let Some(frame) = read_frame(&mut recv).await? {
         match frame {
             Frame::Hello { .. } => bail!("unexpected tunnel hello after attach"),
-            Frame::Data { offset, bytes } => session.accept_data(offset, bytes).await?,
-            Frame::Ack { recv_next } => session.apply_peer_ack(recv_next).await,
+            Frame::Data { offset, bytes } => {
+                if session.accept_data(offset, bytes).await?
+                    && let Some(health) = &mut health
+                {
+                    health.note_application_progress().await;
+                }
+            }
+            Frame::Ack { recv_next } => {
+                if session.apply_peer_ack(recv_next).await
+                    && let Some(health) = &mut health
+                {
+                    health.note_application_progress().await;
+                }
+            }
             Frame::Close { offset } => session.accept_remote_close(offset).await?,
             Frame::Error { message } => bail!("tunnel peer error: {message}"),
         }
@@ -1146,6 +1167,7 @@ async fn run_client_attach_loop(
             attach_stream(
                 session.clone(),
                 stream,
+                connections.clone(),
                 drop_rx.clone(),
                 notices.as_ref(),
                 &mut backoff,
@@ -1326,15 +1348,85 @@ async fn connect_and_attach(
         }
         error = session.watch_local_endpoint() => return Err(error),
     };
-    attach_stream(session, stream, drop_rx, notices, backoff).await
+    attach_stream(session, stream, connections, drop_rx, notices, backoff).await
+}
+
+#[derive(Clone)]
+struct AttachConnectionHealth {
+    connections: Arc<PeerConnections>,
+    peer: EndpointId,
+    stable_id: usize,
+    last_progress_report: Option<Instant>,
+}
+
+impl AttachConnectionHealth {
+    fn new(connections: Arc<PeerConnections>, connection: &Connection) -> Self {
+        Self {
+            connections,
+            peer: connection.remote_id(),
+            stable_id: connection.stable_id(),
+            last_progress_report: None,
+        }
+    }
+
+    async fn note_application_progress(&mut self) {
+        let now = Instant::now();
+        if self
+            .last_progress_report
+            .is_some_and(|last| now.duration_since(last) < HEALTH_PROGRESS_REPORT_INTERVAL)
+        {
+            return;
+        }
+        self.last_progress_report = Some(now);
+        self.connections
+            .note_application_progress(self.peer, self.stable_id)
+            .await;
+    }
+
+    async fn note_attach_failure(&self, phase: &str, duration: Duration) {
+        self.connections
+            .note_attach_failure(self.peer, self.stable_id, phase, duration)
+            .await;
+    }
 }
 
 async fn attach_stream(
     session: Arc<TunnelSession>,
     stream: MuxStream,
+    connections: Arc<PeerConnections>,
     drop_rx: watch::Receiver<u64>,
     notices: Option<&ClientConnectionNotices>,
     backoff: &mut Backoff,
+) -> Result<()> {
+    let health = AttachConnectionHealth::new(connections, &stream.connection);
+    let started = Instant::now();
+    let mut phase = "hello";
+    let result = attach_stream_inner(
+        session.clone(),
+        stream,
+        drop_rx,
+        notices,
+        backoff,
+        health.clone(),
+        &mut phase,
+    )
+    .await;
+    if !matches!(&result, Err(error) if is_permanent_failure(error))
+        && (result.is_err() || !session.is_complete().await)
+    {
+        health.note_attach_failure(phase, started.elapsed()).await;
+    }
+    result
+}
+
+async fn attach_stream_inner(
+    session: Arc<TunnelSession>,
+    stream: MuxStream,
+    drop_rx: watch::Receiver<u64>,
+    notices: Option<&ClientConnectionNotices>,
+    backoff: &mut Backoff,
+    health: AttachConnectionHealth,
+    phase: &mut &'static str,
 ) -> Result<()> {
     let MuxStream {
         connection,
@@ -1368,6 +1460,7 @@ async fn attach_stream(
     if session_id != session.id() {
         bail!("tunnel server replied with wrong session id {session_id}");
     }
+    *phase = "attached";
     // A valid Hello proves that the peer accepted this exact durable session.
     // A later drop is a new outage and must not inherit an older outage's delay.
     backoff.reset();
@@ -1382,7 +1475,10 @@ async fn attach_stream(
     session
         .hold_attach_gauge(notices.and_then(|notices| notices.gauge.clone()))
         .await;
-    let result = session.clone().run_attach(send, recv, recv_next).await;
+    let result = session
+        .clone()
+        .run_attach(send, recv, recv_next, Some(health))
+        .await;
     // Between attaches nothing is held: a reconnecting session must not block a
     // recycle, since a recycle may be exactly what lets it reconnect.
     session.release_attach_gauge().await;
@@ -1704,10 +1800,12 @@ pub async fn serve_connection(
     mut recv: RecvStream,
     peer_id: EndpointId,
     target: ServerTarget,
+    connections: Option<Arc<PeerConnections>>,
     sessions: ServerSessionStore,
     drop_rx: watch::Receiver<u64>,
 ) -> Result<()> {
     attach_drop_closer(&connection, drop_rx);
+    let health = connections.map(|connections| AttachConnectionHealth::new(connections, &connection));
     let Some(Frame::Hello {
         session_id,
         recv_next,
@@ -1754,7 +1852,18 @@ pub async fn serve_connection(
         return Err(error);
     }
 
-    let result = session.clone().run_attach(send, recv, recv_next).await;
+    let attach_started = Instant::now();
+    let result = session
+        .clone()
+        .run_attach(send, recv, recv_next, health.clone())
+        .await;
+    if matches!(&result, Err(error) if !is_permanent_failure(error))
+        && let Some(health) = health
+    {
+        health
+            .note_attach_failure("attached", attach_started.elapsed())
+            .await;
+    }
     sessions.reap_expired(sessions.detached_ttl).await;
     if let Err(error) = &result
         && is_expected_detach(error)

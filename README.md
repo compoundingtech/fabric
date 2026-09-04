@@ -488,28 +488,36 @@ Older default-home installs may have peer entries in
 Fabric migrates those entries to `~/.config/fabric/peers.toml`; an existing
 canonical `peers.toml` wins.
 
-Connection counters live in `<home>/telemetry.json`. They are counters, not
-state the product depends on, so an unreadable file starts the counts over and
-says so rather than stopping the daemon. Delete the file to reset the counts.
+Connection counters live in `<home>/telemetry.json`. They are lifetime history,
+not current connection state. An unreadable file starts the counts over and says
+so rather than stopping the daemon. Delete the file to reset the counts.
 
 ### Did my session actually come back?
 
 `fabric status` answers this from counters that survive a daemon restart:
 
 ```text
-sessions	since 2026-08-24T14:12:09Z
-  hetz	lost=4 resumed=4 failed=0 attempts=7 reconnect_p50=2.0s reconnect_max=4.5s
+current connections
+  hetz	id=19 age=12.5s attach_failures=0 last_failure=none last_application_progress=450ms ago
+session history (lifetime totals)	since 2026-08-24T14:12:09Z
+  hetz	lifetime_lost=4 lifetime_resumed=4 lifetime_failed=0 lifetime_attempts=7 reconnect_p50=2.0s reconnect_max=4.5s
     lost_on=direct=3,relay=1 resumed_on=direct=2,relay=2
-  droppy [not in peers.toml]	lost=3 resumed=0 failed=1 attempts=10885 reconnect_p50=- reconnect_max=-
+  droppy [not in peers.toml]	lifetime_lost=3 lifetime_resumed=0 lifetime_failed=1 lifetime_attempts=10885 reconnect_p50=- reconnect_max=-
 ```
 
-The heading gives the start of the cumulative counter window. A daemon restart
-does not reset it. A reset caused by an unreadable or incompatible snapshot says
-why on the same line. A snapshot from before window tracking says that its start
-is unknown instead of inventing a time.
+The current block resets when Fabric replaces that exact shared connection.
+Three consecutive tunnel attach failures cause that replacement. Only sustained
+application progress clears the failure count. Admission and a short attach do
+not clear it.
+
+The history heading gives the start of the cumulative counter window. A daemon
+restart does not reset it. A reset caused by an unreadable or incompatible
+snapshot says why on the same line. A snapshot from before window tracking says
+that its start is unknown instead of inventing a time.
 
 Read the pair, not either number alone: 4 resumed out of 4 lost and 4 out of 40
-are very different systems. `attempts` counts every retry, so it exceeds `lost`
+are very different systems. `lifetime_attempts` counts every retry, so it exceeds
+`lifetime_lost`
 whenever a break needed more than one try. `reconnect_p50` is the measured time
 from the loss to the resume, which is not the retry backoff delay the log line
 reports. The percentiles come from bounded histogram buckets, so they are

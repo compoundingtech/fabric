@@ -8,6 +8,12 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **A failed tunnel no longer reuses one bad shared connection forever.**
+  Fabric counts post-admission attach failures on the exact current connection.
+  Three consecutive failures replace it. Only sustained application progress
+  clears the count. Status separates current connection health from durable
+  lifetime session totals.
+
 - **A sync pass no longer clones the complete final manifest and observed map
   only to compare them with its baseline.** The pass keeps the required
   baseline across the unlocked peer step and compares the final state by

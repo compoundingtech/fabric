@@ -525,6 +525,7 @@ async fn main() -> Result<()> {
                             peers,
                             connection_telemetry,
                             connection_telemetry_window,
+                            current_connection_health,
                             active_dial_handlers,
                             max_dial_handlers,
                         } => {
@@ -539,6 +540,7 @@ async fn main() -> Result<()> {
                                 &peers,
                                 &connection_telemetry,
                                 &connection_telemetry_window,
+                                &current_connection_health,
                                 (active_dial_handlers, max_dial_handlers),
                             )?;
                         }
@@ -1960,12 +1962,15 @@ mod connection_telemetry_tests {
     fn the_rendered_shape_matches_the_documented_one() {
         let telemetry = BTreeMap::from([("hetz".to_string(), peer_with_losses())]);
         let lines = connection_telemetry_lines(&telemetry, &test_window(), &current(&["hetz"]));
-        assert_eq!(lines[0], "sessions\tsince 1970-01-01T00:00:00Z");
+        assert_eq!(
+            lines[0],
+            "session history (lifetime totals)\tsince 1970-01-01T00:00:00Z"
+        );
         assert_eq!(
             lines[1],
             // p50 is a bucket bound, because a histogram cannot report better
             // than its bucket. The max is the exact largest sample seen.
-            "  hetz\tlost=4 resumed=4 failed=0 attempts=7 reconnect_p50=2.0s reconnect_max=4.5s"
+            "  hetz\tlifetime_lost=4 lifetime_resumed=4 lifetime_failed=0 lifetime_attempts=7 reconnect_p50=2.0s reconnect_max=4.5s"
         );
         assert_eq!(
             lines[2],
@@ -1992,7 +1997,8 @@ mod connection_telemetry_tests {
         assert_eq!(
             lines,
             vec![
-                "sessions\tsince 1970-01-01T00:00:00Z".to_string(),
+                "session history (lifetime totals)\tsince 1970-01-01T00:00:00Z"
+                    .to_string(),
                 "  no losses recorded".to_string(),
             ]
         );
@@ -2056,7 +2062,27 @@ mod connection_telemetry_tests {
         });
         assert_eq!(
             line,
-            "sessions\twindow start unknown: snapshot predates window tracking"
+            "session history (lifetime totals)\twindow start unknown: snapshot predates window tracking"
+        );
+    }
+
+    #[test]
+    fn current_connection_health_names_its_replacement_scope() {
+        let lines = current_connection_health_lines(&BTreeMap::from([(
+            "bluey".to_string(),
+            fabric::mux::CurrentConnectionHealth {
+                connection_id: 19,
+                age_millis: 12_500,
+                consecutive_attach_failures: 2,
+                last_attach_failure_phase: Some("hello".to_string()),
+                last_attach_failure_duration_millis: Some(750),
+                last_application_progress_millis_ago: Some(450),
+            },
+        )]));
+        assert_eq!(lines[0], "current connections");
+        assert_eq!(
+            lines[1],
+            "  bluey\tid=19 age=12.5s attach_failures=2 last_failure=hello/750ms last_application_progress=450ms ago"
         );
     }
 }
@@ -2226,6 +2252,7 @@ fn print_status(
     peers: &[PeerReachability],
     connection_telemetry: &BTreeMap<String, PeerTelemetry>,
     connection_telemetry_window: &TelemetryWindow,
+    current_connection_health: &BTreeMap<String, fabric::mux::CurrentConnectionHealth>,
     dial_handlers: (usize, usize),
 ) -> Result<()> {
     println!("version\t{version}");
@@ -2247,6 +2274,7 @@ fn print_status(
     let (active, max) = dial_handlers;
     println!("dial handlers\t{active}/{max} in use");
     print_peer_reachability(peers);
+    print_current_connection_health(current_connection_health);
     let current_peers = peers
         .iter()
         .map(|peer| peer.name.clone().unwrap_or_else(|| peer.id.clone()))
@@ -2258,6 +2286,52 @@ fn print_status(
     );
     print_path_latency(connection_telemetry, &current_peers);
     Ok(())
+}
+
+fn print_current_connection_health(
+    health: &BTreeMap<String, fabric::mux::CurrentConnectionHealth>,
+) {
+    for line in current_connection_health_lines(health) {
+        println!("{line}");
+    }
+}
+
+fn current_connection_health_lines(
+    health: &BTreeMap<String, fabric::mux::CurrentConnectionHealth>,
+) -> Vec<String> {
+    let mut lines = vec!["current connections".to_string()];
+    if health.is_empty() {
+        lines.push("  none".to_string());
+        return lines;
+    }
+    for (peer, connection) in health {
+        let progress = connection
+            .last_application_progress_millis_ago
+            .map(|millis| format!("{} ago", format_millis(millis)))
+            .unwrap_or_else(|| "none".to_string());
+        let failure = match (
+            connection.last_attach_failure_phase.as_deref(),
+            connection.last_attach_failure_duration_millis,
+        ) {
+            (Some(phase), Some(millis)) => format!("{phase}/{}", format_millis(millis)),
+            _ => "none".to_string(),
+        };
+        lines.push(format!(
+            "  {peer}\tid={} age={} attach_failures={} last_failure={failure} last_application_progress={progress}",
+            connection.connection_id,
+            format_millis(connection.age_millis),
+            connection.consecutive_attach_failures,
+        ));
+    }
+    lines
+}
+
+fn format_millis(millis: u64) -> String {
+    if millis < 1_000 {
+        format!("{millis}ms")
+    } else {
+        format!("{:.1}s", millis as f64 / 1_000.0)
+    }
 }
 
 /// Report what the counters know about losing and regaining a transport.
@@ -2391,7 +2465,7 @@ fn connection_telemetry_lines(
             "-".to_string()
         };
         lines.push(format!(
-            "  {peer}\tlost={} resumed={} failed={} attempts={} reconnect_p50={median} reconnect_max={worst}",
+            "  {peer}\tlifetime_lost={} lifetime_resumed={} lifetime_failed={} lifetime_attempts={} reconnect_p50={median} reconnect_max={worst}",
             stats.losses, stats.resumes, stats.resume_failures, stats.reconnect_attempts
         ));
         if !stats.losses_by_path.is_empty() || !stats.resumes_by_path.is_empty() {
@@ -2413,10 +2487,17 @@ fn telemetry_window_line(window: &TelemetryWindow) -> String {
             .and_then(|timestamp| timestamp.format(&Rfc3339).ok())
     });
     match (started, window.reset_reason.as_deref()) {
-        (Some(started), Some(reason)) => format!("sessions\tsince {started}; {reason}"),
-        (Some(started), None) => format!("sessions\tsince {started}"),
-        (None, Some(reason)) => format!("sessions\t{reason}"),
-        (None, None) => "sessions\twindow unknown: daemon did not report it".to_string(),
+        (Some(started), Some(reason)) => {
+            format!("session history (lifetime totals)\tsince {started}; {reason}")
+        }
+        (Some(started), None) => {
+            format!("session history (lifetime totals)\tsince {started}")
+        }
+        (None, Some(reason)) => format!("session history (lifetime totals)\t{reason}"),
+        (None, None) => {
+            "session history (lifetime totals)\twindow unknown: daemon did not report it"
+                .to_string()
+        }
     }
 }
 
