@@ -355,6 +355,9 @@ ended at 36 passes, 104 scans, 28 no-ops, and 16 guarded transactions. The
 window saw exactly two daemon atomic renames, from `.fabric-tmp` paths to
 `Silber/poc-server/status` and `Silber/vrs-study/status`.
 
+Hetz was walking its entire tree because two agents on Silber updated their
+status files.
+
 Two guarded transactions therefore produced two forward passes and eight
 scans. A receipt mismatch would have scheduled an extra watcher pass, so the
 absence of either extra pass proves that suppression fired twice. The two
@@ -366,6 +369,33 @@ An earlier 30-second window also measured one guarded transaction, one pass,
 and four scans. A later window had no guarded transaction, three passes, six
 scans, and one local hetz atomic-write burst. The latter cannot test the
 prediction; it confirms only that every pass still cost two scans.
+
+Five later live 30-second hetz windows used the same malloc, calloc, realloc,
+and posix_memalign probes as the original allocation measurement. They
+requested 466,272,149, 502,615,392, 1,589,763,800, 1,703,068,388, and
+448,672,305 bytes. Their rates were 52.11, 56.17, 177.67, 190.33, and 50.14
+GiB/hour. The median was 56.17 GiB/hour. The aggregate was 4,710,392,034 bytes
+during 150 sampled seconds, or 105.29 GiB/hour.
+
+The median is only 1.1 percent below the original 56.8 GiB/hour window. The
+busy windows also show that the 75.20 MB full-pass estimate and scan frequency
+do not explain all daemon allocation. The improvement is not enough. Even the
+lowest deployed window remained above 50 GiB/hour, so Fabric does not yet meet
+the low-memory and low-CPU goal.
+
+Six matched host intervals covered 184 seconds without either daemon PID
+changing. Silber added 23 passes, 60 scans, 14 inbound no-ops, and seven
+guarded transactions. Its RSS stayed between 266,848 and 277,280 kB and ended
+48 kB above its first sample. Hetz added 20 passes, 59 scans, 14 no-ops, and
+nine guarded transactions. Its trimmed RSS moved between 174,160 and 302,840
+kB and ended 284 kB below its first sample.
+
+The proved suppression removes two scans per guarded transaction. Applying
+that delta to the matched series gives 74 scans without the fix on Silber and
+77 on hetz. The deployed build avoided 14 scans on Silber, or 18.9 percent,
+and 18 on hetz, or 23.4 percent. Hetz avoided four more scans because it
+received two more guarded transactions. This matches the predicted host
+direction, while the short RSS series shows no durable slope on either host.
 
 The rollout rollback binaries both reported `0.2.1+71f3d06`. Both exact
 rollback files and all release, instrumentation, preflight, and transfer files
