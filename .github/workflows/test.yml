@@ -67,11 +67,9 @@ jobs:
       # Temporary proof for PR 146. Remove this step after its Linux RSS number
       # is recorded; the ignored measurement remains available for later use.
       - name: Linux allocator trim measurement
-        env:
-          FABRIC_MEASURE_ALLOCATOR_TRIM: "1"
         run: >-
           timeout 5m cargo test --locked --release --lib
-          materialize_resident_cost_with_and_without_the_cache
+          concurrent_manifest_decode_resident_cost_before_and_after_trim
           -- --ignored --nocapture
 
       # The binary's own tests were never built here, so a test in src/main.rs

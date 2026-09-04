@@ -3664,8 +3664,6 @@ mod tests {
     ///
     /// Ignored by default because it is a measurement, not a guard. Run it with
     /// `cargo test --release -- --ignored --nocapture materialize_resident_cost`.
-    /// On glibc Linux, set `FABRIC_MEASURE_ALLOCATOR_TRIM=1` to run the same
-    /// corpus with the daemon's RSS growth-step trim.
     ///
     /// Sized to the live `st2-declarations-default` entry observed on
     /// 2026-08-19: three files of about 23 MB, 70.2 MB total, passed over once
@@ -3744,18 +3742,6 @@ mod tests {
         const PASSES: usize = 200;
 
         let before = rss_kb();
-        let trim_enabled = std::env::var("FABRIC_MEASURE_ALLOCATOR_TRIM").as_deref() == Ok("1");
-        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-        assert!(!trim_enabled, "allocator trim measurement requires glibc Linux");
-        let trim_step_kb = crate::daemon::ENDPOINT_RSS_GROWTH_STEP_BYTES / 1024;
-        #[cfg(all(target_os = "linux", target_env = "gnu"))]
-        let mut trim_baseline_kb = before;
-        #[cfg(all(target_os = "linux", target_env = "gnu"))]
-        let mut trim_attempts = 0u64;
-        #[cfg(all(target_os = "linux", target_env = "gnu"))]
-        let mut trim_successes = 0u64;
-        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-        let (trim_attempts, trim_successes) = (0u64, 0u64);
         for _ in 0..PASSES {
             let mut obs = HashMap::new();
             materialize_tracked(
@@ -3769,16 +3755,6 @@ mod tests {
                 None,
             )
             .unwrap();
-            #[cfg(all(target_os = "linux", target_env = "gnu"))]
-            if trim_enabled {
-                let rss_before_trim = rss_kb();
-                if rss_before_trim >= trim_baseline_kb.saturating_add(trim_step_kb) {
-                    trim_attempts += 1;
-                    trim_successes +=
-                        u64::from(crate::daemon::trim_process_allocator_for_test());
-                    trim_baseline_kb = rss_kb();
-                }
-            }
         }
         let after_reads = rss_kb();
 
@@ -3810,14 +3786,97 @@ mod tests {
             "bytes read: re-reading path {:.1} GB, cached path 0.0 GB",
             (total as f64 * PASSES as f64) / 1e9
         );
-        println!(
-            "allocator trim: enabled={trim_enabled} step_mb={} attempts={trim_attempts} successes={trim_successes}",
-            trim_step_kb / 1024
-        );
-        if trim_enabled {
-            assert!(trim_attempts > 0, "the probe never reached one RSS growth step");
-            assert!(trim_successes > 0, "glibc declined every allocator trim request");
+    }
+
+    /// Whether glibc returns the many small allocations made across the live
+    /// daemon's worker count. This is a measurement, not a normal test.
+    ///
+    /// The corpus matches hetz at 2026-09-04. The live process had 28,827
+    /// present entries, 17,641 tombstones, 20 threads, and thirteen fully
+    /// resident 64 MiB anonymous arenas. Sixteen workers approximate the Tokio
+    /// worker pool while keeping the CI memory bound below the live process.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    #[ignore = "Linux allocator measurement"]
+    fn concurrent_manifest_decode_resident_cost_before_and_after_trim() {
+        const PRESENT: usize = 28_827;
+        const TOMBSTONES: usize = 17_641;
+        const WORKERS: usize = 16;
+        const ROUNDS_PER_WORKER: usize = 25;
+
+        fn rss_kb() -> u64 {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+                .output()
+                .expect("ps");
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(0)
         }
+
+        let mut manifest = Manifest::new();
+        for i in 0..PRESENT {
+            manifest.insert(
+                format!("agents/host{}/agent{i}/context/now.md", i % 16),
+                Entry::Present(FileMeta {
+                    hash: ContentHash([(i % 251) as u8; 32]),
+                    size: 1024 + i as u64,
+                    executable: false,
+                    mtime_secs: 1_788_500_000 + i as i64,
+                    mtime_nanos: (i % 1_000_000_000) as u32,
+                    version: 1 + (i % 5) as u64,
+                    author: Author([(i % 13) as u8; 32]),
+                }),
+            );
+        }
+        for i in 0..TOMBSTONES {
+            manifest.insert(
+                format!("agents/host{}/agent{i}/inbox/msg-{i}.md", i % 16),
+                Entry::Tombstone(Tombstone {
+                    version: 2,
+                    author: Author([(i % 13) as u8; 32]),
+                    deleted_secs: 1_788_000_000 + i as i64,
+                }),
+            );
+        }
+        let encoded = Arc::new(serde_json::to_vec(&manifest).expect("encode corpus"));
+        drop(manifest);
+
+        let rss_start_kb = rss_kb();
+        std::thread::scope(|scope| {
+            for _ in 0..WORKERS {
+                let encoded = encoded.clone();
+                scope.spawn(move || {
+                    for _ in 0..ROUNDS_PER_WORKER {
+                        let decoded: Manifest =
+                            serde_json::from_slice(&encoded).expect("decode corpus");
+                        std::hint::black_box(decoded.len());
+                    }
+                });
+            }
+        });
+        let rss_before_trim_kb = rss_kb();
+        let trim_succeeded = crate::daemon::trim_process_allocator_for_test();
+        let rss_after_trim_kb = rss_kb();
+
+        println!(
+            "concurrent manifest decode: entries={} json_mb={:.1} workers={WORKERS} rounds_per_worker={ROUNDS_PER_WORKER}",
+            PRESENT + TOMBSTONES,
+            encoded.len() as f64 / 1_048_576.0,
+        );
+        println!(
+            "RSS MB: start {:.0}, before trim {:.0}, after trim {:.0}; trim_succeeded={trim_succeeded}",
+            rss_start_kb as f64 / 1024.0,
+            rss_before_trim_kb as f64 / 1024.0,
+            rss_after_trim_kb as f64 / 1024.0,
+        );
+
+        assert!(trim_succeeded, "glibc declined the allocator trim request");
+        assert!(
+            rss_after_trim_kb < rss_before_trim_kb,
+            "the allocator trim returned success but RSS did not decrease"
+        );
     }
 
     /// What the sweep is worth, measured rather than asserted.

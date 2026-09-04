@@ -102,7 +102,7 @@ const ENDPOINT_RECYCLE_MIN_INTERVAL: Duration = Duration::from_secs(60);
 const ENDPOINT_RSS_OBSERVE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// Observe a new RSS growth step only after a whole step, so reporting and
 /// allocator trims stay bounded.
-pub(crate) const ENDPOINT_RSS_GROWTH_STEP_BYTES: u64 = 128 * 1024 * 1024;
+const ENDPOINT_RSS_GROWTH_STEP_BYTES: u64 = 128 * 1024 * 1024;
 const NETWORK_CHANGE_DEBOUNCE: Duration = Duration::from_millis(140);
 /// How often the daemon actively echo-probes each trusted peer, so a peer that has
 /// roamed (changed network / public IP) is detected even when THIS machine saw no
