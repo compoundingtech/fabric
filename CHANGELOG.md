@@ -8,6 +8,11 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **A converged materialization pass no longer clones every present manifest
+  path before it checks for work.** The pass borrows unchanged entries and
+  defers only local edits or deletes that must change the manifest. The final
+  concurrent-edit and delete guards keep the same behavior.
+
 - **A complete sync scan no longer stores an extra copy of every file path only
   to prove absence.** A complete walk proves that an unscanned path is absent.
   The scan now retains auxiliary path evidence only for directories and paths
