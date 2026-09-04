@@ -965,6 +965,9 @@ opening or reading files does not schedule sync work. Write bursts settle for
 watcher-driven sync per two-second window. Inbound no-op sessions already queued
 for the same durable folder generation reuse its pre-merge scan, and routine
 sync-accept path snapshots are sampled in the default validation log.
+Folder scans, materialization, and state persistence run on Tokio's bounded
+blocking pool. Fabric holds the live node and disk locks only while it snapshots
+or applies a completed phase, so filesystem latency does not stop other streams.
 
 Entries live in an authoritative, hand-editable `syncs.toml` next to `peers.toml`
 (`~/.config/fabric/syncs.toml` for the default home, `<home>/syncs.toml` with

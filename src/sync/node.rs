@@ -21,7 +21,10 @@
 //!   interleaving of edits and pairwise reconciles converges (see the property
 //!   tests below).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
+};
 
 use super::config::PolicyRules;
 use super::delta::ChangeBuffer;
@@ -38,19 +41,23 @@ pub fn content_hash(bytes: &[u8]) -> ContentHash {
 #[derive(Debug, Clone)]
 pub struct SyncNode {
     author: Author,
-    manifest: Manifest,
+    /// Phase snapshots share the immutable tree. A changed phase clones the
+    /// map on its first write, while a clean phase clones no paths.
+    manifest: Arc<Manifest>,
     /// A local change token for the manifest.
     ///
     /// The engine uses this token to detect a change across an unlocked step.
     /// It is not persisted or sent on the wire.
     manifest_revision: u64,
-    content: HashMap<ContentHash, Vec<u8>>,
+    /// Phase snapshots share both the map and each payload. Copy-on-write can
+    /// clone the hash index without cloning every file's bytes.
+    content: Arc<HashMap<ContentHash, Arc<Vec<u8>>>>,
     /// The include globs this node's entry selects, if any. A receive-side
     /// boundary: `adopt_from_peer` will not take a path outside it. `None`
     /// means no include is configured, so every path is in scope.
     include: Option<Vec<String>>,
     /// Which paths changed here, and which peer has seen them.
-    changes: ChangeBuffer,
+    changes: Arc<ChangeBuffer>,
     /// Payloads this node has SENT that carried its entire manifest.
     ///
     /// Counts the OUTCOME, not the reason. First contact, a peer too old for
@@ -124,11 +131,11 @@ impl SyncNode {
     pub fn new(author: Author) -> Self {
         Self {
             author,
-            manifest: Manifest::new(),
+            manifest: Arc::new(Manifest::new()),
             manifest_revision: 0,
-            content: HashMap::new(),
+            content: Arc::new(HashMap::new()),
             include: None,
-            changes: ChangeBuffer::new(),
+            changes: Arc::new(ChangeBuffer::new()),
             full_payload_sends: 0,
         }
     }
@@ -138,7 +145,15 @@ impl SyncNode {
     }
 
     pub fn manifest(&self) -> &Manifest {
-        &self.manifest
+        self.manifest.as_ref()
+    }
+
+    /// A phase-owned immutable manifest view.
+    ///
+    /// The phase can serialize or inspect this view after it releases the live
+    /// node lock. A later node mutation uses copy-on-write and cannot change it.
+    pub(crate) fn manifest_snapshot(&self) -> Arc<Manifest> {
+        self.manifest.clone()
     }
 
     /// The local manifest revision.
@@ -174,12 +189,12 @@ impl SyncNode {
 
     /// The changed-path bookkeeping for this node.
     pub fn changes(&self) -> &ChangeBuffer {
-        &self.changes
+        self.changes.as_ref()
     }
 
     /// Mutable access, for the engine to seed on load and forget on acknowledge.
     pub fn changes_mut(&mut self) -> &mut ChangeBuffer {
-        &mut self.changes
+        Arc::make_mut(&mut self.changes)
     }
 
     pub fn has_content(&self, hash: &ContentHash) -> bool {
@@ -218,7 +233,7 @@ impl SyncNode {
     /// manifest. Cheaper than rebuilding the referenced set on every write.
     fn forget_if_unreferenced(&mut self, hash: ContentHash) {
         if !self.hash_is_referenced(&hash) {
-            self.content.remove(&hash);
+            Arc::make_mut(&mut self.content).remove(&hash);
         }
     }
 
@@ -230,18 +245,18 @@ impl SyncNode {
             .present_paths()
             .map(|(_, meta)| meta.hash)
             .collect();
-        self.content.retain(|hash, _| referenced.contains(hash));
+        Arc::make_mut(&mut self.content).retain(|hash, _| referenced.contains(hash));
     }
 
     pub fn get_content(&self, hash: &ContentHash) -> Option<&[u8]> {
-        self.content.get(hash).map(Vec::as_slice)
+        self.content.get(hash).map(|bytes| bytes.as_slice())
     }
 
     /// Insert content bytes into the store (used by the async engine when a peer
     /// streams content for an adopted entry).
     pub fn put_content(&mut self, bytes: Vec<u8>) -> ContentHash {
         let hash = content_hash(&bytes);
-        self.content.insert(hash, bytes);
+        Arc::make_mut(&mut self.content).insert(hash, Arc::new(bytes));
         hash
     }
 
@@ -280,15 +295,17 @@ impl SyncNode {
         {
             // Same content already recorded — nothing changed. This is what
             // makes applying a peer's content (or a re-scan) echo-free.
-            self.content.entry(hash).or_insert_with(|| bytes.to_vec());
+            if !self.content.contains_key(&hash) {
+                Arc::make_mut(&mut self.content).insert(hash, Arc::new(bytes.to_vec()));
+            }
             return false;
         }
         let previous = self.manifest.get(path);
         let next_version = previous.map(Entry::version).unwrap_or(0) + 1;
         let superseded = previous.and_then(Entry::meta).map(|meta| meta.hash);
-        self.content.insert(hash, bytes.to_vec());
-        self.changes.record(path);
-        self.manifest.insert(
+        Arc::make_mut(&mut self.content).insert(hash, Arc::new(bytes.to_vec()));
+        Arc::make_mut(&mut self.changes).record(path);
+        Arc::make_mut(&mut self.manifest).insert(
             path.to_string(),
             Entry::Present(FileMeta {
                 hash,
@@ -328,8 +345,8 @@ impl SyncNode {
         }
         let next_version = entry.version() + 1;
         let superseded = entry.meta().map(|meta| meta.hash);
-        self.changes.record(path);
-        self.manifest.insert(
+        Arc::make_mut(&mut self.changes).record(path);
+        Arc::make_mut(&mut self.manifest).insert(
             path.to_string(),
             Entry::Tombstone(Tombstone {
                 version: next_version,
@@ -454,11 +471,11 @@ impl SyncNode {
             }
         }
         for path in &swept {
-            self.manifest.remove(path);
+            Arc::make_mut(&mut self.manifest).remove(path);
             // A swept path has no entry left to send. It only reaches a sweep
             // after every peer acknowledged the tombstone, so dropping its slot
             // strands nobody.
-            self.changes.forget_path(path);
+            Arc::make_mut(&mut self.changes).forget_path(path);
         }
         if !swept.is_empty() {
             self.advance_manifest_revision();
@@ -476,7 +493,7 @@ impl SyncNode {
         let mut out = BTreeMap::new();
         for (path, meta) in self.manifest.present_paths() {
             if let Some(bytes) = self.content.get(&meta.hash) {
-                out.insert(path.clone(), bytes.clone());
+                out.insert(path.clone(), bytes.as_ref().clone());
             }
         }
         out
@@ -522,8 +539,8 @@ impl SyncNode {
         let diff = self.manifest.diff_from(remote);
         let adopted = diff.adopt.len();
         for entry in diff.adopt {
-            self.changes.record(&entry.path);
-            self.manifest.insert(entry.path, entry.entry);
+            Arc::make_mut(&mut self.changes).record(&entry.path);
+            Arc::make_mut(&mut self.manifest).insert(entry.path, entry.entry);
         }
         if adopted > 0 {
             self.advance_manifest_revision();
@@ -552,8 +569,8 @@ impl SyncNode {
             if !self.peer_path_in_scope(&entry.path) {
                 continue;
             }
-            self.changes.record(&entry.path);
-            self.manifest.insert(entry.path, entry.entry);
+            Arc::make_mut(&mut self.changes).record(&entry.path);
+            Arc::make_mut(&mut self.manifest).insert(entry.path, entry.entry);
             adopted += 1;
         }
         if adopted > 0 {
@@ -588,7 +605,11 @@ impl SyncNode {
     pub fn gather_content(&self, hashes: &[ContentHash]) -> Vec<(ContentHash, Vec<u8>)> {
         hashes
             .iter()
-            .filter_map(|hash| self.content.get(hash).map(|bytes| (*hash, bytes.clone())))
+            .filter_map(|hash| {
+                self.content
+                    .get(hash)
+                    .map(|bytes| (*hash, bytes.as_ref().clone()))
+            })
             .collect()
     }
 
@@ -628,10 +649,10 @@ impl SyncNode {
                 if !self.content.contains_key(&meta.hash) {
                     stats.bytes += bytes.len();
                 }
-                self.content.insert(meta.hash, bytes.clone());
+                Arc::make_mut(&mut self.content).insert(meta.hash, bytes.clone());
             }
-            self.changes.record(&adopt.path);
-            self.manifest.insert(adopt.path.clone(), adopt.entry);
+            Arc::make_mut(&mut self.changes).record(&adopt.path);
+            Arc::make_mut(&mut self.manifest).insert(adopt.path.clone(), adopt.entry);
         }
 
         for adopt in &other_adopts.adopt {
@@ -641,10 +662,10 @@ impl SyncNode {
                 if !other.content.contains_key(&meta.hash) {
                     stats.bytes += bytes.len();
                 }
-                other.content.insert(meta.hash, bytes.clone());
+                Arc::make_mut(&mut other.content).insert(meta.hash, bytes.clone());
             }
-            other.changes.record(&adopt.path);
-            other.manifest.insert(adopt.path.clone(), adopt.entry);
+            Arc::make_mut(&mut other.changes).record(&adopt.path);
+            Arc::make_mut(&mut other.manifest).insert(adopt.path.clone(), adopt.entry);
         }
 
         if !self_adopts.is_empty() {
@@ -675,7 +696,7 @@ fn repair_content(node: &mut SyncNode, peer: &SyncNode) -> usize {
     for hash in node.missing_content_hashes() {
         if let Some(bytes) = peer.content.get(&hash) {
             copied += bytes.len();
-            node.content.insert(hash, bytes.clone());
+            Arc::make_mut(&mut node.content).insert(hash, bytes.clone());
         }
     }
     copied
@@ -718,6 +739,30 @@ mod tests {
 
     fn node(n: u8) -> SyncNode {
         SyncNode::new(Author([n; 32]))
+    }
+
+    #[test]
+    fn phase_clone_shares_clean_state_and_isolates_a_write() {
+        let mut live = node(1);
+        live.local_write("kept.txt", b"kept", 0, 0);
+        let kept_hash = content_hash(b"kept");
+
+        Manifest::start_clone_measurement();
+        let mut phase = live.clone();
+        assert_eq!(Manifest::finish_clone_measurement(), 0);
+        assert!(Arc::ptr_eq(&live.manifest, &phase.manifest));
+        assert!(Arc::ptr_eq(&live.content, &phase.content));
+
+        phase.local_write("new.txt", b"new", 0, 0);
+
+        assert!(live.manifest().get("new.txt").is_none());
+        assert!(phase.manifest().get("new.txt").is_some());
+        assert!(!Arc::ptr_eq(&live.manifest, &phase.manifest));
+        assert!(!Arc::ptr_eq(&live.content, &phase.content));
+        assert!(Arc::ptr_eq(
+            live.content.get(&kept_hash).unwrap(),
+            phase.content.get(&kept_hash).unwrap()
+        ));
     }
 
     fn reconcile_pair(nodes: &mut [SyncNode], a: usize, b: usize) -> Reconciled {
@@ -1536,7 +1581,7 @@ mod tests {
         a.local_write("f", b"bytes", 0, 0);
         a.reconcile(&mut b);
         // Simulate a losing its content store but keeping its persisted manifest.
-        a.content.clear();
+        Arc::make_mut(&mut a.content).clear();
         assert_eq!(a.missing_content_hashes().len(), 1);
         // Reconcile repairs content from b.
         a.reconcile(&mut b);

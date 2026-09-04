@@ -8,6 +8,13 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **A sync folder walk no longer stalls unrelated Fabric streams.** Scan,
+  materialization, JSON encoding, metadata checks, and persistence now run on
+  Tokio's bounded blocking pool without holding the live node or disk locks.
+  In a one-worker, five-second pipe window with repeated 500 ms walks, maximum
+  delivery delay fell from 1.195 seconds to 16.9 ms. The source maximum stayed
+  below 10.5 ms in both windows.
+
 - **Fabric commands no longer replace the formatting in `peers.toml`.** Add,
   remove, policy, and Git remote changes update only the affected entries.
   User comments, spacing, order, unknown fields, and an edited or removed file
