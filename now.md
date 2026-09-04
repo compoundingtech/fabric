@@ -5,9 +5,102 @@ current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
 _Last updated: 2026-09-04 by Silber.fabric-codex. Main's last code commit is
-deployed as `0.2.1+9d1c138` on Silber and hetz._
+deployed as `0.2.1+aab58e5` on Silber and hetz._
 
 ## Current release — 2026-09-04
+
+PR #146 releases allocator-retained Linux pages without recycling an endpoint.
+Each new 128 MiB RSS growth step calls `malloc_trim(0)` on glibc Linux. Other
+platforms keep the RSS report without attempting the trim. The action cannot
+free live allocations and does not touch an endpoint or session. PR #146 merged
+as `aab58e5`.
+
+The live fault was not bounded near 1 GiB. One hetz process grew from
+445,186,048 bytes to 1,499,697,152 bytes during 17 hours and 26 minutes. The
+next process reached 977,544 kB after 795 seconds and 1,120,140 kB after 2,824
+seconds.
+
+Twenty live anonymous mappings were at least 60 MiB. Thirteen held at least 60
+MiB resident. Those large mappings contained 845,748 kB. The 16-worker daemon
+used the glibc per-thread arena shape.
+
+Existing live records supplied the direct control. Endpoint close changed RSS
+from 994,246,656 bytes to 994,344,960 bytes. The following allocator trim
+reduced it to 238,071,808 bytes in 65 milliseconds. A second trim reduced
+1,094,070,272 bytes to 257,318,912 bytes in 77 milliseconds. Close returned
+nothing. The two trims returned 721.2 MiB and 798.0 MiB.
+
+Two test proxies did not reproduce the live retention. A single-thread Linux
+probe stayed between 30 MiB and 48 MiB after 14.0 GB of rereads. A 16-thread
+proxy grew from 34 MiB to 235 MiB, then trim returned only 10 MiB. Both proxies
+were removed after their negative results were recorded. The live control is
+the evidence for the fix.
+
+The focused red contract recorded zero trim requests. The fixed contract
+records exactly one request and proves that the endpoint generation stays
+unchanged. It passed 20 of 20 runs. The complete library suite passed 443
+active tests, with three measurements ignored.
+
+Final pull-request test run `33870695087` passed on macOS and Linux. Final
+pull-request Nix run `33870695210` passed. Exact-main test run `33871785503`
+passed on macOS and Linux. Exact-main Nix run `33871785448` passed.
+
+Release `v0.2.1+aab58e5` passed all four release jobs in run `33872935201`.
+The release contains three archives and three checksum files. Every archive
+matched its recorded checksum and contained only `fabric`. The Apple and Linux
+x86_64 binaries both reported `0.2.1+aab58e5` before deployment.
+
+The archive SHA-256 values are `22653dd55fe8b11e34a38622326cfb40a6f20734106b8a0c3e307ff1e380f66e`
+for Apple arm64, `8bb2c5debe6ea2c3ee5e06395701367fccf83369888504345f0bb40b9135c542`
+for Linux arm64, and `f3e0c8222fa1343adf16cbe75af5a237962767ce8787266e0fb3392ae30258aa`
+for Linux x86_64.
+
+The rollout updated hetz first and Silber second. Mixed-version ping and exec
+passed in both directions. Both binaries and daemons now report
+`0.2.1+aab58e5`. Final two-way ping and exec passed through direct paths.
+Doctor passes on both hosts.
+
+The first production trim reduced hetz RSS from 432,263,168 bytes to
+166,961,152 bytes in 21 milliseconds. The endpoint stayed at generation 8.
+This matched the prediction made before deployment.
+
+The production proof kept hetz PID 3992077 for 60.9 minutes. One-minute RSS
+samples stayed between 307,820 kB and 570,820 kB and ended at 375,748 kB. At
+the matching 12.9-minute point, the new daemon held 358,036 kB. The old daemon
+held 977,544 kB. At the matching 47.9-minute point, the new daemon held
+493,620 kB. The old daemon held 1,120,140 kB.
+
+All 115 trim events during the window succeeded and had a follow-up RSS sample.
+They returned 25.89 GiB cumulatively and took 2.269 seconds total. The average
+trim took 19.7 milliseconds, with a 10-to-35-millisecond range.
+Pre-trim RSS ranged from 284.0 MiB to 627.5 MiB. Post-trim RSS ranged from
+153.0 MiB to 247.6 MiB.
+
+The deployment produced the predicted sawtooth instead of the old smooth rise.
+It also produced 115 warning records during 60.9 minutes. The trim calls used
+approximately 0.062 percent of the wall-clock window. The warning
+frequency is the next measured quietness cost; do not weaken the memory fix to
+remove the notices.
+
+Two-way send-file hashes matched. The Silber-to-hetz hash was
+`ee03b206037ca54f4bdb7d56badc929dfabbcf938a20bae75615f4c673336339`.
+The hetz-to-Silber hash was
+`3e096e8179b958e6d1d13e4eb46c6aaa6beb6e9c372761503936fa7c0b9a4996`.
+All transfer and preflight files were deleted after verification.
+
+Both sync entries have matching cross-host digests. The bus digest is
+`2e97897f219816333079ce0d40a735fb9866b80438bd5c5d13641f02cf2b7fcd`.
+The declarations digest is
+`c653141c2291a854ab0c2a30feba733b69bdf0add812bf6b45915811f9fd0f3d`.
+Both hosts report zero drift, missing, unexpected, mismatched, scan issues,
+stopped peers, away peers, and delta fallbacks. Silber retains one cumulative
+reconcile failure from the rollout window. A later successful pass cleared the
+stopped state. Hetz reports zero reconcile failures.
+
+The rollout created two rollback binaries from `0.2.1+9d1c138`. They were
+`/Users/myobie/.local/bin/fabric.rollback-1788525446` and
+`/home/myobie/.local/bin/fabric.rollback-1788525381`. Both exact files were
+deleted after successful verification, and both paths are absent.
 
 PR #141 retired the stale ACL and exec reconnect flake classifications. Each
 unchanged test passed 300 of 300 runs. It also fixed two ledger test races
