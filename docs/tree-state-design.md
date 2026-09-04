@@ -1,6 +1,6 @@
 # Group the sync tree representations
 
-Status: design for review. Do not implement this design before the review.
+Status: implemented after the approved design review. Code review is pending.
 
 ## Decision
 
@@ -12,9 +12,39 @@ This design keeps the manifest and local disk evidence as separate concepts.
 It groups their storage and their snapshot mechanism. It does not make local
 disk evidence part of the replicated manifest.
 
-One clean pass will build two full tree containers. The current pass builds 13.
+One clean pass builds two full tree containers. The former pass built 13.
 The two remaining containers are the two disk scans required around the peer
 step.
+
+## Implementation result
+
+The implementation removes the three live disk maps and `persisted_observed`.
+`EntryState` now holds one `DiskState` behind one mutex.
+
+Each scan builds one `DiskSnapshot`. The snapshot has one path map. Each record
+holds disk evidence, an observed receipt, a cache entry, and an optional issue.
+Production records share one `Arc<str>` path and retain no absolute path.
+
+Materialization writes only a change-sized observed-receipt overlay. The next
+scan folds that overlay into its new snapshot. A clean pass leaves the overlay
+empty.
+
+The fixed allocation contract reports two published disk snapshots and zero
+manifest clones for one clean `sync_once`. The former code count of 13 is in
+the main-branch handover evidence that preceded this implementation.
+
+Snapshot compaction streams `observed` and `scan_cache` from `DiskView`.
+It does not construct either map. The JSON field names and value types stay
+unchanged.
+
+Compaction keeps one transient manifest clone so serialization can release the
+node lock. Five 29,337-path release windows put the old clone-and-compare lock
+at 1,109-1,982 microseconds. The new capture lock took 587-1,319 microseconds.
+Serialization took 33,916-34,986 microseconds outside the lock.
+
+The review proofs cover every code-derived absence state, a real edit between
+the final scan and materialization, eight real process kills at the snapshot
+commit boundary, and every private manifest mutation surface.
 
 ## Evidence
 
@@ -81,72 +111,65 @@ allocation reduction cannot weaken them.
 
 ## Data model
 
-`EntryState` will replace `observed`, `scan_cache`, and `scan_issues` with one
+`EntryState` replaces `observed`, `scan_cache`, and `scan_issues` with one
 `DiskState`.
 
 ```rust
 struct DiskState {
-    base: Arc<DiskSnapshot>,
-    overlay: Arc<DiskOverlay>,
-    revision: u64,
-    durable_revision: u64,
-    changed: PathChangeBuffer,
+    snapshot: Arc<DiskSnapshot>,
+    overlay: Arc<HashMap<Arc<str>, Option<ContentHash>>>,
+    root_state: RootState,
+    receipt_revision: u64,
+    dirty_receipts: BTreeSet<String>,
 }
 
 enum RootState {
     Complete,
     Missing,
-    Unreadable,
 }
 
 struct DiskSnapshot {
-    paths: HashMap<Arc<str>, DiskRecord>,
+    records: HashMap<Arc<str>, DiskRecord>,
     root_state: RootState,
 }
 
-struct DiskOverlay {
-    paths: HashMap<Arc<str>, Option<DiskRecord>>,
-}
-
-enum DiskRecord {
-    File(FileReceipt),
-    Directory,
-    BlockingFile,
-    Unknown(ScanIssue),
-}
-
-struct FileReceipt {
-    hash: ContentHash,
+struct DiskRecord {
+    kind: DiskKind,
+    observed: Option<ContentHash>,
     cache: Option<ScanCacheEntry>,
+    issue: Option<ScanIssue>,
 }
 
 struct DiskView {
-    base: Arc<DiskSnapshot>,
-    overlay: Arc<DiskOverlay>,
-    revision: u64,
+    snapshot: Arc<DiskSnapshot>,
+    overlay: Arc<HashMap<Arc<str>, Option<ContentHash>>>,
+    root_state: RootState,
+    receipt_revision: u64,
 }
 ```
 
 The snapshot owns one normalized path allocation. Records and indexes share
-that path through `Arc<str>`. The snapshot does not retain an absolute path.
-The engine derives an absolute path from the entry root when it needs one.
+that path through `Arc<str>`. The production snapshot does not retain an
+absolute path or changed file bytes. The engine derives an absolute path from
+the entry root when it needs one.
 
-`Complete` permits affirmative absence. `Missing` and `Unreadable` permit no
-delete inference. An unknown path record blocks absence for itself and every
+`Complete` permits affirmative absence. `Missing` permits no delete inference.
+An unreadable root is an opaque root record and also permits no delete
+inference. An unknown path record blocks absence for itself and every
 descendant.
 
-The overlay contains only paths changed by materialization after the last
-scan. A baseline clones two `Arc` values and one revision. It never clones the
-tree.
+The overlay contains only observed receipts changed by materialization after
+the last scan. A baseline clones two `Arc` values and one revision. It never
+clones the tree.
 
 `DiskView` supplies these operations:
 
 - `file(path)` returns the current observed receipt.
-- `cache(path)` returns local size, mtime, mode, and hash facts.
+- `cache(path)` returns local size, mtime, and hash facts.
 - `absence(path)` returns present, affirmatively gone, or unknown.
 - `files()` iterates observed regular files.
 - `issues()` iterates paths with unknown state.
-- `changed_since(revision)` returns changed paths only.
+- `dirty_receipts` returns changed observed paths only.
 
 The methods merge the overlay with the base. Callers do not materialize a
 second map.
@@ -157,14 +180,14 @@ boundary.
 
 ## Scan flow
 
-The scanner will build `DiskSnapshot` directly.
+The scanner builds `DiskSnapshot` directly.
 
 1. Capture the current `DiskView` by cloning its two `Arc` values.
 2. Walk the folder once.
 3. Reuse an existing shared path when the normalized path is unchanged.
 4. Reuse a content hash only when the old local cache facts match exactly.
 5. Store files, directories, blocking files, and unknown paths in one map.
-6. Keep changed file bytes in a change-sized temporary list.
+6. Keep changed bytes only in in-progress file records, then clear them.
 7. Compare the new snapshot with the old view.
 8. Apply local writes and affirmative deletes to the node.
 9. Publish the new snapshot and an empty overlay in one operation.
@@ -196,10 +219,10 @@ an inbound transaction or another local operation publishes a new view.
 
 ## Manifest revisions
 
-`SyncNode` will add a `manifest_revision` field. Every logical manifest change
-increments it through one private mutation surface.
+`SyncNode` adds a `manifest_revision` field. Every logical manifest change
+increments it through the private mutation surfaces.
 
-The engine will carry a revision across a peer step. It will compare revisions
+The engine carries a revision across a peer step. It compares revisions
 instead of cloning the manifest. A changed revision can cause an extra durable
 write, but it cannot hide a change.
 
@@ -211,8 +234,8 @@ The mutation surface covers these operations:
 - a tombstone sweep;
 - a durable-state load.
 
-The code will not expose mutable manifest access. A property test will compare
-the manifest before and after every generated node operation. A changed
+The code does not expose mutable manifest access. A boundary test compares the
+manifest before and after every node mutation API. A changed
 manifest must always have a changed revision.
 
 The revision does not replace the digest. The wire protocol still uses the
@@ -221,8 +244,8 @@ node changed during one operation.
 
 ## Inbound transactions
 
-`PreparedInboundMode::Guarded` will carry a `DiskView` and a manifest revision.
-It will not carry a complete observed map or manifest.
+`PreparedInboundMode::Guarded` carries a `DiskView` and a manifest revision.
+It does not carry a complete observed map or manifest.
 
 The preparation scan publishes a new disk view. The completion scan compares
 against the stable baseline. The operation guard keeps the existing lock order
@@ -232,26 +255,27 @@ The exact no-op path remains unchanged. It does not scan or materialize.
 
 ## Durable state
 
-The disk format and wire format will not change in this work.
+The disk format and wire format do not change in this work.
 
-`state.json` will still contain `manifest`, `observed`, `scan_cache`, and
-`peer_acks`. The serializer will stream `observed` and `scan_cache` views from
-`DiskView`. It will not build temporary maps.
+`state.json` still contains `manifest`, `observed`, `scan_cache`, and
+`peer_acks`. The serializer streams `observed` and `scan_cache` views from
+`DiskView`. It does not build temporary maps.
 
-The append log will keep `LoggedChange`. Persistence will take the union of the
-manifest change buffer and the disk change buffer. It will read the current
+The append log keeps `LoggedChange`. Persistence takes the union of the
+manifest change buffer and the disk change buffer. It reads the current
 manifest entry and observed receipt for each changed path.
 
 One operation guard protects that read. The append reaches disk before either
 durable cursor advances. Thus the manifest entry and observed receipt keep the
 existing crash boundary.
 
-`persisted_observed` will be removed. The disk change buffer becomes the exact
+`persisted_observed` is removed. The disk change buffer becomes the exact
 source of observed paths that need a log record.
 
-Snapshot compaction will serialize directly from the manifest and disk view.
+Snapshot compaction serializes directly from the manifest and disk view.
 It may allocate the JSON output buffer because that buffer is the durable
-artifact. It must not allocate another tree collection.
+artifact. It clones the manifest once before serialization to keep the node
+lock below the former boundary. It does not allocate an observed or cache map.
 
 An old build can read the new state files. A new build can read old state files
 and construct one `DiskSnapshot`. A mixed-version fleet uses the unchanged wire
@@ -265,9 +289,9 @@ keep the order `node` then `disk`.
 No lock spans an outbound peer dial. A `DiskView` and two revisions cross that
 boundary.
 
-Snapshot serialization runs under the operation guard. The implementation must
-measure the node-lock duration for 29,337 paths. It must not exceed the current
-clone plus equality window without a separate review.
+Snapshot serialization runs under the operation guard and outside the node
+lock. The measured 29,337-path capture window is shorter than the former clone
+plus equality window.
 
 ## Implementation boundary
 
