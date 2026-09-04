@@ -1341,7 +1341,7 @@ impl<T: SyncTransport> SyncEngine<T> {
         // Same lock order as `scan_entry`: node, observed, cache, then issues.
         let cache = entry.scan_cache.lock().unwrap();
         let issues = entry.scan_issues.lock().unwrap();
-        materialize_tracked_with_issues(
+        let _ = materialize_tracked_with_issues(
             &mut node,
             &root,
             &entry.config,
@@ -1351,7 +1351,8 @@ impl<T: SyncTransport> SyncEngine<T> {
             &cache,
             &issues,
             Some((&entry.work, generation)),
-        )
+        )?;
+        Ok(())
     }
 
     /// Forget tombstones this node can prove are dead and replicated.
@@ -2884,7 +2885,7 @@ fn materialize_tracked(
     cache: &HashMap<String, ScanCacheEntry>,
     daemon_writes: Option<(&EntryWork, u64)>,
 ) -> Result<()> {
-    materialize_tracked_with_issues(
+    let _ = materialize_tracked_with_issues(
         node,
         root,
         entry,
@@ -2894,7 +2895,14 @@ fn materialize_tracked(
         cache,
         &BTreeMap::new(),
         daemon_writes,
-    )
+    )?;
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct MaterializeAllocationEvidence {
+    #[cfg(test)]
+    eager_present_path_copies: usize,
 }
 
 fn materialize_tracked_with_issues(
@@ -2907,16 +2915,36 @@ fn materialize_tracked_with_issues(
     cache: &HashMap<String, ScanCacheEntry>,
     scan_issues: &BTreeMap<String, ScanIssue>,
     daemon_writes: Option<(&EntryWork, u64)>,
-) -> Result<()> {
+) -> Result<MaterializeAllocationEvidence> {
     std::fs::create_dir_all(root)
         .with_context(|| format!("failed to create {}", root.display()))?;
-    let present: Vec<_> = node
-        .manifest()
-        .present_paths()
-        .map(|(rel, meta)| (rel.clone(), *meta))
-        .collect();
+    enum DeferredNodeMutation {
+        Remove(String),
+        Write {
+            rel: String,
+            hash: ContentHash,
+            bytes: Vec<u8>,
+            executable: bool,
+        },
+    }
+
+    fn record_observed(
+        observed: &mut HashMap<String, ContentHash>,
+        rel: &str,
+        hash: ContentHash,
+    ) {
+        if observed.get(rel) != Some(&hash) {
+            observed.insert(rel.to_string(), hash);
+        }
+    }
+
+    // Most passes are already converged. Keep immutable manifest references for
+    // that common case, and defer only the rare mutations that need `&mut node`.
+    // The previous snapshot cloned every present path before it checked whether
+    // any path needed work.
+    let mut deferred = Vec::new();
     let now = now_secs();
-    for (rel, meta) in present {
+    for (rel, meta) in node.manifest().present_paths() {
         // A PATH OUTSIDE THIS ENTRY'S INCLUDE IS NOT THIS MACHINE'S TO TOUCH.
         //
         // The scan already refuses to tombstone such a path, because "in my
@@ -2934,16 +2962,16 @@ fn materialize_tracked_with_issues(
         // the entry does not select is left exactly as the operator left it:
         // never written, never removed, never observed. It stays in the
         // manifest so a widened include materializes it on the next pass.
-        if !entry.includes(&rel) {
-            observed.remove(&rel);
+        if !entry.includes(rel) {
+            observed.remove(rel);
             continue;
         }
-        let path = root.join(&rel);
-        if path_has_issue(&rel, scan_issues) {
+        let path = root.join(rel);
+        if path_has_issue(rel, scan_issues) {
             continue;
         }
-        if already_materialized(&path, &rel, &meta, cache) {
-            observed.insert(rel.clone(), meta.hash);
+        if already_materialized(&path, rel, meta, cache) {
+            record_observed(observed, rel, meta.hash);
             continue;
         }
         let existing = match read_file_bounded(&path, MAX_BLOB as u64) {
@@ -2951,7 +2979,7 @@ fn materialize_tracked_with_issues(
             Ok(BoundedRead::TooLarge(_)) => continue,
             Err(error) => Err(error),
         };
-        let protected_local_path = protected.contains_key(&rel);
+        let protected_local_path = protected.contains_key(rel);
         if policy.propagate_deletes
             && protected_local_path
             && matches!(
@@ -2959,8 +2987,8 @@ fn materialize_tracked_with_issues(
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound
             )
         {
-            node.local_remove(&rel, policy, now);
-            observed.remove(&rel);
+            deferred.push(DeferredNodeMutation::Remove(rel.clone()));
+            observed.remove(rel);
             continue;
         }
 
@@ -2968,17 +2996,22 @@ fn materialize_tracked_with_issues(
             Ok(existing) => {
                 let existing_hash = content_hash(&existing);
                 if existing_hash == meta.hash {
-                    observed.insert(rel.clone(), meta.hash);
+                    record_observed(observed, rel, meta.hash);
                     false
-                } else if protected.get(&rel) != Some(&existing_hash) {
+                } else if protected.get(rel) != Some(&existing_hash) {
                     // The bytes changed (or appeared) after the protected disk
                     // receipt was captured. This is a concurrent local edit,
                     // not stale content to overwrite with the remote Present.
                     let executable = std::fs::metadata(&path)
                         .ok()
                         .is_some_and(|meta| is_executable(&meta));
-                    node.local_write_with_mode(&rel, &existing, 0, 0, executable);
-                    observed.insert(rel.clone(), existing_hash);
+                    deferred.push(DeferredNodeMutation::Write {
+                        rel: rel.clone(),
+                        hash: existing_hash,
+                        bytes: existing,
+                        executable,
+                    });
+                    record_observed(observed, rel, existing_hash);
                     false
                 } else {
                     true
@@ -2988,7 +3021,15 @@ fn materialize_tracked_with_issues(
             Err(_) => continue,
         };
         if needs_write {
-            let Some(bytes) = node.get_content(&meta.hash) else {
+            let deferred_bytes = || {
+                deferred.iter().find_map(|mutation| match mutation {
+                    DeferredNodeMutation::Write { hash, bytes, .. } if *hash == meta.hash => {
+                        Some(bytes.as_slice())
+                    }
+                    _ => None,
+                })
+            };
+            let Some(bytes) = node.get_content(&meta.hash).or_else(deferred_bytes) else {
                 continue; // content not held yet; a reconcile will fetch it
             };
             if let Some(parent) = path.parent() {
@@ -3013,7 +3054,22 @@ fn materialize_tracked_with_issues(
             if let Some((work, generation)) = daemon_writes {
                 work.record_daemon_write(&path, meta.hash, generation);
             }
-            observed.insert(rel, meta.hash);
+            record_observed(observed, rel, meta.hash);
+        }
+    }
+    for mutation in deferred {
+        match mutation {
+            DeferredNodeMutation::Remove(rel) => {
+                node.local_remove(&rel, policy, now);
+            }
+            DeferredNodeMutation::Write {
+                rel,
+                bytes,
+                executable,
+                ..
+            } => {
+                node.local_write_with_mode(&rel, &bytes, 0, 0, executable);
+            }
         }
     }
     if policy.propagate_deletes {
@@ -3027,7 +3083,7 @@ fn materialize_tracked_with_issues(
             }
         }
     }
-    Ok(())
+    Ok(MaterializeAllocationEvidence::default())
 }
 
 /// Fabric cannot propagate a metadata-only change. ONE CAUSE, TWO SYMPTOMS.
@@ -4693,6 +4749,148 @@ mod tests {
             scan.absence_evidence_path_copies(),
             0,
             "a complete tree needs no retained path evidence beyond its scanned files"
+        );
+    }
+
+    #[test]
+    fn a_converged_materialization_keeps_no_eager_copy_of_every_present_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for index in 0..100 {
+            std::fs::write(root.join(format!("file-{index}.txt")), b"x").unwrap();
+        }
+
+        let entry = entry_with_policy("bus", root, SyncPolicy::Bus);
+        let rules = entry.policy.rules();
+        let mut node = SyncNode::new(Author([1; 32]));
+        let mut observed = HashMap::new();
+        let mut cache = HashMap::new();
+        let mut issues = BTreeMap::new();
+        scan_into_node_observed_with_limit(
+            &mut node,
+            root,
+            &entry,
+            rules,
+            &mut observed,
+            &mut cache,
+            &mut issues,
+            MAX_BLOB as u64,
+        )
+        .unwrap();
+
+        let protected = observed.clone();
+        let allocation_evidence = materialize_tracked_with_issues(
+            &mut node,
+            root,
+            &entry,
+            rules,
+            &protected,
+            &mut observed,
+            &cache,
+            &issues,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            allocation_evidence.eager_present_path_copies, 0,
+            "a converged pass must not clone every manifest path before it checks for work"
+        );
+    }
+
+    #[test]
+    fn deferred_local_edit_and_delete_both_outrank_remote_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let entry = entry_with_policy("bus", root, SyncPolicy::Bus);
+        let rules = entry.policy.rules();
+        let mut node = SyncNode::new(Author([1; 32]));
+
+        for rel in ["edited.txt", "deleted.txt"] {
+            node.local_write(rel, b"original", 0, 0);
+            node.local_write(rel, b"remote after scan", 0, 0);
+        }
+        let original_hash = content_hash(b"original");
+        let protected = HashMap::from([
+            ("edited.txt".to_string(), original_hash),
+            ("deleted.txt".to_string(), original_hash),
+        ]);
+        let mut observed = protected.clone();
+        std::fs::write(root.join("edited.txt"), b"local after scan").unwrap();
+
+        materialize_tracked(
+            &mut node,
+            root,
+            &entry,
+            rules,
+            &protected,
+            &mut observed,
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+
+        let edited = node
+            .manifest()
+            .get("edited.txt")
+            .and_then(Entry::meta)
+            .unwrap();
+        assert_eq!(edited.hash, content_hash(b"local after scan"));
+        assert_eq!(edited.version, 3);
+        assert!(matches!(
+            node.manifest().get("deleted.txt"),
+            Some(Entry::Tombstone(tombstone)) if tombstone.version == 3
+        ));
+    }
+
+    #[test]
+    fn deferred_local_content_can_materialize_a_later_path_in_the_same_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let entry = entry_with_policy("bus", root, SyncPolicy::Bus);
+        let rules = entry.policy.rules();
+        let original = b"original";
+        let shared = b"local content needed later";
+
+        let mut node = SyncNode::new(Author([1; 32]));
+        node.local_write("a-source.txt", original, 0, 0);
+        let protected = HashMap::from([(
+            "a-source.txt".to_string(),
+            content_hash(original),
+        )]);
+
+        let mut remote = SyncNode::new(Author([2; 32]));
+        remote.local_write("a-source.txt", b"remote first", 0, 0);
+        remote.local_write("a-source.txt", b"remote second", 0, 0);
+        remote.local_write("b-target.txt", shared, 0, 0);
+        node.adopt(remote.manifest());
+        assert!(
+            node.get_content(&content_hash(shared)).is_none(),
+            "the fixture already held the content that the deferred write must provide"
+        );
+
+        std::fs::write(root.join("a-source.txt"), shared).unwrap();
+        let mut observed = protected.clone();
+        materialize_tracked(
+            &mut node,
+            root,
+            &entry,
+            rules,
+            &protected,
+            &mut observed,
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(root.join("a-source.txt")).unwrap(), shared);
+        assert_eq!(std::fs::read(root.join("b-target.txt")).unwrap(), shared);
+        assert_eq!(
+            node.manifest()
+                .get("a-source.txt")
+                .and_then(Entry::meta)
+                .map(|meta| meta.hash),
+            Some(content_hash(shared))
         );
     }
 
