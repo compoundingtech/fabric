@@ -23,8 +23,8 @@
 //! something is missing.
 //!
 //! The exit code stays honest either way — an unconfigured machine is not ready,
-//! and a script asking "is this ready" gets told no. Only the words change, and
-//! the words are what a person reads.
+//! and a script asking "is this ready" gets told no. An unknown-only run uses
+//! code 3, so a script can distinguish uncertainty from work it must perform.
 //!
 //! # It never fixes anything
 //!
@@ -615,8 +615,13 @@ fn ca_findings(ca: &CaFact) -> Vec<Finding> {
 
 /// How the whole run came out.
 pub fn exit_code(findings: &[Finding]) -> i32 {
-    if findings.iter().any(|f| f.verdict.needs_attention()) {
+    if findings
+        .iter()
+        .any(|f| matches!(f.verdict, Verdict::Setup | Verdict::Problem))
+    {
         1
+    } else if findings.iter().any(|f| f.verdict == Verdict::Unknown) {
+        3
     } else {
         0
     }
@@ -822,7 +827,7 @@ mod tests {
                 "{check} reported something other than unknown when it could not look"
             );
         }
-        assert_eq!(exit_code(&findings), 1, "unknown must count as attention");
+        assert_eq!(exit_code(&findings), 3, "unknown needs its own exit code");
     }
 
     #[test]
@@ -847,7 +852,7 @@ mod tests {
                 .iter()
                 .any(|finding| finding.verdict == Verdict::Unknown)
         );
-        assert_eq!(exit_code(&findings), 1);
+        assert_eq!(exit_code(&findings), 3);
     }
 
     /// Finding 3 of the 2026-08-29 review. A peer named in `syncs.toml` that is
@@ -1179,7 +1184,7 @@ mod tests {
         assert_eq!(versions[0].verdict, Verdict::Unknown);
         assert!(versions[0].detail.contains("unknown, roaming"));
         assert!(versions[0].detail.contains("whole manifests"));
-        assert_eq!(exit_code(&findings), 1);
+        assert_eq!(exit_code(&findings), 3);
         let summary = closing(&facts, &findings);
         assert_ne!(summary, "nothing to do.");
         assert!(summary.contains("needs attention"));

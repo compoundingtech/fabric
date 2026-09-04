@@ -8,6 +8,11 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Changed
 
+- **`fabric doctor` now gives uncertainty a distinct exit code.** Code 0 means
+  verified healthy, code 1 means a problem or setup remains, and code 3 means
+  one or more checks are unknown with no known problem. Clap keeps code 2 for
+  command-line usage errors.
+
 - **The sync engine now has a process-neutral host boundary.** Its constructor
   receives only the sync config path, state root, author, transport, and
   cancellation token. Peer addresses and daemon state stay in the daemon
