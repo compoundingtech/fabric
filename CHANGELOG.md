@@ -8,6 +8,12 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **Linux no longer treats Fabric's own atomic materialization rename as an
+  external tree change.** The watcher pairs the vanished `.fabric-tmp` path
+  with its final path and verifies the final file against the committed daemon
+  fingerprint. Unpaired renames and external replacements still schedule a
+  normal scan.
+
 - **A converged materialization pass no longer clones every present manifest
   path before it checks for work.** The pass borrows unchanged entries and
   defers only local edits or deletes that must change the manifest. The final

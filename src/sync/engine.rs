@@ -435,8 +435,15 @@ impl EntryWork {
             return false;
         }
 
-        let mut current = Vec::with_capacity(batch.paths.len());
-        for path in &batch.paths {
+        let Some(paths) = batch.daemon_write_paths() else {
+            self.daemon_writes
+                .lock()
+                .unwrap()
+                .forget_paths(&batch.paths);
+            return false;
+        };
+        let mut current = Vec::with_capacity(paths.len());
+        for path in &paths {
             let Ok(fingerprint) = FileFingerprint::read(path) else {
                 self.daemon_writes
                     .lock()
@@ -3395,9 +3402,26 @@ fn watcher_event_can_match_daemon_write(kind: &notify::EventKind) -> bool {
         kind,
         notify::EventKind::Create(_)
             | notify::EventKind::Modify(
-                ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Metadata(_) | ModifyKind::Other
+                ModifyKind::Any
+                    | ModifyKind::Data(_)
+                    | ModifyKind::Metadata(_)
+                    | ModifyKind::Name(_)
+                    | ModifyKind::Other
             )
     )
+}
+
+fn watcher_event_is_rename(kind: &notify::EventKind) -> bool {
+    matches!(
+        kind,
+        notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+    )
+}
+
+fn atomic_write_final_path(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let final_name = name.strip_suffix(".fabric-tmp")?;
+    (!final_name.is_empty()).then(|| path.with_file_name(final_name))
 }
 
 #[derive(Debug)]
@@ -3405,6 +3429,7 @@ struct WatchEvent {
     paths: Vec<PathBuf>,
     generation: u64,
     daemon_write_candidate: bool,
+    rename: bool,
 }
 
 #[derive(Debug)]
@@ -3414,6 +3439,7 @@ struct WatchEventBatch {
     last_generation: u64,
     contiguous: bool,
     daemon_write_candidate: bool,
+    saw_rename: bool,
 }
 
 impl WatchEventBatch {
@@ -3424,6 +3450,7 @@ impl WatchEventBatch {
             last_generation: event.generation,
             contiguous: true,
             daemon_write_candidate: event.daemon_write_candidate,
+            saw_rename: event.rename,
         }
     }
 
@@ -3431,7 +3458,32 @@ impl WatchEventBatch {
         self.contiguous &= self.last_generation.checked_add(1) == Some(event.generation);
         self.last_generation = event.generation;
         self.daemon_write_candidate &= event.daemon_write_candidate;
+        self.saw_rename |= event.rename;
         self.paths.extend(event.paths);
+    }
+
+    /// Return the durable paths represented by this batch.
+    ///
+    /// An atomic write renames `name.fabric-tmp` over `name`. The temp path no
+    /// longer exists when the coalesced batch is handled, so only the paired
+    /// final path can be fingerprinted. An unpaired rename is an external
+    /// mutation and must fail open to the normal scan path.
+    fn daemon_write_paths(&self) -> Option<Vec<PathBuf>> {
+        let mut paired_temp = false;
+        let mut paths = Vec::with_capacity(self.paths.len());
+        for path in &self.paths {
+            if atomic_write_final_path(path)
+                .is_some_and(|final_path| self.paths.contains(&final_path))
+            {
+                paired_temp = true;
+                continue;
+            }
+            paths.push(path.clone());
+        }
+        if self.saw_rename && !paired_temp {
+            return None;
+        }
+        Some(paths)
     }
 }
 
@@ -3527,6 +3579,7 @@ fn spawn_watcher(
                     paths,
                     generation,
                     daemon_write_candidate: watcher_event_can_match_daemon_write(&event.kind),
+                    rename: watcher_event_is_rename(&event.kind),
                 });
             }
         }) {
@@ -4111,7 +4164,7 @@ mod tests {
         assert!(watcher_event_can_match_daemon_write(
             &notify::EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any))
         ));
-        assert!(!watcher_event_can_match_daemon_write(
+        assert!(watcher_event_can_match_daemon_write(
             &notify::EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Any))
         ));
         assert!(!watcher_event_can_match_daemon_write(
@@ -4443,12 +4496,14 @@ mod tests {
             paths: vec![path.clone()],
             generation: first_event_generation,
             daemon_write_candidate: true,
+            rename: false,
         });
         let second_event_generation = work.record_mutation();
         batch.push(WatchEvent {
             paths: vec![path],
             generation: second_event_generation,
             daemon_write_candidate: true,
+            rename: false,
         });
         assert!(work.acknowledge_daemon_write_batch(&batch));
         assert_eq!(
@@ -4460,6 +4515,166 @@ mod tests {
             work.full_scans.load(Ordering::Relaxed),
             0,
             "the delayed daemon-owned batch must not rescan the tree"
+        );
+    }
+
+    /// Linux reports Fabric's atomic write as temp-file create and modify
+    /// events followed by a rename from the temp path to the final path. The
+    /// final fingerprint is already in the daemon-write journal. The missing
+    /// temp path must not turn this exact receipt into another full sync pass.
+    #[test]
+    fn an_atomic_daemon_rename_batch_is_acknowledged_without_rescan() {
+        use notify::event::{CreateKind, DataChange, ModifyKind, RenameMode};
+
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("remote.md");
+        let temp_path = dir.path().join("remote.md.fabric-tmp");
+        std::fs::write(&final_path, b"daemon bytes").unwrap();
+        let work = EntryWork::new();
+        let generation = work.mutation_generation.load(Ordering::Acquire);
+        work.record_daemon_write(&final_path, content_hash(b"daemon bytes"), generation);
+        work.commit_daemon_writes();
+        work.mark_generation_durable(generation);
+
+        let push = |batch: &mut Option<WatchEventBatch>,
+                    paths: Vec<PathBuf>,
+                    kind: notify::EventKind| {
+            let event = WatchEvent {
+                paths,
+                generation: work.record_mutation(),
+                daemon_write_candidate: watcher_event_can_match_daemon_write(&kind),
+                rename: watcher_event_is_rename(&kind),
+            };
+            if let Some(batch) = batch {
+                batch.push(event);
+            } else {
+                *batch = Some(WatchEventBatch::new(event));
+            }
+        };
+        let mut batch = None;
+        push(
+            &mut batch,
+            vec![temp_path.clone()],
+            notify::EventKind::Create(CreateKind::File),
+        );
+        push(
+            &mut batch,
+            vec![temp_path.clone()],
+            notify::EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+        );
+        push(
+            &mut batch,
+            vec![temp_path, final_path],
+            notify::EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+        );
+
+        assert!(
+            work.acknowledge_daemon_write_batch(&batch.unwrap()),
+            "an exact committed atomic write must not schedule another full sync pass"
+        );
+        assert_eq!(
+            work.mutation_generation.load(Ordering::Acquire),
+            work.durable_generation.load(Ordering::Acquire),
+            "the acknowledged atomic batch must leave no periodic dirty work"
+        );
+        assert_eq!(work.full_scans.load(Ordering::Relaxed), 0);
+    }
+
+    /// Exercise the kernel event shape rather than only the modeled batch.
+    /// Linux is the live host where one atomic write produced temp create,
+    /// temp modify, rename-from, and rename-to events.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_atomic_materialization_event_is_acknowledged_without_rescan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let final_path = root.join("remote.md");
+        let mut node = SyncNode::new(Author([1; 32]));
+        node.local_write("remote.md", b"remote bytes", 0, 0);
+        let mut observed = HashMap::new();
+        let work = EntryWork::new();
+        let (tx, mut rx) = mpsc::channel::<WatchEvent>(32);
+        let _watcher = spawn_watcher(
+            root,
+            tx,
+            work.clone(),
+            entry_with_policy("materialize", root, SyncPolicy::Bus),
+        )
+        .unwrap();
+        let generation = work.mutation_generation.load(Ordering::Acquire);
+
+        materialize_tracked(
+            &mut node,
+            root,
+            &entry_with_policy("materialize", root, SyncPolicy::Bus),
+            SyncPolicy::Bus.rules(),
+            &HashMap::new(),
+            &mut observed,
+            &HashMap::new(),
+            Some((&work, generation)),
+        )
+        .unwrap();
+        work.commit_daemon_writes();
+        work.mark_generation_durable(generation);
+
+        let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the live watcher must report the atomic write")
+            .expect("watcher channel closed");
+        let batch = coalesce_watch_events(
+            first,
+            &mut rx,
+            Duration::from_millis(150),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("watcher channel closed while coalescing the atomic write");
+        assert!(batch.saw_rename, "the test must exercise a rename event");
+        assert!(batch.paths.contains(&final_path));
+        assert!(
+            batch.paths.iter().any(|path| {
+                atomic_write_final_path(path).as_ref() == Some(&final_path)
+            }),
+            "the batch must contain the paired Fabric temp path"
+        );
+        assert!(work.acknowledge_daemon_write_batch(&batch));
+        assert_eq!(
+            work.mutation_generation.load(Ordering::Acquire),
+            work.durable_generation.load(Ordering::Acquire)
+        );
+        assert_eq!(work.full_scans.load(Ordering::Relaxed), 0);
+    }
+
+    /// A temp-to-final rename is not enough to claim daemon ownership. An
+    /// external writer can use the same atomic-write shape and the same bytes.
+    /// Its inode and change time must keep the batch dirty.
+    #[test]
+    fn an_external_atomic_shaped_rename_stays_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("remote.md");
+        let temp_path = dir.path().join("remote.md.fabric-tmp");
+        std::fs::write(&final_path, b"same bytes").unwrap();
+        let work = EntryWork::new();
+        let generation = work.mutation_generation.load(Ordering::Acquire);
+        work.record_daemon_write(&final_path, content_hash(b"same bytes"), generation);
+        work.commit_daemon_writes();
+        work.mark_generation_durable(generation);
+
+        std::fs::write(&temp_path, b"same bytes").unwrap();
+        std::fs::rename(&temp_path, &final_path).unwrap();
+        let event_generation = work.record_mutation();
+        let batch = WatchEventBatch::new(WatchEvent {
+            paths: vec![temp_path, final_path],
+            generation: event_generation,
+            daemon_write_candidate: true,
+            rename: true,
+        });
+
+        assert!(!work.acknowledge_daemon_write_batch(&batch));
+        assert_ne!(
+            work.mutation_generation.load(Ordering::Acquire),
+            work.durable_generation.load(Ordering::Acquire),
+            "an external atomic replacement must take the normal scan path"
         );
     }
 
@@ -4500,6 +4715,7 @@ mod tests {
             paths: vec![path],
             generation: event_generation,
             daemon_write_candidate: true,
+            rename: false,
         });
         assert!(!entry.work.acknowledge_daemon_write_batch(&batch));
         assert_ne!(
@@ -4539,6 +4755,7 @@ mod tests {
             paths: vec![path],
             generation: delivered_generation,
             daemon_write_candidate: true,
+            rename: false,
         });
         let _dropped_generation = work.record_mutation();
 
@@ -4580,6 +4797,7 @@ mod tests {
             paths: vec![path],
             generation: event_generation,
             daemon_write_candidate: true,
+            rename: false,
         });
         assert!(!work.acknowledge_daemon_write_batch(&batch));
         assert_ne!(
@@ -4603,7 +4821,8 @@ mod tests {
         ];
         for kind in unsafe_kinds {
             let daemon_write_candidate = watcher_event_can_match_daemon_write(&kind);
-            assert!(!daemon_write_candidate);
+            let rename = watcher_event_is_rename(&kind);
+            assert_eq!(daemon_write_candidate, rename);
             let generation = work.mutation_generation.load(Ordering::Acquire);
             work.record_daemon_write(&path, content_hash(b"daemon bytes"), generation);
             work.commit_daemon_writes();
@@ -4613,6 +4832,7 @@ mod tests {
                 paths: vec![path.clone()],
                 generation: event_generation,
                 daemon_write_candidate,
+                rename,
             });
             assert!(!work.acknowledge_daemon_write_batch(&batch));
             assert_ne!(
@@ -4633,6 +4853,7 @@ mod tests {
             // Exercise the stat-failure branch independently of remove-kind
             // classification.
             daemon_write_candidate: true,
+            rename: false,
         });
         assert!(!work.acknowledge_daemon_write_batch(&batch));
         assert_ne!(
@@ -4651,6 +4872,7 @@ mod tests {
                         paths: Vec::new(),
                         generation,
                         daemon_write_candidate: false,
+                        rename: false,
                     })
                     .await;
                 tokio::time::sleep(Duration::from_millis(5)).await;
