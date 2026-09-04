@@ -650,9 +650,12 @@ impl<S: AsyncRead + Unpin> AsyncRead for IdleTimeoutStream<S> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        let filled_before = buf.filled().len();
         match Pin::new(&mut this.inner).poll_read(cx, buf) {
             Poll::Ready(result) => {
-                this.read_deadline = None;
+                if buf.filled().len() > filled_before {
+                    this.read_deadline = None;
+                }
                 Poll::Ready(result)
             }
             Poll::Pending => {
@@ -676,7 +679,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for IdleTimeoutStream<S> {
         let this = self.get_mut();
         match Pin::new(&mut this.inner).poll_write(cx, buf) {
             Poll::Ready(result) => {
-                this.write_deadline = None;
+                if matches!(&result, Ok(written) if *written > 0) {
+                    this.write_deadline = None;
+                }
                 Poll::Ready(result)
             }
             Poll::Pending => {
