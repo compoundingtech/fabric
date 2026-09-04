@@ -5,9 +5,77 @@ current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
 _Last updated: 2026-09-04 by Silber.fabric-codex. Main's last code commit is
-deployed as `0.2.1+863dc5b` on Silber and hetz._
+deployed as `0.2.1+48208e4` on Silber and hetz._
 
 ## Current release — 2026-09-04
+
+PR #152 removed the final full-state clones from a sync pass. The engine still
+clones the required pre-peer manifest and baseline. It compares the final
+manifest and observed map by reference under their existing locks. It merged as
+`48208e4`.
+
+The red contract counted `Manifest::clone` calls during one clean sync pass. It
+failed before the fix with two calls, where one call was required. It passes
+after the fix with only the required baseline clone. The manual test counter is
+available only in test builds.
+
+The comparison does not increase the lock window. A temporary release-mode
+benchmark used 29,337 realistic entries. A full clone took 1,207,037 ns per
+operation. Equality took 310,312 ns per operation, or 3.89 times less time.
+The temporary benchmark was removed before the merge.
+
+The final library suite passed 456 active tests, with three measurements
+ignored. The serial folder-sync suite passed 18 tests. Exact-main test run
+`33908307690` passed on macOS and Linux. Exact-main Nix run `33908307736`
+passed.
+
+Release `v0.2.1+48208e4` passed all four jobs in run `33909616308`. The archive
+SHA-256 values are `fefb1bb8ab468b2d3c11a02f9e2f1d2a6963ee6a28ce5c82cfa21613ee4cfdc9`
+for Apple arm64, `4371fa60c8d25cf87ecc3832c000e4bbf32d95329e4ca4682503e137db9dedff`
+for Linux arm64, and `628c4a1dbe9af18372c7a0d24d97f80dad99767115be85d7233db3ee8eed98d7`
+for Linux x86_64. Each archive matched its sidecar and contained only
+`fabric`. The Apple and Linux x86_64 binaries reported `0.2.1+48208e4` before
+deployment.
+
+The rollout updated hetz first and Silber second. The mixed-version fleet passed
+two-way ping and exec through direct paths. Both final binaries and daemons
+report `0.2.1+48208e4`. Doctor passes on both hosts. Both native services are
+active and enabled. A two-way send-file round trip matched SHA-256
+`5ac13b6c2f9ebb908bd82784d8cd9fd62edfcb2d9f2453e614c556280a53009d`.
+
+The final snapshots match at 29,369 present bus paths and 17,809 tombstones.
+Their bus digest is
+`9ac561f8c2bed946367146a8436e0069f31a62d684a332de9942cea6e28b2b05`.
+Both declaration entries have 119 present paths, 41 tombstones, and digest
+`a2a70ac8a21be7a49c9654f055a9440a5e165a857217fea39873f8b4247b5d51`.
+Both entries are clean, with no missing, unexpected, or mismatched paths.
+
+Five live hetz windows each measured 30 seconds. They used malloc, calloc,
+realloc, and posix_memalign probes against PID 940540. The windows requested
+446,536,561, 387,734,904, 784,988,157, 449,767,374, and 1,621,589,144 bytes.
+Their rates were 49.90, 43.33, 87.73, 50.27, and 181.23 GiB/hour.
+
+The new median is 50.27 GiB/hour. The earlier five-window median was 56.17
+GiB/hour, so the median fell 10.51 percent. The new aggregate is 3,690,616,140
+bytes during 150 sampled seconds, or 82.49 GiB/hour. The earlier aggregate was
+105.29 GiB/hour, so the aggregate fell 21.65 percent. The busy fifth window
+confirms that more whole-tree allocation remains.
+
+The five bus windows added 1, 2, 3, 2, and 5 passes. They added 4, 4, 8, 4,
+and 16 scans. Their guarded transaction counts increased by 1, 0, 1, 0, and 3.
+The fourth window also included one declaration pass and two declaration scans.
+
+A separate clean 10-second clone window added one bus pass, three scans, and
+one inbound no-op transaction. It added no guarded transaction. The full
+`Manifest::clone` scope requested 13,504,896 bytes. This is one full bus
+manifest clone. The former final full clone did not occur.
+
+The updater rollback binaries both reported `0.2.1+863dc5b`. The exact files
+were `/Users/myobie/.local/bin/fabric.rollback-1788549527` and
+`/home/myobie/.local/bin/fabric.rollback-1788549476`. Both rollback files,
+release files, transfer files, and measurement files were permanently deleted.
+No bpftrace or perf process remains. The old `fabric_alloc_863` probes and all
+known `863dc5b` trace paths are absent.
 
 PR #146 releases allocator-retained Linux pages without recycling an endpoint.
 Each new 128 MiB RSS growth step calls `malloc_trim(0)` on glibc Linux. Other
