@@ -103,6 +103,9 @@ const ENDPOINT_RSS_OBSERVE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// Observe a new RSS growth step only after a whole step, so reporting and
 /// allocator trims stay bounded.
 const ENDPOINT_RSS_GROWTH_STEP_BYTES: u64 = 128 * 1024 * 1024;
+/// Report the first routine allocator trim, then summarize routine successes.
+/// Abnormal outcomes bypass this interval and report immediately.
+const ENDPOINT_RSS_SUCCESS_REPORT_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const NETWORK_CHANGE_DEBOUNCE: Duration = Duration::from_millis(140);
 /// How often the daemon actively echo-probes each trusted peer, so a peer that has
 /// roamed (changed network / public IP) is detected even when THIS machine saw no
@@ -613,6 +616,62 @@ type AllocatorTrimmer = Arc<dyn Fn() -> AllocatorTrimResult + Send + Sync>;
 struct AllocatorTrimResult {
     attempted: bool,
     succeeded: bool,
+}
+
+#[derive(Debug, Default)]
+struct RssTrimSuccessReports {
+    last_report_at: Option<Instant>,
+    pending_successes: usize,
+    pending_returned_bytes: u64,
+    pending_trim_duration: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RssTrimSuccessSummary {
+    successes: usize,
+    returned_bytes: u64,
+    trim_duration: Duration,
+}
+
+impl RssTrimSuccessReports {
+    fn record(
+        &mut self,
+        now: Instant,
+        rss_before_bytes: u64,
+        rss_after_bytes: u64,
+        trim_duration: Duration,
+    ) -> Option<RssTrimSuccessSummary> {
+        self.pending_successes = self.pending_successes.saturating_add(1);
+        self.pending_returned_bytes = self
+            .pending_returned_bytes
+            .saturating_add(rss_before_bytes.saturating_sub(rss_after_bytes));
+        self.pending_trim_duration = self.pending_trim_duration.saturating_add(trim_duration);
+
+        let should_report = self.last_report_at.is_none_or(|last_report_at| {
+            now.duration_since(last_report_at) >= ENDPOINT_RSS_SUCCESS_REPORT_INTERVAL
+        });
+        if !should_report {
+            return None;
+        }
+
+        self.last_report_at = Some(now);
+        let summary = RssTrimSuccessSummary {
+            successes: self.pending_successes,
+            returned_bytes: self.pending_returned_bytes,
+            trim_duration: self.pending_trim_duration,
+        };
+        self.pending_successes = 0;
+        self.pending_returned_bytes = 0;
+        self.pending_trim_duration = Duration::ZERO;
+        Some(summary)
+    }
+}
+
+fn rss_trim_needs_immediate_notice(
+    allocator_trim: AllocatorTrimResult,
+    rss_after_trim_bytes: Option<u64>,
+) -> bool {
+    !allocator_trim.attempted || !allocator_trim.succeeded || rss_after_trim_bytes.is_none()
 }
 
 fn resolve_server_session_settings(
@@ -2942,6 +3001,7 @@ async fn run_endpoint_rss_observe_loop_with_sampler(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     interval.tick().await;
     let mut rss_growth_baseline_bytes = 0u64;
+    let mut rss_trim_success_reports = RssTrimSuccessReports::default();
 
     loop {
         tokio::select! {
@@ -2976,7 +3036,7 @@ async fn run_endpoint_rss_observe_loop_with_sampler(
                     let trim_duration = trim_started.elapsed();
                     let rss_after_trim_bytes = sample_rss();
                     rss_growth_baseline_bytes = rss_after_trim_bytes.unwrap_or(rss_bytes);
-                    warn!(
+                    debug!(
                         target: VALIDATION_LOG_TARGET,
                         event = "endpoint_rss_growth",
                         generation,
@@ -2988,25 +3048,71 @@ async fn run_endpoint_rss_observe_loop_with_sampler(
                         rss_after_trim_bytes = rss_after_trim_bytes.unwrap_or(0),
                         "daemon RSS crossed a new growth step"
                     );
-                    match (allocator_trim.attempted, rss_after_trim_bytes) {
-                        (true, Some(rss_after_trim_bytes)) => {
+
+                    if rss_trim_needs_immediate_notice(allocator_trim, rss_after_trim_bytes) {
+                        warn!(
+                            target: VALIDATION_LOG_TARGET,
+                            event = "endpoint_rss_growth",
+                            generation,
+                            rss_bytes,
+                            allocator_trim_attempted = allocator_trim.attempted,
+                            allocator_trim_succeeded = allocator_trim.succeeded,
+                            allocator_trim_duration_ms = trim_duration.as_millis() as u64,
+                            rss_after_trim_known = rss_after_trim_bytes.is_some(),
+                            rss_after_trim_bytes = rss_after_trim_bytes.unwrap_or(0),
+                            "daemon RSS trim had an abnormal outcome"
+                        );
+                        match (
+                            allocator_trim.attempted,
+                            allocator_trim.succeeded,
+                            rss_after_trim_bytes,
+                        ) {
+                            (false, _, _) => {
+                                eprintln!(
+                                    "fabric: memory in use {} MiB (new growth step, endpoint generation {generation}); allocator trim is unavailable",
+                                    bytes_to_mib(rss_bytes),
+                                )
+                            }
+                            (true, false, _) => {
+                                eprintln!(
+                                    "fabric: memory in use {} MiB (new growth step, endpoint generation {generation}); allocator trim failed",
+                                    bytes_to_mib(rss_bytes),
+                                )
+                            }
+                            (true, true, None) => {
+                                eprintln!(
+                                    "fabric: memory in use {} MiB (new growth step, endpoint generation {generation}); allocator trim completed, follow-up RSS unavailable",
+                                    bytes_to_mib(rss_bytes),
+                                )
+                            }
+                            (true, true, Some(_)) => unreachable!("a routine trim is not abnormal"),
+                        }
+                    } else if let Some(rss_after_trim_bytes) = rss_after_trim_bytes {
+                        if let Some(summary) = rss_trim_success_reports.record(
+                            Instant::now(),
+                            rss_bytes,
+                            rss_after_trim_bytes,
+                            trim_duration,
+                        ) {
+                            warn!(
+                                target: VALIDATION_LOG_TARGET,
+                                event = "endpoint_rss_trim_summary",
+                                generation,
+                                successful_trims = summary.successes,
+                                returned_bytes = summary.returned_bytes,
+                                allocator_trim_duration_ms = summary.trim_duration.as_millis() as u64,
+                                rss_bytes,
+                                rss_after_trim_bytes,
+                                report_interval_ms = ENDPOINT_RSS_SUCCESS_REPORT_INTERVAL.as_millis() as u64,
+                                "allocator trim success summary"
+                            );
                             eprintln!(
-                                "fabric: memory in use {} MiB (new growth step, endpoint generation {generation}); allocator trim left {} MiB",
+                                "fabric: allocator trim returned {} MiB across {} successful requests; memory fell from {} MiB to {} MiB in the latest request (endpoint generation {generation})",
+                                bytes_to_mib(summary.returned_bytes),
+                                summary.successes,
                                 bytes_to_mib(rss_bytes),
                                 bytes_to_mib(rss_after_trim_bytes),
-                            )
-                        }
-                        (true, None) => {
-                            eprintln!(
-                                "fabric: memory in use {} MiB (new growth step, endpoint generation {generation}); allocator trim completed, follow-up RSS unavailable",
-                                bytes_to_mib(rss_bytes),
-                            )
-                        }
-                        (false, _) => {
-                            eprintln!(
-                                "fabric: memory in use {} MiB (new growth step, endpoint generation {generation}); allocator trim is unavailable",
-                                bytes_to_mib(rss_bytes),
-                            )
+                            );
                         }
                     }
                 }
@@ -5885,6 +5991,79 @@ mod tests {
         observer.await??;
         node.shutdown().await?;
         Ok(())
+    }
+
+    #[test]
+    fn routine_rss_trim_notices_are_summarized_without_hiding_abnormal_outcomes() {
+        let started = Instant::now();
+        let mut reports = RssTrimSuccessReports::default();
+        let one_step = ENDPOINT_RSS_GROWTH_STEP_BYTES;
+
+        let first = reports
+            .record(
+                started,
+                4 * one_step,
+                3 * one_step,
+                Duration::from_millis(20),
+            )
+            .expect("the first successful trim must report immediately");
+        assert_eq!(first.successes, 1);
+        assert_eq!(first.returned_bytes, one_step);
+
+        for minute in 1..30 {
+            assert!(
+                reports
+                    .record(
+                        started + Duration::from_secs(minute * 60),
+                        4 * one_step,
+                        3 * one_step,
+                        Duration::from_millis(20),
+                    )
+                    .is_none(),
+                "a routine success before 30 minutes must stay out of the default log"
+            );
+        }
+
+        let summary = reports
+            .record(
+                started + ENDPOINT_RSS_SUCCESS_REPORT_INTERVAL,
+                4 * one_step,
+                3 * one_step,
+                Duration::from_millis(20),
+            )
+            .expect("the 30-minute success must report the suppressed work");
+        assert_eq!(summary.successes, 30);
+        assert_eq!(summary.returned_bytes, 30 * one_step);
+        assert_eq!(summary.trim_duration, Duration::from_millis(600));
+
+        assert!(rss_trim_needs_immediate_notice(
+            AllocatorTrimResult {
+                attempted: true,
+                succeeded: false,
+            },
+            Some(3 * one_step),
+        ));
+        assert!(rss_trim_needs_immediate_notice(
+            AllocatorTrimResult {
+                attempted: true,
+                succeeded: true,
+            },
+            None,
+        ));
+        assert!(rss_trim_needs_immediate_notice(
+            AllocatorTrimResult {
+                attempted: false,
+                succeeded: false,
+            },
+            Some(3 * one_step),
+        ));
+        assert!(!rss_trim_needs_immediate_notice(
+            AllocatorTrimResult {
+                attempted: true,
+                succeeded: true,
+            },
+            Some(3 * one_step),
+        ));
     }
 
     #[test]
