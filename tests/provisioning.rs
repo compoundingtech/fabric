@@ -192,7 +192,10 @@ fn git_shares_and_peer_grants_live_in_peers_toml() -> Result<()> {
             .output()?,
     )?;
     let raw = fs::read_to_string(home.join("peers.toml"))?;
-    assert!(raw.contains("[[git_remotes]]"));
+    assert!(
+        raw.contains("[[git_remotes]]"),
+        "the Git remote table header changed:\n{raw}"
+    );
     assert!(raw.contains("git/mandat/write"));
     assert!(!raw.contains("git/mandat/read"));
     assert!(raw.contains("shell"));

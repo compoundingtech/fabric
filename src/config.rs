@@ -1044,7 +1044,17 @@ fn upsert_table_field(table: &mut Table, desired: &Table, key: &str) -> Result<(
     };
     let child_position = table.position().unwrap_or(0).saturating_add(1);
     if let Some(current_item) = table.get_mut(key) {
+        let current_is_table = matches!(current_item, Item::Table(_) | Item::ArrayOfTables(_));
+        let desired_is_table = matches!(desired_item, Item::Table(_) | Item::ArrayOfTables(_));
         replace_item_preserving_decor(current_item, desired_item, child_position);
+        if current_is_table != desired_is_table
+            && let Some(mut current_key) = table.key_mut(key)
+        {
+            // A key-value line uses one space before `=`, while a table header
+            // uses no space before `]`. Clear the old context's key decor when
+            // a field changes between these two shapes.
+            current_key.fmt();
+        }
     } else {
         let mut desired_item = desired_item;
         let mut next_position = child_position;
@@ -1649,6 +1659,19 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o640);
+    }
+
+    #[test]
+    fn first_peer_save_creates_the_document_header() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = FabricHome::new(directory.path());
+        assert!(!home.peers_path().exists());
+
+        PeerBook::default().save(&home).unwrap();
+
+        let raw = fs::read_to_string(home.peers_path()).unwrap();
+        assert!(raw.starts_with("# fabric peers."));
+        PeerBook::load(&home).unwrap();
     }
 
     #[test]
