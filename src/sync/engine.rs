@@ -1368,57 +1368,135 @@ impl<T: SyncTransport> SyncEngine<T> {
         self.persist_entry(&entry).await
     }
 
-    async fn scan_entry(&self, entry: &EntryState) -> Result<bool> {
+    async fn scan_entry(&self, entry: &Arc<EntryState>) -> Result<bool> {
         entry.work.full_scans.fetch_add(1, Ordering::Relaxed);
         let root = entry.config.folder.clone();
         let cfg = entry.config.clone();
         let policy = entry.policy;
-        let mut node = entry.node.lock().await;
-        let mut disk = entry.disk.lock().unwrap();
-        let previous = disk.view();
-        let Some((snapshot, dirty_receipts, changed)) = scan_into_node_disk_with_limit(
-            &mut node,
-            &root,
-            &cfg,
-            policy,
-            &previous,
-            MAX_BLOB as u64,
-        )?
-        else {
-            disk.mark_root_missing();
-            return Ok(false);
-        };
-        disk.publish(snapshot, dirty_receipts);
-        #[cfg(test)]
-        entry
-            .work
-            .disk_snapshot_publications
-            .fetch_add(1, Ordering::Relaxed);
-        Ok(changed)
+        for _ in 0..3 {
+            let generation = entry.work.mutation_generation.load(Ordering::Acquire);
+            let (staged_node, manifest_revision) = {
+                let node = entry.node.lock().await;
+                (node.clone(), node.manifest_revision())
+            };
+            let (staged_disk, receipt_revision) = {
+                let disk = entry.disk.lock().unwrap();
+                (disk.clone(), disk.receipt_revision)
+            };
+            let root = root.clone();
+            let cfg = cfg.clone();
+            let phase = tokio::task::spawn_blocking(move || {
+                let mut node = staged_node;
+                let mut disk = staged_disk;
+                let previous = disk.view();
+                let changed = match scan_into_node_disk_with_limit(
+                    &mut node,
+                    &root,
+                    &cfg,
+                    policy,
+                    &previous,
+                    MAX_BLOB as u64,
+                )? {
+                    Some((snapshot, dirty_receipts, changed)) => {
+                        disk.publish(snapshot, dirty_receipts);
+                        changed
+                    }
+                    None => {
+                        disk.mark_root_missing();
+                        false
+                    }
+                };
+                Ok::<_, anyhow::Error>((node, disk, changed))
+            })
+            .await
+            .context("the sync scan blocking task stopped")??;
+
+            let mut node = entry.node.lock().await;
+            let mut disk = entry.disk.lock().unwrap();
+            if node.manifest_revision() != manifest_revision
+                || disk.receipt_revision != receipt_revision
+            {
+                continue;
+            }
+            *node = phase.0;
+            *disk = phase.1;
+            // A watcher can advance this generation while the disk task runs.
+            // The caller marks only `generation` durable, so newer work stays.
+            if entry.work.mutation_generation.load(Ordering::Acquire) != generation {
+                tracing::trace!(
+                    sync = entry.config.name,
+                    "filesystem work arrived during the blocking scan"
+                );
+            }
+            #[cfg(test)]
+            entry
+                .work
+                .disk_snapshot_publications
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(phase.2);
+        }
+        anyhow::bail!("sync state changed during three scan attempts")
     }
 
     async fn materialize_entry_state(
         &self,
-        entry: &EntryState,
+        entry: &Arc<EntryState>,
         protected: &DiskView,
     ) -> Result<()> {
         let root = entry.config.folder.clone();
         let policy = entry.policy;
-        let generation = entry.work.mutation_generation.load(Ordering::Acquire);
-        let mut node = entry.node.lock().await;
-        let mut disk = entry.disk.lock().unwrap();
-        let current = disk.view();
-        let _ = materialize_tracked_disk(
-            &mut node,
-            &root,
-            &entry.config,
-            policy,
-            protected,
-            &current,
-            &mut disk,
-            Some((&entry.work, generation)),
-        )?;
-        Ok(())
+        let cfg = entry.config.clone();
+        for _ in 0..3 {
+            let generation = entry.work.mutation_generation.load(Ordering::Acquire);
+            let (staged_node, manifest_revision) = {
+                let node = entry.node.lock().await;
+                (node.clone(), node.manifest_revision())
+            };
+            let (staged_disk, receipt_revision) = {
+                let disk = entry.disk.lock().unwrap();
+                (disk.clone(), disk.receipt_revision)
+            };
+            let root = root.clone();
+            let cfg = cfg.clone();
+            let protected = protected.clone();
+            let work = entry.work.clone();
+            let phase = tokio::task::spawn_blocking(move || {
+                let mut node = staged_node;
+                let mut disk = staged_disk;
+                let current = disk.view();
+                let _ = materialize_tracked_disk(
+                    &mut node,
+                    &root,
+                    &cfg,
+                    policy,
+                    &protected,
+                    &current,
+                    &mut disk,
+                    Some((&work, generation)),
+                )?;
+                Ok::<_, anyhow::Error>((node, disk))
+            })
+            .await
+            .context("the sync materialization blocking task stopped")??;
+
+            let mut node = entry.node.lock().await;
+            let mut disk = entry.disk.lock().unwrap();
+            if node.manifest_revision() != manifest_revision
+                || disk.receipt_revision != receipt_revision
+            {
+                continue;
+            }
+            *node = phase.0;
+            *disk = phase.1;
+            if entry.work.mutation_generation.load(Ordering::Acquire) != generation {
+                tracing::trace!(
+                    sync = entry.config.name,
+                    "filesystem work arrived during blocking materialization"
+                );
+            }
+            return Ok(());
+        }
+        anyhow::bail!("sync state changed during three materialization attempts")
     }
 
     /// Forget tombstones this node can prove are dead and replicated.
@@ -1532,67 +1610,103 @@ impl<T: SyncTransport> SyncEngine<T> {
     async fn persist_entry(&self, entry: &EntryState) -> Result<()> {
         #[cfg(test)]
         entry.work.persist_calls.fetch_add(1, Ordering::Relaxed);
-        let name = &entry.config.name;
+        for _ in 0..3 {
+            let generation = entry.work.mutation_generation.load(Ordering::Acquire);
 
-        // Which paths moved. The manifest side uses `ChangeBuffer`, and the
-        // disk side records changed receipts when a scan or materialization
-        // publishes them. Both buffers keep this union change-sized.
-        let (head, manifest_dirty) = {
-            let node = entry.node.lock().await;
-            let durable = node.changes().durable_cursor();
-            let dirty: Vec<String> = node
-                .changes()
-                .since(durable)
-                .into_iter()
-                .map(String::from)
-                .collect();
-            (node.changes().head(), dirty)
-        };
-
-        let mut changed: std::collections::BTreeSet<String> = manifest_dirty.into_iter().collect();
-        {
-            let disk = entry.disk.lock().unwrap();
-            changed.extend(disk.dirty_receipts.iter().cloned());
-        }
-
-        if self.should_compact(name, &changed) {
-            // Keep the node lock at the old clone boundary. Streaming the full
-            // JSON while holding this lock took 34-38 ms over five 29,337-path
-            // windows. A manifest clone took 1.2 ms after warm-up. Compaction
-            // is rare, so one transient manifest clone here is the safe cost.
-            let manifest = {
+            // Which paths moved. The manifest side uses `ChangeBuffer`, and
+            // the disk side records changed receipts when a scan or
+            // materialization publishes them. Both buffers keep this union
+            // change-sized. Clone only owned snapshots while each lock is
+            // held; all metadata, JSON, and write work happens afterwards.
+            let (head, manifest_revision, manifest, manifest_dirty) = {
                 let node = entry.node.lock().await;
-                node.manifest().clone()
+                let durable = node.changes().durable_cursor();
+                let dirty: Vec<String> = node
+                    .changes()
+                    .since(durable)
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+                (
+                    node.changes().head(),
+                    node.manifest_revision(),
+                    node.manifest_snapshot(),
+                    dirty,
+                )
             };
-            let disk = entry.disk.lock().unwrap().view();
+            let (disk, receipt_revision, disk_dirty) = {
+                let disk = entry.disk.lock().unwrap();
+                (
+                    disk.view(),
+                    disk.receipt_revision,
+                    disk.dirty_receipts.iter().cloned().collect::<Vec<_>>(),
+                )
+            };
             let peer_acks = entry.peer_acks.lock().unwrap().clone();
-            let raw = serde_json::to_vec(&PersistedEntryStateRef {
-                manifest: &manifest,
-                observed: ObservedMapRef(&disk),
-                scan_cache: ScanCacheMapRef(&disk),
-                peer_acks: &peer_acks,
-            })?;
-            self.write_state_bytes(name, &raw)?;
-        } else {
-            let node = entry.node.lock().await;
-            let disk = entry.disk.lock().unwrap().view();
-            let records: Vec<LoggedChange> = changed
-                .iter()
-                .map(|path| LoggedChange {
-                    path: path.clone(),
-                    entry: node.manifest().get(path).copied(),
-                    observed: disk.observed(path),
-                })
-                .collect();
-            self.append_log(name, &records)?;
-        }
+            let mut changed: std::collections::BTreeSet<String> =
+                manifest_dirty.into_iter().collect();
+            changed.extend(disk_dirty);
 
-        // Only AFTER the write. Marking a change durable before it lands is how
-        // it is dropped from the log and never written again.
-        entry.node.lock().await.changes_mut().mark_durable(head);
-        entry.disk.lock().unwrap().mark_durable();
-        entry.work.commit_daemon_writes();
-        Ok(())
+            let name = entry.config.name.clone();
+            let state_path = self.state_path(&name);
+            let log_path = self.log_path(&name);
+            let manifest_path = self.manifest_path(&name);
+            let peer_acks_for_write = peer_acks.clone();
+            tokio::task::spawn_blocking(move || {
+                if should_compact_paths(&state_path, &log_path, &changed) {
+                    let raw = serde_json::to_vec(&PersistedEntryStateRef {
+                        manifest: manifest.as_ref(),
+                        observed: ObservedMapRef(&disk),
+                        scan_cache: ScanCacheMapRef(&disk),
+                        peer_acks: &peer_acks_for_write,
+                    })?;
+                    write_state_bytes_at(
+                        &name,
+                        &state_path,
+                        &log_path,
+                        &manifest_path,
+                        &raw,
+                    )?;
+                } else {
+                    let records: Vec<LoggedChange> = changed
+                        .iter()
+                        .map(|path| LoggedChange {
+                            path: path.clone(),
+                            entry: manifest.get(path).copied(),
+                            observed: disk.observed(path),
+                        })
+                        .collect();
+                    append_log_path(&log_path, &records)?;
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .context("the sync persistence blocking task stopped")??;
+
+            // The operation guard normally makes these checks uneventful. Keep
+            // them here so a future caller cannot apply a stale disk snapshot.
+            let mut node = entry.node.lock().await;
+            let mut disk = entry.disk.lock().unwrap();
+            if node.manifest_revision() != manifest_revision
+                || node.changes().head() != head
+                || disk.receipt_revision != receipt_revision
+            {
+                continue;
+            }
+
+            // A watcher may advance while the write runs. The caller marks
+            // only `generation` durable, so that newer filesystem work stays
+            // pending. The engine state above must still match the snapshot.
+            debug_assert!(entry.work.mutation_generation.load(Ordering::Acquire) >= generation);
+
+            // Only AFTER the write. Marking a change durable before it lands is
+            // how it is dropped from the log and never written again.
+            node.changes_mut().mark_durable(head);
+            disk.mark_durable();
+            entry.work.commit_daemon_writes();
+            return Ok(());
+        }
+        anyhow::bail!("sync state changed during three persistence attempts")
     }
 
     /// One pass, and a second one if the first found a payload incomplete.
@@ -1713,20 +1827,6 @@ impl<T: SyncTransport> SyncEngine<T> {
     ///
     /// A missing snapshot forces one: an append log with nothing under it
     /// recovers nothing.
-    fn should_compact(&self, name: &str, changed: &std::collections::BTreeSet<String>) -> bool {
-        let snapshot = match std::fs::metadata(self.state_path(name)) {
-            Ok(meta) => meta.len(),
-            Err(_) => return true,
-        };
-        if changed.is_empty() {
-            return false;
-        }
-        let log = std::fs::metadata(self.log_path(name))
-            .map(|m| m.len())
-            .unwrap_or(0);
-        log * LOG_COMPACTION_DIVISOR >= snapshot
-    }
-
     fn log_path(&self, name: &str) -> PathBuf {
         self.home
             .root()
@@ -1762,28 +1862,9 @@ impl<T: SyncTransport> SyncEngine<T> {
     ///
     /// That is not made worse by the log and was equally true before it. It is
     /// why the snapshot, and only the snapshot, is written with an fsync.
+    #[cfg(test)]
     fn append_log(&self, name: &str, records: &[LoggedChange]) -> Result<()> {
-        if records.is_empty() {
-            return Ok(());
-        }
-        let path = self.log_path(name);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut buf = Vec::new();
-        for record in records {
-            serde_json::to_writer(&mut buf, record)?;
-            buf.push(b'\n');
-        }
-        use std::io::Write as _;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("failed to open {}", path.display()))?;
-        file.write_all(&buf)
-            .with_context(|| format!("failed to append to {}", path.display()))?;
-        Ok(())
+        append_log_path(&self.log_path(name), records)
     }
 
     /// Read the log, discarding a torn tail.
@@ -1922,59 +2003,15 @@ impl<T: SyncTransport> SyncEngine<T> {
         self.write_state_bytes(name, &raw)
     }
 
+    #[cfg(test)]
     fn write_state_bytes(&self, name: &str, raw: &[u8]) -> Result<()> {
-        let path = self.state_path(name);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // Compact for the same reason as the manifest. Still JSON, so a build
-        // that predates this reads it unchanged; only the whitespace is gone.
-        // The combined state is authoritative and lands atomically first. It is
-        // self-contained: manifest, observed receipt, scan cache and peer acks.
-        //
-        // DURABLY, because the log is truncated against it below. This is the
-        // ordering that loses data if it is reversed, and it is the only one.
-        write_atomic_durable(&path, raw)?;
-        #[cfg(test)]
-        if let Some(marker) = std::env::var_os("FABRIC_TEST_PAUSE_AFTER_STATE_COMMIT") {
-            std::fs::write(marker, b"committed")?;
-            loop {
-                std::thread::park();
-            }
-        }
-        // Only now, with the snapshot on the platter, may the log go. A crash
-        // between these two leaves records that are already inside the snapshot,
-        // and replaying those is a no-op.
-        match std::fs::remove_file(self.log_path(name)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                // Not fatal, and not silent. The snapshot is committed and
-                // correct, and replaying a log it already contains changes
-                // nothing.
-                tracing::debug!(
-                    sync = name,
-                    %error,
-                    "could not truncate the sync log after a snapshot"
-                );
-            }
-        }
-        // The manifest projection is NOT rewritten here, and that is the point.
-        //
-        // It used to be, to keep `manifest.json` current for operators and older
-        // binaries. It is a byte-for-byte duplicate of the manifest written
-        // moments earlier inside the state above, and on the production bus
-        // entry it was 11,440,720 bytes of a 31,056,281 byte write: 36.8% of
-        // everything fabric writes, spent storing the same thing twice.
-        //
-        // It is REMOVED rather than left behind. A projection that stops being
-        // updated is worse than one that never existed: it keeps parsing, it
-        // keeps looking authoritative, and it holds Present entries for paths
-        // that were tombstoned afterwards. An older binary reading a stale one
-        // would resurrect deleted files. An older binary that finds NOTHING
-        // rescans, records what is on disk, and loses to its peers' higher
-        // versions on the first reconcile, which converges.
-        self.remove_manifest_projection(name)
+        write_state_bytes_at(
+            name,
+            &self.state_path(name),
+            &self.log_path(name),
+            &self.manifest_path(name),
+            raw,
+        )
     }
 
     /// Delete the legacy `manifest.json` projection if it is still there.
@@ -1983,22 +2020,7 @@ impl<T: SyncTransport> SyncEngine<T> {
     /// `state.json` migrates on its first write: the load path reads the
     /// projection, the first persist writes the state and removes it.
     fn remove_manifest_projection(&self, name: &str) -> Result<()> {
-        let path = self.manifest_path(name);
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            // Not fatal. The state above is already committed and correct, and a
-            // projection we failed to delete is a stale file, not a lost one.
-            Err(error) => {
-                tracing::debug!(
-                    sync = name,
-                    path = %path.display(),
-                    %error,
-                    "could not remove the legacy manifest projection"
-                );
-                Ok(())
-            }
-        }
+        remove_manifest_projection_at(name, &self.manifest_path(name))
     }
 
     /// Start watching every configured entry's folder and syncing on change,
@@ -2127,6 +2149,100 @@ impl<T: SyncTransport> SyncEngine<T> {
                     }
                 }
             }
+        }
+    }
+}
+
+fn should_compact_paths(
+    state_path: &Path,
+    log_path: &Path,
+    changed: &std::collections::BTreeSet<String>,
+) -> bool {
+    let snapshot = match std::fs::metadata(state_path) {
+        Ok(meta) => meta.len(),
+        Err(_) => return true,
+    };
+    if changed.is_empty() {
+        return false;
+    }
+    let log = std::fs::metadata(log_path).map(|m| m.len()).unwrap_or(0);
+    log * LOG_COMPACTION_DIVISOR >= snapshot
+}
+
+fn append_log_path(path: &Path, records: &[LoggedChange]) -> Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut buf = Vec::new();
+    for record in records {
+        serde_json::to_writer(&mut buf, record)?;
+        buf.push(b'\n');
+    }
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.write_all(&buf)
+        .with_context(|| format!("failed to append to {}", path.display()))?;
+    Ok(())
+}
+
+fn write_state_bytes_at(
+    name: &str,
+    state_path: &Path,
+    log_path: &Path,
+    manifest_path: &Path,
+    raw: &[u8],
+) -> Result<()> {
+    if let Some(parent) = state_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // The combined state is authoritative. It lands durably before the log is
+    // removed. Reversing this order can lose a committed transition.
+    write_atomic_durable(state_path, raw)?;
+    #[cfg(test)]
+    if let Some(marker) = std::env::var_os("FABRIC_TEST_PAUSE_AFTER_STATE_COMMIT") {
+        std::fs::write(marker, b"committed")?;
+        loop {
+            std::thread::park();
+        }
+    }
+
+    // A crash before this removal leaves records already present in the
+    // snapshot. Their replay is a no-op because the latest path value wins.
+    match std::fs::remove_file(log_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::debug!(
+                sync = name,
+                %error,
+                "could not truncate the sync log after a snapshot"
+            );
+        }
+    }
+    remove_manifest_projection_at(name, manifest_path)
+}
+
+fn remove_manifest_projection_at(name: &str, path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        // The state is already committed and correct. This projection is stale
+        // if it remains, so report the cleanup failure but keep the state.
+        Err(error) => {
+            tracing::debug!(
+                sync = name,
+                path = %path.display(),
+                %error,
+                "could not remove the legacy manifest projection"
+            );
+            Ok(())
         }
     }
 }
@@ -2548,6 +2664,7 @@ impl DiskView {
     }
 }
 
+#[derive(Clone)]
 struct DiskState {
     snapshot: Arc<DiskSnapshot>,
     overlay: Arc<HashMap<Arc<str>, Option<ContentHash>>>,
