@@ -31,7 +31,7 @@ use anyhow::{Context, Result};
 
 use crate::daemon::VALIDATION_LOG_TARGET;
 use iroh::EndpointAddr;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, ser::SerializeMap};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -371,6 +371,8 @@ struct EntryWork {
     reconcile_failures: AtomicU64,
     #[cfg(test)]
     persist_calls: AtomicUsize,
+    #[cfg(test)]
+    disk_snapshot_publications: AtomicUsize,
 }
 
 impl EntryWork {
@@ -398,6 +400,8 @@ impl EntryWork {
             reconcile_failures: AtomicU64::new(0),
             #[cfg(test)]
             persist_calls: AtomicUsize::new(0),
+            #[cfg(test)]
+            disk_snapshot_publications: AtomicUsize::new(0),
         })
     }
 
@@ -540,15 +544,9 @@ struct EntryState {
     /// transaction keeps an owned guard across the wire session; outbound
     /// sessions release it while dialing to avoid distributed lock inversion.
     operation: Arc<Mutex<()>>,
-    /// Last state the engine actually observed or materialized on local disk.
-    /// A Present held only in the node is not evidence that a missing path was
-    /// locally deleted; this receipt is what distinguishes those cases.
-    observed: Arc<StdMutex<HashMap<String, ContentHash>>>,
-    /// Local hash cache, keyed on this machine's own disk facts. Never sent.
-    scan_cache: Arc<StdMutex<HashMap<String, ScanCacheEntry>>>,
-    /// Paths the last scan saw but could not read as syncable regular files.
-    /// Never sent and never used as deletion evidence.
-    scan_issues: Arc<StdMutex<BTreeMap<String, ScanIssue>>>,
+    /// One shared-key snapshot for disk evidence, observed receipts, and the
+    /// local scan cache. Materialization adds only a small receipt overlay.
+    disk: Arc<StdMutex<DiskState>>,
     /// Local wall-clock time of the last reconcile this node completed with
     /// each peer, keyed by peer id. Never sent; it is this node's own evidence
     /// of what a peer has been told, and the tombstone sweep will not forget a
@@ -563,15 +561,6 @@ struct EntryState {
     /// likely mistake too: somebody writes `allow = ["web"]` for one peer and
     /// forgets `sync`, and the other peers keep the line looking healthy.
     peer_state: Arc<StdMutex<BTreeMap<String, PeerSyncState>>>,
-    /// What was in `observed` at the last durable write, so a persist can log
-    /// only the paths that moved.
-    ///
-    /// Held rather than derived because `observed` is replaced wholesale in one
-    /// place, so per-site dirty tracking would silently miss changes and a
-    /// missed one is silent divergence. A copy of this map is about 1.8 MB on
-    /// the production bus entry; the manifest side needs no copy at all,
-    /// because `ChangeBuffer` already records every path that moved.
-    persisted_observed: Arc<StdMutex<HashMap<String, ContentHash>>>,
     /// Local time each expired tombstone was first seen expired HERE, for the
     /// tombstones still waiting on an ack. Deliberately not persisted: a
     /// tombstone whose stamp is lost is simply stamped again on the next pass
@@ -602,6 +591,54 @@ struct PersistedEntryState {
     /// refuses to forget anything until one is earned.
     #[serde(default)]
     peer_acks: HashMap<String, i64>,
+}
+
+#[derive(Serialize)]
+struct PersistedEntryStateRef<'a> {
+    manifest: &'a Manifest,
+    observed: ObservedMapRef<'a>,
+    scan_cache: ScanCacheMapRef<'a>,
+    peer_acks: &'a HashMap<String, i64>,
+}
+
+struct ObservedMapRef<'a>(&'a DiskView);
+
+impl Serialize for ObservedMapRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.0.observed_len()))?;
+        let mut error = None;
+        self.0.for_each_observed(|path, hash| {
+            if error.is_none()
+                && let Err(failure) = map.serialize_entry(path, &hash)
+            {
+                error = Some(failure);
+            }
+        });
+        if let Some(error) = error {
+            return Err(error);
+        }
+        map.end()
+    }
+}
+
+struct ScanCacheMapRef<'a>(&'a DiskView);
+
+impl Serialize for ScanCacheMapRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut map = serializer.serialize_map(None)?;
+        for (path, record) in &self.0.snapshot.records {
+            if let Some(cache) = record.cache() {
+                map.serialize_entry(path.as_ref(), &cache)?;
+            }
+        }
+        map.end()
+    }
 }
 
 /// What the LOCAL disk looked like when this path was last hashed.
@@ -724,8 +761,8 @@ pub(crate) struct PreparedInbound {
 enum PreparedInboundMode {
     Noop,
     Guarded {
-        baseline: HashMap<String, ContentHash>,
-        manifest: Manifest,
+        baseline: DiskView,
+        manifest_revision: u64,
         _waiter: InboundWaiter,
         _operation: OwnedMutexGuard<()>,
     },
@@ -797,36 +834,30 @@ impl<T: SyncTransport> SyncEngine<T> {
                 .unwrap_or_else(EntryWork::new);
             // Reuse an existing node for an unchanged entry so in-memory content
             // survives a reload; otherwise start one from the persisted manifest.
-            let (node, operation, observed, scan_cache, scan_issues, peer_acks, expired_since) =
-                match entries.get(&cfg.name) {
-                    Some(existing) if existing.config == *cfg => (
-                        existing.node.clone(),
-                        existing.operation.clone(),
-                        existing.observed.clone(),
-                        existing.scan_cache.clone(),
-                        existing.scan_issues.clone(),
-                        existing.peer_acks.clone(),
-                        existing.expired_since.clone(),
-                    ),
-                    _ => {
-                        work.durable_generation.store(0, Ordering::Release);
-                        work.record_mutation();
-                        let (node, observed, scan_cache, peer_acks) =
-                            self.load_node_and_observed(cfg).await?;
-                        (
-                            Arc::new(Mutex::new(node)),
-                            Arc::new(Mutex::new(())),
-                            Arc::new(StdMutex::new(observed)),
-                            Arc::new(StdMutex::new(scan_cache)),
-                            Arc::new(StdMutex::new(BTreeMap::new())),
-                            Arc::new(StdMutex::new(peer_acks)),
-                            Arc::new(StdMutex::new(HashMap::new())),
-                        )
-                    }
-                };
-            // What is durable right now: the snapshot with its log replayed.
-            let persisted_observed =
-                Arc::new(StdMutex::new(observed.lock().unwrap().clone()));
+            let (node, operation, disk, peer_acks, expired_since) = match entries.get(&cfg.name) {
+                Some(existing) if existing.config == *cfg => (
+                    existing.node.clone(),
+                    existing.operation.clone(),
+                    existing.disk.clone(),
+                    existing.peer_acks.clone(),
+                    existing.expired_since.clone(),
+                ),
+                _ => {
+                    work.durable_generation.store(0, Ordering::Release);
+                    work.record_mutation();
+                    let (node, observed, scan_cache, peer_acks) =
+                        self.load_node_and_observed(cfg).await?;
+                    (
+                        Arc::new(Mutex::new(node)),
+                        Arc::new(Mutex::new(())),
+                        Arc::new(StdMutex::new(DiskState::from_persisted(
+                            observed, scan_cache,
+                        ))),
+                        Arc::new(StdMutex::new(peer_acks)),
+                        Arc::new(StdMutex::new(HashMap::new())),
+                    )
+                }
+            };
             let peer_state = Arc::new(StdMutex::new(BTreeMap::new()));
             next.insert(
                 cfg.name.clone(),
@@ -836,10 +867,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                     node,
                     operation,
                     peer_state,
-                    persisted_observed,
-                    observed,
-                    scan_cache,
-                    scan_issues,
+                    disk,
                     peer_acks,
                     expired_since,
                     last_sweep: Arc::new(StdMutex::new(None)),
@@ -977,14 +1005,14 @@ impl<T: SyncTransport> SyncEngine<T> {
 
         if !entry.work.may_reuse_durable_scan(queued) {
             let generation = entry.work.mutation_generation.load(Ordering::Acquire);
-            let before_manifest = entry.node.lock().await.manifest().clone();
-            let before_observed = entry.observed.lock().unwrap().clone();
+            let before_manifest_revision = entry.node.lock().await.manifest_revision();
+            let before_receipt_revision = entry.disk.lock().unwrap().receipt_revision;
             self.scan_entry(&entry).await?;
-            let final_manifest = entry.node.lock().await.manifest().clone();
-            let final_observed = entry.observed.lock().unwrap().clone();
+            let final_manifest_revision = entry.node.lock().await.manifest_revision();
+            let final_receipt_revision = entry.disk.lock().unwrap().receipt_revision;
             if entry.work.durable_generation.load(Ordering::Acquire) != generation
-                || final_manifest != before_manifest
-                || final_observed != before_observed
+                || final_manifest_revision != before_manifest_revision
+                || final_receipt_revision != before_receipt_revision
                 || !self.state_path(&entry.config.name).exists()
             {
                 // A legacy entry may not have state.json yet, and a crash
@@ -998,13 +1026,13 @@ impl<T: SyncTransport> SyncEngine<T> {
             .work
             .inbound_guarded_transactions
             .fetch_add(1, Ordering::Relaxed);
-        let baseline = entry.observed.lock().unwrap().clone();
-        let manifest = entry.node.lock().await.manifest().clone();
+        let baseline = entry.disk.lock().unwrap().view();
+        let manifest_revision = entry.node.lock().await.manifest_revision();
         Ok(PreparedInbound {
             entry,
             mode: PreparedInboundMode::Guarded {
                 baseline,
-                manifest,
+                manifest_revision,
                 _waiter: waiter,
                 _operation: operation,
             },
@@ -1019,7 +1047,7 @@ impl<T: SyncTransport> SyncEngine<T> {
         let PreparedInbound { entry, mode } = prepared;
         let PreparedInboundMode::Guarded {
             baseline,
-            manifest,
+            manifest_revision,
             _waiter,
             _operation,
         } = mode
@@ -1034,9 +1062,11 @@ impl<T: SyncTransport> SyncEngine<T> {
         // whose size and mtime are unchanged.
         self.scan_entry(&entry).await?;
         self.materialize_entry_state(&entry, &baseline).await?;
-        let final_manifest = entry.node.lock().await.manifest().clone();
-        let final_observed = entry.observed.lock().unwrap().clone();
-        if final_manifest != manifest || final_observed != baseline {
+        let final_manifest_revision = entry.node.lock().await.manifest_revision();
+        let final_receipt_revision = entry.disk.lock().unwrap().receipt_revision;
+        if final_manifest_revision != manifest_revision
+            || final_receipt_revision != baseline.receipt_revision
+        {
             self.persist_entry(&entry).await?;
         }
         entry.work.mark_generation_durable(generation);
@@ -1058,32 +1088,28 @@ impl<T: SyncTransport> SyncEngine<T> {
         for (name, entry) in entries.iter() {
             let _operation = entry.operation.lock().await;
             let node = entry.node.lock().await;
-            let observed = entry.observed.lock().unwrap();
+            let disk = entry.disk.lock().unwrap().view();
             let manifest = node.manifest();
             let present = manifest.present_paths().count();
             let tombstones = manifest.len() - present;
             let missing = manifest
                 .present_paths()
-                .filter(|(path, _)| !observed.contains_key(path.as_str()))
+                .filter(|(path, _)| disk.observed(path).is_none())
                 .count();
-            let unexpected = observed
-                .keys()
-                .filter(|path| !manifest.get(path).is_some_and(|item| item.is_present()))
-                .count();
+            let mut unexpected = 0;
+            disk.for_each_observed(|path, _| {
+                if !manifest.get(path).is_some_and(|item| item.is_present()) {
+                    unexpected += 1;
+                }
+            });
             let mismatched = manifest
                 .present_paths()
-                .filter(|(path, meta)| {
-                    observed
-                        .get(path.as_str())
-                        .is_some_and(|hash| hash != &meta.hash)
-                })
+                .filter(|(path, meta)| disk.observed(path).is_some_and(|hash| hash != meta.hash))
                 .count();
-            let scan_issues = entry
-                .scan_issues
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(path, issue)| (path.clone(), issue.token().to_string()))
+            let scan_issues = disk
+                .snapshot
+                .issues()
+                .map(|(path, issue)| (path.to_string(), issue.token().to_string()))
                 .collect();
             out.push(SyncStatus {
                 digest: manifest.digest(),
@@ -1093,7 +1119,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                 peers: entry.config.peers.clone(),
                 present,
                 tombstones,
-                observed: observed.len(),
+                observed: disk.observed_len(),
                 missing,
                 unexpected,
                 mismatched,
@@ -1148,9 +1174,9 @@ impl<T: SyncTransport> SyncEngine<T> {
         // initiate together, retaining A while awaiting B's inbound guard (and
         // vice versa) is a distributed lock inversion. Carry a pre-merge
         // baseline across the unlocked network step instead.
-        let (baseline, manifest) = {
+        let (baseline, manifest_revision) = {
             let _operation = entry.operation.lock().await;
-            let protected = entry.observed.lock().unwrap().clone();
+            let protected = entry.disk.lock().unwrap().view();
             let generation = entry.work.mutation_generation.load(Ordering::Acquire);
             let phase = Instant::now();
             let scan_changed = self.scan_entry(&entry).await?;
@@ -1171,7 +1197,8 @@ impl<T: SyncTransport> SyncEngine<T> {
             // - the generation catches a watcher event not yet made durable.
             // - a legacy entry may have no state.json yet, so a first pass must
             //   write even when it changed nothing.
-            let observed_changed = { *entry.observed.lock().unwrap() != protected };
+            let observed_changed =
+                { entry.disk.lock().unwrap().receipt_revision != protected.receipt_revision };
             if scan_changed
                 || observed_changed
                 || entry.work.durable_generation.load(Ordering::Acquire) != generation
@@ -1182,9 +1209,9 @@ impl<T: SyncTransport> SyncEngine<T> {
                 EntryWork::add_phase(&entry.work.persist_micros, phase);
             }
             entry.work.mark_generation_durable(generation);
-            let baseline = entry.observed.lock().unwrap().clone();
-            let manifest = entry.node.lock().await.manifest().clone();
-            (baseline, manifest)
+            let baseline = entry.disk.lock().unwrap().view();
+            let manifest_revision = entry.node.lock().await.manifest_revision();
+            (baseline, manifest_revision)
         };
 
         let ResolvedPeers { peers, unresolved } =
@@ -1227,12 +1254,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                     }
                 }
             };
-            let previous_state = entry
-                .peer_state
-                .lock()
-                .unwrap()
-                .get(&peer.id)
-                .copied();
+            let previous_state = entry.peer_state.lock().unwrap().get(&peer.id).copied();
             let elapsed_micros = peer_started.elapsed().as_micros() as u64;
             // Per normal peer, every pass, whether or not it changed anything.
             // The aggregate reconcile counter says the peer step is 91% of a pass;
@@ -1321,8 +1343,9 @@ impl<T: SyncTransport> SyncEngine<T> {
         self.materialize_entry_state(&entry, &baseline).await?;
         EntryWork::add_phase(&entry.work.materialize_micros, phase);
         self.sweep_entry_tombstones(&entry, &peers).await;
-        let manifest_changed = entry.node.lock().await.manifest() != &manifest;
-        let observed_changed = *entry.observed.lock().unwrap() != baseline;
+        let manifest_changed = entry.node.lock().await.manifest_revision() != manifest_revision;
+        let observed_changed =
+            entry.disk.lock().unwrap().receipt_revision != baseline.receipt_revision;
         if manifest_changed || observed_changed {
             let phase = Instant::now();
             self.persist_entry(&entry).await?;
@@ -1337,7 +1360,7 @@ impl<T: SyncTransport> SyncEngine<T> {
             return Ok(());
         };
         let _operation = entry.operation.lock().await;
-        let protected = entry.observed.lock().unwrap().clone();
+        let protected = entry.disk.lock().unwrap().view();
         self.materialize_entry_state(&entry, &protected).await?;
         self.persist_entry(&entry).await
     }
@@ -1348,43 +1371,48 @@ impl<T: SyncTransport> SyncEngine<T> {
         let cfg = entry.config.clone();
         let policy = entry.policy;
         let mut node = entry.node.lock().await;
-        let mut observed = entry.observed.lock().unwrap();
-        let mut cache = entry.scan_cache.lock().unwrap();
-        let mut issues = entry.scan_issues.lock().unwrap();
-        scan_into_node_observed_with_limit(
+        let mut disk = entry.disk.lock().unwrap();
+        let previous = disk.view();
+        let Some((snapshot, dirty_receipts, changed)) = scan_into_node_disk_with_limit(
             &mut node,
             &root,
             &cfg,
             policy,
-            &mut observed,
-            &mut cache,
-            &mut issues,
+            &previous,
             MAX_BLOB as u64,
-        )
+        )?
+        else {
+            disk.mark_root_missing();
+            return Ok(false);
+        };
+        disk.publish(snapshot, dirty_receipts);
+        #[cfg(test)]
+        entry
+            .work
+            .disk_snapshot_publications
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(changed)
     }
 
     async fn materialize_entry_state(
         &self,
         entry: &EntryState,
-        protected: &HashMap<String, ContentHash>,
+        protected: &DiskView,
     ) -> Result<()> {
         let root = entry.config.folder.clone();
         let policy = entry.policy;
         let generation = entry.work.mutation_generation.load(Ordering::Acquire);
         let mut node = entry.node.lock().await;
-        let mut observed = entry.observed.lock().unwrap();
-        // Same lock order as `scan_entry`: node, observed, cache, then issues.
-        let cache = entry.scan_cache.lock().unwrap();
-        let issues = entry.scan_issues.lock().unwrap();
-        let _ = materialize_tracked_with_issues(
+        let mut disk = entry.disk.lock().unwrap();
+        let current = disk.view();
+        let _ = materialize_tracked_disk(
             &mut node,
             &root,
             &entry.config,
             policy,
             protected,
-            &mut observed,
-            &cache,
-            &issues,
+            &current,
+            &mut disk,
             Some((&entry.work, generation)),
         )?;
         Ok(())
@@ -1415,7 +1443,7 @@ impl<T: SyncTransport> SyncEngine<T> {
             // `report_sweep_state` has recorded the named reason.
             return;
         };
-        let observed = entry.observed.lock().unwrap().clone();
+        let disk = entry.disk.lock().unwrap().view();
         let evidence = SweepEvidence {
             now_secs: now_secs(),
             ttl_secs,
@@ -1426,7 +1454,12 @@ impl<T: SyncTransport> SyncEngine<T> {
             // Send, and this runs inside a spawned task.
             let mut node = entry.node.lock().await;
             let mut expired_since = entry.expired_since.lock().unwrap();
-            node.sweep_tombstones(entry.policy, evidence, &observed, &mut expired_since)
+            node.sweep_tombstones_by(
+                entry.policy,
+                evidence,
+                |path| disk.observed(path).is_some(),
+                &mut expired_since,
+            )
         };
         if !swept.is_empty() {
             tracing::info!(
@@ -1498,12 +1531,10 @@ impl<T: SyncTransport> SyncEngine<T> {
         entry.work.persist_calls.fetch_add(1, Ordering::Relaxed);
         let name = &entry.config.name;
 
-        // Which paths moved. The manifest side is free: `ChangeBuffer` already
-        // recorded every path that changed, and the durable cursor says how far
-        // disk has got. The observed side is diffed against the copy held from
-        // the last write, because `observed` is replaced wholesale in one place
-        // and per-site tracking would miss it.
-        let (head, manifest_dirty, manifest) = {
+        // Which paths moved. The manifest side uses `ChangeBuffer`, and the
+        // disk side records changed receipts when a scan or materialization
+        // publishes them. Both buffers keep this union change-sized.
+        let (head, manifest_dirty) = {
             let node = entry.node.lock().await;
             let durable = node.changes().durable_cursor();
             let dirty: Vec<String> = node
@@ -1512,45 +1543,42 @@ impl<T: SyncTransport> SyncEngine<T> {
                 .into_iter()
                 .map(String::from)
                 .collect();
-            (node.changes().head(), dirty, node.manifest().clone())
+            (node.changes().head(), dirty)
         };
-        let observed = entry.observed.lock().unwrap().clone();
 
-        let mut changed: std::collections::BTreeSet<String> =
-            manifest_dirty.into_iter().collect();
+        let mut changed: std::collections::BTreeSet<String> = manifest_dirty.into_iter().collect();
         {
-            let was = entry.persisted_observed.lock().unwrap();
-            for (path, hash) in &observed {
-                if was.get(path) != Some(hash) {
-                    changed.insert(path.clone());
-                }
-            }
-            for path in was.keys() {
-                if !observed.contains_key(path) {
-                    changed.insert(path.clone());
-                }
-            }
+            let disk = entry.disk.lock().unwrap();
+            changed.extend(disk.dirty_receipts.iter().cloned());
         }
 
         if self.should_compact(name, &changed) {
-            let scan_cache = entry.scan_cache.lock().unwrap().clone();
+            // Keep the node lock at the old clone boundary. Streaming the full
+            // JSON while holding this lock took 34-38 ms over five 29,337-path
+            // windows. A manifest clone took 1.2 ms after warm-up. Compaction
+            // is rare, so one transient manifest clone here is the safe cost.
+            let manifest = {
+                let node = entry.node.lock().await;
+                node.manifest().clone()
+            };
+            let disk = entry.disk.lock().unwrap().view();
             let peer_acks = entry.peer_acks.lock().unwrap().clone();
-            self.write_state(
-                name,
-                &PersistedEntryState {
-                    manifest,
-                    observed: observed.clone(),
-                    scan_cache,
-                    peer_acks,
-                },
-            )?;
+            let raw = serde_json::to_vec(&PersistedEntryStateRef {
+                manifest: &manifest,
+                observed: ObservedMapRef(&disk),
+                scan_cache: ScanCacheMapRef(&disk),
+                peer_acks: &peer_acks,
+            })?;
+            self.write_state_bytes(name, &raw)?;
         } else {
+            let node = entry.node.lock().await;
+            let disk = entry.disk.lock().unwrap().view();
             let records: Vec<LoggedChange> = changed
                 .iter()
                 .map(|path| LoggedChange {
                     path: path.clone(),
-                    entry: manifest.get(path).copied(),
-                    observed: observed.get(path).copied(),
+                    entry: node.manifest().get(path).copied(),
+                    observed: disk.observed(path),
                 })
                 .collect();
             self.append_log(name, &records)?;
@@ -1559,7 +1587,7 @@ impl<T: SyncTransport> SyncEngine<T> {
         // Only AFTER the write. Marking a change durable before it lands is how
         // it is dropped from the log and never written again.
         entry.node.lock().await.changes_mut().mark_durable(head);
-        *entry.persisted_observed.lock().unwrap() = observed;
+        entry.disk.lock().unwrap().mark_durable();
         entry.work.commit_daemon_writes();
         Ok(())
     }
@@ -1872,6 +1900,7 @@ impl<T: SyncTransport> SyncEngine<T> {
         Ok(Some(manifest))
     }
 
+    #[cfg(test)]
     fn write_manifest(&self, name: &str, manifest: &Manifest) -> Result<()> {
         let path = self.manifest_path(name);
         if let Some(parent) = path.parent() {
@@ -1884,20 +1913,32 @@ impl<T: SyncTransport> SyncEngine<T> {
         write_atomic(&path, &raw)
     }
 
-    fn write_state(&self, name: &str, state: &PersistedEntryState) -> Result<()> {
+    #[cfg(test)]
+    fn write_state(&self, name: &str, state: &(impl Serialize + ?Sized)) -> Result<()> {
+        let raw = serde_json::to_vec(state)?;
+        self.write_state_bytes(name, &raw)
+    }
+
+    fn write_state_bytes(&self, name: &str, raw: &[u8]) -> Result<()> {
         let path = self.state_path(name);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         // Compact for the same reason as the manifest. Still JSON, so a build
         // that predates this reads it unchanged; only the whitespace is gone.
-        let raw = serde_json::to_vec(state)?;
         // The combined state is authoritative and lands atomically first. It is
         // self-contained: manifest, observed receipt, scan cache and peer acks.
         //
         // DURABLY, because the log is truncated against it below. This is the
         // ordering that loses data if it is reversed, and it is the only one.
-        write_atomic_durable(&path, &raw)?;
+        write_atomic_durable(&path, raw)?;
+        #[cfg(test)]
+        if let Some(marker) = std::env::var_os("FABRIC_TEST_PAUSE_AFTER_STATE_COMMIT") {
+            std::fs::write(marker, b"committed")?;
+            loop {
+                std::thread::park();
+            }
+        }
         // Only now, with the snapshot on the platter, may the log go. A crash
         // between these two leaves records that are already inside the snapshot,
         // and replaying those is a no-op.
@@ -2207,116 +2248,410 @@ enum ScanPathState {
     Unknown,
 }
 
-/// One folder walk and the evidence it can give about every tracked path.
+/// The evidence for one path in one disk walk.
 ///
-/// A path is gone only when a complete parent listing proves that its next
-/// component is absent. An unreadable directory, file, or unsupported object
-/// is present but unknown. This distinction lets the walk continue without
-/// turning a skipped path into a deletion.
-///
-/// A complete walk needs no retained copy of every name it saw. Any path that
-/// is not a scanned file and has no opaque ancestor is absent. Only directories,
-/// excluded files that block a tracked descendant, and paths that block
-/// complete evidence stay in the auxiliary sets.
-#[derive(Default)]
-struct FolderScan {
-    files: Vec<ScannedFile>,
-    present_paths: HashSet<String>,
-    /// Directories, retained only because a directory can replace a tracked
-    /// file without proving that the tracked file was deleted.
-    non_file_paths: HashSet<String>,
-    /// Excluded regular files that can replace an included tracked directory.
-    blocking_file_paths: HashSet<String>,
-    /// Paths whose contents or type the walk could not inspect completely.
-    opaque_paths: HashSet<String>,
-    issues: BTreeMap<String, ScanIssue>,
+/// `Unseen` carries a prior receipt or cache entry. The current walk did not
+/// see that path, so its absence still depends on its nearest recorded ancestor.
+enum DiskKind {
+    Unseen,
+    File(ScannedFile),
+    Directory,
+    BlockingFile,
+    Opaque,
 }
 
-impl FolderScan {
-    fn iter(&self) -> std::slice::Iter<'_, ScannedFile> {
-        self.files.iter()
+struct DiskRecord {
+    kind: DiskKind,
+    observed: Option<ContentHash>,
+    cache: Option<ScanCacheEntry>,
+    issue: Option<ScanIssue>,
+}
+
+impl DiskRecord {
+    fn new(kind: DiskKind) -> Self {
+        Self {
+            kind,
+            observed: None,
+            cache: None,
+            issue: None,
+        }
     }
 
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.files.len()
+    fn cache(&self) -> Option<ScanCacheEntry> {
+        self.cache
     }
+}
 
-    #[cfg(test)]
-    fn absence_evidence_path_copies(&self) -> usize {
-        self.non_file_paths.len() + self.blocking_file_paths.len() + self.opaque_paths.len()
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum RootState {
+    #[default]
+    Complete,
+    Missing,
+}
+
+/// One folder walk and all local state keyed by the same path allocation.
+///
+/// A path is gone only when a complete parent listing proves that its next
+/// component is absent. A directory, blocking file, or opaque object makes the
+/// affected path unknown. The map also holds the observed receipt and scan
+/// cache, so a pass does not build parallel tree maps.
+#[derive(Default)]
+struct DiskSnapshot {
+    records: HashMap<Arc<str>, DiskRecord>,
+    root_state: RootState,
+}
+
+impl DiskSnapshot {
+    fn record_kind(&mut self, path: String, kind: DiskKind) {
+        match self.records.entry(Arc::from(path)) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().kind = kind;
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(DiskRecord::new(kind));
+            }
+        }
     }
 
     fn record_issue(&mut self, path: String, issue: ScanIssue) {
-        self.opaque_paths.insert(path.clone());
-        let display = if path.is_empty() {
-            ".".to_string()
-        } else {
-            path
-        };
-        self.issues.insert(display, issue);
+        let record = self
+            .records
+            .entry(Arc::from(path))
+            .or_insert_with(|| DiskRecord::new(DiskKind::Opaque));
+        record.kind = DiskKind::Opaque;
+        record.issue = Some(issue);
+    }
+
+    fn record(&self, path: &str) -> Option<&DiskRecord> {
+        self.records.get(path)
+    }
+
+    fn ancestor_record_matching(
+        &self,
+        path: &str,
+        matches: impl Fn(&DiskRecord) -> bool,
+    ) -> Option<(&str, &DiskRecord)> {
+        let mut candidate = path;
+        loop {
+            if let Some((stored, record)) = self.records.get_key_value(candidate)
+                && matches(record)
+            {
+                return Some((stored.as_ref(), record));
+            }
+            let Some(index) = candidate.rfind('/') else {
+                break;
+            };
+            candidate = &candidate[..index];
+        }
+        self.records
+            .get_key_value("")
+            .and_then(|(stored, record)| matches(record).then_some((stored.as_ref(), record)))
     }
 
     fn state(&self, path: &str) -> ScanPathState {
-        if self.present_paths.contains(path) {
+        if self.root_state == RootState::Missing {
+            return ScanPathState::Unknown;
+        }
+        if self
+            .record(path)
+            .is_some_and(|record| matches!(record.kind, DiskKind::File(_)))
+        {
             return ScanPathState::Present;
         }
-        if path_ancestor_in_set(path, &self.present_paths).is_some() {
-            // A regular file blocks a tracked descendant. Treat that
-            // unsupported replacement as unknown, not as a delete.
+        if self
+            .record(path)
+            .is_some_and(|record| matches!(record.kind, DiskKind::Directory))
+        {
             return ScanPathState::Unknown;
         }
-        if path_ancestor_in_set(path, &self.opaque_paths).is_some() {
-            return ScanPathState::Unknown;
-        }
-        if path_ancestor_in_set(path, &self.blocking_file_paths).is_some() {
-            return ScanPathState::Unknown;
-        }
-        if self.non_file_paths.contains(path) {
+        if self
+            .ancestor_record_matching(path, |record| {
+                matches!(
+                    record.kind,
+                    DiskKind::File(_) | DiskKind::Opaque | DiskKind::BlockingFile
+                )
+            })
+            .is_some()
+        {
             return ScanPathState::Unknown;
         }
         ScanPathState::AffirmativelyGone
     }
 
     fn has_presence_evidence(&self, path: &str) -> bool {
-        self.non_file_paths.contains(path)
-            || self.blocking_file_paths.contains(path)
-            || path_ancestor_in_set(path, &self.opaque_paths).is_some_and(|path| !path.is_empty())
-    }
-}
-
-impl IntoIterator for FolderScan {
-    type Item = ScannedFile;
-    type IntoIter = std::vec::IntoIter<ScannedFile>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.files.into_iter()
-    }
-}
-
-impl<'a> IntoIterator for &'a FolderScan {
-    type Item = &'a ScannedFile;
-    type IntoIter = std::slice::Iter<'a, ScannedFile>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.files.iter()
-    }
-}
-
-fn path_ancestor_in_set<'a>(path: &str, paths: &'a HashSet<String>) -> Option<&'a str> {
-    let mut candidate = path;
-    loop {
-        if let Some(found) = paths.get(candidate) {
-            return Some(found);
+        if self.record(path).is_some_and(|record| {
+            matches!(record.kind, DiskKind::Directory | DiskKind::BlockingFile)
+        }) {
+            return true;
         }
-        let Some(index) = candidate.rfind('/') else {
-            break;
-        };
-        candidate = &candidate[..index];
+        self.ancestor_record_matching(path, |record| matches!(record.kind, DiskKind::Opaque))
+            .is_some_and(|(ancestor, record)| {
+                !ancestor.is_empty() && matches!(record.kind, DiskKind::Opaque)
+            })
     }
-    paths.get("").map(String::as_str)
+
+    #[cfg(test)]
+    fn files(&self) -> impl Iterator<Item = &ScannedFile> {
+        self.records
+            .values()
+            .filter_map(|record| match &record.kind {
+                DiskKind::File(file) => Some(file),
+                _ => None,
+            })
+    }
+
+    fn file_records(&self) -> impl Iterator<Item = (&str, &ScannedFile)> {
+        self.records
+            .iter()
+            .filter_map(|(path, record)| match &record.kind {
+                DiskKind::File(file) => Some((path.as_ref(), file)),
+                _ => None,
+            })
+    }
+
+    #[cfg(test)]
+    fn iter(&self) -> impl Iterator<Item = &ScannedFile> {
+        self.files()
+    }
+
+    fn issues(&self) -> impl Iterator<Item = (&str, &ScanIssue)> {
+        self.records.iter().filter_map(|(path, record)| {
+            record.issue.as_ref().map(|issue| {
+                let display = if path.is_empty() { "." } else { path.as_ref() };
+                (display, issue)
+            })
+        })
+    }
+
+    fn path_has_issue(&self, path: &str) -> bool {
+        if self.record("").is_some_and(|record| record.issue.is_some()) {
+            return true;
+        }
+        let mut candidate = path;
+        loop {
+            if self
+                .record(candidate)
+                .is_some_and(|record| record.issue.is_some())
+            {
+                return true;
+            }
+            let Some(index) = candidate.rfind('/') else {
+                return false;
+            };
+            candidate = &candidate[..index];
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.files().count()
+    }
+
+    #[cfg(test)]
+    fn absence_evidence_path_copies(&self) -> usize {
+        self.records
+            .values()
+            .filter(|record| {
+                matches!(
+                    record.kind,
+                    DiskKind::Directory | DiskKind::BlockingFile | DiskKind::Opaque
+                )
+            })
+            .count()
+    }
 }
 
+#[cfg(test)]
+type FolderScan = DiskSnapshot;
+
+#[cfg(test)]
+impl<'a> IntoIterator for &'a DiskSnapshot {
+    type Item = &'a ScannedFile;
+    type IntoIter = std::vec::IntoIter<&'a ScannedFile>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.files().collect::<Vec<_>>().into_iter()
+    }
+}
+
+#[derive(Clone)]
+struct DiskView {
+    snapshot: Arc<DiskSnapshot>,
+    overlay: Arc<HashMap<Arc<str>, Option<ContentHash>>>,
+    root_state: RootState,
+    receipt_revision: u64,
+}
+
+impl DiskView {
+    fn observed(&self, path: &str) -> Option<ContentHash> {
+        self.overlay.get(path).copied().unwrap_or_else(|| {
+            self.snapshot
+                .record(path)
+                .and_then(|record| record.observed)
+        })
+    }
+
+    fn cache(&self, path: &str) -> Option<ScanCacheEntry> {
+        self.snapshot.record(path).and_then(DiskRecord::cache)
+    }
+
+    fn shared_path(&self, path: &str) -> Option<Arc<str>> {
+        self.snapshot
+            .records
+            .get_key_value(path)
+            .map(|(shared, _)| shared.clone())
+            .or_else(|| {
+                self.overlay
+                    .get_key_value(path)
+                    .map(|(shared, _)| shared.clone())
+            })
+    }
+
+    fn observed_len(&self) -> usize {
+        let base = self
+            .snapshot
+            .records
+            .iter()
+            .filter(|(path, record)| {
+                record.observed.is_some() && !self.overlay.contains_key(path.as_ref())
+            })
+            .count();
+        base + self.overlay.values().filter(|hash| hash.is_some()).count()
+    }
+
+    fn for_each_observed(&self, mut visit: impl FnMut(&str, ContentHash)) {
+        for (path, record) in &self.snapshot.records {
+            if self.overlay.contains_key(path.as_ref()) {
+                continue;
+            }
+            if let Some(hash) = record.observed {
+                visit(path, hash);
+            }
+        }
+        for (path, hash) in self.overlay.iter() {
+            if let Some(hash) = hash {
+                visit(path, *hash);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn observed_map(&self) -> HashMap<String, ContentHash> {
+        let mut observed = HashMap::new();
+        self.for_each_observed(|path, hash| {
+            observed.insert(path.to_string(), hash);
+        });
+        observed
+    }
+}
+
+struct DiskState {
+    snapshot: Arc<DiskSnapshot>,
+    overlay: Arc<HashMap<Arc<str>, Option<ContentHash>>>,
+    root_state: RootState,
+    receipt_revision: u64,
+    dirty_receipts: std::collections::BTreeSet<String>,
+}
+
+impl DiskState {
+    fn from_persisted(
+        observed: HashMap<String, ContentHash>,
+        cache: HashMap<String, ScanCacheEntry>,
+    ) -> Self {
+        let mut snapshot = DiskSnapshot::default();
+        for (path, cache) in cache {
+            let rel: Arc<str> = Arc::from(path);
+            snapshot.records.insert(
+                rel,
+                DiskRecord {
+                    kind: DiskKind::Unseen,
+                    observed: None,
+                    cache: Some(cache),
+                    issue: None,
+                },
+            );
+        }
+        for (path, hash) in observed {
+            snapshot
+                .records
+                .entry(Arc::from(path))
+                .or_insert_with(|| DiskRecord::new(DiskKind::Unseen))
+                .observed = Some(hash);
+        }
+        Self {
+            snapshot: Arc::new(snapshot),
+            overlay: Arc::new(HashMap::new()),
+            root_state: RootState::Complete,
+            receipt_revision: 0,
+            dirty_receipts: std::collections::BTreeSet::new(),
+        }
+    }
+
+    fn view(&self) -> DiskView {
+        DiskView {
+            snapshot: self.snapshot.clone(),
+            overlay: self.overlay.clone(),
+            root_state: self.root_state,
+            receipt_revision: self.receipt_revision,
+        }
+    }
+
+    fn set_observed(&mut self, path: &str, hash: Option<ContentHash>) {
+        if self.view().observed(path) == hash {
+            return;
+        }
+        let shared = self
+            .view()
+            .shared_path(path)
+            .unwrap_or_else(|| Arc::from(path));
+        Arc::make_mut(&mut self.overlay).insert(shared, hash);
+        self.dirty_receipts.insert(path.to_string());
+        self.receipt_revision = self
+            .receipt_revision
+            .checked_add(1)
+            .expect("disk receipt revision overflow");
+    }
+
+    fn publish(&mut self, snapshot: DiskSnapshot, changed: impl IntoIterator<Item = String>) {
+        let mut any_changed = false;
+        for path in changed {
+            any_changed = true;
+            self.dirty_receipts.insert(path);
+        }
+        self.root_state = snapshot.root_state;
+        self.snapshot = Arc::new(snapshot);
+        self.overlay = Arc::new(HashMap::new());
+        if any_changed {
+            self.receipt_revision = self
+                .receipt_revision
+                .checked_add(1)
+                .expect("disk receipt revision overflow");
+        }
+    }
+
+    fn mark_durable(&mut self) {
+        self.dirty_receipts.clear();
+    }
+
+    fn mark_root_missing(&mut self) {
+        self.root_state = RootState::Missing;
+    }
+
+    #[cfg(test)]
+    fn replace_observed(&mut self, observed: HashMap<String, ContentHash>) {
+        let current = self.view().observed_map();
+        for path in current.keys() {
+            if !observed.contains_key(path) {
+                self.set_observed(path, None);
+            }
+        }
+        for (path, hash) in observed {
+            self.set_observed(&path, Some(hash));
+        }
+    }
+}
+
+#[cfg(test)]
 fn path_has_issue(path: &str, issues: &BTreeMap<String, ScanIssue>) -> bool {
     if issues.contains_key(".") {
         return true;
@@ -2354,7 +2689,9 @@ fn read_file_bounded(path: &Path, limit: u64) -> std::io::Result<BoundedRead> {
 }
 
 struct ScannedFile {
+    #[cfg(test)]
     rel: String,
+    #[cfg(test)]
     path: PathBuf,
     /// Content, read only when the file is new or changed. An unchanged file
     /// keeps this `None` and reuses its recorded hash, which is the difference
@@ -2372,22 +2709,28 @@ struct ScannedFile {
 impl ScannedFile {
     /// Content for the rare paths that need bytes for a file we did not re-read:
     /// reviving an inherited tombstone, or backfilling content the node lost.
-    fn read_bytes(&self) -> Result<Vec<u8>> {
+    fn read_bytes_at(&self, path: &Path) -> Result<Vec<u8>> {
         match &self.bytes {
             Some(bytes) => Ok(bytes.clone()),
-            None => match read_file_bounded(&self.path, MAX_BLOB as u64)
-                .with_context(|| format!("failed to read {}", self.path.display()))?
+            None => match read_file_bounded(path, MAX_BLOB as u64)
+                .with_context(|| format!("failed to read {}", path.display()))?
             {
                 BoundedRead::Bytes(bytes) => Ok(bytes),
                 BoundedRead::TooLarge(size) => anyhow::bail!(
                     "sync file {} has {size} bytes, above the {MAX_BLOB}-byte limit",
-                    self.path.display()
+                    path.display()
                 ),
             },
         }
     }
+
+    #[cfg(test)]
+    fn read_bytes(&self) -> Result<Vec<u8>> {
+        self.read_bytes_at(&self.path)
+    }
 }
 
+#[cfg(test)]
 fn scanned_bytes_or_unknown(
     file: &ScannedFile,
     previous: &HashMap<String, ContentHash>,
@@ -2443,9 +2786,26 @@ fn scan_folder_with_limit(
     entry: &SyncEntry,
     cache: &HashMap<String, ScanCacheEntry>,
     max_blob: u64,
-) -> Result<FolderScan> {
-    let mut scan = FolderScan::default();
+) -> Result<DiskSnapshot> {
+    scan_disk_snapshot_with_limit(
+        root,
+        entry,
+        |path| cache.get(path).copied(),
+        |_| None,
+        max_blob,
+    )
+}
+
+fn scan_disk_snapshot_with_limit(
+    root: &Path,
+    entry: &SyncEntry,
+    cache: impl Fn(&str) -> Option<ScanCacheEntry>,
+    shared_path: impl Fn(&str) -> Option<Arc<str>>,
+    max_blob: u64,
+) -> Result<DiskSnapshot> {
+    let mut scan = DiskSnapshot::default();
     if !root.exists() {
+        scan.root_state = RootState::Missing;
         return Ok(scan);
     }
     let mut stack = vec![(root.to_path_buf(), String::new())];
@@ -2492,26 +2852,26 @@ fn scan_folder_with_limit(
                     "fabric: skipping symlink {} — fabric does not sync symlinks, git does",
                     path.display()
                 );
-                scan.opaque_paths.insert(norm.clone());
+                scan.record_kind(norm.clone(), DiskKind::Opaque);
                 if entry.includes(&norm) {
                     scan.record_issue(norm, ScanIssue::Unsupported);
                 }
                 continue; // never follow symlinks out of the folder
             }
             if file_type.is_dir() {
-                scan.non_file_paths.insert(norm.clone());
+                scan.record_kind(norm.clone(), DiskKind::Directory);
                 stack.push((path, norm));
                 continue;
             }
             if !file_type.is_file() {
-                scan.opaque_paths.insert(norm.clone());
+                scan.record_kind(norm.clone(), DiskKind::Opaque);
                 if entry.includes(&norm) {
                     scan.record_issue(norm, ScanIssue::Unsupported);
                 }
                 continue;
             }
             if !entry.includes(&norm) {
-                scan.blocking_file_paths.insert(norm);
+                scan.record_kind(norm, DiskKind::BlockingFile);
                 continue;
             }
             // One stat per file, not two. `DirEntry::metadata` is a fresh
@@ -2536,7 +2896,7 @@ fn scan_folder_with_limit(
             // Reuse the recorded hash when size and both mtime components are
             // byte-identical to what THIS MACHINE last observed. Anything that
             // differs, or is unknown, is read and hashed as before.
-            let known = cache.get(&norm).filter(|seen| {
+            let known = cache(&norm).filter(|seen| {
                 seen.size == size
                     && seen.mtime_secs == mtime_secs
                     && seen.mtime_nanos == mtime_nanos
@@ -2558,9 +2918,11 @@ fn scan_folder_with_limit(
                     }
                 },
             };
-            scan.present_paths.insert(norm.clone());
-            scan.files.push(ScannedFile {
+            let rel = shared_path(&norm).unwrap_or_else(|| Arc::from(norm.as_str()));
+            let scanned_file = ScannedFile {
+                #[cfg(test)]
                 rel: norm,
+                #[cfg(test)]
                 path,
                 bytes,
                 hash,
@@ -2568,7 +2930,17 @@ fn scan_folder_with_limit(
                 mtime_nanos,
                 size,
                 executable,
-            });
+            };
+            let cache = scanned_file.cache_entry();
+            scan.records.insert(
+                rel,
+                DiskRecord {
+                    kind: DiskKind::File(scanned_file),
+                    observed: None,
+                    cache: Some(cache),
+                    issue: None,
+                },
+            );
         }
         if !complete {
             scan.record_issue(dir_rel, ScanIssue::Unreadable);
@@ -2621,15 +2993,15 @@ fn observed_from_disk_with_limit(
 ) -> Result<HashMap<String, ContentHash>> {
     let mut observed = HashMap::new();
     let scan = scan_folder_with_limit(&entry.folder, entry, cache, max_blob)?;
-    for file in &scan {
+    for (rel, file) in scan.file_records() {
         let hash = file.hash;
-        cache.insert(file.rel.clone(), file.cache_entry());
+        cache.insert(rel.to_string(), file.cache_entry());
         if manifest
-            .get(&file.rel)
+            .get(rel)
             .and_then(|entry| entry.meta())
             .is_some_and(|meta| meta.hash == hash)
         {
-            observed.insert(file.rel.clone(), hash);
+            observed.insert(rel.to_string(), hash);
         }
     }
     // An oversized or unreadable path still gives presence evidence. Retain a
@@ -2642,6 +3014,179 @@ fn observed_from_disk_with_limit(
         }
     }
     Ok(observed)
+}
+
+/// Build one unified disk snapshot and apply its local changes to the node.
+///
+/// `None` means the root is missing. The caller keeps the last snapshot and
+/// receipts because a missing mount is not evidence that every file was
+/// deleted.
+fn scan_into_node_disk_with_limit(
+    node: &mut SyncNode,
+    root: &Path,
+    entry: &SyncEntry,
+    policy: PolicyRules,
+    previous: &DiskView,
+    max_blob: u64,
+) -> Result<Option<(DiskSnapshot, Vec<String>, bool)>> {
+    if !root.exists() {
+        return Ok(None);
+    }
+    let mut scanned = scan_disk_snapshot_with_limit(
+        root,
+        entry,
+        |path| previous.cache(path),
+        |path| previous.shared_path(path),
+        max_blob,
+    )?;
+    let mut changed = false;
+
+    for (path, record) in &mut scanned.records {
+        let DiskKind::File(file) = &record.kind else {
+            continue;
+        };
+        let hash = file.hash;
+        let previous_hash = previous.observed(path);
+        record.observed = Some(hash);
+        if previous_hash == Some(hash) {
+            if !policy.propagate_deletes
+                && node
+                    .manifest()
+                    .get(path)
+                    .is_some_and(|entry| !entry.is_present())
+            {
+                match file.read_bytes_at(&root.join(path.as_ref())) {
+                    Ok(bytes) => {
+                        if node.local_write_with_mode(
+                            path,
+                            &bytes,
+                            file.mtime_secs,
+                            file.mtime_nanos,
+                            file.executable,
+                        ) {
+                            changed = true;
+                        }
+                    }
+                    Err(_) => {
+                        record.issue = Some(ScanIssue::Unreadable);
+                        record.observed = previous_hash;
+                    }
+                }
+                continue;
+            }
+            if node.get_content(&hash).is_none()
+                && node
+                    .manifest()
+                    .get(path)
+                    .and_then(|entry| entry.meta())
+                    .is_some_and(|meta| meta.hash == hash)
+            {
+                match file.read_bytes_at(&root.join(path.as_ref())) {
+                    Ok(bytes) => {
+                        node.put_content(bytes);
+                    }
+                    Err(_) => {
+                        record.issue = Some(ScanIssue::Unreadable);
+                        record.observed = previous_hash;
+                    }
+                }
+            }
+        } else {
+            match file.read_bytes_at(&root.join(path.as_ref())) {
+                Ok(bytes) => {
+                    if node.local_write_with_mode(
+                        path,
+                        &bytes,
+                        file.mtime_secs,
+                        file.mtime_nanos,
+                        file.executable,
+                    ) {
+                        changed = true;
+                    }
+                }
+                Err(_) => {
+                    record.issue = Some(ScanIssue::Unreadable);
+                    record.observed = previous_hash;
+                }
+            }
+        }
+    }
+
+    let now = now_secs();
+    previous.for_each_observed(|path, previous_hash| {
+        if scanned
+            .record(path)
+            .and_then(|record| record.observed)
+            .is_some()
+        {
+            return;
+        }
+        if !entry.includes(path) {
+            return;
+        }
+        match scanned.state(path) {
+            ScanPathState::Present => {}
+            ScanPathState::Unknown => {
+                if let Some((opaque, _)) = scanned
+                    .ancestor_record_matching(path, |record| {
+                        matches!(record.kind, DiskKind::Opaque)
+                    })
+                    .filter(|(opaque, _)| !opaque.is_empty())
+                    .map(|(path, record)| (path.to_string(), record.issue.clone()))
+                {
+                    let record = scanned.records.get_mut(opaque.as_str()).unwrap();
+                    if record.issue.is_none() {
+                        record.issue = Some(ScanIssue::Unsupported);
+                    }
+                } else if scanned
+                    .record(path)
+                    .is_some_and(|record| matches!(record.kind, DiskKind::Directory))
+                {
+                    scanned.records.get_mut(path).unwrap().issue = Some(ScanIssue::Unsupported);
+                }
+                let shared = previous
+                    .shared_path(path)
+                    .unwrap_or_else(|| Arc::from(path));
+                scanned
+                    .records
+                    .entry(shared)
+                    .or_insert_with(|| DiskRecord::new(DiskKind::Unseen))
+                    .observed = Some(previous_hash);
+            }
+            ScanPathState::AffirmativelyGone => {
+                if node.local_remove(path, policy, now) {
+                    changed = true;
+                }
+            }
+        }
+    });
+
+    let mut dirty = std::collections::BTreeSet::new();
+    for (path, record) in &scanned.records {
+        if record.observed != previous.observed(path) {
+            dirty.insert(path.to_string());
+        }
+    }
+    previous.for_each_observed(|path, _| {
+        if scanned
+            .record(path)
+            .and_then(|record| record.observed)
+            .is_none()
+        {
+            dirty.insert(path.to_string());
+        }
+    });
+
+    // Changed bytes are needed only while this scan updates the node. The
+    // content store owns them after that point. The published disk snapshot
+    // keeps local facts, not a second copy of file content.
+    for record in scanned.records.values_mut() {
+        if let DiskKind::File(file) = &mut record.kind {
+            file.bytes = None;
+        }
+    }
+
+    Ok(Some((scanned, dirty.into_iter().collect(), changed)))
 }
 
 /// Scan against the last state actually observed on disk. Manifest-only Present
@@ -2669,6 +3214,7 @@ fn scan_into_node_observed(
     )
 }
 
+#[cfg(test)]
 fn scan_into_node_observed_with_limit(
     node: &mut SyncNode,
     root: &Path,
@@ -2698,18 +3244,21 @@ fn scan_into_node_observed_with_limit(
         return Ok(false);
     }
     let scanned = scan_folder_with_limit(root, entry, cache, max_blob)?;
-    *issues = scanned.issues.clone();
+    *issues = scanned
+        .issues()
+        .map(|(path, issue)| (path.to_string(), issue.clone()))
+        .collect();
     // Refresh the cache from what this scan actually saw, so the next scan of an
     // untouched file is free. Rebuilt rather than merged, so a vanished path
     // does not leak an entry forever.
     *cache = scanned
-        .iter()
+        .files()
         .map(|file| (file.rel.clone(), file.cache_entry()))
         .collect();
     let previous = observed.clone();
     let mut current = HashMap::new();
     let mut changed = false;
-    for file in &scanned {
+    for file in scanned.files() {
         let hash = file.hash;
         current.insert(file.rel.clone(), hash);
         if previous.get(&file.rel) == Some(&hash) {
@@ -2805,16 +3354,20 @@ fn scan_into_node_observed_with_limit(
                 // affirmatively absent, that receipt remains the evidence that
                 // a real local delete occurred. The issue map prevents status
                 // from calling the unreadable or oversized path clean.
-                if let Some(opaque) = path_ancestor_in_set(path, &scanned.opaque_paths)
-                    .filter(|opaque| !opaque.is_empty())
+                if let Some((opaque, _)) = scanned
+                    .ancestor_record_matching(path, |record| {
+                        matches!(record.kind, DiskKind::Opaque)
+                    })
+                    .filter(|(opaque, _)| !opaque.is_empty())
                 {
                     issues
                         .entry(opaque.to_string())
                         .or_insert(ScanIssue::Unsupported);
-                } else if scanned.non_file_paths.contains(path) {
-                    issues
-                        .entry(path.clone())
-                        .or_insert(ScanIssue::Unsupported);
+                } else if scanned
+                    .record(path)
+                    .is_some_and(|record| matches!(record.kind, DiskKind::Directory))
+                {
+                    issues.entry(path.clone()).or_insert(ScanIssue::Unsupported);
                 }
                 current.insert(path.clone(), *previous_hash);
                 continue;
@@ -2909,6 +3462,7 @@ fn materialize(node: &SyncNode, root: &Path, policy: PolicyRules) -> Result<()> 
 ///
 /// Anything unknown or differing returns false. The caller performs a bounded
 /// read for a readable path and skips a path named by the scan issue map.
+#[cfg(test)]
 fn already_materialized(
     path: &Path,
     rel: &str,
@@ -2960,6 +3514,152 @@ struct MaterializeAllocationEvidence {
     eager_present_path_copies: usize,
 }
 
+fn already_materialized_disk(path: &Path, rel: &str, meta: &FileMeta, disk: &DiskView) -> bool {
+    let Some(seen) = disk.cache(rel) else {
+        return false;
+    };
+    if seen.hash != meta.hash {
+        return false;
+    }
+    let Ok(actual) = std::fs::metadata(path) else {
+        return false;
+    };
+    let (mtime_secs, mtime_nanos) = mtime_of_metadata(&actual);
+    seen.size == actual.len() && seen.mtime_secs == mtime_secs && seen.mtime_nanos == mtime_nanos
+}
+
+fn materialize_tracked_disk(
+    node: &mut SyncNode,
+    root: &Path,
+    entry: &SyncEntry,
+    policy: PolicyRules,
+    protected: &DiskView,
+    current: &DiskView,
+    disk: &mut DiskState,
+    daemon_writes: Option<(&EntryWork, u64)>,
+) -> Result<MaterializeAllocationEvidence> {
+    if current.root_state == RootState::Missing && protected.observed_len() > 0 {
+        return Ok(MaterializeAllocationEvidence::default());
+    }
+    std::fs::create_dir_all(root)
+        .with_context(|| format!("failed to create {}", root.display()))?;
+    enum DeferredNodeMutation {
+        Remove(String),
+        Write {
+            rel: String,
+            hash: ContentHash,
+            bytes: Vec<u8>,
+            executable: bool,
+        },
+    }
+
+    let mut deferred = Vec::new();
+    let now = now_secs();
+    for (rel, meta) in node.manifest().present_paths() {
+        if !entry.includes(rel) {
+            disk.set_observed(rel, None);
+            continue;
+        }
+        let path = root.join(rel);
+        if current.snapshot.path_has_issue(rel) {
+            continue;
+        }
+        if already_materialized_disk(&path, rel, meta, current) {
+            disk.set_observed(rel, Some(meta.hash));
+            continue;
+        }
+        let existing = match read_file_bounded(&path, MAX_BLOB as u64) {
+            Ok(BoundedRead::Bytes(bytes)) => Ok(bytes),
+            Ok(BoundedRead::TooLarge(_)) => continue,
+            Err(error) => Err(error),
+        };
+        let protected_local_path = protected.observed(rel).is_some();
+        if policy.propagate_deletes
+            && protected_local_path
+            && matches!(
+                &existing,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        {
+            deferred.push(DeferredNodeMutation::Remove(rel.clone()));
+            disk.set_observed(rel, None);
+            continue;
+        }
+
+        let needs_write = match existing {
+            Ok(existing) => {
+                let existing_hash = content_hash(&existing);
+                if existing_hash == meta.hash {
+                    disk.set_observed(rel, Some(meta.hash));
+                    false
+                } else if protected.observed(rel) != Some(existing_hash) {
+                    let executable = std::fs::metadata(&path)
+                        .ok()
+                        .is_some_and(|meta| is_executable(&meta));
+                    deferred.push(DeferredNodeMutation::Write {
+                        rel: rel.clone(),
+                        hash: existing_hash,
+                        bytes: existing,
+                        executable,
+                    });
+                    disk.set_observed(rel, Some(existing_hash));
+                    false
+                } else {
+                    true
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => continue,
+        };
+        if needs_write {
+            let deferred_bytes = || {
+                deferred.iter().find_map(|mutation| match mutation {
+                    DeferredNodeMutation::Write { hash, bytes, .. } if *hash == meta.hash => {
+                        Some(bytes.as_slice())
+                    }
+                    _ => None,
+                })
+            };
+            let Some(bytes) = node.get_content(&meta.hash).or_else(deferred_bytes) else {
+                continue;
+            };
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            write_atomic_with_mode(&path, bytes, meta.executable)?;
+            if let Some((work, generation)) = daemon_writes {
+                work.record_daemon_write(&path, meta.hash, generation);
+            }
+            disk.set_observed(rel, Some(meta.hash));
+        }
+    }
+    for mutation in deferred {
+        match mutation {
+            DeferredNodeMutation::Remove(rel) => {
+                node.local_remove(&rel, policy, now);
+            }
+            DeferredNodeMutation::Write {
+                rel,
+                bytes,
+                executable,
+                ..
+            } => {
+                node.local_write_with_mode(&rel, &bytes, 0, 0, executable);
+            }
+        }
+    }
+    if policy.propagate_deletes {
+        for (rel, record) in node.manifest().entries() {
+            if !record.is_present() && entry.includes(rel) {
+                let _ = std::fs::remove_file(root.join(rel));
+                disk.set_observed(rel, None);
+            }
+        }
+    }
+    Ok(MaterializeAllocationEvidence::default())
+}
+
+#[cfg(test)]
 fn materialize_tracked_with_issues(
     node: &mut SyncNode,
     root: &Path,
@@ -2983,11 +3683,7 @@ fn materialize_tracked_with_issues(
         },
     }
 
-    fn record_observed(
-        observed: &mut HashMap<String, ContentHash>,
-        rel: &str,
-        hash: ContentHash,
-    ) {
+    fn record_observed(observed: &mut HashMap<String, ContentHash>, rel: &str, hash: ContentHash) {
         if observed.get(rel) != Some(&hash) {
             observed.insert(rel.to_string(), hash);
         }
@@ -3185,6 +3881,7 @@ fn write_atomic_with_mode(path: &Path, bytes: &[u8], executable: bool) -> Result
 
 /// Write bytes atomically, for fabric's own state files, which are never
 /// executable.
+#[cfg(test)]
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     write_atomic_inner(path, bytes, false)
 }
@@ -4439,8 +5136,7 @@ mod tests {
         // Name what arrived. A bare "an event arrived" cannot tell a filter that
         // failed from setup noise that was late, and this test runs on two
         // platforms whose watchers do not agree about either.
-        if let Ok(Some(event)) =
-            tokio::time::timeout(Duration::from_millis(1500), rx.recv()).await
+        if let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(1500), rx.recv()).await
         {
             panic!(
                 "a write outside the glob must not reach the sync loop; if the \
@@ -4633,21 +5329,20 @@ mod tests {
         work.commit_daemon_writes();
         work.mark_generation_durable(generation);
 
-        let push = |batch: &mut Option<WatchEventBatch>,
-                    paths: Vec<PathBuf>,
-                    kind: notify::EventKind| {
-            let event = WatchEvent {
-                paths,
-                generation: work.record_mutation(),
-                daemon_write_candidate: watcher_event_can_match_daemon_write(&kind),
-                rename: watcher_event_is_rename(&kind),
+        let push =
+            |batch: &mut Option<WatchEventBatch>, paths: Vec<PathBuf>, kind: notify::EventKind| {
+                let event = WatchEvent {
+                    paths,
+                    generation: work.record_mutation(),
+                    daemon_write_candidate: watcher_event_can_match_daemon_write(&kind),
+                    rename: watcher_event_is_rename(&kind),
+                };
+                if let Some(batch) = batch {
+                    batch.push(event);
+                } else {
+                    *batch = Some(WatchEventBatch::new(event));
+                }
             };
-            if let Some(batch) = batch {
-                batch.push(event);
-            } else {
-                *batch = Some(WatchEventBatch::new(event));
-            }
-        };
         let mut batch = None;
         push(
             &mut batch,
@@ -4729,9 +5424,10 @@ mod tests {
         assert!(batch.saw_rename, "the test must exercise a rename event");
         assert!(batch.paths.contains(&final_path));
         assert!(
-            batch.paths.iter().any(|path| {
-                atomic_write_final_path(path).as_ref() == Some(&final_path)
-            }),
+            batch
+                .paths
+                .iter()
+                .any(|path| { atomic_write_final_path(path).as_ref() == Some(&final_path) }),
             "the batch must contain the paired Fabric temp path"
         );
         assert!(work.acknowledge_daemon_write_batch(&batch));
@@ -4857,8 +5553,9 @@ mod tests {
             .await
             .local_write("remote.md", b"daemon bytes", 0, 0);
         let generation = entry.work.mutation_generation.load(Ordering::Acquire);
+        let protected = DiskState::from_persisted(HashMap::new(), HashMap::new()).view();
         engine
-            .materialize_entry_state(&entry, &HashMap::new())
+            .materialize_entry_state(&entry, &protected)
             .await
             .unwrap();
         engine.persist_entry(&entry).await.unwrap();
@@ -5099,10 +5796,8 @@ mod tests {
 
     #[test]
     fn an_incomplete_parent_makes_absence_unknown() {
-        let scan = FolderScan {
-            opaque_paths: HashSet::from(["locked".to_string()]),
-            ..FolderScan::default()
-        };
+        let mut scan = FolderScan::default();
+        scan.record_kind("locked".to_string(), DiskKind::Opaque);
 
         assert!(matches!(
             scan.state("gone.txt"),
@@ -5112,6 +5807,123 @@ mod tests {
             scan.state("locked/kept.txt"),
             ScanPathState::Unknown
         ));
+    }
+
+    /// This table follows every branch in `DiskSnapshot::state`.
+    ///
+    /// These states come from the former live scan sets: included files,
+    /// directories, excluded blocking files, opaque objects, and the root.
+    #[test]
+    fn every_current_disk_absence_state_has_an_explicit_result() {
+        let mut scan = DiskSnapshot::default();
+        let file = ScannedFile {
+            rel: "file".to_string(),
+            path: PathBuf::from("file"),
+            bytes: Some(Vec::new()),
+            hash: content_hash(&[]),
+            mtime_secs: 0,
+            mtime_nanos: 0,
+            size: 0,
+            executable: false,
+        };
+        scan.records.insert(
+            Arc::from("file"),
+            DiskRecord {
+                kind: DiskKind::File(file),
+                observed: None,
+                cache: None,
+                issue: None,
+            },
+        );
+        scan.record_kind("directory".to_string(), DiskKind::Directory);
+        scan.record_kind("excluded".to_string(), DiskKind::BlockingFile);
+        scan.record_issue("symlink".to_string(), ScanIssue::Unsupported);
+        scan.record_issue("unreadable".to_string(), ScanIssue::Unreadable);
+        scan.record_issue("too-large".to_string(), ScanIssue::TooLarge);
+
+        let cases = [
+            ("included regular file", "file", ScanPathState::Present),
+            (
+                "regular file ancestor",
+                "file/child",
+                ScanPathState::Unknown,
+            ),
+            (
+                "directory replaces file",
+                "directory",
+                ScanPathState::Unknown,
+            ),
+            (
+                "excluded file blocks child",
+                "excluded/child",
+                ScanPathState::Unknown,
+            ),
+            ("unsupported object", "symlink", ScanPathState::Unknown),
+            (
+                "unsupported ancestor",
+                "symlink/child",
+                ScanPathState::Unknown,
+            ),
+            ("unreadable object", "unreadable", ScanPathState::Unknown),
+            ("oversized object", "too-large", ScanPathState::Unknown),
+            (
+                "complete parent proves absence",
+                "gone",
+                ScanPathState::AffirmativelyGone,
+            ),
+        ];
+        for (label, path, expected) in cases {
+            assert_eq!(scan.state(path), expected, "{label}");
+        }
+
+        let missing_root = DiskSnapshot {
+            root_state: RootState::Missing,
+            ..DiskSnapshot::default()
+        };
+        assert_eq!(
+            missing_root.state("any/path"),
+            ScanPathState::Unknown,
+            "a missing root is not an empty directory"
+        );
+
+        let mut unreadable_root = DiskSnapshot::default();
+        unreadable_root.record_issue(String::new(), ScanIssue::Unreadable);
+        assert_eq!(
+            unreadable_root.state("any/path"),
+            ScanPathState::Unknown,
+            "an unreadable root cannot prove any child absent"
+        );
+    }
+
+    #[test]
+    fn every_observed_receipt_change_enters_the_disk_change_buffer() {
+        let mut disk = DiskState::from_persisted(HashMap::new(), HashMap::new());
+        let hash = content_hash(b"one");
+
+        disk.set_observed("a.md", Some(hash));
+        assert_eq!(
+            disk.dirty_receipts.iter().cloned().collect::<Vec<_>>(),
+            vec!["a.md"]
+        );
+        let revision = disk.receipt_revision;
+        disk.mark_durable();
+
+        disk.set_observed("a.md", Some(hash));
+        assert!(
+            disk.dirty_receipts.is_empty(),
+            "a no-op became a disk change"
+        );
+        assert_eq!(
+            disk.receipt_revision, revision,
+            "a no-op changed the revision"
+        );
+
+        disk.set_observed("a.md", None);
+        assert_eq!(
+            disk.dirty_receipts.iter().cloned().collect::<Vec<_>>(),
+            vec!["a.md"]
+        );
+        assert_ne!(disk.receipt_revision, revision);
     }
 
     #[test]
@@ -5234,10 +6046,7 @@ mod tests {
 
         let mut node = SyncNode::new(Author([1; 32]));
         node.local_write("a-source.txt", original, 0, 0);
-        let protected = HashMap::from([(
-            "a-source.txt".to_string(),
-            content_hash(original),
-        )]);
+        let protected = HashMap::from([("a-source.txt".to_string(), content_hash(original))]);
 
         let mut remote = SyncNode::new(Author([2; 32]));
         remote.local_write("a-source.txt", b"remote first", 0, 0);
@@ -5317,13 +6126,8 @@ mod tests {
         assert!(node.manifest().get("small.txt").unwrap().is_present());
 
         let mut restart_cache = HashMap::new();
-        let restart_observed = observed_from_disk_with_limit(
-            node.manifest(),
-            &entry,
-            &mut restart_cache,
-            4,
-        )
-        .unwrap();
+        let restart_observed =
+            observed_from_disk_with_limit(node.manifest(), &entry, &mut restart_cache, 4).unwrap();
         assert_eq!(
             restart_observed.get("large.bin"),
             Some(&old_hash),
@@ -5508,6 +6312,40 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_vanished_engine_root_stops_materialization_and_keeps_every_manifest_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("watched");
+        std::fs::create_dir_all(&root).unwrap();
+        for name in ["a.md", "b.md", "c.md"] {
+            std::fs::write(root.join(name), b"payload").unwrap();
+        }
+        write_bus_sync(dir.path(), &root);
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+
+        std::fs::remove_dir_all(&root).unwrap();
+        engine.sync_once("bus").await.unwrap();
+
+        let node = engine.node_for("bus").await.unwrap();
+        assert_eq!(
+            node.lock().await.manifest().present_paths().count(),
+            3,
+            "materialization converted a missing root into three deletes"
+        );
+        assert!(
+            !root.exists(),
+            "materialization treated a missing mount as an empty folder to restore"
+        );
+    }
+
     /// Turning delete propagation ON must not delete a file that is simply
     /// there. A delete pending for an unknown length of time is not a delete
     /// anybody asked for today.
@@ -5541,8 +6379,7 @@ mod tests {
         let mut node = SyncNode::new(Author([1; 32]));
         let mut observed = HashMap::new();
         let mut cache = HashMap::new();
-        scan_into_node_observed(&mut node, root, &entry, quiet, &mut observed, &mut cache)
-            .unwrap();
+        scan_into_node_observed(&mut node, root, &entry, quiet, &mut observed, &mut cache).unwrap();
         assert_eq!(
             node.manifest().present_paths().count(),
             2,
@@ -5550,8 +6387,7 @@ mod tests {
         );
 
         // The switch. Same disk, same records, nobody deleted anything.
-        scan_into_node_observed(&mut node, root, &entry, loud, &mut observed, &mut cache)
-            .unwrap();
+        scan_into_node_observed(&mut node, root, &entry, loud, &mut observed, &mut cache).unwrap();
         let protected = observed.clone();
         materialize_tracked(
             &mut node,
@@ -5565,8 +6401,14 @@ mod tests {
         )
         .unwrap();
 
-        assert!(root.join("a.md").exists(), "enabling propagation deleted a.md");
-        assert!(root.join("b.md").exists(), "enabling propagation deleted b.md");
+        assert!(
+            root.join("a.md").exists(),
+            "enabling propagation deleted a.md"
+        );
+        assert!(
+            root.join("b.md").exists(),
+            "enabling propagation deleted b.md"
+        );
         assert_eq!(
             node.manifest().present_paths().count(),
             2,
@@ -5614,6 +6456,100 @@ mod tests {
                 raw.len()
             );
         }
+    }
+
+    #[test]
+    fn streamed_disk_snapshot_keeps_the_exact_owned_state_schema() {
+        let mut node = SyncNode::new(Author([1; 32]));
+        node.local_write("a.md", b"body", 10, 20);
+        let hash = content_hash(b"body");
+        let observed = HashMap::from([("a.md".to_string(), hash)]);
+        let cache = HashMap::from([(
+            "a.md".to_string(),
+            ScanCacheEntry {
+                size: 4,
+                mtime_secs: 10,
+                mtime_nanos: 20,
+                hash,
+            },
+        )]);
+        let peer_acks = HashMap::from([("peer".to_string(), 30)]);
+        let owned = PersistedEntryState {
+            manifest: node.manifest().clone(),
+            observed: observed.clone(),
+            scan_cache: cache.clone(),
+            peer_acks: peer_acks.clone(),
+        };
+        let disk = DiskState::from_persisted(observed, cache).view();
+        let streamed = PersistedEntryStateRef {
+            manifest: node.manifest(),
+            observed: ObservedMapRef(&disk),
+            scan_cache: ScanCacheMapRef(&disk),
+            peer_acks: &peer_acks,
+        };
+
+        assert_eq!(
+            serde_json::to_value(streamed).unwrap(),
+            serde_json::to_value(owned).unwrap(),
+            "streaming changed a state field name, value, or map shape"
+        );
+    }
+
+    #[test]
+    #[ignore = "measurement, not a guard"]
+    fn manifest_snapshot_lock_window_measurement() {
+        const PATHS: usize = 29_337;
+        const WINDOWS: usize = 5;
+        let mut node = SyncNode::new(Author([1; 32]));
+        let mut observed = HashMap::with_capacity(PATHS);
+        let mut cache = HashMap::with_capacity(PATHS);
+        for index in 0..PATHS {
+            let path = format!("tree/{index:05}.json");
+            let bytes = index.to_le_bytes();
+            node.local_write(&path, &bytes, 10, 20);
+            let hash = content_hash(&bytes);
+            observed.insert(path.clone(), hash);
+            cache.insert(
+                path,
+                ScanCacheEntry {
+                    size: bytes.len() as u64,
+                    mtime_secs: 10,
+                    mtime_nanos: 20,
+                    hash,
+                },
+            );
+        }
+        let disk = DiskState::from_persisted(observed, cache).view();
+        let peer_acks = HashMap::new();
+        let mut old_micros = Vec::new();
+        let mut capture_micros = Vec::new();
+        let mut serialize_micros = Vec::new();
+        for _ in 0..WINDOWS {
+            let started = Instant::now();
+            let baseline = node.manifest().clone();
+            std::hint::black_box(node.manifest() == &baseline);
+            old_micros.push(started.elapsed().as_micros());
+
+            let started = Instant::now();
+            let manifest = node.manifest().clone();
+            let captured_disk = disk.clone();
+            let captured_peer_acks = peer_acks.clone();
+            capture_micros.push(started.elapsed().as_micros());
+
+            let started = Instant::now();
+            let bytes = serde_json::to_vec(&PersistedEntryStateRef {
+                manifest: &manifest,
+                observed: ObservedMapRef(&captured_disk),
+                scan_cache: ScanCacheMapRef(&captured_disk),
+                peer_acks: &captured_peer_acks,
+            })
+            .unwrap();
+            std::hint::black_box(bytes);
+            serialize_micros.push(started.elapsed().as_micros());
+        }
+        eprintln!(
+            "{PATHS} paths, {WINDOWS} windows: old lock clone+equality micros={old_micros:?}; new lock capture micros={capture_micros:?}; unlocked serialization micros={serialize_micros:?}"
+        );
     }
 
     /// Catalog USED TO ignore a local delete here and materialize restored the
@@ -5672,7 +6608,10 @@ mod tests {
             // NO POLICY MAY RESURRECT. Catalog used to advance the surviving
             // bytes to Present/v3 here, which is exactly how one peer returning
             // from a long absence undid a delete for the whole fleet.
-            assert!(!changed, "a surviving stale file must not revive a tombstone");
+            assert!(
+                !changed,
+                "a surviving stale file must not revive a tombstone"
+            );
             assert!(
                 matches!(
                     node.manifest().get("retired.toml"),
@@ -5814,15 +6753,15 @@ mod tests {
         async fn peers_for(&self, _peers: &SyncPeers) -> ResolvedPeers {
             ResolvedPeers::all(
                 self.peers
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|peer| PeerRef {
-                    id: peer.id.clone(),
-                    addr: None,
-                    roaming: false,
-                })
-                .collect(),
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|peer| PeerRef {
+                        id: peer.id.clone(),
+                        addr: None,
+                        roaming: false,
+                    })
+                    .collect(),
             )
         }
 
@@ -5896,16 +6835,16 @@ mod tests {
         async fn peers_for(&self, _peers: &SyncPeers) -> ResolvedPeers {
             ResolvedPeers::all(
                 self.peers
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|peer| peer.engine.strong_count() > 0)
-                .map(|peer| PeerRef {
-                    id: peer.id.clone(),
-                    addr: None,
-                    roaming: false,
-                })
-                .collect(),
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|peer| peer.engine.strong_count() > 0)
+                    .map(|peer| PeerRef {
+                        id: peer.id.clone(),
+                        addr: None,
+                        roaming: false,
+                    })
+                    .collect(),
             )
         }
 
@@ -6009,10 +6948,12 @@ mod tests {
         );
     }
 
-    /// A clean pass must carry one manifest across the unlocked peer step.
-    /// It must compare the final manifest by reference instead of cloning it.
+    /// A clean pass publishes one unified map per scan.
+    ///
+    /// The two scans are the accepted first boundary. The peer step carries Arc
+    /// views and revisions, so it does not clone a manifest or disk tree.
     #[tokio::test]
-    async fn a_clean_sync_pass_does_not_clone_its_final_manifest() {
+    async fn a_clean_sync_pass_uses_two_disk_snapshots_and_no_manifest_clone() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("resources");
         std::fs::create_dir_all(&root).unwrap();
@@ -6028,14 +6969,47 @@ mod tests {
         .await
         .unwrap();
         engine.sync_once("bus").await.unwrap();
+        let entry = engine.entries.read().await.get("bus").cloned().unwrap();
+        let first_path = entry
+            .disk
+            .lock()
+            .unwrap()
+            .view()
+            .shared_path("a.md")
+            .unwrap();
+        entry
+            .work
+            .disk_snapshot_publications
+            .store(0, Ordering::Relaxed);
 
         Manifest::start_clone_measurement();
         engine.sync_once("bus").await.unwrap();
         let clones = Manifest::finish_clone_measurement();
 
         assert_eq!(
-            clones, 1,
-            "a clean pass needs one baseline clone and no final comparison clone"
+            entry
+                .work
+                .disk_snapshot_publications
+                .load(Ordering::Relaxed),
+            2,
+            "a clean pass must publish exactly its pre-peer and post-peer snapshots"
+        );
+        assert_eq!(
+            clones, 0,
+            "a clean pass must compare revisions without cloning the tree"
+        );
+        assert!(
+            entry.disk.lock().unwrap().overlay.is_empty(),
+            "a clean pass left receipt copies in its materialization overlay"
+        );
+        let final_disk = entry.disk.lock().unwrap().view();
+        assert!(
+            Arc::ptr_eq(&first_path, &final_disk.shared_path("a.md").unwrap()),
+            "an unchanged path allocated a replacement string"
+        );
+        assert!(
+            final_disk.snapshot.files().all(|file| file.bytes.is_none()),
+            "the published snapshot retained a second copy of file content"
         );
     }
 
@@ -6778,6 +7752,108 @@ mod tests {
         assert_eq!(after.observed, before.observed, "replay was not a no-op");
     }
 
+    #[test]
+    fn snapshot_commit_pause_child() {
+        let Some(home) = std::env::var_os("FABRIC_TEST_SNAPSHOT_CRASH_HOME") else {
+            return;
+        };
+        let engine = SyncEngine {
+            home: FabricHome::new(PathBuf::from(home)),
+            author: Author([1; 32]),
+            transport: Arc::new(LoopbackTransport::default()),
+            entries: RwLock::new(HashMap::new()),
+            watching: StdMutex::new(HashSet::new()),
+            cancel: CancellationToken::new(),
+        };
+        let state = engine.read_durable_state("bus").unwrap().unwrap();
+        // The test hook pauses after the durable rename and before log removal.
+        engine.write_state("bus", &state).unwrap();
+        panic!("the snapshot pause hook did not stop the child");
+    }
+
+    /// Kill a real process after the snapshot commits and before log removal.
+    ///
+    /// Each recovery sees the new snapshot plus a duplicate log record. The
+    /// result must stay exact across repeated crashes at the same boundary.
+    #[tokio::test]
+    async fn repeated_kills_between_snapshot_commit_and_log_removal_recover_exact_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("item.md"), b"zero").unwrap();
+        write_bus_sync(dir.path(), &root);
+
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            Arc::new(LoopbackTransport::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        engine.sync_once("bus").await.unwrap();
+
+        for attempt in 1..=8 {
+            let current = engine.read_durable_state("bus").unwrap().unwrap();
+            let bytes = format!("value-{attempt}").into_bytes();
+            let mut node = SyncNode::new(Author([1; 32]));
+            node.adopt(&current.manifest);
+            assert!(node.local_write("item.md", &bytes, attempt, 0));
+            let hash = content_hash(&bytes);
+            let expected = PersistedEntryState {
+                manifest: node.manifest().clone(),
+                observed: HashMap::from([("item.md".to_string(), hash)]),
+                scan_cache: current.scan_cache,
+                peer_acks: current.peer_acks,
+            };
+            engine
+                .append_log(
+                    "bus",
+                    &[LoggedChange {
+                        path: "item.md".to_string(),
+                        entry: expected.manifest.get("item.md").copied(),
+                        observed: Some(hash),
+                    }],
+                )
+                .unwrap();
+
+            let marker = dir.path().join(format!("snapshot-{attempt}.committed"));
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("sync::engine::tests::snapshot_commit_pause_child")
+                .arg("--nocapture")
+                .env("FABRIC_TEST_SNAPSHOT_CRASH_HOME", dir.path())
+                .env("FABRIC_TEST_PAUSE_AFTER_STATE_COMMIT", &marker)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !marker.exists() {
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!("snapshot child exited before the kill boundary: {status}");
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "snapshot child did not reach the kill boundary"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            child.kill().unwrap();
+            let status = child.wait().unwrap();
+            assert!(!status.success(), "the crash child was not killed");
+            assert!(
+                engine.log_path("bus").exists(),
+                "the child removed the log before it was killed"
+            );
+
+            let recovered = engine.read_durable_state("bus").unwrap().unwrap();
+            assert_eq!(recovered.manifest, expected.manifest, "attempt {attempt}");
+            assert_eq!(recovered.observed, expected.observed, "attempt {attempt}");
+        }
+    }
+
     /// CASE TWO. A crash during an append can only damage the LAST line, because
     /// records are line-delimited and only ever appended. It must be discarded
     /// and everything before it kept.
@@ -6809,7 +7885,10 @@ mod tests {
         engine.sync_once("bus").await.unwrap();
 
         let whole = engine.read_durable_state("bus").unwrap().unwrap();
-        assert!(whole.manifest.get("c.md").is_some(), "c.md never reached disk");
+        assert!(
+            whole.manifest.get("c.md").is_some(),
+            "c.md never reached disk"
+        );
 
         // Tear the last line, as an interrupted append would.
         let log = std::fs::read(engine.log_path("bus")).unwrap();
@@ -7365,7 +8444,10 @@ mod tests {
                 entry.node.lock().await.manifest().get("agent.kdl"),
                 Some(Entry::Tombstone(tombstone)) if tombstone.version == 2
             ));
-            assert_eq!(entry.observed.lock().unwrap().get("agent.kdl"), None);
+            assert_eq!(
+                entry.disk.lock().unwrap().view().observed("agent.kdl"),
+                None
+            );
             assert!(!root.join("agent.kdl").exists());
         }
     }
@@ -7403,7 +8485,7 @@ mod tests {
                 }
             }
         }
-        *entry.observed.lock().unwrap() = observed;
+        entry.disk.lock().unwrap().replace_observed(observed);
 
         let statuses = engine.status().await;
         let status = statuses.first().unwrap();
@@ -8762,8 +9844,7 @@ mod tests {
         // What a RESTART would see: the snapshot with its log replayed. Reading
         // state.json alone now answers a different question, because everything
         // since the last snapshot is in the log.
-        let committed: PersistedEntryState =
-            engine.read_durable_state("bus").unwrap().unwrap();
+        let committed: PersistedEntryState = engine.read_durable_state("bus").unwrap().unwrap();
         assert!(matches!(
             committed.manifest.get("retired.md"),
             Some(Entry::Tombstone(tombstone)) if tombstone.version == 2
@@ -8791,12 +9872,19 @@ mod tests {
             entry.node.lock().await.manifest().get("retired.md"),
             Some(Entry::Tombstone(tombstone)) if tombstone.version == 2
         ));
-        assert!(!entry.observed.lock().unwrap().contains_key("retired.md"));
+        assert!(
+            entry
+                .disk
+                .lock()
+                .unwrap()
+                .view()
+                .observed("retired.md")
+                .is_none()
+        );
         assert!(!root.join("retired.md").exists());
 
         restarted.sync_once("bus").await.unwrap();
-        let replayed: PersistedEntryState =
-            restarted.read_durable_state("bus").unwrap().unwrap();
+        let replayed: PersistedEntryState = restarted.read_durable_state("bus").unwrap().unwrap();
         assert_eq!(replayed.manifest, committed.manifest);
         assert_eq!(replayed.observed, committed.observed);
         // The stale projection this test deliberately left behind must be GONE,
@@ -8881,7 +9969,7 @@ mod tests {
             entry.node.lock().await.manifest().get("retired.md"),
             Some(Entry::Tombstone(tombstone)) if tombstone.version == 2
         ));
-        assert!(entry.observed.lock().unwrap().is_empty());
+        assert_eq!(entry.disk.lock().unwrap().view().observed_len(), 0);
     }
 
     #[tokio::test]
@@ -8989,7 +10077,7 @@ mod tests {
                     .cloned()
                     .unwrap();
                 let manifest = entry.node.lock().await.manifest().clone();
-                let observed = entry.observed.lock().unwrap().clone();
+                let observed = entry.disk.lock().unwrap().view().observed_map();
                 let context = format!("{} under {final_policy:?}", case.label);
                 let expected_present = case.expected_present;
                 if expected_present {
@@ -9035,7 +10123,11 @@ mod tests {
                     &manifest,
                     "{context}"
                 );
-                assert_eq!(&*replayed.observed.lock().unwrap(), &observed, "{context}");
+                assert_eq!(
+                    replayed.disk.lock().unwrap().view().observed_map(),
+                    observed,
+                    "{context}"
+                );
             }
         }
     }
@@ -9164,7 +10256,7 @@ mod tests {
         let PreparedInbound { entry, mode } = prepared;
         let PreparedInboundMode::Guarded {
             baseline,
-            manifest: _,
+            manifest_revision: _,
             _waiter,
             _operation,
         } = mode
@@ -9286,7 +10378,10 @@ mod tests {
             std::fs::write(root.join("keep/k.md"), b"kept").unwrap();
             let entry = entry_with_include(root, SyncPolicy::Catalog, include);
             let rules = entry.policy.rules();
-            assert!(rules.propagate_deletes, "the fixture policy must propagate deletes");
+            assert!(
+                rules.propagate_deletes,
+                "the fixture policy must propagate deletes"
+            );
 
             let mut node = SyncNode::new(Author([1; 32]));
             node.local_write("keep/k.md", b"kept", 0, 0);
@@ -9313,10 +10408,8 @@ mod tests {
             )
             .unwrap();
 
-            let is_tombstone = matches!(
-                node.manifest().get("plans/p.md"),
-                Some(Entry::Tombstone(_))
-            );
+            let is_tombstone =
+                matches!(node.manifest().get("plans/p.md"), Some(Entry::Tombstone(_)));
             assert_eq!(
                 is_tombstone, expect_tombstone,
                 "include={include:?}: an included delete must tombstone and an \

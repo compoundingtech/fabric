@@ -39,6 +39,11 @@ pub fn content_hash(bytes: &[u8]) -> ContentHash {
 pub struct SyncNode {
     author: Author,
     manifest: Manifest,
+    /// A local change token for the manifest.
+    ///
+    /// The engine uses this token to detect a change across an unlocked step.
+    /// It is not persisted or sent on the wire.
+    manifest_revision: u64,
     content: HashMap<ContentHash, Vec<u8>>,
     /// The include globs this node's entry selects, if any. A receive-side
     /// boundary: `adopt_from_peer` will not take a path outside it. `None`
@@ -120,6 +125,7 @@ impl SyncNode {
         Self {
             author,
             manifest: Manifest::new(),
+            manifest_revision: 0,
             content: HashMap::new(),
             include: None,
             changes: ChangeBuffer::new(),
@@ -133,6 +139,20 @@ impl SyncNode {
 
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    /// The local manifest revision.
+    ///
+    /// Every manifest change advances this value. A no-op keeps its value.
+    pub fn manifest_revision(&self) -> u64 {
+        self.manifest_revision
+    }
+
+    fn advance_manifest_revision(&mut self) {
+        self.manifest_revision = self
+            .manifest_revision
+            .checked_add(1)
+            .expect("manifest revision overflow");
     }
 
     /// Payloads sent that carried this node's entire manifest.
@@ -280,6 +300,7 @@ impl SyncNode {
                 author: self.author,
             }),
         );
+        self.advance_manifest_revision();
         if let Some(old) = superseded
             && old != hash
         {
@@ -316,6 +337,7 @@ impl SyncNode {
                 deleted_secs,
             }),
         );
+        self.advance_manifest_revision();
         if let Some(old) = superseded {
             self.forget_if_unreferenced(old);
         }
@@ -370,6 +392,25 @@ impl SyncNode {
         observed: &HashMap<String, ContentHash>,
         expired_since: &mut HashMap<String, i64>,
     ) -> Vec<String> {
+        self.sweep_tombstones_by(
+            policy,
+            evidence,
+            |path| observed.contains_key(path),
+            expired_since,
+        )
+    }
+
+    /// The sweep with a borrowed receipt lookup.
+    ///
+    /// The async engine keeps receipts inside a unified disk snapshot. This
+    /// form avoids rebuilding a full receipt map for each sweep.
+    pub fn sweep_tombstones_by(
+        &mut self,
+        policy: PolicyRules,
+        evidence: SweepEvidence,
+        is_observed: impl Fn(&str) -> bool,
+        expired_since: &mut HashMap<String, i64>,
+    ) -> Vec<String> {
         let SweepEvidence {
             now_secs,
             ttl_secs,
@@ -384,7 +425,7 @@ impl SyncNode {
             let Entry::Tombstone(tombstone) = entry else {
                 continue;
             };
-            if observed.contains_key(path) {
+            if is_observed(path) {
                 continue;
             }
             let Some(expires_at) = tombstone.deleted_secs.checked_add(ttl_secs) else {
@@ -418,6 +459,9 @@ impl SyncNode {
             // after every peer acknowledged the tombstone, so dropping its slot
             // strands nobody.
             self.changes.forget_path(path);
+        }
+        if !swept.is_empty() {
+            self.advance_manifest_revision();
         }
         // Rebuilt rather than retained, so the map tracks exactly the tombstones
         // still waiting for an ack and never grows into a second manifest.
@@ -482,6 +526,7 @@ impl SyncNode {
             self.manifest.insert(entry.path, entry.entry);
         }
         if adopted > 0 {
+            self.advance_manifest_revision();
             self.prune_unreferenced_content();
         }
         adopted
@@ -512,6 +557,7 @@ impl SyncNode {
             adopted += 1;
         }
         if adopted > 0 {
+            self.advance_manifest_revision();
             self.prune_unreferenced_content();
         }
         adopted
@@ -599,6 +645,13 @@ impl SyncNode {
             }
             other.changes.record(&adopt.path);
             other.manifest.insert(adopt.path.clone(), adopt.entry);
+        }
+
+        if !self_adopts.is_empty() {
+            self.advance_manifest_revision();
+        }
+        if !other_adopts.is_empty() {
+            other.advance_manifest_revision();
         }
 
         // Content repair: fill any present entry whose bytes a side still lacks
@@ -719,10 +772,25 @@ mod tests {
         // pass that first sees a tombstone expired stamps it, and the ack it
         // needs must postdate that stamp. So an ack equal to `now` refuses.
         let cases = [
-            (100 + DAY, Some(100 + DAY), false, "exactly at expiry, first seen now"),
-            (100 + 5 * DAY, Some(100 + 5 * DAY), false, "well past expiry, first seen now"),
+            (
+                100 + DAY,
+                Some(100 + DAY),
+                false,
+                "exactly at expiry, first seen now",
+            ),
+            (
+                100 + 5 * DAY,
+                Some(100 + 5 * DAY),
+                false,
+                "well past expiry, first seen now",
+            ),
             (100 + DAY - 1, Some(100 + 5 * DAY), false, "ttl not elapsed"),
-            (100 + 5 * DAY, Some(100 + DAY - 1), false, "ack predates expiry"),
+            (
+                100 + 5 * DAY,
+                Some(100 + DAY - 1),
+                false,
+                "ack predates expiry",
+            ),
             (100 + 5 * DAY, None, false, "a peer never acked"),
         ];
         for (now, acked, expected, why) in cases {
@@ -752,14 +820,21 @@ mod tests {
                 &HashMap::new(),
                 &mut expired_since,
             );
-            assert!(swept.is_empty(), "first_seen={first_seen}: swept on first sight");
+            assert!(
+                swept.is_empty(),
+                "first_seen={first_seen}: swept on first sight"
+            );
             let swept = a.sweep_tombstones(
                 bus(),
                 evidence(first_seen + 1, first_seen + 1),
                 &HashMap::new(),
                 &mut expired_since,
             );
-            assert_eq!(swept, vec!["gone.txt".to_string()], "first_seen={first_seen}");
+            assert_eq!(
+                swept,
+                vec!["gone.txt".to_string()],
+                "first_seen={first_seen}"
+            );
             assert!(a.manifest().get("gone.txt").is_none());
         }
     }
@@ -824,7 +899,10 @@ mod tests {
         let mut peer = b.clone();
         unguarded.reconcile(&mut peer);
         assert!(
-            unguarded.manifest().get("gone.txt").is_some_and(|e| e.is_present()),
+            unguarded
+                .manifest()
+                .get("gone.txt")
+                .is_some_and(|e| e.is_present()),
             "sweeping early must resurrect the file, or this test proves nothing"
         );
 
@@ -887,7 +965,9 @@ mod tests {
             "swept in the same second the tombstone arrived, before x was sent it"
         );
         assert!(
-            m.manifest().get("gone.txt").is_some_and(|e| !e.is_present()),
+            m.manifest()
+                .get("gone.txt")
+                .is_some_and(|e| !e.is_present()),
             "m must still hold the tombstone"
         );
 
@@ -1001,6 +1081,106 @@ mod tests {
             node.changes().since(cursor).is_empty(),
             "an unchanged rewrite must not enter the buffer"
         );
+    }
+
+    fn assert_revision_matches_manifest_change(
+        node: &mut SyncNode,
+        mutate: impl FnOnce(&mut SyncNode),
+    ) {
+        let before_manifest = node.manifest().clone();
+        let before_revision = node.manifest_revision();
+        mutate(node);
+        assert_eq!(
+            node.manifest() != &before_manifest,
+            node.manifest_revision() != before_revision,
+            "the revision boundary did not match the manifest boundary"
+        );
+    }
+
+    /// This test lists every API that can change the private manifest.
+    ///
+    /// The engine uses the revision as a change detector across an unlocked
+    /// peer step. A missed mutation would make a changed manifest look stable.
+    #[test]
+    fn every_manifest_mutation_advances_the_revision_and_every_noop_keeps_it() {
+        let mut local = node(1);
+        assert_revision_matches_manifest_change(&mut local, |node| {
+            assert!(node.local_write("a.txt", b"one", 0, 0));
+        });
+        assert_revision_matches_manifest_change(&mut local, |node| {
+            assert!(!node.local_write("a.txt", b"one", 1, 0));
+        });
+        assert_revision_matches_manifest_change(&mut local, |node| {
+            assert!(node.local_remove("a.txt", bus(), 100));
+        });
+        assert_revision_matches_manifest_change(&mut local, |node| {
+            assert!(!node.local_remove("a.txt", bus(), 101));
+        });
+
+        let mut source = node(2);
+        source.local_write("accepted.txt", b"two", 0, 0);
+        assert_revision_matches_manifest_change(&mut local, |node| {
+            assert_eq!(node.adopt(source.manifest()), 1);
+        });
+        assert_revision_matches_manifest_change(&mut local, |node| {
+            assert_eq!(node.adopt(source.manifest()), 0);
+        });
+
+        let mut filtered = node(3);
+        filtered.set_include(Some(vec!["accepted.txt".to_string()]));
+        let mut offered = node(4);
+        offered.local_write("blocked.txt", b"three", 0, 0);
+        assert_revision_matches_manifest_change(&mut filtered, |node| {
+            assert_eq!(node.adopt_from_peer(offered.manifest()), 0);
+        });
+        offered.local_write("accepted.txt", b"four", 0, 0);
+        assert_revision_matches_manifest_change(&mut filtered, |node| {
+            assert_eq!(node.adopt_from_peer(offered.manifest()), 1);
+        });
+
+        let left_before_manifest = filtered.manifest().clone();
+        let left_before_revision = filtered.manifest_revision();
+        let right_before_manifest = offered.manifest().clone();
+        let right_before_revision = offered.manifest_revision();
+        filtered.reconcile(&mut offered);
+        assert_eq!(
+            filtered.manifest() != &left_before_manifest,
+            filtered.manifest_revision() != left_before_revision
+        );
+        assert_eq!(
+            offered.manifest() != &right_before_manifest,
+            offered.manifest_revision() != right_before_revision
+        );
+
+        let mut swept = tombstoned(100);
+        let mut expired_since = HashMap::new();
+        let evidence = |now, acked| SweepEvidence {
+            now_secs: now,
+            ttl_secs: DAY,
+            acked_through: Some(acked),
+        };
+        assert_revision_matches_manifest_change(&mut swept, |node| {
+            assert!(
+                node.sweep_tombstones(
+                    bus(),
+                    evidence(100 + DAY, 100 + DAY),
+                    &HashMap::new(),
+                    &mut expired_since,
+                )
+                .is_empty()
+            );
+        });
+        assert_revision_matches_manifest_change(&mut swept, |node| {
+            assert_eq!(
+                node.sweep_tombstones(
+                    bus(),
+                    evidence(100 + DAY + 1, 100 + DAY + 1),
+                    &HashMap::new(),
+                    &mut expired_since,
+                ),
+                vec!["gone.txt".to_string()]
+            );
+        });
     }
 
     #[test]
