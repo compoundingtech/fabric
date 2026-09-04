@@ -2934,7 +2934,7 @@ async fn run_endpoint_rss_observe_loop(state: Arc<DaemonState>) -> Result<()> {
 async fn run_endpoint_rss_observe_loop_with_sampler(
     state: Arc<DaemonState>,
     poll_interval: Duration,
-    report_step_bytes: u64,
+    growth_step_bytes: u64,
     sample_rss: RssSampler,
     trim_allocator: AllocatorTrimmer,
 ) -> Result<()> {
@@ -2970,7 +2970,7 @@ async fn run_endpoint_rss_observe_loop_with_sampler(
                 // Act only after RSS grows by a whole step. A successful trim
                 // lowers the next baseline, so retained pages cannot silently
                 // grow back to the old high-water mark.
-                if rss_bytes >= rss_growth_baseline_bytes.saturating_add(report_step_bytes) {
+                if rss_bytes >= rss_growth_baseline_bytes.saturating_add(growth_step_bytes) {
                     let trim_started = Instant::now();
                     let allocator_trim = trim_allocator();
                     let trim_duration = trim_started.elapsed();
