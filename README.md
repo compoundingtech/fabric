@@ -262,10 +262,10 @@ because a healthy working set has not been measured, and a ceiling nobody chose
 kills the daemon at a number nobody chose. (This README used to say the default
 was 1 GiB. It was not.)
 
-If you do set one, leave headroom above fabric's in-process RSS recycle trigger.
-During endpoint recycle, the replacement endpoint can briefly overlap with the
-old endpoint in memory; a service cap too close to the 300 MiB recycle threshold
-lets the OS kill fabric during a successful self-heal.
+If you set a ceiling, leave headroom above the measured healthy working set.
+Fabric never recycles an endpoint because of RSS. On glibc Linux, each new
+128 MiB RSS growth step asks the allocator to return pages it already considers
+free. This request cannot free live allocations or enforce a memory limit.
 
 ### Enabling remote shell and exec
 

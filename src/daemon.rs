@@ -100,9 +100,9 @@ const ENDPOINT_HEALTH_POLL_FAILURES_BEFORE_RECYCLE: usize = 2;
 const ENDPOINT_DIAGNOSTIC_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
 const ENDPOINT_RECYCLE_MIN_INTERVAL: Duration = Duration::from_secs(60);
 const ENDPOINT_RSS_OBSERVE_POLL_INTERVAL: Duration = Duration::from_secs(30);
-/// Report a new RSS peak only after it grows by a whole step, so the operator sees
-/// growth without a per-sample stream. Reporting never interrupts the daemon.
-const ENDPOINT_RSS_REPORT_STEP_BYTES: u64 = 128 * 1024 * 1024;
+/// Observe a new RSS growth step only after a whole step, so reporting and
+/// allocator trims stay bounded.
+const ENDPOINT_RSS_GROWTH_STEP_BYTES: u64 = 128 * 1024 * 1024;
 const NETWORK_CHANGE_DEBOUNCE: Duration = Duration::from_millis(140);
 /// How often the daemon actively echo-probes each trusted peer, so a peer that has
 /// roamed (changed network / public IP) is detected even when THIS machine saw no
@@ -607,6 +607,7 @@ enum EndpointRecycleOutcome {
 }
 
 type RssSampler = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+type AllocatorTrimmer = Arc<dyn Fn() -> AllocatorTrimResult + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AllocatorTrimResult {
@@ -2911,13 +2912,14 @@ async fn run_endpoint_rss_observe_loop(state: Arc<DaemonState>) -> Result<()> {
     run_endpoint_rss_observe_loop_with_sampler(
         state,
         ENDPOINT_RSS_OBSERVE_POLL_INTERVAL,
-        ENDPOINT_RSS_REPORT_STEP_BYTES,
+        ENDPOINT_RSS_GROWTH_STEP_BYTES,
         Arc::new(current_rss_bytes),
+        Arc::new(trim_process_allocator),
     )
     .await
 }
 
-/// Watch RSS and report it. Nothing here interrupts the daemon.
+/// Watch RSS and release allocator-retained pages at new growth steps.
 ///
 /// This loop used to recycle the iroh endpoint whenever RSS crossed a fixed
 /// 300 MiB threshold. That was actively harmful: the memory does not live in the
@@ -2925,18 +2927,21 @@ async fn run_endpoint_rss_observe_loop(state: Arc<DaemonState>) -> Result<()> {
 /// that its own follow-up sample proved ineffective — while every recycle tore
 /// down live shell and tunnel sessions and forced every peer to re-handshake.
 /// A fixed limit also has no idea what a healthy working set is for a given
-/// network size. Memory growth is now reported for an operator to judge, and only
-/// an operator stops the daemon.
+/// network size. A new growth step now asks the process allocator to release
+/// pages it already considers free. This does not free live allocations, stop
+/// the daemon, or touch any endpoint or session. The glibc implementation calls
+/// `malloc_trim`; other platforms report the growth without attempting a trim.
 async fn run_endpoint_rss_observe_loop_with_sampler(
     state: Arc<DaemonState>,
     poll_interval: Duration,
     report_step_bytes: u64,
     sample_rss: RssSampler,
+    trim_allocator: AllocatorTrimmer,
 ) -> Result<()> {
     let mut interval = tokio::time::interval(poll_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     interval.tick().await;
-    let mut peak_reported_bytes = 0u64;
+    let mut rss_growth_baseline_bytes = 0u64;
 
     loop {
         tokio::select! {
@@ -2962,21 +2967,39 @@ async fn run_endpoint_rss_observe_loop_with_sampler(
                     "endpoint RSS sample"
                 );
 
-                // Report each new peak once it clears the previous report by a
-                // whole step, so growth is visible without a per-sample stream.
-                if rss_bytes >= peak_reported_bytes.saturating_add(report_step_bytes) {
-                    peak_reported_bytes = rss_bytes;
+                // Act only after RSS grows by a whole step. A successful trim
+                // lowers the next baseline, so retained pages cannot silently
+                // grow back to the old high-water mark.
+                if rss_bytes >= rss_growth_baseline_bytes.saturating_add(report_step_bytes) {
+                    let trim_started = Instant::now();
+                    let allocator_trim = trim_allocator();
+                    let trim_duration = trim_started.elapsed();
+                    let rss_after_trim_bytes = sample_rss();
+                    rss_growth_baseline_bytes = rss_after_trim_bytes.unwrap_or(rss_bytes);
                     warn!(
                         target: VALIDATION_LOG_TARGET,
                         event = "endpoint_rss_growth",
                         generation,
                         rss_bytes,
-                        "daemon RSS reached a new reported peak"
+                        allocator_trim_attempted = allocator_trim.attempted,
+                        allocator_trim_succeeded = allocator_trim.succeeded,
+                        allocator_trim_duration_ms = trim_duration.as_millis() as u64,
+                        rss_after_trim_known = rss_after_trim_bytes.is_some(),
+                        rss_after_trim_bytes = rss_after_trim_bytes.unwrap_or(0),
+                        "daemon RSS crossed a new growth step"
                     );
-                    eprintln!(
-                        "fabric: memory in use {} MiB (new peak, endpoint generation {generation}); reporting only, no action taken",
-                        bytes_to_mib(rss_bytes),
-                    );
+                    if allocator_trim.attempted {
+                        eprintln!(
+                            "fabric: memory in use {} MiB (new growth step, endpoint generation {generation}); allocator trim left {} MiB",
+                            bytes_to_mib(rss_bytes),
+                            rss_after_trim_bytes.map(bytes_to_mib).unwrap_or(0),
+                        );
+                    } else {
+                        eprintln!(
+                            "fabric: memory in use {} MiB (new growth step, endpoint generation {generation}); allocator trim is unavailable",
+                            bytes_to_mib(rss_bytes),
+                        );
+                    }
                 }
             }
         }
@@ -5799,9 +5822,10 @@ mod tests {
     #[test]
     fn no_fixed_rss_threshold_exists_in_the_daemon() {
         // Nathan's rule: Fabric must not enforce a fixed RSS recycle or kill limit
-        // before healthy working sets are measured. This pins the absence of one:
-        // the source may observe and report RSS, but must not act on a constant.
-        // Needles are split so this assertion does not match itself.
+        // before healthy working sets are measured. Asking the allocator to return
+        // pages it already considers free is not such a limit. This pins that RSS
+        // cannot recycle or stop the daemon at one total. Needles are split so this
+        // assertion does not match itself.
         let source = include_str!("daemon.rs");
         for needle in [
             concat!("ENDPOINT_RSS_RECYCLE", "_THRESHOLD_BYTES"),
@@ -5813,22 +5837,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn high_rss_reports_growth_and_never_recycles_the_endpoint() -> Result<()> {
+    async fn high_rss_trims_retained_memory_and_never_recycles_the_endpoint() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let node = FabricNode::start(FabricHome::new(temp.path())).await?;
         let state = node.state();
         let initial = state.endpoint_handle();
         tokio::time::timeout(ENDPOINT_HEALTH_TIMEOUT, initial.endpoint.online()).await?;
+        let trim_calls = Arc::new(AtomicUsize::new(0));
+        let trim_calls_for_observer = trim_calls.clone();
 
         // Ten gigabytes, far above any threshold this daemon used to enforce.
         let observer = tokio::spawn(run_endpoint_rss_observe_loop_with_sampler(
             state.clone(),
             Duration::from_millis(20),
-            ENDPOINT_RSS_REPORT_STEP_BYTES,
+            ENDPOINT_RSS_GROWTH_STEP_BYTES,
             Arc::new(|| Some(10 * 1024 * 1024 * 1024)),
+            Arc::new(move || {
+                trim_calls_for_observer.fetch_add(1, Ordering::SeqCst);
+                AllocatorTrimResult {
+                    attempted: true,
+                    succeeded: true,
+                }
+            }),
         ));
         tokio::time::sleep(Duration::from_millis(300)).await;
 
+        assert_eq!(
+            trim_calls.load(Ordering::SeqCst),
+            1,
+            "one new RSS growth step must request one allocator trim"
+        );
         assert_eq!(
             state.endpoint_handle().generation,
             initial.generation,
