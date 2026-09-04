@@ -8,6 +8,10 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **`fabric doctor` no longer calls an unverified peer build current.** An
+  unreachable peer now makes the build check `unknown`, including a roaming
+  peer. The closing summary counts that unknown result as needing attention.
+
 - **A sync folder walk no longer stalls unrelated Fabric streams.** Scan,
   materialization, JSON encoding, metadata checks, and persistence now run on
   Tokio's bounded blocking pool without holding the live node or disk locks.

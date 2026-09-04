@@ -312,9 +312,6 @@ fn version_findings(facts: &Facts) -> Vec<Finding> {
         match &peer.version {
             Some(version) if version != &facts.own_version => behind.push(peer),
             Some(_) => {}
-            // A peer that is simply not reachable is already reported by its own
-            // check; saying it twice is noise, not information.
-            None if peer.reachable == Some(false) => {}
             None => unknown.push(peer),
         }
     }
@@ -356,11 +353,6 @@ fn version_findings(facts: &Facts) -> Vec<Finding> {
                 .version_error
                 .clone()
                 .unwrap_or_else(|| "it did not answer".to_string());
-            let verdict = if peer.roaming {
-                Verdict::Ok
-            } else {
-                Verdict::Unknown
-            };
             let detail = if peer.roaming {
                 format!(
                     "{} build is unknown, roaming: {reason}. A peer on an older build makes \
@@ -377,7 +369,7 @@ fn version_findings(facts: &Facts) -> Vec<Finding> {
             };
             let mut finding = Finding::new(
                 "versions",
-                verdict,
+                Verdict::Unknown,
                 detail,
             );
             if !peer.roaming && reason.contains("exec is disabled") {
@@ -834,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn an_absent_roaming_peer_is_a_normal_finding() {
+    fn an_absent_roaming_peer_is_normal_but_its_build_is_unknown() {
         let mut facts = configured();
         facts.peers[0].label = "bluey".to_string();
         facts.peers[0].roaming = true;
@@ -850,7 +842,12 @@ mod tests {
         assert!(peers[0].detail.contains("away"));
         assert_eq!(syncs[0].verdict, Verdict::Ok);
         assert!(syncs[0].detail.contains("away"));
-        assert_eq!(exit_code(&findings), 0);
+        assert!(
+            find(&findings, "versions")
+                .iter()
+                .any(|finding| finding.verdict == Verdict::Unknown)
+        );
+        assert_eq!(exit_code(&findings), 1);
     }
 
     /// Finding 3 of the 2026-08-29 review. A peer named in `syncs.toml` that is
@@ -1169,19 +1166,23 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_roaming_peer_version_is_visible_without_failing_doctor() {
+    fn an_unreachable_roaming_peer_build_is_unknown_and_counts() {
         let mut facts = configured();
         facts.peers[0].roaming = true;
+        facts.peers[0].reachable = Some(false);
         facts.peers[0].version = None;
-        facts.peers[0].version_error = Some("the command failed".to_string());
+        facts.peers[0].version_error = None;
 
         let findings = diagnose(&facts);
         let versions = find(&findings, "versions");
         assert_eq!(versions.len(), 1);
-        assert_eq!(versions[0].verdict, Verdict::Ok);
+        assert_eq!(versions[0].verdict, Verdict::Unknown);
         assert!(versions[0].detail.contains("unknown, roaming"));
         assert!(versions[0].detail.contains("whole manifests"));
-        assert_eq!(exit_code(&findings), 0);
+        assert_eq!(exit_code(&findings), 1);
+        let summary = closing(&facts, &findings);
+        assert_ne!(summary, "nothing to do.");
+        assert!(summary.contains("needs attention"));
     }
 
     /// "one peer could not be asked" does not say one of how many.
@@ -1212,22 +1213,20 @@ mod tests {
         );
     }
 
-    /// An unreachable peer already has its own finding. Saying it twice under a
-    /// second heading is noise wearing the shape of a second fault.
+    /// Reachability and build agreement are separate facts. A failed dial must
+    /// not turn the build check into an affirmative fleet-wide answer.
     #[test]
-    fn an_unreachable_peer_is_not_reported_again_as_a_version_unknown() {
+    fn an_unreachable_peer_build_is_unknown() {
         let mut facts = configured();
         facts.peers[0].reachable = Some(false);
         facts.peers[0].version = None;
         facts.peers[0].version_error = None;
 
         let findings = diagnose(&facts);
-        assert!(
-            find(&findings, "versions")
-                .iter()
-                .all(|f| f.verdict == Verdict::Ok),
-            "an unreachable peer was reported a second time as a version problem"
-        );
+        let versions = find(&findings, "versions");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].verdict, Verdict::Unknown);
+        assert!(versions[0].detail.contains("could not ask hetz"));
     }
 
     #[test]
@@ -1473,21 +1472,26 @@ pub fn report(facts: &Facts, findings: &[Finding]) -> i32 {
     }
     let code = exit_code(findings);
     println!();
+    println!("{}", closing(facts, findings));
+    code
+}
+
+fn closing(facts: &Facts, findings: &[Finding]) -> String {
+    let code = exit_code(findings);
     let count = findings.iter().filter(|f| f.verdict.needs_attention()).count();
     if code == 0 {
-        println!("nothing to do.");
+        "nothing to do.".to_string()
     } else if opening(facts).is_some() {
         // Say steps, not attention. The closing line is the last thing read and
         // it must not undo the framing the opening line just set.
-        println!("{count} {} left.", plural(count, "step", "steps"));
+        format!("{count} {} left.", plural(count, "step", "steps"))
     } else {
-        println!(
+        format!(
             "{count} {} above {} attention.",
             plural(count, "thing", "things"),
             plural(count, "needs", "need")
-        );
+        )
     }
-    code
 }
 
 fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
