@@ -79,6 +79,8 @@ const INCOMING_FAILURE_MAX_BACKOFF: Duration = Duration::from_secs(5);
 const DIAL_FAILURE_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const DIAL_FAILURE_MAX_BACKOFF: Duration = Duration::from_secs(15);
 const DIAL_LISTENER_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+/// Bound a stalled peer while it holds an inbound sync entry guard.
+const INBOUND_SYNC_SESSION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_INCOMING_HANDLERS: usize = 32;
 const MAX_DIAL_HANDLERS: usize = 32;
@@ -3857,13 +3859,18 @@ async fn handle_sync_stream(
     let stream = tokio::io::join(recv, send);
     let resolver_engine = engine.clone();
     let peer = peer.to_string();
-    let outcome = sync::wire::run_server(stream, &peer, move |hello| {
-        let engine = resolver_engine.clone();
-        async move {
-            let prepared = engine.prepare_inbound_for_hello(&hello).await?;
-            Ok(prepared.map(|prepared| (prepared.node(), prepared)))
-        }
-    })
+    let outcome = sync::wire::run_server_with_deadline(
+        stream,
+        &peer,
+        move |hello| {
+            let engine = resolver_engine.clone();
+            async move {
+                let prepared = engine.prepare_inbound_for_hello(&hello).await?;
+                Ok(prepared.map(|prepared| (prepared.node(), prepared)))
+            }
+        },
+        INBOUND_SYNC_SESSION_TIMEOUT,
+    )
     .await;
     match outcome {
         Ok((name, stats, prepared)) => {

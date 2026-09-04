@@ -21,7 +21,7 @@
 //! Content is framed as raw length-prefixed bytes — never JSON-encoded — so file
 //! payloads do not pay base64/array bloat.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -593,12 +593,91 @@ where
     ))
 }
 
+/// Run an inbound wire session with a hard deadline. The resolver context stays
+/// alive for the session, so timeout also releases its entry operation guard.
+pub(crate) async fn run_server_with_deadline<S, F, Fut, C>(
+    stream: S,
+    peer: &str,
+    resolve: F,
+    deadline: Duration,
+) -> Result<(String, Reconciled, C)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: FnOnce(HelloInfo) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<(Arc<Mutex<SyncNode>>, C)>>>,
+{
+    match tokio::time::timeout(deadline, run_server(stream, peer, resolve)).await {
+        Ok(result) => result,
+        Err(_) => bail!(
+            "inbound sync session deadline of {} ms elapsed",
+            deadline.as_millis()
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn author(n: u8) -> super::super::manifest::Author {
         super::super::manifest::Author([n; 32])
+    }
+
+    #[tokio::test]
+    async fn an_inbound_deadline_drops_the_resolver_guard() {
+        let node = Arc::new(Mutex::new(SyncNode::new(author(1))));
+        let guard_lock = Arc::new(Mutex::new(()));
+        let resolver_lock = guard_lock.clone();
+        let (guarded_tx, guarded_rx) = tokio::sync::oneshot::channel();
+        let (mut client_end, server_end) = tokio::io::duplex(1 << 20);
+        let mut server = tokio::spawn(async move {
+            run_server_with_deadline(
+                server_end,
+                "peer-a",
+                move |_| async move {
+                    let guard = resolver_lock.lock_owned().await;
+                    let _ = guarded_tx.send(());
+                    Ok(Some((node, guard)))
+                },
+                Duration::from_millis(250),
+            )
+            .await
+        });
+
+        let hello = HelloHeader {
+            name: "catalog".to_string(),
+            manifest: Manifest::new(),
+            wanted: Vec::new(),
+            digest: String::new(),
+            is_delta: false,
+        };
+        write_len_bytes(&mut client_end, &serde_json::to_vec(&hello).unwrap())
+            .await
+            .unwrap();
+        client_end.flush().await.unwrap();
+        guarded_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), guard_lock.lock())
+                .await
+                .is_err(),
+            "the resolver context did not hold its guard during the session"
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut server).await;
+        if result.is_err() {
+            server.abort();
+        }
+        let error = result
+            .expect("the inbound session had no deadline")
+            .expect("the inbound server task panicked")
+            .expect_err("the stalled inbound session succeeded");
+        assert!(
+            format!("{error:#}").contains("inbound sync session deadline"),
+            "the timeout error did not name the deadline: {error:#}"
+        );
+        let _guard = tokio::time::timeout(Duration::from_millis(100), guard_lock.lock())
+            .await
+            .expect("the inbound deadline did not release the resolver guard");
     }
 
     #[tokio::test]
