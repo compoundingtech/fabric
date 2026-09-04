@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     env, fmt,
     fs::{self, OpenOptions},
     io::Write,
@@ -1491,6 +1491,7 @@ impl DaemonState {
         let (node_id, endpoint_addr, exposed_protocols, dial_sockets) =
             self.local_status_fields().await?;
         let peers = self.peer_reachability().await;
+        let current_connection_health = self.current_connection_health().await;
         let telemetry = self.telemetry.snapshot();
         Ok(ControlResponse::ReachabilityStatus {
             version: crate::version_string(),
@@ -1503,9 +1504,27 @@ impl DaemonState {
             peers,
             connection_telemetry: telemetry.peers,
             connection_telemetry_window: telemetry.window,
+            current_connection_health,
             active_dial_handlers: self.active_dial_handlers(),
             max_dial_handlers: self.max_dial_handlers(),
         })
+    }
+
+    async fn current_connection_health(&self) -> BTreeMap<String, mux::CurrentConnectionHealth> {
+        let current = self.peer_connections.current_health().await;
+        let peers = self.peer_book.read().await;
+        current
+            .into_iter()
+            .map(|(id, health)| {
+                let label = peers
+                    .peers()
+                    .iter()
+                    .find(|peer| peer.id == id)
+                    .and_then(|peer| peer.name.clone())
+                    .unwrap_or_else(|| id.to_string());
+                (label, health)
+            })
+            .collect()
     }
 
     fn schedule_restart(&self, _requested_allow_shell: Option<bool>) -> Result<RestartPlan> {
@@ -3677,6 +3696,7 @@ async fn process_incoming_iroh(
         recv,
         peer_id,
         exposure.to_server_target(),
+        None,
         state.tunnel_sessions.clone(),
         state.tunnel_drop_rx(),
     )
@@ -3787,6 +3807,7 @@ async fn handle_builtin_resumable_shell(
         tunnel::ServerTarget::Shell {
             allowed: state.allow_shell.load(Ordering::SeqCst),
         },
+        None,
         state.tunnel_sessions.clone(),
         state.tunnel_drop_rx(),
     )
@@ -3901,12 +3922,6 @@ async fn handle_mux_stream(
         return Ok(());
     }
 
-    if alpn != BUILTIN_ECHO_ALPN {
-        state
-            .peer_connections
-            .note_application_activity(connection.remote_id())
-            .await;
-    }
     mux::write_ready(&mut send).await?;
 
     if alpn == BUILTIN_ECHO_ALPN {
@@ -3931,6 +3946,7 @@ async fn handle_mux_stream(
             tunnel::ServerTarget::Shell {
                 allowed: state.allow_shell.load(Ordering::SeqCst),
             },
+            Some(state.peer_connections.clone()),
             state.tunnel_sessions.clone(),
             state.tunnel_drop_rx(),
         )
@@ -3965,6 +3981,7 @@ async fn handle_mux_stream(
             recv,
             peer,
             exposure.to_server_target(),
+            Some(state.peer_connections.clone()),
             state.tunnel_sessions.clone(),
             state.tunnel_drop_rx(),
         )

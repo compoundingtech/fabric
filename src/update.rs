@@ -1430,6 +1430,7 @@ mod supervisor_failure_tests {
                     peers: Vec::new(),
                     connection_telemetry: Default::default(),
                     connection_telemetry_window: Default::default(),
+                    current_connection_health: Default::default(),
                     active_dial_handlers: 0,
                     max_dial_handlers: 32,
                 };

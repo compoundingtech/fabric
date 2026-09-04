@@ -3,7 +3,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::telemetry::{PeerTelemetry, TelemetryWindow};
+use crate::{
+    mux::CurrentConnectionHealth,
+    telemetry::{PeerTelemetry, TelemetryWindow},
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -127,6 +130,9 @@ pub enum ControlResponse {
         /// Defaulted so a new client still decodes an older daemon's reply.
         #[serde(default)]
         connection_telemetry_window: TelemetryWindow,
+        /// Health for each current shared connection. Replacement resets it.
+        #[serde(default)]
+        current_connection_health: BTreeMap<String, CurrentConnectionHealth>,
         /// Dial permits in use and the cap. Every shell, exec and dial holds
         /// one for the life of its session, and when all are held every new
         /// one waits with no error. Defaulted for an older daemon's reply.
@@ -343,6 +349,17 @@ mod tests {
                 started_unix_seconds: Some(1_788_369_000),
                 reset_reason: None,
             },
+            current_connection_health: BTreeMap::from([(
+                "droppy".to_string(),
+                CurrentConnectionHealth {
+                    connection_id: 7,
+                    age_millis: 12_000,
+                    consecutive_attach_failures: 2,
+                    last_attach_failure_phase: Some("hello".to_string()),
+                    last_attach_failure_duration_millis: Some(750),
+                    last_application_progress_millis_ago: Some(500),
+                },
+            )]),
             active_dial_handlers: 0,
             max_dial_handlers: 32,
         };
@@ -356,6 +373,7 @@ mod tests {
             ControlResponse::ReachabilityStatus {
                 connection_telemetry,
                 connection_telemetry_window,
+                current_connection_health,
                 ..
             } => {
                 let peer = &connection_telemetry["droppy"];
@@ -366,6 +384,10 @@ mod tests {
                     "the measured total must cross the wire, not just its count"
                 );
                 assert_eq!(peer.probe_latency["relay"].samples, 1);
+                assert_eq!(
+                    current_connection_health["droppy"].consecutive_attach_failures,
+                    2
+                );
                 assert_eq!(
                     connection_telemetry_window.started_unix_seconds,
                     Some(1_788_369_000),
