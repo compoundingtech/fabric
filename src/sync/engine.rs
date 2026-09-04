@@ -3664,6 +3664,8 @@ mod tests {
     ///
     /// Ignored by default because it is a measurement, not a guard. Run it with
     /// `cargo test --release -- --ignored --nocapture materialize_resident_cost`.
+    /// On glibc Linux, set `FABRIC_MEASURE_ALLOCATOR_TRIM=1` to run the same
+    /// corpus with the daemon's RSS growth-step trim.
     ///
     /// Sized to the live `st2-declarations-default` entry observed on
     /// 2026-08-19: three files of about 23 MB, 70.2 MB total, passed over once
@@ -3742,6 +3744,18 @@ mod tests {
         const PASSES: usize = 200;
 
         let before = rss_kb();
+        let trim_enabled = std::env::var("FABRIC_MEASURE_ALLOCATOR_TRIM").as_deref() == Ok("1");
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        assert!(!trim_enabled, "allocator trim measurement requires glibc Linux");
+        let trim_step_kb = crate::daemon::ENDPOINT_RSS_GROWTH_STEP_BYTES / 1024;
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        let mut trim_baseline_kb = before;
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        let mut trim_attempts = 0u64;
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        let mut trim_successes = 0u64;
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        let (trim_attempts, trim_successes) = (0u64, 0u64);
         for _ in 0..PASSES {
             let mut obs = HashMap::new();
             materialize_tracked(
@@ -3755,6 +3769,16 @@ mod tests {
                 None,
             )
             .unwrap();
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            if trim_enabled {
+                let rss_before_trim = rss_kb();
+                if rss_before_trim >= trim_baseline_kb.saturating_add(trim_step_kb) {
+                    trim_attempts += 1;
+                    trim_successes +=
+                        u64::from(crate::daemon::trim_process_allocator_for_test());
+                    trim_baseline_kb = rss_kb();
+                }
+            }
         }
         let after_reads = rss_kb();
 
@@ -3786,6 +3810,14 @@ mod tests {
             "bytes read: re-reading path {:.1} GB, cached path 0.0 GB",
             (total as f64 * PASSES as f64) / 1e9
         );
+        println!(
+            "allocator trim: enabled={trim_enabled} step_mb={} attempts={trim_attempts} successes={trim_successes}",
+            trim_step_kb / 1024
+        );
+        if trim_enabled {
+            assert!(trim_attempts > 0, "the probe never reached one RSS growth step");
+            assert!(trim_successes > 0, "glibc declined every allocator trim request");
+        }
     }
 
     /// What the sweep is worth, measured rather than asserted.

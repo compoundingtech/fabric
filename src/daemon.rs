@@ -102,7 +102,7 @@ const ENDPOINT_RECYCLE_MIN_INTERVAL: Duration = Duration::from_secs(60);
 const ENDPOINT_RSS_OBSERVE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// Observe a new RSS growth step only after a whole step, so reporting and
 /// allocator trims stay bounded.
-const ENDPOINT_RSS_GROWTH_STEP_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const ENDPOINT_RSS_GROWTH_STEP_BYTES: u64 = 128 * 1024 * 1024;
 const NETWORK_CHANGE_DEBOUNCE: Duration = Duration::from_millis(140);
 /// How often the daemon actively echo-probes each trusted peer, so a peer that has
 /// roamed (changed network / public IP) is detected even when THIS machine saw no
@@ -4065,6 +4065,11 @@ fn trim_process_allocator() -> AllocatorTrimResult {
         attempted: true,
         succeeded,
     }
+}
+
+#[cfg(all(test, target_os = "linux", target_env = "gnu"))]
+pub(crate) fn trim_process_allocator_for_test() -> bool {
+    trim_process_allocator().succeeded
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
