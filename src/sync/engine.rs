@@ -60,6 +60,9 @@ const MISSED_EVENT_RESYNC: Duration = Duration::from_secs(5 * 60);
 /// delayed daemon-owned event can be acknowledged without another tree scan.
 const MAX_DAEMON_WRITE_FINGERPRINTS: usize = 4_096;
 
+#[cfg(debug_assertions)]
+const DEBUG_WALK_HOLD_FILE: &str = ".fabric-test-walk-hold-ms";
+
 #[inline]
 fn periodic_scan_due(dirty: bool, safety_due: bool) -> bool {
     dirty || safety_due
@@ -2807,6 +2810,12 @@ fn scan_disk_snapshot_with_limit(
     if !root.exists() {
         scan.root_state = RootState::Missing;
         return Ok(scan);
+    }
+    #[cfg(debug_assertions)]
+    if let Ok(raw) = std::fs::read_to_string(root.join(DEBUG_WALK_HOLD_FILE))
+        && let Ok(milliseconds) = raw.trim().parse::<u64>()
+    {
+        std::thread::sleep(Duration::from_millis(milliseconds));
     }
     let mut stack = vec![(root.to_path_buf(), String::new())];
     while let Some((dir, dir_rel)) = stack.pop() {
