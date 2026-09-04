@@ -10,6 +10,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use iroh::{EndpointAddr, EndpointId, SecretKey};
 use serde::{Deserialize, Serialize};
+use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, Value};
 
 pub const DEFAULT_EXEC_MAX_CHILDREN: usize = 32;
 pub const DEFAULT_SERVER_SESSION_MAX_TOTAL: usize = 64;
@@ -453,7 +454,7 @@ impl PeerBook {
         Ok(())
     }
 
-    /// The header written above every `peers.toml`.
+    /// The header written above a new `peers.toml`.
     ///
     /// The rule about `name` lives in the FILE, not only in the documentation.
     /// A rule someone has to go and read is a rule that gets designed around by
@@ -489,12 +490,63 @@ impl PeerBook {
     fn write_peer_file(&self, home: &FabricHome) -> Result<()> {
         home.prepare()?;
         let path = home.peers_path();
-        let raw = format!(
-            "{}{}",
-            Self::PEER_FILE_HEADER,
-            toml::to_string_pretty(self)?
-        );
+        let serialized = toml::to_string_pretty(self)?;
+        let raw = match home.existing_peers_path() {
+            Some(existing_path) => {
+                let existing = fs::read_to_string(&existing_path)
+                    .with_context(|| format!("failed to read {}", existing_path.display()))?;
+                self.upsert_peer_document(&existing, &serialized, &existing_path)?
+            }
+            None => format!("{}{}", Self::PEER_FILE_HEADER, serialized),
+        };
         write_atomic(&path, raw.as_bytes())
+    }
+
+    fn upsert_peer_document(
+        &self,
+        existing: &str,
+        serialized: &str,
+        path: &Path,
+    ) -> Result<String> {
+        let before: Self = toml::from_str(existing)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        before.validate()?;
+        let mut document: DocumentMut = existing
+            .parse()
+            .with_context(|| format!("failed to edit {}", path.display()))?;
+        // New nested tables need positions between existing table headers.
+        // Wide gaps preserve the parsed order and give each edit that space.
+        spread_table_positions(document.as_table_mut());
+        let desired: DocumentMut = serialized
+            .parse()
+            .context("failed to prepare the peers.toml update")?;
+        let desired_root = desired.as_table();
+        let root = document.as_table_mut();
+
+        if before.allow_shell != self.allow_shell {
+            upsert_table_field(root, desired_root, "allow_shell")?;
+        }
+        if before.allow_exec != self.allow_exec {
+            upsert_table_field(root, desired_root, "allow_exec")?;
+        }
+        let appended_peers = upsert_peer_tables(root, desired_root, &before.peers, &self.peers)?;
+        upsert_git_remote_tables(root, desired_root, &before.git_remotes, &self.git_remotes)?;
+
+        let mut updated = document.to_string();
+        // A peer address contains nested tables. Append each complete record so
+        // its address stays directly after its own `[[peers]]` header.
+        for peer in appended_peers {
+            if !updated.ends_with('\n') {
+                updated.push('\n');
+            }
+            if !updated.ends_with("\n\n") {
+                updated.push('\n');
+            }
+            updated.push_str(&toml::to_string_pretty(&PeerEntries {
+                peers: std::slice::from_ref(&peer),
+            })?);
+        }
+        Ok(updated)
     }
 
     fn remove_embedded_config_peers(home: &FabricHome) -> Result<()> {
@@ -780,6 +832,293 @@ impl PeerBook {
             }
         }
         Ok(())
+    }
+}
+
+fn upsert_peer_tables(
+    root: &mut Table,
+    desired_root: &Table,
+    before: &[Peer],
+    after: &[Peer],
+) -> Result<Vec<Peer>> {
+    if before == after {
+        return Ok(Vec::new());
+    }
+    let Some(desired_tables) = desired_root.get("peers").and_then(Item::as_array_of_tables) else {
+        upsert_table_field(root, desired_root, "peers")?;
+        return Ok(Vec::new());
+    };
+    let Some(current_tables) = root.get_mut("peers").and_then(Item::as_array_of_tables_mut) else {
+        let Some(first) = desired_tables.iter().next() else {
+            upsert_table_field(root, desired_root, "peers")?;
+            return Ok(Vec::new());
+        };
+        let mut first_table = ArrayOfTables::new();
+        first_table.push(first.clone());
+        let first_id = table_endpoint_id(first, "id")
+            .context("the prepared peers.toml update has no first peer id")?;
+        let mut first_item = Item::ArrayOfTables(first_table);
+        let first_position = root.position().unwrap_or(0).saturating_add(1);
+        if let Some(item) = root.get_mut("peers") {
+            replace_item_preserving_decor(item, first_item, first_position);
+        } else {
+            let mut next_position = first_position;
+            assign_item_positions(&mut first_item, &mut next_position);
+            root.insert("peers", first_item);
+        }
+        return Ok(after
+            .iter()
+            .filter(|peer| peer.id != first_id)
+            .cloned()
+            .collect());
+    };
+
+    let desired_ids: HashSet<EndpointId> = after.iter().map(|peer| peer.id).collect();
+    if before.iter().any(|peer| !desired_ids.contains(&peer.id)) {
+        current_tables.retain(|table| {
+            table_endpoint_id(table, "id").is_some_and(|id| desired_ids.contains(&id))
+        });
+    }
+
+    for table in current_tables.iter_mut() {
+        let id = table_endpoint_id(table, "id")
+            .context("a validated peers.toml table lost its peer id")?;
+        let old_peer = before
+            .iter()
+            .find(|peer| peer.id == id)
+            .context("a validated peers.toml table lost its old peer")?;
+        let new_peer = after
+            .iter()
+            .find(|peer| peer.id == id)
+            .context("a retained peers.toml table lost its new peer")?;
+        let desired_table = desired_tables
+            .iter()
+            .find(|candidate| table_endpoint_id(candidate, "id") == Some(id))
+            .context("the prepared peers.toml update lost a peer table")?;
+
+        if old_peer.name != new_peer.name {
+            upsert_table_field(table, desired_table, "name")?;
+        }
+        if old_peer.addr != new_peer.addr {
+            upsert_table_field(table, desired_table, "addr")?;
+        }
+        if old_peer.roaming != new_peer.roaming {
+            upsert_table_field(table, desired_table, "roaming")?;
+        }
+        if old_peer.allow != new_peer.allow {
+            upsert_string_array_field(table, desired_table, "allow")?;
+        }
+    }
+
+    let present: HashSet<EndpointId> = current_tables
+        .iter()
+        .filter_map(|table| table_endpoint_id(table, "id"))
+        .collect();
+    Ok(after
+        .iter()
+        .filter(|peer| !present.contains(&peer.id))
+        .cloned()
+        .collect())
+}
+
+#[derive(Serialize)]
+struct PeerEntries<'a> {
+    peers: &'a [Peer],
+}
+
+fn upsert_git_remote_tables(
+    root: &mut Table,
+    desired_root: &Table,
+    before: &[GitRemote],
+    after: &[GitRemote],
+) -> Result<()> {
+    if before == after {
+        return Ok(());
+    }
+    let Some(current_tables) = root
+        .get_mut("git_remotes")
+        .and_then(Item::as_array_of_tables_mut)
+    else {
+        return upsert_table_field(root, desired_root, "git_remotes");
+    };
+    let Some(desired_tables) = desired_root
+        .get("git_remotes")
+        .and_then(Item::as_array_of_tables)
+    else {
+        return upsert_table_field(root, desired_root, "git_remotes");
+    };
+
+    let desired_names: HashSet<&str> = after.iter().map(|remote| remote.name.as_str()).collect();
+    current_tables.retain(|table| {
+        table_string(table, "name").is_some_and(|name| desired_names.contains(name))
+    });
+
+    for table in current_tables.iter_mut() {
+        let name = table_string(table, "name")
+            .context("a validated peers.toml table lost its Git remote name")?;
+        let old_remote = before
+            .iter()
+            .find(|remote| remote.name == name)
+            .context("a validated peers.toml table lost its old Git remote")?;
+        let new_remote = after
+            .iter()
+            .find(|remote| remote.name == name)
+            .context("a retained peers.toml table lost its new Git remote")?;
+        if old_remote.path != new_remote.path {
+            let desired_table = desired_tables
+                .iter()
+                .find(|candidate| table_string(candidate, "name") == Some(name))
+                .context("the prepared peers.toml update lost a Git remote table")?;
+            upsert_table_field(table, desired_table, "path")?;
+        }
+    }
+
+    let present: HashSet<String> = current_tables
+        .iter()
+        .filter_map(|table| table_string(table, "name"))
+        .map(str::to_owned)
+        .collect();
+    let mut next_position = current_tables
+        .iter()
+        .filter_map(Table::position)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    for desired_table in desired_tables.iter() {
+        let name = table_string(desired_table, "name")
+            .context("the prepared peers.toml update has no Git remote name")?;
+        if !present.contains(name) {
+            let mut desired_table = desired_table.clone();
+            assign_table_positions(&mut desired_table, &mut next_position);
+            current_tables.push(desired_table);
+        }
+    }
+    Ok(())
+}
+
+fn table_endpoint_id(table: &Table, key: &str) -> Option<EndpointId> {
+    EndpointId::from_str(table_string(table, key)?).ok()
+}
+
+fn table_string<'a>(table: &'a Table, key: &str) -> Option<&'a str> {
+    table.get(key)?.as_str()
+}
+
+fn upsert_string_array_field(table: &mut Table, desired: &Table, key: &str) -> Result<()> {
+    let desired_item = desired
+        .get(key)
+        .with_context(|| format!("the prepared peers.toml update has no {key} field"))?;
+    let Some(current_array) = table.get_mut(key).and_then(Item::as_array_mut) else {
+        return upsert_table_field(table, desired, key);
+    };
+    let Some(desired_array) = desired_item.as_array() else {
+        return upsert_table_field(table, desired, key);
+    };
+
+    let mut old_values: Vec<Value> = current_array.iter().cloned().collect();
+    let desired_values: Vec<Value> = desired_array.iter().cloned().collect();
+    let decor = current_array.decor().clone();
+    let trailing = current_array.trailing().clone();
+    let trailing_comma = current_array.trailing_comma();
+    current_array.clear();
+    *current_array.decor_mut() = decor;
+    current_array.set_trailing(trailing);
+    current_array.set_trailing_comma(trailing_comma);
+
+    for desired_value in desired_values {
+        let matching = old_values
+            .iter()
+            .position(|old_value| old_value.as_str() == desired_value.as_str());
+        let value = matching
+            .map(|index| old_values.remove(index))
+            .unwrap_or(desired_value);
+        current_array.push_formatted(value);
+    }
+    Ok(())
+}
+
+fn upsert_table_field(table: &mut Table, desired: &Table, key: &str) -> Result<()> {
+    let Some(desired_item) = desired.get(key).cloned() else {
+        table.remove(key);
+        return Ok(());
+    };
+    let child_position = table.position().unwrap_or(0).saturating_add(1);
+    if let Some(current_item) = table.get_mut(key) {
+        let current_is_table = matches!(current_item, Item::Table(_) | Item::ArrayOfTables(_));
+        let desired_is_table = matches!(desired_item, Item::Table(_) | Item::ArrayOfTables(_));
+        replace_item_preserving_decor(current_item, desired_item, child_position);
+        if current_is_table != desired_is_table
+            && let Some(mut current_key) = table.key_mut(key)
+        {
+            // A key-value line uses one space before `=`, while a table header
+            // uses no space before `]`. Clear the old context's key decor when
+            // a field changes between these two shapes.
+            current_key.fmt();
+        }
+    } else {
+        let mut desired_item = desired_item;
+        let mut next_position = child_position;
+        assign_item_positions(&mut desired_item, &mut next_position);
+        table.insert(key, desired_item);
+    }
+    Ok(())
+}
+
+fn replace_item_preserving_decor(current: &mut Item, mut desired: Item, fallback_position: isize) {
+    let mut next_position = match &*current {
+        Item::Table(table) => table.position().unwrap_or(fallback_position),
+        Item::ArrayOfTables(tables) => tables
+            .iter()
+            .filter_map(Table::position)
+            .min()
+            .unwrap_or(fallback_position),
+        _ => fallback_position,
+    };
+    assign_item_positions(&mut desired, &mut next_position);
+    match (&*current, &mut desired) {
+        (Item::Value(old), Item::Value(new)) => *new.decor_mut() = old.decor().clone(),
+        (Item::Table(old), Item::Table(new)) => *new.decor_mut() = old.decor().clone(),
+        _ => {}
+    }
+    *current = desired;
+}
+
+const TABLE_POSITION_GAP: isize = 1_000_000;
+
+fn spread_table_positions(table: &mut Table) {
+    if let Some(position) = table.position() {
+        table.set_position(Some(position.saturating_mul(TABLE_POSITION_GAP)));
+    }
+    for (_, item) in table.iter_mut() {
+        match item {
+            Item::Table(child) => spread_table_positions(child),
+            Item::ArrayOfTables(children) => {
+                for child in children.iter_mut() {
+                    spread_table_positions(child);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn assign_item_positions(item: &mut Item, next_position: &mut isize) {
+    match item {
+        Item::Table(table) => assign_table_positions(table, next_position),
+        Item::ArrayOfTables(tables) => {
+            for table in tables.iter_mut() {
+                assign_table_positions(table, next_position);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn assign_table_positions(table: &mut Table, next_position: &mut isize) {
+    table.set_position(Some(*next_position));
+    *next_position = next_position.saturating_add(1);
+    for (_, item) in table.iter_mut() {
+        assign_item_positions(item, next_position);
     }
 }
 
@@ -1320,6 +1659,131 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o640);
+    }
+
+    #[test]
+    fn first_peer_save_creates_the_document_header() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = FabricHome::new(directory.path());
+        assert!(!home.peers_path().exists());
+
+        PeerBook::default().save(&home).unwrap();
+
+        let raw = fs::read_to_string(home.peers_path()).unwrap();
+        assert!(raw.starts_with("# fabric peers."));
+        PeerBook::load(&home).unwrap();
+    }
+
+    #[test]
+    fn peer_add_and_remove_preserve_human_formatting() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = FabricHome::new(directory.path());
+        home.prepare().unwrap();
+        let kept = an_id(20);
+        let removed = an_id(21);
+        let added = an_id(22);
+        let kept_block = format!(
+            "# This comment belongs to the peer.\n\
+             [[peers]]\n\
+             id   = '{kept}' # Keep this identity note.\n\
+             name = 'kept'\n\
+             allow = [ 'shell' ] # Keep this grant note.\n"
+        );
+        let original = format!(
+            "# My peer file. Keep this header.\n\
+             allow_shell   = false # Keep this setting note.\n\
+             allow_exec = false\n\
+             future_setting = 'keep me' # Keep unknown data too.\n\
+             \n\
+             {kept_block}\n\
+             # This peer will be removed.\n\
+             [[peers]]\n\
+             id = '{removed}'\n\
+             name = 'removed'\n\
+             allow = []\n"
+        );
+        fs::write(home.peers_path(), original).unwrap();
+
+        let mut book = PeerBook::load(&home).unwrap();
+        book.add(added, Some("added".into()), None);
+        book.save(&home).unwrap();
+
+        let after_add = fs::read_to_string(home.peers_path()).unwrap();
+        assert!(after_add.contains("# My peer file. Keep this header."));
+        assert!(after_add.contains(&kept_block));
+        assert!(after_add.contains("future_setting = 'keep me' # Keep unknown data too."));
+        assert!(!after_add.contains("# fabric peers."));
+
+        let mut book = PeerBook::load(&home).unwrap();
+        book.set_allow_shell(true);
+        book.save(&home).unwrap();
+        let after_policy = fs::read_to_string(home.peers_path()).unwrap();
+        assert!(after_policy.contains("allow_shell   = true # Keep this setting note."));
+
+        let mut book = PeerBook::load(&home).unwrap();
+        assert!(book.remove("removed"));
+        book.save(&home).unwrap();
+
+        let after_remove = fs::read_to_string(home.peers_path()).unwrap();
+        assert!(after_remove.contains("# My peer file. Keep this header."));
+        assert!(after_remove.contains(&kept_block));
+        assert!(after_remove.contains("future_setting = 'keep me' # Keep unknown data too."));
+        assert!(!after_remove.contains("# fabric peers."));
+        assert!(!after_remove.contains(&removed.to_string()));
+    }
+
+    #[test]
+    fn adding_addressed_peers_keeps_a_valid_peer_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = FabricHome::new(directory.path());
+        let first = an_id(23);
+        let second = an_id(24);
+        let third = an_id(25);
+
+        let mut book = PeerBook::load(&home).unwrap();
+        book.add(
+            first,
+            Some("z-first".into()),
+            Some(EndpointAddr::new(first).with_ip_addr("127.0.0.1:11204".parse().unwrap())),
+        );
+        book.save(&home).unwrap();
+        let mut book = PeerBook::load(&home).unwrap();
+        book.add(
+            second,
+            Some("a-second".into()),
+            Some(EndpointAddr::new(second).with_ip_addr("127.0.0.1:11205".parse().unwrap())),
+        );
+        book.save(&home).unwrap();
+
+        let raw = fs::read_to_string(home.peers_path()).unwrap();
+        toml::from_str::<PeerBook>(&raw)
+            .unwrap_or_else(|error| panic!("the updated peer file is invalid: {error}\n{raw}"));
+
+        let mut book = PeerBook::load(&home).unwrap();
+        book.add(
+            first,
+            Some("z-first".into()),
+            Some(EndpointAddr::new(first).with_ip_addr("127.0.0.1:11206".parse().unwrap())),
+        );
+        book.save(&home).unwrap();
+        PeerBook::load(&home).unwrap();
+
+        let mut book = PeerBook::load(&home).unwrap();
+        book.add(third, Some("third".into()), None);
+        book.save(&home).unwrap();
+        let mut book = PeerBook::load(&home).unwrap();
+        book.add(
+            third,
+            Some("third".into()),
+            Some(EndpointAddr::new(third).with_ip_addr("127.0.0.1:11207".parse().unwrap())),
+        );
+        book.save(&home).unwrap();
+        PeerBook::load(&home).unwrap();
+
+        let mut book = PeerBook::load(&home).unwrap();
+        assert!(book.remove("z-first"));
+        book.save(&home).unwrap();
+        PeerBook::load(&home).unwrap();
     }
 
     #[test]
