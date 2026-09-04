@@ -5,7 +5,7 @@ current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
 _Last updated: 2026-09-04 by Silber.fabric-codex. Main's last code commit is
-deployed as `0.2.1+71f3d06` on Silber and hetz._
+deployed as `0.2.1+863dc5b` on Silber and hetz._
 
 ## Current release — 2026-09-04
 
@@ -306,6 +306,70 @@ were `/Users/myobie/.local/bin/fabric.rollback-1788540671` and
 `/home/myobie/.local/bin/fabric.rollback-1788540631`. Both paths and all exact
 release, preflight, and transfer paths were permanently deleted after
 verification and are absent.
+
+PR #151 separates forward work from watcher mutation receipts. An inbound
+adoption advances a forward generation and wakes the entry loop. A successful
+pass settles only the forward generation it observed at its start, so an
+adoption that arrives during that pass remains pending. The 30-second tick
+still schedules missed forward work. A held wake for work another trigger
+already completed now costs no pass.
+
+The ordering contract failed before the fix because the forward marker made an
+exact daemon atomic-write receipt look stale. It passes after the fix. Separate
+contracts cover an adoption during a pass, the periodic backstop, and a stale
+held wake. The existing journal-overflow and dropped-generation contracts still
+fail open to a normal scan.
+
+PR #151 merged as `863dc5b`. Pull-request test run `33899754269` and Nix run
+`33899754314` passed. Exact-main test run `33899950082` and Nix run
+`33899950176` passed. The final local library suite passed 455 active tests,
+with three measurements ignored. The serial folder-sync suite passed 18 tests.
+
+Release `v0.2.1+863dc5b` passed all four jobs in run `33901173856`. The archive
+SHA-256 values are `b590eb68b92b955865948d0d020c02d2eb9ed407d11256d8d34c168f487590b4`
+for Apple arm64, `15ac41d336a09e6c409a4f9cb3d6e2a49f81e2025163b051fe89489f7565222d`
+for Linux arm64, and `8bdc16fdf56175aed23a2723d2a40615db9d2f2ad291b6977bda5f7070b8db20`
+for Linux x86_64. Each archive matched its sidecar and contained only
+`fabric`. The Apple and Linux x86_64 binaries reported `0.2.1+863dc5b` before
+deployment.
+
+The independent predeployment baseline matched on all three readings. Both
+Silber readings and the hetz binary reported `0.2.1+71f3d06`. The rollout then
+updated hetz first and Silber second. Mixed-version and final two-way ping and
+exec passed through direct paths. Doctor passed on both hosts. Both native
+services are active and enabled. Two-way send-file hashes matched. The
+Silber-to-hetz hash was
+`d2c450b11ec2c0c87034569606e3d463e42b92f1cc01aa451fcf862be3bd362c`.
+The hetz-to-Silber hash was
+`c8f30d8d3113eacff05bd8ce2aabe0217edec1223761eed9c069be17fc33ad8d`.
+
+The repeated final snapshots converged at 29,314 present bus paths and 17,791
+tombstones on both hosts. Their bus digest prefix was `0412294a3827`. Both
+declaration entries had 119 present paths, 41 tombstones, and digest prefix
+`57d8522f710d`. Drift was clean, with no scan issue, stopped peer, away peer,
+reconcile failure, or delta fallback.
+
+The decisive watcher-ready 30-second hetz window started at 34 sync passes, 96
+full scans, 26 inbound no-op transactions, and 14 guarded transactions. It
+ended at 36 passes, 104 scans, 28 no-ops, and 16 guarded transactions. The
+window saw exactly two daemon atomic renames, from `.fabric-tmp` paths to
+`Silber/poc-server/status` and `Silber/vrs-study/status`.
+
+Two guarded transactions therefore produced two forward passes and eight
+scans. A receipt mismatch would have scheduled an extra watcher pass, so the
+absence of either extra pass proves that suppression fired twice. The two
+no-op inbound transactions added no scan. The recorded prediction was six
+scans falling to four for one guarded transaction, or twelve falling to eight
+for two. The measured two-transaction case matched.
+
+An earlier 30-second window also measured one guarded transaction, one pass,
+and four scans. A later window had no guarded transaction, three passes, six
+scans, and one local hetz atomic-write burst. The latter cannot test the
+prediction; it confirms only that every pass still cost two scans.
+
+The rollout rollback binaries both reported `0.2.1+71f3d06`. Both exact
+rollback files and all release, instrumentation, preflight, and transfer files
+were permanently deleted after verification and are absent.
 
 The rollout created two rollback binaries from `0.2.1+9d1c138`. They were
 `/Users/myobie/.local/bin/fabric.rollback-1788525446` and
