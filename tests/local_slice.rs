@@ -1365,6 +1365,66 @@ async fn declarative_peer_config_can_be_reloaded_without_restart() -> Result<()>
     Ok(())
 }
 
+/// An ACL refusal happens before the remote exec handler starts. The local
+/// daemon must still send a framed failure to the CLI. Otherwise `fabric exec`
+/// exits with no output and a person cannot tell a refusal from a broken dial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_names_the_peer_and_service_when_the_peer_acl_refuses_it() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let server_dir = TempDir::new()?;
+    let client_dir = TempDir::new()?;
+    let server_home = FabricHome::new(server_dir.path());
+    let client_home = FabricHome::new(client_dir.path());
+    let server = FabricNode::start(server_home.clone()).await?;
+    let client = FabricNode::start(client_home.clone()).await?;
+
+    let mut server_book = PeerBook::load(&server_home)?;
+    server_book.set_allow_exec(true);
+    server_book.add_with_allow(
+        client.id(),
+        Some("client".into()),
+        Some(client.addr()),
+        Some(vec!["echo".into()]),
+    );
+    server_book.save(&server_home)?;
+    server.state().reload_peers().await?;
+    trust_peer(
+        &client_home,
+        &client,
+        server.id(),
+        Some("server"),
+        Some(server.addr()),
+    )
+    .await?;
+    assert_eq!(client.ping("server").await?.bytes, 32);
+
+    let output = tokio::time::timeout(
+        FABRIC_COMMAND_TIMEOUT,
+        tokio::process::Command::new(fabric_bin())
+            .arg("--home")
+            .arg(client_home.root())
+            .args(["exec", "server", "--", "fabric", "--version"])
+            .output(),
+    )
+    .await
+    .context("fabric exec timed out after an ACL refusal")??;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(126), "stderr: {stderr}");
+    assert!(
+        stderr.contains("server"),
+        "the refusal omitted the peer: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("exec"),
+        "the refusal omitted the service: {stderr:?}"
+    );
+
+    client.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_file_remains_authoritative_when_daemon_config_is_created() -> Result<()> {
     let _guard = local_slice_guard().await;

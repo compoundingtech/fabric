@@ -840,6 +840,12 @@ async fn trusted_peer_without_allow_shell_is_refused() -> Result<()> {
         !output.status.success(),
         "a compatibility flag opened remote exec"
     );
+    let exec_stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(126), "stderr: {exec_stderr}");
+    assert!(
+        exec_stderr.contains("node-a") && exec_stderr.contains("exec"),
+        "the refusal did not name the peer and service: {exec_stderr:?}"
+    );
     assert!(!marker.exists(), "the refused remote command ran");
 
     node_b.shutdown().await?;
