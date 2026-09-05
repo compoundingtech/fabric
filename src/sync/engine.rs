@@ -783,6 +783,27 @@ impl PreparedInbound {
     }
 }
 
+/// The points between a scan and the materialization that follows it.
+///
+/// A rename or delete that lands in one of these windows is invisible to the
+/// scan that just ran and visible to the materialization that follows. Tests
+/// pin an event to a seam so the window is exercised on demand rather than by
+/// scheduler luck. Production builds carry the enum and an empty call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PhaseSeam {
+    /// `sync_once`, after the pre-peer scan and before its materialization.
+    AfterPrePeerScan,
+    /// `sync_once`, after the peer step, before the post-peer scan.
+    BeforePostPeerScan,
+    /// `sync_once`, after the post-peer scan and before its materialization.
+    AfterPostPeerScan,
+    /// `complete_inbound`, after its scan and before its materialization.
+    AfterInboundScan,
+}
+
+#[cfg(test)]
+type SeamHook = Arc<dyn Fn(PhaseSeam) + Send + Sync>;
+
 impl<T: SyncTransport> std::fmt::Debug for SyncEngine<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SyncEngine").finish_non_exhaustive()
@@ -800,6 +821,9 @@ pub struct SyncEngine<T: SyncTransport> {
     /// for newly added entries.
     watching: StdMutex<HashSet<String>>,
     cancel: CancellationToken,
+    /// Test-only seam between a scan and the materialization that follows it.
+    #[cfg(test)]
+    seam_hook: StdMutex<Option<SeamHook>>,
 }
 
 impl<T: SyncTransport> SyncEngine<T> {
@@ -824,6 +848,8 @@ impl<T: SyncTransport> SyncEngine<T> {
             entries: RwLock::new(HashMap::new()),
             watching: StdMutex::new(HashSet::new()),
             cancel,
+            #[cfg(test)]
+            seam_hook: StdMutex::new(None),
         });
         engine.load_from_config().await?;
         Ok(engine)
@@ -831,6 +857,23 @@ impl<T: SyncTransport> SyncEngine<T> {
 
     /// (Re)load entries from `syncs.toml`, keeping existing nodes for entries
     /// that are unchanged and dropping entries no longer configured.
+    #[cfg(test)]
+    pub(crate) fn set_seam_hook(&self, hook: impl Fn(PhaseSeam) + Send + Sync + 'static) {
+        *self.seam_hook.lock().unwrap() = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    fn at_seam(&self, seam: PhaseSeam) {
+        let hook = self.seam_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(seam);
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn at_seam(&self, _seam: PhaseSeam) {}
+
     pub async fn load_from_config(&self) -> Result<()> {
         let book = SyncBook::load_path(self.paths.config_path())?;
         self.load_book(book).await
@@ -1077,6 +1120,7 @@ impl<T: SyncTransport> SyncEngine<T> {
         // It is cheap now because scan_folder reuses recorded hashes for files
         // whose size and mtime are unchanged.
         self.scan_entry(&entry).await?;
+        self.at_seam(PhaseSeam::AfterInboundScan);
         self.materialize_entry_state(&entry, &baseline).await?;
         let final_manifest_revision = entry.node.lock().await.manifest_revision();
         let final_receipt_revision = entry.disk.lock().unwrap().receipt_revision;
@@ -1197,6 +1241,7 @@ impl<T: SyncTransport> SyncEngine<T> {
             let phase = Instant::now();
             let scan_changed = self.scan_entry(&entry).await?;
             EntryWork::add_phase(&entry.work.scan_micros, phase);
+            self.at_seam(PhaseSeam::AfterPrePeerScan);
             let phase = Instant::now();
             self.materialize_entry_state(&entry, &protected).await?;
             EntryWork::add_phase(&entry.work.materialize_micros, phase);
@@ -1352,9 +1397,11 @@ impl<T: SyncTransport> SyncEngine<T> {
         EntryWork::add_phase(&entry.work.reconcile_micros, reconcile_phase);
 
         let _operation = entry.operation.lock().await;
+        self.at_seam(PhaseSeam::BeforePostPeerScan);
         let phase = Instant::now();
         self.scan_entry(&entry).await?;
         EntryWork::add_phase(&entry.work.scan_micros, phase);
+        self.at_seam(PhaseSeam::AfterPostPeerScan);
         let phase = Instant::now();
         self.materialize_entry_state(&entry, &baseline).await?;
         EntryWork::add_phase(&entry.work.materialize_micros, phase);
@@ -7959,6 +8006,7 @@ mod tests {
             entries: RwLock::new(HashMap::new()),
             watching: StdMutex::new(HashSet::new()),
             cancel: CancellationToken::new(),
+            seam_hook: StdMutex::new(None),
         };
         let state = engine.read_durable_state("bus").unwrap().unwrap();
         // The test hook pauses after the durable rename and before log removal.
@@ -10717,5 +10765,335 @@ mod tests {
                  excluded one must not"
             );
         }
+    }
+
+    // ---- issue 175: a rename between a scan and the materialization after it ----
+
+    /// A peer that behaves like the client half of a real exchange and, once,
+    /// lands a guarded inbound session on this engine during its unguarded
+    /// peer step. That inbound session is what first materializes the peer's
+    /// file on local disk, after the outbound pass captured its pre-peer view
+    /// and before its post-peer scan.
+    struct SeamRaceTransport {
+        engine: StdMutex<Option<Weak<SyncEngine<Self>>>>,
+        remote: Arc<Mutex<SyncNode>>,
+        inbound_during_peer_step: bool,
+        inbound_done: std::sync::atomic::AtomicBool,
+    }
+
+    impl SeamRaceTransport {
+        fn new(remote: Arc<Mutex<SyncNode>>, inbound_during_peer_step: bool) -> Arc<Self> {
+            Arc::new(Self {
+                engine: StdMutex::new(None),
+                remote,
+                inbound_during_peer_step,
+                inbound_done: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        fn attach(&self, engine: &Arc<SyncEngine<Self>>) {
+            *self.engine.lock().unwrap() = Some(Arc::downgrade(engine));
+        }
+    }
+
+    impl SyncTransport for SeamRaceTransport {
+        async fn peers_for(&self, _peers: &SyncPeers) -> ResolvedPeers {
+            ResolvedPeers::all(vec![PeerRef {
+                key: "peer-a".to_string(),
+                id: "peer-a".to_string(),
+                roaming: false,
+            }])
+        }
+
+        async fn reconcile(
+            &self,
+            _peer: PeerRef,
+            name: String,
+            node: Arc<Mutex<SyncNode>>,
+        ) -> Result<Reconciled> {
+            // The client half of a real exchange: adopt the peer's winning
+            // entries and pull the bytes behind them.
+            let (remote_manifest, remote_content) = {
+                let remote = self.remote.lock().await;
+                let manifest = remote.manifest().clone();
+                let hashes: Vec<ContentHash> =
+                    manifest.present_paths().map(|(_, meta)| meta.hash).collect();
+                (manifest, remote.gather_content(&hashes))
+            };
+            let pulled = {
+                let mut node = node.lock().await;
+                let pulled = node.adopt_from_peer(&remote_manifest);
+                for (_, bytes) in remote_content {
+                    node.put_content(bytes);
+                }
+                pulled
+            };
+            // Once, while this pass holds no operation guard: the same peer's
+            // own pass arrives as a guarded inbound session. It scans, adopts
+            // nothing new, and materializes the file adopted above.
+            if self.inbound_during_peer_step
+                && !self.inbound_done.swap(true, Ordering::AcqRel)
+            {
+                let engine = self
+                    .engine
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .and_then(|weak| weak.upgrade())
+                    .expect("the transport is attached to its engine");
+                let prepared = engine
+                    .prepare_inbound(&name)
+                    .await?
+                    .expect("the entry exists");
+                engine.complete_inbound(prepared).await?;
+            }
+            Ok(Reconciled {
+                pulled,
+                ..Reconciled::default()
+            })
+        }
+    }
+
+    async fn rename_race_fixture(
+        inbound_during_peer_step: bool,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        Arc<SyncEngine<SeamRaceTransport>>,
+        Arc<Mutex<SyncNode>>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(root.join("inbox")).unwrap();
+        write_bus_sync(dir.path(), &root);
+        let mut remote = SyncNode::new(Author([2; 32]));
+        remote.local_write("inbox/job.md", b"concurrent update", 0, 0);
+        let remote = Arc::new(Mutex::new(remote));
+        let transport = SeamRaceTransport::new(remote.clone(), inbound_during_peer_step);
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            transport.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        transport.attach(&engine);
+        (dir, root, engine, remote)
+    }
+
+    /// Rename `inbox/job.md` to `archive/job.md` the first time `seam` fires,
+    /// and record what the seam saw each time it fired: whether the source was
+    /// on disk, and whether the manifest held it Present.
+    fn rename_at_seam(
+        engine: &SyncEngine<SeamRaceTransport>,
+        root: &Path,
+        node: &Arc<Mutex<SyncNode>>,
+        seam: PhaseSeam,
+    ) -> Arc<StdMutex<Vec<(bool, Option<bool>)>>> {
+        let evidence = Arc::new(StdMutex::new(Vec::new()));
+        let hook_root = root.to_path_buf();
+        let hook_node = node.clone();
+        let hook_evidence = evidence.clone();
+        engine.set_seam_hook(move |fired| {
+            if fired != seam {
+                return;
+            }
+            let mut evidence = hook_evidence.lock().unwrap();
+            let on_disk = hook_root.join("inbox/job.md").is_file();
+            let present = hook_node.try_lock().ok().map(|node| {
+                node.manifest()
+                    .get("inbox/job.md")
+                    .is_some_and(Entry::is_present)
+            });
+            evidence.push((on_disk, present));
+            if evidence.len() == 1 {
+                std::fs::create_dir_all(hook_root.join("archive")).unwrap();
+                std::fs::rename(
+                    hook_root.join("inbox/job.md"),
+                    hook_root.join("archive/job.md"),
+                )
+                .unwrap();
+            }
+        });
+        evidence
+    }
+
+    async fn assert_rename_outcome(
+        node: &Arc<Mutex<SyncNode>>,
+        remote: &Arc<Mutex<SyncNode>>,
+        root: &Path,
+    ) {
+        let node = node.lock().await;
+        assert!(
+            matches!(node.manifest().get("inbox/job.md"), Some(Entry::Tombstone(_))),
+            "the rename source must be a tombstone, got {:?}",
+            node.manifest().get("inbox/job.md")
+        );
+        assert!(
+            matches!(node.manifest().get("archive/job.md"), Some(Entry::Present(_))),
+            "the rename destination must be present, got {:?}",
+            node.manifest().get("archive/job.md")
+        );
+        assert!(
+            !root.join("inbox/job.md").exists(),
+            "the rename source was written back to disk"
+        );
+        assert_eq!(
+            std::fs::read(root.join("archive/job.md")).unwrap(),
+            b"concurrent update"
+        );
+        // The peer converges on the same answer from this node's state alone.
+        let mut remote = remote.lock().await;
+        remote.adopt_from_peer(node.manifest());
+        assert!(
+            matches!(remote.manifest().get("inbox/job.md"), Some(Entry::Tombstone(_))),
+            "the peer must adopt the source tombstone, got {:?}",
+            remote.manifest().get("inbox/job.md")
+        );
+        assert!(
+            matches!(remote.manifest().get("archive/job.md"), Some(Entry::Present(_))),
+            "the peer must adopt the destination"
+        );
+    }
+
+    /// Issue 175. The outbound pass carries its pre-peer disk view across the
+    /// peer step and uses it as the protected view for the post-peer
+    /// materialization. A file that an inbound session materialized during the
+    /// peer step is absent from that view, so a rename landing between the
+    /// post-peer scan and its materialization reads as a never-seen remote
+    /// file, and the source is written back. Both paths end Present.
+    #[tokio::test]
+    async fn a_rename_between_the_post_peer_scan_and_its_materialization_does_not_split_the_file()
+    {
+        let (_dir, root, engine, remote) = rename_race_fixture(true).await;
+        let node = engine.node_for("bus").await.unwrap();
+        let evidence = rename_at_seam(&engine, &root, &node, PhaseSeam::AfterPostPeerScan);
+
+        engine.sync_once("bus").await.unwrap();
+        engine.sync_once("bus").await.unwrap();
+
+        // The fixture must have reached the window: when the seam first fired,
+        // the peer's file was on disk and Present in the manifest.
+        let evidence = evidence.lock().unwrap().clone();
+        assert_eq!(
+            evidence.first(),
+            Some(&(true, Some(true))),
+            "the seam did not see the peer's file on disk and Present: {evidence:?}"
+        );
+        assert_rename_outcome(&node, &remote, &root).await;
+    }
+
+    /// Control for the test above: the same rename one seam earlier, before
+    /// the post-peer scan, is recorded by that scan. This passes with or
+    /// without the fix, so a failure of the test above is the window itself.
+    #[tokio::test]
+    async fn a_rename_before_the_post_peer_scan_is_recorded_by_that_scan() {
+        let (_dir, root, engine, remote) = rename_race_fixture(true).await;
+        let node = engine.node_for("bus").await.unwrap();
+        let evidence = rename_at_seam(&engine, &root, &node, PhaseSeam::BeforePostPeerScan);
+
+        engine.sync_once("bus").await.unwrap();
+        engine.sync_once("bus").await.unwrap();
+
+        let evidence = evidence.lock().unwrap().clone();
+        assert_eq!(evidence.first(), Some(&(true, Some(true))), "{evidence:?}");
+        assert_rename_outcome(&node, &remote, &root).await;
+    }
+
+    /// Control against over-correction: a path adopted during the peer step
+    /// that never existed on local disk must still be materialized by the
+    /// post-peer materialization. Protecting every path in the manifest would
+    /// turn every remote-only file into a local delete.
+    #[tokio::test]
+    async fn a_path_adopted_during_the_peer_step_and_never_seen_locally_is_still_materialized() {
+        let (_dir, root, engine, _remote) = rename_race_fixture(false).await;
+        engine.sync_once("bus").await.unwrap();
+
+        assert_eq!(
+            std::fs::read(root.join("inbox/job.md")).unwrap(),
+            b"concurrent update"
+        );
+        let node = engine.node_for("bus").await.unwrap();
+        let node = node.lock().await;
+        assert!(matches!(
+            node.manifest().get("inbox/job.md"),
+            Some(Entry::Present(_))
+        ));
+    }
+
+    /// The inbound half of the same window. `complete_inbound` scans, then
+    /// materializes with the view captured before the wire session. A file
+    /// created during the session and removed between that scan and its
+    /// materialization is absent from the older view, so it is written back.
+    #[tokio::test]
+    async fn a_file_created_and_removed_inside_one_inbound_session_stays_removed() {
+        let (_dir, root, engine, _remote) = rename_race_fixture(false).await;
+        engine.sync_once("bus").await.unwrap();
+        let node = engine.node_for("bus").await.unwrap();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let hook_root = root.clone();
+        let hook_fired = fired.clone();
+        engine.set_seam_hook(move |seam| {
+            if seam == PhaseSeam::AfterInboundScan
+                && hook_fired.fetch_add(1, Ordering::AcqRel) == 0
+            {
+                std::fs::remove_file(hook_root.join("inbox/draft.md")).unwrap();
+            }
+        });
+
+        let prepared = engine.prepare_inbound("bus").await.unwrap().unwrap();
+        // A file appears during the wire session. The completion scan records
+        // it, the seam removes it, and the materialization must not restore it.
+        std::fs::write(root.join("inbox/draft.md"), b"draft").unwrap();
+        engine.complete_inbound(prepared).await.unwrap();
+
+        assert_eq!(fired.load(Ordering::Relaxed), 1, "the inbound seam did not fire exactly once");
+        let node = node.lock().await;
+        assert!(
+            matches!(node.manifest().get("inbox/draft.md"), Some(Entry::Tombstone(_))),
+            "a file removed after the completion scan must be a tombstone, got {:?}",
+            node.manifest().get("inbox/draft.md")
+        );
+        assert!(
+            !root.join("inbox/draft.md").exists(),
+            "the removed file was written back to disk"
+        );
+    }
+
+    /// The pre-peer half of the same window. `sync_once` captures its
+    /// protected view before the pre-peer scan, so a file created before that
+    /// scan and removed between the scan and its materialization is absent
+    /// from the protected view and is written back.
+    #[tokio::test]
+    async fn a_file_created_and_removed_around_the_pre_peer_scan_stays_removed() {
+        let (_dir, root, engine, _remote) = rename_race_fixture(false).await;
+        engine.sync_once("bus").await.unwrap();
+        let node = engine.node_for("bus").await.unwrap();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let hook_root = root.clone();
+        let hook_fired = fired.clone();
+        engine.set_seam_hook(move |seam| {
+            if seam == PhaseSeam::AfterPrePeerScan
+                && hook_fired.fetch_add(1, Ordering::AcqRel) == 0
+            {
+                std::fs::remove_file(hook_root.join("inbox/draft.md")).unwrap();
+            }
+        });
+
+        std::fs::write(root.join("inbox/draft.md"), b"draft").unwrap();
+        engine.sync_once("bus").await.unwrap();
+
+        assert_eq!(fired.load(Ordering::Relaxed), 1, "the pre-peer seam did not fire exactly once");
+        let node = node.lock().await;
+        assert!(
+            matches!(node.manifest().get("inbox/draft.md"), Some(Entry::Tombstone(_))),
+            "a file removed after the pre-peer scan must be a tombstone, got {:?}",
+            node.manifest().get("inbox/draft.md")
+        );
+        assert!(
+            !root.join("inbox/draft.md").exists(),
+            "the removed file was written back to disk"
+        );
     }
 }
