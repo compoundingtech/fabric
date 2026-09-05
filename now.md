@@ -4,16 +4,16 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-04 by Silber.fabric-codex. Main is ahead of the fleet.
-Ask Silber.cos for the current fleet build. Do not cut or deploy a release
-without Silber.cos._
+_Last updated: 2026-09-05 by Silber.fabric-codex. Silber and hetz run Release A.
+Bluey was away and last reported the earlier fleet build. Ask Silber.cos before
+each release or deployment._
 
 For extraction steps 6 and 8, merge on green without asking for a separate
 Silber.cos approval. Silber.cos holds the step 7 activation gate and every
 release or deployment gate. Before any deployment, prove matched-pair rollback
 on hetz. macOS needs a detached update supervisor; the current change adds it.
 
-## Current main — 2026-09-04
+## Current main — 2026-09-05
 
 PR #154 made the current-connection fault class visible. PR #155 froze the
 sync-process extraction plan. PR #156 made `peers.toml` formatting stable.
@@ -46,7 +46,7 @@ PR #164 added a detached macOS update supervisor. PR #165 added pair-aware,
 fail-closed rollback. PR #166 made real launchd and systemd tests exercise that
 reader. All three changes are merged.
 
-The fleet build `0.2.1+48208e4` has only single-binary supervisor logic. The
+The pre-transition fleet build `0.2.1+48208e4` has only single-binary supervisor logic. The
 rollback runs this old binary on purpose because it is the machine's known-good
 copy. New rollback logic therefore cannot protect the release that introduces
 it.
@@ -79,7 +79,33 @@ exact status and manual recovery commands. PR #169 keeps expected companion
 absence silent on launchd and systemd. Step 7 restores paired archives after
 Release A reaches every machine.
 
-The local library suite passed 499 tests with five measurements ignored. The
+PR #170 set the operator-visible version boundary. Release A
+`v0.2.2+a2f8a73` is published from exact commit `a2f8a73`. Its three archives
+passed checksum and one-member checks. Each archive contains only `fabric`.
+
+Hetz and Silber now run `0.2.2+a2f8a73`. Hetz restarted through systemd and its
+detached supervisor confirmed the new version. A hetz-side observer sent 360
+pings to Silber over 451.5 seconds. No ping failed. The restart-crossing ping
+returned through the relay in 835 ms, so observed unreachability was zero.
+
+The same observer disproved the tentative sync-starvation explanation for slow
+pings. After both machines ran Release A, 24 of 341 pings exceeded one second,
+seven exceeded three seconds, and the maximum was 9.212 seconds. The connection
+stayed alive with zero attach failures. This remains unassigned work.
+
+The old running updater performs the transition install. It therefore prints
+the old premature `control-socket ready` line. On macOS, it also cannot schedule
+the detached supervisor that Release A first introduces. Bluey's instructions
+must tell Nathan to ignore that line, wait two minutes, and use manual recovery
+if the new version does not answer.
+
+Release A intentionally has no companion binary or service while embedded sync
+remains active. Doctor incorrectly reports both absences as problems and tells
+the operator to run `fabric service install`. This change makes that exact
+transition green. A present companion binary with a missing service remains a
+problem. An enabled service with a missing binary now asks for a matched pair.
+
+The local library suite passed 513 tests with five measurements ignored. The
 binary suite passed 19 tests, and the update contract passed eight tests. The
 five-second latency property measured 502 records, seven scans, a 10.001166 ms
 source maximum, and a 20.102959 ms delivery maximum. The explicit live-launchd
