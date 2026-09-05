@@ -980,6 +980,10 @@ mod tests {
         ));
         assert!(is_stream_denied(&acl));
         assert!(is_permanent_stream_denial(&acl));
+
+        let transport = anyhow::anyhow!("connection timed out");
+        assert!(!is_stream_denied(&transport));
+        assert!(!is_permanent_stream_denial(&transport));
     }
 
     #[test]

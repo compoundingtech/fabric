@@ -75,6 +75,21 @@ impl ProtocolHandler for LegacyRawShell {
     }
 }
 
+#[derive(Debug, Clone)]
+struct LegacyDisabledShell;
+
+impl ProtocolHandler for LegacyDisabledShell {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let (mut send, _recv) = connection.accept_bi().await?;
+        shell::serve_shell_disabled(&mut send)
+            .await
+            .map_err(|error| AcceptError::from_boxed(error.into_boxed_dyn_error()))?;
+        send.finish()?;
+        connection.closed().await;
+        Ok(())
+    }
+}
+
 /// The legacy ALPN is a wire contract with every released Fabric: it carries
 /// one-shot shell framing and never generic tunnel frames. A build that routes
 /// shell/0 through the tunnel session protocol makes an old peer reject the
@@ -127,6 +142,42 @@ async fn new_client_falls_back_to_legacy_raw_shell_zero() -> Result<()> {
         !String::from_utf8_lossy(&output.stderr).contains("unknown tunnel frame"),
         "stderr was: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+
+    client.shutdown().await?;
+    legacy.shutdown().await?;
+    Ok(())
+}
+
+/// A legacy peer can send a refusal and stop reading at the same time. The
+/// stopped send direction must not cancel the Error and Exit frames already in
+/// the receive direction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_shell_refusal_frames_survive_a_stopped_send_direction() -> Result<()> {
+    let legacy_endpoint = Endpoint::bind(presets::N0).await?;
+    let legacy = Router::builder(legacy_endpoint)
+        .accept(shell::SHELL_ALPN, LegacyDisabledShell)
+        .spawn();
+    legacy.endpoint().online().await;
+
+    let client_dir = TempDir::new()?;
+    let client_home = FabricHome::new(client_dir.path());
+    let client = FabricNode::start(client_home.clone()).await?;
+    trust_peer(
+        &client_home,
+        &client,
+        legacy.endpoint().id(),
+        Some("legacy-disabled"),
+        Some(legacy.endpoint().addr()),
+    )
+    .await?;
+
+    let output = run_shell(&client_home, "legacy-disabled", "")?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(126), "stderr: {stderr}");
+    assert!(
+        stderr.contains("legacy-disabled") && stderr.contains("shell"),
+        "the legacy refusal omitted the peer or service: {stderr:?}"
     );
 
     client.shutdown().await?;
@@ -850,6 +901,54 @@ async fn trusted_peer_without_allow_shell_is_refused() -> Result<()> {
 
     node_b.shutdown().await?;
     node_a.shutdown().await?;
+    Ok(())
+}
+
+/// A per-peer ACL refusal happens before the resumable shell session starts.
+/// The local daemon must still send shell frames to the CLI. Otherwise the CLI
+/// returns status 1 with no reason, even though the peer is reachable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shell_names_the_peer_and_service_when_the_peer_acl_refuses_it() -> Result<()> {
+    let server_dir = TempDir::new()?;
+    let client_dir = TempDir::new()?;
+    let server_home = FabricHome::new(server_dir.path());
+    let client_home = FabricHome::new(client_dir.path());
+    let server = start_shell_server(server_home.clone()).await?;
+    let client = FabricNode::start(client_home.clone()).await?;
+
+    trust_peer_allowing(
+        &server_home,
+        &server,
+        client.id(),
+        Some("client"),
+        Some(client.addr()),
+        &["echo"],
+    )
+    .await?;
+    trust_peer(
+        &client_home,
+        &client,
+        server.id(),
+        Some("server"),
+        Some(server.addr()),
+    )
+    .await?;
+    assert_eq!(client.ping("server").await?.bytes, 32);
+
+    let output = run_shell(&client_home, "server", "")?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(126), "stderr: {stderr}");
+    assert!(
+        stderr.contains("server"),
+        "the refusal omitted the peer: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("shell"),
+        "the refusal omitted the service: {stderr:?}"
+    );
+
+    client.shutdown().await?;
+    server.shutdown().await?;
     Ok(())
 }
 

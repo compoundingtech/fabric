@@ -26,6 +26,7 @@ const SERVER_OUTPUT: u8 = 17;
 const SERVER_EXIT: u8 = 18;
 const SERVER_ERROR: u8 = 19;
 const SERVER_STATUS: u8 = 20;
+pub(crate) const EXIT_SHELL_DISABLED: i32 = 126;
 
 #[derive(Debug)]
 pub enum ClientFrame {
@@ -46,14 +47,25 @@ pub async fn serve_shell_disabled<W>(send: &mut W) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    write_server_frame(
+    serve_shell_failure(
         send,
-        ServerFrame::Error(
-            "remote shell is disabled; set allow_shell = true in peers.toml".to_string(),
-        ),
+        "refused service \"shell\": remote shell is disabled; set allow_shell = true in peers.toml",
+        EXIT_SHELL_DISABLED,
     )
-    .await?;
-    write_server_frame(send, ServerFrame::Exit(126)).await
+    .await
+}
+
+/// Send a complete failure response when a shell session cannot start.
+pub(crate) async fn serve_shell_failure<W>(
+    send: &mut W,
+    message: &str,
+    exit_code: i32,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_server_frame(send, ServerFrame::Error(message.to_string())).await?;
+    write_server_frame(send, ServerFrame::Exit(exit_code)).await
 }
 
 pub async fn serve_shell_session<R, W>(recv: &mut R, send: &mut W, peer: &str) -> Result<()>

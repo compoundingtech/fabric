@@ -4698,6 +4698,16 @@ async fn handle_shell_dial_socket_connection(
                 .await;
             }
             Err(error) => {
+                if mux::is_permanent_stream_denial(&error) {
+                    let message = format!("refused service \"shell\": {error}");
+                    let _ = shell::serve_shell_failure(
+                        &mut local,
+                        &message,
+                        shell::EXIT_SHELL_DISABLED,
+                    )
+                    .await;
+                    return Err(error).context("peer refused resumable shell");
+                }
                 if tunnel::is_permanent_failure(&error) {
                     return Err(error.context("peer refused resumable shell"));
                 }
@@ -4763,7 +4773,7 @@ async fn run_legacy_shell_after_selection(
         match connected {
             Ok(connection) => {
                 let (send, recv) = connection.open_bi().await?;
-                return pipe_unix_iroh(local, send, recv).await;
+                return pipe_framed_unix_iroh(local, send, recv).await;
             }
             Err(error) => {
                 let error = anyhow::Error::new(error);
@@ -5185,18 +5195,18 @@ async fn handle_raw_dial_socket_connection(
         }
     };
     if alpn == exec::EXEC_ALPN {
-        pipe_exec_unix_iroh(local, stream.send, stream.recv).await?;
+        pipe_framed_unix_iroh(local, stream.send, stream.recv).await?;
     } else {
         pipe_unix_iroh(local, stream.send, stream.recv).await?;
     }
     Ok(())
 }
 
-/// Keep receiving exec frames after the peer stops its receive direction.
+/// Keep receiving framed replies after the peer stops its receive direction.
 ///
 /// A policy refusal sends Error and Exit, then closes without reading the
-/// command frame. That stopped send direction must not cancel the useful reply.
-async fn pipe_exec_unix_iroh(
+/// request frames. That stopped send direction must not cancel the useful reply.
+async fn pipe_framed_unix_iroh(
     local: UnixStream,
     mut send: SendStream,
     mut recv: RecvStream,
