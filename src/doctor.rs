@@ -152,6 +152,9 @@ pub struct Facts {
     /// unit file exists. Presence is not enablement.
     pub service: ServiceEnablement,
     pub sync_service: ServiceEnablement,
+    /// Whether the managed install path has a sibling `fabric-sync` binary.
+    /// `None` means the path could not be established.
+    pub sync_companion_binary: Option<bool>,
     pub sync_runtime: crate::control::SyncRuntimeStatus,
     pub own_version: String,
     pub peers: Vec<PeerFact>,
@@ -175,9 +178,19 @@ impl Facts {
     }
 }
 
+fn is_fabric_only_transition(facts: &Facts) -> bool {
+    facts.manages_service
+        && facts.daemon_running
+        && facts.sync_service == ServiceEnablement::NotInstalled
+        && facts.sync_companion_binary == Some(false)
+        && facts.sync_runtime.owner == "embedded"
+        && facts.sync_runtime.companion == "absent"
+}
+
 /// Turn facts into findings. Pure, so every outcome is testable.
 pub fn diagnose(facts: &Facts) -> Vec<Finding> {
     let fresh = facts.never_configured();
+    let fabric_only_transition = is_fabric_only_transition(facts);
     let mut out = Vec::new();
 
     out.push(if facts.has_identity {
@@ -239,29 +252,65 @@ pub fn diagnose(facts: &Facts) -> Vec<Finding> {
     });
 
     if facts.manages_service {
-        out.push(match facts.sync_service {
-            ServiceEnablement::Enabled => Finding::new(
+        out.push(if fabric_only_transition {
+            Finding::new(
                 "sync service",
                 Verdict::Ok,
-                "the sync companion is installed and enabled",
-            ),
-            ServiceEnablement::PresentNotEnabled => Finding::new(
-                "sync service",
-                if fresh { Verdict::Setup } else { Verdict::Problem },
-                "the sync companion is installed but not enabled",
+                "the fabric-only transition does not install a sync companion service",
             )
-            .with_action("fabric service install"),
-            ServiceEnablement::NotInstalled => Finding::new(
-                "sync service",
-                if fresh { Verdict::Setup } else { Verdict::Problem },
-                "the sync companion service is absent",
-            )
-            .with_action("fabric service install"),
-            ServiceEnablement::Unknown => Finding::new(
-                "sync service",
-                Verdict::Unknown,
-                "could not tell whether the sync companion is enabled",
-            ),
+        } else {
+            match (facts.sync_service, facts.sync_companion_binary) {
+                (ServiceEnablement::Enabled, Some(true)) => Finding::new(
+                    "sync service",
+                    Verdict::Ok,
+                    "the sync companion is installed and enabled",
+                ),
+                (ServiceEnablement::Enabled, Some(false)) => Finding::new(
+                    "sync service",
+                    Verdict::Problem,
+                    "the sync companion service is enabled, but its binary is absent",
+                )
+                .with_action("install a matched fabric and fabric-sync pair"),
+                (ServiceEnablement::Enabled, None) => Finding::new(
+                    "sync service",
+                    Verdict::Unknown,
+                    "could not verify the binary used by the sync companion service",
+                ),
+                (ServiceEnablement::PresentNotEnabled, Some(false)) => Finding::new(
+                    "sync service",
+                    if fresh { Verdict::Setup } else { Verdict::Problem },
+                    "the sync companion service is not enabled, and its binary is absent",
+                )
+                .with_action("install a matched fabric and fabric-sync pair"),
+                (ServiceEnablement::PresentNotEnabled, _) => Finding::new(
+                    "sync service",
+                    if fresh { Verdict::Setup } else { Verdict::Problem },
+                    "the sync companion is installed but not enabled",
+                )
+                .with_action("fabric service install"),
+                (ServiceEnablement::NotInstalled, Some(true)) => Finding::new(
+                    "sync service",
+                    if fresh { Verdict::Setup } else { Verdict::Problem },
+                    "the sync companion service is absent",
+                )
+                .with_action("fabric service install"),
+                (ServiceEnablement::NotInstalled, Some(false)) => Finding::new(
+                    "sync service",
+                    if fresh { Verdict::Setup } else { Verdict::Problem },
+                    "the sync companion binary and service are absent",
+                )
+                .with_action("install a matched fabric and fabric-sync pair"),
+                (ServiceEnablement::NotInstalled, None) => Finding::new(
+                    "sync service",
+                    Verdict::Unknown,
+                    "could not tell whether the absent sync service has a companion binary",
+                ),
+                (ServiceEnablement::Unknown, _) => Finding::new(
+                    "sync service",
+                    Verdict::Unknown,
+                    "could not tell whether the sync companion is enabled",
+                ),
+            }
         });
     }
 
@@ -272,16 +321,30 @@ pub fn diagnose(facts: &Facts) -> Vec<Finding> {
             "the sync runtime is unavailable",
         )
         .with_action("start the fabric daemon and sync companion")
-    } else if facts.manages_service && facts.sync_runtime.companion == "absent" {
+    } else if fabric_only_transition {
         Finding::new(
+            "sync runtime",
+            Verdict::Ok,
+            "embedded sync is active; this fabric-only transition has no companion",
+        )
+    } else if facts.manages_service && facts.sync_runtime.companion == "absent" {
+        let finding = Finding::new(
             "sync runtime",
             Verdict::Problem,
             format!(
                 "{} sync is active, but the supervised companion is absent",
                 facts.sync_runtime.owner
             ),
-        )
-        .with_action("fabric service install")
+        );
+        match facts.sync_companion_binary {
+            Some(true) => finding.with_action("fabric service install"),
+            Some(false) => finding.with_action("install a matched fabric and fabric-sync pair"),
+            None => Finding::new(
+                "sync runtime",
+                Verdict::Unknown,
+                "the sync companion is absent, and its binary could not be checked",
+            ),
+        }
     } else if facts.sync_runtime.companion == "incompatible" {
         Finding::new(
             "sync runtime",
@@ -739,6 +802,7 @@ mod tests {
             daemon_running: true,
             service: ServiceEnablement::Enabled,
             sync_service: ServiceEnablement::Enabled,
+            sync_companion_binary: Some(true),
             sync_runtime: crate::control::SyncRuntimeStatus {
                 owner: "embedded".to_string(),
                 companion: "standby".to_string(),
@@ -791,6 +855,82 @@ mod tests {
     }
 
     #[test]
+    fn a_fabric_only_transition_does_not_offer_a_stranding_action() {
+        let mut facts = configured();
+        facts.sync_service = ServiceEnablement::NotInstalled;
+        facts.sync_companion_binary = Some(false);
+        facts.sync_runtime.companion = "absent".to_string();
+
+        let findings = diagnose(&facts);
+        for finding in find(&findings, "sync service")
+            .into_iter()
+            .chain(find(&findings, "sync runtime"))
+        {
+            assert_eq!(finding.verdict, Verdict::Ok, "wrong finding: {finding:?}");
+            assert!(
+                finding.action.is_none(),
+                "the transition offered an unsafe action: {finding:?}"
+            );
+        }
+        assert_eq!(exit_code(&findings), 0);
+    }
+
+    #[test]
+    fn a_paired_binary_without_its_service_stays_loud() {
+        let mut facts = configured();
+        facts.sync_service = ServiceEnablement::NotInstalled;
+        facts.sync_runtime.companion = "absent".to_string();
+
+        let findings = diagnose(&facts);
+        for finding in find(&findings, "sync service")
+            .into_iter()
+            .chain(find(&findings, "sync runtime"))
+        {
+            assert_eq!(finding.verdict, Verdict::Problem);
+            assert_eq!(finding.action.as_deref(), Some("fabric service install"));
+        }
+    }
+
+    #[test]
+    fn an_enabled_companion_service_without_its_binary_stays_loud() {
+        let mut facts = configured();
+        facts.sync_companion_binary = Some(false);
+        facts.sync_runtime.companion = "absent".to_string();
+
+        let findings = diagnose(&facts);
+        for finding in find(&findings, "sync service")
+            .into_iter()
+            .chain(find(&findings, "sync runtime"))
+        {
+            assert_eq!(finding.verdict, Verdict::Problem);
+            assert!(
+                finding
+                    .action
+                    .as_deref()
+                    .is_some_and(|action| action.contains("matched")),
+                "the missing binary got the wrong action: {finding:?}"
+            );
+            assert_ne!(finding.action.as_deref(), Some("fabric service install"));
+        }
+    }
+
+    #[test]
+    fn an_unknown_companion_binary_offers_no_action() {
+        let mut facts = configured();
+        facts.sync_companion_binary = None;
+        facts.sync_runtime.companion = "absent".to_string();
+
+        let findings = diagnose(&facts);
+        for finding in find(&findings, "sync service")
+            .into_iter()
+            .chain(find(&findings, "sync runtime"))
+        {
+            assert_eq!(finding.verdict, Verdict::Unknown);
+            assert!(finding.action.is_none(), "unknown state offered an action");
+        }
+    }
+
+    #[test]
     fn a_peer_with_no_grants_is_an_actionable_problem() {
         let mut facts = configured();
         facts.peers[0].has_grants = Some(false);
@@ -820,6 +960,7 @@ mod tests {
             daemon_running: false,
             service: ServiceEnablement::NotInstalled,
             sync_service: ServiceEnablement::NotInstalled,
+            sync_companion_binary: Some(false),
             sync_runtime: crate::control::SyncRuntimeStatus {
                 owner: "unavailable".to_string(),
                 companion: "unknown".to_string(),
@@ -871,6 +1012,7 @@ mod tests {
             // what the gatherer sees.
             service: ServiceEnablement::Enabled,
             sync_service: ServiceEnablement::Enabled,
+            sync_companion_binary: Some(true),
             sync_runtime: crate::control::SyncRuntimeStatus {
                 owner: "unavailable".to_string(),
                 companion: "unknown".to_string(),
@@ -1438,6 +1580,10 @@ where
 
     let service = crate::service::service_enablement();
     let sync_service = crate::service::sync_service_enablement();
+    let sync_companion_binary = crate::update::managed_binary_path()
+        .and_then(|path| crate::update::companion_binary_path(&path))
+        .map(|path| path.exists())
+        .ok();
 
     let mut own_version = env!("CARGO_PKG_VERSION").to_string();
     let mut daemon_running = false;
@@ -1535,6 +1681,7 @@ where
         daemon_running,
         service,
         sync_service,
+        sync_companion_binary,
         sync_runtime,
         own_version,
         peers,
