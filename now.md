@@ -4,10 +4,59 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-05 by Silber.fabric-codex. The latest policy code merge
-is `f5a88b7`._
+_Last updated: 2026-09-05 by Silber.fabric-codex. The latest code merge is
+`931b77d`, pull request #188._
 
-## Latest handoff — 2026-09-05
+## Latest handoff — 2026-09-05, late
+
+PR #188 merged at `931b77d`. It fixes issue #175, the rename that split a file
+into two names. A sync pass materialized its post-peer half with the disk view
+captured at the end of its pre-peer half. An inbound session, or the second
+pass that the daemon's `SyncReload` handler starts for every entry, could
+materialize the peer's file during the peer step, so that view lacked the file.
+A rename landing between the post-peer scan and its materialization read as a
+never-seen remote file, and the source was written back on every peer. The same
+shape let a file created and removed inside one pass or one inbound session
+come back.
+
+The fix is one rule. Every materialization protects exactly what the scan
+immediately before it saw, under the same operation guard. The function
+`materialize_entry_state` takes that view for itself at the start of each
+attempt, and its `protected` parameter is gone, so no caller can pass a stale
+view. The baselines carried across the peer step and the wire session now decide
+only whether to persist.
+
+The proof is the seam tests, not the integration test. Five tests in
+`src/sync/engine.rs` pin events to test-only seams between each scan and the
+materialization after it. Three reproduce the defect and two are controls. On
+the unfixed tree the three failed 30 of 30 and the controls passed 30 of 30. On
+the fixed head all five passed 30 of 30. With the fix commit reverted alone and
+the tests kept, the three failed 30 of 30 again and the controls still passed.
+The control `a_path_adopted_during_the_peer_step_and_never_seen_locally_is_still_materialized`
+fails if a fix protects every manifest path instead of every scanned path. Keep
+it green.
+
+The seams exist only in test builds. `PhaseSeam`, the hook slot,
+`set_seam_hook`, `at_seam`, and every call to `at_seam` are under `cfg(test)`.
+A production reference to them cannot compile. The release binary built from
+`aa94381` held 0 seam symbols against 61 for the surrounding functions.
+
+The schedule-dependent integration test
+`bus_update_beats_equal_version_delete_then_archive_survives_restart` passed
+10 of 10 on the unfixed tree from 22:55:14Z to 23:16:47Z. Passing samples are
+not evidence of absence. The after-fix samples and their window are a comment
+on PR #188. Do not use either count as the proof.
+
+A remote edit of the source at a higher version, concurrent with the local
+rename, still brings the edited source back beside the new path. That is the
+designed newer-wins rule for a real concurrent edit and rename, not this defect.
+
+No release or deployment followed the merge. Silber.cos gates both, separately.
+Re-read the fleet build with `fabric --version` on Silber and
+`fabric exec hetz -- fabric --version` for Hetz before using any recorded value.
+No code job remains live from this work.
+
+## Earlier handoff — 2026-09-05
 
 PR #185 merged at `f5a88b7`. It removes the machine-wide shell and exec policy
 gates. Each peer `allow` array is now the complete service policy. Old command
