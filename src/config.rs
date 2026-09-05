@@ -390,27 +390,93 @@ impl std::fmt::Display for Denied {
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+const PEER_FILE_FORMAT: u8 = 2;
+const ROLLBACK_MIRROR_COMMENT: &str = "\
+# allow_shell and allow_exec are GENERATED ROLLBACK MIRRORS.\n\
+#        EDITING THEM DOES NOTHING in format 2. Change each peer's allow array.\n\
+#        Fabric overwrites both mirrors on its next save. They exist only so a\n\
+#        restored 0.2.5 binary reads the same policy after an update rollback.\n";
+
+#[derive(Debug, Clone)]
 pub struct PeerBook {
-    /// Does this machine serve remote shells at all?
-    ///
-    /// This is separate from each peer's grant. Both gates must permit the
-    /// service. Absence defaults closed, like an omitted peer grant.
+    peers: Vec<Peer>,
+    git_remotes: Vec<GitRemote>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+struct StoredPeerBook {
     #[serde(default)]
-    allow_shell: bool,
-    /// Does this machine serve remote command execution at all?
+    format: Option<u8>,
     #[serde(default)]
-    allow_exec: bool,
+    allow_shell: Option<bool>,
+    #[serde(default)]
+    allow_exec: Option<bool>,
+    #[serde(default)]
     peers: Vec<Peer>,
     #[serde(default)]
     git_remotes: Vec<GitRemote>,
 }
 
+#[derive(Serialize)]
+struct StoredPeerBookRef<'a> {
+    format: u8,
+    // REMOVE IN 0.2.7, but only when the newest rollback binary understands
+    // format 2. A machine can skip a release, so the capability of the actual
+    // rollback binary is the condition. A release number alone is not proof.
+    //
+    // These are generated compatibility mirrors for a restored 0.2.5 binary.
+    // The format 2 reader never uses them to grant access.
+    allow_shell: bool,
+    allow_exec: bool,
+    peers: &'a [Peer],
+    #[serde(skip_serializing_if = "slice_is_empty")]
+    git_remotes: &'a [GitRemote],
+}
+
+fn slice_is_empty<T>(values: &&[T]) -> bool {
+    values.is_empty()
+}
+
+impl Default for PeerBook {
+    fn default() -> Self {
+        Self {
+            peers: Vec::new(),
+            git_remotes: Vec::new(),
+        }
+    }
+}
+
+impl Serialize for PeerBook {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.stored().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PeerBook {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let stored = StoredPeerBook::deserialize(deserializer)?;
+        Self::from_stored(stored)
+            .map(|(book, _, _)| book)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 impl PeerBook {
     pub fn load(home: &FabricHome) -> Result<Self> {
-        if let Some((path, book)) = Self::load_existing(home)? {
-            if path != home.peers_path() {
+        if let Some((path, book, migrated, removed_grants)) = Self::load_existing(home)? {
+            if migrated || path != home.peers_path() {
                 book.write_peer_file(home)?;
+                if migrated {
+                    report_legacy_policy_migration(&path, &removed_grants);
+                }
+            }
+            if path != home.peers_path() {
                 home.remove_legacy_peer_config()?;
             }
             Self::remove_embedded_config_peers(home)?;
@@ -419,31 +485,105 @@ impl PeerBook {
 
         let mut config = FabricConfig::load(home)?;
         if config.peers.is_empty() {
+            if config.legacy_allow_shell.is_some() || config.legacy_allow_exec.is_some() {
+                config.legacy_allow_shell = None;
+                config.legacy_allow_exec = None;
+                config.save(home)?;
+            }
             return Ok(Self::default());
         }
 
-        let book = Self {
-            allow_shell: config.allow_shell().unwrap_or(false),
-            allow_exec: config.allow_exec().unwrap_or(false),
+        let stored = StoredPeerBook {
+            format: None,
+            allow_shell: config.allow_shell(),
+            allow_exec: config.allow_exec(),
             peers: std::mem::take(&mut config.peers),
             git_remotes: Vec::new(),
         };
+        let (book, _, removed_grants) = Self::from_stored(stored)?;
         book.validate()?;
         book.write_peer_file(home)?;
+        report_legacy_policy_migration(&home.config_path(), &removed_grants);
+        config.legacy_allow_shell = None;
+        config.legacy_allow_exec = None;
         config.save(home)?;
         Ok(book)
     }
 
-    fn load_existing(home: &FabricHome) -> Result<Option<(PathBuf, Self)>> {
+    fn load_existing(home: &FabricHome) -> Result<Option<(PathBuf, Self, bool, Vec<String>)>> {
         let Some(path) = home.existing_peers_path() else {
             return Ok(None);
         };
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let book: Self =
+        let stored: StoredPeerBook =
             toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
+        let (book, migrated, removed_grants) = Self::from_stored(stored)
+            .with_context(|| format!("failed to load {}", path.display()))?;
         book.validate()?;
-        Ok(Some((path, book)))
+        Ok(Some((path, book, migrated, removed_grants)))
+    }
+
+    fn from_stored(mut stored: StoredPeerBook) -> Result<(Self, bool, Vec<String>)> {
+        let mut removed_grants = Vec::new();
+        let migrated = match stored.format {
+            None => {
+                let allow_shell = stored.allow_shell.unwrap_or(false);
+                let allow_exec = stored.allow_exec.unwrap_or(false);
+                for peer in &mut stored.peers {
+                    let label = peer.name.as_deref().unwrap_or("unnamed peer");
+                    if !allow_shell {
+                        if peer.allow.iter().any(|grant| grant == "shell") {
+                            removed_grants.push(format!(
+                                "shell from peer {label:?} because legacy allow_shell was {}",
+                                if stored.allow_shell.is_some() {
+                                    "false"
+                                } else {
+                                    "omitted, which meant false"
+                                }
+                            ));
+                        }
+                        peer.allow.retain(|grant| grant != "shell");
+                    }
+                    if !allow_exec {
+                        if peer.allow.iter().any(|grant| grant == "exec") {
+                            removed_grants.push(format!(
+                                "exec from peer {label:?} because legacy allow_exec was {}",
+                                if stored.allow_exec.is_some() {
+                                    "false"
+                                } else {
+                                    "omitted, which meant false"
+                                }
+                            ));
+                        }
+                        peer.allow.retain(|grant| grant != "exec");
+                    }
+                }
+                true
+            }
+            Some(PEER_FILE_FORMAT) => false,
+            Some(format) => bail!(
+                "unsupported peers.toml format {format}; this binary supports format {PEER_FILE_FORMAT}"
+            ),
+        };
+        Ok((
+            Self {
+                peers: stored.peers,
+                git_remotes: stored.git_remotes,
+            },
+            migrated,
+            removed_grants,
+        ))
+    }
+
+    fn stored(&self) -> StoredPeerBookRef<'_> {
+        StoredPeerBookRef {
+            format: PEER_FILE_FORMAT,
+            allow_shell: self.grants_service("shell"),
+            allow_exec: self.grants_service("exec"),
+            peers: &self.peers,
+            git_remotes: &self.git_remotes,
+        }
     }
 
     pub fn save(&self, home: &FabricHome) -> Result<()> {
@@ -462,11 +602,10 @@ impl PeerBook {
     const PEER_FILE_HEADER: &'static str = "\
 # fabric peers. Written by `fabric add` and `fabric remove`; safe to edit.
 #
-# allow_shell  whether this machine serves remote shells.
-# allow_exec   whether this machine serves remote command execution.
-#        Both settings default to false when absent. The command-line flags
-#        with the same names are accepted for compatibility but do not change
-#        these settings. Each peer also needs the matching service grant.
+# allow_shell and allow_exec are GENERATED ROLLBACK MIRRORS.
+#        EDITING THEM DOES NOTHING in format 2. Change each peer's allow array.
+#        Fabric overwrites both mirrors on its next save. They exist only so a
+#        restored 0.2.5 binary reads the same policy after an update rollback.
 #
 # id     the peer's identity. PERMISSIONS KEY ON THIS AND ONLY THIS.
 # name   a local label for your convenience. You can rename it at any time,
@@ -508,9 +647,13 @@ impl PeerBook {
         serialized: &str,
         path: &Path,
     ) -> Result<String> {
-        let before: Self = toml::from_str(existing)
+        let before: StoredPeerBook = toml::from_str(existing)
             .with_context(|| format!("failed to parse {}", path.display()))?;
-        before.validate()?;
+        let before_book = Self {
+            peers: before.peers.clone(),
+            git_remotes: before.git_remotes.clone(),
+        };
+        before_book.validate()?;
         let mut document: DocumentMut = existing
             .parse()
             .with_context(|| format!("failed to edit {}", path.display()))?;
@@ -523,12 +666,17 @@ impl PeerBook {
         let desired_root = desired.as_table();
         let root = document.as_table_mut();
 
-        if before.allow_shell != self.allow_shell {
+        if before.format != Some(PEER_FILE_FORMAT) {
+            upsert_table_field(root, desired_root, "format")?;
+        }
+        let stored = self.stored();
+        if before.allow_shell != Some(stored.allow_shell) {
             upsert_table_field(root, desired_root, "allow_shell")?;
         }
-        if before.allow_exec != self.allow_exec {
+        if before.allow_exec != Some(stored.allow_exec) {
             upsert_table_field(root, desired_root, "allow_exec")?;
         }
+        ensure_rollback_mirror_comment(root);
         let appended_peers = upsert_peer_tables(root, desired_root, &before.peers, &self.peers)?;
         upsert_git_remote_tables(root, desired_root, &before.git_remotes, &self.git_remotes)?;
 
@@ -554,10 +702,14 @@ impl PeerBook {
             return Ok(());
         }
         let mut config = FabricConfig::load(home)?;
-        if config.peers.is_empty() {
+        let has_legacy_policy =
+            config.legacy_allow_shell.is_some() || config.legacy_allow_exec.is_some();
+        if config.peers.is_empty() && !has_legacy_policy {
             return Ok(());
         }
         config.peers.clear();
+        config.legacy_allow_shell = None;
+        config.legacy_allow_exec = None;
         config.save(home)
     }
 
@@ -565,20 +717,10 @@ impl PeerBook {
         &self.peers
     }
 
-    pub fn allow_shell(&self) -> bool {
-        self.allow_shell
-    }
-
-    pub fn allow_exec(&self) -> bool {
-        self.allow_exec
-    }
-
-    pub fn set_allow_shell(&mut self, allow_shell: bool) {
-        self.allow_shell = allow_shell;
-    }
-
-    pub fn set_allow_exec(&mut self, allow_exec: bool) {
-        self.allow_exec = allow_exec;
+    pub fn grants_service(&self, service: &str) -> bool {
+        self.peers
+            .iter()
+            .any(|peer| peer.allow.iter().any(|grant| grant == service))
     }
 
     pub fn git_remotes(&self) -> &[GitRemote] {
@@ -672,8 +814,7 @@ impl PeerBook {
     /// Trusted and permitted are two different answers. A peer absent from the
     /// book is `NotTrusted`; a peer present but restricted is `NotPermitted`.
     ///
-    /// This checks the per-peer grant. The caller applies the machine-level
-    /// `allow_shell` and `allow_exec` settings from this same file.
+    /// This peer grant is the complete policy for the service.
     pub fn may(&self, id: &EndpointId, service: &str) -> Result<(), Denied> {
         let Some(peer) = self.peers.iter().find(|peer| peer.id == *id) else {
             return Err(Denied::NotTrusted);
@@ -1064,6 +1205,39 @@ fn upsert_table_field(table: &mut Table, desired: &Table, key: &str) -> Result<(
     Ok(())
 }
 
+fn report_legacy_policy_migration(path: &Path, removed_grants: &[String]) {
+    if removed_grants.is_empty() {
+        eprintln!(
+            "fabric: migrated legacy shell and exec policy in {}; no peer grant was removed",
+            path.display()
+        );
+    } else {
+        for removed in removed_grants {
+            eprintln!("fabric: migrated {}: removed {removed}", path.display());
+        }
+    }
+}
+
+fn ensure_rollback_mirror_comment(table: &mut Table) {
+    let Some(mut key) = table.key_mut("allow_shell") else {
+        return;
+    };
+    let existing = key
+        .leaf_decor()
+        .prefix()
+        .and_then(|prefix| prefix.as_str())
+        .unwrap_or_default();
+    if existing.contains("GENERATED ROLLBACK MIRRORS") {
+        return;
+    }
+    let mut prefix = existing.to_string();
+    if !prefix.is_empty() && !prefix.ends_with('\n') {
+        prefix.push('\n');
+    }
+    prefix.push_str(ROLLBACK_MIRROR_COMMENT);
+    key.leaf_decor_mut().set_prefix(prefix);
+}
+
 fn replace_item_preserving_decor(current: &mut Item, mut desired: Item, fallback_position: isize) {
     let mut next_position = match &*current {
         Item::Table(table) => table.position().unwrap_or(fallback_position),
@@ -1227,16 +1401,25 @@ pub enum PersistedExposeTarget {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct FabricConfig {
-    #[serde(default)]
-    allow_shell: Option<bool>,
-    #[serde(default)]
-    allow_exec: Option<bool>,
+    // Keep these values through unrelated config saves until PeerBook migrates
+    // them. PeerBook clears them only after the format 2 write succeeds.
+    #[serde(
+        default,
+        rename = "allow_shell",
+        skip_serializing_if = "Option::is_none"
+    )]
+    legacy_allow_shell: Option<bool>,
+    #[serde(
+        default,
+        rename = "allow_exec",
+        skip_serializing_if = "Option::is_none"
+    )]
+    legacy_allow_exec: Option<bool>,
     /// The memory ceiling the last install asked for, in MiB.
     ///
-    /// Persisted for the same reason the two allow flags are: the rendered
-    /// plist or unit is not a place to remember an operator's choice, because
-    /// the next re-render starts from whatever the caller passed and silently
-    /// drops what it does not mention.
+    /// The rendered plist or unit is not a place to remember an operator's
+    /// choice. The next render starts from the caller's values and otherwise
+    /// drops an unpersisted ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     memory_max_mb: Option<u64>,
     #[serde(default)]
@@ -1304,11 +1487,11 @@ impl FabricConfig {
     }
 
     pub fn allow_shell(&self) -> Option<bool> {
-        self.allow_shell
+        self.legacy_allow_shell
     }
 
     pub fn allow_exec(&self) -> Option<bool> {
-        self.allow_exec
+        self.legacy_allow_exec
     }
 
     pub fn memory_max_mb(&self) -> Option<u64> {
@@ -1317,14 +1500,6 @@ impl FabricConfig {
 
     pub fn server_sessions(&self) -> &ServerSessionConfig {
         &self.server_sessions
-    }
-
-    pub fn set_allow_shell(&mut self, allow_shell: bool) {
-        self.allow_shell = Some(allow_shell);
-    }
-
-    pub fn set_allow_exec(&mut self, allow_exec: bool) {
-        self.allow_exec = Some(allow_exec);
     }
 
     /// `None` clears the ceiling, which is what `--no-memory-max-mb` asks for.
@@ -1352,8 +1527,6 @@ impl FabricConfig {
 
     fn validate(&self) -> Result<()> {
         PeerBook {
-            allow_shell: false,
-            allow_exec: false,
             peers: self.peers.clone(),
             git_remotes: Vec::new(),
         }
@@ -1497,10 +1670,186 @@ fn short_hash(input: &str) -> u64 {
 mod tests {
     use super::*;
 
+    #[derive(Debug, Deserialize)]
+    struct FrozenV025PeerBook {
+        #[serde(default)]
+        allow_shell: bool,
+        #[serde(default)]
+        allow_exec: bool,
+        peers: Vec<Peer>,
+    }
+
     /// A distinct, valid identity per call. An `EndpointId` is an ed25519
     /// public key, so it cannot be conjured from an arbitrary byte pattern.
     fn an_id(_seed: u8) -> EndpointId {
         SecretKey::generate().public()
+    }
+
+    /// A false legacy machine gate can be the only thing that refuses shell.
+    /// Migration must move that refusal into the peer array before the gate goes.
+    #[test]
+    fn legacy_false_shell_gate_remains_closed_after_migration() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = FabricHome::new(directory.path());
+        home.prepare().unwrap();
+        let id = an_id(90);
+        fs::write(
+            home.peers_path(),
+            format!(
+                "allow_shell = false\nallow_exec = true\n\n\
+                 [[peers]]\nid = \"{id}\"\nallow = [\"shell\", \"exec\"]\n"
+            ),
+        )
+        .unwrap();
+
+        let book = PeerBook::load(&home).unwrap();
+
+        assert!(book.may(&id, "shell").is_err());
+        assert_eq!(book.may(&id, "exec"), Ok(()));
+        let migrated = fs::read_to_string(home.peers_path()).unwrap();
+        assert!(migrated.contains("format = 2"));
+        assert!(!book.peers()[0].allow.iter().any(|grant| grant == "shell"));
+    }
+
+    /// The automatic update supervisor restores 0.2.5 on verification failure.
+    /// Its frozen reader must see the exact policy that existed before migration.
+    #[test]
+    fn v025_rollback_reader_gets_the_same_effective_policy() {
+        for legacy_shell in [None, Some(false), Some(true)] {
+            for legacy_exec in [None, Some(false), Some(true)] {
+                for peer_grants_shell in [false, true] {
+                    for peer_grants_exec in [false, true] {
+                        let directory = tempfile::tempdir().unwrap();
+                        let home = FabricHome::new(directory.path());
+                        home.prepare().unwrap();
+                        let id = an_id(91);
+                        let mut keys = legacy_shell
+                            .map(|value| format!("allow_shell = {value}\n"))
+                            .unwrap_or_default();
+                        if let Some(value) = legacy_exec {
+                            keys.push_str(&format!("allow_exec = {value}\n"));
+                        }
+                        let mut grants = Vec::new();
+                        if peer_grants_shell {
+                            grants.push("\"shell\"");
+                        }
+                        if peer_grants_exec {
+                            grants.push("\"exec\"");
+                        }
+                        let allow = format!("[{}]", grants.join(", "));
+                        fs::write(
+                            home.peers_path(),
+                            format!("{keys}\n[[peers]]\nid = \"{id}\"\nallow = {allow}\n"),
+                        )
+                        .unwrap();
+                        let shell_before = legacy_shell.unwrap_or(false) && peer_grants_shell;
+                        let exec_before = legacy_exec.unwrap_or(false) && peer_grants_exec;
+
+                        PeerBook::load(&home).unwrap();
+                        let migrated = fs::read_to_string(home.peers_path()).unwrap();
+                        assert!(migrated.contains("format = 2"));
+                        let rollback: FrozenV025PeerBook = toml::from_str(&migrated).unwrap();
+                        let shell_after = rollback.allow_shell
+                            && rollback.peers[0].allow.iter().any(|grant| grant == "shell");
+                        let exec_after = rollback.allow_exec
+                            && rollback.peers[0].allow.iter().any(|grant| grant == "exec");
+
+                        assert_eq!(shell_after, shell_before);
+                        assert_eq!(exec_after, exec_before);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn format_two_mirrors_are_ignored_and_overwritten_on_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = FabricHome::new(directory.path());
+        home.prepare().unwrap();
+        let id = an_id(93);
+        fs::write(
+            home.peers_path(),
+            format!(
+                "format = 2\nallow_shell = false\nallow_exec = true\n\n\
+                 [[peers]]\nid = \"{id}\"\nallow = [\"shell\"]\n"
+            ),
+        )
+        .unwrap();
+
+        let book = PeerBook::load(&home).unwrap();
+        assert_eq!(book.may(&id, "shell"), Ok(()));
+        assert!(book.may(&id, "exec").is_err());
+        book.save(&home).unwrap();
+
+        let raw = fs::read_to_string(home.peers_path()).unwrap();
+        assert!(raw.contains("allow_shell = true"));
+        assert!(raw.contains("allow_exec = false"));
+        assert!(raw.contains("GENERATED ROLLBACK MIRRORS"));
+        assert!(raw.contains("EDITING THEM DOES NOTHING in format 2"));
+    }
+
+    #[test]
+    fn every_format_two_legacy_key_combination_loads_and_uses_peer_grants() {
+        for shell in [None, Some(false), Some(true)] {
+            for exec in [None, Some(false), Some(true)] {
+                let directory = tempfile::tempdir().unwrap();
+                let home = FabricHome::new(directory.path());
+                home.prepare().unwrap();
+                let id = an_id(94);
+                let mut keys = String::new();
+                if let Some(value) = shell {
+                    keys.push_str(&format!("allow_shell = {value}\n"));
+                }
+                if let Some(value) = exec {
+                    keys.push_str(&format!("allow_exec = {value}\n"));
+                }
+                fs::write(
+                    home.peers_path(),
+                    format!(
+                        "format = 2\n{keys}\n[[peers]]\nid = \"{id}\"\nallow = [\"shell\", \"exec\"]\n"
+                    ),
+                )
+                .unwrap();
+
+                let book = PeerBook::load(&home).unwrap();
+
+                assert_eq!(book.may(&id, "shell"), Ok(()), "shell={shell:?}");
+                assert_eq!(book.may(&id, "exec"), Ok(()), "exec={exec:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_migration_names_each_removed_grant_and_reason() {
+        let id = an_id(95);
+        let stored: StoredPeerBook = toml::from_str(&format!(
+            "allow_shell = false\n\n[[peers]]\nid = \"{id}\"\nname = \"friend\"\nallow = [\"shell\", \"exec\"]\n"
+        ))
+        .unwrap();
+
+        let (_, migrated, removed) = PeerBook::from_stored(stored).unwrap();
+
+        assert!(migrated);
+        assert!(removed.iter().any(|line| {
+            line.contains("shell from peer \"friend\"") && line.contains("allow_shell was false")
+        }));
+        assert!(removed.iter().any(|line| {
+            line.contains("exec from peer \"friend\"")
+                && line.contains("allow_exec was omitted, which meant false")
+        }));
+    }
+
+    #[test]
+    fn unknown_peer_file_format_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = FabricHome::new(directory.path());
+        home.prepare().unwrap();
+        fs::write(home.peers_path(), "format = 99\npeers = []\n").unwrap();
+
+        let error = PeerBook::load(&home).unwrap_err();
+
+        assert!(format!("{error:#}").contains("unsupported peers.toml format 99"));
     }
 
     /// Fabric is an allow list. An omitted list grants nothing.
@@ -1691,7 +2040,7 @@ mod tests {
         );
         let original = format!(
             "# My peer file. Keep this header.\n\
-             allow_shell   = false # Keep this setting note.\n\
+             allow_shell   = true # Keep this setting note.\n\
              allow_exec = false\n\
              future_setting = 'keep me' # Keep unknown data too.\n\
              \n\
@@ -1715,7 +2064,7 @@ mod tests {
         assert!(!after_add.contains("# fabric peers."));
 
         let mut book = PeerBook::load(&home).unwrap();
-        book.set_allow_shell(true);
+        book.add_with_allow(kept, Some("kept".into()), None, Some(vec!["shell".into()]));
         book.save(&home).unwrap();
         let after_policy = fs::read_to_string(home.peers_path()).unwrap();
         assert!(after_policy.contains("allow_shell   = true # Keep this setting note."));
@@ -2040,20 +2389,27 @@ mod tests {
     }
 
     #[test]
-    fn machine_service_settings_default_closed_and_round_trip() {
+    fn rollback_mirrors_are_derived_from_peer_grants() {
         let mut book = PeerBook::default();
-        assert!(!book.allow_shell());
-        assert!(!book.allow_exec());
-
-        book.set_allow_shell(true);
-        book.set_allow_exec(true);
+        let id = an_id(92);
+        book.add_with_allow(
+            id,
+            Some("friend".into()),
+            None,
+            Some(vec!["shell".into(), "exec".into()]),
+        );
         let raw = toml::to_string_pretty(&book).unwrap();
         assert!(raw.contains("allow_shell = true"));
         assert!(raw.contains("allow_exec = true"));
 
-        let loaded: PeerBook = toml::from_str(&raw).unwrap();
-        assert!(loaded.allow_shell());
-        assert!(loaded.allow_exec());
+        let rollback: FrozenV025PeerBook = toml::from_str(&raw).unwrap();
+        assert!(rollback.allow_shell);
+        assert!(rollback.allow_exec);
+
+        book.add_with_allow(id, Some("friend".into()), None, Some(Vec::new()));
+        let raw = toml::to_string_pretty(&book).unwrap();
+        assert!(raw.contains("allow_shell = false"));
+        assert!(raw.contains("allow_exec = false"));
     }
 
     #[test]
@@ -2109,6 +2465,19 @@ mod tests {
             DEFAULT_SERVER_SESSION_DETACHED_TTL_SECS,
             "the default config must carry the decided value"
         );
+    }
+
+    #[test]
+    fn unrelated_config_save_keeps_legacy_policy_until_peer_migration() {
+        let mut config: FabricConfig =
+            toml::from_str("allow_shell = true\nallow_exec = false\n").unwrap();
+        config.set_memory_max_mb(Some(512));
+
+        let raw = toml::to_string_pretty(&config).unwrap();
+
+        assert!(raw.contains("allow_shell = true"));
+        assert!(raw.contains("allow_exec = false"));
+        assert!(raw.contains("memory_max_mb = 512"));
     }
 
     #[test]

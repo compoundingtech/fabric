@@ -405,8 +405,6 @@ pub struct DaemonState {
     tunnel_blocked: AtomicBool,
     network_usable: AtomicBool,
     builtin_echo_hits: AtomicUsize,
-    allow_shell: AtomicBool,
-    allow_exec: AtomicBool,
     incoming_failures: Arc<FailureBackoff>,
     dial_failures: Arc<FailureBackoff>,
     incoming_slots: Arc<Semaphore>,
@@ -944,11 +942,6 @@ impl DaemonState {
                 "sync entry has unknown peer selectors and will stay stopped"
             );
         }
-        // The command-line flags remain accepted while existing launchd and
-        // systemd definitions still pass them. Machine policy lives only in
-        // peers.toml, so the flags cannot open or close either service.
-        let allow_shell = peer_book.allow_shell();
-        let allow_exec = peer_book.allow_exec();
         let exposures = load_persisted_exposures(&home)?;
         let allowed = Arc::new(RwLock::new(peer_book.trusted_ids()));
         let endpoint = build_daemon_endpoint(&home, allowed.clone(), &exposures).await?;
@@ -982,8 +975,6 @@ impl DaemonState {
             tunnel_blocked: AtomicBool::new(false),
             network_usable: AtomicBool::new(true),
             builtin_echo_hits: AtomicUsize::new(0),
-            allow_shell: AtomicBool::new(allow_shell),
-            allow_exec: AtomicBool::new(allow_exec),
             incoming_failures: FailureBackoff::new(
                 INCOMING_FAILURE_INITIAL_BACKOFF,
                 INCOMING_FAILURE_MAX_BACKOFF,
@@ -1096,14 +1087,20 @@ impl DaemonState {
     }
 
     pub async fn reload_peers(&self) -> Result<()> {
-        let peer_book = PeerBook::load(&self.home)?;
+        let peer_book = match PeerBook::load(&self.home) {
+            Ok(peer_book) => peer_book,
+            Err(error) => {
+                // A bad format or a failed security migration must not leave
+                // the old, possibly wider policy live after a reload request.
+                *self.peer_book.write().await = PeerBook::default();
+                *self.allowed.write().await = HashSet::new();
+                return Err(error);
+            }
+        };
         SyncBook::load(&self.home)?.validate_against(&peer_book)?;
-        self.allow_shell
-            .store(peer_book.allow_shell(), Ordering::SeqCst);
-        self.allow_exec
-            .store(peer_book.allow_exec(), Ordering::SeqCst);
-        *self.allowed.write().await = peer_book.trusted_ids();
+        let trusted_ids = peer_book.trusted_ids();
         *self.peer_book.write().await = peer_book;
+        *self.allowed.write().await = trusted_ids;
         Ok(())
     }
 
@@ -1501,13 +1498,16 @@ impl DaemonState {
     async fn status_response(&self) -> Result<ControlResponse> {
         let (node_id, endpoint_addr, exposed_protocols, dial_sockets) =
             self.local_status_fields().await?;
+        let peer_book = self.peer_book.read().await;
         Ok(ControlResponse::Status {
             node_id,
             endpoint_addr,
             exposed_protocols,
             dial_sockets,
-            allow_shell: self.allow_shell.load(Ordering::SeqCst),
-            allow_exec: self.allow_exec.load(Ordering::SeqCst),
+            // Retained on the wire for 0.2.5 clients. These report whether any
+            // peer grant exists. They are not machine-wide policy gates.
+            allow_shell: peer_book.grants_service("shell"),
+            allow_exec: peer_book.grants_service("exec"),
         })
     }
 
@@ -1517,14 +1517,15 @@ impl DaemonState {
         let peers = self.peer_reachability().await;
         let current_connection_health = self.current_connection_health().await;
         let telemetry = self.telemetry.snapshot();
+        let peer_book = self.peer_book.read().await;
         Ok(ControlResponse::ReachabilityStatus {
             version: crate::version_string(),
             node_id,
             endpoint_addr,
             exposed_protocols,
             dial_sockets,
-            allow_shell: self.allow_shell.load(Ordering::SeqCst),
-            allow_exec: self.allow_exec.load(Ordering::SeqCst),
+            allow_shell: peer_book.grants_service("shell"),
+            allow_exec: peer_book.grants_service("exec"),
             peers,
             connection_telemetry: telemetry.peers,
             connection_telemetry_window: telemetry.window,
@@ -1551,11 +1552,11 @@ impl DaemonState {
             .collect()
     }
 
-    fn schedule_restart(&self, _requested_allow_shell: Option<bool>) -> Result<RestartPlan> {
+    async fn schedule_restart(&self, _requested_allow_shell: Option<bool>) -> Result<RestartPlan> {
         // Check before opening the log or spawning either helper. A native
         // service must remain the process owner for the whole restart.
         crate::service::ensure_unsupervised_restart(&self.home)?;
-        let allow_shell = self.allow_shell.load(Ordering::SeqCst);
+        let allow_shell = self.peer_book.read().await.grants_service("shell");
         self.home.prepare()?;
         let log_path = self.home.restart_log_path();
         let mut log = OpenOptions::new()
@@ -1575,9 +1576,6 @@ impl DaemonState {
             .arg("--home")
             .arg(self.home.root())
             .arg("restart-detacher");
-        if allow_shell {
-            command.arg("--allow-shell");
-        }
         command
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
@@ -3358,7 +3356,7 @@ async fn process_control_request(
             ControlResponse::Ok
         }
         ControlRequest::Restart { allow_shell } => {
-            let restart = state.schedule_restart(allow_shell)?;
+            let restart = state.schedule_restart(allow_shell).await?;
             ControlResponse::Restarting {
                 log: restart.log,
                 allow_shell: restart.allow_shell,
@@ -3609,21 +3607,7 @@ async fn handshake_and_identify(
 }
 
 impl DaemonState {
-    /// May this peer reach this service? PER-PEER policy only.
-    ///
-    /// The machine-wide `allow_shell` / `allow_exec` setting is deliberately NOT
-    /// applied here. The protocol handler applies it after this check. It is
-    /// already enforced further in, by `serve_shell_disabled` and its exec
-    /// twin, which refuse at the protocol level with a readable sentence and
-    /// exit 126 — the conventional "found but not permitted to run".
-    ///
-    /// Checking it here as well replaced that with a closed connection and exit
-    /// 1, which is a worse error for the same condition. A blanket that
-    /// subtracts is right; subtracting it twice, in the place with the poorer
-    /// message, is not.
-    ///
-    /// The ordering property still holds: no peer grant can lift the machine
-    /// setting, because the machine setting refuses after this check passes.
+    /// May this peer reach this service? The peer grant is the complete policy.
     pub async fn may(
         &self,
         peer: &iroh::EndpointId,
@@ -3858,15 +3842,11 @@ async fn handle_builtin_echo(connection: Connection, state: Arc<DaemonState>) ->
 
 async fn handle_builtin_legacy_shell(
     connection: Connection,
-    state: Arc<DaemonState>,
+    _state: Arc<DaemonState>,
 ) -> Result<()> {
     let peer = connection.remote_id().to_string();
     let (mut send, mut recv) = connection.accept_bi().await?;
-    if state.allow_shell.load(Ordering::SeqCst) {
-        shell::serve_shell_session(&mut recv, &mut send, &peer).await?;
-    } else {
-        shell::serve_shell_disabled(&mut send).await?;
-    }
+    shell::serve_shell_session(&mut recv, &mut send, &peer).await?;
     send.finish()?;
     connection.closed().await;
     Ok(())
@@ -3883,9 +3863,7 @@ async fn handle_builtin_resumable_shell(
         send,
         recv,
         peer_id,
-        tunnel::ServerTarget::Shell {
-            allowed: state.allow_shell.load(Ordering::SeqCst),
-        },
+        tunnel::ServerTarget::Shell { allowed: true },
         None,
         state.tunnel_sessions.clone(),
         state.tunnel_drop_rx(),
@@ -3893,14 +3871,10 @@ async fn handle_builtin_resumable_shell(
     .await
 }
 
-async fn handle_builtin_exec(connection: Connection, state: Arc<DaemonState>) -> Result<()> {
+async fn handle_builtin_exec(connection: Connection, _state: Arc<DaemonState>) -> Result<()> {
     let peer = connection.remote_id().to_string();
     let (mut send, mut recv) = connection.accept_bi().await?;
-    if state.allow_exec.load(Ordering::SeqCst) {
-        exec::serve_exec_session(&mut recv, &mut send, &peer).await?;
-    } else {
-        exec::serve_exec_disabled(&mut send).await?;
-    }
+    exec::serve_exec_session(&mut recv, &mut send, &peer).await?;
     send.finish()?;
     connection.closed().await;
     Ok(())
@@ -4009,11 +3983,7 @@ async fn handle_mux_stream(
         send.finish()?;
     } else if alpn == shell::SHELL_ALPN {
         let peer = connection.remote_id().to_string();
-        if state.allow_shell.load(Ordering::SeqCst) {
-            shell::serve_shell_session(&mut recv, &mut send, &peer).await?;
-        } else {
-            shell::serve_shell_disabled(&mut send).await?;
-        }
+        shell::serve_shell_session(&mut recv, &mut send, &peer).await?;
         send.finish()?;
     } else if alpn == shell::RESUMABLE_SHELL_ALPN {
         let peer = connection.remote_id();
@@ -4022,9 +3992,7 @@ async fn handle_mux_stream(
             send,
             recv,
             peer,
-            tunnel::ServerTarget::Shell {
-                allowed: state.allow_shell.load(Ordering::SeqCst),
-            },
+            tunnel::ServerTarget::Shell { allowed: true },
             Some(state.peer_connections.clone()),
             state.tunnel_sessions.clone(),
             state.tunnel_drop_rx(),
@@ -4032,11 +4000,7 @@ async fn handle_mux_stream(
         .await?;
     } else if alpn == exec::EXEC_ALPN {
         let peer = connection.remote_id().to_string();
-        if state.allow_exec.load(Ordering::SeqCst) {
-            exec::serve_exec_session(&mut recv, &mut send, &peer).await?;
-        } else {
-            exec::serve_exec_disabled(&mut send).await?;
-        }
+        exec::serve_exec_session(&mut recv, &mut send, &peer).await?;
         send.finish()?;
     } else if alpn == gitremote::GIT_ALPN {
         let book = state.peer_book.read().await.clone();
@@ -5422,6 +5386,42 @@ mod tests {
         node.shutdown().await
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_policy_migration_closes_the_last_valid_peer_book() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let id = trust_named_peer(&home, "silber")?;
+        let node = FabricNode::start(home.clone()).await?;
+        fs::write(
+            home.peers_path(),
+            format!(
+                "allow_shell = true\nallow_exec = true\n\n\
+                 [[peers]]\nid = \"{id}\"\nname = \"silber\"\nallow = [\"sync\"]\n"
+            ),
+        )?;
+
+        let original_permissions = fs::metadata(dir.path())?.permissions();
+        let mut read_only = original_permissions.clone();
+        read_only.set_mode(0o500);
+        fs::set_permissions(dir.path(), read_only)?;
+        let reload = node.state().reload_peers().await;
+        fs::set_permissions(dir.path(), original_permissions)?;
+
+        let error = reload.expect_err("a migration write failure was accepted");
+        assert!(
+            format!("{error:#}").contains("failed to"),
+            "migration failure was not clear: {error:#}"
+        );
+        assert!(
+            node.state().may(&id, "sync").await.is_err(),
+            "the old grant stayed open after the migration write failed"
+        );
+        node.shutdown().await
+    }
+
     #[tokio::test]
     async fn endpoint_close_wait_has_a_hard_deadline() {
         let bound = Duration::from_millis(20);
@@ -6587,7 +6587,6 @@ mod tests {
         let client_dir = tempfile::tempdir()?;
         let server_home = FabricHome::new(server_dir.path());
         let client_home = FabricHome::new(client_dir.path());
-        set_machine_services(&server_home, false, true)?;
         let server = FabricNode::start_with_daemon_options(
             server_home.clone(),
             DaemonOptions {
@@ -6692,13 +6691,10 @@ mod tests {
         )
         .await?;
 
-        assert!(!server.state.allow_shell.load(Ordering::SeqCst));
-        assert!(!server.state.allow_exec.load(Ordering::SeqCst));
-
-        set_machine_services(&server_home, true, true)?;
-        server.state().reload_peers().await?;
-        assert!(server.state.allow_shell.load(Ordering::SeqCst));
-        assert!(server.state.allow_exec.load(Ordering::SeqCst));
+        let peer_book = server.state.peer_book.read().await;
+        assert!(!peer_book.grants_service("shell"));
+        assert!(!peer_book.grants_service("exec"));
+        drop(peer_book);
 
         server.shutdown().await?;
         Ok(())
@@ -6764,15 +6760,7 @@ mod tests {
         node.state().reload_peers().await
     }
 
-    fn set_machine_services(home: &FabricHome, allow_shell: bool, allow_exec: bool) -> Result<()> {
-        let mut peers = PeerBook::load(home)?;
-        peers.set_allow_shell(allow_shell);
-        peers.set_allow_exec(allow_exec);
-        peers.save(home)
-    }
-
     async fn start_shell_server(home: FabricHome) -> Result<FabricNode> {
-        set_machine_services(&home, true, false)?;
         FabricNode::start_with_options(home, true).await
     }
 

@@ -1730,9 +1730,8 @@ fn finish(
         return Ok(());
     }
 
-    // Re-render the unit and restart in one step. Passing every option as `None`
-    // keeps allow-shell, allow-exec and any memory ceiling exactly as they were:
-    // they round trip through config.toml rather than being re-derived here.
+    // Re-render the unit and restart in one step. Passing the memory option as
+    // `None` keeps any memory ceiling exactly as it was in config.toml.
     // Re-render pointing at the MANAGED binary, not at whatever is running this
     // command. `service::install` would use `current_exe`, which during a manual
     // test is a `target/debug` build.

@@ -81,6 +81,31 @@ fn service_help_lists_user_service_lifecycle_commands() -> Result<()> {
 }
 
 #[test]
+fn compatibility_policy_flags_are_hidden_from_help() -> Result<()> {
+    for args in [
+        &["up", "--help"][..],
+        &["restart", "--help"][..],
+        &["service", "install", "--help"][..],
+    ] {
+        let help = stdout(
+            Command::new(fabric_bin())
+                .args(args)
+                .output()
+                .with_context(|| format!("failed to run fabric {}", args.join(" ")))?,
+        )?;
+        assert!(
+            !help.contains("allow-shell"),
+            "help exposed allow-shell: {help}"
+        );
+        assert!(
+            !help.contains("allow-exec"),
+            "help exposed allow-exec: {help}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn top_level_help_lists_declarative_peer_reload() -> Result<()> {
     let help = stdout(
         Command::new(fabric_bin())
@@ -119,10 +144,7 @@ fn peers_lists_declarative_config_without_add() -> Result<()> {
             .output()
             .context("failed to run fabric peers")?,
     )?;
-    assert_eq!(
-        peers,
-        format!("machine\tshell=disabled\texec=disabled\n{peer_id}\tbox-a\tno services")
-    );
+    assert_eq!(peers, format!("{peer_id}\tbox-a\tno services"));
     Ok(())
 }
 
@@ -254,10 +276,7 @@ fn default_home_reads_peers_from_config_dir() -> Result<()> {
             .output()
             .context("failed to run fabric peers")?,
     )?;
-    assert_eq!(
-        peers,
-        format!("machine\tshell=disabled\texec=disabled\n{peer_id}\tconfig-peer\tno services")
-    );
+    assert_eq!(peers, format!("{peer_id}\tconfig-peer\tno services"));
     Ok(())
 }
 
@@ -291,16 +310,15 @@ fn default_home_moves_legacy_peer_file_to_config_dir() -> Result<()> {
             .output()
             .context("failed to run fabric peers")?,
     )?;
-    assert_eq!(
-        peers,
-        format!("machine\tshell=disabled\texec=disabled\n{peer_id}\tlegacy-peer\tno services")
-    );
+    assert_eq!(peers, format!("{peer_id}\tlegacy-peer\tno services"));
     let migrated_config = fs::read_to_string(fabric_home.join("config.toml"))?;
-    assert!(migrated_config.contains("allow_shell = true"));
+    assert!(!migrated_config.contains("allow_shell"));
     assert!(!migrated_config.contains("legacy-peer"));
     assert!(!fabric_home.join("peers.toml").exists());
     let migrated_peers = fs::read_to_string(fake_home.join(".config/fabric/peers.toml"))?;
     assert!(migrated_peers.contains("legacy-peer"));
+    assert!(migrated_peers.contains("format = 2"));
+    assert!(migrated_peers.contains("allow_shell = false"));
     Ok(())
 }
 
@@ -333,16 +351,15 @@ fn default_home_moves_embedded_peers_to_authoritative_peer_file() -> Result<()> 
             .output()
             .context("failed to run fabric peers")?,
     )?;
-    assert_eq!(
-        peers,
-        format!("machine\tshell=allowed\texec=disabled\n{peer_id}\tembedded-peer\tno services")
-    );
+    assert_eq!(peers, format!("{peer_id}\tembedded-peer\tno services"));
 
     let migrated_config = fs::read_to_string(fabric_home.join("config.toml"))?;
-    assert!(migrated_config.contains("allow_shell = true"));
+    assert!(!migrated_config.contains("allow_shell"));
     assert!(!migrated_config.contains("embedded-peer"));
     let migrated_peers = fs::read_to_string(fake_home.join(".config/fabric/peers.toml"))?;
     assert!(migrated_peers.contains("embedded-peer"));
+    assert!(migrated_peers.contains("format = 2"));
+    assert!(migrated_peers.contains("allow_shell = false"));
     Ok(())
 }
 
@@ -389,10 +406,7 @@ fn default_home_peer_file_overrides_embedded_config_peers() -> Result<()> {
             .output()
             .context("failed to run fabric peers")?,
     )?;
-    assert_eq!(
-        peers,
-        format!("machine\tshell=disabled\texec=disabled\n{new_id}\tnew-peer\tno services")
-    );
+    assert_eq!(peers, format!("{new_id}\tnew-peer\tno services"));
     let migrated_config = fs::read_to_string(fabric_home.join("config.toml"))?;
     assert!(!migrated_config.contains("old-peer"));
     assert!(fs::read_to_string(config_dir.join("peers.toml"))?.contains("new-peer"));

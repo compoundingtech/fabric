@@ -44,8 +44,6 @@ pub struct ServiceInstallOptions {
 pub struct ServiceSpec {
     exe: PathBuf,
     home: PathBuf,
-    allow_shell: bool,
-    allow_exec: bool,
     memory_max_mb: Option<u64>,
 }
 
@@ -87,8 +85,8 @@ impl ServiceSpec {
     pub fn new(
         exe: impl Into<PathBuf>,
         home: impl Into<PathBuf>,
-        allow_shell: bool,
-        allow_exec: bool,
+        _allow_shell: bool,
+        _allow_exec: bool,
         memory_max_mb: Option<u64>,
     ) -> Result<Self> {
         if memory_max_mb == Some(0) {
@@ -97,8 +95,6 @@ impl ServiceSpec {
         Ok(Self {
             exe: exe.into(),
             home: home.into(),
-            allow_shell,
-            allow_exec,
             memory_max_mb,
         })
     }
@@ -114,19 +110,12 @@ impl ServiceSpec {
     }
 
     fn program_arguments(&self) -> Vec<String> {
-        let mut args = vec![
+        vec![
             self.exe.display().to_string(),
             "--home".to_string(),
             self.home.display().to_string(),
             "daemon".to_string(),
-        ];
-        if self.allow_shell {
-            args.push("--allow-shell".to_string());
-        }
-        if self.allow_exec {
-            args.push("--allow-exec".to_string());
-        }
-        args
+        ]
     }
 
     fn sync_exe(&self) -> Result<PathBuf> {
@@ -235,10 +224,11 @@ fn install_at_with_verification(
         );
     }
     home.prepare()?;
-    let allow_shell = resolve_allow_shell(home, options.allow_shell)?;
-    let allow_exec = resolve_allow_exec(home, options.allow_exec)?;
+    // Old callers and installed launch definitions can still provide these
+    // options. They are parse-only compatibility values and never set policy.
+    let _ = (options.allow_shell, options.allow_exec);
     let memory_max_mb = resolve_memory_max_mb(home, options.memory_max_mb)?;
-    let spec = ServiceSpec::new(exe, home.root(), allow_shell, allow_exec, memory_max_mb)?;
+    let spec = ServiceSpec::new(exe, home.root(), false, false, memory_max_mb)?;
     if companion_exists {
         require_sync_companion(&spec)?;
     }
@@ -267,8 +257,6 @@ fn install_at_with_verification(
     });
     println!("installed");
     println!("home\t{}", home.root().display());
-    println!("allow-shell\t{allow_shell}");
-    println!("allow-exec\t{allow_exec}");
     // Report the RESOLVED ceiling, not what the caller passed. They differ
     // whenever the caller said nothing and a persisted ceiling was kept, which
     // is precisely the case this line exists to make visible.
@@ -324,10 +312,8 @@ pub(crate) fn restore_after_update_rollback(
     companion_exists: bool,
 ) -> Result<()> {
     home.prepare()?;
-    let allow_shell = resolve_allow_shell(home, None)?;
-    let allow_exec = resolve_allow_exec(home, None)?;
     let memory_max_mb = resolve_memory_max_mb(home, None)?;
-    let spec = ServiceSpec::new(exe, home.root(), allow_shell, allow_exec, memory_max_mb)?;
+    let spec = ServiceSpec::new(exe, home.root(), false, false, memory_max_mb)?;
     if companion_exists {
         require_sync_companion(&spec)?;
     }
@@ -412,26 +398,6 @@ pub fn uninstall() -> Result<()> {
     }
     println!("uninstalled");
     Ok(())
-}
-
-fn resolve_allow_shell(home: &FabricHome, requested: Option<bool>) -> Result<bool> {
-    let mut config = FabricConfig::load(home)?;
-    if let Some(allow_shell) = requested {
-        config.set_allow_shell(allow_shell);
-        config.save(home)?;
-        return Ok(allow_shell);
-    }
-    Ok(config.allow_shell().unwrap_or(false))
-}
-
-fn resolve_allow_exec(home: &FabricHome, requested: Option<bool>) -> Result<bool> {
-    let mut config = FabricConfig::load(home)?;
-    if let Some(allow_exec) = requested {
-        config.set_allow_exec(allow_exec);
-        config.save(home)?;
-        return Ok(allow_exec);
-    }
-    Ok(config.allow_exec().unwrap_or(false))
 }
 
 /// The command that restarts the managed Linux service, handed to systemd to
@@ -1787,11 +1753,9 @@ mod tests {
     /// A ceiling an operator set once must survive a re-install that does not
     /// mention it.
     ///
-    /// `allow_shell` and `allow_exec` already survive, because they round trip
-    /// through `config.toml`. `memory_max_mb` did not: it lived only in the
-    /// rendered plist or unit, and `render_*` emits it only when `Some`. So any
-    /// re-install without `--memory-max-mb` removed a ceiling somebody set
-    /// earlier, silently.
+    /// `memory_max_mb` lived only in the rendered plist or unit. `render_*`
+    /// emits it only when it is `Some`. Thus, a re-install without
+    /// `--memory-max-mb` removed a ceiling somebody set earlier, silently.
     ///
     /// `fabric update` re-renders the unit on every run, so this would have
     /// fired constantly rather than rarely.
@@ -2010,7 +1974,11 @@ mod tests {
 
         let unit = render_systemd_user_unit(&spec);
 
-        assert!(unit.contains("ExecStart=/usr/local/bin/fabric --home /home/nathan/.local/share/fabric daemon --allow-shell --allow-exec"));
+        assert!(unit.contains(
+            "ExecStart=/usr/local/bin/fabric --home /home/nathan/.local/share/fabric daemon"
+        ));
+        assert!(!unit.contains("--allow-shell"));
+        assert!(!unit.contains("--allow-exec"));
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("RestartSec=5s"));
         assert!(unit.contains("MemoryMax=512M"));
@@ -2089,8 +2057,8 @@ mod tests {
         assert!(plist.contains("<string>--home</string>"));
         assert!(plist.contains("<string>/Users/nathan/.local/share/fabric</string>"));
         assert!(plist.contains("<string>daemon</string>"));
-        assert!(plist.contains("<string>--allow-shell</string>"));
-        assert!(plist.contains("<string>--allow-exec</string>"));
+        assert!(!plist.contains("<string>--allow-shell</string>"));
+        assert!(!plist.contains("<string>--allow-exec</string>"));
         assert!(plist.contains("<key>SuccessfulExit</key>"));
         assert!(plist.contains("<false/>"));
         assert!(plist.contains("<key>ResidentSetSize</key>"));

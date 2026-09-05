@@ -49,7 +49,7 @@ where
 {
     serve_shell_failure(
         send,
-        "refused service \"shell\": remote shell is disabled; set allow_shell = true in peers.toml",
+        "refused service \"shell\": add shell to this peer's allow array in peers.toml",
         EXIT_SHELL_DISABLED,
     )
     .await
