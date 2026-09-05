@@ -1414,6 +1414,7 @@ impl DaemonState {
             tokio::spawn(run_raw_dial_socket(
                 listener,
                 self.endpoint_rx(),
+                peer.to_string(),
                 peer_addr.clone(),
                 alpn,
                 listener_cancel.clone(),
@@ -5078,6 +5079,7 @@ async fn run_dial_tcp_listener(
 async fn run_raw_dial_socket(
     listener: UnixListener,
     endpoint_rx: watch::Receiver<CurrentEndpoint>,
+    peer: String,
     peer_addr: EndpointAddr,
     alpn: Vec<u8>,
     listener_cancel: CancellationToken,
@@ -5109,6 +5111,7 @@ async fn run_raw_dial_socket(
                     }
                 };
                 let endpoint = endpoint_rx.borrow().clone();
+                let peer = peer.clone();
                 let peer_addr = peer_addr.clone();
                 let alpn = alpn.clone();
                 let cancel = daemon_cancel.clone();
@@ -5123,6 +5126,7 @@ async fn run_raw_dial_socket(
                     match handle_raw_dial_socket_connection(
                         local,
                         endpoint,
+                        peer,
                         peer_addr,
                         alpn,
                         peer_connections,
@@ -5143,14 +5147,15 @@ async fn run_raw_dial_socket(
 }
 
 async fn handle_raw_dial_socket_connection(
-    local: UnixStream,
+    mut local: UnixStream,
     endpoint: CurrentEndpoint,
+    peer: String,
     peer_addr: EndpointAddr,
     alpn: Vec<u8>,
     peer_connections: Arc<mux::PeerConnections>,
 ) -> Result<()> {
     let protocol = std::str::from_utf8(&alpn).context("protocol is not UTF-8")?;
-    let stream = peer_connections
+    let stream = match peer_connections
         .open_stream(
             &endpoint.endpoint,
             endpoint.generation,
@@ -5158,8 +5163,58 @@ async fn handle_raw_dial_socket_connection(
             protocol,
             mux::StreamActivity::Application,
         )
-        .await?;
-    pipe_unix_iroh(local, stream.send, stream.recv).await?;
+        .await
+    {
+        Ok(stream) => stream,
+        Err(error) => {
+            if alpn == exec::EXEC_ALPN {
+                let (message, exit_code) = if mux::is_permanent_stream_denial(&error) {
+                    (
+                        format!("refused service \"exec\": {error}"),
+                        exec::EXIT_EXEC_DISABLED,
+                    )
+                } else {
+                    (format!("failed to start service \"exec\": {error}"), 1)
+                };
+                // Preserve the dial error for diagnostics and backoff. The
+                // frame is for the local CLI, which otherwise sees only EOF.
+                let _ = exec::serve_exec_failure(&mut local, &message, exit_code).await;
+            }
+            let context = format!("dial to peer {peer:?} failed: {error}");
+            return Err(error).context(context);
+        }
+    };
+    if alpn == exec::EXEC_ALPN {
+        pipe_exec_unix_iroh(local, stream.send, stream.recv).await?;
+    } else {
+        pipe_unix_iroh(local, stream.send, stream.recv).await?;
+    }
+    Ok(())
+}
+
+/// Keep receiving exec frames after the peer stops its receive direction.
+///
+/// A policy refusal sends Error and Exit, then closes without reading the
+/// command frame. That stopped send direction must not cancel the useful reply.
+async fn pipe_exec_unix_iroh(
+    local: UnixStream,
+    mut send: SendStream,
+    mut recv: RecvStream,
+) -> Result<()> {
+    let (mut local_read, mut local_write) = local.into_split();
+    let to_remote = async {
+        tokio::io::copy(&mut local_read, &mut send).await?;
+        send.finish()?;
+        Ok::<(), anyhow::Error>(())
+    };
+    let to_local = async {
+        tokio::io::copy(&mut recv, &mut local_write).await?;
+        let _ = local_write.shutdown().await;
+        Ok::<(), anyhow::Error>(())
+    };
+    let (to_remote, to_local) = tokio::join!(to_remote, to_local);
+    to_local?;
+    to_remote?;
     Ok(())
 }
 

@@ -203,12 +203,12 @@ enum Commands {
     },
     /// Say what is wrong with this machine, in words a stranger can act on.
     ///
-    /// Reports each check as `ok`, `setup`, `problem`, or `unknown`. A check
+    /// Reports each check as `ok`, `info`, `setup`, `problem`, or `unknown`. A check
     /// that could not establish an answer says `unknown` rather than `ok`, and
     /// that counts as needing attention: a doctor is read INSTEAD of
     /// investigating, so it must not guess in the reassuring direction.
     ///
-    /// Exit code is the answer: 0 verified healthy, 1 problem or setup,
+    /// Exit code is the answer: 0 no attention needed, 1 problem or setup,
     /// 2 command-line usage error, 3 unknown because a check could not answer.
     /// The command never changes anything.
     Doctor,
@@ -1026,11 +1026,14 @@ async fn main() -> Result<()> {
                     std::process::exit(code);
                 }
                 Commands::Exec { peer, cmd } => {
-                    let socket = match send_control(&home, ControlRequest::Exec { peer }).await? {
-                        ControlResponse::Exec { socket } => socket,
-                        response => bail!("unexpected daemon response: {response:?}"),
-                    };
-                    let code = run_exec_client(&socket, &cmd).await?;
+                    let socket =
+                        match send_control(&home, ControlRequest::Exec { peer: peer.clone() })
+                            .await?
+                        {
+                            ControlResponse::Exec { socket } => socket,
+                            response => bail!("unexpected daemon response: {response:?}"),
+                        };
+                    let code = run_exec_client(&socket, &peer, &cmd).await?;
                     std::process::exit(code);
                 }
                 Commands::Sync { command } => run_sync(&home, command).await?,
@@ -2953,14 +2956,14 @@ async fn run_shell_client(socket: &PathBuf) -> Result<i32> {
 /// Drive the client side of a `fabric exec` session over the daemon-provided
 /// socket: send the argv, forward the remote stdout/stderr to the local
 /// stdout/stderr on their own streams, and return the remote command's exit code.
-async fn run_exec_client(socket: &PathBuf, cmd: &[String]) -> Result<i32> {
+async fn run_exec_client(socket: &PathBuf, peer: &str, cmd: &[String]) -> Result<i32> {
     let stream = tokio::net::UnixStream::connect(socket).await?;
     let (mut read, mut write) = stream.into_split();
     exec::write_client_argv(&mut write, cmd).await?;
 
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
-    let mut exit_code = 1;
+    let mut exit_code = None;
 
     while let Some(frame) = exec::read_server_frame(&mut read).await? {
         match frame {
@@ -2973,20 +2976,34 @@ async fn run_exec_client(socket: &PathBuf, cmd: &[String]) -> Result<i32> {
                 stderr.flush().await?;
             }
             exec::ServerFrame::Error(message) => {
+                stderr
+                    .write_all(format!("fabric: peer {peer:?} ").as_bytes())
+                    .await?;
                 stderr.write_all(message.as_bytes()).await?;
                 stderr.write_all(b"\n").await?;
                 stderr.flush().await?;
             }
             exec::ServerFrame::Exit(code) => {
-                exit_code = normalize_exit_code(code);
+                exit_code = Some(normalize_exit_code(code));
                 break;
             }
         }
     }
 
+    if exit_code.is_none() {
+        stderr
+            .write_all(
+                format!(
+                    "fabric: peer {peer:?} closed service \"exec\" before it returned an exit status\n"
+                )
+                .as_bytes(),
+            )
+            .await?;
+    }
+
     stdout.flush().await?;
     stderr.flush().await?;
-    Ok(exit_code)
+    Ok(exit_code.unwrap_or(1))
 }
 
 /// When a mutating command (down/restart) can't reach a daemon at the target

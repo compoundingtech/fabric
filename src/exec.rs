@@ -30,7 +30,7 @@ const SERVER_EXIT: u8 = 19;
 const SERVER_ERROR: u8 = 20;
 
 /// Exit code sent when this node has `allow_exec` disabled (mirrors `shell`'s 126).
-const EXIT_EXEC_DISABLED: i32 = 126;
+pub(crate) const EXIT_EXEC_DISABLED: i32 = 126;
 /// Exit code sent when the requested command could not be spawned (mirrors sh 127).
 const EXIT_SPAWN_FAILED: i32 = 127;
 
@@ -47,14 +47,25 @@ pub async fn serve_exec_disabled<W>(send: &mut W) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    write_server_frame(
+    serve_exec_failure(
         send,
-        ServerFrame::Error(
-            "remote exec is disabled on this peer; set allow_exec = true in peers.toml".to_string(),
-        ),
+        "refused service \"exec\": remote exec is disabled; set allow_exec = true in peers.toml",
+        EXIT_EXEC_DISABLED,
     )
-    .await?;
-    write_server_frame(send, ServerFrame::Exit(EXIT_EXEC_DISABLED)).await
+    .await
+}
+
+/// Send a complete failure response when exec cannot start a remote command.
+pub(crate) async fn serve_exec_failure<W>(
+    send: &mut W,
+    message: &str,
+    exit_code: i32,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_server_frame(send, ServerFrame::Error(message.to_string())).await?;
+    write_server_frame(send, ServerFrame::Exit(exit_code)).await
 }
 
 /// Server side of an exec session: read the argv, spawn the command with no tty

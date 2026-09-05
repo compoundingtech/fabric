@@ -37,7 +37,7 @@ fn doctor_help_documents_every_exit_code() -> Result<()> {
     let help = String::from_utf8(output.stdout)?;
 
     for expected in [
-        "0 verified healthy",
+        "0 no attention needed",
         "1 problem or setup",
         "2 command-line usage error",
         "3 unknown",

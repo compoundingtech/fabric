@@ -1,8 +1,8 @@
 //! What is wrong with this machine, in words a stranger can act on.
 //!
-//! # Three verdicts, and why the third exists
+//! # Honest verdicts
 //!
-//! `Ok`, `Problem`, and `Unknown`. The third is the important one. A doctor is
+//! `Ok`, `Informational`, `Setup`, `Problem`, and `Unknown`. A doctor is
 //! trusted INSTEAD of investigating, so a check that says `ok` when it could not
 //! look is worse than one that admits it — the person stops looking and the
 //! fault stays. Four separate checks did exactly that this week, and every one
@@ -37,6 +37,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     Ok,
+    /// The check established a useful limitation that needs no action.
+    Informational,
     /// Not done yet on a machine that has never been configured.
     Setup,
     Problem,
@@ -48,15 +50,33 @@ pub enum Verdict {
 
 impl Verdict {
     pub fn needs_attention(self) -> bool {
-        !matches!(self, Verdict::Ok)
+        !matches!(self, Verdict::Ok | Verdict::Informational)
     }
 
     pub fn token(self) -> &'static str {
         match self {
             Verdict::Ok => "ok",
+            Verdict::Informational => "info",
             Verdict::Setup => "setup",
             Verdict::Problem => "problem",
             Verdict::Unknown => "unknown",
+        }
+    }
+}
+
+/// Why doctor could not learn a reachable peer's build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerVersionError {
+    /// The peer intentionally does not serve exec to this machine.
+    PolicyRefusal(String),
+    /// The version command or its connection failed unexpectedly.
+    Failed(String),
+}
+
+impl PeerVersionError {
+    fn reason(&self) -> &str {
+        match self {
+            Self::PolicyRefusal(reason) | Self::Failed(reason) => reason,
         }
     }
 }
@@ -104,7 +124,7 @@ pub struct PeerFact {
     pub version: Option<String>,
     /// Why it could not be asked. A count of peers you could not reach is not
     /// something a stranger can act on; the name and the reason are.
-    pub version_error: Option<String>,
+    pub version_error: Option<PeerVersionError>,
 }
 
 /// What one sync entry looks like.
@@ -443,10 +463,14 @@ fn peer_finding(peer: &PeerFact) -> Finding {
 fn version_findings(facts: &Facts) -> Vec<Finding> {
     let mut behind: Vec<&PeerFact> = Vec::new();
     let mut unknown: Vec<&PeerFact> = Vec::new();
+    let mut policy_unavailable: Vec<&PeerFact> = Vec::new();
     for peer in &facts.peers {
         match &peer.version {
             Some(version) if version != &facts.own_version => behind.push(peer),
             Some(_) => {}
+            None if matches!(peer.version_error, Some(PeerVersionError::PolicyRefusal(_))) => {
+                policy_unavailable.push(peer);
+            }
             None => unknown.push(peer),
         }
     }
@@ -466,13 +490,15 @@ fn version_findings(facts: &Facts) -> Vec<Finding> {
             )
             .with_action(format!("fabric exec {} -- fabric update", names[0])),
         );
-    } else if !unknown.is_empty() {
+    }
+
+    if !unknown.is_empty() || !policy_unavailable.is_empty() {
         // Say what IS known as well. On the fleet's first real run this
         // reported one unknown peer and nothing else, so a reader could not
         // tell "one of three" from "one of one" — and the reassuring half is
         // the half that says how much of the fleet was actually checked.
-        let known = facts.peers.len() - unknown.len();
-        if known > 0 {
+        let known = facts.peers.len() - unknown.len() - policy_unavailable.len();
+        if known > 0 && behind.is_empty() {
             out.push(Finding::new(
                 "versions",
                 Verdict::Ok,
@@ -483,11 +509,12 @@ fn version_findings(facts: &Facts) -> Vec<Finding> {
                 ),
             ));
         }
-        for peer in unknown {
+        for peer in &unknown {
             let reason = peer
                 .version_error
-                .clone()
-                .unwrap_or_else(|| "it did not answer".to_string());
+                .as_ref()
+                .map(PeerVersionError::reason)
+                .unwrap_or("it did not answer");
             let detail = if peer.roaming {
                 format!(
                     "{} build is unknown, roaming: {reason}. A peer on an older build makes \
@@ -502,20 +529,27 @@ fn version_findings(facts: &Facts) -> Vec<Finding> {
                     peer.label
                 )
             };
-            let mut finding = Finding::new(
-                "versions",
-                Verdict::Unknown,
-                detail,
-            );
-            if !peer.roaming && reason.contains("exec is disabled") {
-                finding = finding.with_action(format!(
-                    "on {}, set allow_exec = true in peers.toml, then run: fabric reload-peers",
-                    peer.label
-                ));
-            }
-            out.push(finding);
+            out.push(Finding::new("versions", Verdict::Unknown, detail));
         }
-    } else {
+        for peer in &policy_unavailable {
+            let reason = peer
+                .version_error
+                .as_ref()
+                .map(PeerVersionError::reason)
+                .unwrap_or("the peer refused exec");
+            out.push(Finding::new(
+                "versions",
+                Verdict::Informational,
+                format!(
+                    "cannot check {} build because it does not serve exec: {reason}. If it runs an \
+                     older build, the fleet sends whole manifests",
+                    peer.label
+                ),
+            ));
+        }
+    }
+
+    if behind.is_empty() && unknown.is_empty() && policy_unavailable.is_empty() {
         out.push(Finding::new(
             "versions",
             Verdict::Ok,
@@ -1441,32 +1475,63 @@ mod tests {
     /// "could not ask 1 peer" is a count. A count is not something a stranger
     /// can act on, and this check exists to be acted on.
     #[test]
-    fn a_peer_that_could_not_be_asked_is_named_with_the_reason() {
+    fn an_exec_policy_refusal_is_informational_and_does_not_count() {
         let mut facts = configured();
         facts.peers[0].version = None;
-        facts.peers[0].version_error =
-            Some("remote exec is disabled on this peer".to_string());
+        facts.peers[0].version_error = Some(PeerVersionError::PolicyRefusal(
+            "peer not permitted for service \"exec\"".to_string(),
+        ));
 
         let findings = diagnose(&facts);
         let versions = find(&findings, "versions");
-        assert_eq!(versions[0].verdict, Verdict::Unknown);
+        assert_eq!(versions[0].verdict, Verdict::Informational);
         assert!(
             versions[0].detail.contains("hetz"),
             "the peer was not named: {}",
             versions[0].detail
         );
         assert!(
-            versions[0].detail.contains("exec is disabled"),
+            versions[0].detail.contains("does not serve exec"),
             "the reason was not given: {}",
             versions[0].detail
         );
         assert!(
-            versions[0]
-                .action
-                .as_deref()
-                .is_some_and(|a| a.contains("allow_exec = true") && !a.contains("--allow-exec")),
-            "it did not say what to change"
+            versions[0].detail.contains("whole manifests"),
+            "the fallback risk was not given: {}",
+            versions[0].detail
         );
+        assert!(versions[0].action.is_none());
+        assert!(!versions[0].verdict.needs_attention());
+        assert_eq!(exit_code(&findings), 0);
+    }
+
+    #[test]
+    fn a_broken_version_command_remains_unknown_and_counts() {
+        let mut facts = configured();
+        facts.peers[0].version = None;
+        facts.peers[0].version_error = Some(PeerVersionError::Failed(
+            "connection closed before a reply".to_string(),
+        ));
+
+        let findings = diagnose(&facts);
+        let versions = find(&findings, "versions");
+        assert_eq!(versions[0].verdict, Verdict::Unknown);
+        assert!(versions[0].verdict.needs_attention());
+        assert_eq!(exit_code(&findings), 3);
+    }
+
+    #[test]
+    fn exit_126_identifies_an_exec_policy_refusal() {
+        let refusal = classify_peer_version_failure(
+            Some(crate::exec::EXIT_EXEC_DISABLED),
+            "",
+            "peer \"bluey\" refused service \"exec\"",
+        );
+        let failure =
+            classify_peer_version_failure(Some(1), "", "peer \"bluey\" closed service \"exec\"");
+
+        assert!(matches!(refusal, PeerVersionError::PolicyRefusal(_)));
+        assert!(matches!(failure, PeerVersionError::Failed(_)));
     }
 
     #[test]
@@ -1500,7 +1565,9 @@ mod tests {
             has_grants: Some(true),
             reachable: Some(true),
             version: None,
-            version_error: Some("remote exec is disabled".to_string()),
+            version_error: Some(PeerVersionError::PolicyRefusal(
+                "remote exec is disabled".to_string(),
+            )),
         });
         let findings = diagnose(&facts);
         let versions = find(&findings, "versions");
@@ -1512,8 +1579,10 @@ mod tests {
             versions.iter().map(|f| &f.detail).collect::<Vec<_>>()
         );
         assert!(
-            versions.iter().any(|f| f.verdict == Verdict::Unknown),
-            "the unknown peer stopped being reported"
+            versions
+                .iter()
+                .any(|f| f.verdict == Verdict::Informational),
+            "the policy-unavailable peer stopped being reported"
         );
     }
 
@@ -1716,29 +1785,46 @@ fn peer_version_argv(home: &FabricHome, label: &str) -> Vec<String> {
     ]
 }
 
-fn peer_version(home: &FabricHome, label: &str) -> std::result::Result<String, String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+fn peer_version(home: &FabricHome, label: &str) -> std::result::Result<String, PeerVersionError> {
+    let exe = std::env::current_exe()
+        .map_err(|error| PeerVersionError::Failed(error.to_string()))?;
     let output = std::process::Command::new(exe)
         .args(peer_version_argv(home, label))
         .output()
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| PeerVersionError::Failed(error.to_string()))?;
     if !output.status.success() {
-        // The refusal text is the useful part. `exec is disabled` is the common
-        // one and it names something a person can change.
-        let why = String::from_utf8_lossy(&output.stderr)
-            .lines()
-            .chain(String::from_utf8_lossy(&output.stdout).lines())
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .unwrap_or("the command failed")
-            .to_string();
-        return Err(why);
+        return Err(classify_peer_version_failure(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        ));
     }
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
     // `fabric --version` prints `fabric 0.2.0+abc`; keep the version alone.
     match text.split_whitespace().next_back() {
         Some(version) if !version.is_empty() => Ok(version.to_string()),
-        _ => Err("it answered with no version".to_string()),
+        _ => Err(PeerVersionError::Failed(
+            "it answered with no version".to_string(),
+        )),
+    }
+}
+
+fn classify_peer_version_failure(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> PeerVersionError {
+    let reason = stderr
+        .lines()
+        .chain(stdout.lines())
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("the command failed")
+        .to_string();
+    if exit_code == Some(crate::exec::EXIT_EXEC_DISABLED) {
+        PeerVersionError::PolicyRefusal(reason)
+    } else {
+        PeerVersionError::Failed(reason)
     }
 }
 
