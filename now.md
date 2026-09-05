@@ -11,7 +11,7 @@ without Silber.cos._
 For extraction steps 6 and 8, merge on green without asking for a separate
 Silber.cos approval. Silber.cos holds the step 7 activation gate and every
 release or deployment gate. Before any deployment, prove matched-pair rollback
-on hetz and decide whether macOS needs a detached update supervisor.
+on hetz. macOS needs a detached update supervisor; the current change adds it.
 
 ## Current main — 2026-09-04
 
@@ -35,12 +35,37 @@ build, and sync IPC compatibility. Release archives, the installer, the
 updater, and rollback now handle `fabric` and `fabric-sync` as one versioned
 pair. The main daemon still owns and runs sync in-process.
 
-The current change adds an independent service for the companion. It runs in
-compatibility standby, so it acquires no lease and starts no watcher. The daemon
-records matching heartbeats and reports a missing or incompatible companion.
-Service status, `fabric status`, `fabric sync ls`, and doctor show that runtime.
-A configured entry remains visible when the daemon is down. The embedded engine
+PR #163 added an independent service for the companion. It runs in compatibility
+standby, so it acquires no lease and starts no watcher. The daemon records
+matching heartbeats and reports a missing or incompatible companion. Service
+status, `fabric status`, `fabric sync ls`, and doctor show that runtime. A
+configured entry remains visible when the daemon is down. The embedded engine
 remains the production owner.
+
+The current change adds a detached macOS update supervisor. Launchd owns it
+before the updater renames the first binary. It survives terminal loss and
+sleep, then removes its job after success or rollback.
+
+The fleet build `0.2.1+48208e4` has only single-binary supervisor logic. The
+rollback runs this old binary on purpose because it is the machine's known-good
+copy. New rollback logic therefore cannot protect the release that introduces
+it.
+
+Release A must be a fabric-only transition release. It carries pair-aware
+rollback and the macOS supervisor, but its archive has no companion. Deploy and
+prove Release A on each machine before that machine receives its first paired
+archive. Bluey also receives Release A first when it returns. Silber.cos owns
+both release and deployment gates.
+
+The Release A reader must handle OS service state as well as binary paths. It
+must restart both old services when a companion rollback exists. It must remove
+the companion service when the old release had no companion.
+
+The local library suite passed 499 tests with five measurements ignored. The
+binary suite passed 19 tests, and the update contract passed eight tests. The
+five-second latency property measured 502 records, seven scans, a 10.001166 ms
+source maximum, and a 20.102959 ms delivery maximum. The explicit live-launchd
+test also restored the staged old binary and removed its transient registration.
 
 PR #153 grouped the sync disk state and merged as `7733e4b`. It is not released
 or deployed. Ask Silber.cos for the current fleet build.
