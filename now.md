@@ -4,7 +4,8 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-05 by Silber.fabric-codex. Main is `f5a88b7`._
+_Last updated: 2026-09-05 by Silber.fabric-codex. The latest policy code merge
+is `f5a88b7`._
 
 ## Latest handoff — 2026-09-05
 
