@@ -788,7 +788,13 @@ impl PreparedInbound {
 /// A rename or delete that lands in one of these windows is invisible to the
 /// scan that just ran and visible to the materialization that follows. Tests
 /// pin an event to a seam so the window is exercised on demand rather than by
-/// scheduler luck. Production builds carry the enum and an empty call.
+/// scheduler luck.
+///
+/// TEST BUILDS ONLY. This enum, the hook slot, `set_seam_hook`, `at_seam`, and
+/// every call to `at_seam` are under `cfg(test)`. A production build never
+/// compiles them, so a production reference to any of them fails to compile
+/// rather than shipping a hook in the sync path.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PhaseSeam {
     /// `sync_once`, after the pre-peer scan and before its materialization.
@@ -869,10 +875,6 @@ impl<T: SyncTransport> SyncEngine<T> {
             hook(seam);
         }
     }
-
-    #[cfg(not(test))]
-    #[inline(always)]
-    fn at_seam(&self, _seam: PhaseSeam) {}
 
     pub async fn load_from_config(&self) -> Result<()> {
         let book = SyncBook::load_path(self.paths.config_path())?;
@@ -1099,9 +1101,11 @@ impl<T: SyncTransport> SyncEngine<T> {
     }
 
     /// Complete an inbound transaction while its entry operation guard is still
-    /// held. Disk changes that landed during the wire session are compared to
-    /// the pre-merge baseline: a vanished baseline Present is a local delete,
-    /// while a remote-only Present is materialized instead of tombstoned.
+    /// held. The completion scan records disk changes that landed during the
+    /// wire session, and the materialization that follows protects exactly what
+    /// that scan saw: a Present the scan observed and that is gone now is a
+    /// local delete, while a Present no scan observed is remote-only and is
+    /// materialized. The pre-merge baseline decides only whether to persist.
     pub(crate) async fn complete_inbound(&self, prepared: PreparedInbound) -> Result<()> {
         let PreparedInbound { entry, mode } = prepared;
         let PreparedInboundMode::Guarded {
@@ -1120,8 +1124,9 @@ impl<T: SyncTransport> SyncEngine<T> {
         // It is cheap now because scan_folder reuses recorded hashes for files
         // whose size and mtime are unchanged.
         self.scan_entry(&entry).await?;
+        #[cfg(test)]
         self.at_seam(PhaseSeam::AfterInboundScan);
-        self.materialize_entry_state(&entry, &baseline).await?;
+        self.materialize_entry_state(&entry).await?;
         let final_manifest_revision = entry.node.lock().await.manifest_revision();
         let final_receipt_revision = entry.disk.lock().unwrap().receipt_revision;
         if final_manifest_revision != manifest_revision
@@ -1232,18 +1237,23 @@ impl<T: SyncTransport> SyncEngine<T> {
         entry.work.sync_passes.fetch_add(1, Ordering::Relaxed);
         // Never hold the local operation guard across a peer dial. If A and B
         // initiate together, retaining A while awaiting B's inbound guard (and
-        // vice versa) is a distributed lock inversion. Carry a pre-merge
-        // baseline across the unlocked network step instead.
+        // vice versa) is a distributed lock inversion. The baseline carried
+        // across the unlocked network step decides only whether the post-peer
+        // half has anything to persist. It is NOT the protected view for the
+        // post-peer materialization: an inbound session can materialize a file
+        // during the network step, and a view from before that step would
+        // read the file as never having been here. Issue #175.
         let (baseline, manifest_revision) = {
             let _operation = entry.operation.lock().await;
-            let protected = entry.disk.lock().unwrap().view();
+            let before_scan = entry.disk.lock().unwrap().view();
             let generation = entry.work.mutation_generation.load(Ordering::Acquire);
             let phase = Instant::now();
             let scan_changed = self.scan_entry(&entry).await?;
             EntryWork::add_phase(&entry.work.scan_micros, phase);
+            #[cfg(test)]
             self.at_seam(PhaseSeam::AfterPrePeerScan);
             let phase = Instant::now();
-            self.materialize_entry_state(&entry, &protected).await?;
+            self.materialize_entry_state(&entry).await?;
             EntryWork::add_phase(&entry.work.materialize_micros, phase);
             // A pass that changed nothing has nothing to record. This call was
             // unguarded while `prepare_inbound_entry` guards the identical one,
@@ -1259,7 +1269,7 @@ impl<T: SyncTransport> SyncEngine<T> {
             // - a legacy entry may have no state.json yet, so a first pass must
             //   write even when it changed nothing.
             let observed_changed =
-                { entry.disk.lock().unwrap().receipt_revision != protected.receipt_revision };
+                { entry.disk.lock().unwrap().receipt_revision != before_scan.receipt_revision };
             if scan_changed
                 || observed_changed
                 || entry.work.durable_generation.load(Ordering::Acquire) != generation
@@ -1397,13 +1407,15 @@ impl<T: SyncTransport> SyncEngine<T> {
         EntryWork::add_phase(&entry.work.reconcile_micros, reconcile_phase);
 
         let _operation = entry.operation.lock().await;
+        #[cfg(test)]
         self.at_seam(PhaseSeam::BeforePostPeerScan);
         let phase = Instant::now();
         self.scan_entry(&entry).await?;
         EntryWork::add_phase(&entry.work.scan_micros, phase);
+        #[cfg(test)]
         self.at_seam(PhaseSeam::AfterPostPeerScan);
         let phase = Instant::now();
-        self.materialize_entry_state(&entry, &baseline).await?;
+        self.materialize_entry_state(&entry).await?;
         EntryWork::add_phase(&entry.work.materialize_micros, phase);
         self.sweep_entry_tombstones(&entry, &peers).await;
         let manifest_changed = entry.node.lock().await.manifest_revision() != manifest_revision;
@@ -1423,8 +1435,7 @@ impl<T: SyncTransport> SyncEngine<T> {
             return Ok(());
         };
         let _operation = entry.operation.lock().await;
-        let protected = entry.disk.lock().unwrap().view();
-        self.materialize_entry_state(&entry, &protected).await?;
+        self.materialize_entry_state(&entry).await?;
         self.persist_entry(&entry).await
     }
 
@@ -1498,11 +1509,24 @@ impl<T: SyncTransport> SyncEngine<T> {
         anyhow::bail!("sync state changed during three scan attempts")
     }
 
-    async fn materialize_entry_state(
-        &self,
-        entry: &Arc<EntryState>,
-        protected: &DiskView,
-    ) -> Result<()> {
+    /// Materialize the entry's manifest onto disk.
+    ///
+    /// THE PROTECTED VIEW IS THE ONE THIS CALL TAKES FOR ITSELF, under the
+    /// caller's operation guard, and never one the caller carried in. Under
+    /// the guard that view is exactly what the scan immediately before this
+    /// call published, so a Present path that the scan saw on disk and that
+    /// is absent now is a local delete, and a Present path no scan saw is a
+    /// remote-only file to write.
+    ///
+    /// This used to take the view as a parameter, and `sync_once` passed the
+    /// view it captured BEFORE its peer step into the materialization AFTER
+    /// it. An inbound session that ran during the peer step had materialized
+    /// the peer's file by then, so that view lacked the file. A rename landing
+    /// between the post-peer scan and its materialization then read as a
+    /// never-seen remote file and the source was written back, leaving both
+    /// paths present on every peer. Issue #175. Removing the parameter is the
+    /// fix: no caller can hand this function a stale view again.
+    async fn materialize_entry_state(&self, entry: &Arc<EntryState>) -> Result<()> {
         let root = entry.config.folder.clone();
         let policy = entry.policy;
         let cfg = entry.config.clone();
@@ -1518,18 +1542,20 @@ impl<T: SyncTransport> SyncEngine<T> {
             };
             let root = root.clone();
             let cfg = cfg.clone();
-            let protected = protected.clone();
             let work = entry.work.clone();
             let phase = tokio::task::spawn_blocking(move || {
                 let mut node = staged_node;
                 let mut disk = staged_disk;
+                // One view serves both roles. It is what the preceding scan
+                // published, taken again on every retry so a re-staged attempt
+                // cannot inherit an older one.
                 let current = disk.view();
                 let _ = materialize_tracked_disk(
                     &mut node,
                     &root,
                     &cfg,
                     policy,
-                    &protected,
+                    &current,
                     &current,
                     &mut disk,
                     Some((&work, generation)),
@@ -1720,13 +1746,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                         scan_cache: ScanCacheMapRef(&disk),
                         peer_acks: &peer_acks_for_write,
                     })?;
-                    write_state_bytes_at(
-                        &name,
-                        &state_path,
-                        &log_path,
-                        &manifest_path,
-                        &raw,
-                    )?;
+                    write_state_bytes_at(&name, &state_path, &log_path, &manifest_path, &raw)?;
                 } else {
                     let records: Vec<LoggedChange> = changed
                         .iter()
@@ -5736,11 +5756,7 @@ mod tests {
             .await
             .local_write("remote.md", b"daemon bytes", 0, 0);
         let generation = entry.work.mutation_generation.load(Ordering::Acquire);
-        let protected = DiskState::from_persisted(HashMap::new(), HashMap::new()).view();
-        engine
-            .materialize_entry_state(&entry, &protected)
-            .await
-            .unwrap();
+        engine.materialize_entry_state(&entry).await.unwrap();
         engine.persist_entry(&entry).await.unwrap();
         entry.work.mark_generation_durable(generation);
         entry.work.full_scans.store(0, Ordering::Relaxed);
@@ -7994,10 +8010,8 @@ mod tests {
         // The parent deliberately owns the real state lease while this crash
         // helper stops at a write boundary. Use a test-only lease root so the
         // helper can exercise that boundary without becoming a second engine.
-        let owner_paths = SyncPaths::new(
-            home.syncs_path(),
-            home.root().join("sync-crash-test-owner"),
-        );
+        let owner_paths =
+            SyncPaths::new(home.syncs_path(), home.root().join("sync-crash-test-owner"));
         let engine = SyncEngine {
             paths: SyncPaths::new(home.syncs_path(), home.root().join("sync")),
             _owner: SyncOwnerLease::acquire(&owner_paths).unwrap(),
@@ -10498,7 +10512,7 @@ mod tests {
         // materialization must version this local write above the remote edit.
         let PreparedInbound { entry, mode } = prepared;
         let PreparedInboundMode::Guarded {
-            baseline,
+            baseline: _,
             manifest_revision: _,
             _waiter,
             _operation,
@@ -10508,10 +10522,7 @@ mod tests {
         };
         engine.scan_entry(&entry).await.unwrap();
         std::fs::write(root.join("shared.md"), b"local after scan").unwrap();
-        engine
-            .materialize_entry_state(&entry, &baseline)
-            .await
-            .unwrap();
+        engine.materialize_entry_state(&entry).await.unwrap();
         engine.persist_entry(&entry).await.unwrap();
 
         assert_eq!(
@@ -10816,8 +10827,10 @@ mod tests {
             let (remote_manifest, remote_content) = {
                 let remote = self.remote.lock().await;
                 let manifest = remote.manifest().clone();
-                let hashes: Vec<ContentHash> =
-                    manifest.present_paths().map(|(_, meta)| meta.hash).collect();
+                let hashes: Vec<ContentHash> = manifest
+                    .present_paths()
+                    .map(|(_, meta)| meta.hash)
+                    .collect();
                 (manifest, remote.gather_content(&hashes))
             };
             let pulled = {
@@ -10831,9 +10844,7 @@ mod tests {
             // Once, while this pass holds no operation guard: the same peer's
             // own pass arrives as a guarded inbound session. It scans, adopts
             // nothing new, and materializes the file adopted above.
-            if self.inbound_during_peer_step
-                && !self.inbound_done.swap(true, Ordering::AcqRel)
-            {
+            if self.inbound_during_peer_step && !self.inbound_done.swap(true, Ordering::AcqRel) {
                 let engine = self
                     .engine
                     .lock()
@@ -10926,12 +10937,18 @@ mod tests {
     ) {
         let node = node.lock().await;
         assert!(
-            matches!(node.manifest().get("inbox/job.md"), Some(Entry::Tombstone(_))),
+            matches!(
+                node.manifest().get("inbox/job.md"),
+                Some(Entry::Tombstone(_))
+            ),
             "the rename source must be a tombstone, got {:?}",
             node.manifest().get("inbox/job.md")
         );
         assert!(
-            matches!(node.manifest().get("archive/job.md"), Some(Entry::Present(_))),
+            matches!(
+                node.manifest().get("archive/job.md"),
+                Some(Entry::Present(_))
+            ),
             "the rename destination must be present, got {:?}",
             node.manifest().get("archive/job.md")
         );
@@ -10947,12 +10964,18 @@ mod tests {
         let mut remote = remote.lock().await;
         remote.adopt_from_peer(node.manifest());
         assert!(
-            matches!(remote.manifest().get("inbox/job.md"), Some(Entry::Tombstone(_))),
+            matches!(
+                remote.manifest().get("inbox/job.md"),
+                Some(Entry::Tombstone(_))
+            ),
             "the peer must adopt the source tombstone, got {:?}",
             remote.manifest().get("inbox/job.md")
         );
         assert!(
-            matches!(remote.manifest().get("archive/job.md"), Some(Entry::Present(_))),
+            matches!(
+                remote.manifest().get("archive/job.md"),
+                Some(Entry::Present(_))
+            ),
             "the peer must adopt the destination"
         );
     }
@@ -10964,8 +10987,7 @@ mod tests {
     /// post-peer scan and its materialization reads as a never-seen remote
     /// file, and the source is written back. Both paths end Present.
     #[tokio::test]
-    async fn a_rename_between_the_post_peer_scan_and_its_materialization_does_not_split_the_file()
-    {
+    async fn a_rename_between_the_post_peer_scan_and_its_materialization_does_not_split_the_file() {
         let (_dir, root, engine, remote) = rename_race_fixture(true).await;
         let node = engine.node_for("bus").await.unwrap();
         let evidence = rename_at_seam(&engine, &root, &node, PhaseSeam::AfterPostPeerScan);
@@ -11035,8 +11057,7 @@ mod tests {
         let hook_root = root.clone();
         let hook_fired = fired.clone();
         engine.set_seam_hook(move |seam| {
-            if seam == PhaseSeam::AfterInboundScan
-                && hook_fired.fetch_add(1, Ordering::AcqRel) == 0
+            if seam == PhaseSeam::AfterInboundScan && hook_fired.fetch_add(1, Ordering::AcqRel) == 0
             {
                 std::fs::remove_file(hook_root.join("inbox/draft.md")).unwrap();
             }
@@ -11048,10 +11069,17 @@ mod tests {
         std::fs::write(root.join("inbox/draft.md"), b"draft").unwrap();
         engine.complete_inbound(prepared).await.unwrap();
 
-        assert_eq!(fired.load(Ordering::Relaxed), 1, "the inbound seam did not fire exactly once");
+        assert_eq!(
+            fired.load(Ordering::Relaxed),
+            1,
+            "the inbound seam did not fire exactly once"
+        );
         let node = node.lock().await;
         assert!(
-            matches!(node.manifest().get("inbox/draft.md"), Some(Entry::Tombstone(_))),
+            matches!(
+                node.manifest().get("inbox/draft.md"),
+                Some(Entry::Tombstone(_))
+            ),
             "a file removed after the completion scan must be a tombstone, got {:?}",
             node.manifest().get("inbox/draft.md")
         );
@@ -11074,8 +11102,7 @@ mod tests {
         let hook_root = root.clone();
         let hook_fired = fired.clone();
         engine.set_seam_hook(move |seam| {
-            if seam == PhaseSeam::AfterPrePeerScan
-                && hook_fired.fetch_add(1, Ordering::AcqRel) == 0
+            if seam == PhaseSeam::AfterPrePeerScan && hook_fired.fetch_add(1, Ordering::AcqRel) == 0
             {
                 std::fs::remove_file(hook_root.join("inbox/draft.md")).unwrap();
             }
@@ -11084,10 +11111,17 @@ mod tests {
         std::fs::write(root.join("inbox/draft.md"), b"draft").unwrap();
         engine.sync_once("bus").await.unwrap();
 
-        assert_eq!(fired.load(Ordering::Relaxed), 1, "the pre-peer seam did not fire exactly once");
+        assert_eq!(
+            fired.load(Ordering::Relaxed),
+            1,
+            "the pre-peer seam did not fire exactly once"
+        );
         let node = node.lock().await;
         assert!(
-            matches!(node.manifest().get("inbox/draft.md"), Some(Entry::Tombstone(_))),
+            matches!(
+                node.manifest().get("inbox/draft.md"),
+                Some(Entry::Tombstone(_))
+            ),
             "a file removed after the pre-peer scan must be a tombstone, got {:?}",
             node.manifest().get("inbox/draft.md")
         );

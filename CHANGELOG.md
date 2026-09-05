@@ -26,6 +26,17 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **A local rename can no longer leave both the old and the new path present
+  on every peer.** A sync pass materialized with a disk view it captured before
+  its peer step. An inbound session that ran during that step had already
+  written the peer's file to disk, so the view lacked it, and a rename landing
+  between the post-peer scan and its materialization read as a file this
+  machine never had. The old path was written back and the delete was never
+  recorded. Every materialization now protects exactly what the scan before it
+  saw, and the function that materializes no longer accepts a caller's view.
+  The same rule stops a file created and removed inside one pass or one
+  inbound session from coming back. Issue #175.
+
 - **`fabric doctor` no longer calls an unverified peer build current.** An
   unreachable peer now makes the build check `unknown`, including a roaming
   peer. The closing summary counts that unknown result as needing attention.
