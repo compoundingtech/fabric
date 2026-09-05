@@ -13,6 +13,18 @@ gates. Each peer `allow` array is now the complete service policy. Old command
 flags remain hidden parse-only compatibility inputs. Generated launchd and
 systemd definitions no longer contain those flags.
 
+PRs #180 and #182 completed the refusal-honesty work. Exec and shell policy
+refusals name the peer and service and return status 126. Doctor treats an
+intentional exec policy refusal as informational and does not add it to the
+attention count. It must never report that refusal as Ok. Ok means the check
+confirmed the remote build, while a policy refusal prevented that check.
+Unexpected version failures stay unknown.
+
+Issue #181 records the missing peer build handshake. Fabric can learn a remote
+build only through exec today. Adding build metadata requires separate wire
+design with mixed-version and preface-ordering proofs. Nobody has started that
+design, and the issue does not authorize a wire change.
+
 The legacy migration uses an intersection. A true old key preserves only the
 matching grants already present in peer arrays. A false or missing old key
 removes the matching grants. Fabric reports each removed grant and whether the
