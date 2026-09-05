@@ -147,7 +147,7 @@ async fn sync_status_of(home: &FabricHome) -> Result<Vec<fabric::control::SyncEn
     let mut last = None;
     for _ in 0..50 {
         match send_control(home, ControlRequest::SyncStatus).await {
-            Ok(fabric::control::ControlResponse::SyncStatus { entries }) => return Ok(entries),
+            Ok(fabric::control::ControlResponse::SyncStatus { entries, .. }) => return Ok(entries),
             Ok(other) => panic!("expected SyncStatus, got {other:?}"),
             Err(error) => last = Some(error),
         }
@@ -776,7 +776,7 @@ async fn a_small_change_must_not_ship_the_whole_manifest() -> Result<()> {
 
     async fn sample(home: &FabricHome) -> Result<(u64, u64, String)> {
         match send_control(home, ControlRequest::SyncStatus).await? {
-            fabric::control::ControlResponse::SyncStatus { entries } => {
+            fabric::control::ControlResponse::SyncStatus { entries, .. } => {
                 let e = entries.into_iter().find(|e| e.name == "shared").unwrap();
                 Ok((e.reconcile_wire_bytes, e.sync_passes, e.digest))
             }
@@ -1420,7 +1420,7 @@ async fn stopped_peers_of(home: &FabricHome) -> Vec<(String, String)> {
     let mut stopped = Vec::new();
     for _ in 0..40 {
         stopped = match send_control(home, ControlRequest::SyncStatus).await {
-            Ok(fabric::control::ControlResponse::SyncStatus { entries }) => entries
+            Ok(fabric::control::ControlResponse::SyncStatus { entries, .. }) => entries
                 .into_iter()
                 .find(|e| e.name == "shared")
                 .map(|e| e.stopped_peers)
@@ -1627,7 +1627,7 @@ async fn a_peer_denied_sync_makes_the_entry_report_stopped_not_clean() -> Result
     let mut stopped = Vec::new();
     for _ in 0..40 {
         stopped = match send_control(&a_home, ControlRequest::SyncStatus).await? {
-            fabric::control::ControlResponse::SyncStatus { entries } => entries
+            fabric::control::ControlResponse::SyncStatus { entries, .. } => entries
                 .into_iter()
                 .find(|e| e.name == "shared")
                 .map(|e| e.stopped_peers)

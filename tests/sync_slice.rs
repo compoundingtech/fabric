@@ -64,7 +64,7 @@ async fn reload_sync(home: &FabricHome) -> Result<()> {
 }
 
 async fn sync_status(home: &FabricHome, name: &str) -> Result<SyncEntryStatus> {
-    let ControlResponse::SyncStatus { entries } =
+    let ControlResponse::SyncStatus { entries, .. } =
         send_control(home, ControlRequest::SyncStatus).await?
     else {
         anyhow::bail!("unexpected sync status response");

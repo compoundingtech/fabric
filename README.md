@@ -889,16 +889,22 @@ fabric service status
 fabric service uninstall
 ```
 
-Install, inspect, or remove the OS user service. `install` starts/restarts the
-native service manager entry and enables it for future user sessions. `status`
-delegates to `systemctl --user status fabric.service --no-pager` on Linux and
-`launchctl print gui/$UID/com.compoundingtech.fabric` on macOS. `uninstall` stops the
-managed service and removes only the systemd/launchd artifact; it leaves the
-fabric home, identity, peers, logs, and config in place. No memory ceiling is
-set unless `--memory-max-mb` is passed, and `--no-memory-max-mb` removes one
-that was. The shell and exec flags remain accepted for compatibility, but they
-do not decide policy. Set one memory limit only after validating that endpoint
-recycle can complete below that cap on the target machine.
+Install, inspect, or remove the OS user services. `install` starts/restarts the
+daemon and its independent `fabric-sync` companion. It enables both services
+for future user sessions. The companion runs in compatibility standby while
+the daemon owns embedded sync.
+
+`status` reports `fabric.service` and `fabric-sync.service` on Linux. It reports
+`com.compoundingtech.fabric` and `com.compoundingtech.fabric-sync` on macOS.
+`uninstall` stops the companion first, then the daemon. It removes only the
+systemd or launchd artifacts. It leaves the fabric home, identity, peers, logs,
+and config in place.
+
+No memory ceiling is set unless `--memory-max-mb` is passed, and
+`--no-memory-max-mb` removes one that was. The shell and exec flags remain
+accepted for compatibility, but they do not decide policy. Set one memory limit
+only after validating that endpoint recycle can complete below that cap on the
+target machine.
 
 ### Debug Transport Test Commands
 
@@ -982,10 +988,18 @@ The sync engine receives explicit config and state paths instead of the daemon
 home. It holds `<home>/sync/owner.lock` for its lifetime, so a second engine
 fails before it reads or changes the same state.
 
-The library also defines a dormant `fabric/sync-ipc/1` Unix bridge for the
-planned companion process. Its owner-only socket uses bounded, versioned control
-messages, then carries raw `fabric/sync/1` bytes. No production request selects
-this bridge yet; the daemon remains the embedded sync owner.
+The package ships a separately supervised `fabric-sync` companion. It reports
+its presence to the daemon, but it stays in compatibility standby. It does not
+acquire the sync-owner lease or start folder watchers. The daemon remains the
+embedded sync owner.
+
+The library also defines a dormant `fabric/sync-ipc/1` Unix bridge. Its
+owner-only socket uses bounded, versioned control messages, then carries raw
+`fabric/sync/1` bytes. No production request selects this bridge yet.
+
+`fabric status`, `fabric sync ls`, and `fabric doctor` report the sync owner and
+companion state. `fabric sync ls` reads `syncs.toml` when the daemon is down. It
+still lists every configured entry and marks runtime and drift as unavailable.
 
 Entries live in an authoritative, hand-editable `syncs.toml` next to `peers.toml`
 (`~/.config/fabric/syncs.toml` for the default home, `<home>/syncs.toml` with

@@ -15,7 +15,7 @@ use fabric::{
         DEFAULT_EXEC_MAX_CHILDREN, FabricHome, GitAccess, PeerBook, generate_identity_file,
         load_or_create_identity, parse_addr_json, parse_node_id,
     },
-    control::{ControlRequest, ControlResponse, PeerReachability},
+    control::{ControlRequest, ControlResponse, PeerReachability, SyncEntryStatus, SyncRuntimeStatus},
     daemon::{
         DaemonOptions, FabricNode, init_daemon_tracing, run_daemon_with_options, send_control,
     },
@@ -530,6 +530,18 @@ async fn main() -> Result<()> {
                             active_dial_handlers,
                             max_dial_handlers,
                         } => {
+                            let sync_runtime = match send_control(
+                                &home,
+                                ControlRequest::SyncRuntimeStatus,
+                            )
+                            .await
+                            {
+                                Ok(ControlResponse::SyncRuntimeStatus { runtime }) => runtime,
+                                _ => SyncRuntimeStatus {
+                                    owner: "unknown".to_string(),
+                                    companion: "unknown".to_string(),
+                                },
+                            };
                             print_status(
                                 &version,
                                 &node_id,
@@ -543,6 +555,7 @@ async fn main() -> Result<()> {
                                 &connection_telemetry_window,
                                 &current_connection_health,
                                 (active_dial_handlers, max_dial_handlers),
+                                &sync_runtime,
                             )?;
                         }
                         response => bail!("unexpected daemon response: {response:?}"),
@@ -1224,85 +1237,119 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
             let _ = send_control(home, ControlRequest::SyncReload).await;
             println!("sync {name:?} written to {}", home.syncs_path().display());
         }
-        SyncCommands::Ls { json } => match send_control(home, ControlRequest::SyncStatus).await? {
-            ControlResponse::SyncStatus { entries } => {
-                if json {
-                    let entries: Vec<_> = entries.iter().map(SyncLsJsonEntry::from).collect();
-                    println!("{}", serde_json::to_string_pretty(&entries)?);
-                    return Ok(());
+        SyncCommands::Ls { json } => {
+            let (entries, runtime) = match send_control(home, ControlRequest::SyncStatus).await {
+                Ok(ControlResponse::SyncStatus { entries, runtime }) => (entries, runtime),
+                Ok(response) => bail!("unexpected daemon response: {response:?}"),
+                Err(_) => {
+                    let book = SyncBook::load(home)?;
+                    let entries = book
+                        .entries()
+                        .iter()
+                        .map(configured_sync_status)
+                        .collect();
+                    (
+                        entries,
+                        SyncRuntimeStatus {
+                            owner: "unavailable".to_string(),
+                            companion: "unknown".to_string(),
+                        },
+                    )
                 }
-                if entries.is_empty() {
-                    println!("no sync entries");
+            };
+            if json {
+                let entries: Vec<_> = entries
+                    .iter()
+                    .map(|entry| SyncLsJsonEntry::from(entry).with_runtime(&runtime))
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+                return Ok(());
+            }
+            println!(
+                "runtime\towner={}\tcompanion={}",
+                runtime.owner, runtime.companion
+            );
+            if entries.is_empty() {
+                println!("no sync entries");
+            }
+            for entry in entries {
+                if runtime.owner == "unavailable" {
+                    println!(
+                        "{}\t{}\t{}\tpeers={}\truntime=unavailable\tdrift=unknown\tstopped={}",
+                        entry.name,
+                        entry.folder,
+                        entry.policy,
+                        entry.peers,
+                        stopped_token(&entry),
+                    );
+                    continue;
                 }
-                for entry in entries {
-                    let present = logical_present(&entry);
-                    if entry.missing == 0
-                        && entry.unexpected == 0
-                        && entry.mismatched == 0
-                        && entry.scan_issues.is_empty()
-                    {
-                        println!(
-                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean\tscan_issues=none\tstopped={}\taway={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tcontent_bytes={}\tdigest={}",
-                            entry.name,
-                            entry.folder,
-                            entry.policy,
-                            entry.peers,
-                            entry.tombstones,
-                            entry.observed,
-                            stopped_token(&entry),
-                            away_token(&entry),
-                            entry.sync_passes,
-                            entry.full_scans,
-                            entry.inbound_noop_transactions,
-                            entry.inbound_guarded_transactions,
-                            entry.scan_micros / 1000,
-                            entry.materialize_micros / 1000,
-                            entry.persist_micros / 1000,
-                            entry.reconcile_micros / 1000,
-                            entry.reconcile_wire_bytes,
-                            entry.reconcile_failures,
-                            sweep_token(&entry),
-                            entry.delta_fallbacks,
-                            entry.full_payload_sends,
-                            entry.content_bytes,
-                            short_digest(&entry.digest),
-                        );
-                    } else {
-                        println!(
-                            "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}\tscan_issues={}\tstopped={}\taway={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tcontent_bytes={}\tdigest={}",
-                            entry.name,
-                            entry.folder,
-                            entry.policy,
-                            entry.peers,
-                            entry.tombstones,
-                            entry.observed,
-                            entry.missing,
-                            entry.unexpected,
-                            entry.mismatched,
-                            scan_issues_token(&entry),
-                            stopped_token(&entry),
-                            away_token(&entry),
-                            entry.sync_passes,
-                            entry.full_scans,
-                            entry.inbound_noop_transactions,
-                            entry.inbound_guarded_transactions,
-                            entry.scan_micros / 1000,
-                            entry.materialize_micros / 1000,
-                            entry.persist_micros / 1000,
-                            entry.reconcile_micros / 1000,
-                            entry.reconcile_wire_bytes,
-                            entry.reconcile_failures,
-                            sweep_token(&entry),
-                            entry.delta_fallbacks,
-                            entry.full_payload_sends,
-                            entry.content_bytes,
-                            short_digest(&entry.digest),
-                        );
-                    }
+                let present = logical_present(&entry);
+                if entry.missing == 0
+                    && entry.unexpected == 0
+                    && entry.mismatched == 0
+                    && entry.scan_issues.is_empty()
+                {
+                    println!(
+                        "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean\tscan_issues=none\tstopped={}\taway={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tcontent_bytes={}\tdigest={}",
+                        entry.name,
+                        entry.folder,
+                        entry.policy,
+                        entry.peers,
+                        entry.tombstones,
+                        entry.observed,
+                        stopped_token(&entry),
+                        away_token(&entry),
+                        entry.sync_passes,
+                        entry.full_scans,
+                        entry.inbound_noop_transactions,
+                        entry.inbound_guarded_transactions,
+                        entry.scan_micros / 1000,
+                        entry.materialize_micros / 1000,
+                        entry.persist_micros / 1000,
+                        entry.reconcile_micros / 1000,
+                        entry.reconcile_wire_bytes,
+                        entry.reconcile_failures,
+                        sweep_token(&entry),
+                        entry.delta_fallbacks,
+                        entry.full_payload_sends,
+                        entry.content_bytes,
+                        short_digest(&entry.digest),
+                    );
+                } else {
+                    println!(
+                        "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}\tscan_issues={}\tstopped={}\taway={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tcontent_bytes={}\tdigest={}",
+                        entry.name,
+                        entry.folder,
+                        entry.policy,
+                        entry.peers,
+                        entry.tombstones,
+                        entry.observed,
+                        entry.missing,
+                        entry.unexpected,
+                        entry.mismatched,
+                        scan_issues_token(&entry),
+                        stopped_token(&entry),
+                        away_token(&entry),
+                        entry.sync_passes,
+                        entry.full_scans,
+                        entry.inbound_noop_transactions,
+                        entry.inbound_guarded_transactions,
+                        entry.scan_micros / 1000,
+                        entry.materialize_micros / 1000,
+                        entry.persist_micros / 1000,
+                        entry.reconcile_micros / 1000,
+                        entry.reconcile_wire_bytes,
+                        entry.reconcile_failures,
+                        sweep_token(&entry),
+                        entry.delta_fallbacks,
+                        entry.full_payload_sends,
+                        entry.content_bytes,
+                        short_digest(&entry.digest),
+                    );
                 }
             }
-            response => bail!("unexpected daemon response: {response:?}"),
-        },
+        }
         SyncCommands::Rm { name_or_folder } => {
             let mut book = SyncBook::load(home)?;
             if !book.remove(&name_or_folder) {
@@ -1350,6 +1397,8 @@ mod sync_command_tests {
 
 #[derive(serde::Serialize)]
 struct SyncLsJsonEntry<'a> {
+    runtime_owner: String,
+    companion: String,
     name: &'a str,
     folder: &'a str,
     policy: &'a str,
@@ -1357,7 +1406,7 @@ struct SyncLsJsonEntry<'a> {
     present: usize,
     tombstones: usize,
     observed: usize,
-    drift: bool,
+    drift: Option<bool>,
     missing: usize,
     unexpected: usize,
     mismatched: usize,
@@ -1401,6 +1450,8 @@ struct SyncLsJsonEntry<'a> {
 impl<'a> From<&'a fabric::control::SyncEntryStatus> for SyncLsJsonEntry<'a> {
     fn from(entry: &'a fabric::control::SyncEntryStatus) -> Self {
         Self {
+            runtime_owner: "unknown".to_string(),
+            companion: "unknown".to_string(),
             name: &entry.name,
             folder: &entry.folder,
             policy: &entry.policy,
@@ -1408,10 +1459,12 @@ impl<'a> From<&'a fabric::control::SyncEntryStatus> for SyncLsJsonEntry<'a> {
             present: logical_present(entry),
             tombstones: entry.tombstones,
             observed: entry.observed,
-            drift: entry.missing != 0
-                || entry.unexpected != 0
-                || entry.mismatched != 0
-                || !entry.scan_issues.is_empty(),
+            drift: Some(
+                entry.missing != 0
+                    || entry.unexpected != 0
+                    || entry.mismatched != 0
+                    || !entry.scan_issues.is_empty(),
+            ),
             missing: entry.missing,
             unexpected: entry.unexpected,
             mismatched: entry.mismatched,
@@ -1444,6 +1497,31 @@ impl<'a> From<&'a fabric::control::SyncEntryStatus> for SyncLsJsonEntry<'a> {
             reconcile_failures: entry.reconcile_failures,
             sweep: sweep_token(entry),
         }
+    }
+}
+
+impl SyncLsJsonEntry<'_> {
+    fn with_runtime(mut self, runtime: &SyncRuntimeStatus) -> Self {
+        self.runtime_owner = runtime.owner.clone();
+        self.companion = runtime.companion.clone();
+        if runtime.owner == "unavailable" {
+            self.drift = None;
+        }
+        self
+    }
+}
+
+fn configured_sync_status(entry: &SyncEntry) -> SyncEntryStatus {
+    SyncEntryStatus {
+        name: entry.name.clone(),
+        folder: entry.folder.display().to_string(),
+        policy: entry.policy.as_str().to_string(),
+        peers: match &entry.peers {
+            SyncPeers::Wildcard(_) => "*".to_string(),
+            SyncPeers::List(peers) => peers.join(","),
+        },
+        stopped_peers: vec![("runtime".to_string(), "unavailable".to_string())],
+        ..SyncEntryStatus::default()
     }
 }
 
@@ -2136,6 +2214,8 @@ mod sync_ls_tests {
         assert_eq!(
             json,
             serde_json::json!({
+                "runtime_owner": "unknown",
+                "companion": "unknown",
                 "name": "catalog",
                 "folder": "/catalog",
                 "policy": "catalog",
@@ -2255,6 +2335,7 @@ fn print_status(
     connection_telemetry_window: &TelemetryWindow,
     current_connection_health: &BTreeMap<String, fabric::mux::CurrentConnectionHealth>,
     dial_handlers: (usize, usize),
+    sync_runtime: &SyncRuntimeStatus,
 ) -> Result<()> {
     println!("version\t{version}");
     println!("node\t{node_id}");
@@ -2274,6 +2355,10 @@ fn print_status(
     // waits with no error, which reads as "hangs while ping answers".
     let (active, max) = dial_handlers;
     println!("dial handlers\t{active}/{max} in use");
+    println!(
+        "sync runtime\towner={}\tcompanion={}",
+        sync_runtime.owner, sync_runtime.companion
+    );
     print_peer_reachability(peers);
     print_current_connection_health(current_connection_health);
     let current_peers = peers
