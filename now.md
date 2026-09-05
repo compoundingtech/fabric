@@ -4,15 +4,46 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-05 by Silber.fabric-codex. Silber and hetz run
-`0.2.2+a2f8a73`, measured by Silber.cos on 2026-09-05. Bluey is away. Nathan
-last saw Bluey on `0.2.1+48208e4` at about 22:30 on 2026-09-04. Treat that as
-last-known, not current. Ask Silber.cos before each release or deployment._
+_Last updated: 2026-09-05 by Silber.fabric-codex. Main is `f5a88b7`._
 
-For extraction steps 6 and 8, merge on green without asking for a separate
-Silber.cos approval. Silber.cos holds the step 7 activation gate and every
-release or deployment gate. Before any deployment, prove matched-pair rollback
-on hetz. macOS needs a detached update supervisor; the current change adds it.
+## Latest handoff — 2026-09-05
+
+PR #185 merged at `f5a88b7`. It removes the machine-wide shell and exec policy
+gates. Each peer `allow` array is now the complete service policy. Old command
+flags remain hidden parse-only compatibility inputs. Generated launchd and
+systemd definitions no longer contain those flags.
+
+The legacy migration uses an intersection. A true old key preserves only the
+matching grants already present in peer arrays. A false or missing old key
+removes the matching grants. Fabric reports each removed grant and whether the
+old key was false or absent. An unknown format or failed migration write makes
+a reload fail closed.
+
+Format 2 writes generated `allow_shell` and `allow_exec` rollback mirrors. The
+new reader ignores them as policy. A restored 0.2.5 binary reads them and gets
+the same effective policy that existed before migration. Remove these mirrors
+in 0.2.7 only when the actual rollback binary understands format 2. A release
+number alone does not prove that condition because a machine can skip a
+release.
+
+Silber and Hetz received the approved format 2 config markers before PR #185
+merged. Their peer arrays did not change. Each host passed `fabric doctor`.
+Real exec worked from Silber to Hetz and from Hetz to Silber. The installed
+0.2.5 binary performed a no-op peer write on each host, and the full file stayed
+byte-identical. The marker and rollback warning survived both writes.
+
+All PR #185 merge-result checks passed. The local proof was 533 active library
+tests, 31 local-slice tests, 14 shell tests, and 12 provisioning tests. Five
+library measurements stayed ignored. `cargo check --all-targets` also passed.
+
+No release or deployment followed the merge. A release or deployment requires
+a fresh exact gate from Silber.cos. At this handoff, Silber and Hetz both run
+`0.2.5+4dc0cac`. Silber.cos re-read them with `fabric --version` on Silber and
+`fabric exec hetz -- fabric --version` for Hetz. Re-run those commands before
+using the recorded value because an update makes it stale immediately.
+
+No code job remains live from this work. Do not infer a release task from the
+merged change or from this note. Wait for a native request.
 
 ## Current main — 2026-09-05
 
