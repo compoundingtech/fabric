@@ -404,9 +404,19 @@ Silber.cos owns the step 7 activation gate and every release and deployment
 gate.
 
 Before any release, run every ignored test that needs a real machine. Record
-the machine, commit, command, and result. The current required test is:
+the machine, commit, command, and result.
 
-- macOS launchd rollback: `a_real_launchd_supervisor_rolls_back_and_removes_its_job`
+| Platform | Test | Exact proof |
+| --- | --- | --- |
+| macOS | `a_real_launchd_supervisor_rolls_back_and_removes_its_job` | An isolated real launchd job detects a deliberately broken pair. The pair-aware reader restores both members. The plist and loaded job disappear. |
+| Linux | `a_real_systemd_supervisor_rolls_back_and_removes_its_jobs` | An isolated real systemd timer starts its service over a deliberately broken pair. The pair-aware reader restores both members. Both units disappear. |
+
+These tests use isolated paths and services. They do not prove the production
+service names, install paths, home permissions, or service definitions.
+
+Before the transition release, run one rollback through the actual production
+service on Linux and macOS. Use hetz first and Silber second. Record every
+observed state and any manual cleanup. Do not use Bluey for this exercise.
 
 Add each future real-machine test to this named list when the test is added.
 The measurement-only ignored tests are not release gates unless this list names
