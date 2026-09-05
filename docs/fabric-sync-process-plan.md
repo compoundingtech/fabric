@@ -415,13 +415,15 @@ Each implementation pull request merges when its required tests and CI pass.
 Silber.cos owns the step 7 activation gate and every release and deployment
 gate.
 
-Before any release, run every ignored test that needs a real machine. Record
-the machine, commit, command, and result.
+Before any release, run every named real-machine gate. Some gates are ignored
+tests, and some are matched live measurements. Record the machine, commit,
+command, and result.
 
 | Platform | Test | Exact proof |
 | --- | --- | --- |
 | macOS | `a_real_launchd_supervisor_rolls_back_and_removes_its_job` | An isolated real launchd job detects a deliberately broken pair. The pair-aware reader restores both members. The plist and loaded job disappear. |
 | Linux | `a_real_systemd_supervisor_rolls_back_and_removes_its_jobs` | An isolated real systemd timer starts its service over a deliberately broken pair. The pair-aware reader restores both members. Both units disappear. |
+| Linux | `offline_peer_cost_matches_control` | A configured peer that never answers does not move healthy-peer latency, CPU use, or resident memory outside a matched control window. |
 
 These tests use isolated paths and services. They do not prove the production
 service names, install paths, home permissions, or service definitions.
@@ -454,6 +456,24 @@ isolated home. It accepted the checksum, then refused the archive because it
 expected exactly one `fabric` member. It changed no executable or staging file.
 This clean refusal enforces the Release A order for that deployed reader. It is
 not a property of the Release A pair-aware reader.
+
+The first `offline_peer_cost_matches_control` gate passed on hetz at exact tag
+`v0.2.4+9b425d6` on 2026-09-05. The treatment added one peer that never answered
+and then restored the exact prior file digest. It sent 300 healthy-peer pings
+over 91.663 seconds. All pings passed, and none took more than one second.
+
+The matched resource traces each sampled the same daemon PID once per second
+for 379.095 seconds. Treatment used 5.925% of one core and had a 155,824 KiB RSS
+span. Control used 11.942% and had a 196,048 KiB span. Normal machine work was
+larger than the effect under test. Thus, the offline peer's cost was below this
+machine's noise floor. The daemon did not restart during the gate.
+
+For each release, run the treatment and control on the same Linux machine and
+deployed commit. Record CPU time, RSS minimum and maximum, and 300 healthy-peer
+ping times. Sample each resource window once per second for at least six
+minutes. Restore the exact prior `peers.toml` digest after treatment. The gate
+fails if treatment exceeds the control by more than the control's own 60-second
+variation. It also fails if a healthy ping fails or exceeds one second.
 
 Add each future real-machine test to this named list when the test is added.
 The measurement-only ignored tests are not release gates unless this list names
