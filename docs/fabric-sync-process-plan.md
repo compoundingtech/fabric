@@ -186,7 +186,7 @@ pair-aware rollback reader and the macOS supervisor. It contains no companion.
 The reader restores both old processes when a companion existed. It removes the
 companion binary and OS service when no companion existed. The first paired
 archive is the later writer. This gate is per machine, so a roaming machine such
-as Bluey first receives the transition release when it returns.
+as Bluey first receives a fabric-only archive when it returns.
 
 The reader-before-writer rule applies to every update artifact. If a new release
 writes an artifact that an old rollback binary must read, the old binary must
@@ -194,6 +194,13 @@ understand that artifact before the writer reaches the machine. Service
 definitions, generation records, durable state, and future install metadata all
 follow this rule. A release plan must identify the reader for each new artifact
 before it permits the writer.
+
+Release `v0.2.3+bef869a` is a published one-member route. Release `0.2.4`
+publishes the canonical paired archive for the strict `0.2.2` server readers.
+It also publishes a distinct one-member compatibility archive for Bluey's
+strict `0.2.1` reader. Bluey selects that asset with an explicit URL and hash,
+so it needs only one supervised update. The `0.2.4` updater accepts both valid
+shapes, and later releases can return to paired archives only.
 
 ### Paired-install rollback inventory
 
@@ -330,6 +337,11 @@ Release archives contain exactly `fabric` and `fabric-sync`. The installer and
 updater verify both members, both hashes, and equal versions. Rollback stores a
 matched pair.
 
+The updater also accepts the earlier fabric-only release shape. A one-member
+install removes an installed companion and keeps the complete prior set for
+rollback. It rejects all other member sets. This tolerant reader prevents a
+future archive-shape change from requiring another strict-reader flag day.
+
 The main daemon still runs embedded sync. Removing the companion binary reverts
 this step without changing behavior.
 
@@ -375,9 +387,9 @@ Deploy one machine first and prove both mixed directions. Continue one machine
 at a time. The release gate remains with Silber.cos. Reverting the complete
 binary pair restores the embedded owner and reads the unchanged state.
 
-No paired archive may reach a machine until that machine runs the fabric-only
-transition release and has proved its rollback reader. Bluey follows the same
-gate when it returns.
+No paired archive may reach a machine until that machine runs a fabric-only
+release and has proved its rollback reader. Bluey follows the same gate when it
+returns. Its distinct `0.2.4` compatibility asset satisfies this reader gate.
 
 ### 8. Remove the dormant embedded engine
 

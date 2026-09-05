@@ -362,6 +362,13 @@ and `fabric-sync` (not dot-prefixed paths). Verify that shape before extracting:
 
 The process-extraction plan defines one fabric-only transition release before
 the first paired deployment. That gated reader release is the only exception.
+The updater accepts that one-member shape and the paired shape. It rejects all
+other member sets. A one-member install removes an installed companion and
+keeps both prior binaries for rollback.
+
+Current releases publish the pair at `fabric-<target>.tar.gz`. Release `0.2.4`
+also publishes `fabric-only-<target>.tar.gz` for a strict one-member reader.
+That compatibility asset requires `fabric update --url ... --sha256 ...`.
 
 `fabric update` arms a detached verifier before it replaces either binary. On
 macOS, launchd owns a transient one-shot job across terminal loss and system

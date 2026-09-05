@@ -4,9 +4,10 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-05 by Silber.fabric-codex. Silber and hetz run Release A.
-Bluey was away and last reported the earlier fleet build. Ask Silber.cos before
-each release or deployment._
+_Last updated: 2026-09-05 by Silber.fabric-codex. Silber and hetz run
+`0.2.2+a2f8a73`, measured by Silber.cos on 2026-09-05. Bluey is away. Nathan
+last saw Bluey on `0.2.1+48208e4` at about 22:30 on 2026-09-04. Treat that as
+last-known, not current. Ask Silber.cos before each release or deployment._
 
 For extraction steps 6 and 8, merge on green without asking for a separate
 Silber.cos approval. Silber.cos holds the step 7 activation gate and every
@@ -54,8 +55,9 @@ it.
 Release A must be a fabric-only transition release. It carries pair-aware
 rollback and the macOS supervisor, but its archive has no companion. Deploy and
 prove Release A on each machine before that machine receives its first paired
-archive. Bluey also receives Release A first when it returns. Silber.cos owns
-both release and deployment gates.
+archive. Bluey can instead receive the fabric-only `0.2.4` compatibility asset
+when it returns. That asset installs the same tolerant reader before Bluey sees
+a paired archive. Silber.cos owns both release and deployment gates.
 
 The Release A reader must handle OS service state as well as binary paths. It
 must restart both old services when a companion rollback exists. It must remove
@@ -107,6 +109,30 @@ problem. An enabled service with a missing binary now asks for a matched pair.
 
 PR #171 merged the transition doctor fix as `475807e`. It passed the Nix,
 macOS, and deterministic checks. It is not released or deployed.
+
+PR #172 isolated one peer's slow connection open from healthy peers. A recovery
+regression exposed two separate races. PR #174 corrected the connection race as
+`2d629f4`. Issue #175 retains the older sync rename race, which remains unfixed.
+
+PR #173 set version `0.2.3` and merged as `bef869a`. Release
+`v0.2.3+bef869a` is published with one-member archives. The checksums and the
+macOS binary passed. No server installed it. The `0.2.2` updater refused it
+before staging because that reader requires exactly two archive members.
+
+PR #176 restores paired release packaging. It also makes the updater
+accept exactly two valid shapes: `fabric` alone, or `fabric` with
+`fabric-sync`. Extra, missing, duplicate, and dot-prefixed members remain
+errors. A one-member install removes the companion and keeps the prior pair for
+rollback. Both Linux shapes schedule the service restart outside the caller's
+cgroup. The one-member restart omits the absent companion. Release `0.2.4` must
+use paired archives so the strict `0.2.2` server readers can install it. The
+release also publishes a distinct one-member asset
+for Bluey's strict `0.2.1` reader. Bluey selects that asset with an explicit URL
+and SHA-256, so it can move to `0.2.4` in one supervised update. The explicit
+URL path does not check Git commit direction. It checks the caller's hash, the
+archive shape, the executable, its reported version, and rollback readiness.
+Do not replace or remove `v0.2.3`. Silber.cos must gate the release and every
+deployment.
 
 A retained hetz-to-Silber window measured 300 direct probes over 358.498
 seconds. All probes passed. External p50 was 45.013 ms, p95 was 2.117 seconds,

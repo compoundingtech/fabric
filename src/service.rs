@@ -186,19 +186,27 @@ fn control_socket_state(
 /// That is the same trap as installing at `command -v fabric`, entered from the
 /// other side.
 pub fn install_at(home: &FabricHome, exe: &Path, options: ServiceInstallOptions) -> Result<()> {
-    install_at_with_verification(home, exe, options, InstallVerification::Immediate)
+    install_at_with_verification(home, exe, options, InstallVerification::Immediate, true)
 }
 
 pub(crate) fn install_at_for_update(
     home: &FabricHome,
     exe: &Path,
     options: ServiceInstallOptions,
+    companion_exists: bool,
+    detached_supervisor: bool,
 ) -> Result<()> {
+    let verification = if detached_supervisor {
+        InstallVerification::DetachedSupervisor
+    } else {
+        InstallVerification::Immediate
+    };
     install_at_with_verification(
         home,
         exe,
         options,
-        InstallVerification::DetachedSupervisor,
+        verification,
+        companion_exists,
     )
 }
 
@@ -207,6 +215,7 @@ fn install_at_with_verification(
     exe: &Path,
     options: ServiceInstallOptions,
     verification: InstallVerification,
+    companion_exists: bool,
 ) -> Result<()> {
     // The managed OS-service is a PROD-only concept, under a single global label.
     // Installing it against a dev/custom home would register a SECOND service on
@@ -230,14 +239,23 @@ fn install_at_with_verification(
     let allow_exec = resolve_allow_exec(home, options.allow_exec)?;
     let memory_max_mb = resolve_memory_max_mb(home, options.memory_max_mb)?;
     let spec = ServiceSpec::new(exe, home.root(), allow_shell, allow_exec, memory_max_mb)?;
-    require_sync_companion(&spec)?;
+    if companion_exists {
+        require_sync_companion(&spec)?;
+    }
     match ServiceManager::current()? {
         #[cfg(target_os = "linux")]
-        ServiceManager::SystemdUser => install_systemd_user(&spec)?,
+        ServiceManager::SystemdUser => {
+            install_systemd_user(&spec, companion_exists)?;
+        }
         #[cfg(target_os = "macos")]
         ServiceManager::LaunchdUser => {
+            if !companion_exists {
+                remove_launchd_sync_for_rollback()?;
+            }
             install_launchd_user(home, &spec)?;
-            install_launchd_sync_user(home, &spec)?;
+            if companion_exists {
+                install_launchd_sync_user(home, &spec)?;
+            }
         }
     }
 
@@ -427,34 +445,34 @@ fn resolve_allow_exec(home: &FabricHome, requested: Option<bool>) -> Result<bool
 /// No `--unit` name is passed on purpose. systemd names the transient unit
 /// itself, so two updates close together cannot collide on a name that already
 /// exists — which would fail the second one for a reason nobody would guess.
-fn systemd_restart_argv() -> (&'static str, Vec<String>) {
-    (
-        "systemd-run",
-        vec![
-            "--user".into(),
-            // THE VERIFIER TRUSTS THIS DELAY, so systemd must honour it.
-            //
-            // `fabric update` schedules this restart at +3s and a verifier at
-            // +12s that waits 45s for the new version and rolls back if it does
-            // not see it. systemd defaults to AccuracySec=1min and batches
-            // timers, so without this line the restart can fire up to a minute
-            // late while the verifier fires on time, sees the OLD daemon for its
-            // whole window, and rolls a good update back to the previous binary
-            // — cleanly, with the only record in the journal. The verifier's own
-            // timer already sets this; the restart it verifies must too, or the
-            // two delays encode an order systemd is free to ignore. Finding 6 of
-            // the 2026-08-29 review.
-            "--timer-property=AccuracySec=1s".into(),
-            // Long enough that the caller returns before its cgroup goes away,
-            // short enough that an operator is not left waiting on it.
-            "--on-active=3".into(),
-            "systemctl".into(),
-            "--user".into(),
-            "restart".into(),
-            SERVICE_NAME.into(),
-            SYNC_SERVICE_NAME.into(),
-        ],
-    )
+fn systemd_restart_argv(companion_exists: bool) -> (&'static str, Vec<String>) {
+    let mut args = vec![
+        "--user".into(),
+        // THE VERIFIER TRUSTS THIS DELAY, so systemd must honour it.
+        //
+        // `fabric update` schedules this restart at +3s and a verifier at
+        // +12s that waits 45s for the new version and rolls back if it does
+        // not see it. systemd defaults to AccuracySec=1min and batches
+        // timers, so without this line the restart can fire up to a minute
+        // late while the verifier fires on time, sees the OLD daemon for its
+        // whole window, and rolls a good update back to the previous binary
+        // — cleanly, with the only record in the journal. The verifier's own
+        // timer already sets this; the restart it verifies must too, or the
+        // two delays encode an order systemd is free to ignore. Finding 6 of
+        // the 2026-08-29 review.
+        "--timer-property=AccuracySec=1s".into(),
+        // Long enough that the caller returns before its cgroup goes away,
+        // short enough that an operator is not left waiting on it.
+        "--on-active=3".into(),
+        "systemctl".into(),
+        "--user".into(),
+        "restart".into(),
+        SERVICE_NAME.into(),
+    ];
+    if companion_exists {
+        args.push(SYNC_SERVICE_NAME.into());
+    }
+    ("systemd-run", args)
 }
 
 /// Resolve the memory ceiling, in the same shape as the two allow flags above.
@@ -711,26 +729,35 @@ impl ServiceManager {
 }
 
 #[cfg(target_os = "linux")]
-fn install_systemd_user(spec: &ServiceSpec) -> Result<()> {
+fn install_systemd_user(spec: &ServiceSpec, companion_exists: bool) -> Result<()> {
     let unit_path = systemd_user_unit_path()?;
     let sync_unit_path = systemd_sync_user_unit_path()?;
+    if !companion_exists {
+        remove_systemd_sync_for_rollback()?;
+    }
     if let Some(parent) = unit_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     fs::write(&unit_path, render_systemd_user_unit(spec))
         .with_context(|| format!("failed to write {}", unit_path.display()))?;
-    fs::write(&sync_unit_path, render_systemd_sync_user_unit(spec)?)
-        .with_context(|| format!("failed to write {}", sync_unit_path.display()))?;
+    if companion_exists {
+        fs::write(&sync_unit_path, render_systemd_sync_user_unit(spec)?)
+            .with_context(|| format!("failed to write {}", sync_unit_path.display()))?;
+    }
 
     run_command("systemctl", &["--user", "daemon-reload"])?;
     run_command("systemctl", &["--user", "enable", SERVICE_NAME])?;
-    run_command("systemctl", &["--user", "enable", SYNC_SERVICE_NAME])?;
-    let (program, args) = systemd_restart_argv();
+    if companion_exists {
+        run_command("systemctl", &["--user", "enable", SYNC_SERVICE_NAME])?;
+    }
+    let (program, args) = systemd_restart_argv(companion_exists);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run_command(program, &args)?;
     println!("unit\t{}", unit_path.display());
-    println!("sync-unit\t{}", sync_unit_path.display());
+    if companion_exists {
+        println!("sync-unit\t{}", sync_unit_path.display());
+    }
     // Say scheduled, because it is. Claiming a restart that has not happened yet
     // would make a failed start look like a successful install.
     println!("restart\tscheduled");
@@ -1666,7 +1693,7 @@ mod tests {
     /// the effect would be the thing that got killed.
     #[test]
     fn the_linux_service_restart_is_detached_from_the_caller() {
-        let (program, args) = systemd_restart_argv();
+        let (program, args) = systemd_restart_argv(true);
         assert_eq!(
             program, "systemd-run",
             "the restart is issued in place, so it kills its own caller"
@@ -1692,6 +1719,12 @@ mod tests {
         assert!(
             args.contains(&SYNC_SERVICE_NAME),
             "the same detached action must restart the companion: {args:?}"
+        );
+
+        let (_, single_args) = systemd_restart_argv(false);
+        assert!(
+            !single_args.iter().any(|arg| arg == SYNC_SERVICE_NAME),
+            "a fabric-only release must not restart the absent companion: {single_args:?}"
         );
     }
 
