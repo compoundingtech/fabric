@@ -360,6 +360,10 @@ Download a release asset directly, verify it against that asset's published
 renames. A release archive contains exactly two members named literal `fabric`
 and `fabric-sync` (not dot-prefixed paths). Verify that shape before extracting:
 
+`fabric update` arms a detached verifier before it replaces either binary. On
+macOS, launchd owns a transient one-shot job across terminal loss and system
+sleep. The job removes itself after a successful restart or a rollback.
+
 ```sh
 set -eu
 

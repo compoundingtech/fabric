@@ -4,8 +4,8 @@ Date: 2026-09-04
 
 Status: approved for implementation on 2026-09-04.
 
-Implementation: steps 1 through 4 are merged. The current change implements
-step 5 while the embedded engine remains the production owner.
+Implementation: steps 1 through 5 are merged. The embedded engine remains the
+production owner.
 
 ## Decisions
 
@@ -175,6 +175,24 @@ Each binary must report the same release version. A partial local update is safe
 because the local handshake rejects an incompatible version before it forwards
 bytes or opens sync state.
 
+The rollback command runs the old binary on purpose because that binary is the
+copy already proven on the machine. Therefore, new rollback logic cannot protect
+the release that first introduces it. This is a recurring self-update property,
+not an implementation exception.
+
+A fabric-only transition release must reach each machine before that machine
+receives its first paired archive. The transition release contains the complete
+pair-aware rollback reader and the macOS supervisor. It contains no companion.
+The reader restores both old processes when a companion existed. It removes the
+companion binary and OS service when no companion existed. The first paired
+archive is the later writer. This gate is per machine, so a roaming machine such
+as Bluey first receives the transition release when it returns.
+
+On macOS, the updater arms a transient launchd supervisor before the first pair
+rename. The supervisor starts its timeout only after replacement is visible, so
+a system sleep cannot consume the recovery window before the update starts. It
+removes its plist and loaded job after success or rollback.
+
 ## Compatibility contracts
 
 The remote `fabric/sync/1` wire stays byte-compatible during the complete mixed
@@ -327,6 +345,10 @@ structured local error. Neither case is classified as network weather.
 Deploy one machine first and prove both mixed directions. Continue one machine
 at a time. The release gate remains with Silber.cos. Reverting the complete
 binary pair restores the embedded owner and reads the unchanged state.
+
+No paired archive may reach a machine until that machine runs the fabric-only
+transition release and has proved its rollback reader. Bluey follows the same
+gate when it returns.
 
 ### 8. Remove the dormant embedded engine
 

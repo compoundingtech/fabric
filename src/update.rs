@@ -448,6 +448,16 @@ pub fn stage_binary(path: &Path, bytes: &[u8], stamp: &str) -> Result<PathBuf> {
 /// `ETXTBSY`; renaming past it leaves the running process on its old inode and
 /// the next start on the new one.
 pub fn commit_staged(staged: &Path, path: &Path, stamp: &str) -> Result<PathBuf> {
+    let rollback = prepare_rollback(path, stamp)?;
+    commit_prepared(staged, path)?;
+    Ok(rollback)
+}
+
+/// Copy the installed binary to its final rollback path without replacing it.
+///
+/// A detached supervisor must own the rollback before the first pair member is
+/// renamed. Keeping preparation separate makes that ordering enforceable.
+fn prepare_rollback(path: &Path, stamp: &str) -> Result<PathBuf> {
     let dir = path
         .parent()
         .context("the install path has no directory to write beside")?;
@@ -469,14 +479,21 @@ pub fn commit_staged(staged: &Path, path: &Path, stamp: &str) -> Result<PathBuf>
         std::fs::rename(&aside, &rollback)
             .with_context(|| format!("failed to place {}", rollback.display()))?;
     }
+    Ok(rollback)
+}
+
+fn commit_prepared(staged: &Path, path: &Path) -> Result<()> {
     std::fs::rename(staged, path)
         .with_context(|| format!("failed to install {}", path.display()))?;
-    Ok(rollback)
+    Ok(())
 }
 
 fn restore_after_pair_commit_failure(path: &Path, rollback: &Path) -> Result<()> {
     if rollback.exists() {
-        std::fs::rename(rollback, path).with_context(|| {
+        let bytes = std::fs::read(rollback)
+            .with_context(|| format!("failed to read {}", rollback.display()))?;
+        let staged = stage_binary(path, &bytes, &format!("restore-{}", timestamp()))?;
+        commit_prepared(&staged, path).with_context(|| {
             format!(
                 "failed to restore {} after a partial pair install",
                 path.display()
@@ -491,6 +508,34 @@ fn restore_after_pair_commit_failure(path: &Path, rollback: &Path) -> Result<()>
         })?;
     }
     Ok(())
+}
+
+/// Preserve both old members, arm supervision, then replace the matched pair.
+fn commit_staged_pair<F>(
+    staged: &Path,
+    path: &Path,
+    staged_companion: &Path,
+    companion_path: &Path,
+    stamp: &str,
+    before_commit: F,
+) -> Result<(PathBuf, PathBuf)>
+where
+    F: FnOnce(&Path, &Path) -> Result<()>,
+{
+    let rollback = prepare_rollback(path, stamp)?;
+    let companion_rollback = match prepare_rollback(companion_path, stamp) {
+        Ok(rollback) => rollback,
+        Err(error) => {
+            return Err(error.context("fabric-sync rollback could not be prepared"));
+        }
+    };
+    before_commit(&rollback, &companion_rollback)?;
+    commit_prepared(staged, path)?;
+    if let Err(error) = commit_prepared(staged_companion, companion_path) {
+        restore_after_pair_commit_failure(path, &rollback)?;
+        return Err(error.context("fabric-sync could not be installed; fabric was restored"));
+    }
+    Ok((rollback, companion_rollback))
 }
 
 /// A stamp for rollback names. Seconds are enough: two updates inside one second
@@ -649,17 +694,53 @@ async fn wait_for_daemon_version(
     loop {
         // ReachabilityStatus rather than Status, because only that reply
         // carries the daemon's version, which is the whole question here.
-        if let Ok(crate::control::ControlResponse::ReachabilityStatus { version, .. }) =
-            crate::daemon::send_control(home, crate::control::ControlRequest::ReachabilityStatus)
+        let observed =
+            if let Ok(crate::control::ControlResponse::ReachabilityStatus { version, .. }) =
+                crate::daemon::send_control(
+                    home,
+                    crate::control::ControlRequest::ReachabilityStatus,
+                )
                 .await
-            && version == expect
-        {
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            return false;
+            {
+                Some(version)
+            } else {
+                None
+            };
+        match version_wait_decision(
+            observed.as_deref(),
+            expect,
+            std::time::Instant::now() >= deadline,
+        ) {
+            VersionWaitDecision::Ready => return true,
+            VersionWaitDecision::Rollback => return false,
+            VersionWaitDecision::Wait => {}
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionWaitDecision {
+    Ready,
+    Wait,
+    Rollback,
+}
+
+/// Check the observed daemon before the deadline.
+///
+/// A sleeping Mac can resume after the nominal deadline. If launchd completed
+/// the restart while the updater slept, that healthy version must win.
+fn version_wait_decision(
+    observed: Option<&str>,
+    expect: &str,
+    deadline_reached: bool,
+) -> VersionWaitDecision {
+    if observed == Some(expect) {
+        VersionWaitDecision::Ready
+    } else if deadline_reached {
+        VersionWaitDecision::Rollback
+    } else {
+        VersionWaitDecision::Wait
     }
 }
 
@@ -754,6 +835,257 @@ pub fn supervisor_argv(home: &Path, rollback: &Path, expect: &str) -> (&'static 
             expect.into(),
         ],
     )
+}
+
+/// The launchd-owned wrapper waits until replacement starts, then asks the
+/// known-good rollback binary to verify the daemon.
+#[cfg(any(target_os = "macos", test))]
+const MACOS_SUPERVISOR_SCRIPT: &str = r#"
+target=$1
+plist=$2
+installed=$3
+rollback=$4
+expect=$5
+home=$6
+updater_pid=$7
+launchctl=$8
+
+cleanup() {
+    /bin/rm -f "$plist"
+    "$launchctl" bootout "$target" >/dev/null 2>&1 &
+}
+
+# launchd owns this process before either installed path changes. A pause or
+# sleep here is safe: the timeout in the rollback binary does not start until
+# the first replacement is visible.
+while /usr/bin/cmp -s "$installed" "$rollback"; do
+    if ! kill -0 "$updater_pid" 2>/dev/null; then
+        cleanup
+        exit 0
+    fi
+    /bin/sleep 1
+done
+
+# On macOS the updater survives its service restart. Do not spend the recovery
+# timeout while that updater is asleep or still completing launchd work.
+while kill -0 "$updater_pid" 2>/dev/null; do
+    /bin/sleep 1
+done
+
+"$rollback" --home "$home" supervise-restart --rollback "$rollback" --expect "$expect"
+status=$?
+
+cleanup
+exit "$status"
+"#;
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone)]
+struct MacosSupervisorSpec {
+    label: String,
+    target: String,
+    plist: PathBuf,
+    xml: String,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn xml_escape_update(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn render_macos_supervisor(
+    home: &Path,
+    installed: &Path,
+    rollback: &Path,
+    expect: &str,
+    uid: u32,
+    updater_pid: u32,
+    stamp: &str,
+    launchctl: &Path,
+) -> MacosSupervisorSpec {
+    let label = format!("com.compoundingtech.fabric.update-supervisor.{stamp}.{updater_pid}");
+    let domain = format!("gui/{uid}");
+    let target = format!("{domain}/{label}");
+    let plist = home
+        .join("run")
+        .join(format!("update-supervisor-{stamp}-{updater_pid}.plist"));
+    let stdout = home.join("logs/update-supervisor.out.log");
+    let stderr = home.join("logs/update-supervisor.err.log");
+    let args = [
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        MACOS_SUPERVISOR_SCRIPT.to_string(),
+        "fabric-update-supervisor".to_string(),
+        target.clone(),
+        plist.display().to_string(),
+        installed.display().to_string(),
+        rollback.display().to_string(),
+        expect.to_string(),
+        home.display().to_string(),
+        updater_pid.to_string(),
+        launchctl.display().to_string(),
+    ];
+    let arguments = args
+        .iter()
+        .map(|arg| format!("        <string>{}</string>", xml_escape_update(arg)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+<plist version=\"1.0\">\n\
+<dict>\n\
+    <key>Label</key>\n\
+    <string>{}</string>\n\
+    <key>ProgramArguments</key>\n\
+    <array>\n\
+{}\n\
+    </array>\n\
+    <key>RunAtLoad</key>\n\
+    <true/>\n\
+    <key>KeepAlive</key>\n\
+    <false/>\n\
+    <key>AbandonProcessGroup</key>\n\
+    <true/>\n\
+    <key>ProcessType</key>\n\
+    <string>Background</string>\n\
+    <key>StandardOutPath</key>\n\
+    <string>{}</string>\n\
+    <key>StandardErrorPath</key>\n\
+    <string>{}</string>\n\
+</dict>\n\
+</plist>\n",
+        xml_escape_update(&label),
+        arguments,
+        xml_escape_update(&stdout.display().to_string()),
+        xml_escape_update(&stderr.display().to_string()),
+    );
+    MacosSupervisorSpec {
+        label,
+        target,
+        plist,
+        xml,
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let parent = path.parent().context("the private file has no directory")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&temporary, bytes)
+        .with_context(|| format!("failed to write {}", temporary.display()))?;
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to protect {}", temporary.display()))?;
+    std::fs::rename(&temporary, path)
+        .with_context(|| format!("failed to place {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn register_macos_supervisor<F>(spec: &MacosSupervisorSpec, mut launchctl: F) -> Result<()>
+where
+    F: FnMut(&[&str]) -> Result<bool>,
+{
+    write_private_file(&spec.plist, spec.xml.as_bytes())?;
+    let domain = spec
+        .target
+        .rsplit_once('/')
+        .map(|(domain, _)| domain)
+        .context("the launchd supervisor target has no domain")?;
+    let plist = spec.plist.display().to_string();
+    let bootstrap = launchctl(&["bootstrap", domain, &plist]);
+    if !matches!(bootstrap, Ok(true)) {
+        let _ = std::fs::remove_file(&spec.plist);
+        return match bootstrap {
+            Ok(false) => bail!("launchctl did not bootstrap the update supervisor"),
+            Err(error) => Err(error.context("failed to bootstrap the update supervisor")),
+            Ok(true) => unreachable!(),
+        };
+    }
+    match launchctl(&["print", &spec.target]) {
+        Ok(true) => Ok(()),
+        result => {
+            let _ = launchctl(&["bootout", &spec.target]);
+            let _ = std::fs::remove_file(&spec.plist);
+            match result {
+                Ok(false) => bail!("launchd does not own the update supervisor"),
+                Err(error) => Err(error.context("failed to verify the update supervisor")),
+                Ok(true) => unreachable!(),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn schedule_macos_supervisor(
+    home: &crate::config::FabricHome,
+    installed: &Path,
+    rollback: &Path,
+    expect: &str,
+    stamp: &str,
+) -> Result<()> {
+    if !rollback.exists() {
+        println!("supervise\tskipped, there is no previous binary to fall back to");
+        return Ok(());
+    }
+    let spec = render_macos_supervisor(
+        home.root(),
+        installed,
+        rollback,
+        expect,
+        unsafe { libc::geteuid() },
+        std::process::id(),
+        stamp,
+        Path::new("/bin/launchctl"),
+    );
+    register_macos_supervisor(&spec, |args| {
+        let output = std::process::Command::new("/bin/launchctl")
+            .args(args)
+            .output()
+            .context("failed to run launchctl")?;
+        Ok(output.status.success())
+    })?;
+    println!(
+        "supervise\tlaunchd owns {}; it is armed before replacement",
+        spec.label
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn schedule_before_pair_commit(
+    home: &crate::config::FabricHome,
+    options: &UpdateOptions,
+    installed: &Path,
+    rollback: &Path,
+    expect: &str,
+    stamp: &str,
+) -> Result<()> {
+    if options.no_restart || !home.is_default_state_root() {
+        return Ok(());
+    }
+    schedule_macos_supervisor(home, installed, rollback, expect, stamp)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn schedule_before_pair_commit(
+    _home: &crate::config::FabricHome,
+    _options: &UpdateOptions,
+    _installed: &Path,
+    _rollback: &Path,
+    _expect: &str,
+    _stamp: &str,
+) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -968,13 +1300,28 @@ pub async fn run(home: &crate::config::FabricHome, options: UpdateOptions) -> Re
         return Err(error.context("the Git helper path is unsafe, so nothing was installed"));
     }
 
-    let rollback = commit_staged(&staged, &installed_path, &stamp)?;
-    let companion_rollback = match commit_staged(&staged_companion, &companion_path, &stamp) {
-        Ok(path) => path,
+    let (rollback, companion_rollback) = match commit_staged_pair(
+        &staged,
+        &installed_path,
+        &staged_companion,
+        &companion_path,
+        &stamp,
+        |rollback, _companion_rollback| {
+            schedule_before_pair_commit(
+                home,
+                &options,
+                &installed_path,
+                rollback,
+                &staged_version,
+                &stamp,
+            )
+        },
+    ) {
+        Ok(pair) => pair,
         Err(error) => {
+            let _ = std::fs::remove_file(&staged);
             let _ = std::fs::remove_file(&staged_companion);
-            restore_after_pair_commit_failure(&installed_path, &rollback)?;
-            return Err(error.context("fabric-sync could not be installed; fabric was restored"));
+            return Err(error);
         }
     };
     let helper = crate::gitremote::install_helper_for(&installed_path)?;
@@ -1507,15 +1854,49 @@ mod io_tests {
         let staged_companion = stage_binary(&companion, b"new companion", "pair").unwrap();
         assert_ne!(staged_fabric, staged_companion);
         let rollback = commit_staged(&staged_fabric, &fabric, "pair").unwrap();
-        let companion_rollback =
-            commit_staged(&staged_companion, &companion, "pair").unwrap();
+        let companion_rollback = commit_staged(&staged_companion, &companion, "pair").unwrap();
 
         assert_eq!(std::fs::read(&rollback).unwrap(), b"old daemon");
         assert_eq!(
             companion_rollback_path(&rollback).unwrap(),
             companion_rollback
         );
-        assert_eq!(std::fs::read(&companion_rollback).unwrap(), b"old companion");
+        assert_eq!(
+            std::fs::read(&companion_rollback).unwrap(),
+            b"old companion"
+        );
+    }
+
+    #[test]
+    fn supervision_is_armed_before_the_first_pair_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let fabric = dir.path().join("fabric");
+        let companion = dir.path().join("fabric-sync");
+        std::fs::write(&fabric, b"old daemon").unwrap();
+        std::fs::write(&companion, b"old companion").unwrap();
+        let staged = stage_binary(&fabric, b"new daemon", "ordered").unwrap();
+        let staged_companion = stage_binary(&companion, b"new companion", "ordered").unwrap();
+
+        let (rollback, companion_rollback) = commit_staged_pair(
+            &staged,
+            &fabric,
+            &staged_companion,
+            &companion,
+            "ordered",
+            |rollback, companion_rollback| {
+                assert_eq!(std::fs::read(&fabric)?, b"old daemon");
+                assert_eq!(std::fs::read(&companion)?, b"old companion");
+                assert_eq!(std::fs::read(rollback)?, b"old daemon");
+                assert_eq!(std::fs::read(companion_rollback)?, b"old companion");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&fabric).unwrap(), b"new daemon");
+        assert_eq!(std::fs::read(&companion).unwrap(), b"new companion");
+        assert_eq!(std::fs::read(rollback).unwrap(), b"old daemon");
+        assert_eq!(std::fs::read(companion_rollback).unwrap(), b"old companion");
     }
 
     /// Nothing partial may survive a run. A leftover `.fabric-incoming-*` beside
@@ -1563,7 +1944,45 @@ mod io_tests {
 #[cfg(test)]
 mod supervisor_tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+
+    fn executable(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn run_macos_wrapper(
+        installed: &Path,
+        rollback: &Path,
+        plist: &Path,
+        launchctl: &Path,
+    ) -> std::process::ExitStatus {
+        std::process::Command::new("/bin/sh")
+            .args(["-c", MACOS_SUPERVISOR_SCRIPT, "fabric-update-supervisor"])
+            .arg("gui/501/com.compoundingtech.fabric.update-supervisor.test")
+            .arg(plist)
+            .arg(installed)
+            .arg(rollback)
+            .arg("fabric 0.2.1+new")
+            .arg("/tmp/fabric-home")
+            .arg(u32::MAX.to_string())
+            .arg(launchctl)
+            .status()
+            .unwrap()
+    }
+
+    fn wait_for_call(path: &Path, expected: &str) -> String {
+        for _ in 0..100 {
+            if let Ok(calls) = std::fs::read_to_string(path)
+                && calls.contains(expected)
+            {
+                return calls;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("launchctl did not receive {expected}")
+    }
 
     /// The supervisor must run OUTSIDE the caller's cgroup, and it must run the
     /// binary already proven to work on this machine.
@@ -1653,6 +2072,184 @@ mod supervisor_tests {
             args.windows(2).any(|w| w == ["--expect", "0.2.0+abc1234"]),
             "the supervisor cannot tell the new daemon from the old one: {args:?}"
         );
+    }
+
+    #[test]
+    fn a_wake_checks_the_daemon_before_an_expired_deadline() {
+        assert_eq!(
+            version_wait_decision(Some("new"), "new", true),
+            VersionWaitDecision::Ready,
+            "a healthy restart seen after wake was rolled back"
+        );
+        assert_eq!(
+            version_wait_decision(Some("old"), "new", true),
+            VersionWaitDecision::Rollback,
+            "an unhealthy restart survived the same wake"
+        );
+    }
+
+    #[test]
+    fn the_macos_job_is_launchd_owned_and_has_no_calendar_timer() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = render_macos_supervisor(
+            dir.path(),
+            Path::new("/Users/n/.local/bin/fabric"),
+            Path::new("/Users/n/.local/bin/fabric.rollback-1000"),
+            "fabric 0.2.1+new",
+            501,
+            42,
+            "1000",
+            Path::new("/bin/launchctl"),
+        );
+        assert!(spec.xml.contains("<key>RunAtLoad</key>\n<true/>"));
+        assert!(spec.xml.contains("<key>KeepAlive</key>\n<false/>"));
+        assert!(spec.xml.contains("<key>AbandonProcessGroup</key>"));
+        assert!(!spec.xml.contains("StartInterval"));
+        assert!(!spec.xml.contains("StartCalendarInterval"));
+
+        let mut calls = Vec::new();
+        register_macos_supervisor(&spec, |args| {
+            calls.push(
+                args.iter()
+                    .map(|arg| (*arg).to_string())
+                    .collect::<Vec<_>>(),
+            );
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(calls[0][0], "bootstrap");
+        assert_eq!(calls[1], ["print", spec.target.as_str()]);
+        assert_eq!(
+            std::fs::metadata(&spec.plist).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        if let Ok(output) = std::process::Command::new("plutil")
+            .args(["-lint", "--"])
+            .arg(&spec.plist)
+            .output()
+        {
+            assert!(
+                output.status.success(),
+                "plutil rejected the supervisor plist: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn the_macos_job_removes_itself_after_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("fabric");
+        let rollback = dir.path().join("fabric.rollback-test");
+        let plist = dir.path().join("supervisor.plist");
+        let launchctl = dir.path().join("launchctl");
+        executable(&installed, "#!/bin/sh\n# candidate\nexit 0\n");
+        executable(&rollback, "#!/bin/sh\nexit 0\n");
+        std::fs::write(&plist, b"loaded").unwrap();
+        executable(
+            &launchctl,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\n",
+        );
+
+        let status = run_macos_wrapper(&installed, &rollback, &plist, &launchctl);
+        assert!(status.success());
+        assert!(
+            !plist.exists(),
+            "the successful transient job left its plist"
+        );
+        let expected = "bootout gui/501/com.compoundingtech.fabric.update-supervisor.test";
+        let calls = wait_for_call(&launchctl.with_extension("calls"), expected);
+        assert!(calls.contains(expected));
+    }
+
+    #[test]
+    fn an_interruption_after_replacement_restores_the_binary_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("fabric");
+        let rollback = dir.path().join("fabric.rollback-test");
+        let plist = dir.path().join("supervisor.plist");
+        let launchctl = dir.path().join("launchctl");
+        executable(&installed, "#!/bin/sh\nexit 99\n");
+        executable(
+            &rollback,
+            "#!/bin/sh\ninstalled=${0%%.rollback-*}\n/bin/cp \"$0\" \"$installed\"\nexit 0\n",
+        );
+        std::fs::write(&plist, b"loaded").unwrap();
+        executable(
+            &launchctl,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\n",
+        );
+
+        // The updater is gone. The launchd-owned job starts from installed
+        // replacement bytes and performs the recovery without that process.
+        let status = run_macos_wrapper(&installed, &rollback, &plist, &launchctl);
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read(&installed).unwrap(),
+            std::fs::read(&rollback).unwrap()
+        );
+        assert!(!plist.exists(), "the rollback left its transient plist");
+        let expected = "bootout gui/501/com.compoundingtech.fabric.update-supervisor.test";
+        let calls = wait_for_call(&launchctl.with_extension("calls"), expected);
+        assert!(calls.contains(expected));
+    }
+
+    /// This test changes the current user's launchd domain for a few seconds.
+    /// Run it explicitly on a Mac before a release that changes the updater.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "uses the live user launchd domain"]
+    fn a_real_launchd_supervisor_rolls_back_and_removes_its_job() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let installed = dir.path().join("fabric");
+        let rollback = dir.path().join("fabric.rollback-real");
+        executable(&installed, "#!/bin/sh\nexit 99\n");
+        executable(
+            &rollback,
+            "#!/bin/sh\ninstalled=${0%%.rollback-*}\n/bin/cp \"$0\" \"$installed\"\nexit 0\n",
+        );
+        let stamp = format!("test-{}-{}", timestamp(), std::process::id());
+        let spec = render_macos_supervisor(
+            dir.path(),
+            &installed,
+            &rollback,
+            "fabric test",
+            unsafe { libc::geteuid() },
+            u32::MAX,
+            &stamp,
+            Path::new("/bin/launchctl"),
+        );
+        register_macos_supervisor(&spec, |args| {
+            Ok(std::process::Command::new("/bin/launchctl")
+                .args(args)
+                .output()?
+                .status
+                .success())
+        })
+        .unwrap();
+
+        let mut removed = false;
+        for _ in 0..100 {
+            let loaded = std::process::Command::new("/bin/launchctl")
+                .args(["print", &spec.target])
+                .output()
+                .is_ok_and(|output| output.status.success());
+            if !loaded
+                && !spec.plist.exists()
+                && std::fs::read(&installed).unwrap() == std::fs::read(&rollback).unwrap()
+            {
+                removed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !removed {
+            let _ = std::process::Command::new("/bin/launchctl")
+                .args(["bootout", &spec.target])
+                .output();
+        }
+        assert!(removed, "the real launchd job did not roll back and remove itself");
     }
 }
 
