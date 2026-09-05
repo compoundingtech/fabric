@@ -1018,11 +1018,14 @@ async fn main() -> Result<()> {
                     }
                 }
                 Commands::Shell { peer } => {
-                    let socket = match send_control(&home, ControlRequest::Shell { peer }).await? {
-                        ControlResponse::Shell { socket } => socket,
-                        response => bail!("unexpected daemon response: {response:?}"),
-                    };
-                    let code = run_shell_client(&socket).await?;
+                    let socket =
+                        match send_control(&home, ControlRequest::Shell { peer: peer.clone() })
+                            .await?
+                        {
+                            ControlResponse::Shell { socket } => socket,
+                            response => bail!("unexpected daemon response: {response:?}"),
+                        };
+                    let code = run_shell_client(&socket, &peer).await?;
                     std::process::exit(code);
                 }
                 Commands::Exec { peer, cmd } => {
@@ -2869,7 +2872,7 @@ async fn wait_for_daemon_ready(
     }
 }
 
-async fn run_shell_client(socket: &PathBuf) -> Result<i32> {
+async fn run_shell_client(socket: &PathBuf, peer: &str) -> Result<i32> {
     let stream = tokio::net::UnixStream::connect(socket).await?;
     let (mut read, write) = stream.into_split();
     let mut signals = ShellSignals::new()?;
@@ -2894,7 +2897,7 @@ async fn run_shell_client(socket: &PathBuf) -> Result<i32> {
 
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
-    let mut exit_code = 1;
+    let mut exit_code = None;
 
     loop {
         tokio::select! {
@@ -2908,6 +2911,9 @@ async fn run_shell_client(socket: &PathBuf) -> Result<i32> {
                         stdout.flush().await?;
                     }
                     ServerFrame::Error(message) => {
+                        stderr
+                            .write_all(format!("fabric: peer {peer:?} ").as_bytes())
+                            .await?;
                         stderr.write_all(message.as_bytes()).await?;
                         stderr.write_all(b"\n").await?;
                         stderr.flush().await?;
@@ -2918,7 +2924,7 @@ async fn run_shell_client(socket: &PathBuf) -> Result<i32> {
                         stderr.flush().await?;
                     }
                     ServerFrame::Exit(code) => {
-                        exit_code = normalize_exit_code(code);
+                        exit_code = Some(normalize_exit_code(code));
                         break;
                     }
                 }
@@ -2948,9 +2954,19 @@ async fn run_shell_client(socket: &PathBuf) -> Result<i32> {
     stdin_task.abort();
     let _ = stdin_task.await;
     terminal.restore()?;
+    if exit_code.is_none() {
+        stderr
+            .write_all(
+                format!(
+                    "fabric: peer {peer:?} closed service \"shell\" before it returned an exit status\n"
+                )
+                .as_bytes(),
+            )
+            .await?;
+    }
     stdout.flush().await?;
     stderr.flush().await?;
-    Ok(exit_code)
+    Ok(exit_code.unwrap_or(1))
 }
 
 /// Drive the client side of a `fabric exec` session over the daemon-provided
