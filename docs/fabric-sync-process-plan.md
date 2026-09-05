@@ -418,6 +418,31 @@ Before the transition release, run one rollback through the actual production
 service on Linux and macOS. Use hetz first and Silber second. Record every
 observed state and any manual cleanup. Do not use Bluey for this exercise.
 
+Test the recovery route from the actor who will use it before each deliberate
+outage. A reachable host and an open SSH port do not prove that the actor can
+log in. Fabric is the only working route to hetz for every agent and for
+Silber.cos. If Fabric fails there and cannot recover itself, Nathan must recover
+hetz personally. Silber.cos has local shell access on Silber and can repair that
+machine by hand.
+
+Both production rollback exercises passed on 2026-09-05 at exact main
+`ebfd0ec`. On hetz, the broken pair installed at 03:33:02Z. The systemd reader
+restored exact main at 03:34:00Z, and Fabric answered externally at 03:34:14Z.
+The observer depended on Fabric because no agent or Silber.cos could complete
+an SSH login. The exercise then restored fleet build `0.2.1+48208e4`.
+
+On Silber, the broken pair installed at 03:46:14Z. The launchd reader restored
+exact main on disk at 03:47:18Z. The control socket answered at 03:47:27Z. The
+transient job and plist disappeared, and the reader removed the new companion.
+Local shell observation stayed available. The exercise then restored fleet
+build `0.2.1+48208e4`. Doctor passed on both hosts after the exercises.
+
+The deployed `48208e4` reader also received the exact paired archive in an
+isolated home. It accepted the checksum, then refused the archive because it
+expected exactly one `fabric` member. It changed no executable or staging file.
+This clean refusal enforces the Release A order for that deployed reader. It is
+not a property of the Release A pair-aware reader.
+
 Add each future real-machine test to this named list when the test is added.
 The measurement-only ignored tests are not release gates unless this list names
 them.
@@ -432,7 +457,10 @@ The process-boundary release needs all of these results:
 - The bridge keeps at least 90 percent of embedded content throughput during the
   fixed 10-minute comparison. A larger loss stops activation and reopens the
   transport decision with Nathan.
-- The release archive and updater verify a matched binary pair.
+- The Release A archive contains exactly `fabric`. The deployed `48208e4`
+  reader refuses a paired archive without changing the machine.
+- Step 7 restores an archive with exactly `fabric` and `fabric-sync`. The
+  updater verifies that matched pair.
 
 This plan changes where sync executes. It does not claim that the connection
 cache caused Nathan's earlier pauses, and it does not optimize sync memory.
