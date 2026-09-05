@@ -23,6 +23,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -341,6 +342,10 @@ struct LegacyFallback {
 pub struct PeerConnections {
     local_id: EndpointId,
     conns: Mutex<HashMap<EndpointId, PeerConn>>,
+    /// Serializes connection replacement for one peer without making a slow
+    /// dial block every other peer in the map. This keeps one small entry per
+    /// peer used during the process lifetime; the fleet peer set is bounded.
+    peer_gates: Mutex<HashMap<EndpointId, Arc<Mutex<()>>>>,
     legacy_notices: Mutex<HashSet<(EndpointId, u64)>>,
     legacy_fallbacks: Mutex<HashMap<(EndpointId, u64), LegacyFallback>>,
     opened_tx: mpsc::UnboundedSender<Connection>,
@@ -353,12 +358,22 @@ impl PeerConnections {
         Self {
             local_id,
             conns: Mutex::new(HashMap::new()),
+            peer_gates: Mutex::new(HashMap::new()),
             legacy_notices: Mutex::new(HashSet::new()),
             legacy_fallbacks: Mutex::new(HashMap::new()),
             opened_tx,
             #[cfg(test)]
             mux_connect_attempts: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    async fn peer_gate(&self, peer: EndpointId) -> Arc<Mutex<()>> {
+        self.peer_gates
+            .lock()
+            .await
+            .entry(peer)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// Open a mux stream to `peer_addr`'s exposure `protocol`, reusing the peer's
@@ -628,6 +643,8 @@ impl PeerConnections {
         protocol: &str,
         _activity: StreamActivity,
     ) -> Result<Option<Connection>> {
+        let peer_gate = self.peer_gate(peer_addr.id).await;
+        let _peer_guard = peer_gate.lock().await;
         let mut conns = self.conns.lock().await;
         if let Some(existing) = conns.get(&peer_addr.id)
             && existing.generation == generation
@@ -652,6 +669,7 @@ impl PeerConnections {
             // retain the old canonical connection and reject the replacement.
             stale.connection.close(0u32.into(), STALE_GENERATION_REASON);
         }
+        drop(conns);
         if self.mux_probe_deferred(peer_addr.id, generation).await {
             return Ok(None);
         }
@@ -671,6 +689,7 @@ impl PeerConnections {
             }
         };
         let remote_generation = Self::exchange_generations(&connection, generation).await?;
+        let mut conns = self.conns.lock().await;
         conns.insert(
             peer_addr.id,
             PeerConn {
@@ -696,6 +715,8 @@ impl PeerConnections {
         stable_id: usize,
         reason: &'static [u8],
     ) {
+        let peer_gate = self.peer_gate(peer).await;
+        let _peer_guard = peer_gate.lock().await;
         let mut connections = self.conns.lock().await;
         if connections
             .get(&peer)
@@ -710,6 +731,8 @@ impl PeerConnections {
 
     /// Make one peer use a fresh multipath connection on its next stream.
     pub async fn redial(&self, peer: EndpointId, reason: &[u8]) -> bool {
+        let peer_gate = self.peer_gate(peer).await;
+        let _peer_guard = peer_gate.lock().await;
         let removed = self.conns.lock().await.remove(&peer);
         if let Some(removed) = removed {
             removed.connection.close(0u32.into(), reason);
@@ -726,6 +749,8 @@ impl PeerConnections {
         remote_generation: u64,
     ) {
         let peer = connection.remote_id();
+        let peer_gate = self.peer_gate(peer).await;
+        let _peer_guard = peer_gate.lock().await;
         let mut conns = self.conns.lock().await;
         let replace = match conns.get(&peer) {
             None => true,
@@ -866,7 +891,6 @@ mod tests {
         endpoint::presets,
         protocol::{AcceptError, ProtocolHandler, Router},
     };
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const LEGACY_ECHO_ALPN: &[u8] = b"fabric/test-legacy-echo/1";
@@ -1004,6 +1028,43 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct BlockedGenerationMuxEcho {
+        entered: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl ProtocolHandler for BlockedGenerationMuxEcho {
+        async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+            let result: Result<()> = async {
+                let (mut send, mut recv) = connection.accept_bi().await?;
+                let _remote_generation = recv.read_u64().await?;
+                self.entered.wait().await;
+                self.release.notified().await;
+                send.write_u64(0).await?;
+                send.finish()?;
+
+                loop {
+                    let (mut send, mut recv) = match connection.accept_bi().await {
+                        Ok(pair) => pair,
+                        Err(_) => break,
+                    };
+                    tokio::spawn(async move {
+                        if MuxStreamHeader::read(&mut recv).await.is_ok() {
+                            let _ = write_ready(&mut send).await;
+                            let _ = tokio::io::copy(&mut recv, &mut send).await;
+                            let _ = send.finish();
+                        }
+                    });
+                }
+                Ok(())
+            }
+            .await;
+            result
+                .map_err(|error| AcceptError::from_err(std::io::Error::other(format!("{error:#}"))))
+        }
+    }
+
     async fn finish_streams_then_echo(connection: Connection, failures: usize) {
         let mut streams = 0usize;
         loop {
@@ -1025,6 +1086,98 @@ mod tests {
                 let _ = send.finish();
             });
         }
+    }
+
+    /// A slow connection to one peer must not delay an existing connection to
+    /// another peer. Production showed a 2-second delay every 20 seconds when
+    /// the health loop probed an absent peer beside a healthy peer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_slow_peer_open_does_not_block_another_peer() -> Result<()> {
+        let client = Endpoint::builder(presets::N0).bind().await?;
+        let (opened_tx, _opened_rx) = mpsc::unbounded_channel();
+        let manager = Arc::new(PeerConnections::new(client.id(), opened_tx));
+
+        let healthy = Router::builder(
+            Endpoint::builder(presets::N0)
+                .alpns(vec![MUX_ALPN.to_vec()])
+                .bind()
+                .await?,
+        )
+        .accept(
+            MUX_ALPN,
+            MuxEcho {
+                connections: Arc::new(AtomicUsize::new(0)),
+                headers: Arc::new(Mutex::new(Vec::new())),
+            },
+        )
+        .spawn();
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let slow = Router::builder(
+            Endpoint::builder(presets::N0)
+                .alpns(vec![MUX_ALPN.to_vec()])
+                .bind()
+                .await?,
+        )
+        .accept(
+            MUX_ALPN,
+            BlockedGenerationMuxEcho {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        )
+        .spawn();
+        healthy.endpoint().online().await;
+        slow.endpoint().online().await;
+
+        let first = manager
+            .open_mux_stream(
+                &client,
+                0,
+                &healthy.endpoint().addr(),
+                "first",
+                StreamActivity::Probe,
+            )
+            .await?;
+        drop(first);
+
+        let slow_manager = manager.clone();
+        let slow_client = client.clone();
+        let slow_addr = slow.endpoint().addr();
+        let slow_open = tokio::spawn(async move {
+            slow_manager
+                .open_mux_stream(&slow_client, 0, &slow_addr, "slow", StreamActivity::Probe)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), entered.wait())
+            .await
+            .context("the slow peer did not reach generation exchange")?;
+
+        let healthy_open = tokio::time::timeout(
+            Duration::from_millis(250),
+            manager.open_mux_stream(
+                &client,
+                0,
+                &healthy.endpoint().addr(),
+                "healthy",
+                StreamActivity::Probe,
+            ),
+        )
+        .await;
+        release.notify_one();
+        let slow_stream = slow_open.await??;
+        drop(slow_stream);
+
+        assert!(
+            healthy_open.is_ok(),
+            "a slow open to one peer blocked an existing connection to another peer"
+        );
+        healthy_open.expect("checked timeout")?;
+
+        slow.shutdown().await?;
+        healthy.shutdown().await?;
+        client.close().await;
+        Ok(())
     }
 
     async fn assert_stream_failure_recovery(

@@ -105,6 +105,22 @@ the operator to run `fabric service install`. This change makes that exact
 transition green. A present companion binary with a missing service remains a
 problem. An enabled service with a missing binary now asks for a matched pair.
 
+PR #171 merged the transition doctor fix as `475807e`. It passed the Nix,
+macOS, and deterministic checks. It is not released or deployed.
+
+A retained hetz-to-Silber window measured 300 direct probes over 358.498
+seconds. All probes passed. External p50 was 45.013 ms, p95 was 2.117 seconds,
+and p99 was 2.675 seconds. Nineteen probes exceeded two seconds. Eighteen of
+those probes aligned with the daemon's 20-second peer health loop.
+
+The synchronized internal snapshot recorded 18 Silber probes. All were below
+200 ms, and it recorded no transport loss or retry. This instrument is blind
+to the external delay. The health loop probes peers in sequence, and
+`PeerConnections::get_or_open` holds the full connection-map lock across a
+peer dial and generation exchange. A deterministic red test proved that one
+slow peer open blocks an existing healthy peer. Branch
+`fix/peer-lock-head-of-line` narrows this serialization to one peer.
+
 The local library suite passed 513 tests with five measurements ignored. The
 binary suite passed 19 tests, and the update contract passed eight tests. The
 five-second latency property measured 502 records, seven scans, a 10.001166 ms
