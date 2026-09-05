@@ -42,9 +42,9 @@ status, `fabric status`, `fabric sync ls`, and doctor show that runtime. A
 configured entry remains visible when the daemon is down. The embedded engine
 remains the production owner.
 
-The current change adds a detached macOS update supervisor. Launchd owns it
-before the updater renames the first binary. It survives terminal loss and
-sleep, then removes its job after success or rollback.
+PR #164 added a detached macOS update supervisor. PR #165 added pair-aware,
+fail-closed rollback. PR #166 made real launchd and systemd tests exercise that
+reader. All three changes are merged.
 
 The fleet build `0.2.1+48208e4` has only single-binary supervisor logic. The
 rollback runs this old binary on purpose because it is the machine's known-good
@@ -60,6 +60,22 @@ both release and deployment gates.
 The Release A reader must handle OS service state as well as binary paths. It
 must restart both old services when a companion rollback exists. It must remove
 the companion service when the old release had no companion.
+
+Both production rollback exercises passed on 2026-09-05 at exact main
+`ebfd0ec`. Hetz restored exact main 58 seconds after the broken pair installed,
+and Fabric answered externally after 72 seconds. Silber restored exact main on
+disk after 64 seconds, and its control socket answered after 73 seconds. Both
+hosts returned to fleet build `0.2.1+48208e4`, and both doctors passed.
+
+Fabric is the only working route to hetz for every agent and for Silber.cos.
+An open SSH port did not provide a usable login. Nathan must personally recover
+hetz if Fabric cannot recover itself. Test the recovery actor's route before
+every deliberate outage. Silber.cos has local shell access on Silber.
+
+The release workflow must publish a fabric-only Release A archive. The deployed
+`48208e4` reader cleanly refused a paired archive in isolation and changed no
+file. Step 7 restores paired archives after Release A reaches every machine.
+Do not tag current main until the workflow has this transition shape.
 
 The local library suite passed 499 tests with five measurements ignored. The
 binary suite passed 19 tests, and the update contract passed eight tests. The
@@ -123,6 +139,14 @@ percent.
 The Silber-to-hetz direct path has p50 50 ms, p90 100 ms, and p99 500 ms. It has
 73 of 127,753 samples above one second, or 0.057 percent. The relay path has no
 sample above one second. These are not Bluey-to-hetz path measurements.
+
+A three-sample direct window after both rollback exercises separated connection
+setup from the settled path. Silber-to-hetz measured 1,772.560, 36.751, and
+37.637 milliseconds. Hetz-to-Silber measured 116.158, 37.388, and 35.640
+milliseconds. Current path telemetry records a probe that opens a connection in
+the same latency series as a probe on an established path. Split those cases so
+the network tail and reconnect cost have separate meanings. Release A does not
+wait for this low-priority telemetry change.
 
 The `droppy` status row is retained telemetry for a removed peer. Its 10,885
 reconnect attempts did not change during a 30-second window. The latest droppy

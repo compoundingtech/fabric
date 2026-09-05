@@ -48,13 +48,13 @@ jobs:
           set -euo pipefail
           mkdir -p dist/package
           cp "target/${{ matrix.target }}/release/fabric" dist/package/fabric
-          cp "target/${{ matrix.target }}/release/fabric-sync" dist/package/fabric-sync
-          chmod 755 dist/package/fabric dist/package/fabric-sync
+          chmod 755 dist/package/fabric
           archive="dist/fabric-${{ matrix.target }}.tar.gz"
-          tar -czf "$archive" -C dist/package fabric fabric-sync
+          # Release A is the reader-only transition. Step 7 restores the pair.
+          tar -czf "$archive" -C dist/package fabric
           members="$(tar -tzf "$archive")"
-          if [[ "$members" != $'fabric\nfabric-sync' ]]; then
-            echo "release archive must contain exactly fabric and fabric-sync" >&2
+          if [[ "$members" != "fabric" ]]; then
+            echo "transition archive must contain exactly fabric" >&2
             printf 'archive members:\n%s\n' "$members" >&2
             exit 1
           fi

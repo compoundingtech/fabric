@@ -638,10 +638,11 @@ fn generation_is_current(home: &crate::config::FabricHome, generation: &str) -> 
 
 /// Check that the daemon came back, and put the old binary back if it did not.
 ///
-/// THIS EXISTS BECAUSE NOTHING OUTSIDE THE MACHINE CAN FIX IT. If a bad binary
-/// takes the daemon down, `fabric exec` stops working, and the tool that would
-/// repair the machine is the tool that just broke it. On hetz and droppy there
-/// is still ssh. On a travelling laptop there may be nothing for days.
+/// THIS EXISTS BECAUSE THE RECOVERY ACTOR MAY HAVE NO WORKING ROUTE. If a bad
+/// binary takes the daemon down, `fabric exec` stops working, and the tool that
+/// would repair the machine is the tool that just broke it. The route must be
+/// tested before a deliberate outage. Do not infer that an open SSH port means
+/// the recovery actor can log in.
 ///
 /// It cannot run in the updating process either: on Linux that process lives
 /// inside the service's own cgroup and dies with the restart. So it is scheduled
@@ -1930,11 +1931,12 @@ mod tests {
     }
 
     #[test]
-    fn the_release_workflow_packages_exactly_the_binary_pair() {
+    fn the_release_a_workflow_packages_only_the_reader() {
         let workflow = include_str!("../.github/workflows/release.yml");
-        assert!(workflow.contains("release/fabric-sync\" dist/package/fabric-sync"));
-        assert!(workflow.contains("-C dist/package fabric fabric-sync"));
-        assert!(workflow.contains("$'fabric\\nfabric-sync'"));
+        assert!(workflow.contains("tar -czf \"$archive\" -C dist/package fabric\n"));
+        assert!(workflow.contains("[[ \"$members\" != \"fabric\" ]]"));
+        assert!(!workflow.contains("release/fabric-sync\" dist/package/fabric-sync"));
+        assert!(!workflow.contains("-C dist/package fabric fabric-sync"));
     }
 }
 
