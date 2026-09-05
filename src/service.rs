@@ -49,6 +49,40 @@ pub struct ServiceSpec {
     memory_max_mb: Option<u64>,
 }
 
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug)]
+pub(crate) struct RollbackServiceDefinitions {
+    pub main: String,
+    pub companion: Option<String>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn rollback_systemd_definitions(
+    spec: &ServiceSpec,
+    companion_exists: bool,
+) -> Result<RollbackServiceDefinitions> {
+    Ok(RollbackServiceDefinitions {
+        main: render_systemd_user_unit(spec),
+        companion: companion_exists
+            .then(|| render_systemd_sync_user_unit(spec))
+            .transpose()?,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn rollback_launchd_definitions(
+    home: &FabricHome,
+    spec: &ServiceSpec,
+    companion_exists: bool,
+) -> Result<RollbackServiceDefinitions> {
+    Ok(RollbackServiceDefinitions {
+        main: render_launch_agent_plist(home, spec)?,
+        companion: companion_exists
+            .then(|| render_launch_sync_agent_plist(home, spec))
+            .transpose()?,
+    })
+}
+
 impl ServiceSpec {
     pub fn new(
         exe: impl Into<PathBuf>,
@@ -198,6 +232,53 @@ pub fn install_at(home: &FabricHome, exe: &Path, options: ServiceInstallOptions)
     }
     println!("control-socket\tready");
     Ok(())
+}
+
+/// Stop and remove a companion service that does not exist in the rollback
+/// target. A running process may still hold the replaced executable inode, so
+/// this step proves that the new companion no longer owns machine state.
+pub(crate) fn prepare_update_rollback(companion_will_exist: bool) -> Result<()> {
+    if companion_will_exist {
+        return Ok(());
+    }
+    match ServiceManager::current()? {
+        #[cfg(target_os = "linux")]
+        ServiceManager::SystemdUser => remove_systemd_sync_for_rollback(),
+        #[cfg(target_os = "macos")]
+        ServiceManager::LaunchdUser => remove_launchd_sync_for_rollback(),
+    }
+}
+
+/// Restore the native service definitions with the known-good reader.
+///
+/// The new release may have changed these files. Re-rendering them from the
+/// rollback binary keeps the service-manager contract matched to the restored
+/// executable. The companion is installed only when the rollback set has one.
+pub(crate) fn restore_after_update_rollback(
+    home: &FabricHome,
+    exe: &Path,
+    companion_exists: bool,
+) -> Result<()> {
+    home.prepare()?;
+    let allow_shell = resolve_allow_shell(home, None)?;
+    let allow_exec = resolve_allow_exec(home, None)?;
+    let memory_max_mb = resolve_memory_max_mb(home, None)?;
+    let spec = ServiceSpec::new(exe, home.root(), allow_shell, allow_exec, memory_max_mb)?;
+    if companion_exists {
+        require_sync_companion(&spec)?;
+    }
+    match ServiceManager::current()? {
+        #[cfg(target_os = "linux")]
+        ServiceManager::SystemdUser => restore_systemd_after_update_rollback(&spec, companion_exists),
+        #[cfg(target_os = "macos")]
+        ServiceManager::LaunchdUser => {
+            install_launchd_user(home, &spec)?;
+            if companion_exists {
+                install_launchd_sync_user(home, &spec)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 fn require_sync_companion(spec: &ServiceSpec) -> Result<PathBuf> {
@@ -611,6 +692,67 @@ fn install_systemd_user(spec: &ServiceSpec) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn remove_systemd_sync_for_rollback() -> Result<()> {
+    let stop = Command::new("systemctl")
+        .args(["--user", "stop", SYNC_SERVICE_NAME])
+        .status()
+        .context("failed to stop the fabric-sync service")?;
+    if !stop.success() {
+        let still_active = Command::new("systemctl")
+            .args(["--user", "is-active", "--quiet", SYNC_SERVICE_NAME])
+            .status()
+            .context("failed to check the fabric-sync service")?
+            .success();
+        if still_active {
+            bail!("the fabric-sync service is still active, so rollback stopped");
+        }
+    }
+    let _ = Command::new("systemctl")
+        .args(["--user", "disable", SYNC_SERVICE_NAME])
+        .status();
+    let sync_unit_path = systemd_sync_user_unit_path()?;
+    if sync_unit_path.exists() {
+        fs::remove_file(&sync_unit_path)
+            .with_context(|| format!("failed to remove {}", sync_unit_path.display()))?;
+    }
+    run_command("systemctl", &["--user", "daemon-reload"])
+}
+
+#[cfg(target_os = "linux")]
+fn restore_systemd_after_update_rollback(
+    spec: &ServiceSpec,
+    companion_exists: bool,
+) -> Result<()> {
+    let definitions = rollback_systemd_definitions(spec, companion_exists)?;
+    let unit_path = systemd_user_unit_path()?;
+    if let Some(parent) = unit_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(&unit_path, definitions.main)
+        .with_context(|| format!("failed to write {}", unit_path.display()))?;
+    let sync_unit_path = systemd_sync_user_unit_path()?;
+    if let Some(companion) = definitions.companion {
+        fs::write(&sync_unit_path, companion)
+            .with_context(|| format!("failed to write {}", sync_unit_path.display()))?;
+    } else if sync_unit_path.exists() {
+        fs::remove_file(&sync_unit_path)
+            .with_context(|| format!("failed to remove {}", sync_unit_path.display()))?;
+    }
+    run_command("systemctl", &["--user", "daemon-reload"])?;
+    run_command("systemctl", &["--user", "enable", SERVICE_NAME])?;
+    if companion_exists {
+        run_command("systemctl", &["--user", "enable", SYNC_SERVICE_NAME])?;
+        run_command(
+            "systemctl",
+            &["--user", "restart", SERVICE_NAME, SYNC_SERVICE_NAME],
+        )
+    } else {
+        run_command("systemctl", &["--user", "restart", SERVICE_NAME])
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn uninstall_systemd_user() -> Result<()> {
     for service in systemd_uninstall_order() {
         let _ = Command::new("systemctl")
@@ -706,6 +848,26 @@ fn install_launchd_sync_user(home: &FabricHome, spec: &ServiceSpec) -> Result<()
         return result;
     }
     println!("sync-plist\t{}", plist_path.display());
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn remove_launchd_sync_for_rollback() -> Result<()> {
+    let target = launchd_sync_service_target();
+    let _ = Command::new("launchctl")
+        .args(["bootout", &target])
+        .status();
+    wait_for_launchd_unloaded(&target, LAUNCHD_UNLOAD_TIMEOUT);
+    if launchd_service_loaded(&target) {
+        bail!("the fabric-sync service is still loaded, so rollback stopped");
+    }
+    let plist_path = launch_sync_agent_path()?;
+    if plist_path.exists() {
+        fs::remove_file(&plist_path)
+            .with_context(|| format!("failed to remove {}", plist_path.display()))?;
+    }
+    // Do not call `launchctl disable`. That override survives the plist and
+    // would poison a later paired install.
     Ok(())
 }
 
