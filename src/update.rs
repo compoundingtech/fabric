@@ -668,12 +668,13 @@ async fn wait_for_daemon_version(
 fn restart_service() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let status = std::process::Command::new("systemctl")
-            .args(["--user", "restart", "fabric.service"])
+        let (program, args) = rollback_restart_argv();
+        let status = std::process::Command::new(program)
+            .args(args)
             .status()
             .context("failed to run systemctl")?;
         if !status.success() {
-            bail!("systemctl --user restart fabric.service failed with {status}");
+            bail!("systemctl --user restart of the fabric pair failed with {status}");
         }
         Ok(())
     }
@@ -692,6 +693,21 @@ fn restart_service() -> Result<()> {
         }
         Ok(())
     }
+}
+
+/// Restart both members after the supervisor restores their matched bytes.
+/// This is not cfg-gated because CI on either platform must pin the Linux shape.
+#[cfg(any(target_os = "linux", test))]
+fn rollback_restart_argv() -> (&'static str, [&'static str; 4]) {
+    (
+        "systemctl",
+        [
+            "--user",
+            "restart",
+            "fabric.service",
+            "fabric-sync.service",
+        ],
+    )
 }
 
 /// Schedule the supervisor to run outside this process's cgroup.
@@ -1587,6 +1603,21 @@ mod supervisor_tests {
         assert!(
             args.contains(&"supervise-restart"),
             "the supervisor does not invoke the supervising subcommand: {args:?}"
+        );
+    }
+
+    #[test]
+    fn rollback_restarts_both_restored_processes() {
+        let (program, args) = rollback_restart_argv();
+        assert_eq!(program, "systemctl");
+        assert_eq!(
+            args,
+            [
+                "--user",
+                "restart",
+                "fabric.service",
+                "fabric-sync.service"
+            ]
         );
     }
 

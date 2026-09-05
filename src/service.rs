@@ -14,7 +14,9 @@ use crate::config::{FabricConfig, FabricHome};
 /// platform. A Linux-only string cannot be tested from a Mac, and this is the
 /// exact shape whose regression takes a remote machine down.
 const SERVICE_NAME: &str = "fabric.service";
+const SYNC_SERVICE_NAME: &str = "fabric-sync.service";
 const LAUNCHD_LABEL: &str = "com.compoundingtech.fabric";
+const LAUNCHD_SYNC_LABEL: &str = "com.compoundingtech.fabric-sync";
 /// How long to wait for launchd to fully unload a booted-out service before
 /// bootstrapping the same label again — bootout is async, and bootstrapping a
 /// still-loaded label races into "Bootstrap failed: 5: Input/output error".
@@ -92,6 +94,23 @@ impl ServiceSpec {
         }
         args
     }
+
+    fn sync_exe(&self) -> Result<PathBuf> {
+        let dir = self
+            .exe
+            .parent()
+            .context("the fabric executable has no parent directory")?;
+        Ok(dir.join("fabric-sync"))
+    }
+
+    fn sync_program_arguments(&self) -> Result<Vec<String>> {
+        Ok(vec![
+            self.sync_exe()?.display().to_string(),
+            "--home".to_string(),
+            self.home.display().to_string(),
+            "--standby".to_string(),
+        ])
+    }
 }
 
 pub fn install(home: &FabricHome, options: ServiceInstallOptions) -> Result<()> {
@@ -133,11 +152,15 @@ pub fn install_at(home: &FabricHome, exe: &Path, options: ServiceInstallOptions)
     let allow_exec = resolve_allow_exec(home, options.allow_exec)?;
     let memory_max_mb = resolve_memory_max_mb(home, options.memory_max_mb)?;
     let spec = ServiceSpec::new(exe, home.root(), allow_shell, allow_exec, memory_max_mb)?;
+    require_sync_companion(&spec)?;
     match ServiceManager::current()? {
         #[cfg(target_os = "linux")]
         ServiceManager::SystemdUser => install_systemd_user(&spec)?,
         #[cfg(target_os = "macos")]
-        ServiceManager::LaunchdUser => install_launchd_user(home, &spec)?,
+        ServiceManager::LaunchdUser => {
+            install_launchd_user(home, &spec)?;
+            install_launchd_sync_user(home, &spec)?;
+        }
     }
 
     // The service manager returns once it has STARTED the process, not once the
@@ -177,6 +200,17 @@ pub fn install_at(home: &FabricHome, exe: &Path, options: ServiceInstallOptions)
     Ok(())
 }
 
+fn require_sync_companion(spec: &ServiceSpec) -> Result<PathBuf> {
+    let sync_exe = spec.sync_exe()?;
+    if !sync_exe.is_file() {
+        bail!(
+            "the managed fabric binary has no fabric-sync companion at {}",
+            sync_exe.display()
+        );
+    }
+    Ok(sync_exe)
+}
+
 /// Poll the daemon's control socket until it accepts, or the deadline passes.
 ///
 /// Connect-and-drop is the honest check: the socket file appears before the
@@ -198,14 +232,28 @@ pub(crate) fn wait_for_control_socket(home: &FabricHome, timeout: Duration) -> b
 pub fn status() -> Result<()> {
     match ServiceManager::current()? {
         #[cfg(target_os = "linux")]
-        ServiceManager::SystemdUser => run_command(
-            "systemctl",
-            &["--user", "status", SERVICE_NAME, "--no-pager"],
-        ),
+        ServiceManager::SystemdUser => {
+            println!("daemon service");
+            let daemon = run_command(
+                "systemctl",
+                &["--user", "status", SERVICE_NAME, "--no-pager"],
+            );
+            println!("sync companion service");
+            let sync = run_command(
+                "systemctl",
+                &["--user", "status", SYNC_SERVICE_NAME, "--no-pager"],
+            );
+            daemon.and(sync)
+        }
         #[cfg(target_os = "macos")]
         ServiceManager::LaunchdUser => {
             let target = launchd_service_target();
-            run_command("launchctl", &["print", &target])
+            let sync_target = launchd_sync_service_target();
+            println!("daemon service");
+            let daemon = run_command("launchctl", &["print", &target]);
+            println!("sync companion service");
+            let sync = run_command("launchctl", &["print", &sync_target]);
+            daemon.and(sync)
         }
     }
 }
@@ -277,6 +325,7 @@ fn systemd_restart_argv() -> (&'static str, Vec<String>) {
             "--user".into(),
             "restart".into(),
             SERVICE_NAME.into(),
+            SYNC_SERVICE_NAME.into(),
         ],
     )
 }
@@ -320,6 +369,14 @@ pub enum ServiceEnablement {
 pub fn service_enablement() -> ServiceEnablement {
     match ServiceManager::current() {
         Ok(manager) => manager.enablement(),
+        Err(_) => ServiceEnablement::Unknown,
+    }
+}
+
+/// Query whether the independently supervised sync companion starts on boot.
+pub fn sync_service_enablement() -> ServiceEnablement {
+    match ServiceManager::current() {
+        Ok(manager) => manager.sync_enablement(),
         Err(_) => ServiceEnablement::Unknown,
     }
 }
@@ -492,24 +549,61 @@ impl ServiceManager {
             }
         }
     }
+
+    fn sync_enablement(&self) -> ServiceEnablement {
+        match self {
+            #[cfg(target_os = "linux")]
+            ServiceManager::SystemdUser => {
+                let present = systemd_sync_user_unit_path()
+                    .map(|path| path.exists())
+                    .unwrap_or(false);
+                let query = Command::new("systemctl")
+                    .args(["--user", "is-enabled", SYNC_SERVICE_NAME])
+                    .output();
+                let (ran, stdout) = match &query {
+                    Ok(output) => (true, String::from_utf8_lossy(&output.stdout).into_owned()),
+                    Err(_) => (false, String::new()),
+                };
+                interpret_systemd_is_enabled(present, ran, &stdout)
+            }
+            #[cfg(target_os = "macos")]
+            ServiceManager::LaunchdUser => {
+                let present = launch_sync_agent_path()
+                    .map(|path| path.exists())
+                    .unwrap_or(false);
+                let target = launchd_sync_service_target();
+                let loaded = Command::new("launchctl")
+                    .args(["print", &target])
+                    .output()
+                    .map(|output| output.status.success())
+                    .unwrap_or(false);
+                interpret_launchd(present, loaded)
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
 fn install_systemd_user(spec: &ServiceSpec) -> Result<()> {
     let unit_path = systemd_user_unit_path()?;
+    let sync_unit_path = systemd_sync_user_unit_path()?;
     if let Some(parent) = unit_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     fs::write(&unit_path, render_systemd_user_unit(spec))
         .with_context(|| format!("failed to write {}", unit_path.display()))?;
+    fs::write(&sync_unit_path, render_systemd_sync_user_unit(spec)?)
+        .with_context(|| format!("failed to write {}", sync_unit_path.display()))?;
 
     run_command("systemctl", &["--user", "daemon-reload"])?;
     run_command("systemctl", &["--user", "enable", SERVICE_NAME])?;
+    run_command("systemctl", &["--user", "enable", SYNC_SERVICE_NAME])?;
     let (program, args) = systemd_restart_argv();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run_command(program, &args)?;
     println!("unit\t{}", unit_path.display());
+    println!("sync-unit\t{}", sync_unit_path.display());
     // Say scheduled, because it is. Claiming a restart that has not happened yet
     // would make a failed start look like a successful install.
     println!("restart\tscheduled");
@@ -518,16 +612,28 @@ fn install_systemd_user(spec: &ServiceSpec) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn uninstall_systemd_user() -> Result<()> {
-    let _ = Command::new("systemctl")
-        .args(["--user", "disable", "--now", SERVICE_NAME])
-        .status();
+    for service in systemd_uninstall_order() {
+        let _ = Command::new("systemctl")
+            .args(["--user", "disable", "--now", service])
+            .status();
+    }
     let unit_path = systemd_user_unit_path()?;
     if unit_path.exists() {
         fs::remove_file(&unit_path)
             .with_context(|| format!("failed to remove {}", unit_path.display()))?;
     }
+    let sync_unit_path = systemd_sync_user_unit_path()?;
+    if sync_unit_path.exists() {
+        fs::remove_file(&sync_unit_path)
+            .with_context(|| format!("failed to remove {}", sync_unit_path.display()))?;
+    }
     run_command("systemctl", &["--user", "daemon-reload"])?;
     Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn systemd_uninstall_order() -> [&'static str; 2] {
+    [SYNC_SERVICE_NAME, SERVICE_NAME]
 }
 
 #[cfg(target_os = "macos")]
@@ -554,7 +660,7 @@ fn install_launchd_user(home: &FabricHome, spec: &ServiceSpec) -> Result<()> {
     // back to its previous bytes or absent, and the label back to whatever
     // enable/disable state launchd had for it. Installing should not be able to
     // half-change a machine.
-    let previously_disabled = launchd_label_disabled(&domain);
+    let previously_disabled = launchd_label_disabled(&domain, LAUNCHD_LABEL);
     let previous = fs::read(&plist_path).ok();
     fs::write(&plist_path, render_launch_agent_plist(home, spec)?)
         .with_context(|| format!("failed to write {}", plist_path.display()))?;
@@ -570,6 +676,36 @@ fn install_launchd_user(home: &FabricHome, spec: &ServiceSpec) -> Result<()> {
     }
 
     println!("plist\t{}", plist_path.display());
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn install_launchd_sync_user(home: &FabricHome, spec: &ServiceSpec) -> Result<()> {
+    let plist_path = launch_sync_agent_path()?;
+    let domain = launchd_domain();
+    let target = launchd_sync_service_target();
+    if !launchd_domain_available(&domain) {
+        bail!("{}", launchd_domain_unavailable_message(&domain));
+    }
+    if let Some(parent) = plist_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let previously_disabled = launchd_label_disabled(&domain, LAUNCHD_SYNC_LABEL);
+    let previous = fs::read(&plist_path).ok();
+    fs::write(&plist_path, render_launch_sync_agent_plist(home, spec)?)
+        .with_context(|| format!("failed to write {}", plist_path.display()))?;
+    let result = bootstrap_and_start(&plist_path, &domain, &target);
+    if result.is_err() {
+        restore_plist(&plist_path, previous.as_deref());
+        if previously_disabled == Some(true) {
+            let _ = Command::new("launchctl")
+                .args(["disable", &target])
+                .status();
+        }
+        return result;
+    }
+    println!("sync-plist\t{}", plist_path.display());
     Ok(())
 }
 
@@ -597,7 +733,7 @@ fn restore_plist(path: &std::path::Path, previous: Option<&[u8]>) {
 /// Whether launchd holds a persistent disable override for our label, or None
 /// when that cannot be determined. `fabric service uninstall` sets this, and it
 /// outlives the plist, so install both clears it and restores it on failure.
-fn launchd_label_disabled(domain: &str) -> Option<bool> {
+fn launchd_label_disabled(domain: &str, label: &str) -> Option<bool> {
     let output = Command::new("launchctl")
         .args(["print-disabled", domain])
         .output()
@@ -606,7 +742,7 @@ fn launchd_label_disabled(domain: &str) -> Option<bool> {
         return None;
     }
     let listing = String::from_utf8_lossy(&output.stdout);
-    let line = listing.lines().find(|line| line.contains(LAUNCHD_LABEL))?;
+    let line = listing.lines().find(|line| line.contains(label))?;
     Some(line.contains("true") || line.contains("disabled"))
 }
 
@@ -767,6 +903,18 @@ fn bootstrap_launchd_with_retry(domain: &str, plist: &str, target: &str) -> Resu
 
 #[cfg(target_os = "macos")]
 fn uninstall_launchd_user() -> Result<()> {
+    let sync_plist_path = launch_sync_agent_path()?;
+    let sync_target = launchd_sync_service_target();
+    let _ = Command::new("launchctl")
+        .args(["bootout", &sync_target])
+        .status();
+    let _ = Command::new("launchctl")
+        .args(["disable", &sync_target])
+        .status();
+    if sync_plist_path.exists() {
+        fs::remove_file(&sync_plist_path)
+            .with_context(|| format!("failed to remove {}", sync_plist_path.display()))?;
+    }
     let plist_path = launch_agent_path()?;
     let target = launchd_service_target();
     let _ = Command::new("launchctl")
@@ -808,11 +956,23 @@ pub(crate) fn systemd_user_unit_path() -> Result<PathBuf> {
     Ok(base.join("systemd/user").join(SERVICE_NAME))
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn systemd_sync_user_unit_path() -> Result<PathBuf> {
+    Ok(systemd_user_unit_path()?.with_file_name(SYNC_SERVICE_NAME))
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn launch_agent_path() -> Result<PathBuf> {
     Ok(home_dir()?
         .join("Library/LaunchAgents")
         .join(format!("{LAUNCHD_LABEL}.plist")))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn launch_sync_agent_path() -> Result<PathBuf> {
+    Ok(home_dir()?
+        .join("Library/LaunchAgents")
+        .join(format!("{LAUNCHD_SYNC_LABEL}.plist")))
 }
 
 #[cfg(target_os = "macos")]
@@ -823,6 +983,11 @@ fn launchd_domain() -> String {
 #[cfg(target_os = "macos")]
 fn launchd_service_target() -> String {
     format!("{}/{}", launchd_domain(), LAUNCHD_LABEL)
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_sync_service_target() -> String {
+    format!("{}/{}", launchd_domain(), LAUNCHD_SYNC_LABEL)
 }
 
 pub fn render_systemd_user_unit(spec: &ServiceSpec) -> String {
@@ -855,7 +1020,62 @@ WantedBy=default.target\n",
     )
 }
 
+pub fn render_systemd_sync_user_unit(spec: &ServiceSpec) -> Result<String> {
+    let exec_start = spec
+        .sync_program_arguments()?
+        .iter()
+        .map(|arg| systemd_quote_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(format!(
+        "[Unit]\n\
+Description=fabric sync compatibility companion\n\
+After=fabric.service\n\
+\n\
+[Service]\n\
+Type=simple\n\
+ExecStart={exec_start}\n\
+Restart=on-failure\n\
+RestartSec=5s\n\
+LimitNOFILE=8192\n\
+WorkingDirectory={}\n\
+\n\
+[Install]\n\
+WantedBy=default.target\n",
+        systemd_quote_arg(&spec.home.display().to_string())
+    ))
+}
+
 pub fn render_launch_agent_plist(home: &FabricHome, spec: &ServiceSpec) -> Result<String> {
+    render_launch_agent_plist_for(
+        home,
+        LAUNCHD_LABEL,
+        spec.program_arguments(),
+        "service",
+        spec.memory_max_mb,
+    )
+}
+
+pub fn render_launch_sync_agent_plist(
+    home: &FabricHome,
+    spec: &ServiceSpec,
+) -> Result<String> {
+    render_launch_agent_plist_for(
+        home,
+        LAUNCHD_SYNC_LABEL,
+        spec.sync_program_arguments()?,
+        "sync-service",
+        None,
+    )
+}
+
+fn render_launch_agent_plist_for(
+    home: &FabricHome,
+    label: &str,
+    program_arguments: Vec<String>,
+    log_name: &str,
+    memory_max_mb: Option<u64>,
+) -> Result<String> {
     // A resident-set ceiling is written only when the operator asked for one.
     // launchd treats ResidentSetSize as a reclaim preference rather than a kill,
     // but it is still a fixed number, and shipping one by default declares a
@@ -884,7 +1104,7 @@ pub fn render_launch_agent_plist(home: &FabricHome, spec: &ServiceSpec) -> Resul
     // The resident-set ceiling stays opt-in. launchd treats ResidentSetSize as a
     // reclaim preference rather than a kill, but it is still a fixed number, and
     // shipping one by default declares a healthy working set nobody has measured.
-    if let Some(mb) = spec.memory_max_mb {
+    if let Some(mb) = memory_max_mb {
         let rss_bytes = mb
             .checked_mul(1024)
             .and_then(|value| value.checked_mul(1024))
@@ -907,10 +1127,9 @@ pub fn render_launch_agent_plist(home: &FabricHome, spec: &ServiceSpec) -> Resul
 {soft_limits}    </dict>\n\
 {hard_limits}"
     );
-    let stdout_path = home.root().join("logs/service.out.log");
-    let stderr_path = home.root().join("logs/service.err.log");
-    let args = spec
-        .program_arguments()
+    let stdout_path = home.root().join(format!("logs/{log_name}.out.log"));
+    let stderr_path = home.root().join(format!("logs/{log_name}.err.log"));
+    let args = program_arguments
         .iter()
         .map(|arg| format!("        <string>{}</string>", xml_escape(arg)))
         .collect::<Vec<_>>()
@@ -942,7 +1161,7 @@ pub fn render_launch_agent_plist(home: &FabricHome, spec: &ServiceSpec) -> Resul
 {resource_limits}\
 </dict>\n\
 </plist>\n",
-        xml_escape(LAUNCHD_LABEL),
+        xml_escape(label),
         args,
         xml_escape(&home.root().display().to_string()),
         xml_escape(&stdout_path.display().to_string()),
@@ -1168,6 +1387,66 @@ mod tests {
             args.windows(4)
                 .any(|w| w == ["systemctl", "--user", "restart", SERVICE_NAME]),
             "whatever wrapping it gains, it must still restart {SERVICE_NAME}: {args:?}"
+        );
+        assert!(
+            args.contains(&SYNC_SERVICE_NAME),
+            "the same detached action must restart the companion: {args:?}"
+        );
+    }
+
+    #[test]
+    fn companion_units_run_only_the_compatibility_standby() -> Result<()> {
+        let home = FabricHome::new("/Users/nathan/.local/share/fabric");
+        let spec = ServiceSpec::new(
+            "/Users/nathan/.local/bin/fabric",
+            home.root(),
+            true,
+            true,
+            Some(512),
+        )?;
+
+        let unit = render_systemd_sync_user_unit(&spec)?;
+        assert!(unit.contains("After=fabric.service"));
+        assert!(unit.contains("ExecStart=/Users/nathan/.local/bin/fabric-sync --home /Users/nathan/.local/share/fabric --standby"));
+        assert!(unit.contains("Restart=on-failure"));
+        assert!(!unit.contains(" daemon"));
+
+        let plist = render_launch_sync_agent_plist(&home, &spec)?;
+        assert!(plist.contains("<string>com.compoundingtech.fabric-sync</string>"));
+        assert!(plist.contains("<string>/Users/nathan/.local/bin/fabric-sync</string>"));
+        assert!(plist.contains("<string>--standby</string>"));
+        assert!(plist.contains("sync-service.out.log"));
+        assert!(plist.contains("sync-service.err.log"));
+        assert!(!plist.contains("<string>daemon</string>"));
+        assert!(
+            !plist.contains("ResidentSetSize"),
+            "the daemon memory setting must not become an unmeasured companion limit"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn service_install_requires_the_sibling_companion() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let fabric = dir.path().join("fabric");
+        std::fs::write(&fabric, b"daemon")?;
+        let spec = ServiceSpec::new(&fabric, dir.path(), false, false, None)?;
+
+        let error = require_sync_companion(&spec)
+            .expect_err("a service without the companion was accepted");
+        assert!(format!("{error:#}").contains("fabric-sync"));
+
+        let companion = dir.path().join("fabric-sync");
+        std::fs::write(&companion, b"companion")?;
+        assert_eq!(require_sync_companion(&spec)?, companion);
+        Ok(())
+    }
+
+    #[test]
+    fn uninstall_stops_the_companion_before_the_daemon() {
+        assert_eq!(
+            systemd_uninstall_order(),
+            [SYNC_SERVICE_NAME, SERVICE_NAME]
         );
     }
 
@@ -1511,23 +1790,28 @@ mod plist_validity {
         let home = FabricHome::new(std::path::Path::new("/home/nathan/.local/share/fabric"));
         for memory in [None, Some(512u64)] {
             let spec = ServiceSpec::new("/usr/local/bin/fabric", home.root(), true, true, memory)?;
-            let plist = render_launch_agent_plist(&home, &spec)?;
-            let path = std::env::temp_dir().join(format!("fabric-plist-{:?}.plist", memory));
-            std::fs::write(&path, &plist)?;
-            let out = std::process::Command::new("plutil")
-                .arg("-lint")
-                .arg(&path)
-                .output();
-            let _ = std::fs::remove_file(&path);
-            match out {
-                Ok(out) => assert!(
-                    out.status.success(),
-                    "plutil rejected the plist for memory_max_mb={memory:?}: {}\n{plist}",
-                    String::from_utf8_lossy(&out.stderr)
-                ),
-                // Not a Mac, so there is nothing to lint with. Say so rather
-                // than passing silently as if it had been checked.
-                Err(_) => eprintln!("plutil unavailable, plist not linted here"),
+            for (name, plist) in [
+                ("fabric", render_launch_agent_plist(&home, &spec)?),
+                ("fabric-sync", render_launch_sync_agent_plist(&home, &spec)?),
+            ] {
+                let path = std::env::temp_dir()
+                    .join(format!("{name}-plist-{:?}.plist", memory));
+                std::fs::write(&path, &plist)?;
+                let out = std::process::Command::new("plutil")
+                    .arg("-lint")
+                    .arg(&path)
+                    .output();
+                let _ = std::fs::remove_file(&path);
+                match out {
+                    Ok(out) => assert!(
+                        out.status.success(),
+                        "plutil rejected {name} for memory_max_mb={memory:?}: {}\n{plist}",
+                        String::from_utf8_lossy(&out.stderr)
+                    ),
+                    // Not a Mac, so there is nothing to lint with. Say so rather
+                    // than passing silently as if it had been checked.
+                    Err(_) => eprintln!("plutil unavailable, {name} plist not linted here"),
+                }
             }
         }
         Ok(())

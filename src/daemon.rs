@@ -42,7 +42,9 @@ use crate::{
         PersistedExposeTarget, load_or_create_identity, validate_protocol,
         validate_server_session_config, validate_tcp_addr, write_atomic,
     },
-    control::{ControlRequest, ControlResponse, PeerReachability, SyncEntryStatus},
+    control::{
+        ControlRequest, ControlResponse, PeerReachability, SyncEntryStatus, SyncRuntimeStatus,
+    },
     exec, gitremote, mux, pathwatch, shell,
     sync::{
         self,
@@ -118,6 +120,8 @@ const PEER_HEALTH_FAILURES_BEFORE_RECOVER: usize = 3;
 /// peer, so a genuinely-down peer does not cause recovery thrash.
 const PEER_HEALTH_RECOVER_INITIAL_BACKOFF: Duration = Duration::from_secs(30);
 const PEER_HEALTH_RECOVER_MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
+/// The companion sends every 10 seconds. Three missed heartbeats mean absent.
+const SYNC_COMPANION_PRESENCE_WINDOW: Duration = Duration::from_secs(30);
 const PATH_QUALITY_ABSOLUTE_FLOOR: Duration = Duration::from_secs(1);
 const PATH_QUALITY_BASELINE_MULTIPLIER: u32 = 8;
 const PATH_QUALITY_CONSECUTIVE_SAMPLES: usize = 3;
@@ -429,6 +433,8 @@ pub struct DaemonState {
     /// The file-sync engine, set once just after this state is constructed (it
     /// needs a handle back to the state to dial peers).
     sync_engine: OnceLock<Arc<SyncEngine<IrohSyncTransport>>>,
+    /// The last companion heartbeat and its compatibility classification.
+    sync_companion_seen: Mutex<Option<(Instant, &'static str)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -998,6 +1004,7 @@ impl DaemonState {
             telemetry,
             last_probe_transport: Arc::new(StdRwLock::new(HashMap::new())),
             sync_engine: OnceLock::new(),
+            sync_companion_seen: Mutex::new(None),
         }))
     }
 
@@ -1033,6 +1040,21 @@ impl DaemonState {
 
     fn sync_engine(&self) -> Option<Arc<SyncEngine<IrohSyncTransport>>> {
         self.sync_engine.get().cloned()
+    }
+
+    async fn sync_runtime_status(&self) -> SyncRuntimeStatus {
+        let companion = match *self.sync_companion_seen.lock().await {
+            Some((seen, state)) if seen.elapsed() <= SYNC_COMPANION_PRESENCE_WINDOW => state,
+            _ => "absent",
+        };
+        SyncRuntimeStatus {
+            owner: "embedded".to_string(),
+            companion: companion.to_string(),
+        }
+    }
+
+    async fn record_sync_companion_state(&self, state: &'static str) {
+        *self.sync_companion_seen.lock().await = Some((Instant::now(), state));
     }
 
     fn endpoint_handle(&self) -> CurrentEndpoint {
@@ -3402,13 +3424,49 @@ async fn process_control_request(
                     .collect(),
                 None => Vec::new(),
             };
-            ControlResponse::SyncStatus { entries }
+            ControlResponse::SyncStatus {
+                entries,
+                runtime: state.sync_runtime_status().await,
+            }
         }
         ControlRequest::SyncIpcCompatibility => ControlResponse::SyncIpcCompatibility {
             version: crate::version_string(),
             sync_ipc_magic: sync::ipc::IPC_MAGIC.to_string(),
             sync_ipc_version: sync::ipc::IPC_VERSION,
             owner: "embedded".to_string(),
+        },
+        ControlRequest::SyncCompanionHello {
+            version,
+            sync_ipc_magic,
+            sync_ipc_version,
+        } => {
+            if version != crate::version_string() {
+                state.record_sync_companion_state("incompatible").await;
+                bail!(
+                    "fabric-sync is {version}, but the daemon is {}",
+                    crate::version_string()
+                );
+            }
+            if sync_ipc_magic != sync::ipc::IPC_MAGIC
+                || sync_ipc_version != sync::ipc::IPC_VERSION
+            {
+                state.record_sync_companion_state("incompatible").await;
+                bail!(
+                    "fabric-sync IPC is {sync_ipc_magic} version {sync_ipc_version}; expected {} version {}",
+                    sync::ipc::IPC_MAGIC,
+                    sync::ipc::IPC_VERSION
+                );
+            }
+            state.record_sync_companion_state("standby").await;
+            ControlResponse::SyncIpcCompatibility {
+                version: crate::version_string(),
+                sync_ipc_magic: sync::ipc::IPC_MAGIC.to_string(),
+                sync_ipc_version: sync::ipc::IPC_VERSION,
+                owner: "embedded".to_string(),
+            }
+        }
+        ControlRequest::SyncRuntimeStatus => ControlResponse::SyncRuntimeStatus {
+            runtime: state.sync_runtime_status().await,
         },
         ControlRequest::Shutdown => {
             state.cancel.cancel();
@@ -5201,6 +5259,68 @@ mod tests {
             }
             other => panic!("wrong compatibility response: {other:?}"),
         }
+        node.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn companion_presence_requires_a_matching_heartbeat_and_expires() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let node = FabricNode::start(FabricHome::new(dir.path())).await?;
+
+        let runtime = process_control_request(ControlRequest::SyncRuntimeStatus, node.state()).await?;
+        assert!(matches!(
+            runtime,
+            ControlResponse::SyncRuntimeStatus {
+                runtime: SyncRuntimeStatus { owner, companion }
+            } if owner == "embedded" && companion == "absent"
+        ));
+
+        let rejected = process_control_request(
+            ControlRequest::SyncCompanionHello {
+                version: "different-build".to_string(),
+                sync_ipc_magic: sync::ipc::IPC_MAGIC.to_string(),
+                sync_ipc_version: sync::ipc::IPC_VERSION,
+            },
+            node.state(),
+        )
+        .await
+        .expect_err("a different build must not become the standby");
+        assert!(format!("{rejected:#}").contains("different-build"));
+        assert_eq!(
+            node.state().sync_runtime_status().await.companion,
+            "incompatible"
+        );
+
+        let accepted = process_control_request(
+            ControlRequest::SyncCompanionHello {
+                version: crate::version_string(),
+                sync_ipc_magic: sync::ipc::IPC_MAGIC.to_string(),
+                sync_ipc_version: sync::ipc::IPC_VERSION,
+            },
+            node.state(),
+        )
+        .await?;
+        assert!(matches!(
+            accepted,
+            ControlResponse::SyncIpcCompatibility { owner, .. } if owner == "embedded"
+        ));
+        assert_eq!(
+            node.state().sync_runtime_status().await,
+            SyncRuntimeStatus {
+                owner: "embedded".to_string(),
+                companion: "standby".to_string(),
+            }
+        );
+
+        *node.state().sync_companion_seen.lock().await = Some((
+            Instant::now() - SYNC_COMPANION_PRESENCE_WINDOW - Duration::from_secs(1),
+            "standby",
+        ));
+        assert_eq!(
+            node.state().sync_runtime_status().await.companion,
+            "absent",
+            "a dead companion must not remain healthy forever"
+        );
         node.shutdown().await
     }
 

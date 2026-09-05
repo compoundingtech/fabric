@@ -2598,7 +2598,7 @@ fn compile_pipe_tick(directory: &TempDir) -> Result<PathBuf> {
 async fn sync_full_scans(home: &FabricHome, name: &str) -> Result<u64> {
     for _ in 0..50 {
         match send_control(home, ControlRequest::SyncStatus).await {
-            Ok(ControlResponse::SyncStatus { entries }) => {
+            Ok(ControlResponse::SyncStatus { entries, .. }) => {
                 return entries
                     .into_iter()
                     .find(|entry| entry.name == name)

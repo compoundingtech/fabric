@@ -12,7 +12,7 @@ use fabric::{
 #[derive(Debug, Parser)]
 #[command(name = "fabric-sync")]
 #[command(about = "Diagnostic companion for fabric file sync")]
-#[command(group(ArgGroup::new("action").required(true).multiple(false).args(["version", "check"])))]
+#[command(group(ArgGroup::new("action").required(true).multiple(false).args(["version", "check", "standby"])))]
 struct Cli {
     /// Print the build version.
     #[arg(long)]
@@ -21,6 +21,10 @@ struct Cli {
     /// Validate sync config, state ownership, and daemon compatibility.
     #[arg(long)]
     check: bool,
+
+    /// Run the supervised compatibility standby.
+    #[arg(long, hide = true)]
+    standby: bool,
 
     /// Use an isolated fabric state root.
     #[arg(long, global = true)]
@@ -34,7 +38,46 @@ async fn main() -> Result<()> {
         println!("{}", fabric::version_string());
         return Ok(());
     }
-    check(FabricHome::resolve(cli.home)?).await
+    let home = FabricHome::resolve(cli.home)?;
+    if cli.check {
+        return check(home).await;
+    }
+    standby(home).await
+}
+
+async fn standby(home: FabricHome) -> Result<()> {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+    let mut previous = String::new();
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = interval.tick() => {
+                let state = standby_heartbeat(&home).await;
+                if state != previous {
+                    println!("runtime\t{state}");
+                    previous = state;
+                }
+            }
+        }
+    }
+}
+
+async fn standby_heartbeat(home: &FabricHome) -> String {
+    let request = ControlRequest::SyncCompanionHello {
+        version: fabric::version_string(),
+        sync_ipc_magic: ipc::IPC_MAGIC.to_string(),
+        sync_ipc_version: ipc::IPC_VERSION,
+    };
+    match send_control(home, request).await {
+        Ok(ControlResponse::SyncIpcCompatibility { owner, .. }) if owner == "embedded" => {
+            "standby; daemon owns embedded sync".to_string()
+        }
+        Ok(ControlResponse::SyncIpcCompatibility { owner, .. }) => {
+            format!("unavailable; daemon granted unsupported owner {owner}")
+        }
+        Ok(response) => format!("unavailable; unexpected daemon response {response:?}"),
+        Err(error) => format!("unavailable; {error:#}"),
+    }
 }
 
 async fn check(home: FabricHome) -> Result<()> {

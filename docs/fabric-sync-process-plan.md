@@ -4,6 +4,9 @@ Date: 2026-09-04
 
 Status: approved for implementation on 2026-09-04.
 
+Implementation: steps 1 through 4 are merged. The current change implements
+step 5 while the embedded engine remains the production owner.
+
 ## Decisions
 
 File sync becomes a separate `fabric-sync` process. The monorepo ships `fabric`

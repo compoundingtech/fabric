@@ -94,6 +94,14 @@ pub enum ControlRequest {
     SyncStatus,
     /// Report whether this build can host the companion sync process.
     SyncIpcCompatibility,
+    /// Register one compatibility-standby heartbeat from the companion.
+    SyncCompanionHello {
+        version: String,
+        sync_ipc_magic: String,
+        sync_ipc_version: u16,
+    },
+    /// Report which process owns sync and whether its companion is present.
+    SyncRuntimeStatus,
     Shutdown,
 }
 
@@ -185,6 +193,7 @@ pub enum ControlResponse {
     },
     SyncStatus {
         entries: Vec<SyncEntryStatus>,
+        runtime: SyncRuntimeStatus,
     },
     SyncIpcCompatibility {
         version: String,
@@ -192,13 +201,24 @@ pub enum ControlResponse {
         sync_ipc_version: u16,
         owner: String,
     },
+    SyncRuntimeStatus {
+        runtime: SyncRuntimeStatus,
+    },
     Error {
         message: String,
     },
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncRuntimeStatus {
+    /// `embedded`, `companion`, or `unavailable`.
+    pub owner: String,
+    /// `standby`, `active`, `absent`, `incompatible`, or `unknown`.
+    pub companion: String,
+}
+
 /// One configured sync entry's status, for `fabric sync ls`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncEntryStatus {
     pub name: String,
     pub folder: String,

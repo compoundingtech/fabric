@@ -8,6 +8,11 @@ _Last updated: 2026-09-04 by Silber.fabric-codex. Main is ahead of the fleet.
 Ask Silber.cos for the current fleet build. Do not cut or deploy a release
 without Silber.cos._
 
+For extraction steps 6 and 8, merge on green without asking for a separate
+Silber.cos approval. Silber.cos holds the step 7 activation gate and every
+release or deployment gate. Before any deployment, prove matched-pair rollback
+on hetz and decide whether macOS needs a detached update supervisor.
+
 ## Current main — 2026-09-04
 
 PR #154 made the current-connection fault class visible. PR #155 froze the
@@ -24,14 +29,21 @@ owner-only socket permissions, same-user checks, version and feature
 negotiation, structured errors, status, shutdown, and a raw bidirectional
 stream relay.
 
-The current change ships `fabric-sync` as a diagnostic companion. Its read-only
+PR #162 ships `fabric-sync` as a diagnostic companion. Its read-only
 `--check` validates `syncs.toml`, the state paths, the owner lease, the daemon
 build, and sync IPC compatibility. Release archives, the installer, the
 updater, and rollback now handle `fabric` and `fabric-sync` as one versioned
 pair. The main daemon still owns and runs sync in-process.
 
+The current change adds an independent service for the companion. It runs in
+compatibility standby, so it acquires no lease and starts no watcher. The daemon
+records matching heartbeats and reports a missing or incompatible companion.
+Service status, `fabric status`, `fabric sync ls`, and doctor show that runtime.
+A configured entry remains visible when the daemon is down. The embedded engine
+remains the production owner.
+
 PR #153 grouped the sync disk state and merged as `7733e4b`. It is not released
-or deployed. The fleet remains on `0.2.1+48208e4`.
+or deployed. Ask Silber.cos for the current fleet build.
 
 One clean `sync_once` now publishes two full disk snapshots. It clones no
 manifest. The former pass built 13 full tree containers. One `DiskState` now

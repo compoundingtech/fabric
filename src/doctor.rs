@@ -118,6 +118,8 @@ pub struct SyncFact {
     pub scan_issues: Vec<(String, String)>,
     /// Peers this entry has stopped syncing with, and why.
     pub stopped: Vec<(String, String)>,
+    /// The process that currently owns this configured entry.
+    pub runtime_owner: String,
 }
 
 /// What the certificate authority looks like.
@@ -149,6 +151,8 @@ pub struct Facts {
     /// Whether the managed service will start on boot, not merely whether its
     /// unit file exists. Presence is not enablement.
     pub service: ServiceEnablement,
+    pub sync_service: ServiceEnablement,
+    pub sync_runtime: crate::control::SyncRuntimeStatus,
     pub own_version: String,
     pub peers: Vec<PeerFact>,
     pub syncs: Vec<SyncFact>,
@@ -232,6 +236,74 @@ pub fn diagnose(facts: &Facts) -> Vec<Finding> {
             "not running, so nothing on this machine is reachable by a peer",
         )
         .with_action("fabric up")
+    });
+
+    if facts.manages_service {
+        out.push(match facts.sync_service {
+            ServiceEnablement::Enabled => Finding::new(
+                "sync service",
+                Verdict::Ok,
+                "the sync companion is installed and enabled",
+            ),
+            ServiceEnablement::PresentNotEnabled => Finding::new(
+                "sync service",
+                if fresh { Verdict::Setup } else { Verdict::Problem },
+                "the sync companion is installed but not enabled",
+            )
+            .with_action("fabric service install"),
+            ServiceEnablement::NotInstalled => Finding::new(
+                "sync service",
+                if fresh { Verdict::Setup } else { Verdict::Problem },
+                "the sync companion service is absent",
+            )
+            .with_action("fabric service install"),
+            ServiceEnablement::Unknown => Finding::new(
+                "sync service",
+                Verdict::Unknown,
+                "could not tell whether the sync companion is enabled",
+            ),
+        });
+    }
+
+    out.push(if facts.sync_runtime.owner == "unavailable" {
+        Finding::new(
+            "sync runtime",
+            if fresh { Verdict::Setup } else { Verdict::Problem },
+            "the sync runtime is unavailable",
+        )
+        .with_action("start the fabric daemon and sync companion")
+    } else if facts.manages_service && facts.sync_runtime.companion == "absent" {
+        Finding::new(
+            "sync runtime",
+            Verdict::Problem,
+            format!(
+                "{} sync is active, but the supervised companion is absent",
+                facts.sync_runtime.owner
+            ),
+        )
+        .with_action("fabric service install")
+    } else if facts.sync_runtime.companion == "incompatible" {
+        Finding::new(
+            "sync runtime",
+            Verdict::Problem,
+            "the sync companion does not match the running daemon",
+        )
+        .with_action("install a matched fabric and fabric-sync pair")
+    } else if facts.sync_runtime.companion == "unknown" {
+        Finding::new(
+            "sync runtime",
+            Verdict::Unknown,
+            "could not tell whether the sync companion is compatible",
+        )
+    } else {
+        Finding::new(
+            "sync runtime",
+            Verdict::Ok,
+            format!(
+                "owner={}, companion={}",
+                facts.sync_runtime.owner, facts.sync_runtime.companion
+            ),
+        )
     });
 
     if facts.peers.is_empty() {
@@ -394,6 +466,17 @@ fn sync_findings(sync: &SyncFact) -> Vec<Finding> {
     let name = &sync.name;
     let mut out = Vec::new();
 
+    if sync.runtime_owner == "unavailable" {
+        out.push(
+            Finding::new(
+                "sync",
+                Verdict::Problem,
+                format!("{name} is configured, but its sync runtime is unavailable"),
+            )
+            .with_action("start the fabric daemon and sync companion"),
+        );
+    }
+
     if !sync.folder_exists {
         // Deliberately silent in the engine: a folder that vanished must not be
         // read as "everything was deleted". Correct, and invisible, which is
@@ -517,7 +600,7 @@ fn sync_findings(sync: &SyncFact) -> Vec<Finding> {
         out.push(finding);
     }
 
-    if !sync.drift_clean {
+    if sync.runtime_owner != "unavailable" && !sync.drift_clean {
         out.push(Finding::new(
             "sync",
             Verdict::Problem,
@@ -525,7 +608,11 @@ fn sync_findings(sync: &SyncFact) -> Vec<Finding> {
         ));
     }
 
-    if sync.stopped.is_empty() && sync.scan_issues.is_empty() && sync.drift_clean {
+    if sync.runtime_owner != "unavailable"
+        && sync.stopped.is_empty()
+        && sync.scan_issues.is_empty()
+        && sync.drift_clean
+    {
         out.push(Finding::new(
             "sync",
             Verdict::Ok,
@@ -651,6 +738,11 @@ mod tests {
             manages_service: true,
             daemon_running: true,
             service: ServiceEnablement::Enabled,
+            sync_service: ServiceEnablement::Enabled,
+            sync_runtime: crate::control::SyncRuntimeStatus {
+                owner: "embedded".to_string(),
+                companion: "standby".to_string(),
+            },
             own_version: "0.2.0+abc".to_string(),
             peers: vec![PeerFact {
                 label: "hetz".to_string(),
@@ -668,6 +760,7 @@ mod tests {
                 drift_clean: true,
                 scan_issues: Vec::new(),
                 stopped: Vec::new(),
+                runtime_owner: "embedded".to_string(),
             }],
             ca: CaFact {
                 present: false,
@@ -726,6 +819,11 @@ mod tests {
             manages_service: true,
             daemon_running: false,
             service: ServiceEnablement::NotInstalled,
+            sync_service: ServiceEnablement::NotInstalled,
+            sync_runtime: crate::control::SyncRuntimeStatus {
+                owner: "unavailable".to_string(),
+                companion: "unknown".to_string(),
+            },
             own_version: "0.2.0+abc".to_string(),
             peers: Vec::new(),
             syncs: Vec::new(),
@@ -772,6 +870,11 @@ mod tests {
             // ...but the unit is on disk for the prod home, and this is exactly
             // what the gatherer sees.
             service: ServiceEnablement::Enabled,
+            sync_service: ServiceEnablement::Enabled,
+            sync_runtime: crate::control::SyncRuntimeStatus {
+                owner: "unavailable".to_string(),
+                companion: "unknown".to_string(),
+            },
             daemon_running: false,
             own_version: "0.2.0+abc".to_string(),
             peers: Vec::new(),
@@ -806,6 +909,60 @@ mod tests {
         let service = find(&findings, "service");
         assert_eq!(service[0].verdict, Verdict::Problem);
         assert!(service[0].action.is_some(), "no action was offered");
+    }
+
+    #[test]
+    fn an_incompatible_companion_is_not_reported_as_healthy() {
+        let mut facts = configured();
+        facts.sync_runtime.companion = "incompatible".to_string();
+        let findings = diagnose(&facts);
+        let runtime = find(&findings, "sync runtime");
+        assert_eq!(runtime[0].verdict, Verdict::Problem);
+        assert!(runtime[0].detail.contains("does not match"));
+        assert!(
+            runtime[0]
+                .action
+                .as_deref()
+                .is_some_and(|action| action.contains("matched"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_configured_sync_does_not_disappear_when_the_daemon_is_down() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let folder = dir.path().join("catalog");
+        std::fs::create_dir_all(&folder)?;
+        std::fs::write(
+            home.syncs_path(),
+            format!(
+                "[[sync]]\nname = \"catalog\"\nfolder = {:?}\npeers = \"*\"\npolicy = \"catalog\"\n",
+                folder
+            ),
+        )?;
+
+        let facts = gather(&home, |_| async {
+            Err(anyhow::anyhow!("the daemon is down"))
+        })
+        .await;
+        assert_eq!(facts.syncs.len(), 1);
+        assert_eq!(facts.syncs[0].name, "catalog");
+        assert_eq!(facts.syncs[0].runtime_owner, "unavailable");
+        assert!(
+            diagnose(&facts).iter().any(|finding| {
+                finding.check == "sync"
+                    && finding.verdict == Verdict::Problem
+                    && finding.detail.contains("catalog is configured")
+            }),
+            "the configured entry vanished with its runtime"
+        );
+        assert!(
+            !diagnose(&facts)
+                .iter()
+                .any(|finding| finding.detail.contains("has drifted")),
+            "an unavailable runtime was guessed to have drift"
+        );
+        Ok(())
     }
 
     /// A check that could not look must never say ok.
@@ -1260,7 +1417,9 @@ use anyhow::Result;
 use crate::ca;
 use crate::service::ServiceEnablement;
 use crate::config::{FabricHome, PeerBook};
-use crate::control::{ControlRequest, ControlResponse, PeerReachability, SyncEntryStatus};
+use crate::control::{
+    ControlRequest, ControlResponse, PeerReachability, SyncRuntimeStatus,
+};
 
 /// Where the OS service definition would live on this platform.
 
@@ -1278,6 +1437,7 @@ where
     let manages_service = home.is_default_state_root();
 
     let service = crate::service::service_enablement();
+    let sync_service = crate::service::sync_service_enablement();
 
     let mut own_version = env!("CARGO_PKG_VERSION").to_string();
     let mut daemon_running = false;
@@ -1327,26 +1487,44 @@ where
         })
         .collect::<Vec<_>>();
 
-    let entries: Vec<SyncEntryStatus> = match send_control(ControlRequest::SyncStatus).await {
-        Ok(ControlResponse::SyncStatus { entries }) => entries,
-        // The daemon is the only thing that knows this. Without it we say
-        // nothing about sync rather than guessing it is fine.
-        _ => Vec::new(),
+    let (entries, sync_runtime) = match send_control(ControlRequest::SyncStatus).await {
+        Ok(ControlResponse::SyncStatus { entries, runtime }) => (entries, runtime),
+        _ => (
+            Vec::new(),
+            SyncRuntimeStatus {
+                owner: "unavailable".to_string(),
+                companion: "unknown".to_string(),
+            },
+        ),
     };
 
-    let syncs = entries
+    let entries_by_name = entries
         .iter()
-        .map(|entry| {
-            let folder = PathBuf::from(&entry.folder);
+        .map(|entry| (entry.name.as_str(), entry))
+        .collect::<std::collections::HashMap<_, _>>();
+    let configured = crate::sync::SyncBook::load(home).ok();
+    let syncs = configured
+        .as_ref()
+        .map(|book| book.entries())
+        .unwrap_or_default()
+        .iter()
+        .map(|configured| {
+            let runtime = entries_by_name.get(configured.name.as_str()).copied();
+            let folder = configured.folder.clone();
             SyncFact {
-                name: entry.name.clone(),
+                name: configured.name.clone(),
                 folder_exists: folder.exists(),
                 folder,
-                drift_clean: entry.missing == 0
-                    && entry.mismatched == 0
-                    && entry.scan_issues.is_empty(),
-                scan_issues: entry.scan_issues.clone(),
-                stopped: entry.stopped_peers.clone(),
+                drift_clean: runtime.is_some_and(|entry| {
+                    entry.missing == 0
+                        && entry.mismatched == 0
+                        && entry.scan_issues.is_empty()
+                }),
+                scan_issues: runtime.map(|entry| entry.scan_issues.clone()).unwrap_or_default(),
+                stopped: runtime
+                    .map(|entry| entry.stopped_peers.clone())
+                    .unwrap_or_default(),
+                runtime_owner: sync_runtime.owner.clone(),
             }
         })
         .collect::<Vec<_>>();
@@ -1356,6 +1534,8 @@ where
         manages_service,
         daemon_running,
         service,
+        sync_service,
+        sync_runtime,
         own_version,
         peers,
         ca: gather_ca(home, &syncs),
