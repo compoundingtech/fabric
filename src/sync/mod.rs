@@ -19,6 +19,7 @@ pub mod config;
 pub mod delta;
 pub mod engine;
 pub mod glob;
+pub mod ipc;
 pub mod manifest;
 pub mod node;
 pub mod paths;

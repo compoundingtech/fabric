@@ -972,6 +972,11 @@ The sync engine receives explicit config and state paths instead of the daemon
 home. It holds `<home>/sync/owner.lock` for its lifetime, so a second engine
 fails before it reads or changes the same state.
 
+The library also defines a dormant `fabric/sync-ipc/1` Unix bridge for the
+planned companion process. Its owner-only socket uses bounded, versioned control
+messages, then carries raw `fabric/sync/1` bytes. No production request selects
+this bridge yet; the daemon remains the embedded sync owner.
+
 Entries live in an authoritative, hand-editable `syncs.toml` next to `peers.toml`
 (`~/.config/fabric/syncs.toml` for the default home, `<home>/syncs.toml` with
 `--home` or `FABRIC_HOME`):

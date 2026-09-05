@@ -8,6 +8,12 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Changed
 
+- **The dormant `fabric/sync-ipc/1` local bridge now has a frozen contract.**
+  Versioned, bounded control frames negotiate peer resolution, raw sync streams,
+  status, shutdown, and structured errors. The socket is owner-only, verifies
+  the local user and daemon-instance nonce, and applies no extra framing after
+  a stream is ready. Production still uses the embedded sync engine.
+
 - **`fabric doctor` now gives uncertainty a distinct exit code.** Code 0 means
   verified healthy, code 1 means a problem or setup remains, and code 3 means
   one or more checks are unknown with no known problem. Clap keeps code 2 for
