@@ -643,6 +643,24 @@ impl PeerConnections {
         protocol: &str,
         _activity: StreamActivity,
     ) -> Result<Option<Connection>> {
+        {
+            let conns = self.conns.lock().await;
+            if let Some(existing) = conns.get(&peer_addr.id)
+                && existing.generation == generation
+                && existing.connection.close_reason().is_none()
+            {
+                return Ok(Some(existing.connection.clone()));
+            }
+            if let Some(existing) = conns.get(&peer_addr.id)
+                && existing.generation > generation
+            {
+                bail!(
+                    "endpoint generation changed before mux open: requested {generation}, current {}",
+                    existing.generation
+                );
+            }
+        }
+
         let peer_gate = self.peer_gate(peer_addr.id).await;
         let _peer_guard = peer_gate.lock().await;
         let mut conns = self.conns.lock().await;
@@ -731,14 +749,29 @@ impl PeerConnections {
 
     /// Make one peer use a fresh multipath connection on its next stream.
     pub async fn redial(&self, peer: EndpointId, reason: &[u8]) -> bool {
-        let peer_gate = self.peer_gate(peer).await;
-        let _peer_guard = peer_gate.lock().await;
-        let removed = self.conns.lock().await.remove(&peer);
-        if let Some(removed) = removed {
-            removed.connection.close(0u32.into(), reason);
-            return true;
+        self.redial_opened_before(peer, reason, Instant::now()).await
+    }
+
+    /// Close only a connection that existed before the failed probe started.
+    pub async fn redial_opened_before(
+        &self,
+        peer: EndpointId,
+        reason: &[u8],
+        probe_started: Instant,
+    ) -> bool {
+        let mut connections = self.conns.lock().await;
+        let Some(current) = connections.get(&peer) else {
+            return false;
+        };
+        if current.opened_at > probe_started {
+            return false;
         }
-        false
+        let removed = connections
+            .remove(&peer)
+            .expect("the matched mux connection disappeared while locked");
+        drop(connections);
+        removed.connection.close(0u32.into(), reason);
+        true
     }
 
     /// Cache an accepted peer connection for traffic in the reverse direction.
@@ -1176,6 +1209,73 @@ mod tests {
 
         slow.shutdown().await?;
         healthy.shutdown().await?;
+        client.close().await;
+        Ok(())
+    }
+
+    /// Recovery must not close a connection that opened after the failed probe.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovery_does_not_close_a_connection_opened_after_the_probe() -> Result<()> {
+        let client = Endpoint::builder(presets::N0).bind().await?;
+        let (opened_tx, _opened_rx) = mpsc::unbounded_channel();
+        let manager = Arc::new(PeerConnections::new(client.id(), opened_tx));
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let slow = Router::builder(
+            Endpoint::builder(presets::N0)
+                .alpns(vec![MUX_ALPN.to_vec()])
+                .bind()
+                .await?,
+        )
+        .accept(
+            MUX_ALPN,
+            BlockedGenerationMuxEcho {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        )
+        .spawn();
+        slow.endpoint().online().await;
+
+        let peer = slow.endpoint().id();
+        let failed_probe_started = Instant::now();
+        let slow_manager = manager.clone();
+        let slow_client = client.clone();
+        let slow_addr = slow.endpoint().addr();
+        let slow_open = tokio::spawn(async move {
+            slow_manager
+                .open_mux_stream(&slow_client, 0, &slow_addr, "slow", StreamActivity::Probe)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), entered.wait())
+            .await
+            .context("the slow peer did not reach generation exchange")?;
+
+        release.notify_one();
+        let stream = slow_open.await??;
+        let stable_id = stream.connection.stable_id();
+        drop(stream);
+        let recovery = manager
+            .redial_opened_before(peer, b"peer health recovery", failed_probe_started)
+            .await;
+
+        assert_eq!(
+            recovery,
+            false,
+            "recovery closed a connection that opened after the failed probe started"
+        );
+        assert_eq!(
+            manager.connection(peer).await.map(|conn| conn.stable_id()),
+            Some(stable_id),
+            "recovery closed the connection that completed after it started"
+        );
+        assert!(
+            manager.redial(peer, b"current connection recovery").await,
+            "recovery did not close the connection present when it started"
+        );
+        assert!(manager.connection(peer).await.is_none());
+
+        slow.shutdown().await?;
         client.close().await;
         Ok(())
     }
