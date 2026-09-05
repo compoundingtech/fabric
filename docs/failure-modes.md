@@ -3,11 +3,11 @@
 fabric connects two machines that are not on the same network. Networks fail, so
 this page is about what fabric does when they do.
 
-**Every number here was measured**, on one machine running two fabric daemons
-against each other, by the test named in the last column. Where there is no
-test, the row says `NOT PROVEN` and stays in the table. A page that lists only
-the failures we happened to test would read as a complete list of what can go
-wrong, and it would not be one.
+**Every number here was measured.** Most measurements use one machine running
+two fabric daemons, with the test named in the last column. A fleet measurement
+names its machine and window. Where there is no test, the row says `NOT PROVEN`
+and stays in the table. A page that lists only the failures we happened to test
+would read as a complete list of what can go wrong, and it would not be one.
 
 ## The two questions
 
@@ -33,6 +33,7 @@ nothing tells you to look.
 | **The far machine restarts** — you restart your dev server while a browser is connected | The open connection does not survive because the process that owned it is gone. A new request during the outage fails within Fabric's three-second initial-connect bound. A client can then retry. A new request works when the peer returns. See "Whose problem is a page that stops updating" below. | During the outage 3.006 s; after restart 91.681 ms; one 9.87 s focused run on 2026-09-02 | `a_peer_restarting_mid_session_restores_service_without_intervention` |
 | The direct path between the machines dies while a relay is available | `NOT PROVEN.` Two daemons on one machine cannot lose a direct path they never had, so this cannot be forced in a test here. It is not hypothetical: on the three-machine fleet today, 1,569 connections used a direct path and 1,463 used a relay, so both are in constant use. Proving the switch needs two real machines. | Unmeasured | `NOT PROVEN` |
 | A machine's address changes mid-session, as a laptop moving between networks does | The session survives without restarting the process, and the machine keeps its identity. Proven for one kind of tunnel. | Not separately measured | `generic_tunnel_survives_client_endpoint_recycle_without_process_restart`. **`NOT PROVEN` for TCP tunnels specifically.** |
+| A configured peer stays offline | Its failed connection attempt stays isolated. Healthy peer streams still open. Failed probes retain no connection. | Under 250 ms in the regression test. On hetz, 300 of 300 healthy pings passed over 91.663 seconds. | `offline_peer_cost_is_bounded_and_healthy_peer_stays_fast` |
 
 ## What you see while it is broken
 
@@ -78,6 +79,24 @@ network is back, for the same reason, while a new request is immediate.
 **A restart on the far side ends open connections.** See the table. Whether the
 application notices is up to the application; fabric restores the tunnel but
 cannot resurrect a socket the far process no longer has.
+
+**An offline peer still gets a health probe every 20 seconds.** This is extra
+work, but its fleet cost was not detectable on 2026-09-05. A 91.663-second
+treatment had six failed probes. All 300 healthy-peer pings passed, with no ping
+above one second.
+
+Two matched resource traces each used 380 one-second samples over 379.095
+seconds. The offline-peer treatment used 5.925% of one core. The no-offline-peer
+control used 11.942%, because unrelated work made the control busier. Treatment
+RSS spanned 155,824 KiB. Control RSS spanned 196,048 KiB. Both traces crossed the
+daemon's 128 MiB allocator sawtooth. These results show no attributable cost at
+this fleet size. They do not show that a failed probe costs nothing.
+
+Remove a truly retired peer from `peers.toml` on every machine. This file is a
+local allow list, so removal on one machine does not remove trust elsewhere.
+`fabric doctor` can report an unreachable peer, but it cannot know that the peer
+was retired. The fleet has no authoritative peer set today. An operator must
+compare every machine's `peers.toml` to find this drift.
 
 ## Why `send-file` is not shaped like scp
 

@@ -1280,6 +1280,119 @@ mod tests {
         Ok(())
     }
 
+    /// A peer that never answers must keep a fixed amount of manager state and
+    /// must not delay a healthy peer while 32 repeated probes fail.
+    ///
+    /// The live control on hetz used 4.81 CPU-seconds over 93.339 seconds. A
+    /// 342.087-second window with one offline peer used 17.09 CPU-seconds, or
+    /// 4.996% of one core against the control's 5.153%. RSS followed the same
+    /// bounded 128 MiB allocator sawtooth with and without the offline peer.
+    /// This test pins the deterministic causes behind that result: each probe
+    /// owns one bounded attempt, failed probes retain no connection, and a
+    /// healthy peer never waits for the offline peer's gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn offline_peer_cost_is_bounded_and_healthy_peer_stays_fast() -> Result<()> {
+        const FAILED_PROBES: usize = 32;
+        const FAILED_PROBE_WINDOW: Duration = Duration::from_millis(350);
+        const HEALTHY_STREAM_BUDGET: Duration = Duration::from_millis(250);
+
+        let client = Endpoint::builder(presets::N0).bind().await?;
+        let (opened_tx, _opened_rx) = mpsc::unbounded_channel();
+        let manager = Arc::new(PeerConnections::new(client.id(), opened_tx));
+        let healthy = Router::builder(
+            Endpoint::builder(presets::N0)
+                .alpns(vec![MUX_ALPN.to_vec()])
+                .bind()
+                .await?,
+        )
+        .accept(
+            MUX_ALPN,
+            MuxEcho {
+                connections: Arc::new(AtomicUsize::new(0)),
+                headers: Arc::new(Mutex::new(Vec::new())),
+            },
+        )
+        .spawn();
+        healthy.endpoint().online().await;
+        let healthy_addr = healthy.endpoint().addr();
+        let offline_addr = EndpointAddr::new(iroh::SecretKey::generate().public());
+
+        let mut first = manager
+            .open_mux_stream(&client, 0, &healthy_addr, "control", StreamActivity::Probe)
+            .await?;
+        prove_measurement_stream(&mut first).await?;
+        drop(first);
+        let attempts_before = manager.mux_connect_attempts.load(Ordering::SeqCst);
+
+        for probe in 0..FAILED_PROBES {
+            let offline_manager = manager.clone();
+            let offline_client = client.clone();
+            let offline_addr = offline_addr.clone();
+            let offline = tokio::spawn(async move {
+                tokio::time::timeout(
+                    FAILED_PROBE_WINDOW,
+                    offline_manager.open_mux_stream(
+                        &offline_client,
+                        0,
+                        &offline_addr,
+                        "offline",
+                        StreamActivity::Probe,
+                    ),
+                )
+                .await
+            });
+
+            let expected_attempts = attempts_before + probe + 1;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while manager.mux_connect_attempts.load(Ordering::SeqCst) < expected_attempts {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .with_context(|| format!("offline probe {probe} never started"))?;
+
+            let mut stream = tokio::time::timeout(
+                HEALTHY_STREAM_BUDGET,
+                manager.open_mux_stream(
+                    &client,
+                    0,
+                    &healthy_addr,
+                    "healthy",
+                    StreamActivity::Probe,
+                ),
+            )
+            .await
+            .with_context(|| {
+                format!("offline probe {probe} delayed the healthy peer past the budget")
+            })??;
+            prove_measurement_stream(&mut stream).await?;
+            drop(stream);
+
+            let offline = offline.await?;
+            assert!(
+                !matches!(offline, Ok(Ok(_))),
+                "the offline peer unexpectedly accepted probe {probe}"
+            );
+        }
+
+        assert_eq!(
+            manager.mux_connect_attempts.load(Ordering::SeqCst) - attempts_before,
+            FAILED_PROBES,
+            "a probe must own one connection attempt and no hidden retry task"
+        );
+        assert_eq!(
+            manager.conns.lock().await.len(),
+            1,
+            "failed probes must retain no connection beside the healthy one"
+        );
+        assert!(manager.legacy_notices.lock().await.is_empty());
+        assert!(manager.legacy_fallbacks.lock().await.is_empty());
+
+        healthy.shutdown().await?;
+        client.close().await;
+        Ok(())
+    }
+
     async fn assert_stream_failure_recovery(
         failures: usize,
         expect_same_connection: bool,
