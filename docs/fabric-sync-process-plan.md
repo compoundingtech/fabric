@@ -188,6 +188,27 @@ companion binary and OS service when no companion existed. The first paired
 archive is the later writer. This gate is per machine, so a roaming machine such
 as Bluey first receives the transition release when it returns.
 
+### Paired-install rollback inventory
+
+Every future paired-install change must add its machine effects to this table.
+The rollback review answers both columns before a paired release.
+
+| Item changed by install | Required rollback action | Harm if stale |
+| --- | --- | --- |
+| `fabric` binary | Restore the exact prior binary. | A bad candidate can keep every Fabric service down. |
+| `fabric-sync` binary | Restore the prior binary, or remove it when none existed. | A mismatched binary fails the local handshake. An unwanted binary can restart later. |
+| Main service definition | Restore or render a definition that the old binary accepts. | A new argument can make the old daemon fail at the next restart. |
+| Companion service definition | Restore it when one existed. Otherwise, unload and remove it. | A definition pointing at an absent binary causes permanent restart churn. |
+| Main and companion enablement | Restore each prior enabled or disabled state. | A disabled daemon does not return after login. An unwanted companion keeps retrying. |
+| Git remote helper | Repair the relative helper link after restoring `fabric`. | The current relative link is safe. A future versioned target could call the wrong binary. |
+| Sync IPC socket | Stop the companion and remove its socket before the old owner starts. Keep the shared run directory. | A stale socket can block bind or report a process that is gone. |
+| State-owner lease | Stop every new owner before the old embedded owner starts. The unlocked lease file can remain. | A living holder prevents the restored daemon from opening sync state. |
+| Durable sync state | Keep the schema readable by both releases. Do not rewrite state during binary rollback. | New-only state can make the restored engine fail or misread data. |
+| Incoming staging files | Remove every uncommitted file on success and handled failure. | Hidden executable bytes waste disk and invite an unsafe manual recovery. |
+| Rollback copies | Keep one exact matched prior set through the rollback window. Prune older complete sets later. | An unmatched newest set can select a mismatched pair. Unlimited sets waste disk. |
+| Detached supervisor job and plist | Remove both after success and rollback. | A stale verifier can roll back a later healthy build. |
+| Service log files | No restore is needed. Keep bounded logs for diagnosis. | Unbounded logs waste disk. Existing bounded files are harmless. |
+
 On macOS, the updater arms a transient launchd supervisor before the first pair
 rename. The supervisor starts its timeout only after replacement is visible, so
 a system sleep cannot consume the recovery window before the update starts. It
