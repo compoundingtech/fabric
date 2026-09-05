@@ -2030,9 +2030,94 @@ mod supervisor_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
+    const REAL_PAIR_WORKER: &str = "FABRIC_REAL_PAIR_ROLLBACK_WORKER";
+    const REAL_PAIR_INSTALLED: &str = "FABRIC_REAL_PAIR_INSTALLED";
+    const REAL_PAIR_ROLLBACK: &str = "FABRIC_REAL_PAIR_ROLLBACK";
+
     fn executable(path: &Path, body: &str) {
         std::fs::write(path, body).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn run_real_pair_worker() -> bool {
+        if std::env::var_os(REAL_PAIR_WORKER).is_none() {
+            return false;
+        }
+        let installed = PathBuf::from(std::env::var_os(REAL_PAIR_INSTALLED).unwrap());
+        let rollback = PathBuf::from(std::env::var_os(REAL_PAIR_ROLLBACK).unwrap());
+        let companion = companion_binary_path(&installed).unwrap();
+        let companion_rollback = companion_rollback_path(&rollback).unwrap();
+
+        assert_ne!(
+            std::fs::read(&installed).unwrap(),
+            std::fs::read(&rollback).unwrap()
+        );
+        assert_ne!(
+            std::fs::read(&companion).unwrap(),
+            std::fs::read(&companion_rollback).unwrap()
+        );
+        let companion_restored = restore_rollback_machine(
+            &installed,
+            &rollback,
+            |exists| {
+                assert!(exists, "the supervisor did not find the companion rollback");
+                Ok(())
+            },
+            |path, exists| {
+                assert_eq!(path, installed);
+                assert!(exists, "the supervisor would restore only fabric");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(companion_restored);
+        assert_eq!(
+            std::fs::read(&installed).unwrap(),
+            std::fs::read(&rollback).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(&companion).unwrap(),
+            std::fs::read(&companion_rollback).unwrap()
+        );
+        true
+    }
+
+    fn real_pair_fixture(
+        dir: &Path,
+        test_name: &str,
+    ) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let installed = dir.join("fabric");
+        let companion = dir.join("fabric-sync");
+        let rollback = dir.join("fabric.rollback-real");
+        let companion_rollback = dir.join("fabric-sync.rollback-real");
+        executable(
+            &installed,
+            "#!/bin/sh\n# broken candidate fabric\nexit 99\n",
+        );
+        executable(
+            &companion,
+            "#!/bin/sh\n# broken candidate fabric-sync\nexit 98\n",
+        );
+        executable(
+            &companion_rollback,
+            "#!/bin/sh\n# known-good fabric-sync\nexit 0\n",
+        );
+        let test_exe = std::env::current_exe().unwrap();
+        executable(
+            &rollback,
+            &format!(
+                "#!/bin/sh\n{}=1 \\\n{}='{}' \\\n{}='{}' \\\nexec '{}' --exact '{}' --ignored --nocapture\n",
+                REAL_PAIR_WORKER,
+                REAL_PAIR_INSTALLED,
+                installed.display(),
+                REAL_PAIR_ROLLBACK,
+                rollback.display(),
+                test_exe.display(),
+                test_name,
+            ),
+        );
+        (installed, companion, rollback, companion_rollback)
     }
 
     fn run_macos_wrapper(
@@ -2462,6 +2547,9 @@ mod supervisor_tests {
     #[test]
     #[ignore = "uses the live user launchd domain"]
     fn a_real_launchd_supervisor_rolls_back_and_removes_its_job() {
+        if run_real_pair_worker() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("logs")).unwrap();
         std::fs::create_dir_all(dir.path().join("run")).unwrap();
@@ -2470,12 +2558,9 @@ mod supervisor_tests {
             b"generation-1\n",
         )
         .unwrap();
-        let installed = dir.path().join("fabric");
-        let rollback = dir.path().join("fabric.rollback-real");
-        executable(&installed, "#!/bin/sh\nexit 99\n");
-        executable(
-            &rollback,
-            "#!/bin/sh\ninstalled=${0%%.rollback-*}\n/bin/cp \"$0\" \"$installed\"\nexit 0\n",
+        let (installed, companion, rollback, companion_rollback) = real_pair_fixture(
+            dir.path(),
+            "update::supervisor_tests::a_real_launchd_supervisor_rolls_back_and_removes_its_job",
         );
         let stamp = format!("test-{}-{}", timestamp(), std::process::id());
         let spec = render_macos_supervisor(
@@ -2507,6 +2592,7 @@ mod supervisor_tests {
             if !loaded
                 && !spec.plist.exists()
                 && std::fs::read(&installed).unwrap() == std::fs::read(&rollback).unwrap()
+                && std::fs::read(&companion).unwrap() == std::fs::read(&companion_rollback).unwrap()
             {
                 removed = true;
                 break;
@@ -2518,7 +2604,90 @@ mod supervisor_tests {
                 .args(["bootout", &spec.target])
                 .output();
         }
-        assert!(removed, "the real launchd job did not roll back and remove itself");
+        assert!(
+            removed,
+            "the real launchd job did not restore both members and remove itself"
+        );
+    }
+
+    /// This test changes the current user's systemd manager for a few seconds.
+    /// Run it explicitly on Linux before a release that changes the updater.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "uses the live user systemd manager"]
+    fn a_real_systemd_supervisor_rolls_back_and_removes_its_jobs() {
+        if run_real_pair_worker() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (installed, companion, rollback, companion_rollback) = real_pair_fixture(
+            dir.path(),
+            "update::supervisor_tests::a_real_systemd_supervisor_rolls_back_and_removes_its_jobs",
+        );
+        let unit = format!("fabric-update-supervisor-test-{}", std::process::id());
+        let (_, mut args) = supervisor_argv(dir.path(), &rollback, "generation-1", "fabric test");
+        let timer = args
+            .iter_mut()
+            .find(|arg| arg.starts_with("--on-active="))
+            .expect("the supervisor has no timer");
+        *timer = "--on-active=1".into();
+        args.insert(1, format!("--unit={unit}"));
+        let scheduled = std::process::Command::new("systemd-run")
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            scheduled.status.success(),
+            "systemd-run failed: {}",
+            String::from_utf8_lossy(&scheduled.stderr)
+        );
+
+        let mut removed = false;
+        for _ in 0..200 {
+            let service_loaded = std::process::Command::new("systemctl")
+                .args([
+                    "--user",
+                    "show",
+                    &format!("{unit}.service"),
+                    "-p",
+                    "LoadState",
+                ])
+                .output()
+                .is_ok_and(|output| output.stdout != b"LoadState=not-found\n");
+            let timer_loaded = std::process::Command::new("systemctl")
+                .args([
+                    "--user",
+                    "show",
+                    &format!("{unit}.timer"),
+                    "-p",
+                    "LoadState",
+                ])
+                .output()
+                .is_ok_and(|output| output.stdout != b"LoadState=not-found\n");
+            if !service_loaded
+                && !timer_loaded
+                && std::fs::read(&installed).unwrap() == std::fs::read(&rollback).unwrap()
+                && std::fs::read(&companion).unwrap() == std::fs::read(&companion_rollback).unwrap()
+            {
+                removed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !removed {
+            let _ = std::process::Command::new("systemctl")
+                .args([
+                    "--user",
+                    "stop",
+                    &format!("{unit}.timer"),
+                    &format!("{unit}.service"),
+                ])
+                .output();
+        }
+        assert!(
+            removed,
+            "the real systemd jobs did not restore both members and remove themselves"
+        );
     }
 }
 
