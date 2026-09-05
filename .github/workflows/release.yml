@@ -48,12 +48,13 @@ jobs:
           set -euo pipefail
           mkdir -p dist/package
           cp "target/${{ matrix.target }}/release/fabric" dist/package/fabric
-          chmod 755 dist/package/fabric
+          cp "target/${{ matrix.target }}/release/fabric-sync" dist/package/fabric-sync
+          chmod 755 dist/package/fabric dist/package/fabric-sync
           archive="dist/fabric-${{ matrix.target }}.tar.gz"
-          tar -czf "$archive" -C dist/package fabric
+          tar -czf "$archive" -C dist/package fabric fabric-sync
           members="$(tar -tzf "$archive")"
-          if [[ "$members" != "fabric" ]]; then
-            echo "release archive must contain exactly one member named fabric" >&2
+          if [[ "$members" != $'fabric\nfabric-sync' ]]; then
+            echo "release archive must contain exactly fabric and fabric-sync" >&2
             printf 'archive members:\n%s\n' "$members" >&2
             exit 1
           fi

@@ -8,6 +8,17 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
+/// The result of a non-mutating sync-owner lease inspection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncOwnerLeaseState {
+    /// The state root or lock file does not exist.
+    Absent,
+    /// The lock file exists and no process owns it.
+    Available,
+    /// A process owns the lock file.
+    Held,
+}
+
 /// The paths a sync engine needs from its host process.
 ///
 /// The engine receives these paths directly. It does not need a daemon home,
@@ -56,6 +67,54 @@ pub struct SyncOwnerLease {
 }
 
 impl SyncOwnerLease {
+    /// Inspect the lease without creating or changing any path.
+    pub fn probe(paths: &SyncPaths) -> Result<SyncOwnerLeaseState> {
+        let root = paths.state_root();
+        if !root.exists() {
+            return Ok(SyncOwnerLeaseState::Absent);
+        }
+        if !root.is_dir() {
+            bail!("sync state root is not a directory: {}", root.display());
+        }
+        let path = paths.owner_lease_path();
+        if !path.exists() {
+            return Ok(SyncOwnerLeaseState::Absent);
+        }
+        if !path.is_file() {
+            bail!("sync state owner lease is not a file: {}", path.display());
+        }
+        let file = OpenOptions::new().read(true).open(&path).with_context(|| {
+            format!(
+                "failed to inspect sync state owner lease {}",
+                path.display()
+            )
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+                return Ok(SyncOwnerLeaseState::Available);
+            }
+            let error = std::io::Error::last_os_error();
+            let code = error.raw_os_error();
+            if code == Some(libc::EWOULDBLOCK) || code == Some(libc::EAGAIN) {
+                return Ok(SyncOwnerLeaseState::Held);
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect sync state owner lease {}",
+                    path.display()
+                )
+            });
+        }
+
+        #[cfg(not(unix))]
+        bail!("fabric sync state owner leases are not supported on this platform");
+    }
+
     pub fn acquire(paths: &SyncPaths) -> Result<Self> {
         std::fs::create_dir_all(paths.state_root()).with_context(|| {
             format!(
@@ -88,7 +147,10 @@ impl SyncOwnerLease {
                 let code = error.raw_os_error();
                 if code != Some(libc::EWOULDBLOCK) && code != Some(libc::EAGAIN) {
                     return Err(error).with_context(|| {
-                        format!("failed to acquire sync state owner lease {}", path.display())
+                        format!(
+                            "failed to acquire sync state owner lease {}",
+                            path.display()
+                        )
                     });
                 }
                 if Instant::now() >= deadline {
@@ -106,5 +168,39 @@ impl SyncOwnerLease {
 
         #[allow(unreachable_code)]
         Ok(Self { _file: file })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probing_a_lease_never_creates_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SyncPaths::new(dir.path().join("syncs.toml"), dir.path().join("state"));
+        assert_eq!(
+            SyncOwnerLease::probe(&paths).unwrap(),
+            SyncOwnerLeaseState::Absent
+        );
+        assert!(!paths.state_root().exists());
+    }
+
+    #[test]
+    fn probing_distinguishes_an_available_lease_from_a_held_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SyncPaths::new(dir.path().join("syncs.toml"), dir.path().join("state"));
+        std::fs::create_dir_all(paths.state_root()).unwrap();
+        std::fs::write(paths.owner_lease_path(), b"").unwrap();
+        assert_eq!(
+            SyncOwnerLease::probe(&paths).unwrap(),
+            SyncOwnerLeaseState::Available
+        );
+        let lease = SyncOwnerLease::acquire(&paths).unwrap();
+        assert_eq!(
+            SyncOwnerLease::probe(&paths).unwrap(),
+            SyncOwnerLeaseState::Held
+        );
+        drop(lease);
     }
 }

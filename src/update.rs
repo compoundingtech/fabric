@@ -135,17 +135,23 @@ pub fn verify_sha256(bytes: &[u8], expected: &str) -> Result<()> {
     Ok(())
 }
 
-/// Take the one `fabric` binary out of a release archive, refusing anything that
-/// is not exactly that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseBinaries {
+    pub fabric: Vec<u8>,
+    pub fabric_sync: Vec<u8>,
+}
+
+/// Take the matched binary pair out of a release archive.
 ///
-/// A release archive holds a single member named literally `fabric`. Not
-/// `./fabric`, not a directory, not two files. Anything else is not a thing we
-/// published, and unpacking it to find out would already have written it.
-pub fn extract_fabric_binary(archive: &[u8]) -> Result<Vec<u8>> {
+/// A release archive holds literal `fabric` and `fabric-sync` members. It holds
+/// no dot-prefixed paths, directories, or extra files. Anything else is not a
+/// thing we published, and unpacking it to find out would already write it.
+pub fn extract_release_binaries(archive: &[u8]) -> Result<ReleaseBinaries> {
     use std::io::Read;
     let decoder = flate2::read::GzDecoder::new(archive);
     let mut tar = tar::Archive::new(decoder);
-    let mut found: Option<Vec<u8>> = None;
+    let mut fabric: Option<Vec<u8>> = None;
+    let mut fabric_sync: Option<Vec<u8>> = None;
     let mut names = Vec::new();
     for entry in tar.entries().context("the archive could not be read")? {
         let mut entry = entry.context("the archive holds an unreadable member")?;
@@ -161,21 +167,28 @@ pub fn extract_fabric_binary(archive: &[u8]) -> Result<Vec<u8>> {
         let raw = entry.path_bytes().into_owned();
         let name = String::from_utf8_lossy(&raw).into_owned();
         names.push(name.clone());
-        if raw.as_slice() == b"fabric" {
+        if raw.as_slice() == b"fabric" || raw.as_slice() == b"fabric-sync" {
             let mut bytes = Vec::new();
             entry
                 .read_to_end(&mut bytes)
-                .context("the fabric member could not be read")?;
-            found = Some(bytes);
+                .with_context(|| format!("the {name} member could not be read"))?;
+            match raw.as_slice() {
+                b"fabric" => fabric = Some(bytes),
+                b"fabric-sync" => fabric_sync = Some(bytes),
+                _ => unreachable!(),
+            }
         }
     }
-    if names.len() != 1 || found.is_none() {
+    if names.len() != 2 || fabric.is_none() || fabric_sync.is_none() {
         bail!(
-            "the archive is not a fabric release: expected exactly one member named \
-             `fabric`, found {names:?}"
+            "the archive is not a fabric release: expected exactly two members named \
+             `fabric` and `fabric-sync`, found {names:?}"
         );
     }
-    Ok(found.expect("checked above"))
+    Ok(ReleaseBinaries {
+        fabric: fabric.expect("checked above"),
+        fabric_sync: fabric_sync.expect("checked above"),
+    })
 }
 
 /// The version a release tag promises. Tags are `v<version>`; the binary reports
@@ -334,6 +347,13 @@ pub fn managed_binary_path() -> Result<PathBuf> {
     std::env::current_exe().context("could not determine which binary is running")
 }
 
+pub fn companion_binary_path(fabric_path: &Path) -> Result<PathBuf> {
+    let dir = fabric_path
+        .parent()
+        .context("the fabric install path has no directory")?;
+    Ok(dir.join("fabric-sync"))
+}
+
 #[cfg(target_os = "macos")]
 fn managed_binary_path_from_service_manager() -> Option<PathBuf> {
     let plist = crate::service::launch_agent_path().ok()?;
@@ -410,7 +430,11 @@ pub fn stage_binary(path: &Path, bytes: &[u8], stamp: &str) -> Result<PathBuf> {
     let dir = path
         .parent()
         .context("the install path has no directory to write beside")?;
-    let staged = dir.join(format!(".fabric-incoming-{stamp}"));
+    let name = path
+        .file_name()
+        .context("the install path has no file name")?
+        .to_string_lossy();
+    let staged = dir.join(format!(".{name}-incoming-{stamp}"));
     std::fs::write(&staged, bytes)
         .with_context(|| format!("failed to stage {}", staged.display()))?;
     std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
@@ -435,7 +459,11 @@ pub fn commit_staged(staged: &Path, path: &Path, stamp: &str) -> Result<PathBuf>
     ));
 
     if path.exists() {
-        let aside = dir.join(format!(".fabric-rollback-{stamp}"));
+        let name = path
+            .file_name()
+            .context("the install path has no file name")?
+            .to_string_lossy();
+        let aside = dir.join(format!(".{name}-rollback-{stamp}"));
         std::fs::copy(path, &aside)
             .with_context(|| format!("failed to copy {} aside", path.display()))?;
         std::fs::rename(&aside, &rollback)
@@ -444,6 +472,25 @@ pub fn commit_staged(staged: &Path, path: &Path, stamp: &str) -> Result<PathBuf>
     std::fs::rename(staged, path)
         .with_context(|| format!("failed to install {}", path.display()))?;
     Ok(rollback)
+}
+
+fn restore_after_pair_commit_failure(path: &Path, rollback: &Path) -> Result<()> {
+    if rollback.exists() {
+        std::fs::rename(rollback, path).with_context(|| {
+            format!(
+                "failed to restore {} after a partial pair install",
+                path.display()
+            )
+        })?;
+    } else if path.exists() {
+        std::fs::remove_file(path).with_context(|| {
+            format!(
+                "failed to remove {} after a partial first install",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// A stamp for rollback names. Seconds are enough: two updates inside one second
@@ -481,6 +528,32 @@ pub fn newest_rollback(path: &Path) -> Result<Option<PathBuf>> {
     Ok(best.map(|(_, path)| path))
 }
 
+fn companion_rollback_path(fabric_rollback: &Path) -> Result<PathBuf> {
+    let name = fabric_rollback
+        .file_name()
+        .context("the rollback path has no file name")?
+        .to_string_lossy();
+    let stamp = name
+        .strip_prefix("fabric.rollback-")
+        .context("the fabric rollback name has no stamp")?;
+    Ok(fabric_rollback.with_file_name(format!("fabric-sync.rollback-{stamp}")))
+}
+
+fn remove_with_rollback(path: &Path, stamp: &str) -> Result<PathBuf> {
+    let rollback = path.with_file_name(format!(
+        "{}.rollback-{stamp}",
+        path.file_name()
+            .context("the install path has no file name")?
+            .to_string_lossy()
+    ));
+    if path.exists() {
+        std::fs::rename(path, &rollback).with_context(|| {
+            format!("failed to preserve {} before removing it", path.display())
+        })?;
+    }
+    Ok(rollback)
+}
+
 /// How long the supervisor gives the restarted daemon to answer before it
 /// decides the new binary does not work. Generous: a slow machine coming back
 /// under load must not be mistaken for a broken build.
@@ -514,11 +587,31 @@ pub async fn supervise_restart(
     );
 
     let installed_path = managed_binary_path()?;
+    let companion_path = companion_binary_path(&installed_path)?;
+    let companion_rollback = companion_rollback_path(rollback)?;
     let bytes = std::fs::read(rollback)
         .with_context(|| format!("failed to read {}", rollback.display()))?;
     let stamp = timestamp();
     let staged = stage_binary(&installed_path, &bytes, &stamp)?;
-    commit_staged(&staged, &installed_path, &stamp)?;
+    let staged_companion = if companion_rollback.exists() {
+        let bytes = std::fs::read(&companion_rollback)
+            .with_context(|| format!("failed to read {}", companion_rollback.display()))?;
+        Some(stage_binary(&companion_path, &bytes, &stamp)?)
+    } else {
+        None
+    };
+    let previous_companion = match staged_companion {
+        Some(staged) => {
+            commit_staged(&staged, &companion_path, &stamp)?
+        }
+        None => {
+            remove_with_rollback(&companion_path, &stamp)?
+        }
+    };
+    if let Err(error) = commit_staged(&staged, &installed_path, &stamp) {
+        restore_after_pair_commit_failure(&companion_path, &previous_companion)?;
+        return Err(error.context("fabric rollback failed; fabric-sync was restored"));
+    }
     if let Err(error) = crate::gitremote::install_helper_for(&installed_path) {
         eprintln!("supervise\tGit helper repair failed: {error:#}");
     }
@@ -704,11 +797,20 @@ pub struct UpdateOptions {
 pub async fn run(home: &crate::config::FabricHome, options: UpdateOptions) -> Result<i32> {
     let installed_path = managed_binary_path()?;
     let installed = binary_version(&installed_path).unwrap_or_else(|_| "unknown".into());
+    let companion_path = companion_binary_path(&installed_path)?;
     println!("installed\t{installed}");
     println!("path\t{}", installed_path.display());
 
     if options.rollback {
         return roll_back(home, &installed_path, &options).await;
+    }
+    if companion_path.exists() {
+        let companion = binary_version(&companion_path)?;
+        if companion != installed {
+            bail!(
+                "the installed pair does not match: fabric is {installed}, but fabric-sync is {companion}"
+            );
+        }
     }
 
     let source = resolve_source(
@@ -787,9 +889,16 @@ pub async fn run(home: &crate::config::FabricHome, options: UpdateOptions) -> Re
     verify_sha256(&archive, &expected_hash)?;
     println!("checksum\tok");
 
-    let binary = extract_fabric_binary(&archive)?;
+    let binaries = extract_release_binaries(&archive)?;
     let stamp = timestamp();
-    let staged = stage_binary(&installed_path, &binary, &stamp)?;
+    let staged = stage_binary(&installed_path, &binaries.fabric, &stamp)?;
+    let staged_companion = match stage_binary(&companion_path, &binaries.fabric_sync, &stamp) {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error);
+        }
+    };
 
     // Ask the binary what it is before trusting it with the name of the one
     // that is running. A staged file that cannot answer is not installed.
@@ -797,15 +906,32 @@ pub async fn run(home: &crate::config::FabricHome, options: UpdateOptions) -> Re
         Ok(version) => version,
         Err(error) => {
             let _ = std::fs::remove_file(&staged);
+            let _ = std::fs::remove_file(&staged_companion);
             return Err(error.context("the downloaded binary could not run, so nothing was installed"));
         }
     };
+    let companion_version = match binary_version(&staged_companion) {
+        Ok(version) => version,
+        Err(error) => {
+            let _ = std::fs::remove_file(&staged);
+            let _ = std::fs::remove_file(&staged_companion);
+            return Err(error.context("the downloaded companion could not run, so nothing was installed"));
+        }
+    };
+    if companion_version != staged_version {
+        let _ = std::fs::remove_file(&staged);
+        let _ = std::fs::remove_file(&staged_companion);
+        bail!(
+            "fabric reports {staged_version}, but fabric-sync reports {companion_version}; nothing was installed"
+        );
+    }
     println!("downloaded\t{staged_version}");
 
     if let Some(expected) = &expected_version
         && &staged_version != expected
     {
         let _ = std::fs::remove_file(&staged);
+        let _ = std::fs::remove_file(&staged_companion);
         bail!(
             "the release claims to be {expected} but the binary in it reports \
              {staged_version}; nothing was installed"
@@ -814,6 +940,7 @@ pub async fn run(home: &crate::config::FabricHome, options: UpdateOptions) -> Re
 
     if options.dry_run {
         let _ = std::fs::remove_file(&staged);
+        let _ = std::fs::remove_file(&staged_companion);
         println!();
         println!("DRY RUN: verified and stopped. Nothing was changed.");
         return Ok(0);
@@ -821,15 +948,28 @@ pub async fn run(home: &crate::config::FabricHome, options: UpdateOptions) -> Re
 
     if let Err(error) = crate::gitremote::validate_helper_install(&installed_path) {
         let _ = std::fs::remove_file(&staged);
+        let _ = std::fs::remove_file(&staged_companion);
         return Err(error.context("the Git helper path is unsafe, so nothing was installed"));
     }
 
     let rollback = commit_staged(&staged, &installed_path, &stamp)?;
+    let companion_rollback = match commit_staged(&staged_companion, &companion_path, &stamp) {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = std::fs::remove_file(&staged_companion);
+            restore_after_pair_commit_failure(&installed_path, &rollback)?;
+            return Err(error.context("fabric-sync could not be installed; fabric was restored"));
+        }
+    };
     let helper = crate::gitremote::install_helper_for(&installed_path)?;
     println!("installed\t{}", binary_version(&installed_path)?);
+    println!("companion\t{}", binary_version(&companion_path)?);
     println!("helper\t{}", helper.display());
     if rollback.exists() {
         println!("rollback\t{}", rollback.display());
+    }
+    if companion_rollback.exists() {
+        println!("rollback companion\t{}", companion_rollback.display());
     }
 
     let running = binary_version(&installed_path)?;
@@ -869,6 +1009,16 @@ async fn roll_back(
         );
     };
     let version = binary_version(&rollback)?;
+    let companion_path = companion_binary_path(installed_path)?;
+    let companion_rollback = companion_rollback_path(&rollback)?;
+    if companion_rollback.exists() {
+        let companion_version = binary_version(&companion_rollback)?;
+        if companion_version != version {
+            bail!(
+                "the rollback pair does not match: fabric is {version}, but fabric-sync is {companion_version}"
+            );
+        }
+    }
     println!("rolling back to\t{version}");
     println!("from\t{}", rollback.display());
 
@@ -876,16 +1026,50 @@ async fn roll_back(
         .with_context(|| format!("failed to read {}", rollback.display()))?;
     let stamp = timestamp();
     let staged = stage_binary(installed_path, &bytes, &stamp)?;
+    let staged_companion = if companion_rollback.exists() {
+        let bytes = std::fs::read(&companion_rollback)
+            .with_context(|| format!("failed to read {}", companion_rollback.display()))?;
+        match stage_binary(&companion_path, &bytes, &stamp) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                let _ = std::fs::remove_file(&staged);
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     if let Err(error) = crate::gitremote::validate_helper_install(installed_path) {
         let _ = std::fs::remove_file(&staged);
+        if let Some(path) = &staged_companion {
+            let _ = std::fs::remove_file(path);
+        }
         return Err(error.context("the Git helper path is unsafe, so nothing was installed"));
     }
-    let previous = commit_staged(&staged, installed_path, &stamp)?;
+    let previous_companion = match staged_companion {
+        Some(staged) => commit_staged(&staged, &companion_path, &stamp)?,
+        None => remove_with_rollback(&companion_path, &stamp)?,
+    };
+    let previous = match commit_staged(&staged, installed_path, &stamp) {
+        Ok(path) => path,
+        Err(error) => {
+            restore_after_pair_commit_failure(&companion_path, &previous_companion)?;
+            return Err(error.context("fabric could not be rolled back; fabric-sync was restored"));
+        }
+    };
     let helper = crate::gitremote::install_helper_for(installed_path)?;
     println!("installed\t{}", binary_version(installed_path)?);
+    if companion_path.exists() {
+        println!("companion\t{}", binary_version(&companion_path)?);
+    } else {
+        println!("companion\tabsent in rollback target");
+    }
     println!("helper\t{}", helper.display());
     if previous.exists() {
         println!("rollback\t{}", previous.display());
+    }
+    if previous_companion.exists() {
+        println!("rollback companion\t{}", previous_companion.display());
     }
     let running = binary_version(installed_path)?;
     finish(home, options, &previous, &running)?;
@@ -1102,9 +1286,14 @@ mod tests {
     }
 
     #[test]
-    fn a_release_archive_yields_the_binary() {
-        let archive = make_archive(&[("fabric", b"ELF-ish")]);
-        assert_eq!(extract_fabric_binary(&archive).unwrap(), b"ELF-ish");
+    fn a_release_archive_yields_the_matched_pair() {
+        let archive = make_archive(&[
+            ("fabric", b"daemon ELF-ish"),
+            ("fabric-sync", b"companion ELF-ish"),
+        ]);
+        let binaries = extract_release_binaries(&archive).unwrap();
+        assert_eq!(binaries.fabric, b"daemon ELF-ish");
+        assert_eq!(binaries.fabric_sync, b"companion ELF-ish");
     }
 
     /// Write a tar header by hand so the stored name is EXACTLY what we say.
@@ -1167,24 +1356,28 @@ mod tests {
         );
 
         assert!(
-            extract_fabric_binary(&archive).is_err(),
+            extract_release_binaries(&archive).is_err(),
             "./fabric is not the member name a fabric release has"
         );
     }
 
     #[test]
     fn an_archive_with_an_extra_member_is_refused() {
-        let archive = make_archive(&[("fabric", b"ELF-ish"), ("install.sh", b"rm -rf /")]);
+        let archive = make_archive(&[
+            ("fabric", b"ELF-ish"),
+            ("fabric-sync", b"also ELF-ish"),
+            ("install.sh", b"rm -rf /"),
+        ]);
         assert!(
-            extract_fabric_binary(&archive).is_err(),
-            "a release holds one member; a second one is somebody else's archive"
+            extract_release_binaries(&archive).is_err(),
+            "a release holds two members; a third one is somebody else's archive"
         );
     }
 
     #[test]
     fn an_archive_without_fabric_is_refused() {
-        let archive = make_archive(&[("something-else", b"nope")]);
-        assert!(extract_fabric_binary(&archive).is_err());
+        let archive = make_archive(&[("fabric", b"ELF-ish"), ("something-else", b"nope")]);
+        assert!(extract_release_binaries(&archive).is_err());
     }
 
     #[test]
@@ -1202,6 +1395,14 @@ mod tests {
             release_asset_url("v0.2.0+76376d4", &asset),
             "https://github.com/compoundingtech/fabric/releases/download/v0.2.0+76376d4/fabric-aarch64-apple-darwin.tar.gz"
         );
+    }
+
+    #[test]
+    fn the_release_workflow_packages_exactly_the_binary_pair() {
+        let workflow = include_str!("../.github/workflows/release.yml");
+        assert!(workflow.contains("release/fabric-sync\" dist/package/fabric-sync"));
+        assert!(workflow.contains("-C dist/package fabric fabric-sync"));
+        assert!(workflow.contains("$'fabric\\nfabric-sync'"));
     }
 }
 
@@ -1276,6 +1477,29 @@ mod io_tests {
             !rollback.exists(),
             "a rollback was created for a binary that never existed"
         );
+    }
+
+    #[test]
+    fn one_stamp_stages_and_preserves_a_matched_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let fabric = dir.path().join("fabric");
+        let companion = dir.path().join("fabric-sync");
+        std::fs::write(&fabric, b"old daemon").unwrap();
+        std::fs::write(&companion, b"old companion").unwrap();
+
+        let staged_fabric = stage_binary(&fabric, b"new daemon", "pair").unwrap();
+        let staged_companion = stage_binary(&companion, b"new companion", "pair").unwrap();
+        assert_ne!(staged_fabric, staged_companion);
+        let rollback = commit_staged(&staged_fabric, &fabric, "pair").unwrap();
+        let companion_rollback =
+            commit_staged(&staged_companion, &companion, "pair").unwrap();
+
+        assert_eq!(std::fs::read(&rollback).unwrap(), b"old daemon");
+        assert_eq!(
+            companion_rollback_path(&rollback).unwrap(),
+            companion_rollback
+        );
+        assert_eq!(std::fs::read(&companion_rollback).unwrap(), b"old companion");
     }
 
     /// Nothing partial may survive a run. A leftover `.fabric-incoming-*` beside

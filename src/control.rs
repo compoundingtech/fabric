@@ -92,6 +92,8 @@ pub enum ControlRequest {
     },
     /// Report the daemon's configured sync entries and their state.
     SyncStatus,
+    /// Report whether this build can host the companion sync process.
+    SyncIpcCompatibility,
     Shutdown,
 }
 
@@ -183,6 +185,12 @@ pub enum ControlResponse {
     },
     SyncStatus {
         entries: Vec<SyncEntryStatus>,
+    },
+    SyncIpcCompatibility {
+        version: String,
+        sync_ipc_magic: String,
+        sync_ipc_version: u16,
+        owner: String,
     },
     Error {
         message: String,

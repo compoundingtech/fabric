@@ -357,8 +357,8 @@ restart can sever the only path back to the box. Follow this order.
 
 Download a release asset directly, verify it against that asset's published
 `.sha256`, and stage both the old and new binaries with same-directory
-renames. A release archive contains exactly one member named literal `fabric`
-(not `./fabric`); verify that shape before extracting:
+renames. A release archive contains exactly two members named literal `fabric`
+and `fabric-sync` (not dot-prefixed paths). Verify that shape before extracting:
 
 ```sh
 set -eu
@@ -392,22 +392,32 @@ fi
 test "$actual" = "$expected"
 
 members="$(tar -tzf "$download_dir/$asset")"
-if [ "$members" != 'fabric' ]; then
+if [ "$members" != "$(printf 'fabric\nfabric-sync')" ]; then
   printf 'unexpected release archive members:\n%s\n' "$members" >&2
   exit 1
 fi
 tar -xzf "$download_dir/$asset" -C "$download_dir"
 test "$("$download_dir/fabric" --version)" = "${tag#v}"
+test "$("$download_dir/fabric-sync" --version)" = "${tag#v}"
 
 # Confirm this is the exact path in launchd/systemd ExecStart before replacing it.
 fabric_path="${FABRIC_BIN_PATH:-$(command -v fabric)}"
 test -x "$fabric_path"
+sync_path="$(dirname "$fabric_path")/fabric-sync"
 rollback="$fabric_path.rollback-$(date -u +%Y%m%dT%H%M%SZ)"
+sync_rollback="$sync_path.rollback-${rollback##*.rollback-}"
 install -m 755 "$fabric_path" "$rollback.new.$$"
 mv -f "$rollback.new.$$" "$rollback"
+if [ -e "$sync_path" ]; then
+  install -m 755 "$sync_path" "$sync_rollback.new.$$"
+  mv -f "$sync_rollback.new.$$" "$sync_rollback"
+fi
 install -m 755 "$download_dir/fabric" "$fabric_path.new.$$"
+install -m 755 "$download_dir/fabric-sync" "$sync_path.new.$$"
 mv -f "$fabric_path.new.$$" "$fabric_path"
-echo "installed $("$fabric_path" --version); rollback: $rollback"
+mv -f "$sync_path.new.$$" "$sync_path"
+test "$("$fabric_path" --version)" = "$("$sync_path" --version)"
+echo "installed $("$fabric_path" --version); rollback pair: $rollback"
 ```
 
 Set `tag` to the release being installed. `FABRIC_BIN_PATH` is only needed when

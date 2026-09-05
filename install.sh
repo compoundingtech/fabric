@@ -115,7 +115,9 @@ require_cargo() {
 
 install_binary() {
   src="$1"
+  sync_src="$2"
   target="$INSTALL_DIR/fabric"
+  sync_target="$INSTALL_DIR/fabric-sync"
   helper="$INSTALL_DIR/git-remote-fabric"
   mkdir -p "$INSTALL_DIR"
 
@@ -124,6 +126,18 @@ install_binary() {
       die "refusing to overwrite non-fabric file at $target"
     fi
   fi
+  if [ -e "$sync_target" ] || [ -L "$sync_target" ]; then
+    if ! "$sync_target" --help 2>/dev/null | grep -q "Diagnostic companion for fabric file sync"; then
+      die "refusing to overwrite non-fabric file at $sync_target"
+    fi
+    old_daemon_version=$(binary_version "$target")
+    old_sync_version=$(binary_version "$sync_target")
+    [ "$old_daemon_version" = "$old_sync_version" ] || die "installed fabric pair does not match"
+  fi
+
+  daemon_version=$(binary_version "$src")
+  sync_version=$(binary_version "$sync_src")
+  [ "$daemon_version" = "$sync_version" ] || die "fabric is $daemon_version but fabric-sync is $sync_version"
 
   if [ -L "$helper" ]; then
     [ "$(readlink "$helper")" = "fabric" ] || die "refusing to replace unrelated Git helper at $helper"
@@ -136,15 +150,41 @@ install_binary() {
   # daemon keeps executing the old one — no ETXTBSY ("text file busy") and no
   # window where the path is missing. `fabric restart` then re-execs the new
   # binary at this same path, which is how a live daemon is swapped in place.
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
   tmp="$target.new.$$"
+  sync_tmp="$sync_target.new.$$"
   cp "$src" "$tmp"
+  cp "$sync_src" "$sync_tmp"
   chmod 755 "$tmp"
-  mv -f "$tmp" "$target"
+  chmod 755 "$sync_tmp"
+  had_sync_target=0
+  if [ -e "$target" ]; then
+    cp "$target" "$target.rollback-$stamp"
+  fi
+  if [ -e "$sync_target" ]; then
+    had_sync_target=1
+    cp "$sync_target" "$sync_target.rollback-$stamp"
+  fi
+  if ! mv -f "$sync_tmp" "$sync_target"; then
+    rm -f "$tmp" "$sync_tmp"
+    die "failed to install $sync_target; fabric was not changed"
+  fi
+  if ! mv -f "$tmp" "$target"; then
+    if [ "$had_sync_target" -eq 1 ]; then
+      cp "$sync_target.rollback-$stamp" "$sync_target.restore.$$"
+      mv -f "$sync_target.restore.$$" "$sync_target"
+    else
+      rm -f "$sync_target"
+    fi
+    rm -f "$tmp"
+    die "failed to install $target; fabric-sync was restored"
+  fi
   if [ ! -L "$helper" ]; then
     ln -s fabric "$helper"
   fi
   INSTALLED_TARGET="$target"
   echo "installed: $target"
+  echo "installed: $sync_target"
   echo "installed: $helper -> fabric"
   echo "ensure $INSTALL_DIR is on PATH"
 
@@ -221,8 +261,9 @@ build_from_source_dir() {
   cargo build --release --manifest-path "$src_dir/Cargo.toml"
   if [ -n "$expected_tag" ]; then
     verify_binary_version "$src_dir/target/release/fabric" "$expected_tag"
+    verify_binary_version "$src_dir/target/release/fabric-sync" "$expected_tag"
   fi
-  install_binary "$src_dir/target/release/fabric"
+  install_binary "$src_dir/target/release/fabric" "$src_dir/target/release/fabric-sync"
 }
 
 build_release_source() {
@@ -281,19 +322,26 @@ install_prebuilt() {
     return 1
   fi
   verify_checksum "$archive" "$checksum"
+  members=$(tar -tzf "$archive")
+  if [ "$members" != "$(printf 'fabric\nfabric-sync')" ]; then
+    warn "release archive $url did not contain exactly fabric and fabric-sync"
+    rm -rf "$tmp"
+    return 1
+  fi
   if ! tar -xzf "$archive" -C "$tmp"; then
     warn "failed to extract $url"
     rm -rf "$tmp"
     return 1
   fi
-  if [ ! -f "$tmp/fabric" ]; then
-    warn "release archive $url did not contain ./fabric"
+  if [ ! -f "$tmp/fabric" ] || [ ! -f "$tmp/fabric-sync" ]; then
+    warn "release archive $url did not contain both binaries"
     rm -rf "$tmp"
     return 1
   fi
 
   verify_binary_version "$tmp/fabric" "$tag"
-  install_binary "$tmp/fabric"
+  verify_binary_version "$tmp/fabric-sync" "$tag"
+  install_binary "$tmp/fabric" "$tmp/fabric-sync"
   rm -rf "$tmp"
   return 0
 }
