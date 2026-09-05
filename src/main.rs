@@ -139,10 +139,10 @@ enum Commands {
         #[arg(long)]
         foreground: bool,
         /// Accepted for compatibility. peers.toml decides shell availability.
-        #[arg(long)]
+        #[arg(long, hide = true)]
         allow_shell: bool,
         /// Accepted for compatibility. peers.toml decides exec availability.
-        #[arg(long)]
+        #[arg(long, hide = true)]
         allow_exec: bool,
         /// Maximum total server-side tunnel sessions.
         #[arg(long)]
@@ -159,10 +159,10 @@ enum Commands {
     /// Restart the local fabric daemon through a detached helper.
     Restart {
         /// Accepted for compatibility. peers.toml decides shell availability.
-        #[arg(long, conflicts_with = "no_allow_shell")]
+        #[arg(long, hide = true, conflicts_with = "no_allow_shell")]
         allow_shell: bool,
         /// Accepted for compatibility. peers.toml decides shell availability.
-        #[arg(long)]
+        #[arg(long, hide = true)]
         no_allow_shell: bool,
     },
     /// Expose a local service to trusted peers under an ALPN protocol.
@@ -396,16 +396,16 @@ enum ServiceCommands {
     /// Install and start a user service for the foreground daemon.
     Install {
         /// Accepted for compatibility. peers.toml decides shell availability.
-        #[arg(long, conflicts_with = "no_allow_shell")]
+        #[arg(long, hide = true, conflicts_with = "no_allow_shell")]
         allow_shell: bool,
         /// Accepted for compatibility. peers.toml decides shell availability.
-        #[arg(long)]
+        #[arg(long, hide = true)]
         no_allow_shell: bool,
         /// Accepted for compatibility. peers.toml decides exec availability.
-        #[arg(long, conflicts_with = "no_allow_exec")]
+        #[arg(long, hide = true, conflicts_with = "no_allow_exec")]
         allow_exec: bool,
         /// Accepted for compatibility. peers.toml decides exec availability.
-        #[arg(long)]
+        #[arg(long, hide = true)]
         no_allow_exec: bool,
         /// Memory ceiling applied by systemd/launchd, in MiB. Unset by default:
         /// a healthy working set depends on how much this node syncs, so Fabric
@@ -571,19 +571,6 @@ async fn main() -> Result<()> {
                 }
                 Commands::Peers => {
                     let book = PeerBook::load(&home)?;
-                    println!(
-                        "machine\tshell={}\texec={}",
-                        if book.allow_shell() {
-                            "allowed"
-                        } else {
-                            "disabled"
-                        },
-                        if book.allow_exec() {
-                            "allowed"
-                        } else {
-                            "disabled"
-                        }
-                    );
                     for peer in book.peers() {
                         let name = peer.name.clone().unwrap_or_default();
                         let policy = if peer.allow.is_empty() {
@@ -838,7 +825,7 @@ async fn main() -> Result<()> {
                         ControlResponse::Restarting { log, allow_shell } => {
                             println!("restart scheduled");
                             println!("log\t{}", log.display());
-                            println!("allow-shell\t{allow_shell}");
+                            let _ = allow_shell;
                         }
                         response => bail!("unexpected daemon response: {response:?}"),
                     }
@@ -2354,8 +2341,8 @@ fn print_status(
     endpoint_addr: &serde_json::Value,
     exposed_protocols: &[String],
     dial_sockets: &[PathBuf],
-    allow_shell: bool,
-    allow_exec: bool,
+    _allow_shell: bool,
+    _allow_exec: bool,
     peers: &[PeerReachability],
     connection_telemetry: &BTreeMap<String, PeerTelemetry>,
     connection_telemetry_window: &TelemetryWindow,
@@ -2372,11 +2359,6 @@ fn print_status(
         .map(|path| path.display().to_string())
         .collect();
     println!("dials\t{}", joined_or_dash(&dials));
-    println!(
-        "shell\t{}",
-        if allow_shell { "allowed" } else { "disabled" }
-    );
-    println!("exec\t{}", if allow_exec { "allowed" } else { "disabled" });
     // Shell, exec and every dial share these. When all are held, a new one
     // waits with no error, which reads as "hangs while ping answers".
     let (active, max) = dial_handlers;
@@ -2770,17 +2752,14 @@ fn daemon_options(
     }
 }
 
-fn run_restart_detacher(home: &FabricHome, allow_shell: bool) -> Result<()> {
+fn run_restart_detacher(home: &FabricHome, _allow_shell: bool) -> Result<()> {
     println!(
-        "restart detacher started: version={} allow_shell={allow_shell}",
+        "restart detacher started: version={}",
         fabric::version_string()
     );
     let exe = std::env::current_exe()?;
     let mut command = ProcessCommand::new(exe);
     command.arg("--home").arg(home.root()).arg("restart-helper");
-    if allow_shell {
-        command.arg("--allow-shell");
-    }
     let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
@@ -2790,9 +2769,9 @@ fn run_restart_detacher(home: &FabricHome, allow_shell: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run_restart_helper(home: &FabricHome, allow_shell: bool) -> Result<()> {
+async fn run_restart_helper(home: &FabricHome, _allow_shell: bool) -> Result<()> {
     println!(
-        "restart helper started: version={} allow_shell={allow_shell}",
+        "restart helper started: version={}",
         fabric::version_string()
     );
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -2806,12 +2785,12 @@ async fn run_restart_helper(home: &FabricHome, allow_shell: bool) -> Result<()> 
         println!("daemon did not report down before restart; continuing: {error:#}");
     }
 
-    let start_result = spawn_daemon(home, DaemonOptions::new(allow_shell)).await;
+    let start_result = spawn_daemon(home, DaemonOptions::default()).await;
     if let Err(error) = &start_result {
         println!("daemon start failed; checking final state: {error:#}");
     }
 
-    match wait_for_daemon_ready(home, allow_shell, Duration::from_secs(10)).await {
+    match wait_for_daemon_ready(home, Duration::from_secs(10)).await {
         Ok(_) => {
             println!("restart complete");
             Ok(())
@@ -2842,22 +2821,11 @@ async fn wait_for_daemon_down(home: &FabricHome, timeout: Duration) -> Result<()
     }
 }
 
-async fn wait_for_daemon_ready(
-    home: &FabricHome,
-    expected_allow_shell: bool,
-    timeout: Duration,
-) -> Result<()> {
+async fn wait_for_daemon_ready(home: &FabricHome, timeout: Duration) -> Result<()> {
     let started = Instant::now();
     loop {
         match send_control(home, ControlRequest::Status).await {
-            Ok(ControlResponse::Status { allow_shell, .. }) => {
-                if allow_shell != expected_allow_shell {
-                    bail!(
-                        "daemon is running with allow_shell={allow_shell}, expected {expected_allow_shell}"
-                    );
-                }
-                return Ok(());
-            }
+            Ok(ControlResponse::Status { .. }) => return Ok(()),
             Ok(response) => bail!("unexpected daemon response: {response:?}"),
             Err(error) => {
                 if started.elapsed() > timeout {
@@ -3220,12 +3188,6 @@ async fn spawn_daemon(home: &FabricHome, options: DaemonOptions) -> Result<()> {
     let exe = std::env::current_exe()?;
     let mut command = ProcessCommand::new(exe);
     command.arg("--home").arg(home.root()).arg("daemon");
-    if options.allow_shell {
-        command.arg("--allow-shell");
-    }
-    if options.allow_exec {
-        command.arg("--allow-exec");
-    }
     if let Some(max_total) = options.server_session_max_total {
         command
             .arg("--server-session-max-total")

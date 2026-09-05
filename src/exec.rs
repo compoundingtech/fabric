@@ -7,11 +7,9 @@
 //! (`out=$(fabric exec hetz -- cat /etc/hostname)`), with none of the
 //! pipe-into-an-interactive-shell gymnastics.
 //!
-//! Security mirrors `shell`: this is arbitrary remote command execution, so it is
-//! **default-deny per machine**. A daemon only runs an incoming exec if its own
-//! `peers.toml` enables it with the machine-level `allow_exec` setting. Each
-//! peer's allow list gates *who* may connect. The machine setting gates
-//! *whether* this node runs remote commands at all. Both are required.
+//! Security mirrors `shell`: this is arbitrary remote command execution. A
+//! daemon only runs an incoming exec when that peer's `allow` array contains
+//! `exec`. An omitted grant denies the service.
 
 use anyhow::{Context, Result, bail};
 use tokio::{
@@ -29,7 +27,7 @@ const SERVER_STDERR: u8 = 18;
 const SERVER_EXIT: u8 = 19;
 const SERVER_ERROR: u8 = 20;
 
-/// Exit code sent when this node has `allow_exec` disabled (mirrors `shell`'s 126).
+/// Exit code sent when policy refuses exec (mirrors `shell`'s 126).
 pub(crate) const EXIT_EXEC_DISABLED: i32 = 126;
 /// Exit code sent when the requested command could not be spawned (mirrors sh 127).
 const EXIT_SPAWN_FAILED: i32 = 127;
@@ -42,14 +40,14 @@ pub enum ServerFrame {
     Error(String),
 }
 
-/// Reply to an exec request when this node does not permit remote exec.
+/// Reply to an exec request when policy does not permit remote exec.
 pub async fn serve_exec_disabled<W>(send: &mut W) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     serve_exec_failure(
         send,
-        "refused service \"exec\": remote exec is disabled; set allow_exec = true in peers.toml",
+        "refused service \"exec\": add exec to this peer's allow array in peers.toml",
         EXIT_EXEC_DISABLED,
     )
     .await

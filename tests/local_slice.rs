@@ -808,16 +808,22 @@ async fn exec_expose_spawn_failure_closes_local_stream_and_daemon_survives() -> 
 
     fs::write(
         node_a_home.peers_path(),
-        "[[peers]]\nid = \"not-a-node-id\"\n",
+        format!(
+            "format = 99\n\n[[peers]]\nid = \"{}\"\nname = \"node-b\"\nallow = [\"echo\"]\n",
+            node_b.id()
+        ),
     )?;
     assert!(
         run_fabric(&node_a_home, &["reload-peers"]).is_err(),
-        "invalid peers.toml unexpectedly reloaded"
+        "unknown peers.toml format unexpectedly reloaded"
     );
-    let ping = node_b.ping("node-a").await?;
-    assert_eq!(
-        ping.bytes, 32,
-        "failed reload should preserve the previously loaded allow-list"
+    let error = node_b
+        .ping("node-a")
+        .await
+        .expect_err("an unknown policy format kept the old grant open");
+    assert!(
+        format!("{error:#}").contains("not trusted"),
+        "unknown policy format did not fail closed: {error:#}"
     );
 
     node_b.shutdown().await?;
@@ -892,7 +898,6 @@ async fn separate_peer_and_daemon_configs_restore_on_restart() -> Result<()> {
     let node_a_home = FabricHome::new(node_a_dir.path());
     let node_b_home = FabricHome::new(node_b_dir.path());
 
-    set_machine_services(&node_a_home, true, false)?;
     let node_a = FabricNode::start_with_options(node_a_home.clone(), true).await?;
     let node_b = FabricNode::start(node_b_home.clone()).await?;
 
@@ -917,7 +922,7 @@ async fn separate_peer_and_daemon_configs_restore_on_restart() -> Result<()> {
         .expose_exec("stdio-cat", vec!["/bin/cat".to_string()])
         .await?;
     assert_status_exposes(&node_a_home, "stdio-cat").await?;
-    assert_status_shell_allowed(&node_a_home).await?;
+    assert_status_has_shell_grant(&node_a_home).await?;
     assert!(
         node_a_home.config_path().exists(),
         "daemon config should be persisted to config.toml"
@@ -941,7 +946,7 @@ async fn separate_peer_and_daemon_configs_restore_on_restart() -> Result<()> {
     )
     .await?;
 
-    assert_status_shell_allowed(&node_a_home).await?;
+    assert_status_has_shell_grant(&node_a_home).await?;
     assert_status_exposes(&node_a_home, "stdio-cat").await?;
     let ping = node_b.ping("node-a").await?;
     assert_eq!(ping.bytes, 32);
@@ -1379,7 +1384,6 @@ async fn exec_names_the_peer_and_service_when_the_peer_acl_refuses_it() -> Resul
     let client = FabricNode::start(client_home.clone()).await?;
 
     let mut server_book = PeerBook::load(&server_home)?;
-    server_book.set_allow_exec(true);
     server_book.add_with_allow(
         client.id(),
         Some("client".into()),
@@ -1452,7 +1456,10 @@ async fn peer_file_remains_authoritative_when_daemon_config_is_created() -> Resu
     )
     .await?;
 
-    assert_status_shell_allowed(&node_a_home).await?;
+    let ControlResponse::Status { allow_shell, .. } = wait_for_status(&node_a_home).await? else {
+        panic!("unexpected status response");
+    };
+    assert!(!allow_shell, "legacy global key created a shell grant");
     let ping = node_b.ping("node-a").await?;
     assert_eq!(ping.bytes, 32);
     assert!(!node_a_home.config_path().exists());
@@ -1611,13 +1618,6 @@ async fn trust_peer(
     Ok(())
 }
 
-fn set_machine_services(home: &FabricHome, allow_shell: bool, allow_exec: bool) -> Result<()> {
-    let mut peers = PeerBook::load(home)?;
-    peers.set_allow_shell(allow_shell);
-    peers.set_allow_exec(allow_exec);
-    peers.save(home)
-}
-
 async fn exposed_protocols(home: &FabricHome) -> Result<Vec<String>> {
     let response = wait_for_status(home).await?;
     let ControlResponse::Status {
@@ -1667,12 +1667,12 @@ async fn assert_status_does_not_expose(home: &FabricHome, protocol: &str) -> Res
     Ok(())
 }
 
-async fn assert_status_shell_allowed(home: &FabricHome) -> Result<()> {
+async fn assert_status_has_shell_grant(home: &FabricHome) -> Result<()> {
     let response = wait_for_status(home).await?;
     let ControlResponse::Status { allow_shell, .. } = response else {
         panic!("unexpected response: {response:?}");
     };
-    assert!(allow_shell, "daemon should have shell allowed from config");
+    assert!(allow_shell, "daemon should report a peer shell grant");
     Ok(())
 }
 

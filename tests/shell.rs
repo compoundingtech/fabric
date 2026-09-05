@@ -26,15 +26,7 @@ fn fabric_bin() -> &'static str {
     env!("CARGO_BIN_EXE_fabric")
 }
 
-fn set_machine_services(home: &FabricHome, allow_shell: bool, allow_exec: bool) -> Result<()> {
-    let mut book = PeerBook::load(home)?;
-    book.set_allow_shell(allow_shell);
-    book.set_allow_exec(allow_exec);
-    book.save(home)
-}
-
 async fn start_shell_server(home: FabricHome) -> Result<FabricNode> {
-    set_machine_services(&home, true, false)?;
     FabricNode::start_with_options(home, true).await
 }
 
@@ -599,11 +591,8 @@ async fn unsupervised_restart_preserves_shell_and_exec_in_both_directions() -> R
     let node_b_home = FabricHome::new(node_b_dir.path());
     let _node_a_guard = CliDaemonGuard::new(node_a_home.clone());
 
-    set_machine_services(&node_a_home, true, true)?;
-    set_machine_services(&node_b_home, true, true)?;
     let output = fabric_output(&node_a_home, &["up", "--allow-shell"])?;
     assert_success(&output, "fabric up --allow-shell");
-    wait_for_cli_status(&node_a_home, true).await?;
     let node_a_id: iroh::EndpointId = fabric_stdout(&node_a_home, &["id"])?.trim().parse()?;
     let node_a_addr = cli_addr(&node_a_home)?;
 
@@ -614,6 +603,7 @@ async fn unsupervised_restart_preserves_shell_and_exec_in_both_directions() -> R
         "node-b",
         serde_json::to_string(&node_b.addr())?,
     )?;
+    wait_for_cli_status(&node_a_home).await?;
     trust_peer_allowing(
         &node_b_home,
         &node_b,
@@ -623,7 +613,7 @@ async fn unsupervised_restart_preserves_shell_and_exec_in_both_directions() -> R
         &["shell", "exec", "echo"],
     )
     .await?;
-    wait_for_cli_status(&node_b_home, true).await?;
+    wait_for_cli_status(&node_b_home).await?;
 
     let before = run_shell(
         &node_b_home,
@@ -651,15 +641,7 @@ async fn unsupervised_restart_preserves_shell_and_exec_in_both_directions() -> R
     );
 
     wait_for_restart_complete(&node_a_home).await?;
-    let status = wait_for_cli_status(&node_a_home, true).await?;
-    assert!(
-        status.contains("shell\tallowed"),
-        "status did not preserve allow_shell: {status}"
-    );
-    assert!(
-        status.contains("exec\tallowed"),
-        "status did not preserve allow_exec: {status}"
-    );
+    wait_for_cli_status(&node_a_home).await?;
 
     let restarted_addr = cli_addr(&node_a_home)?;
     trust_peer_allowing(
@@ -691,22 +673,12 @@ async fn unsupervised_restart_preserves_shell_and_exec_in_both_directions() -> R
 
     let exec_b_to_a = fabric_output(
         &node_b_home,
-        &[
-            "exec",
-            "node-a",
-            "--",
-            "/usr/bin/printf",
-            "exec-b-to-a",
-        ],
+        &["exec", "node-a", "--", "/usr/bin/printf", "exec-b-to-a"],
     )?;
     assert_success(&exec_b_to_a, "post-restart exec from B to A");
     assert_eq!(exec_b_to_a.stdout, b"exec-b-to-a");
 
-    let shell_a_to_b = run_shell(
-        &node_a_home,
-        "node-b",
-        "printf 'shell-a-to-b\\n'; exit 0\n",
-    )?;
+    let shell_a_to_b = run_shell(&node_a_home, "node-b", "printf 'shell-a-to-b\\n'; exit 0\n")?;
     assert_success(&shell_a_to_b, "post-restart shell from A to B");
     assert!(
         String::from_utf8_lossy(&shell_a_to_b.stdout).contains("shell-a-to-b"),
@@ -716,13 +688,7 @@ async fn unsupervised_restart_preserves_shell_and_exec_in_both_directions() -> R
 
     let exec_a_to_b = fabric_output(
         &node_a_home,
-        &[
-            "exec",
-            "node-b",
-            "--",
-            "/usr/bin/printf",
-            "exec-a-to-b",
-        ],
+        &["exec", "node-b", "--", "/usr/bin/printf", "exec-a-to-b"],
     )?;
     assert_success(&exec_a_to_b, "post-restart exec from A to B");
     assert_eq!(exec_a_to_b.stdout, b"exec-a-to-b");
@@ -738,7 +704,7 @@ async fn unsupervised_restart_preserves_shell_and_exec_in_both_directions() -> R
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn trusted_peer_with_allow_shell_runs_remote_shell_and_propagates_exit() -> Result<()> {
+async fn peer_with_shell_grant_runs_remote_shell_and_propagates_exit() -> Result<()> {
     let node_a_dir = TempDir::new()?;
     let node_b_dir = TempDir::new()?;
     let node_a_home = FabricHome::new(node_a_dir.path());
@@ -762,7 +728,7 @@ async fn trusted_peer_with_allow_shell_runs_remote_shell_and_propagates_exit() -
         Some(node_a.addr()),
     )
     .await?;
-    wait_for_cli_status(&node_b_home, false).await?;
+    wait_for_cli_status(&node_b_home).await?;
 
     let output = run_shell(
         &node_b_home,
@@ -806,7 +772,7 @@ async fn remote_shell_exposes_fabric_marker_env() -> Result<()> {
         Some(node_a.addr()),
     )
     .await?;
-    wait_for_cli_status(&node_b_home, false).await?;
+    wait_for_cli_status(&node_b_home).await?;
 
     // node_b shells into node_a, so inside node_a's shell FABRIC_SHELL=1 and
     // FABRIC_PEER is node_b's NodeID (the connecting peer).
@@ -829,13 +795,23 @@ async fn remote_shell_exposes_fabric_marker_env() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn trusted_peer_without_allow_shell_is_refused() -> Result<()> {
+async fn legacy_false_shell_gate_stays_refused_after_migration() -> Result<()> {
     let node_a_dir = TempDir::new()?;
     let node_b_dir = TempDir::new()?;
     let node_a_home = FabricHome::new(node_a_dir.path());
     let node_b_home = FabricHome::new(node_b_dir.path());
 
-    // The compatibility flags cannot override the closed machine settings.
+    let node_b = FabricNode::start(node_b_home.clone()).await?;
+    node_a_home.prepare()?;
+    fs::write(
+        node_a_home.peers_path(),
+        format!(
+            "allow_shell = false\nallow_exec = false\n\n\
+             [[peers]]\nid = \"{}\"\nname = \"node-b\"\nallow = [\"shell\", \"exec\"]\n",
+            node_b.id()
+        ),
+    )?;
+    // The compatibility flags cannot override the migrated peer policy.
     let node_a = FabricNode::start_with_daemon_options(
         node_a_home.clone(),
         DaemonOptions {
@@ -845,15 +821,10 @@ async fn trusted_peer_without_allow_shell_is_refused() -> Result<()> {
         },
     )
     .await?;
-    let node_b = FabricNode::start(node_b_home.clone()).await?;
-    trust_peer(
-        &node_a_home,
-        &node_a,
-        node_b.id(),
-        Some("node-b"),
-        Some(node_b.addr()),
-    )
-    .await?;
+    let mut node_a_peers = PeerBook::load(&node_a_home)?;
+    node_a_peers.add(node_b.id(), Some("node-b".to_string()), Some(node_b.addr()));
+    node_a_peers.save(&node_a_home)?;
+    node_a.state().reload_peers().await?;
     trust_peer(
         &node_b_home,
         &node_b,
@@ -862,21 +833,12 @@ async fn trusted_peer_without_allow_shell_is_refused() -> Result<()> {
         Some(node_a.addr()),
     )
     .await?;
-    let mut node_a_peers = PeerBook::load(&node_a_home)?;
-    node_a_peers.add_with_allow(
-        node_b.id(),
-        Some("node-b".to_string()),
-        Some(node_b.addr()),
-        Some(vec!["shell".to_string(), "exec".to_string()]),
-    );
-    node_a_peers.save(&node_a_home)?;
-    node_a.state().reload_peers().await?;
-    wait_for_cli_status(&node_b_home, false).await?;
+    wait_for_cli_status(&node_b_home).await?;
 
     let output = run_shell(&node_b_home, "node-a", "exit 0\n")?;
     assert_eq!(output.status.code(), Some(126));
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("remote shell is disabled"),
+        String::from_utf8_lossy(&output.stderr).contains("shell"),
         "stderr was: {}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -953,7 +915,7 @@ async fn shell_names_the_peer_and_service_when_the_peer_acl_refuses_it() -> Resu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn untrusted_peer_is_refused_even_when_shell_is_allowed() -> Result<()> {
+async fn untrusted_peer_is_refused_when_another_peer_has_a_shell_grant() -> Result<()> {
     let node_a_dir = TempDir::new()?;
     let node_c_dir = TempDir::new()?;
     let node_a_home = FabricHome::new(node_a_dir.path());
@@ -969,7 +931,7 @@ async fn untrusted_peer_is_refused_even_when_shell_is_allowed() -> Result<()> {
         Some(node_a.addr()),
     )
     .await?;
-    wait_for_cli_status(&node_c_home, false).await?;
+    wait_for_cli_status(&node_c_home).await?;
 
     let output = run_shell(&node_c_home, "node-a", "echo should-not-run\n")?;
     assert!(
@@ -1090,22 +1052,14 @@ fn cli_add_peer(
     Ok(())
 }
 
-async fn wait_for_cli_status(home: &FabricHome, expected_allow_shell: bool) -> Result<String> {
+async fn wait_for_cli_status(home: &FabricHome) -> Result<String> {
     let started = Instant::now();
     loop {
         let output = fabric_output(home, &["status"])?;
         let current;
         if output.status.success() {
             let stdout = String::from_utf8(output.stdout)?;
-            let expected = if expected_allow_shell {
-                "shell\tallowed"
-            } else {
-                "shell\tdisabled"
-            };
-            if stdout.contains(expected) {
-                return Ok(stdout);
-            }
-            current = stdout;
+            return Ok(stdout);
         } else {
             current = format!(
                 "status={:?}\nstdout={}\nstderr={}",
