@@ -72,10 +72,12 @@ An open SSH port did not provide a usable login. Nathan must personally recover
 hetz if Fabric cannot recover itself. Test the recovery actor's route before
 every deliberate outage. Silber.cos has local shell access on Silber.
 
-The release workflow must publish a fabric-only Release A archive. The deployed
-`48208e4` reader cleanly refused a paired archive in isolation and changed no
-file. Step 7 restores paired archives after Release A reaches every machine.
-Do not tag current main until the workflow has this transition shape.
+PR #167 made the release workflow publish a fabric-only Release A archive. The
+deployed `48208e4` reader cleanly refused a paired archive in isolation and
+changed no file. PR #168 makes scheduled verification honest and prints the
+exact status and manual recovery commands. PR #169 keeps expected companion
+absence silent on launchd and systemd. Step 7 restores paired archives after
+Release A reaches every machine.
 
 The local library suite passed 499 tests with five measurements ignored. The
 binary suite passed 19 tests, and the update contract passed eight tests. The

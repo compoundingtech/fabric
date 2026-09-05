@@ -653,18 +653,21 @@ pub async fn supervise_restart(
     rollback: &Path,
     generation: &str,
     expect: &str,
+    restore_now: bool,
 ) -> Result<()> {
-    match wait_for_daemon_version(home, generation, expect, SUPERVISE_READY_TIMEOUT).await {
-        VersionWaitDecision::Ready => {
-            println!("supervise\tthe daemon came back running {expect}");
-            return Ok(());
+    if !restore_now {
+        match wait_for_daemon_version(home, generation, expect, SUPERVISE_READY_TIMEOUT).await {
+            VersionWaitDecision::Ready => {
+                println!("supervise\tthe daemon came back running {expect}");
+                return Ok(());
+            }
+            VersionWaitDecision::Superseded => {
+                println!("supervise\tstopped because its generation is stale or missing");
+                return Ok(());
+            }
+            VersionWaitDecision::Rollback => {}
+            VersionWaitDecision::Wait => unreachable!(),
         }
-        VersionWaitDecision::Superseded => {
-            println!("supervise\tstopped because its generation is stale or missing");
-            return Ok(());
-        }
-        VersionWaitDecision::Rollback => {}
-        VersionWaitDecision::Wait => unreachable!(),
     }
 
     // The record can change after the final wait decision. Check it again
@@ -675,11 +678,15 @@ pub async fn supervise_restart(
         return Ok(());
     }
 
-    eprintln!(
-        "supervise\tthe daemon is not running {expect} after {}s; restoring {}",
-        SUPERVISE_READY_TIMEOUT.as_secs(),
-        rollback.display()
-    );
+    if restore_now {
+        eprintln!("recover\trestoring {}", rollback.display());
+    } else {
+        eprintln!(
+            "supervise\tthe daemon is not running {expect} after {}s; restoring {}",
+            SUPERVISE_READY_TIMEOUT.as_secs(),
+            rollback.display()
+        );
+    }
 
     let installed_path = managed_binary_path()?;
     restore_rollback_machine(
@@ -1196,9 +1203,8 @@ fn schedule_supervisor(
     _generation: &str,
     _expect: &str,
 ) -> Result<()> {
-    // macOS installs verify in place: `launchctl kickstart` does not tear down
-    // the caller, so `service::install` already waits for the control socket and
-    // fails loudly if it never answers.
+    // The macOS supervisor is already launchd-owned before the first binary
+    // replacement. It waits for this updater to exit before verification.
     Ok(())
 }
 
@@ -1523,6 +1529,53 @@ async fn roll_back(
 }
 
 /// Re-render the unit and restart, unless told not to.
+fn recovery_command(
+    home: &Path,
+    rollback: &Path,
+    generation: &str,
+    expect: &str,
+) -> String {
+    [
+        rollback.display().to_string(),
+        "--home".into(),
+        home.display().to_string(),
+        "supervise-restart".into(),
+        "--rollback".into(),
+        rollback.display().to_string(),
+        "--generation".into(),
+        generation.into(),
+        "--expect".into(),
+        expect.into(),
+        "--restore-now".into(),
+    ]
+    .iter()
+    .map(|word| shell_word(word))
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
+fn shell_word(word: &str) -> String {
+    if !word.is_empty()
+        && word.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'+' | b':')
+        })
+    {
+        return word.to_string();
+    }
+    format!("'{}'", word.replace('\'', "'\"'\"'"))
+}
+
+fn pending_verification_report(expect: &str, previous: &str, recovery: &str) -> String {
+    format!(
+        "restart\tscheduled\n\
+         verification\tpending; the detached supervisor will confirm {expect} or restore {previous}\n\
+         check\twait up to two minutes, then run `fabric status`\n\
+         outcome\tversion {expect} means success; version {previous} means rollback; no answer needs manual recovery\n\
+         recover\t{recovery}"
+    )
+}
+
 fn finish(
     home: &crate::config::FabricHome,
     options: &UpdateOptions,
@@ -1555,21 +1608,54 @@ fn finish(
     // command. `service::install` would use `current_exe`, which during a manual
     // test is a `target/debug` build.
     let managed = managed_binary_path()?;
-    crate::service::install_at(
-        home,
-        &managed,
-        crate::service::ServiceInstallOptions {
-            allow_shell: None,
-            allow_exec: None,
-            memory_max_mb: None,
-        },
-    )?;
-    schedule_supervisor(home, rollback, generation, expect)
+    let install_options = crate::service::ServiceInstallOptions {
+        allow_shell: None,
+        allow_exec: None,
+        memory_max_mb: None,
+    };
+    let supervised = rollback.exists();
+    if supervised {
+        crate::service::install_at_for_update(home, &managed, install_options)?;
+    } else {
+        crate::service::install_at(home, &managed, install_options)?;
+    }
+    schedule_supervisor(home, rollback, generation, expect)?;
+    if supervised {
+        let previous = binary_version(rollback).unwrap_or_else(|_| "the previous version".into());
+        let recovery = recovery_command(home.root(), rollback, generation, expect);
+        println!(
+            "{}",
+            pending_verification_report(expect, &previous, &recovery)
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_verification_names_the_command_bound_and_outcomes() {
+        let command = recovery_command(
+            Path::new("/Users/Nathan Example/.local/share/fabric"),
+            Path::new("/Users/Nathan Example/.local/bin/fabric.rollback-1"),
+            "generation-1",
+            "0.2.1+new",
+        );
+        let report = pending_verification_report("0.2.1+new", "0.2.1+old", &command);
+        assert!(report.contains("verification\tpending"));
+        assert!(report.contains("wait up to two minutes"));
+        assert!(report.contains("`fabric status`"));
+        assert!(report.contains("version 0.2.1+new means success"));
+        assert!(report.contains("version 0.2.1+old means rollback"));
+        assert!(report.contains("no answer needs manual recovery"));
+        assert!(report.contains("recover\t"));
+        assert!(command.starts_with("'/Users/Nathan Example/.local/bin/fabric.rollback-1'"));
+        assert!(command.ends_with("--restore-now"));
+        assert_eq!(shell_word("Nathan's Mac"), "'Nathan'\"'\"'s Mac'");
+        assert!(!report.contains("control-socket\tready"));
+    }
 
     /// Build a tarball the way the release workflow does, so the archive checks
     /// are tested against real bytes rather than a mock of them.
