@@ -2068,10 +2068,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_commit_suffixed_tag_keeps_its_exact_version() {
+    #[tokio::test]
+    async fn a_commit_suffixed_tag_keeps_its_exact_version() {
         assert_eq!(
-            version_for_tag_commit("v0.2.4+9b425d6", "4dc0cac80674c3996dd546b5979e59b5b0316773")
+            expected_version_for_tag("v0.2.4+9b425d6")
+                .await
                 .unwrap(),
             "0.2.4+9b425d6"
         );
