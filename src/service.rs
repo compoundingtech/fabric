@@ -152,18 +152,62 @@ pub fn install(home: &FabricHome, options: ServiceInstallOptions) -> Result<()> 
     install_at(home, &exe, options)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallVerification {
+    Immediate,
+    DetachedSupervisor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlSocketState {
+    Ready,
+    NotReady,
+    Pending,
+}
+
+fn control_socket_state(
+    verification: InstallVerification,
+    wait: impl FnOnce() -> bool,
+) -> ControlSocketState {
+    match verification {
+        InstallVerification::Immediate if wait() => ControlSocketState::Ready,
+        InstallVerification::Immediate => ControlSocketState::NotReady,
+        InstallVerification::DetachedSupervisor => ControlSocketState::Pending,
+    }
+}
+
 /// Install the service so it runs `exe`, whatever binary is asking.
 ///
-/// `fabric update` needs this. It resolves the binary the service manager
-/// already runs and installs the new bytes THERE, then re-renders the unit — and
-/// the unit must keep naming that path. Rendering from `current_exe` would point
-/// the daemon at whichever binary happened to run the update, which during
-/// testing is a `target/debug` build and in general is nobody's idea of the
-/// installed fabric.
+/// The caller gives the path that the service manager must run. Rendering from
+/// `current_exe` would point the daemon at whichever binary ran this command.
+/// During a test that can be a `target/debug` build. It is not necessarily the
+/// installed Fabric binary.
 ///
 /// That is the same trap as installing at `command -v fabric`, entered from the
 /// other side.
 pub fn install_at(home: &FabricHome, exe: &Path, options: ServiceInstallOptions) -> Result<()> {
+    install_at_with_verification(home, exe, options, InstallVerification::Immediate)
+}
+
+pub(crate) fn install_at_for_update(
+    home: &FabricHome,
+    exe: &Path,
+    options: ServiceInstallOptions,
+) -> Result<()> {
+    install_at_with_verification(
+        home,
+        exe,
+        options,
+        InstallVerification::DetachedSupervisor,
+    )
+}
+
+fn install_at_with_verification(
+    home: &FabricHome,
+    exe: &Path,
+    options: ServiceInstallOptions,
+    verification: InstallVerification,
+) -> Result<()> {
     // The managed OS-service is a PROD-only concept, under a single global label.
     // Installing it against a dev/custom home would register a SECOND service on
     // the same label that fights the prod daemon (the service-vs-manual race).
@@ -197,13 +241,12 @@ pub fn install_at(home: &FabricHome, exe: &Path, options: ServiceInstallOptions)
         }
     }
 
-    // The service manager returns once it has STARTED the process, not once the
-    // daemon can answer. Between those two moments `fabric status` gets
-    // connection refused, which reads as a failed install and is really a race
-    // against the daemon binding its control socket. Wait for the socket to
-    // actually accept before claiming success, so a script can install and then
-    // immediately use the thing it installed.
-    let ready = wait_for_control_socket(home, CONTROL_READY_TIMEOUT);
+    // A direct service install waits until the daemon can answer. An update has
+    // a detached supervisor that verifies the exact new version or restores the
+    // prior binaries. The update must not call an old answering socket ready.
+    let control_socket = control_socket_state(verification, || {
+        wait_for_control_socket(home, CONTROL_READY_TIMEOUT)
+    });
     println!("installed");
     println!("home\t{}", home.root().display());
     println!("allow-shell\t{allow_shell}");
@@ -217,20 +260,23 @@ pub fn install_at(home: &FabricHome, exe: &Path, options: ServiceInstallOptions)
             .map(|mb| mb.to_string())
             .unwrap_or_else(|| "unset".to_string())
     );
-    if !ready {
-        bail!(
-            "the service is registered and {} reports it started, but its control socket at {} \
-             did not accept a connection within {:?}.\n\
-             The install itself succeeded; the daemon is either still coming up or failing at \
-             startup. Check `fabric service status` and the daemon log at {} before re-running \
-             install, which would only restart it.",
-            "the service manager",
-            home.control_socket_path().display(),
-            CONTROL_READY_TIMEOUT,
-            home.root().join("logs/service.err.log").display(),
-        );
+    match control_socket {
+        ControlSocketState::Ready => println!("control-socket\tready"),
+        ControlSocketState::Pending => {}
+        ControlSocketState::NotReady => {
+            bail!(
+                "the service is registered and {} reports it started, but its control socket at {} \
+                 did not accept a connection within {:?}.\n\
+                 The install itself succeeded; the daemon is either still coming up or failing at \
+                 startup. Check `fabric service status` and the daemon log at {} before re-running \
+                 install, which would only restart it.",
+                "the service manager",
+                home.control_socket_path().display(),
+                CONTROL_READY_TIMEOUT,
+                home.root().join("logs/service.err.log").display(),
+            );
+        }
     }
-    println!("control-socket\tready");
     Ok(())
 }
 
@@ -1372,7 +1418,34 @@ fn xml_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServiceEnablement, interpret_launchd, interpret_systemd_is_enabled};
+    use super::{
+        ControlSocketState, InstallVerification, ServiceEnablement, control_socket_state,
+        interpret_launchd, interpret_systemd_is_enabled,
+    };
+
+    #[test]
+    fn a_detached_supervisor_does_not_check_the_old_control_socket() {
+        let mut waited = false;
+        let state = control_socket_state(InstallVerification::DetachedSupervisor, || {
+            waited = true;
+            true
+        });
+
+        assert_eq!(state, ControlSocketState::Pending);
+        assert!(!waited, "the update treated the old daemon as the new one");
+    }
+
+    #[test]
+    fn a_direct_install_still_checks_its_control_socket() {
+        let mut waited = false;
+        let state = control_socket_state(InstallVerification::Immediate, || {
+            waited = true;
+            true
+        });
+
+        assert_eq!(state, ControlSocketState::Ready);
+        assert!(waited, "the direct install skipped its readiness check");
+    }
 
     #[test]
     fn systemd_is_enabled_reading_tells_enabled_from_merely_present() {

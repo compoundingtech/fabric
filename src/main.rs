@@ -269,6 +269,10 @@ enum Commands {
         /// is still answering until the moment it is torn down.
         #[arg(long)]
         expect: String,
+        /// Restore the named rollback immediately. This is the manual recovery
+        /// path printed after a scheduled update.
+        #[arg(long)]
+        restore_now: bool,
     },
     /// Update this machine's fabric to a verified build, then restart it.
     ///
@@ -1059,8 +1063,16 @@ async fn main() -> Result<()> {
                     rollback,
                     generation,
                     expect,
+                    restore_now,
                 } => {
-                    update::supervise_restart(&home, &rollback, &generation, &expect).await?;
+                    update::supervise_restart(
+                        &home,
+                        &rollback,
+                        &generation,
+                        &expect,
+                        restore_now,
+                    )
+                    .await?;
                 }
                 Commands::Update {
                     tag,
