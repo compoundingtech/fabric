@@ -403,6 +403,15 @@ Each implementation pull request merges when its required tests and CI pass.
 Silber.cos owns the step 7 activation gate and every release and deployment
 gate.
 
+Before any release, run every ignored test that needs a real machine. Record
+the machine, commit, command, and result. The current required test is:
+
+- macOS launchd rollback: `a_real_launchd_supervisor_rolls_back_and_removes_its_job`
+
+Add each future real-machine test to this named list when the test is added.
+The measurement-only ignored tests are not release gates unless this list names
+them.
+
 The process-boundary release needs all of these results:
 
 - The permanent five-second latency test passes with its original 150 ms bound.
