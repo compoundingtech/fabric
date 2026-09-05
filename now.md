@@ -4,10 +4,31 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-04 by Silber.fabric-codex. Main is ahead of the deployed
-`0.2.1+48208e4` build. Do not cut or deploy a release without Silber.cos._
+_Last updated: 2026-09-04 by Silber.fabric-codex. Main is ahead of the fleet.
+Ask Silber.cos for the current fleet build. Do not cut or deploy a release
+without Silber.cos._
 
 ## Current main — 2026-09-04
+
+PR #154 made the current-connection fault class visible. PR #155 froze the
+sync-process extraction plan. PR #156 made `peers.toml` formatting stable.
+
+PR #157 moved blocking sync work off Tokio workers. PR #158 made an unreachable
+peer an unknown doctor result. PR #159 added process-neutral sync paths and an
+exclusive state-owner lease. PR #160 gave doctor distinct exit codes for a
+problem, an unknown result, and command-line usage.
+
+PR #161 froze the dormant `fabric/sync-ipc/1` bridge. Production still selects
+the embedded engine. The bridge has bounded control frames and handshakes,
+owner-only socket permissions, same-user checks, version and feature
+negotiation, structured errors, status, shutdown, and a raw bidirectional
+stream relay.
+
+The current change ships `fabric-sync` as a diagnostic companion. Its read-only
+`--check` validates `syncs.toml`, the state paths, the owner lease, the daemon
+build, and sync IPC compatibility. Release archives, the installer, the
+updater, and rollback now handle `fabric` and `fabric-sync` as one versioned
+pair. The main daemon still owns and runs sync in-process.
 
 PR #153 grouped the sync disk state and merged as `7733e4b`. It is not released
 or deployed. The fleet remains on `0.2.1+48208e4`.

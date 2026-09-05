@@ -30,4 +30,4 @@ pub use delta::{ChangeBuffer, Cursor};
 pub use engine::{PeerRef, SYNC_LOG_TARGET, SyncEngine, SyncStatus, SyncTransport};
 pub use manifest::{FileMeta, Manifest, ManifestDiff};
 pub use node::{Reconciled, SyncNode, content_hash};
-pub use paths::{SyncOwnerLease, SyncPaths};
+pub use paths::{SyncOwnerLease, SyncOwnerLeaseState, SyncPaths};

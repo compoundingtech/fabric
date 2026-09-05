@@ -3404,6 +3404,12 @@ async fn process_control_request(
             };
             ControlResponse::SyncStatus { entries }
         }
+        ControlRequest::SyncIpcCompatibility => ControlResponse::SyncIpcCompatibility {
+            version: crate::version_string(),
+            sync_ipc_magic: sync::ipc::IPC_MAGIC.to_string(),
+            sync_ipc_version: sync::ipc::IPC_VERSION,
+            owner: "embedded".to_string(),
+        },
         ControlRequest::Shutdown => {
             state.cancel.cancel();
             ControlResponse::Ok
@@ -5169,6 +5175,32 @@ mod tests {
 
         let status = node.state().sync_engine().unwrap().status().await;
         assert_eq!(status[0].peers.selectors(), &["silber"]);
+        node.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn daemon_reports_the_frozen_sync_ipc_contract_and_embedded_owner() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let node = FabricNode::start(FabricHome::new(dir.path())).await?;
+        let response = process_control_request(
+            ControlRequest::SyncIpcCompatibility,
+            node.state(),
+        )
+        .await?;
+        match response {
+            ControlResponse::SyncIpcCompatibility {
+                version,
+                sync_ipc_magic,
+                sync_ipc_version,
+                owner,
+            } => {
+                assert_eq!(version, crate::version_string());
+                assert_eq!(sync_ipc_magic, sync::ipc::IPC_MAGIC);
+                assert_eq!(sync_ipc_version, sync::ipc::IPC_VERSION);
+                assert_eq!(owner, "embedded");
+            }
+            other => panic!("wrong compatibility response: {other:?}"),
+        }
         node.shutdown().await
     }
 
