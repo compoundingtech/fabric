@@ -85,6 +85,9 @@ jobs:
       - name: Provisioning and CLI contract
         run: timeout 5m cargo test --locked --test provisioning -- --test-threads=1
 
+      - name: Doctor command contract
+        run: timeout 5m cargo test --locked --test doctor -- --test-threads=1
+
       - name: Real iroh folder sync and restart
         run: timeout 10m cargo test --locked --test sync_slice -- --test-threads=1
 

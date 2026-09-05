@@ -208,8 +208,9 @@ enum Commands {
     /// that counts as needing attention: a doctor is read INSTEAD of
     /// investigating, so it must not guess in the reassuring direction.
     ///
-    /// Exit code is the answer: 0 nothing to do, 1 something needs attention.
-    /// It never changes anything.
+    /// Exit code is the answer: 0 verified healthy, 1 problem or setup,
+    /// 2 command-line usage error, 3 unknown because a check could not answer.
+    /// The command never changes anything.
     Doctor,
     /// Round-trip a random nonce through a peer's built-in echo protocol.
     Ping { peer: String },
