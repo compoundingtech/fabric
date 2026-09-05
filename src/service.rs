@@ -695,27 +695,57 @@ fn install_systemd_user(spec: &ServiceSpec) -> Result<()> {
 fn remove_systemd_sync_for_rollback() -> Result<()> {
     let stop = Command::new("systemctl")
         .args(["--user", "stop", SYNC_SERVICE_NAME])
-        .status()
+        .output()
         .context("failed to stop the fabric-sync service")?;
-    if !stop.success() {
-        let still_active = Command::new("systemctl")
-            .args(["--user", "is-active", "--quiet", SYNC_SERVICE_NAME])
-            .status()
-            .context("failed to check the fabric-sync service")?
-            .success();
-        if still_active {
-            bail!("the fabric-sync service is still active, so rollback stopped");
-        }
-    }
-    let _ = Command::new("systemctl")
+    let active = Command::new("systemctl")
+        .args(["--user", "is-active", SYNC_SERVICE_NAME])
+        .output()
+        .context("failed to check the fabric-sync service")?;
+    let still_active = systemd_unit_is_active(
+        &String::from_utf8_lossy(&active.stdout),
+        &String::from_utf8_lossy(&active.stderr),
+    )?;
+    rollback_service_command_result(
+        "stop the fabric-sync service",
+        still_active,
+        &String::from_utf8_lossy(&stop.stderr),
+    )?;
+
+    let disable = Command::new("systemctl")
         .args(["--user", "disable", SYNC_SERVICE_NAME])
-        .status();
+        .output()
+        .context("failed to disable the fabric-sync service")?;
+    let still_enabled = match ServiceManager::SystemdUser.sync_enablement() {
+        ServiceEnablement::Enabled => true,
+        ServiceEnablement::PresentNotEnabled | ServiceEnablement::NotInstalled => false,
+        ServiceEnablement::Unknown => {
+            bail!("could not verify that the fabric-sync service is disabled")
+        }
+    };
+    rollback_service_command_result(
+        "disable the fabric-sync service",
+        still_enabled,
+        &String::from_utf8_lossy(&disable.stderr),
+    )?;
+
     let sync_unit_path = systemd_sync_user_unit_path()?;
     if sync_unit_path.exists() {
         fs::remove_file(&sync_unit_path)
             .with_context(|| format!("failed to remove {}", sync_unit_path.display()))?;
     }
     run_command("systemctl", &["--user", "daemon-reload"])
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn systemd_unit_is_active(stdout: &str, stderr: &str) -> Result<bool> {
+    match stdout.split_whitespace().next().unwrap_or("") {
+        "active" | "activating" | "reloading" | "deactivating" => Ok(true),
+        "inactive" | "failed" => Ok(false),
+        state => {
+            let detail = stderr.trim();
+            bail!("could not determine the fabric-sync service state: {state} {detail}")
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -854,13 +884,16 @@ fn install_launchd_sync_user(home: &FabricHome, spec: &ServiceSpec) -> Result<()
 #[cfg(target_os = "macos")]
 fn remove_launchd_sync_for_rollback() -> Result<()> {
     let target = launchd_sync_service_target();
-    let _ = Command::new("launchctl")
+    let bootout = Command::new("launchctl")
         .args(["bootout", &target])
-        .status();
+        .output()
+        .context("failed to unload the fabric-sync service")?;
     wait_for_launchd_unloaded(&target, LAUNCHD_UNLOAD_TIMEOUT);
-    if launchd_service_loaded(&target) {
-        bail!("the fabric-sync service is still loaded, so rollback stopped");
-    }
+    rollback_service_command_result(
+        "unload the fabric-sync service",
+        launchd_service_loaded(&target),
+        &String::from_utf8_lossy(&bootout.stderr),
+    )?;
     let plist_path = launch_sync_agent_path()?;
     if plist_path.exists() {
         fs::remove_file(&plist_path)
@@ -869,6 +902,21 @@ fn remove_launchd_sync_for_rollback() -> Result<()> {
     // Do not call `launchctl disable`. That override survives the plist and
     // would poison a later paired install.
     Ok(())
+}
+
+fn rollback_service_command_result(
+    action: &str,
+    service_remains: bool,
+    stderr: &str,
+) -> Result<()> {
+    if !service_remains {
+        return Ok(());
+    }
+    let detail = stderr.trim();
+    if detail.is_empty() {
+        bail!("failed to {action}; the service remains present");
+    }
+    bail!("failed to {action}; the service remains present: {detail}")
 }
 
 /// Restore a plist to what it was before a failed install: its previous bytes,
@@ -1372,7 +1420,27 @@ fn xml_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServiceEnablement, interpret_launchd, interpret_systemd_is_enabled};
+    use super::{
+        ServiceEnablement, interpret_launchd, interpret_systemd_is_enabled,
+        rollback_service_command_result, systemd_unit_is_active,
+    };
+
+    #[test]
+    fn rollback_ignores_only_a_failed_command_for_an_absent_service() {
+        rollback_service_command_result("stop it", false, "not found")
+            .expect("an absent service made rollback noisy");
+
+        let error = rollback_service_command_result("stop it", true, "permission denied")
+            .expect_err("a service that remained active was ignored");
+        assert!(error.to_string().contains("permission denied"));
+    }
+
+    #[test]
+    fn systemd_absence_is_inactive_but_an_unknown_reply_is_not_safe() {
+        assert!(!systemd_unit_is_active("inactive\n", "").unwrap());
+        assert!(systemd_unit_is_active("active\n", "").unwrap());
+        assert!(systemd_unit_is_active("", "bus error").is_err());
+    }
 
     #[test]
     fn systemd_is_enabled_reading_tells_enabled_from_merely_present() {
