@@ -603,6 +603,38 @@ fn remove_with_rollback(path: &Path, stamp: &str) -> Result<PathBuf> {
 /// decides the new binary does not work. Generous: a slow machine coming back
 /// under load must not be mistaken for a broken build.
 const SUPERVISE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+const UPDATE_GENERATION_FILE: &str = "update-generation";
+
+fn update_generation_path(home: &crate::config::FabricHome) -> PathBuf {
+    home.root().join("run").join(UPDATE_GENERATION_FILE)
+}
+
+fn new_update_generation() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{}-{nanos}", std::process::id())
+}
+
+fn write_update_generation(home: &crate::config::FabricHome, generation: &str) -> Result<()> {
+    let path = update_generation_path(home);
+    let parent = path.parent().context("the generation file has no directory")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    let temporary = parent.join(format!(".{UPDATE_GENERATION_FILE}-{}", std::process::id()));
+    std::fs::write(&temporary, format!("{generation}\n"))
+        .with_context(|| format!("failed to write {}", temporary.display()))?;
+    std::fs::rename(&temporary, &path)
+        .with_context(|| format!("failed to place {}", path.display()))?;
+    Ok(())
+}
+
+fn generation_is_current(home: &crate::config::FabricHome, generation: &str) -> bool {
+    std::fs::read_to_string(update_generation_path(home))
+        .map(|recorded| recorded.trim() == generation)
+        .unwrap_or(false)
+}
 
 /// Check that the daemon came back, and put the old binary back if it did not.
 ///
@@ -618,10 +650,27 @@ const SUPERVISE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 pub async fn supervise_restart(
     home: &crate::config::FabricHome,
     rollback: &Path,
+    generation: &str,
     expect: &str,
 ) -> Result<()> {
-    if wait_for_daemon_version(home, expect, SUPERVISE_READY_TIMEOUT).await {
-        println!("supervise\tthe daemon came back running {expect}");
+    match wait_for_daemon_version(home, generation, expect, SUPERVISE_READY_TIMEOUT).await {
+        VersionWaitDecision::Ready => {
+            println!("supervise\tthe daemon came back running {expect}");
+            return Ok(());
+        }
+        VersionWaitDecision::Superseded => {
+            println!("supervise\tstopped because its generation is stale or missing");
+            return Ok(());
+        }
+        VersionWaitDecision::Rollback => {}
+        VersionWaitDecision::Wait => unreachable!(),
+    }
+
+    // The record can change after the final wait decision. Check it again
+    // immediately before the first rollback mutation. Uncertainty is safe only
+    // when it leaves the installed machine unchanged.
+    if !generation_is_current(home, generation) {
+        println!("supervise\tstopped because its generation is stale or missing");
         return Ok(());
     }
 
@@ -632,6 +681,46 @@ pub async fn supervise_restart(
     );
 
     let installed_path = managed_binary_path()?;
+    restore_rollback_machine(
+        &installed_path,
+        rollback,
+        crate::service::prepare_update_rollback,
+        |installed, companion_exists| {
+            crate::service::restore_after_update_rollback(home, installed, companion_exists)
+        },
+    )?;
+    if let Err(error) = crate::gitremote::install_helper_for(&installed_path) {
+        eprintln!("supervise\tGit helper repair failed: {error:#}");
+    }
+    if crate::service::wait_for_control_socket(home, SUPERVISE_READY_TIMEOUT) {
+        eprintln!("supervise\trolled back and the daemon came back");
+        return Ok(());
+    }
+    bail!(
+        "rolled back to {} and the daemon still did not answer; this machine needs a person",
+        rollback.display()
+    );
+}
+
+fn restore_rollback_machine<P, R>(
+    installed_path: &Path,
+    rollback: &Path,
+    prepare_service: P,
+    restore_service: R,
+) -> Result<bool>
+where
+    P: FnOnce(bool) -> Result<()>,
+    R: FnOnce(&Path, bool) -> Result<()>,
+{
+    let companion_exists = restore_rollback_binaries(installed_path, rollback)?;
+    prepare_service(companion_exists)?;
+    restore_service(installed_path, companion_exists)?;
+    Ok(companion_exists)
+}
+
+/// Restore a matched prior binary set. A missing companion rollback means the
+/// prior release was fabric-only, so the newly installed companion is removed.
+fn restore_rollback_binaries(installed_path: &Path, rollback: &Path) -> Result<bool> {
     let companion_path = companion_binary_path(&installed_path)?;
     let companion_rollback = companion_rollback_path(rollback)?;
     let bytes = std::fs::read(rollback)
@@ -657,19 +746,7 @@ pub async fn supervise_restart(
         restore_after_pair_commit_failure(&companion_path, &previous_companion)?;
         return Err(error.context("fabric rollback failed; fabric-sync was restored"));
     }
-    if let Err(error) = crate::gitremote::install_helper_for(&installed_path) {
-        eprintln!("supervise\tGit helper repair failed: {error:#}");
-    }
-
-    restart_service()?;
-    if crate::service::wait_for_control_socket(home, SUPERVISE_READY_TIMEOUT) {
-        eprintln!("supervise\trolled back and the daemon came back");
-        return Ok(());
-    }
-    bail!(
-        "rolled back to {} and the daemon still did not answer; this machine needs a person",
-        rollback.display()
-    );
+    Ok(companion_rollback.exists())
 }
 
 /// Wait until the RUNNING DAEMON reports `expect`, not merely until something
@@ -687,11 +764,15 @@ pub async fn supervise_restart(
 /// prevent. So ask the daemon who it is.
 async fn wait_for_daemon_version(
     home: &crate::config::FabricHome,
+    generation: &str,
     expect: &str,
     timeout: std::time::Duration,
-) -> bool {
+) -> VersionWaitDecision {
     let deadline = std::time::Instant::now() + timeout;
     loop {
+        if !generation_is_current(home, generation) {
+            return VersionWaitDecision::Superseded;
+        }
         // ReachabilityStatus rather than Status, because only that reply
         // carries the daemon's version, which is the whole question here.
         let observed =
@@ -711,8 +792,9 @@ async fn wait_for_daemon_version(
             expect,
             std::time::Instant::now() >= deadline,
         ) {
-            VersionWaitDecision::Ready => return true,
-            VersionWaitDecision::Rollback => return false,
+            VersionWaitDecision::Ready => return VersionWaitDecision::Ready,
+            VersionWaitDecision::Rollback => return VersionWaitDecision::Rollback,
+            VersionWaitDecision::Superseded => unreachable!(),
             VersionWaitDecision::Wait => {}
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -724,6 +806,7 @@ enum VersionWaitDecision {
     Ready,
     Wait,
     Rollback,
+    Superseded,
 }
 
 /// Check the observed daemon before the deadline.
@@ -744,53 +827,6 @@ fn version_wait_decision(
     }
 }
 
-/// Restart the managed service, in place. Only the supervisor calls this: it
-/// already runs outside the service's cgroup, so it is not restarting itself.
-fn restart_service() -> Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        let (program, args) = rollback_restart_argv();
-        let status = std::process::Command::new(program)
-            .args(args)
-            .status()
-            .context("failed to run systemctl")?;
-        if !status.success() {
-            bail!("systemctl --user restart of the fabric pair failed with {status}");
-        }
-        Ok(())
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let target = format!(
-            "gui/{}/com.compoundingtech.fabric",
-            unsafe { libc::geteuid() }
-        );
-        let status = std::process::Command::new("launchctl")
-            .args(["kickstart", "-k", &target])
-            .status()
-            .context("failed to run launchctl")?;
-        if !status.success() {
-            bail!("launchctl kickstart failed with {status}");
-        }
-        Ok(())
-    }
-}
-
-/// Restart both members after the supervisor restores their matched bytes.
-/// This is not cfg-gated because CI on either platform must pin the Linux shape.
-#[cfg(any(target_os = "linux", test))]
-fn rollback_restart_argv() -> (&'static str, [&'static str; 4]) {
-    (
-        "systemctl",
-        [
-            "--user",
-            "restart",
-            "fabric.service",
-            "fabric-sync.service",
-        ],
-    )
-}
-
 /// Schedule the supervisor to run outside this process's cgroup.
 ///
 /// The delay lets the restart that `service::install` scheduled actually happen
@@ -805,7 +841,12 @@ fn rollback_restart_argv() -> (&'static str, [&'static str; 4]) {
 /// It runs the ROLLBACK binary, not the new one. The rollback is the copy
 /// already proven to work on this machine; asking a binary that may be broken to
 /// supervise its own installation is not supervision.
-pub fn supervisor_argv(home: &Path, rollback: &Path, expect: &str) -> (&'static str, Vec<String>) {
+pub fn supervisor_argv(
+    home: &Path,
+    rollback: &Path,
+    generation: &str,
+    expect: &str,
+) -> (&'static str, Vec<String>) {
     (
         "systemd-run",
         vec![
@@ -831,6 +872,8 @@ pub fn supervisor_argv(home: &Path, rollback: &Path, expect: &str) -> (&'static 
             "supervise-restart".into(),
             "--rollback".into(),
             rollback.display().to_string(),
+            "--generation".into(),
+            generation.into(),
             "--expect".into(),
             expect.into(),
         ],
@@ -849,16 +892,26 @@ expect=$5
 home=$6
 updater_pid=$7
 launchctl=$8
+generation_file=$9
+generation=${10}
 
 cleanup() {
     /bin/rm -f "$plist"
     "$launchctl" bootout "$target" >/dev/null 2>&1 &
 }
 
+generation_is_current() {
+    test -r "$generation_file" && test "$(/bin/cat "$generation_file")" = "$generation"
+}
+
 # launchd owns this process before either installed path changes. A pause or
 # sleep here is safe: the timeout in the rollback binary does not start until
 # the first replacement is visible.
 while /usr/bin/cmp -s "$installed" "$rollback"; do
+    if ! generation_is_current; then
+        cleanup
+        exit 0
+    fi
     if ! kill -0 "$updater_pid" 2>/dev/null; then
         cleanup
         exit 0
@@ -869,10 +922,19 @@ done
 # On macOS the updater survives its service restart. Do not spend the recovery
 # timeout while that updater is asleep or still completing launchd work.
 while kill -0 "$updater_pid" 2>/dev/null; do
+    if ! generation_is_current; then
+        cleanup
+        exit 0
+    fi
     /bin/sleep 1
 done
 
-"$rollback" --home "$home" supervise-restart --rollback "$rollback" --expect "$expect"
+if ! generation_is_current; then
+    cleanup
+    exit 0
+fi
+
+"$rollback" --home "$home" supervise-restart --rollback "$rollback" --generation "$generation" --expect "$expect"
 status=$?
 
 cleanup
@@ -903,6 +965,7 @@ fn render_macos_supervisor(
     home: &Path,
     installed: &Path,
     rollback: &Path,
+    generation: &str,
     expect: &str,
     uid: u32,
     updater_pid: u32,
@@ -930,6 +993,11 @@ fn render_macos_supervisor(
         home.display().to_string(),
         updater_pid.to_string(),
         launchctl.display().to_string(),
+        home.join("run")
+            .join(UPDATE_GENERATION_FILE)
+            .display()
+            .to_string(),
+        generation.to_string(),
     ];
     let arguments = args
         .iter()
@@ -1030,6 +1098,7 @@ fn schedule_macos_supervisor(
     home: &crate::config::FabricHome,
     installed: &Path,
     rollback: &Path,
+    generation: &str,
     expect: &str,
     stamp: &str,
 ) -> Result<()> {
@@ -1041,6 +1110,7 @@ fn schedule_macos_supervisor(
         home.root(),
         installed,
         rollback,
+        generation,
         expect,
         unsafe { libc::geteuid() },
         std::process::id(),
@@ -1067,13 +1137,14 @@ fn schedule_before_pair_commit(
     options: &UpdateOptions,
     installed: &Path,
     rollback: &Path,
+    generation: &str,
     expect: &str,
     stamp: &str,
 ) -> Result<()> {
     if options.no_restart || !home.is_default_state_root() {
         return Ok(());
     }
-    schedule_macos_supervisor(home, installed, rollback, expect, stamp)
+    schedule_macos_supervisor(home, installed, rollback, generation, expect, stamp)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1082,6 +1153,7 @@ fn schedule_before_pair_commit(
     _options: &UpdateOptions,
     _installed: &Path,
     _rollback: &Path,
+    _generation: &str,
     _expect: &str,
     _stamp: &str,
 ) -> Result<()> {
@@ -1092,6 +1164,7 @@ fn schedule_before_pair_commit(
 fn schedule_supervisor(
     home: &crate::config::FabricHome,
     rollback: &Path,
+    generation: &str,
     expect: &str,
 ) -> Result<()> {
     if !rollback.exists() {
@@ -1100,7 +1173,7 @@ fn schedule_supervisor(
         println!("supervise\tskipped, there is no previous binary to fall back to");
         return Ok(());
     }
-    let (program, args) = supervisor_argv(home.root(), rollback, expect);
+    let (program, args) = supervisor_argv(home.root(), rollback, generation, expect);
     let status = std::process::Command::new(program)
         .args(&args)
         .status()
@@ -1119,6 +1192,7 @@ fn schedule_supervisor(
 fn schedule_supervisor(
     _home: &crate::config::FabricHome,
     _rollback: &Path,
+    _generation: &str,
     _expect: &str,
 ) -> Result<()> {
     // macOS installs verify in place: `launchctl kickstart` does not tear down
@@ -1300,6 +1374,11 @@ pub async fn run(home: &crate::config::FabricHome, options: UpdateOptions) -> Re
         return Err(error.context("the Git helper path is unsafe, so nothing was installed"));
     }
 
+    // Advance the generation before any installed path changes. This invalidates
+    // every older supervisor, including one whose job survived its own cleanup.
+    let generation = new_update_generation();
+    write_update_generation(home, &generation)?;
+
     let (rollback, companion_rollback) = match commit_staged_pair(
         &staged,
         &installed_path,
@@ -1312,6 +1391,7 @@ pub async fn run(home: &crate::config::FabricHome, options: UpdateOptions) -> Re
                 &options,
                 &installed_path,
                 rollback,
+                &generation,
                 &staged_version,
                 &stamp,
             )
@@ -1336,7 +1416,7 @@ pub async fn run(home: &crate::config::FabricHome, options: UpdateOptions) -> Re
     }
 
     let running = binary_version(&installed_path)?;
-    finish(home, &options, &rollback, &running)?;
+    finish(home, &options, &rollback, &generation, &running)?;
     Ok(0)
 }
 
@@ -1382,6 +1462,8 @@ async fn roll_back(
             );
         }
     }
+    let generation = new_update_generation();
+    write_update_generation(home, &generation)?;
     println!("rolling back to\t{version}");
     println!("from\t{}", rollback.display());
 
@@ -1435,7 +1517,7 @@ async fn roll_back(
         println!("rollback companion\t{}", previous_companion.display());
     }
     let running = binary_version(installed_path)?;
-    finish(home, options, &previous, &running)?;
+    finish(home, options, &previous, &generation, &running)?;
     Ok(0)
 }
 
@@ -1444,6 +1526,7 @@ fn finish(
     home: &crate::config::FabricHome,
     options: &UpdateOptions,
     rollback: &Path,
+    generation: &str,
     expect: &str,
 ) -> Result<()> {
     if options.no_restart {
@@ -1480,7 +1563,7 @@ fn finish(
             memory_max_mb: None,
         },
     )?;
-    schedule_supervisor(home, rollback, expect)
+    schedule_supervisor(home, rollback, generation, expect)
 }
 
 #[cfg(test)]
@@ -1957,6 +2040,8 @@ mod supervisor_tests {
         rollback: &Path,
         plist: &Path,
         launchctl: &Path,
+        generation_file: &Path,
+        generation: &str,
     ) -> std::process::ExitStatus {
         std::process::Command::new("/bin/sh")
             .args(["-c", MACOS_SUPERVISOR_SCRIPT, "fabric-update-supervisor"])
@@ -1968,6 +2053,8 @@ mod supervisor_tests {
             .arg("/tmp/fabric-home")
             .arg(u32::MAX.to_string())
             .arg(launchctl)
+            .arg(generation_file)
+            .arg(generation)
             .status()
             .unwrap()
     }
@@ -1994,8 +2081,12 @@ mod supervisor_tests {
     #[test]
     fn the_supervisor_runs_detached_and_uses_the_known_good_binary() {
         let rollback = Path::new("/home/n/.local/bin/fabric.rollback-1000");
-        let (program, args) =
-            supervisor_argv(Path::new("/home/n/.local/share/fabric"), rollback, "0.2.0+abc1234");
+        let (program, args) = supervisor_argv(
+            Path::new("/home/n/.local/share/fabric"),
+            rollback,
+            "generation-1",
+            "0.2.0+abc1234",
+        );
 
         assert_eq!(
             program, "systemd-run",
@@ -2023,20 +2114,10 @@ mod supervisor_tests {
             args.contains(&"supervise-restart"),
             "the supervisor does not invoke the supervising subcommand: {args:?}"
         );
-    }
-
-    #[test]
-    fn rollback_restarts_both_restored_processes() {
-        let (program, args) = rollback_restart_argv();
-        assert_eq!(program, "systemctl");
-        assert_eq!(
-            args,
-            [
-                "--user",
-                "restart",
-                "fabric.service",
-                "fabric-sync.service"
-            ]
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--generation", "generation-1"]),
+            "the supervisor cannot reject a stale update: {args:?}"
         );
     }
 
@@ -2048,6 +2129,7 @@ mod supervisor_tests {
         let (_, args) = supervisor_argv(
             Path::new("/home/n/.local/share/fabric"),
             Path::new("/home/n/.local/bin/fabric.rollback-1000"),
+            "generation-1",
             "0.2.0+abc1234",
         );
         assert!(
@@ -2065,6 +2147,7 @@ mod supervisor_tests {
         let (_, args) = supervisor_argv(
             Path::new("/home/n/.local/share/fabric"),
             Path::new("/home/n/.local/bin/fabric.rollback-1000"),
+            "generation-1",
             "0.2.0+abc1234",
         );
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -2089,12 +2172,115 @@ mod supervisor_tests {
     }
 
     #[test]
+    fn an_older_fabric_only_supervisor_restores_a_broken_first_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("fabric");
+        let companion = dir.path().join("fabric-sync");
+        let rollback = dir.path().join("fabric.rollback-release-a");
+        executable(&installed, "#!/bin/sh\n# broken paired fabric\nexit 99\n");
+        executable(&companion, "#!/bin/sh\n# new companion\nexit 99\n");
+        executable(&rollback, "#!/bin/sh\n# proven Release A fabric\nexit 0\n");
+        let expected = std::fs::read(&rollback).unwrap();
+        let home = crate::config::FabricHome::new(dir.path().join("home"));
+        let main_definition = dir.path().join("fabric.service");
+        let companion_definition = dir.path().join("fabric-sync.service");
+        std::fs::write(&main_definition, b"new-only main arguments").unwrap();
+        std::fs::write(&companion_definition, b"new companion service").unwrap();
+        let actions = std::cell::RefCell::new(Vec::new());
+
+        let companion_restored = restore_rollback_machine(
+            &installed,
+            &rollback,
+            |companion_exists| {
+                assert!(!companion_exists, "Release A unexpectedly had a companion");
+                std::fs::remove_file(&companion_definition)?;
+                actions.borrow_mut().push("companion stopped and removed");
+                Ok(())
+            },
+            |restored, companion_exists| {
+                let spec = crate::service::ServiceSpec::new(
+                    restored,
+                    home.root(),
+                    false,
+                    false,
+                    None,
+                )?;
+                let systemd = crate::service::rollback_systemd_definitions(
+                    &spec,
+                    companion_exists,
+                )?;
+                let launchd = crate::service::rollback_launchd_definitions(
+                    &home,
+                    &spec,
+                    companion_exists,
+                )?;
+                assert!(systemd.companion.is_none());
+                assert!(launchd.companion.is_none());
+                std::fs::write(&main_definition, systemd.main)?;
+                actions.borrow_mut().push("old main service restored");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(!companion_restored);
+        assert_eq!(std::fs::read(&installed).unwrap(), expected);
+        assert!(!companion.exists(), "the new companion binary survived rollback");
+        assert!(
+            !companion_definition.exists(),
+            "the new companion service survived rollback"
+        );
+        assert!(
+            std::fs::read_to_string(&main_definition)
+                .unwrap()
+                .contains(&installed.display().to_string()),
+            "the old reader did not restore its main service definition"
+        );
+        assert_eq!(
+            actions.into_inner(),
+            ["companion stopped and removed", "old main service restored"]
+        );
+    }
+
+    #[test]
+    fn a_pair_rollback_restores_both_matching_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("fabric");
+        let companion = dir.path().join("fabric-sync");
+        let rollback = dir.path().join("fabric.rollback-old-pair");
+        let companion_rollback = dir.path().join("fabric-sync.rollback-old-pair");
+        executable(&installed, "#!/bin/sh\n# broken main\nexit 99\n");
+        executable(&companion, "#!/bin/sh\n# broken companion\nexit 99\n");
+        executable(&rollback, "#!/bin/sh\n# old main\nexit 0\n");
+        executable(&companion_rollback, "#!/bin/sh\n# old companion\nexit 0\n");
+
+        let companion_restored = restore_rollback_machine(
+            &installed,
+            &rollback,
+            |_| Ok(()),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+
+        assert!(companion_restored);
+        assert_eq!(
+            std::fs::read(&installed).unwrap(),
+            std::fs::read(&rollback).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(&companion).unwrap(),
+            std::fs::read(&companion_rollback).unwrap()
+        );
+    }
+
+    #[test]
     fn the_macos_job_is_launchd_owned_and_has_no_calendar_timer() {
         let dir = tempfile::tempdir().unwrap();
         let spec = render_macos_supervisor(
             dir.path(),
             Path::new("/Users/n/.local/bin/fabric"),
             Path::new("/Users/n/.local/bin/fabric.rollback-1000"),
+            "generation-1",
             "fabric 0.2.1+new",
             501,
             42,
@@ -2143,6 +2329,7 @@ mod supervisor_tests {
         let rollback = dir.path().join("fabric.rollback-test");
         let plist = dir.path().join("supervisor.plist");
         let launchctl = dir.path().join("launchctl");
+        let generation_file = dir.path().join("update-generation");
         executable(&installed, "#!/bin/sh\n# candidate\nexit 0\n");
         executable(&rollback, "#!/bin/sh\nexit 0\n");
         std::fs::write(&plist, b"loaded").unwrap();
@@ -2150,12 +2337,25 @@ mod supervisor_tests {
             &launchctl,
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\n",
         );
+        std::fs::write(&generation_file, b"generation-1\n").unwrap();
 
-        let status = run_macos_wrapper(&installed, &rollback, &plist, &launchctl);
+        let status = run_macos_wrapper(
+            &installed,
+            &rollback,
+            &plist,
+            &launchctl,
+            &generation_file,
+            "generation-1",
+        );
         assert!(status.success());
         assert!(
             !plist.exists(),
             "the successful transient job left its plist"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&generation_file).unwrap(),
+            "generation-1\n",
+            "the supervisor changed its durable generation record"
         );
         let expected = "bootout gui/501/com.compoundingtech.fabric.update-supervisor.test";
         let calls = wait_for_call(&launchctl.with_extension("calls"), expected);
@@ -2169,6 +2369,7 @@ mod supervisor_tests {
         let rollback = dir.path().join("fabric.rollback-test");
         let plist = dir.path().join("supervisor.plist");
         let launchctl = dir.path().join("launchctl");
+        let generation_file = dir.path().join("update-generation");
         executable(&installed, "#!/bin/sh\nexit 99\n");
         executable(
             &rollback,
@@ -2179,10 +2380,18 @@ mod supervisor_tests {
             &launchctl,
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\n",
         );
+        std::fs::write(&generation_file, b"generation-1\n").unwrap();
 
         // The updater is gone. The launchd-owned job starts from installed
         // replacement bytes and performs the recovery without that process.
-        let status = run_macos_wrapper(&installed, &rollback, &plist, &launchctl);
+        let status = run_macos_wrapper(
+            &installed,
+            &rollback,
+            &plist,
+            &launchctl,
+            &generation_file,
+            "generation-1",
+        );
         assert!(status.success());
         assert_eq!(
             std::fs::read(&installed).unwrap(),
@@ -2194,6 +2403,59 @@ mod supervisor_tests {
         assert!(calls.contains(expected));
     }
 
+    fn stale_macos_supervisor_leaves_healthy_update_unchanged(record: Option<&str>) {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("fabric");
+        let rollback = dir.path().join("fabric.rollback-test");
+        let plist = dir.path().join("supervisor.plist");
+        let launchctl = dir.path().join("launchctl");
+        let generation_file = dir.path().join("update-generation");
+        executable(&installed, "#!/bin/sh\n# healthy later build\nexit 0\n");
+        let healthy = std::fs::read(&installed).unwrap();
+        executable(
+            &rollback,
+            "#!/bin/sh\ninstalled=${0%%.rollback-*}\nprintf broken > \"$installed\"\nexit 0\n",
+        );
+        std::fs::write(&plist, b"stale loaded job").unwrap();
+        executable(
+            &launchctl,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\n",
+        );
+        if let Some(record) = record {
+            std::fs::write(&generation_file, format!("{record}\n")).unwrap();
+        }
+
+        let status = run_macos_wrapper(
+            &installed,
+            &rollback,
+            &plist,
+            &launchctl,
+            &generation_file,
+            "stale-generation",
+        );
+
+        assert!(status.success());
+        assert_eq!(std::fs::read(&installed).unwrap(), healthy);
+        assert!(!plist.exists(), "the stale supervisor did not clean itself");
+        if let Some(record) = record {
+            assert_eq!(
+                std::fs::read_to_string(&generation_file).unwrap(),
+                format!("{record}\n"),
+                "the stale supervisor removed the later update generation"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stale_supervisor_does_not_revert_a_healthy_later_update() {
+        stale_macos_supervisor_leaves_healthy_update_unchanged(Some("later-generation"));
+    }
+
+    #[test]
+    fn a_supervisor_without_a_generation_record_does_nothing() {
+        stale_macos_supervisor_leaves_healthy_update_unchanged(None);
+    }
+
     /// This test changes the current user's launchd domain for a few seconds.
     /// Run it explicitly on a Mac before a release that changes the updater.
     #[cfg(target_os = "macos")]
@@ -2202,6 +2464,12 @@ mod supervisor_tests {
     fn a_real_launchd_supervisor_rolls_back_and_removes_its_job() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        std::fs::create_dir_all(dir.path().join("run")).unwrap();
+        std::fs::write(
+            dir.path().join("run").join(UPDATE_GENERATION_FILE),
+            b"generation-1\n",
+        )
+        .unwrap();
         let installed = dir.path().join("fabric");
         let rollback = dir.path().join("fabric.rollback-real");
         executable(&installed, "#!/bin/sh\nexit 99\n");
@@ -2214,6 +2482,7 @@ mod supervisor_tests {
             dir.path(),
             &installed,
             &rollback,
+            "generation-1",
             "fabric test",
             unsafe { libc::geteuid() },
             u32::MAX,
@@ -2257,6 +2526,10 @@ mod supervisor_tests {
 mod supervisor_failure_tests {
     use super::*;
     use std::time::Duration;
+
+    fn arm(home: &crate::config::FabricHome, generation: &str) {
+        write_update_generation(home, generation).unwrap();
+    }
 
     /// Stand up something that answers the control socket and calls itself
     /// `version`, so the supervisor can be pointed at a daemon that is up but is
@@ -2306,9 +2579,17 @@ mod supervisor_failure_tests {
         let dir = tempfile::tempdir().unwrap();
         let home = crate::config::FabricHome::new(dir.path());
         fake_daemon(&home, "0.2.0+theoldone").await;
+        arm(&home, "generation-1");
 
-        assert!(
-            !wait_for_daemon_version(&home, "0.2.0+thenewone", Duration::from_millis(600)).await,
+        assert_eq!(
+            wait_for_daemon_version(
+                &home,
+                "generation-1",
+                "0.2.0+thenewone",
+                Duration::from_millis(600),
+            )
+            .await,
+            VersionWaitDecision::Rollback,
             "the supervisor accepted the OLD daemon as a healthy restart, which is \
              the failure it exists to catch"
         );
@@ -2320,9 +2601,17 @@ mod supervisor_failure_tests {
         let dir = tempfile::tempdir().unwrap();
         let home = crate::config::FabricHome::new(dir.path());
         fake_daemon(&home, "0.2.0+thenewone").await;
+        arm(&home, "generation-1");
 
-        assert!(
-            wait_for_daemon_version(&home, "0.2.0+thenewone", Duration::from_secs(5)).await,
+        assert_eq!(
+            wait_for_daemon_version(
+                &home,
+                "generation-1",
+                "0.2.0+thenewone",
+                Duration::from_secs(5),
+            )
+            .await,
+            VersionWaitDecision::Ready,
             "the supervisor rejected the daemon it was told to expect"
         );
     }
@@ -2332,11 +2621,54 @@ mod supervisor_failure_tests {
     async fn no_daemon_at_all_is_not_a_healthy_restart() {
         let dir = tempfile::tempdir().unwrap();
         let home = crate::config::FabricHome::new(dir.path());
+        arm(&home, "generation-1");
         let started = std::time::Instant::now();
-        assert!(!wait_for_daemon_version(&home, "0.2.0+anything", Duration::from_millis(400)).await);
+        assert_eq!(
+            wait_for_daemon_version(
+                &home,
+                "generation-1",
+                "0.2.0+anything",
+                Duration::from_millis(400),
+            )
+            .await,
+            VersionWaitDecision::Rollback
+        );
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "the supervisor hung instead of giving up"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_generation_stops_before_daemon_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = crate::config::FabricHome::new(dir.path());
+        arm(&home, "later-generation");
+        assert_eq!(
+            wait_for_daemon_version(
+                &home,
+                "stale-generation",
+                "0.2.0+old-candidate",
+                Duration::from_secs(5),
+            )
+            .await,
+            VersionWaitDecision::Superseded
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_generation_stops_before_daemon_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = crate::config::FabricHome::new(dir.path());
+        assert_eq!(
+            wait_for_daemon_version(
+                &home,
+                "missing-generation",
+                "0.2.0+old-candidate",
+                Duration::from_secs(5),
+            )
+            .await,
+            VersionWaitDecision::Superseded
         );
     }
 }

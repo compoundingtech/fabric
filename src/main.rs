@@ -260,6 +260,10 @@ enum Commands {
     SuperviseRestart {
         #[arg(long)]
         rollback: PathBuf,
+        /// The update generation this supervisor owns. A stale or missing
+        /// generation record makes the supervisor stop without changing bytes.
+        #[arg(long)]
+        generation: String,
         /// The version the daemon must report before this counts as a healthy
         /// restart. Checking that a socket answers is not enough: the old daemon
         /// is still answering until the moment it is torn down.
@@ -1051,8 +1055,12 @@ async fn main() -> Result<()> {
                         service::uninstall()?;
                     }
                 },
-                Commands::SuperviseRestart { rollback, expect } => {
-                    update::supervise_restart(&home, &rollback, &expect).await?;
+                Commands::SuperviseRestart {
+                    rollback,
+                    generation,
+                    expect,
+                } => {
+                    update::supervise_restart(&home, &rollback, &generation, &expect).await?;
                 }
                 Commands::Update {
                     tag,

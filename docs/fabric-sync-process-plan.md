@@ -188,6 +188,13 @@ companion binary and OS service when no companion existed. The first paired
 archive is the later writer. This gate is per machine, so a roaming machine such
 as Bluey first receives the transition release when it returns.
 
+The reader-before-writer rule applies to every update artifact. If a new release
+writes an artifact that an old rollback binary must read, the old binary must
+understand that artifact before the writer reaches the machine. Service
+definitions, generation records, durable state, and future install metadata all
+follow this rule. A release plan must identify the reader for each new artifact
+before it permits the writer.
+
 ### Paired-install rollback inventory
 
 Every future paired-install change must add its machine effects to this table.
@@ -207,6 +214,7 @@ The rollback review answers both columns before a paired release.
 | Incoming staging files | Remove every uncommitted file on success and handled failure. | Hidden executable bytes waste disk and invite an unsafe manual recovery. |
 | Rollback copies | Keep one exact matched prior set through the rollback window. Prune older complete sets later. | An unmatched newest set can select a mismatched pair. Unlimited sets waste disk. |
 | Detached supervisor job and plist | Remove both after success and rollback. | A stale verifier can roll back a later healthy build. |
+| Update generation record | Replace it atomically before each install. A supervisor acts only on an exact match. A stale or missing record makes it stop. | A stale verifier can revert a healthy later build. Guessing after a missing record has the same harm. |
 | Service log files | No restore is needed. Keep bounded logs for diagnosis. | Unbounded logs waste disk. Existing bounded files are harmless. |
 
 On macOS, the updater arms a transient launchd supervisor before the first pair
@@ -394,6 +402,15 @@ cleanup only. Reverting it does not change the active process architecture.
 Each implementation pull request merges when its required tests and CI pass.
 Silber.cos owns the step 7 activation gate and every release and deployment
 gate.
+
+Before any release, run every ignored test that needs a real machine. Record
+the machine, commit, command, and result. The current required test is:
+
+- macOS launchd rollback: `a_real_launchd_supervisor_rolls_back_and_removes_its_job`
+
+Add each future real-machine test to this named list when the test is added.
+The measurement-only ignored tests are not release gates unless this list names
+them.
 
 The process-boundary release needs all of these results:
 
