@@ -200,6 +200,54 @@ pub fn version_for_tag(tag: &str) -> &str {
     tag.strip_prefix('v').unwrap_or(tag)
 }
 
+/// The version a binary from `tag` must report.
+///
+/// Older release tags carry their build commit already. Newer human-facing
+/// tags carry only the package version, so add the commit the tag resolves to.
+fn version_for_tag_commit(tag: &str, commit: &str) -> Result<String> {
+    let version = version_for_tag(tag);
+    if version.contains('+') {
+        release_commit(version)?;
+        return Ok(version.to_string());
+    }
+    if !(7..=40).contains(&commit.len())
+        || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("the release tag did not resolve to a Git commit: {commit}");
+    }
+    Ok(format!("{version}+{}", &commit[..7]))
+}
+
+fn release_tag_commit_api_url(tag: &str) -> String {
+    format!("https://api.github.com/repos/{RELEASE_REPO}/commits/{tag}")
+}
+
+fn parse_release_tag_commit(body: &[u8]) -> Result<String> {
+    let json: serde_json::Value = serde_json::from_slice(body)
+        .context("the release tag API returned something that is not JSON")?;
+    let commit = json
+        .get("sha")
+        .and_then(|sha| sha.as_str())
+        .context("the release tag API returned no commit")?;
+    if !(7..=40).contains(&commit.len())
+        || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("the release tag API returned an invalid Git commit: {commit}");
+    }
+    Ok(commit.to_string())
+}
+
+async fn expected_version_for_tag(tag: &str) -> Result<String> {
+    let version = version_for_tag(tag);
+    if version.contains('+') {
+        release_commit(version)?;
+        return Ok(version.to_string());
+    }
+    let body = fetch(&release_tag_commit_api_url(tag)).await?;
+    let commit = parse_release_tag_commit(&body)?;
+    version_for_tag_commit(tag, &commit)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReleaseDirection {
     Current,
@@ -1513,7 +1561,8 @@ async fn resolve_artifact(source: &Source) -> Result<(String, String, Option<Str
             let url = release_asset_url(&tag, &asset);
             let sidecar = fetch(&format!("{url}.sha256")).await?;
             let hash = parse_sha256_sidecar(&String::from_utf8_lossy(&sidecar))?;
-            Ok((url, hash, Some(version_for_tag(&tag).to_string())))
+            let version = expected_version_for_tag(&tag).await?;
+            Ok((url, hash, Some(version)))
         }
     }
 }
@@ -2008,6 +2057,56 @@ mod tests {
         assert_eq!(version_for_tag("v0.2.0+76376d4"), "0.2.0+76376d4");
         // Idempotent, because a caller may paste either form.
         assert_eq!(version_for_tag("0.2.0+76376d4"), "0.2.0+76376d4");
+    }
+
+    #[test]
+    fn a_suffix_free_tag_names_the_tagged_commit_build() {
+        assert_eq!(
+            version_for_tag_commit("v0.2.5", "4dc0cac80674c3996dd546b5979e59b5b0316773")
+                .unwrap(),
+            "0.2.5+4dc0cac"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_commit_suffixed_tag_keeps_its_exact_version() {
+        assert_eq!(
+            expected_version_for_tag("v0.2.4+9b425d6")
+                .await
+                .unwrap(),
+            "0.2.4+9b425d6"
+        );
+    }
+
+    #[test]
+    fn a_suffix_free_tag_refuses_a_non_commit_target() {
+        let error = version_for_tag_commit("v0.2.5", "main")
+            .expect_err("a branch name was accepted as a release commit");
+        assert!(
+            error
+                .to_string()
+                .contains("did not resolve to a Git commit")
+        );
+    }
+
+    #[test]
+    fn the_release_tag_commit_reply_must_name_a_commit() {
+        assert_eq!(
+            parse_release_tag_commit(br#"{"sha":"4dc0cac80674c3996dd546b5979e59b5b0316773"}"#)
+                .unwrap(),
+            "4dc0cac80674c3996dd546b5979e59b5b0316773"
+        );
+        assert!(parse_release_tag_commit(br#"{"sha":"main"}"#).is_err());
+        assert!(parse_release_tag_commit(br#"{"message":"not found"}"#).is_err());
+        assert!(parse_release_tag_commit(b"not json").is_err());
+    }
+
+    #[test]
+    fn the_release_tag_commit_url_names_the_pasted_tag() {
+        assert_eq!(
+            release_tag_commit_api_url("v0.2.5"),
+            "https://api.github.com/repos/compoundingtech/fabric/commits/v0.2.5"
+        );
     }
 
     #[test]
