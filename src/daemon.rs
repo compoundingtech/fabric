@@ -1808,11 +1808,17 @@ impl DaemonState {
 
     /// Close only the failed peer's cached connection. The next probe opens a new
     /// connection and refreshes discovery without touching any other peer.
-    async fn recover_unreachable_peer(&self, peer_id: EndpointId, label: &str, attempt: usize) {
+    async fn recover_unreachable_peer(
+        &self,
+        peer_id: EndpointId,
+        label: &str,
+        attempt: usize,
+        failed_probe_started: Instant,
+    ) {
         let endpoint = self.endpoint_handle();
         let redialled = self
             .peer_connections
-            .redial(peer_id, b"peer health recovery")
+            .redial_opened_before(peer_id, b"peer health recovery", failed_probe_started)
             .await;
         warn!(
             target: VALIDATION_LOG_TARGET,
@@ -2760,9 +2766,10 @@ async fn run_peer_health_loop_with(
                                 "recent application traffic proved peer liveness"
                             ),
                         }
-                        round.push((peer_id, label, true, peer.roaming));
+                        round.push((peer_id, label, true, peer.roaming, Instant::now()));
                         continue;
                     }
+                    let probe_started = Instant::now();
                     let health = state.check_peer_reachability(&peer).await;
                     match peer_probe_log_action(
                         &mut roaming_away,
@@ -2852,14 +2859,20 @@ async fn run_peer_health_loop_with(
                             "persistent path degradation closed the shared peer connection"
                         );
                     }
-                    round.push((peer_id, label, health.reachable, peer.roaming));
+                    round.push((
+                        peer_id,
+                        label,
+                        health.reachable,
+                        peer.roaming,
+                        probe_started,
+                    ));
                 }
-                for (peer_id, label, reachable, roaming) in round {
+                for (peer_id, label, reachable, roaming, probe_started) in round {
                     if let PeerHealthAction::Recover { attempt } =
                         tracker.on_probe(peer_id, reachable, roaming, Instant::now())
                     {
                         state
-                            .recover_unreachable_peer(peer_id, &label, attempt)
+                            .recover_unreachable_peer(peer_id, &label, attempt, probe_started)
                             .await;
                     }
                 }
@@ -5914,14 +5927,18 @@ mod tests {
         let bluey = iroh::SecretKey::generate().public();
         let before = state.endpoint_handle().generation;
 
-        state.recover_unreachable_peer(bluey, "bluey", 3).await;
+        state
+            .recover_unreachable_peer(bluey, "bluey", 3, Instant::now())
+            .await;
         assert_eq!(
             state.endpoint_handle().generation,
             before,
             "one peer's absence must never replace the shared endpoint"
         );
 
-        state.recover_unreachable_peer(bluey, "bluey", 100).await;
+        state
+            .recover_unreachable_peer(bluey, "bluey", 100, Instant::now())
+            .await;
         assert_eq!(state.endpoint_handle().generation, before);
 
         node.shutdown().await?;
@@ -5956,7 +5973,7 @@ mod tests {
             };
             assert_eq!(attempt, expected_attempt);
             state
-                .recover_unreachable_peer(bluey, "bluey", attempt)
+                .recover_unreachable_peer(bluey, "bluey", attempt, now)
                 .await;
         }
 
@@ -5972,7 +5989,7 @@ mod tests {
         };
         assert_eq!(attempt, OLD_RECYCLE_ATTEMPT);
         state
-            .recover_unreachable_peer(bluey, "bluey", attempt)
+            .recover_unreachable_peer(bluey, "bluey", attempt, now)
             .await;
 
         assert_eq!(
@@ -6971,7 +6988,7 @@ mod tests {
         let absent = iroh::SecretKey::generate().public();
         let drops_before = *state.tunnel_drop_tx.borrow();
         state
-            .recover_unreachable_peer(absent, "absent-peer", 100)
+            .recover_unreachable_peer(absent, "absent-peer", 100, Instant::now())
             .await;
         let drops_after = *state.tunnel_drop_tx.borrow();
         assert_eq!(drops_after, drops_before);
@@ -7562,7 +7579,12 @@ mod tests {
             .await;
         // One peer away while the other answers: cheap recovery, no teardown.
         state
-            .recover_unreachable_peer(iroh::SecretKey::generate().public(), "absent", 3)
+            .recover_unreachable_peer(
+                iroh::SecretKey::generate().public(),
+                "absent",
+                3,
+                Instant::now(),
+            )
             .await;
         // And a recycle attempt, which is what a failed health poll ends in.
         let outcome = state

@@ -121,6 +121,36 @@ peer dial and generation exchange. A deterministic red test proved that one
 slow peer open blocks an existing healthy peer. Branch
 `fix/peer-lock-head-of-line` narrows this serialization to one peer.
 
+PR #172 merged that isolation as `5dbe595`. Its focused red test and all three
+GitHub checks passed. The existing restart recovery test then exposed a real
+regression. It passed 4 of 4 times on parent `475807e`, 2 of 4 times on the PR
+tree, and 0 of 2 times in GitHub CI.
+
+The first race let a failed probe request recovery while the peer connection
+was still opening. Recovery waited for the peer gate and then closed the new
+successful connection. A second form let the connection enter the map between
+the failed probe and recovery. Recovery now closes only a connection that
+existed when that failed probe started.
+
+The peer gate also added two asynchronous lock operations to every cached
+connection use. A retained failed run kept one live canonical connection on
+both peers. The bus archive bytes arrived, but a concurrent older inbox entry
+returned before the local rename scan recorded its delete. The cached path now
+uses only the connection-map lock. The per-peer gate remains on replacement,
+dial, incoming registration, and stream-failure close operations.
+
+Issue #175 tracks that sync rename race as a separate data-correctness defect.
+PR #174 restores the former timing window. It does not fix the rename race.
+
+The corrected tree passed 4 of 4 serial restart recovery samples. The samples
+took 130.36, 129.42, 129.55, and 130.05 seconds. The focused recovery test, all
+15 active mux tests, and simultaneous-peer integration also passed.
+
+The original red test proved the lock fix removed cross-peer blocking. It did
+not prove the change preserved restart convergence. A focused test can prove
+its named behavior while the existing property suite finds a different loss.
+Keep both kinds of proof.
+
 The local library suite passed 513 tests with five measurements ignored. The
 binary suite passed 19 tests, and the update contract passed eight tests. The
 five-second latency property measured 502 records, seven scans, a 10.001166 ms
