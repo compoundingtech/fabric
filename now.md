@@ -45,6 +45,21 @@ smaller, found while chasing the second: the daemon log at
 `<home>/logs/service.err.log` carries no timestamps, so no line in it can be
 attributed to a session or a moment.
 
+Silber now shares a bare repository, `st3-ui`, at
+`/Users/myobie/Developer/github.com/myobie/st3-ui.git`, as a push target for
+a new hetz agent prototyping an st3 UI. Silber's `peers.toml` names it in a
+`[[git_remotes]]` table and grants hetz `git/st3-ui/read` and
+`git/st3-ui/write`, applied with `fabric git share` and `fabric git grant
+--read-write`, the writers, not by hand. Read is granted because a backup that
+cannot be restored from is not a backup. Proven from hetz on 2026-09-06 with a
+real branch push, an `ls-remote` that listed it, and a deletion push. A finding
+from that edit, cosmetic and not fixed: the writer adds a second copy of the
+four-line rollback mirror comment above the mirrors when the file already
+carries one in its header. `ensure_rollback_mirror_comment` in `src/config.rs`
+attaches the comment to the `allow_shell` key and checks only that key's own
+comment, so the header copy is invisible to it. Bounded at two copies; further
+saves add nothing. A doubled warning block in `peers.toml` is that, not damage.
+
 A rule from the same rollout, because the report to the gate holder carried a
 wrong line for one minute: a comparison of two readings must prove the readings
 happened. A digest comparison parsed both sides with a broken one-liner, got
