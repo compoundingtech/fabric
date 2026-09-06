@@ -4,10 +4,64 @@ The living handoff for whoever owns fabric next (there was none before; keep thi
 current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
-_Last updated: 2026-09-05 by Silber.fabric-codex. The latest code merge is
-`931b77d`, pull request #188._
+_Last updated: 2026-09-06 by Silber.fabric-codex. The latest code merge is
+`8b4c7c6`, pull request #189._
 
-## Latest handoff — 2026-09-05, late
+## Latest handoff — 2026-09-06
+
+PR #189 merged at `8b4c7c6`. It adds staging to synced folders. Nathan said
+"Don't file an issue, get it fixed" about the gap Silber.catalog described: in a
+synced folder the write is the publish, so a change had no state in which it
+existed, was complete, and had not been distributed, and nothing could be
+reviewed before it crossed.
+
+The mechanism. A staged file lives at `<fabric home>/staging/<entry>/<rel>`,
+outside every synced folder. `fabric sync stage <target>` resolves the entry
+from the target path and the include globs, seeds the staged copy from the
+published file or `--from`, prints the path to edit, and records the published
+file's hash as the base. `fabric sync staged` lists staged files as `new`,
+`edit`, or `stale`. `fabric sync publish` hands the reviewed bytes to the
+daemon, which publishes under the entry operation guard: every base is checked
+against the live manifest before any write, each file is written through the
+engine write path with a journal receipt, then one scan, one persist, and one
+wake. A set is one reconcile on each peer, and a refused set changes nothing.
+`--force` publishes over a moved base. With no daemon, or an older one, the CLI
+writes each file atomically into the folder and says so. `fabric sync discard`
+removes staged copies. `fabric sync ls` shows `staged=N`.
+
+Why the tree is outside every root and not a prefix inside one. A daemon
+decides what to publish from exactly two things: the folder it walks and the
+include globs in its own `syncs.toml`. `SyncEntry` ignores unknown fields, so a
+new config key is dropped silently by an older build, and no engine state or
+control request reaches an older build's scan. A prefix inside the folder, an
+exclude a tool flips, or a per-path hold in engine state would all publish the
+staged bytes the moment a machine rolled back. A tree outside every folder is
+never walked by any build that has shipped. The old-binary guarantee comes from
+the folder walk, not from any new config an old binary would ignore. That
+sentence is the one to keep.
+
+The proofs are in the pull request. Seven library tests over two loopback
+engines, written before the implementation and failing on it. One of them is
+the leak control `the_leak_control_sees_a_file_placed_inside_the_folder`: it
+places the same file inside the folder and is `should_panic` on the exact
+message, so the absence assertion is known to see a leak. If it ever passes,
+the staged-file test has stopped watching. One real-daemon test proves a staged
+file does not reach a peer while control files cross, survives a restart of the
+staging daemon, and arrives after publish. The installed `0.2.5+4dc0cac` daemon
+ran in a temporary home over a staged file for 4 passes and 8 scans and
+recorded nothing, while the same bytes inside the folder published at once,
+09:10:08Z to 09:10:18Z. Both temporary directories were removed.
+
+Limits, stated. A multi-file publish is atomic per file, not across a crash;
+publish again to finish. A reviewer on another machine cannot see a staged
+file, by design; review happens on the staging machine at the printed path.
+
+No release or deployment followed the merge. Silber.cos gates both, separately.
+Re-read the fleet build with `fabric --version` on Silber and
+`fabric exec hetz -- fabric --version` for Hetz before using any recorded value.
+No code job remains live from this work.
+
+## Earlier handoff — 2026-09-05, late
 
 PR #188 merged at `931b77d`. It fixes issue #175, the rename that split a file
 into two names. A sync pass materialized its post-peer half with the disk view
