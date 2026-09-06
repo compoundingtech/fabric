@@ -30,12 +30,29 @@ heartbeat; on Silber it appeared 4 seconds after the restart and was gone 31
 seconds later, with the companion log reading standby, unavailable, standby.
 Anyone running doctor right after an update is told something is broken when
 nothing is. A startup grace or an informational verdict while the daemon's
-uptime is under a minute would fix it. Second, a `fabric exec` client opened
-against a daemon at the moment that daemon restarts can hang: one such client
-on Silber sat for 11 minutes 26 seconds with no stuck child on hetz until it
-was killed, while a fresh exec answered in 3 seconds. The daemon log carries no
-timestamps, so the session could not be traced. Not shown to be a `0.2.6`
-regression; it is the shape any operator meets during an update.
+uptime is under a minute would fix it. Second, and the one that matters: a
+`fabric exec` client opened against a daemon at the moment that daemon
+restarts can hang forever. On Silber a `0.2.6` client ran
+`fabric exec hetz -- sh -c "fabric status ..."` as hetz's daemon restarted
+under it. The client sat in state S for 11 minutes 26 seconds and never
+returned. There was no stuck child on hetz. A fresh bounded exec to the same
+machine answered in 3 seconds. It returned only when killed. Nathan runs
+`fabric exec` by hand, so if he execs to a machine while its daemon restarts,
+his terminal hangs with no error, no exit code, and no clue, and the right
+action, kill it and run it again, is the one he would not guess. Not shown to
+be a `0.2.6` regression. Silber.cos took it to Nathan as a real thing. Third,
+smaller, found while chasing the second: the daemon log at
+`<home>/logs/service.err.log` carries no timestamps, so no line in it can be
+attributed to a session or a moment.
+
+A rule from the same rollout, because the report to the gate holder carried a
+wrong line for one minute: a comparison of two readings must prove the readings
+happened. A digest comparison parsed both sides with a broken one-liner, got
+two empty strings, and printed a match. An empty reading printed what a clean
+one printed, and an equality check is the worst place for that, because failure
+produces the same value on both sides. Assert each reading is non-empty and
+well-formed before comparing, or give the comparison a control that must fail,
+as the staging leak control does. The digests were in fact identical.
 
 PR #189 merged at `8b4c7c6`. It adds staging to synced folders. Nathan said
 "Don't file an issue, get it fixed" about the gap Silber.catalog described: in a
