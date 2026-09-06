@@ -1147,14 +1147,112 @@ impl<T: SyncTransport> SyncEngine<T> {
     }
 
     /// Publish staged files into `name` under its operation guard.
+    ///
+    /// One guard hold, so the set is one scan, one persist, and one wake, and
+    /// a peer adopts all of it in one reconcile or none of it. Every base is
+    /// checked against the live manifest before anything is written, so a
+    /// refused set changes nothing. Each write goes through the engine write
+    /// path and its receipt journal, so the watcher acknowledges the daemon's
+    /// own writes without a second scan. The forward wake then makes the entry
+    /// loop push the set now rather than on the next tick.
+    ///
+    /// Atomic per file, not across a crash. A crash after some writes and
+    /// before the scan leaves those files in the folder, and the next start
+    /// records them; the rest are still staged. Publish again to finish.
     pub async fn publish_staged(
         &self,
         name: &str,
         files: Vec<super::staging::PublishFile>,
         force: bool,
     ) -> Result<Vec<PublishedFile>> {
-        let _ = (name, files, force);
-        anyhow::bail!("sync staging is not implemented yet")
+        let Some(entry) = self.entries.read().await.get(name).cloned() else {
+            anyhow::bail!("no sync entry named {name:?}");
+        };
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _operation = entry.operation.lock().await;
+        // A local edit the watcher has reported but no scan has recorded yet
+        // is still a change to the published file. Bring the manifest up to
+        // date before comparing bases against it.
+        if !entry.work.is_clean() {
+            self.scan_entry(&entry).await?;
+        }
+        {
+            let node = entry.node.lock().await;
+            let mut refusals = Vec::new();
+            for file in &files {
+                if !entry.config.includes(&file.rel) {
+                    refusals.push(format!(
+                        "{}: no include glob of sync {name:?} matches it",
+                        file.rel
+                    ));
+                    continue;
+                }
+                let current = node
+                    .manifest()
+                    .get(&file.rel)
+                    .and_then(|recorded| recorded.meta())
+                    .map(|meta| meta.hash);
+                if current != file.base && !force {
+                    refusals.push(super::staging::refusal_line(
+                        &file.rel, file.base, current,
+                    ));
+                }
+            }
+            if !refusals.is_empty() {
+                anyhow::bail!("publish refused:\n{}", refusals.join("\n"));
+            }
+        }
+
+        let generation = entry.work.mutation_generation.load(Ordering::Acquire);
+        let root = entry.config.folder.clone();
+        let work = entry.work.clone();
+        let files = tokio::task::spawn_blocking(move || {
+            for file in &files {
+                let path = root.join(&file.rel);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("failed to create {}", parent.display()))?;
+                }
+                write_atomic_with_mode(&path, &file.bytes, file.executable)?;
+                work.record_engine_write(&path, content_hash(&file.bytes), generation);
+            }
+            Ok::<_, anyhow::Error>(files)
+        })
+        .await
+        .context("the publish blocking task stopped")??;
+
+        self.scan_entry(&entry).await?;
+        self.persist_entry(&entry).await?;
+        entry.work.mark_generation_durable(generation);
+        let published = {
+            let node = entry.node.lock().await;
+            files
+                .iter()
+                .map(|file| {
+                    let Some(meta) = node
+                        .manifest()
+                        .get(&file.rel)
+                        .and_then(|recorded| recorded.meta())
+                    else {
+                        anyhow::bail!("{}: the scan after the write did not record it", file.rel);
+                    };
+                    Ok(PublishedFile {
+                        rel: file.rel.clone(),
+                        version: meta.version,
+                        hash: meta.hash,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        drop(_operation);
+        // Both, for the same two reasons as an inbound adoption: the wake
+        // makes the set reach peers now, and the generation makes the tick a
+        // backstop if the wake is missed.
+        entry.work.record_forward();
+        entry.work.forward.notify_one();
+        Ok(published)
     }
 
     /// The configured sync names.
