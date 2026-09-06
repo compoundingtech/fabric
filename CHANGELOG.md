@@ -6,6 +6,19 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ## [Unreleased]
 
+### Added
+
+- **A change to a synced folder can be staged, reviewed, and published on
+  purpose.** `fabric sync stage <target>` makes a staged copy under the fabric
+  home, outside every synced folder, and records the published file's hash as
+  its base. `fabric sync staged` lists staged files with their state, and
+  `fabric sync publish` writes the reviewed bytes into the folder, refusing a
+  file whose published version moved since it was staged unless `--force`.
+  With the daemon running, a publish is one scan, one persist, and one
+  reconcile per peer for the whole set. No build that has shipped can publish a
+  staged file, because every daemon publishes only from the folder it walks
+  and its own include globs.
+
 ### Changed
 
 - **The dormant `fabric/sync-ipc/1` local bridge now has a frozen contract.**

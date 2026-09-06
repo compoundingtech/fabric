@@ -1082,6 +1082,10 @@ fabric sync ls
 fabric sync ls --json
 fabric sync rm <name-or-folder>
 fabric sync reload
+fabric sync stage <target> [--from <file>] [--entry <name>]
+fabric sync staged [--entry <name>] [--json]
+fabric sync publish <target>... | --all --entry <name> [--force]
+fabric sync discard <target>... [--entry <name>]
 ```
 
 `fabric sync add` is a convenience writer for `syncs.toml`; the file can also be
@@ -1114,6 +1118,46 @@ guarded scan/materialize path. Ordinary reloads preserve the counters; a daemon
 restart or removing and later re-adding the name starts a new counter epoch.
 `fabric sync ls --json` emits a stable array with all of those fields plus a
 Boolean `drift` for automation.
+
+### Stage a change before it publishes
+
+In a synced folder the write is the publish. The moment bytes land on disk,
+every peer receives them, so an edit made over several saves publishes each
+save, and nothing can be reviewed before it crosses. Staging adds the missing
+state: a change that exists, is complete, and has not been distributed.
+
+```sh
+fabric sync stage ~/catalog/docs/handbook.md      # prints the path to edit
+$EDITOR ~/.local/share/fabric/staging/st2-declarations-default/docs/handbook.md
+fabric sync staged                                 # review: state, hashes, both paths
+fabric sync publish ~/catalog/docs/handbook.md     # one revision, one reconcile per peer
+```
+
+`stage` resolves the entry from the target path and the include globs, seeds
+the staged copy from the published file when there is one, or from `--from`,
+and records the published file's hash as the base. `staged` lists every staged
+file with its state: `new` when nothing is published at the target, `edit` when
+the published file is still the one it was staged against, and `stale` when
+that file moved. `publish` refuses a stale file unless `--force`, so a change a
+peer made under a staged edit is never overwritten by accident. `discard`
+removes staged copies and touches nothing in the folder.
+
+A staged file lives under `<fabric home>/staging/<entry>/`, never inside a
+synced folder. That location is the whole guarantee. A daemon decides what to
+publish from exactly two things, the folder it walks and the include globs in
+its own `syncs.toml`, so no build that has shipped can publish a staged file,
+including an older binary after a rollback. A daemon restart with staged files
+publishes nothing. `stage` refuses when the staging tree would lie inside a
+synced folder.
+
+With the daemon running, `publish` hands the reviewed bytes to it, and the
+daemon writes them under the entry's operation guard: one scan, one persist,
+and one reconcile carries the whole set to each peer. Without a daemon, or
+with one older than this command, `publish` writes each file atomically into
+the folder itself and says so; the next scan records them, and a set can then
+reach a peer in more than one reconcile. A crash in the middle of a multi-file
+publish leaves the written files to publish on the next start and the rest
+still staged; publish again to finish.
 
 ### Sync an st2 catalog safely
 
