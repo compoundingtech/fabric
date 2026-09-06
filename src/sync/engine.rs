@@ -544,6 +544,14 @@ impl Drop for InboundWaiter {
     }
 }
 
+/// One file after `SyncEngine::publish_staged` recorded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedFile {
+    pub rel: String,
+    pub version: u64,
+    pub hash: ContentHash,
+}
+
 /// One configured entry's live state.
 struct EntryState {
     config: SyncEntry,
@@ -1136,6 +1144,17 @@ impl<T: SyncTransport> SyncEngine<T> {
         }
         entry.work.mark_generation_durable(generation);
         Ok(())
+    }
+
+    /// Publish staged files into `name` under its operation guard.
+    pub async fn publish_staged(
+        &self,
+        name: &str,
+        files: Vec<super::staging::PublishFile>,
+        force: bool,
+    ) -> Result<Vec<PublishedFile>> {
+        let _ = (name, files, force);
+        anyhow::bail!("sync staging is not implemented yet")
     }
 
     /// The configured sync names.
@@ -4078,7 +4097,7 @@ pub(crate) const METADATA_ONLY_CHANGES_DO_NOT_PROPAGATE: () = ();
 /// syncs the attributes git syncs, and git deliberately does not track mtime.
 /// `FileMeta` still carries one, but it is informational only: see the note on
 /// that field, and on [`METADATA_ONLY_CHANGES_DO_NOT_PROPAGATE`].
-fn write_atomic_with_mode(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
+pub(crate) fn write_atomic_with_mode(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
     write_atomic_inner(path, bytes, executable)
 }
 
@@ -4322,7 +4341,7 @@ fn now_secs() -> i64 {
 }
 
 /// Make a sync name safe to use as a directory component for its manifest store.
-fn sanitize_name(name: &str) -> String {
+pub(crate) fn sanitize_name(name: &str) -> String {
     name.chars()
         .map(|c| {
             if c.is_alphanumeric() || c == '-' || c == '_' {
@@ -11128,6 +11147,430 @@ mod tests {
         assert!(
             !root.join("inbox/draft.md").exists(),
             "the removed file was written back to disk"
+        );
+    }
+
+    // ---- staging: a change that exists, is complete, and is not yet published ----
+
+    /// Two engines over loopback, each with a bus entry named "bus" on its own
+    /// folder, converged on one seed file. The convergence matters: a later
+    /// absence on B is then a fact about staging, not about a pair that never
+    /// synced.
+    async fn staged_pair() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Arc<SyncEngine<LoopbackTransport>>,
+        Arc<SyncEngine<LoopbackTransport>>,
+        Arc<LoopbackTransport>,
+        Arc<LoopbackTransport>,
+    ) {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let root_a = dir_a.path().join("resources");
+        let root_b = dir_b.path().join("resources");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        write_bus_sync(dir_a.path(), &root_a);
+        write_bus_sync(dir_b.path(), &root_b);
+        let ta = Arc::new(LoopbackTransport::default());
+        let tb = Arc::new(LoopbackTransport::default());
+        let a = SyncEngine::new(
+            FabricHome::new(dir_a.path()),
+            Author([1; 32]),
+            ta.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let b = SyncEngine::new(
+            FabricHome::new(dir_b.path()),
+            Author([2; 32]),
+            tb.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        ta.add_peer("b", "bus", b.node_for("bus").await.unwrap());
+        tb.add_peer("a", "bus", a.node_for("bus").await.unwrap());
+        std::fs::write(root_a.join("seed.md"), b"seed").unwrap();
+        a.sync_once("bus").await.unwrap();
+        b.sync_once("bus").await.unwrap();
+        assert_eq!(std::fs::read(root_b.join("seed.md")).unwrap(), b"seed");
+        (dir_a, dir_b, a, b, ta, tb)
+    }
+
+    async fn pass_both(a: &SyncEngine<LoopbackTransport>, b: &SyncEngine<LoopbackTransport>) {
+        a.sync_once("bus").await.unwrap();
+        b.sync_once("bus").await.unwrap();
+    }
+
+    async fn manifest_holds(engine: &SyncEngine<LoopbackTransport>, rel: &str) -> bool {
+        engine
+            .node_for("bus")
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .manifest()
+            .get(rel)
+            .is_some_and(Entry::is_present)
+    }
+
+    async fn assert_peer_never_saw(engine: &SyncEngine<LoopbackTransport>, home: &Path, rel: &str) {
+        assert!(
+            !manifest_holds(engine, rel).await,
+            "the peer must not hold {rel} in its manifest"
+        );
+        assert!(
+            !home.join("resources").join(rel).exists(),
+            "the peer must not hold {rel} on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_staged_file_never_enters_the_manifest_or_reaches_a_peer() {
+        let (dir_a, dir_b, a, b, _ta, _tb) = staged_pair().await;
+        let home_a = FabricHome::new(dir_a.path());
+        let book_a = SyncBook::load(&home_a).unwrap();
+
+        let staged = crate::sync::staging::stage(
+            &home_a,
+            &book_a,
+            &dir_a.path().join("resources/draft.md"),
+            None,
+            None,
+        )
+        .unwrap();
+        std::fs::write(&staged.staged_path, b"not yet").unwrap();
+        assert!(
+            !staged.staged_path.starts_with(dir_a.path().join("resources")),
+            "the staged copy must live outside the synced folder"
+        );
+
+        for _ in 0..3 {
+            pass_both(&a, &b).await;
+        }
+        assert!(
+            !manifest_holds(&a, "draft.md").await,
+            "the staged file entered the manifest of the machine that staged it"
+        );
+        assert_peer_never_saw(&b, dir_b.path(), "draft.md").await;
+        assert_eq!(
+            std::fs::read(&staged.staged_path).unwrap(),
+            b"not yet",
+            "the staged copy must survive every pass untouched"
+        );
+    }
+
+    /// EXPECTED TO FAIL, FOREVER. THIS IS THE CONTROL FOR THE TEST ABOVE.
+    ///
+    /// An absence assertion has two possible causes: there was nothing to see,
+    /// or the assertion cannot see. The test above asserts that a peer never
+    /// holds a staged file. This test writes the same file INSIDE the synced
+    /// folder, where it must publish, and runs the same assertion. It must
+    /// panic, and `should_panic` pins the exact message, so the assertion is
+    /// known to see a leak. If this test ever passes, the staged-file test
+    /// above has stopped watching and proves nothing.
+    #[tokio::test]
+    #[should_panic(expected = "the peer must not hold draft.md in its manifest")]
+    async fn the_leak_control_sees_a_file_placed_inside_the_folder() {
+        let (dir_a, dir_b, a, b, _ta, _tb) = staged_pair().await;
+        std::fs::write(dir_a.path().join("resources/draft.md"), b"leaks").unwrap();
+        for _ in 0..3 {
+            pass_both(&a, &b).await;
+        }
+        assert_peer_never_saw(&b, dir_b.path(), "draft.md").await;
+    }
+
+    #[tokio::test]
+    async fn an_engine_restart_with_a_staged_file_publishes_nothing() {
+        let (dir_a, dir_b, a, b, ta, tb) = staged_pair().await;
+        let home_a = FabricHome::new(dir_a.path());
+        let book_a = SyncBook::load(&home_a).unwrap();
+        let staged = crate::sync::staging::stage(
+            &home_a,
+            &book_a,
+            &dir_a.path().join("resources/draft.md"),
+            None,
+            None,
+        )
+        .unwrap();
+        std::fs::write(&staged.staged_path, b"held across a restart").unwrap();
+
+        // Stop A and start it again over the same home, as a daemon restart
+        // does. The transports point at the old node, so rewire them.
+        drop(a);
+        drop(ta);
+        let ta = Arc::new(LoopbackTransport::default());
+        let a = SyncEngine::new(
+            home_a.clone(),
+            Author([1; 32]),
+            ta.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        ta.add_peer("b", "bus", b.node_for("bus").await.unwrap());
+        tb.peers.lock().unwrap().clear();
+        tb.add_peer("a", "bus", a.node_for("bus").await.unwrap());
+
+        for _ in 0..3 {
+            pass_both(&a, &b).await;
+        }
+        assert!(
+            !manifest_holds(&a, "draft.md").await,
+            "the restart published the staged file on the machine that staged it"
+        );
+        assert_peer_never_saw(&b, dir_b.path(), "draft.md").await;
+        assert_eq!(
+            std::fs::read(&staged.staged_path).unwrap(),
+            b"held across a restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_records_the_set_in_one_pass_and_the_peer_adopts_it_in_one_reconcile() {
+        let (dir_a, dir_b, a, b, _ta, _tb) = staged_pair().await;
+        let home_a = FabricHome::new(dir_a.path());
+        let book_a = SyncBook::load(&home_a).unwrap();
+        let root_a = dir_a.path().join("resources");
+        for (rel, bytes) in [
+            ("notes/one.md", &b"one"[..]),
+            ("notes/two.md", &b"two"[..]),
+            ("three.md", &b"three"[..]),
+        ] {
+            let staged =
+                crate::sync::staging::stage(&home_a, &book_a, &root_a.join(rel), None, None)
+                    .unwrap();
+            std::fs::write(&staged.staged_path, bytes).unwrap();
+        }
+        let (_entry, files) =
+            crate::sync::staging::read_for_publish(&home_a, &book_a, "bus", &[]).unwrap();
+        assert_eq!(files.len(), 3);
+        let rels: Vec<String> = files.iter().map(|file| file.rel.clone()).collect();
+
+        let entry = a.entries.read().await.get("bus").cloned().unwrap();
+        let scans_before = entry.work.full_scans.load(Ordering::Relaxed);
+        let persists_before = entry.work.persist_calls.load(Ordering::Relaxed);
+        let published = a.publish_staged("bus", files, false).await.unwrap();
+
+        assert_eq!(published.len(), 3);
+        for file in &published {
+            assert_eq!(file.version, 1, "{} must be a first version", file.rel);
+        }
+        assert_eq!(
+            entry.work.full_scans.load(Ordering::Relaxed) - scans_before,
+            1,
+            "a publish of a clean entry costs exactly one scan"
+        );
+        assert_eq!(
+            entry.work.persist_calls.load(Ordering::Relaxed) - persists_before,
+            1,
+            "a publish persists exactly once"
+        );
+        assert!(
+            entry.work.has_pending_forward(),
+            "a publish must wake the entry loop so peers receive it without waiting for a tick"
+        );
+        assert_eq!(std::fs::read(root_a.join("notes/one.md")).unwrap(), b"one");
+        assert_eq!(std::fs::read(root_a.join("three.md")).unwrap(), b"three");
+
+        // One pass on B is one reconcile with A, and it carries the whole set.
+        b.sync_once("bus").await.unwrap();
+        let root_b = dir_b.path().join("resources");
+        assert_eq!(std::fs::read(root_b.join("notes/one.md")).unwrap(), b"one");
+        assert_eq!(std::fs::read(root_b.join("notes/two.md")).unwrap(), b"two");
+        assert_eq!(std::fs::read(root_b.join("three.md")).unwrap(), b"three");
+
+        crate::sync::staging::forget(&home_a, "bus", &rels).unwrap();
+        assert!(
+            crate::sync::staging::list(&home_a, &book_a, Some("bus"))
+                .unwrap()
+                .is_empty(),
+            "published files must leave the staging tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_publish_after_the_published_file_changed_is_refused_and_force_publishes_the_next_version()
+    {
+        let (dir_a, _dir_b, a, _b, _ta, _tb) = staged_pair().await;
+        let home_a = FabricHome::new(dir_a.path());
+        let book_a = SyncBook::load(&home_a).unwrap();
+        let root_a = dir_a.path().join("resources");
+        let staged =
+            crate::sync::staging::stage(&home_a, &book_a, &root_a.join("seed.md"), None, None)
+                .unwrap();
+        assert_eq!(
+            staged.base.as_deref(),
+            Some(content_hash(b"seed").to_hex().as_str()),
+            "staging a published file records its hash as the base"
+        );
+        std::fs::write(&staged.staged_path, b"staged edit").unwrap();
+
+        // The published file moves under the staged change.
+        std::fs::write(root_a.join("seed.md"), b"someone else edited").unwrap();
+        a.sync_once("bus").await.unwrap();
+
+        let (_entry, files) =
+            crate::sync::staging::read_for_publish(&home_a, &book_a, "bus", &[]).unwrap();
+        let error = a
+            .publish_staged("bus", files.clone(), false)
+            .await
+            .unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(
+            detail.contains("publish refused") && detail.contains("seed.md"),
+            "a moved base must refuse by name: {detail}"
+        );
+        assert_eq!(
+            std::fs::read(root_a.join("seed.md")).unwrap(),
+            b"someone else edited",
+            "a refused publish must change nothing"
+        );
+
+        let published = a.publish_staged("bus", files, true).await.unwrap();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].version, 3, "seed v1, edit v2, forced publish v3");
+        assert_eq!(std::fs::read(root_a.join("seed.md")).unwrap(), b"staged edit");
+    }
+
+    #[tokio::test]
+    async fn a_publish_write_is_acknowledged_by_the_watcher_without_a_rescan() {
+        use notify::event::{CreateKind, DataChange, ModifyKind, RenameMode};
+
+        let (dir_a, _dir_b, a, _b, _ta, _tb) = staged_pair().await;
+        let home_a = FabricHome::new(dir_a.path());
+        let book_a = SyncBook::load(&home_a).unwrap();
+        let root_a = dir_a.path().join("resources");
+        let staged =
+            crate::sync::staging::stage(&home_a, &book_a, &root_a.join("quiet.md"), None, None)
+                .unwrap();
+        std::fs::write(&staged.staged_path, b"quiet bytes").unwrap();
+        let (_entry, files) =
+            crate::sync::staging::read_for_publish(&home_a, &book_a, "bus", &[]).unwrap();
+        a.publish_staged("bus", files, false).await.unwrap();
+
+        // The watcher then reports the daemon's own atomic write. The receipt
+        // recorded during publish must acknowledge it, exactly as it does for
+        // a materialization, so a publish does not schedule a second pass.
+        let entry = a.entries.read().await.get("bus").cloned().unwrap();
+        let work = entry.work.clone();
+        let final_path = root_a.join("quiet.md");
+        let temp_path = root_a.join("quiet.md.fabric-tmp");
+        let scans_before = work.full_scans.load(Ordering::Relaxed);
+        let push =
+            |batch: &mut Option<WatchEventBatch>, paths: Vec<PathBuf>, kind: notify::EventKind| {
+                let event = WatchEvent {
+                    paths,
+                    generation: work.record_mutation(),
+                    engine_write_candidate: watcher_event_can_match_engine_write(&kind),
+                    rename: watcher_event_is_rename(&kind),
+                };
+                if let Some(batch) = batch {
+                    batch.push(event);
+                } else {
+                    *batch = Some(WatchEventBatch::new(event));
+                }
+            };
+        let mut batch = None;
+        push(
+            &mut batch,
+            vec![temp_path.clone()],
+            notify::EventKind::Create(CreateKind::File),
+        );
+        push(
+            &mut batch,
+            vec![temp_path.clone()],
+            notify::EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+        );
+        push(
+            &mut batch,
+            vec![temp_path, final_path],
+            notify::EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+        );
+        assert!(
+            work.acknowledge_engine_write_batch(&batch.unwrap()),
+            "the watcher must acknowledge a publish write from its receipt"
+        );
+        assert_eq!(
+            work.mutation_generation.load(Ordering::Acquire),
+            work.durable_generation.load(Ordering::Acquire),
+            "an acknowledged publish leaves no periodic dirty work"
+        );
+        assert_eq!(work.full_scans.load(Ordering::Relaxed), scans_before);
+    }
+
+    #[tokio::test]
+    async fn stage_refuses_a_target_outside_the_include_and_a_staging_tree_inside_a_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = FabricHome::new(dir.path());
+        let root = dir.path().join("resources");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut book = SyncBook::default();
+        book.upsert(SyncEntry {
+            name: "bus".to_string(),
+            folder: root.clone(),
+            peers: SyncPeers::Wildcard("*".to_string()),
+            policy: SyncPolicy::Bus,
+            include: Some(vec!["*.md".to_string()]),
+        });
+        book.save(&home).unwrap();
+
+        let error = crate::sync::staging::stage(&home, &book, &root.join("notes.txt"), None, None)
+            .unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(
+            detail.contains("include") && detail.contains("notes.txt"),
+            "a target no include glob matches must be refused by name: {detail}"
+        );
+        assert!(
+            crate::sync::staging::list(&home, &book, None)
+                .unwrap()
+                .is_empty(),
+            "a refused stage leaves nothing behind"
+        );
+
+        let error = crate::sync::staging::stage(
+            &home,
+            &book,
+            &dir.path().join("elsewhere/notes.md"),
+            None,
+            None,
+        )
+        .unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(
+            detail.contains("not inside any synced folder"),
+            "a target outside every folder must say so: {detail}"
+        );
+
+        // An entry whose folder is the fabric home itself would publish the
+        // staging tree. Staging must refuse rather than stage into a folder.
+        let mut wide = SyncBook::default();
+        wide.upsert(SyncEntry {
+            name: "home".to_string(),
+            folder: dir.path().to_path_buf(),
+            peers: SyncPeers::Wildcard("*".to_string()),
+            policy: SyncPolicy::Bus,
+            include: None,
+        });
+        let error = crate::sync::staging::stage(
+            &home,
+            &wide,
+            &dir.path().join("anything.md"),
+            None,
+            None,
+        )
+        .unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(
+            detail.contains("lies inside the synced folder"),
+            "a staging tree inside a folder must be refused: {detail}"
+        );
+        assert!(
+            !crate::sync::staging::staging_root(&home).join("home").exists(),
+            "a refused stage must write nothing into the folder"
         );
     }
 }

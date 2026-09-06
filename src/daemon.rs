@@ -3480,6 +3480,41 @@ async fn process_control_request(
         ControlRequest::SyncRuntimeStatus => ControlResponse::SyncRuntimeStatus {
             runtime: state.sync_runtime_status().await,
         },
+        ControlRequest::SyncPublish { name, files, force } => {
+            let Some(engine) = state.sync_engine() else {
+                anyhow::bail!("this daemon does not own sync, so it cannot publish");
+            };
+            let files = files
+                .into_iter()
+                .map(|file| {
+                    let base = match file.base {
+                        Some(hex) => Some(
+                            crate::sync::manifest::ContentHash::from_hex(&hex).ok_or_else(|| {
+                                anyhow::anyhow!("{}: the base is not a content hash", file.rel)
+                            })?,
+                        ),
+                        None => None,
+                    };
+                    Ok(crate::sync::staging::PublishFile {
+                        rel: file.rel,
+                        bytes: file.bytes,
+                        executable: file.executable,
+                        base,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let published = engine.publish_staged(&name, files, force).await?;
+            ControlResponse::SyncPublished {
+                files: published
+                    .into_iter()
+                    .map(|file| crate::control::SyncPublishedFile {
+                        rel: file.rel,
+                        version: file.version,
+                        hash: file.hash.to_hex(),
+                    })
+                    .collect(),
+            }
+        }
         ControlRequest::Shutdown => {
             state.cancel.cancel();
             ControlResponse::Ok
