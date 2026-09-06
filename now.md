@@ -5,9 +5,37 @@ current). This records what is DONE, what is IN FLIGHT, and what is NEXT — the
 things the repo history alone does not carry.
 
 _Last updated: 2026-09-06 by Silber.fabric-codex. The latest code merge is
-`8b4c7c6`, pull request #189._
+`b743c05`, pull request #190, and it is released as `v0.2.6`._
 
 ## Latest handoff — 2026-09-06
+
+Release `v0.2.6` is cut from `b743c05` and deployed on Silber and hetz. Both
+binaries, both `fabric-sync` companions, and both daemons report
+`0.2.6+b743c05`. Silber.cos opened the gate, and the sequence was: version bump
+PR #190 with only `Cargo.toml` and `Cargo.lock`, green on its merge commit, a
+lightweight tag on that commit, every archive verified against its sidecar and
+member shape, the Apple binary run to read its version, then Silber, the
+checks, then hetz. Rollback pairs `fabric.rollback-1788690706` on Silber and
+`fabric.rollback-1788690854` on hetz, with their companions, report
+`0.2.5+4dc0cac`. Both `peers.toml` files kept `format = 2` at line 23 and the
+mirror comment at line 3. Doctor exits 3 on both with only the unknown line
+for the offline roaming peer Bluey, which was the baseline before the deploy.
+Bluey stays on `0.2.5` until Nathan runs the update by hand; doctor cannot see
+that it is behind. Re-read the fleet build before using any of this.
+
+Two findings from the rollout, recorded and not fixed. First, doctor reports
+"the supervised companion is absent" as a problem for about thirty seconds
+after a daemon restart, until the restarted companion sends its first
+heartbeat; on Silber it appeared 4 seconds after the restart and was gone 31
+seconds later, with the companion log reading standby, unavailable, standby.
+Anyone running doctor right after an update is told something is broken when
+nothing is. A startup grace or an informational verdict while the daemon's
+uptime is under a minute would fix it. Second, a `fabric exec` client opened
+against a daemon at the moment that daemon restarts can hang: one such client
+on Silber sat for 11 minutes 26 seconds with no stuck child on hetz until it
+was killed, while a fresh exec answered in 3 seconds. The daemon log carries no
+timestamps, so the session could not be traced. Not shown to be a `0.2.6`
+regression; it is the shape any operator meets during an update.
 
 PR #189 merged at `8b4c7c6`. It adds staging to synced folders. Nathan said
 "Don't file an issue, get it fixed" about the gap Silber.catalog described: in a
