@@ -102,7 +102,42 @@ pub enum ControlRequest {
     },
     /// Report which process owns sync and whether its companion is present.
     SyncRuntimeStatus,
+    /// Publish staged files into one sync entry under its operation guard, so
+    /// the set becomes one scan, one persist, and one reconcile on each peer.
+    ///
+    /// Carries the bytes rather than a path: the daemon writes exactly what the
+    /// caller reviewed, and a staged file is small by the nature of the thing
+    /// being staged.
+    SyncPublish {
+        name: String,
+        files: Vec<SyncPublishFile>,
+        #[serde(default)]
+        force: bool,
+    },
     Shutdown,
+}
+
+/// One file of a `SyncPublish` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncPublishFile {
+    /// The path inside the synced folder, in manifest form.
+    pub rel: String,
+    pub bytes: Vec<u8>,
+    #[serde(default)]
+    pub executable: bool,
+    /// The hex content hash of the published file when this was staged, or
+    /// `None` when there was no published file. The daemon refuses to publish
+    /// over a file that moved since, unless forced.
+    #[serde(default)]
+    pub base: Option<String>,
+}
+
+/// One file of a `SyncPublished` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncPublishedFile {
+    pub rel: String,
+    pub version: u64,
+    pub hash: String,
 }
 
 fn default_persist() -> bool {
@@ -203,6 +238,9 @@ pub enum ControlResponse {
     },
     SyncRuntimeStatus {
         runtime: SyncRuntimeStatus,
+    },
+    SyncPublished {
+        files: Vec<SyncPublishedFile>,
     },
     Error {
         message: String,

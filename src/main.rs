@@ -23,6 +23,7 @@ use fabric::{
     service::{self, ServiceInstallOptions},
     shell::{self, ServerFrame},
     sync::config::{SyncBook, SyncEntry, SyncPeers, SyncPolicy},
+    sync::staging,
     telemetry::{PeerTelemetry, TelemetryWindow},
     terminal::TerminalModeGuard,
     update,
@@ -452,6 +453,51 @@ enum SyncCommands {
     Rm { name_or_folder: String },
     /// Re-read syncs.toml into the running daemon (like reload-peers).
     Reload,
+    /// Stage a change to a synced file without publishing it.
+    ///
+    /// The staged copy lives under the fabric home, outside every synced
+    /// folder, so no daemon publishes it until `fabric sync publish`.
+    Stage {
+        /// The path inside a synced folder that the change is for.
+        target: String,
+        /// Seed the staged copy from this file instead of the published one.
+        #[arg(long)]
+        from: Option<String>,
+        /// The sync entry, when the target lies inside more than one folder.
+        #[arg(long)]
+        entry: Option<String>,
+    },
+    /// List staged changes and whether their published file moved since.
+    Staged {
+        /// Only this sync entry.
+        #[arg(long)]
+        entry: Option<String>,
+        /// Emit a JSON array for scripts.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Publish staged changes into their synced folder.
+    Publish {
+        /// The paths inside synced folders to publish.
+        targets: Vec<String>,
+        /// Publish every staged file of --entry.
+        #[arg(long)]
+        all: bool,
+        /// The sync entry, for --all or to break a tie between folders.
+        #[arg(long)]
+        entry: Option<String>,
+        /// Publish even if the published file changed since it was staged.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove staged changes without publishing them.
+    Discard {
+        /// The paths inside synced folders whose staged copies to remove.
+        targets: Vec<String>,
+        /// The sync entry, to break a tie between folders.
+        #[arg(long)]
+        entry: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1226,6 +1272,117 @@ fn expose_request(
 
 async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
     match command {
+        SyncCommands::Stage {
+            target,
+            from,
+            entry,
+        } => {
+            let book = SyncBook::load(home)?;
+            let target = absolutize(&target)?;
+            let from = from.as_deref().map(absolutize).transpose()?;
+            let staged = staging::stage(home, &book, &target, from.as_deref(), entry.as_deref())?;
+            println!("staged\t{}", staged.rel);
+            println!("entry\t{}", staged.entry);
+            println!("edit\t{}", staged.staged_path.display());
+            println!("target\t{}", staged.target_path.display());
+            println!("base\t{}", staged.base.as_deref().unwrap_or("new"));
+        }
+        SyncCommands::Staged { entry, json } => {
+            let book = SyncBook::load(home)?;
+            let files = staging::list(home, &book, entry.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&files)?);
+                return Ok(());
+            }
+            if files.is_empty() {
+                println!("nothing staged");
+                return Ok(());
+            }
+            for file in files {
+                println!(
+                    "{}\t{}\t{}\t{}B\thash={}\tbase={}\tedit={}\ttarget={}",
+                    file.entry,
+                    file.rel,
+                    file.state(),
+                    file.bytes,
+                    &file.hash[..12],
+                    file.base
+                        .as_deref()
+                        .map(|hex| &hex[..12])
+                        .unwrap_or("new"),
+                    file.staged_path.display(),
+                    file.target_path.display()
+                );
+            }
+        }
+        SyncCommands::Publish {
+            targets,
+            all,
+            entry,
+            force,
+        } => {
+            let book = SyncBook::load(home)?;
+            let groups = group_targets_by_entry(&book, &targets, all, entry.as_deref())?;
+            for (name, rels) in groups {
+                let (configured, files) = staging::read_for_publish(home, &book, &name, &rels)?;
+                let rels: Vec<String> = files.iter().map(|file| file.rel.clone()).collect();
+                let request = ControlRequest::SyncPublish {
+                    name: name.clone(),
+                    files: files
+                        .iter()
+                        .map(|file| fabric::control::SyncPublishFile {
+                            rel: file.rel.clone(),
+                            bytes: file.bytes.clone(),
+                            executable: file.executable,
+                            base: file.base.map(|hash| hash.to_hex()),
+                        })
+                        .collect(),
+                    force,
+                };
+                match send_control(home, request).await {
+                    Ok(ControlResponse::SyncPublished { files }) => {
+                        for file in files {
+                            println!(
+                                "published\t{name}\t{}\tversion={}\thash={}",
+                                file.rel,
+                                file.version,
+                                &file.hash[..12]
+                            );
+                        }
+                    }
+                    Ok(response) => bail!("unexpected daemon response: {response:?}"),
+                    // Only when no daemon can take the request: it is down, or
+                    // it predates SyncPublish. A refusal is a decision and is
+                    // never retried around.
+                    Err(error) if daemon_cannot_publish(&error) => {
+                        let placed = staging::publish_locally(&configured, &files, force)?;
+                        for (rel, hash) in placed {
+                            println!(
+                                "placed\t{name}\t{rel}\thash={}\tvia=folder",
+                                &hash.to_hex()[..12]
+                            );
+                        }
+                        println!(
+                            "note\tno daemon took the publish ({}); the next scan records the \
+                             files, and a set can cross to a peer in more than one reconcile",
+                            first_line(&format!("{error:#}"))
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
+                staging::forget(home, &name, &rels)?;
+            }
+        }
+        SyncCommands::Discard { targets, entry } => {
+            let book = SyncBook::load(home)?;
+            let groups = group_targets_by_entry(&book, &targets, false, entry.as_deref())?;
+            for (name, rels) in groups {
+                staging::forget(home, &name, &rels)?;
+                for rel in rels {
+                    println!("discarded\t{name}\t{rel}");
+                }
+            }
+        }
         SyncCommands::Add {
             folder,
             name,
@@ -1270,10 +1427,18 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                     )
                 }
             };
+            // Staged files are a local fact the daemon does not know: they live
+            // in the fabric home, outside every folder. Count them here so a
+            // staged change is never forgotten because nobody ran `staged`.
+            let staged_counts = staged_counts(home);
             if json {
                 let entries: Vec<_> = entries
                     .iter()
-                    .map(|entry| SyncLsJsonEntry::from(entry).with_runtime(&runtime))
+                    .map(|entry| {
+                        SyncLsJsonEntry::from(entry)
+                            .with_runtime(&runtime)
+                            .with_staged(staged_counts.get(&entry.name).copied().unwrap_or(0))
+                    })
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&entries)?);
                 return Ok(());
@@ -1286,9 +1451,10 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                 println!("no sync entries");
             }
             for entry in entries {
+                let staged = staged_counts.get(&entry.name).copied().unwrap_or(0);
                 if runtime.owner == "unavailable" {
                     println!(
-                        "{}\t{}\t{}\tpeers={}\truntime=unavailable\tdrift=unknown\tstopped={}",
+                        "{}\t{}\t{}\tpeers={}\truntime=unavailable\tdrift=unknown\tstopped={}\tstaged={staged}",
                         entry.name,
                         entry.folder,
                         entry.policy,
@@ -1304,7 +1470,7 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                     && entry.scan_issues.is_empty()
                 {
                     println!(
-                        "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean\tscan_issues=none\tstopped={}\taway={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tcontent_bytes={}\tdigest={}",
+                        "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=clean\tscan_issues=none\tstopped={}\taway={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tcontent_bytes={}\tdigest={}\tstaged={staged}",
                         entry.name,
                         entry.folder,
                         entry.policy,
@@ -1331,7 +1497,7 @@ async fn run_sync(home: &FabricHome, command: SyncCommands) -> Result<()> {
                     );
                 } else {
                     println!(
-                        "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}\tscan_issues={}\tstopped={}\taway={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tcontent_bytes={}\tdigest={}",
+                        "{}\t{}\t{}\tpeers={}\tpresent={present}\ttombstones={}\tobserved={}\tdrift=WARNING missing={} unexpected={} mismatched={}\tscan_issues={}\tstopped={}\taway={}\tsync_passes={}\tfull_scans={}\tinbound_noop_transactions={}\tinbound_guarded_transactions={}\tscan_ms={}\tmaterialize_ms={}\tpersist_ms={}\treconcile_ms={}\treconcile_wire_bytes={}\treconcile_failures={}\tsweep={}\tdelta_fallbacks={}\tfull_payload_sends={}\tcontent_bytes={}\tdigest={}\tstaged={staged}",
                         entry.name,
                         entry.folder,
                         entry.policy,
@@ -1458,6 +1624,9 @@ struct SyncLsJsonEntry<'a> {
     /// `tombstones` can match while the state differs, so they cannot answer
     /// this. Empty from a daemon that predates the field.
     digest: &'a str,
+    /// Files staged for this entry under the fabric home and not yet
+    /// published. Counted locally; the daemon does not know them.
+    staged: usize,
 }
 
 impl<'a> From<&'a fabric::control::SyncEntryStatus> for SyncLsJsonEntry<'a> {
@@ -1498,6 +1667,7 @@ impl<'a> From<&'a fabric::control::SyncEntryStatus> for SyncLsJsonEntry<'a> {
             content_bytes: entry.content_bytes,
             delta_fallbacks: entry.delta_fallbacks,
             digest: &entry.digest,
+            staged: 0,
             sync_passes: entry.sync_passes,
             full_scans: entry.full_scans,
             inbound_noop_transactions: entry.inbound_noop_transactions,
@@ -1514,6 +1684,11 @@ impl<'a> From<&'a fabric::control::SyncEntryStatus> for SyncLsJsonEntry<'a> {
 }
 
 impl SyncLsJsonEntry<'_> {
+    fn with_staged(mut self, staged: usize) -> Self {
+        self.staged = staged;
+        self
+    }
+
     fn with_runtime(mut self, runtime: &SyncRuntimeStatus) -> Self {
         self.runtime_owner = runtime.owner.clone();
         self.companion = runtime.companion.clone();
@@ -2246,6 +2421,7 @@ mod sync_ls_tests {
                 "inbound_guarded_transactions": 3,
                 "sync_passes": 9,
                 "scan_micros": 1500,
+                "staged": 0,
                 "materialize_micros": 2500,
                 "persist_micros": 3500,
                 "reconcile_micros": 4500,
@@ -2290,6 +2466,69 @@ mod sync_ls_tests {
         assert_eq!(status.full_scans, 0);
         assert_eq!(status.inbound_noop_transactions, 0);
         assert_eq!(status.inbound_guarded_transactions, 0);
+    }
+}
+
+/// Group target paths by the entry that would publish each, or take every
+/// staged file of one entry for `--all`.
+fn group_targets_by_entry(
+    book: &SyncBook,
+    targets: &[String],
+    all: bool,
+    entry: Option<&str>,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    if all {
+        let Some(entry) = entry else {
+            bail!("--all needs --entry <name>");
+        };
+        if book.get(entry).is_none() {
+            bail!("no sync entry named {entry:?}");
+        }
+        groups.insert(entry.to_string(), Vec::new());
+        return Ok(groups);
+    }
+    if targets.is_empty() {
+        bail!("give one or more target paths, or --all --entry <name>");
+    }
+    for target in targets {
+        let resolved = staging::resolve_target(book, &absolutize(target)?, entry)?;
+        groups
+            .entry(resolved.entry.name)
+            .or_default()
+            .push(resolved.rel);
+    }
+    Ok(groups)
+}
+
+/// True only when no daemon can take a request: it is not running, or it is
+/// an older build that does not know the request type.
+fn daemon_cannot_publish(error: &anyhow::Error) -> bool {
+    let detail = format!("{error:#}");
+    detail.contains("is not running") || detail.contains("unknown variant")
+}
+
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or(text)
+}
+
+/// Staged files per entry, from the staging tree under the fabric home. An
+/// unreadable tree prints one line and counts as nothing, so `sync ls` still
+/// answers about the daemon.
+fn staged_counts(home: &FabricHome) -> BTreeMap<String, usize> {
+    let listed = SyncBook::load(home).and_then(|book| staging::list(home, &book, None));
+    match listed {
+        Ok(files) => {
+            let mut counts = BTreeMap::new();
+            for file in files {
+                *counts.entry(file.entry).or_insert(0) += 1;
+            }
+            counts
+        }
+        Err(error) => {
+            eprintln!("fabric: could not read the staging tree: {error:#}");
+            BTreeMap::new()
+        }
     }
 }
 

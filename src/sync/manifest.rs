@@ -36,6 +36,20 @@ use serde::{Deserialize, Serialize};
 pub struct ContentHash(pub [u8; 32]);
 
 impl ContentHash {
+    /// Parse the 64-character form that `to_hex` writes. `None` for any other
+    /// length or a non-hex character.
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        if hex.len() != 64 || !hex.is_ascii() {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        for (index, chunk) in hex.as_bytes().chunks(2).enumerate() {
+            let pair = std::str::from_utf8(chunk).ok()?;
+            out[index] = u8::from_str_radix(pair, 16).ok()?;
+        }
+        Some(Self(out))
+    }
+
     pub fn to_hex(self) -> String {
         let mut s = String::with_capacity(64);
         for byte in self.0 {

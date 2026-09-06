@@ -236,6 +236,106 @@ async fn bus_update_beats_equal_version_delete_then_archive_survives_restart() -
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_staged_file_does_not_reach_a_peer_until_published() -> Result<()> {
+    use fabric::control::SyncPublishFile;
+    use fabric::sync::{SyncBook, staging};
+
+    let _guard = SYNC_SLICE_LOCK.lock().await;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let a_home = FabricHome::new(a_dir.path());
+    let b_home = FabricHome::new(b_dir.path());
+    let a_bus = a_dir.path().join("bus");
+    let b_bus = b_dir.path().join("bus");
+    std::fs::create_dir_all(&a_bus)?;
+    std::fs::create_dir_all(&b_bus)?;
+    write_sync(a_dir.path(), &a_bus, "bus");
+    write_sync(b_dir.path(), &b_bus, "bus");
+
+    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_b = FabricNode::start(b_home.clone()).await?;
+    trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
+    trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
+
+    std::fs::write(a_bus.join("seed.md"), b"seed")?;
+    reload_sync(&a_home).await?;
+    assert!(
+        wait_for_file(&b_bus.join("seed.md"), b"seed").await,
+        "the pair did not converge on the seed"
+    );
+
+    // Stage on A. The staged copy lives in A's fabric home, not in the folder.
+    let book_a = SyncBook::load(&a_home)?;
+    let staged = staging::stage(&a_home, &book_a, &a_bus.join("draft.md"), None, None)?;
+    std::fs::write(&staged.staged_path, b"held")?;
+    assert!(!staged.staged_path.starts_with(&a_bus));
+
+    // A control file written into the folder crosses in the same window. That
+    // proves the window carried a file, so the staged file's absence on B is
+    // about staging and not about a quiet pair.
+    reload_sync(&a_home).await?;
+    reload_sync(&b_home).await?;
+    std::fs::write(a_bus.join("control-one.md"), b"crosses")?;
+    assert!(
+        wait_for_file(&b_bus.join("control-one.md"), b"crosses").await,
+        "the control file did not cross, so this window proves nothing"
+    );
+    assert!(!b_bus.join("draft.md").exists(), "the staged file reached the peer");
+    assert_stays_missing(&b_bus.join("draft.md")).await;
+
+    // Restart A with the file still staged. Nothing may publish it.
+    node_a.shutdown().await?;
+    let node_a = FabricNode::start(a_home.clone()).await?;
+    trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
+    trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
+    reload_sync(&a_home).await?;
+    std::fs::write(a_bus.join("control-two.md"), b"crosses again")?;
+    assert!(
+        wait_for_file(&b_bus.join("control-two.md"), b"crosses again").await,
+        "the second control file did not cross after the restart"
+    );
+    assert!(
+        !b_bus.join("draft.md").exists(),
+        "the restart published the staged file"
+    );
+    assert_stays_missing(&b_bus.join("draft.md")).await;
+    assert!(!a_bus.join("draft.md").exists());
+
+    // Publish through the daemon. The peer receives exactly the reviewed bytes.
+    let (_entry, files) = staging::read_for_publish(&a_home, &book_a, "shared", &[])?;
+    let request = ControlRequest::SyncPublish {
+        name: "shared".to_string(),
+        files: files
+            .iter()
+            .map(|file| SyncPublishFile {
+                rel: file.rel.clone(),
+                bytes: file.bytes.clone(),
+                executable: file.executable,
+                base: file.base.map(|hash| hash.to_hex()),
+            })
+            .collect(),
+        force: false,
+    };
+    let ControlResponse::SyncPublished { files: published } = send_control(&a_home, request).await?
+    else {
+        anyhow::bail!("unexpected response to SyncPublish");
+    };
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].rel, "draft.md");
+    assert_eq!(published[0].version, 1);
+    staging::forget(&a_home, "shared", &["draft.md".to_string()])?;
+    assert!(
+        wait_for_file(&b_bus.join("draft.md"), b"held").await,
+        "the published file did not reach the peer"
+    );
+    assert!(!staged.staged_path.exists(), "a published file must leave the staging tree");
+
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn production_status_exposes_exact_inbound_scan_ledger() -> Result<()> {
     let _guard = SYNC_SLICE_LOCK.lock().await;
     let a_dir = TempDir::new()?;

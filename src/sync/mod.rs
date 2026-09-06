@@ -23,6 +23,7 @@ pub mod ipc;
 pub mod manifest;
 pub mod node;
 pub mod paths;
+pub mod staging;
 pub mod wire;
 
 pub use config::{PolicyRules, SyncBook, SyncEntry, SyncPeers, SyncPolicy};
@@ -31,3 +32,4 @@ pub use engine::{PeerRef, SYNC_LOG_TARGET, SyncEngine, SyncStatus, SyncTransport
 pub use manifest::{FileMeta, Manifest, ManifestDiff};
 pub use node::{Reconciled, SyncNode, content_hash};
 pub use paths::{SyncOwnerLease, SyncOwnerLeaseState, SyncPaths};
+pub use staging::{PublishFile, StagedFile};
