@@ -1054,6 +1054,98 @@ async fn tcp_expose_dial_listener_round_trips_and_reconnects() -> Result<()> {
     Ok(())
 }
 
+/// A consumer that opens one short TCP connection per request through a dial
+/// listener produces sessions of this shape: connect, send, half-close, read
+/// to EOF. Each one is a tunnel session that ends because both sides finished. Six of them must leave the
+/// shared peer connection exactly as it was, with no attach failure counted on
+/// either daemon. Before the fix both daemons counted every clean end as an
+/// attach failure, and the third one closed the shared connection with
+/// "repeated tunnel attach failures". The live fleet did that every one to
+/// four seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_request_tcp_sessions_leave_the_shared_connection_alone() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let node_a_dir = TempDir::new()?;
+    let node_b_dir = TempDir::new()?;
+    let node_a_home = FabricHome::new(node_a_dir.path());
+    let node_b_home = FabricHome::new(node_b_dir.path());
+
+    let node_a = FabricNode::start(node_a_home.clone()).await?;
+    let node_b = FabricNode::start(node_b_home.clone()).await?;
+
+    trust_peer(
+        &node_a_home,
+        &node_a,
+        node_b.id(),
+        Some("node-b"),
+        Some(node_b.addr()),
+    )
+    .await?;
+    trust_peer(
+        &node_b_home,
+        &node_b,
+        node_a.id(),
+        Some("node-a"),
+        Some(node_a.addr()),
+    )
+    .await?;
+
+    let (tcp_echo_addr, echo_hits, echo_task) = spawn_tcp_echo_service().await?;
+    run_fabric(
+        &node_a_home,
+        &["expose", "tcp-echo", "--tcp", tcp_echo_addr.as_str()],
+    )?;
+    let local_addr = run_fabric(
+        &node_b_home,
+        &["dial", "node-a", "tcp-echo", "--tcp", "127.0.0.1:0"],
+    )?;
+
+    // The first request opens the shared connection. Read its identity on
+    // both sides before the sessions under test.
+    assert_eq!(
+        tcp_one_request(&local_addr, b"request-0").await?,
+        b"request-0"
+    );
+    tokio::time::sleep(LOCAL_SLICE_SETTLE).await;
+    let before_client = connection_health(&node_b_home, "node-a").await?;
+    let before_server = connection_health(&node_a_home, "node-b").await?;
+
+    for i in 1..=6 {
+        let payload = format!("request-{i}");
+        assert_eq!(
+            tcp_one_request(&local_addr, payload.as_bytes()).await?,
+            payload.as_bytes()
+        );
+    }
+    tokio::time::sleep(LOCAL_SLICE_SETTLE).await;
+    assert_eq!(
+        echo_hits.load(Ordering::SeqCst),
+        7,
+        "every request must reach the exposed service"
+    );
+
+    let after_client = connection_health(&node_b_home, "node-a").await?;
+    let after_server = connection_health(&node_a_home, "node-b").await?;
+    for (side, before, after) in [
+        ("client", before_client, after_client),
+        ("server", before_server, after_server),
+    ] {
+        assert_eq!(
+            after.connection_id, before.connection_id,
+            "{side}: clean session ends replaced the shared connection: {after:?}"
+        );
+        assert_eq!(
+            after.consecutive_attach_failures, 0,
+            "{side}: a clean session end was counted as an attach failure: {after:?}"
+        );
+    }
+
+    echo_task.abort();
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persisted_tcp_expose_survives_daemon_restart() -> Result<()> {
     let _guard = local_slice_guard().await;
@@ -1639,6 +1731,25 @@ async fn wait_for_status(home: &FabricHome) -> Result<ControlResponse> {
     send_control(home, ControlRequest::Status).await
 }
 
+/// The daemon's view of its current shared connection to `peer`, by label.
+async fn connection_health(
+    home: &FabricHome,
+    peer: &str,
+) -> Result<fabric::mux::CurrentConnectionHealth> {
+    let response = wait_for_reachability_status(home).await?;
+    let ControlResponse::ReachabilityStatus {
+        current_connection_health,
+        ..
+    } = response
+    else {
+        panic!("unexpected response: {response:?}");
+    };
+    current_connection_health
+        .get(peer)
+        .cloned()
+        .with_context(|| format!("no current connection to {peer}: {current_connection_health:?}"))
+}
+
 async fn wait_for_reachability_status(home: &FabricHome) -> Result<ControlResponse> {
     for _ in 0..50 {
         match send_control(home, ControlRequest::ReachabilityStatus).await {
@@ -1873,6 +1984,19 @@ async fn tcp_echo_connection(stream: TcpStream) {
 async fn unix_round_trip(socket: &PathBuf, payload: &[u8]) -> Result<Vec<u8>> {
     let mut stream = UnixStream::connect(socket).await?;
     stream_round_trip(&mut stream, payload).await
+}
+
+/// One request the way such a consumer makes it: connect, write, half-close,
+/// read to EOF.
+async fn tcp_one_request(addr: &str, payload: &[u8]) -> Result<Vec<u8>> {
+    let mut stream = TcpStream::connect(addr).await?;
+    stream.write_all(payload).await?;
+    stream.shutdown().await?;
+    let mut echoed = Vec::new();
+    tokio::time::timeout(LOCAL_IO_TIMEOUT, stream.read_to_end(&mut echoed))
+        .await
+        .context("one-request echo timed out")??;
+    Ok(echoed)
 }
 
 async fn tcp_round_trip(addr: &str, payload: &[u8]) -> Result<Vec<u8>> {

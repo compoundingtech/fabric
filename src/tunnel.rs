@@ -1411,9 +1411,7 @@ async fn attach_stream(
         &mut phase,
     )
     .await;
-    if !matches!(&result, Err(error) if is_permanent_failure(error))
-        && (result.is_err() || !session.is_complete().await)
-    {
+    if attach_end_counts_against_connection(&result, session.is_complete().await) {
         health.note_attach_failure(phase, started.elapsed()).await;
     }
     result
@@ -1857,7 +1855,7 @@ pub async fn serve_connection(
         .clone()
         .run_attach(send, recv, recv_next, health.clone())
         .await;
-    if matches!(&result, Err(error) if !is_permanent_failure(error))
+    if attach_end_counts_against_connection(&result, true)
         && let Some(health) = health
     {
         health
@@ -1871,6 +1869,23 @@ pub async fn serve_connection(
         return Ok(());
     }
     result
+}
+
+/// Whether an attach that ended with `result` counts against the shared peer
+/// connection's health. Three counted ends replace the connection, so this
+/// decides when a healthy connection is thrown away.
+///
+/// A permanent refusal is the peer's policy, not the transport. An expected
+/// detach is the session ending: the far stream closed because its side
+/// finished, which every one-request session does within a second. Counting
+/// those replaced a healthy shared connection every few seconds on a live pair.
+/// An `Ok` end with the session still incomplete means the transport went away
+/// under a live session, which is the case the counter exists for.
+fn attach_end_counts_against_connection(result: &Result<()>, session_complete: bool) -> bool {
+    match result {
+        Err(error) => !is_permanent_failure(error) && !is_expected_detach(error),
+        Ok(()) => !session_complete,
+    }
 }
 
 fn is_expected_detach(error: &anyhow::Error) -> bool {
@@ -2575,6 +2590,52 @@ mod tests {
             session.state.lock().await.send_closed,
             Some(0),
             "the send side must close, or the server keeps counting this attached"
+        );
+    }
+
+    /// The live shape since 2026-09-08: a one-request session ends because
+    /// its local side finished, the far stream closes, and the attach ends
+    /// with "tunnel attach stream closed". That is the session ending, not
+    /// the transport failing, and it must not count toward replacing the
+    /// shared peer connection.
+    #[test]
+    fn a_clean_detach_does_not_count_against_the_connection() {
+        for expected in [
+            "tunnel attach stream closed",
+            "connection lost: closed",
+            "connection lost: closed: closed by peer",
+        ] {
+            let ended = Err(anyhow::anyhow!("{expected}"));
+            assert!(
+                !attach_end_counts_against_connection(&ended, false),
+                "{expected:?} is an expected detach and must not count"
+            );
+        }
+    }
+
+    /// The control: what the counter exists for must still count, or the
+    /// fix above would hide a connection that is actually broken.
+    #[test]
+    fn a_real_attach_failure_still_counts_against_the_connection() {
+        for transient in ["connection lost: timed out", "no route to host"] {
+            let failed = Err(anyhow::anyhow!("{transient}"));
+            assert!(
+                attach_end_counts_against_connection(&failed, false),
+                "{transient:?} must still count"
+            );
+        }
+        assert!(
+            attach_end_counts_against_connection(&Ok(()), false),
+            "a transport that ended under a live session must still count"
+        );
+        assert!(
+            !attach_end_counts_against_connection(&Ok(()), true),
+            "a session that completed is not a failure"
+        );
+        let refused: Result<()> = Err(ServerRejected("denied".to_string()).into());
+        assert!(
+            !attach_end_counts_against_connection(&refused, false),
+            "a policy refusal is the peer's decision, not the transport's"
         );
     }
 
