@@ -39,6 +39,23 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **A tunnel session that ends because both sides finished no longer counts
+  as an attach failure.** A consumer that opens one short TCP connection per
+  request through a `fabric dial` listener makes each request a tunnel session
+  that ends within a second. Both daemons counted that end as a failed attach
+  on the shared peer connection, and the third one closed the connection with
+  `repeated tunnel attach failures`. On a live two-machine pair that was a
+  replacement every one to four seconds, 52 in the hour 07:12Z to 08:11Z on
+  2026-09-11 as seen from one side. Each replacement failed sync sessions in
+  flight, defeated the liveness-probe skip that recent traffic earns, made a
+  health check report a peer's sync stopped while its own peer check said the
+  peer was reachable, and the reconnect storm around it took each machine's
+  validation log from about 12 to about 25 MB per day. An expected detach is now the session ending, not
+  the transport failing. A transport that ends under a live session, a hello
+  that never arrives, and a timed-out connection still count. Two daemons
+  running six one-request sessions now keep the same connection with zero
+  counted failures.
+
 - **A local rename can no longer leave both the old and the new path present
   on every peer.** A sync pass materialized with a disk view it captured before
   its peer step. An inbound session that ran during that step had already
