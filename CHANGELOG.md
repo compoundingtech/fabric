@@ -49,7 +49,8 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   switch or an interface change kills; before this, a silently dead path was
   noticed only by the QUIC path-idle timeout (64.6 s measured between two
   daemons) or by three failed 20 s peer probes. A connection that answers is
-  kept, a peer with no held connection costs nothing, recent application
+  kept, and a peer that refuses the echo by policy has answered over that very
+  connection, so it is kept too; a peer with no held connection costs nothing, recent application
   traffic stands in for the probe, one reset per peer per minute is the bound,
   and the endpoint is never recycled from this check. Regression tests drive
   the rehome loop with scripted interface updates: a Wi-Fi switch whose peer

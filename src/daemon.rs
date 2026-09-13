@@ -1936,10 +1936,18 @@ impl DaemonState {
                 .clone()
                 .unwrap_or_else(|| EndpointAddr::new(peer.id));
             let probe_started = Instant::now();
-            let answered = matches!(
-                tokio::time::timeout(REACHABILITY_TIMEOUT, self.ping_addr(&label, addr)).await,
-                Ok(Ok(_))
-            );
+            let answered = match tokio::time::timeout(
+                REACHABILITY_TIMEOUT,
+                self.ping_addr(&label, addr),
+            )
+            .await
+            {
+                Ok(Ok(_)) => true,
+                // A refusal by policy travels back over this very connection:
+                // the path is alive, the peer simply grants no echo.
+                Ok(Err(error)) => mux::is_stream_denied(&error),
+                Err(_) => false,
+            };
             if answered {
                 check.answered += 1;
                 continue;
@@ -6948,26 +6956,42 @@ mod tests {
         name: &str,
         addr: EndpointAddr,
     ) -> Result<()> {
+        trust_test_peer_allowing(
+            home,
+            node,
+            id,
+            name,
+            addr,
+            &[
+                "shell",
+                "exec",
+                "sync",
+                "echo",
+                "send-file",
+                "audit/echo",
+                "audit/sink",
+                "test/reused/1",
+            ],
+        )
+        .await
+    }
+
+    /// Trust `id` for exactly the named services, so a test can model a peer
+    /// whose grant leaves a built-in out.
+    async fn trust_test_peer_allowing(
+        home: &FabricHome,
+        node: &FabricNode,
+        id: EndpointId,
+        name: &str,
+        addr: EndpointAddr,
+        allow: &[&str],
+    ) -> Result<()> {
         let mut peers = PeerBook::load(home)?;
         peers.add_with_allow(
             id,
             Some(name.to_string()),
             Some(addr),
-            Some(
-                [
-                    "shell",
-                    "exec",
-                    "sync",
-                    "echo",
-                    "send-file",
-                    "audit/echo",
-                    "audit/sink",
-                    "test/reused/1",
-                ]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            ),
+            Some(allow.iter().map(|service| (*service).to_string()).collect()),
         );
         peers.save(home)?;
         node.state().reload_peers().await
@@ -8556,6 +8580,52 @@ mod tests {
             .await
             .context("the rehome loop did not return after the daemon was cancelled")???;
         router.shutdown().await?;
+        Ok(())
+    }
+
+    /// A peer that grants this daemon no echo refuses the probe over the very
+    /// connection being checked. That refusal is the peer answering: the path
+    /// is alive, so the connection must be kept. Without this, a peer without
+    /// an echo grant would have its connection reset on every network change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_network_change_keeps_a_held_connection_whose_peer_refuses_echo() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (server, client, server_home, _client_home) = probe_pair(dir.path()).await?;
+        // The server grants the client a shell and nothing else.
+        trust_test_peer_allowing(
+            &server_home,
+            &server,
+            client.id(),
+            "client",
+            client.addr(),
+            &["shell"],
+        )
+        .await?;
+        let state = client.state();
+
+        let refused = state.ping("server").await;
+        assert!(
+            refused.is_err(),
+            "the server must refuse the echo by policy, got {refused:?}"
+        );
+        let held = held_connection_id(&state, server.id())
+            .await
+            .context("a refused echo still leaves the shared connection held")?;
+        let generation = state.endpoint_handle().generation;
+
+        state
+            .rehome_after_network_change("test: change with a peer that refuses echo", true)
+            .await;
+
+        assert_eq!(
+            held_connection_id(&state, server.id()).await,
+            Some(held),
+            "a refusal is the peer answering; the held connection must be kept"
+        );
+        assert_eq!(state.endpoint_handle().generation, generation);
+
+        client.shutdown().await?;
+        server.shutdown().await?;
         Ok(())
     }
 }
