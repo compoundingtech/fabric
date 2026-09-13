@@ -2264,16 +2264,23 @@ impl<T: SyncTransport> SyncEngine<T> {
         };
         let root = entry.config.folder.clone();
 
-        // Best-effort initial sync.
-        if let Err(error) = self.sync_scheduled_work(&name, &entry.work).await {
-            tracing::warn!(sync = %name, %error, "initial sync failed");
-        }
-
+        // Arm the watcher BEFORE the first sync, not after it. The first sync
+        // scans and then reconciles over the network, which takes hundreds of
+        // milliseconds. A file written in that window used to land after the
+        // scan and before any watcher existed, so nothing recorded it; a clean
+        // periodic tick does not scan, so it stayed unpublished until an
+        // unrelated event. With the watcher already armed, that write is one
+        // queued edge and the loop below scans for it as soon as the first sync
+        // returns.
         // The channel is only an edge trigger. One pending signal is enough;
         // keeping it bounded prevents an arbitrarily hot writer from building
         // an in-memory event backlog while the current sync is running.
         let (tx, mut rx) = mpsc::channel::<WatchEvent>(1);
         let _watcher = spawn_watcher(&root, tx, entry.work.clone(), entry.config.clone());
+        // Best-effort initial sync.
+        if let Err(error) = self.sync_scheduled_work(&name, &entry.work).await {
+            tracing::warn!(sync = %name, %error, "initial sync failed");
+        }
 
         let mut ticker = tokio::time::interval(PERIODIC_RESYNC);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -11669,6 +11676,98 @@ mod tests {
         assert!(
             !crate::sync::staging::staging_root(&home).join("home").exists(),
             "a refused stage must write nothing into the folder"
+        );
+    }
+
+    /// A transport whose first reconcile parks until the test releases it, so a
+    /// file can be written while the entry's first sync is still running. It
+    /// also signals the first reconcile that sees `late.md` in the node.
+    #[derive(Default)]
+    struct BlockingFirstReconcile {
+        reconciles: AtomicUsize,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        saw_late: tokio::sync::Notify,
+    }
+
+    impl SyncTransport for BlockingFirstReconcile {
+        async fn peers_for(&self, _peers: &SyncPeers) -> ResolvedPeers {
+            ResolvedPeers::all(vec![PeerRef {
+                key: "peer".to_string(),
+                id: "peer".to_string(),
+                roaming: false,
+            }])
+        }
+
+        async fn reconcile(
+            &self,
+            _peer: PeerRef,
+            _name: String,
+            node: Arc<Mutex<SyncNode>>,
+        ) -> Result<Reconciled> {
+            let ordinal = self.reconciles.fetch_add(1, Ordering::SeqCst);
+            let saw_late = node
+                .lock()
+                .await
+                .manifest()
+                .get("late.md")
+                .and_then(|entry| entry.meta())
+                .is_some();
+            if saw_late {
+                self.saw_late.notify_one();
+            }
+            if ordinal == 0 {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(Reconciled::default())
+        }
+    }
+
+    /// A file written while the entry's first sync is still running must still
+    /// be published promptly. The first sync scans and then reconciles over the
+    /// network, which takes hundreds of milliseconds; the watcher used to be
+    /// armed only after it returned, so a write in that window landed after the
+    /// scan and before any watcher existed. Nothing recorded it, a clean
+    /// periodic tick does not scan, and the file stayed unpublished until an
+    /// unrelated event. That is the restart phase of the staged-file slice
+    /// test, which failed at its 10 s window in 4 of 5 CI attempts on
+    /// 2026-09-13 and about half the time on one machine. Without the fix the
+    /// write below is never seen and this fails at its 5 s bound.
+    #[tokio::test]
+    async fn a_file_written_during_the_first_sync_is_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resources");
+        write_bus_sync(dir.path(), &root);
+        let transport = Arc::new(BlockingFirstReconcile::default());
+        let cancel = CancellationToken::new();
+        let engine = SyncEngine::new(
+            FabricHome::new(dir.path()),
+            Author([1; 32]),
+            transport.clone(),
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+
+        engine.ensure_watching().await;
+        tokio::time::timeout(Duration::from_secs(5), transport.entered.notified())
+            .await
+            .expect("the first sync did not reach its reconcile within 5 s");
+        // The first scan is done and its reconcile is parked: this write lands
+        // inside the window.
+        std::fs::write(root.join("late.md"), b"late").unwrap();
+        transport.release.notify_one();
+
+        let published =
+            tokio::time::timeout(Duration::from_secs(5), transport.saw_late.notified())
+                .await
+                .is_ok();
+        cancel.cancel();
+        assert!(
+            published,
+            "a file written during the first sync was not published within 5 s; \
+             the watcher was armed after the write, so nothing recorded it"
         );
     }
 }

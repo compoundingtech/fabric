@@ -57,6 +57,19 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   stopped answering resets the held connection within the deadline without a
   recycle, and a VPN coming up leaves a connection that still answers alone.
 
+- **A file written into a synced folder during the entry's first sync is no
+  longer missed.** The engine armed its file watcher only after the first sync
+  returned, and that sync scans and then reconciles over the network, which
+  takes hundreds of milliseconds. A write landing after the scan and before
+  the watcher existed was recorded by nothing, and a clean periodic tick does
+  not scan, so the file stayed unpublished until an unrelated event. The
+  watcher is now armed before the first sync, so such a write is one queued
+  edge and is scanned as soon as the first sync returns. This was the restart
+  phase of the staged-file slice test failing at its 10 s window in 4 of 5 CI
+  attempts on one day and about half the time on one machine; a deterministic
+  test now parks the first reconcile, writes during it, and requires the file
+  to be published within 5 s.
+
 - **A tunnel session that ends because both sides finished no longer counts
   as an attach failure.** A consumer that opens one short TCP connection per
   request through a `fabric dial` listener makes each request a tunnel session
