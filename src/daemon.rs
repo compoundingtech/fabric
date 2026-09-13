@@ -110,6 +110,19 @@ const ENDPOINT_RSS_GROWTH_STEP_BYTES: u64 = 128 * 1024 * 1024;
 /// Abnormal outcomes bypass this interval and report immediately.
 const ENDPOINT_RSS_SUCCESS_REPORT_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const NETWORK_CHANGE_DEBOUNCE: Duration = Duration::from_millis(140);
+/// After a debounced network change the daemon asks every peer whose shared
+/// connection it still holds to answer one echo within `REACHABILITY_TIMEOUT`,
+/// and resets a connection that does not so the next stream redials with fresh
+/// path selection. `Endpoint::online()` only says this endpoint reached a relay;
+/// a VPN coming up, a Wi-Fi switch or an interface change kills the selected path
+/// to a peer, and iroh notices a silently dead path only through the QUIC
+/// path-idle timeout (64.6 s measured on 2026-09-11 by cutting a forwarder
+/// between two daemons), while the peer probe loop needs three failed 20 s
+/// probes. One reset per peer per this cooldown, the same bound the path-quality
+/// redial uses, so a peer that answers slower than the deadline under a burst of
+/// notices cannot have its sessions' transport torn down more often than that.
+/// The endpoint itself is never recycled from this check.
+const HELD_CONNECTION_RESET_COOLDOWN: Duration = Duration::from_secs(60);
 /// How often the daemon actively echo-probes each trusted peer, so a peer that has
 /// roamed (changed network / public IP) is detected even when THIS machine saw no
 /// local network change. `FABRIC_PEER_HEALTH_SECS` overrides; `0` disables.
@@ -404,6 +417,8 @@ pub struct DaemonState {
     tunnel_drop_tx: watch::Sender<u64>,
     tunnel_blocked: AtomicBool,
     network_usable: AtomicBool,
+    /// See `HELD_CONNECTION_RESET_COOLDOWN`.
+    held_connection_resets: Mutex<HeldConnectionResetLimiter>,
     builtin_echo_hits: AtomicUsize,
     incoming_failures: Arc<FailureBackoff>,
     dial_failures: Arc<FailureBackoff>,
@@ -884,6 +899,53 @@ impl NetworkChangeDebouncer {
     }
 }
 
+/// Bounds how often the post-network-change check may reset one peer's held
+/// connection. Entries older than the cooldown are dropped on each decision, so
+/// the map holds at most the peers reset within one cooldown.
+#[derive(Debug)]
+struct HeldConnectionResetLimiter {
+    cooldown: Duration,
+    last_reset: HashMap<EndpointId, Instant>,
+}
+
+impl HeldConnectionResetLimiter {
+    fn new(cooldown: Duration) -> Self {
+        Self {
+            cooldown,
+            last_reset: HashMap::new(),
+        }
+    }
+
+    /// Whether `peer` may be reset at `now`. A permitted reset is recorded so the
+    /// next one inside the cooldown is refused.
+    fn permit(&mut self, peer: EndpointId, now: Instant) -> bool {
+        self.last_reset
+            .retain(|_, last| now.duration_since(*last) < self.cooldown);
+        if self.last_reset.contains_key(&peer) {
+            return false;
+        }
+        self.last_reset.insert(peer, now);
+        true
+    }
+}
+
+/// What one post-network-change check of the held peer connections did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct HeldConnectionCheck {
+    /// Peers whose shared connection this daemon held when the check ran.
+    held: usize,
+    /// Held connections that carried application traffic inside the debounce
+    /// window and so were not probed again.
+    skipped_recent_traffic: usize,
+    /// Held connections that answered the echo within the deadline.
+    answered: usize,
+    /// Held connections that did not answer and were closed.
+    reset: usize,
+    /// Held connections that did not answer but were left alone because the
+    /// previous reset of that peer was inside the cooldown.
+    reset_suppressed: usize,
+}
+
 #[derive(Debug)]
 struct InterfaceSnapshot {
     interface_count: usize,
@@ -974,6 +1036,9 @@ impl DaemonState {
             tunnel_drop_tx,
             tunnel_blocked: AtomicBool::new(false),
             network_usable: AtomicBool::new(true),
+            held_connection_resets: Mutex::new(HeldConnectionResetLimiter::new(
+                HELD_CONNECTION_RESET_COOLDOWN,
+            )),
             builtin_echo_hits: AtomicUsize::new(0),
             incoming_failures: FailureBackoff::new(
                 INCOMING_FAILURE_INITIAL_BACKOFF,
@@ -1794,6 +1859,10 @@ impl DaemonState {
             .endpoint_health_recovered(endpoint.clone(), "network change")
             .await
         {
+            // Online means this endpoint reached a relay. It says nothing about
+            // the selected path to any peer, which is what the change may have
+            // killed; ask each held connection, and reset only one that fails.
+            self.check_held_peer_connections("network change").await;
             return;
         }
 
@@ -1831,6 +1900,115 @@ impl DaemonState {
         eprintln!(
             "fabric: peer {label:?} unreachable (recovery attempt {attempt}); resetting only this peer's connection"
         );
+    }
+
+    /// Prove every held peer connection still answers after a network change,
+    /// and reset only the ones that do not. `HELD_CONNECTION_RESET_COOLDOWN`
+    /// says why this exists and how it is bounded.
+    ///
+    /// A peer with no held connection has nothing to invalidate: its next stream
+    /// dials fresh, so it costs nothing here, which keeps an away roaming peer
+    /// free. Application traffic that arrived inside the debounce window arrived
+    /// after the change was first seen and already proved that path, so that
+    /// connection is not probed again. The probe rides the held connection
+    /// itself, so a selected path that died stalls it until the deadline; the
+    /// reset closes only a connection that existed before that probe started,
+    /// never one a concurrent redial just opened.
+    async fn check_held_peer_connections(&self, context: &str) -> HeldConnectionCheck {
+        let peers = self.peer_book.read().await.peers().to_vec();
+        let mut check = HeldConnectionCheck::default();
+        for peer in peers {
+            let Some(held) = self.peer_connections.connection(peer.id).await else {
+                continue;
+            };
+            check.held += 1;
+            if self
+                .peer_connections
+                .recently_active(peer.id, NETWORK_CHANGE_DEBOUNCE)
+                .await
+            {
+                check.skipped_recent_traffic += 1;
+                continue;
+            }
+            let label = peer.name.clone().unwrap_or_else(|| peer.id.to_string());
+            let addr = peer
+                .addr
+                .clone()
+                .unwrap_or_else(|| EndpointAddr::new(peer.id));
+            let probe_started = Instant::now();
+            let answered = matches!(
+                tokio::time::timeout(REACHABILITY_TIMEOUT, self.ping_addr(&label, addr)).await,
+                Ok(Ok(_))
+            );
+            if answered {
+                check.answered += 1;
+                continue;
+            }
+            let connection_id = held.stable_id() as u64;
+            let permitted = self
+                .held_connection_resets
+                .lock()
+                .await
+                .permit(peer.id, Instant::now());
+            if !permitted {
+                check.reset_suppressed += 1;
+                info!(
+                    target: VALIDATION_LOG_TARGET,
+                    event = "held_connection_reset_suppressed",
+                    context,
+                    peer = %label,
+                    connection_id,
+                    cooldown_secs = HELD_CONNECTION_RESET_COOLDOWN.as_secs(),
+                    "held connection stopped answering again inside the reset cooldown"
+                );
+                continue;
+            }
+            let reset = self
+                .peer_connections
+                .redial_opened_before(
+                    peer.id,
+                    b"network change: held connection stopped answering",
+                    probe_started,
+                )
+                .await;
+            if reset {
+                check.reset += 1;
+                warn!(
+                    target: VALIDATION_LOG_TARGET,
+                    event = "held_connection_reset",
+                    context,
+                    peer = %label,
+                    connection_id,
+                    probe_deadline_ms = REACHABILITY_TIMEOUT.as_millis() as u64,
+                    "held connection stopped answering after a network change; resetting only this peer's connection"
+                );
+                eprintln!(
+                    "fabric: peer {label:?} stopped answering after {context}; resetting only this peer's connection"
+                );
+            }
+        }
+        if check.held == 0 {
+            debug!(
+                target: VALIDATION_LOG_TARGET,
+                event = "held_connection_check",
+                context,
+                held = 0usize,
+                "no held peer connection to check after a network change"
+            );
+        } else {
+            info!(
+                target: VALIDATION_LOG_TARGET,
+                event = "held_connection_check",
+                context,
+                held = check.held,
+                skipped_recent_traffic = check.skipped_recent_traffic,
+                answered = check.answered,
+                reset = check.reset,
+                reset_suppressed = check.reset_suppressed,
+                "checked held peer connections after a network change"
+            );
+        }
+        check
     }
 
     async fn endpoint_health_recovered(&self, endpoint: CurrentEndpoint, context: &str) -> bool {
@@ -8087,6 +8265,297 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), loop_task)
             .await
             .expect("the loop did not return after the daemon was cancelled")??;
+        Ok(())
+    }
+
+    /// One reset per peer per cooldown from the network-change check, and peers
+    /// do not share a cooldown.
+    #[test]
+    fn held_connection_resets_are_limited_to_one_per_peer_per_cooldown() {
+        let mut limiter = HeldConnectionResetLimiter::new(Duration::from_secs(60));
+        let a = iroh::SecretKey::generate().public();
+        let b = iroh::SecretKey::generate().public();
+        let start = Instant::now();
+
+        assert!(
+            limiter.permit(a, start),
+            "the first reset of a peer is permitted"
+        );
+        assert!(
+            !limiter.permit(a, start + Duration::from_secs(30)),
+            "a second reset inside the cooldown is refused"
+        );
+        assert!(
+            limiter.permit(b, start + Duration::from_secs(30)),
+            "another peer's first reset is not held back by this one"
+        );
+        assert!(
+            limiter.permit(a, start + Duration::from_secs(60)),
+            "the reset is permitted again once the cooldown has passed"
+        );
+        assert!(
+            !limiter.permit(a, start + Duration::from_secs(61)),
+            "and the permitted reset starts a new cooldown"
+        );
+    }
+
+    /// A mux peer under the test's control. It echoes every stream until told to
+    /// stall; while stalled it reads the stream header and never answers, which
+    /// is what a held connection whose selected path just died looks like from
+    /// this side: the stream opens locally and nothing ever comes back.
+    #[derive(Debug, Clone)]
+    struct StallableMuxPeer {
+        stalled: Arc<AtomicBool>,
+        echoes: Arc<AtomicUsize>,
+    }
+
+    impl iroh::protocol::ProtocolHandler for StallableMuxPeer {
+        async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
+            mux::PeerConnections::accept_generation(&connection, 0)
+                .await
+                .map_err(|error| {
+                    iroh::protocol::AcceptError::from_err(std::io::Error::other(format!(
+                        "{error:#}"
+                    )))
+                })?;
+            loop {
+                let (mut send, mut recv) = match connection.accept_bi().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let stalled = self.stalled.clone();
+                let echoes = self.echoes.clone();
+                let connection = connection.clone();
+                tokio::spawn(async move {
+                    if mux::MuxStreamHeader::read(&mut recv).await.is_err() {
+                        return;
+                    }
+                    if stalled.load(Ordering::SeqCst) {
+                        connection.closed().await;
+                        return;
+                    }
+                    echoes.fetch_add(1, Ordering::SeqCst);
+                    let _ = mux::write_ready(&mut send).await;
+                    let _ = tokio::io::copy(&mut recv, &mut send).await;
+                    let _ = send.finish();
+                });
+            }
+            Ok(())
+        }
+    }
+
+    async fn start_stallable_peer() -> Result<(iroh::protocol::Router, StallableMuxPeer)> {
+        let peer = StallableMuxPeer {
+            stalled: Arc::new(AtomicBool::new(false)),
+            echoes: Arc::new(AtomicUsize::new(0)),
+        };
+        let router = iroh::protocol::Router::builder(
+            Endpoint::builder(presets::N0)
+                .alpns(vec![mux::MUX_ALPN.to_vec()])
+                .bind()
+                .await?,
+        )
+        .accept(mux::MUX_ALPN, peer.clone())
+        .spawn();
+        let _ = tokio::time::timeout(ENDPOINT_ONLINE_TIMEOUT, router.endpoint().online()).await;
+        Ok((router, peer))
+    }
+
+    /// Interface updates the test writes, standing in for the OS monitor.
+    struct ScriptedUpdates(mpsc::UnboundedReceiver<netwatch::interfaces::State>);
+
+    impl InterfaceUpdates for ScriptedUpdates {
+        async fn next_update(&mut self) -> Result<netwatch::interfaces::State> {
+            self.0
+                .recv()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("the scripted network monitor ended"))
+        }
+    }
+
+    /// A usable network whose default route is `default_route`.
+    fn usable_network(default_route: &str, have_v6: bool) -> netwatch::interfaces::State {
+        netwatch::interfaces::State {
+            interfaces: HashMap::new(),
+            local_addresses: netwatch::ip::LocalAddresses {
+                loopback: Vec::new(),
+                regular: Vec::new(),
+            },
+            have_v6,
+            have_v4: true,
+            is_expensive: false,
+            default_route_interface: Some(default_route.to_string()),
+            last_unsuspend: None,
+        }
+    }
+
+    async fn held_connection_id(state: &DaemonState, peer: EndpointId) -> Option<u64> {
+        state
+            .peer_connections
+            .connection(peer)
+            .await
+            .map(|connection| connection.stable_id() as u64)
+    }
+
+    /// A network change whose peer stops answering: the held connection is
+    /// reset within the probe deadline, the endpoint is not rebuilt, and the
+    /// next request reaches the peer over a fresh connection.
+    ///
+    /// Before this check the daemon trusted `Endpoint::online()` after a network
+    /// change and left the connection alone; only the QUIC path-idle timeout
+    /// (64.6 s measured) or three failed 20 s peer probes would have noticed.
+    /// The 10 s deadline here is well inside both, so this fails without the
+    /// check and passes with it. The healthy change first is the control: the
+    /// check runs, asks, and keeps a connection that answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_network_change_resets_a_held_connection_that_stopped_answering_without_a_recycle()
+    -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let node = FabricNode::start(home.clone()).await?;
+        let (router, peer) = start_stallable_peer().await?;
+        let peer_id = router.endpoint().id();
+        trust_test_peer(&home, &node, peer_id, "peer", router.endpoint().addr()).await?;
+        let state = node.state();
+
+        state
+            .ping("peer")
+            .await
+            .context("the first ping should reach the peer")?;
+        let held = held_connection_id(&state, peer_id)
+            .await
+            .context("the ping should leave a held connection")?;
+        let generation = state.endpoint_handle().generation;
+        let echoes_after_ping = peer.echoes.load(Ordering::SeqCst);
+        let (updates_tx, updates_rx) = mpsc::unbounded_channel();
+        let rehome = tokio::spawn(run_rehome_updates(
+            state.clone(),
+            ScriptedUpdates(updates_rx),
+        ));
+
+        // Control: a change on a healthy network. The check must ask the held
+        // connection and keep it.
+        updates_tx.send(usable_network("en0", false))?;
+        let asked_at = Instant::now();
+        while peer.echoes.load(Ordering::SeqCst) == echoes_after_ping {
+            assert!(
+                asked_at.elapsed() < Duration::from_secs(10),
+                "the check did not ask the held connection within 10 s of a healthy change"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            held_connection_id(&state, peer_id).await,
+            Some(held),
+            "a held connection that answers must be kept"
+        );
+        assert_eq!(state.endpoint_handle().generation, generation);
+
+        // The default route moves to another interface, and the peer stops
+        // answering on the connection this daemon still holds.
+        peer.stalled.store(true, Ordering::SeqCst);
+        let changed_at = Instant::now();
+        updates_tx.send(usable_network("en1", false))?;
+        let reset_after = loop {
+            if held_connection_id(&state, peer_id).await != Some(held) {
+                break changed_at.elapsed();
+            }
+            assert!(
+                changed_at.elapsed() < Duration::from_secs(10),
+                "held connection {held} was still in place 10 s after the network change; \
+                 the check did not reset it"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(
+            state.endpoint_handle().generation,
+            generation,
+            "one peer's dead connection must not rebuild the shared endpoint"
+        );
+        eprintln!(
+            "held connection reset {:.3} s after the network change",
+            reset_after.as_secs_f64()
+        );
+
+        // The next request dials fresh and reaches the peer again.
+        peer.stalled.store(false, Ordering::SeqCst);
+        state
+            .ping("peer")
+            .await
+            .context("the ping after the reset should reach the peer")?;
+        let fresh = held_connection_id(&state, peer_id)
+            .await
+            .context("the ping should leave a fresh held connection")?;
+        assert_ne!(
+            fresh, held,
+            "the request after the reset must ride a new connection"
+        );
+
+        drop(updates_tx);
+        node.shutdown().await?;
+        tokio::time::timeout(Duration::from_secs(5), rehome)
+            .await
+            .context("the rehome loop did not return after the daemon was cancelled")???;
+        router.shutdown().await?;
+        Ok(())
+    }
+
+    /// A VPN coming up on a healthy machine: the interface set changes, the
+    /// default route does not, and the peer keeps answering. The held connection
+    /// is kept, the endpoint is not rebuilt, and the next request rides the same
+    /// connection. This holds with and without the check; it pins what the
+    /// check must not do.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_vpn_coming_up_keeps_a_held_connection_that_still_answers() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let node = FabricNode::start(home.clone()).await?;
+        let (router, _peer) = start_stallable_peer().await?;
+        let peer_id = router.endpoint().id();
+        trust_test_peer(&home, &node, peer_id, "peer", router.endpoint().addr()).await?;
+        let state = node.state();
+
+        state.ping("peer").await?;
+        let held = held_connection_id(&state, peer_id)
+            .await
+            .context("the ping should leave a held connection")?;
+        let generation = state.endpoint_handle().generation;
+        let (updates_tx, updates_rx) = mpsc::unbounded_channel();
+        let rehome = tokio::spawn(run_rehome_updates(
+            state.clone(),
+            ScriptedUpdates(updates_rx),
+        ));
+
+        updates_tx.send(usable_network("en0", false))?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // The VPN adds a tunnel interface with a global v6 address; the default
+        // route stays on the same interface.
+        updates_tx.send(usable_network("en0", true))?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        assert_eq!(
+            held_connection_id(&state, peer_id).await,
+            Some(held),
+            "a VPN coming up must not reset a held connection that still answers"
+        );
+        assert_eq!(
+            state.endpoint_handle().generation,
+            generation,
+            "a VPN coming up must not rebuild the endpoint"
+        );
+        state.ping("peer").await?;
+        assert_eq!(
+            held_connection_id(&state, peer_id).await,
+            Some(held),
+            "the next request must ride the same held connection"
+        );
+
+        drop(updates_tx);
+        node.shutdown().await?;
+        tokio::time::timeout(Duration::from_secs(5), rehome)
+            .await
+            .context("the rehome loop did not return after the daemon was cancelled")???;
+        router.shutdown().await?;
         Ok(())
     }
 }

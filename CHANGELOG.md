@@ -39,6 +39,23 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **A network change now re-proves every held peer connection instead of
+  trusting the endpoint's own online state.** After the debounced notice the
+  daemon asks each peer whose shared connection it still holds to answer one
+  echo within the three-second reachability deadline, and resets only a
+  connection that does not, so the next stream redials with fresh path
+  selection. `Endpoint::online()` says the endpoint reached a relay and nothing
+  about the selected path to a peer, which is what a VPN coming up, a Wi-Fi
+  switch or an interface change kills; before this, a silently dead path was
+  noticed only by the QUIC path-idle timeout (64.6 s measured between two
+  daemons) or by three failed 20 s peer probes. A connection that answers is
+  kept, a peer with no held connection costs nothing, recent application
+  traffic stands in for the probe, one reset per peer per minute is the bound,
+  and the endpoint is never recycled from this check. Regression tests drive
+  the rehome loop with scripted interface updates: a Wi-Fi switch whose peer
+  stopped answering resets the held connection within the deadline without a
+  recycle, and a VPN coming up leaves a connection that still answers alone.
+
 - **A tunnel session that ends because both sides finished no longer counts
   as an attach failure.** A consumer that opens one short TCP connection per
   request through a `fabric dial` listener makes each request a tunnel session
