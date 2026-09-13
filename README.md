@@ -87,6 +87,10 @@ config) from an existing machine.
 
 Peers are found by NodeID over iroh discovery (relays), so **no address hints are
 needed** and a roaming laptop reconnects on its own as its network changes.
+After a local network change the daemon also asks each peer whose connection it
+still holds to answer one echo within three seconds and resets only a connection
+that does not, at most once a minute per peer; the endpoint itself is not
+rebuilt for that.
 
 ### Presence, partitions, and local ownership
 

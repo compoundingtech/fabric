@@ -39,6 +39,24 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **A network change now re-proves every held peer connection instead of
+  trusting the endpoint's own online state.** After the debounced notice the
+  daemon asks each peer whose shared connection it still holds to answer one
+  echo within the three-second reachability deadline, and resets only a
+  connection that does not, so the next stream redials with fresh path
+  selection. `Endpoint::online()` says the endpoint reached a relay and nothing
+  about the selected path to a peer, which is what a VPN coming up, a Wi-Fi
+  switch or an interface change kills; before this, a silently dead path was
+  noticed only by the QUIC path-idle timeout (64.6 s measured between two
+  daemons) or by three failed 20 s peer probes. A connection that answers is
+  kept, and a peer that refuses the echo by policy has answered over that very
+  connection, so it is kept too; a peer with no held connection costs nothing, recent application
+  traffic stands in for the probe, one reset per peer per minute is the bound,
+  and the endpoint is never recycled from this check. Regression tests drive
+  the rehome loop with scripted interface updates: a Wi-Fi switch whose peer
+  stopped answering resets the held connection within the deadline without a
+  recycle, and a VPN coming up leaves a connection that still answers alone.
+
 - **A file written into a synced folder during the entry's first sync is no
   longer missed.** The engine armed its file watcher only after the first sync
   returned, and that sync scans and then reconciles over the network, which
