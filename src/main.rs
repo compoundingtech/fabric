@@ -2,9 +2,12 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::IsTerminal,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -1051,14 +1054,8 @@ async fn main() -> Result<()> {
                     }
                 }
                 Commands::Shell { peer } => {
-                    let socket =
-                        match send_control(&home, ControlRequest::Shell { peer: peer.clone() })
-                            .await?
-                        {
-                            ControlResponse::Shell { socket } => socket,
-                            response => bail!("unexpected daemon response: {response:?}"),
-                        };
-                    let code = run_shell_client(&socket, &peer).await?;
+                    let socket = request_shell_socket(&home, &peer).await?;
+                    let code = run_shell_client(&home, &peer, socket).await?;
                     std::process::exit(code);
                 }
                 Commands::Exec { peer, cmd } => {
@@ -3079,75 +3076,377 @@ async fn wait_for_daemon_ready(home: &FabricHome, timeout: Duration) -> Result<(
     }
 }
 
-async fn run_shell_client(socket: &PathBuf, peer: &str) -> Result<i32> {
-    let stream = tokio::net::UnixStream::connect(socket).await?;
-    let (mut read, write) = stream.into_split();
-    let mut signals = ShellSignals::new()?;
-    let terminal = TerminalModeGuard::enable_if_terminal()?;
-    let (cols, rows) = terminal_size();
-    let write = Arc::new(tokio::sync::Mutex::new(write));
-    shell::write_client_resize(&mut *write.lock().await, rows, cols).await?;
+/// How long `fabric shell` keeps trying to start a replacement shell after its
+/// session ended without an exit status. The daemon's own pre-attach probing
+/// has no bound, so this is the bound: a peer that stays away this long gets a
+/// person's attention instead of a terminal pinned forever.
+const SHELL_REPLACEMENT_DEADLINE: Duration = Duration::from_secs(5 * 60);
+/// How often to ask the local daemon again while it is itself unavailable.
+const SHELL_REPLACEMENT_LOCAL_RETRY: Duration = Duration::from_secs(1);
 
-    let stdin_write = write.clone();
-    let stdin_task = tokio::spawn(async move {
+async fn request_shell_socket(home: &FabricHome, peer: &str) -> Result<PathBuf> {
+    match send_control(
+        home,
+        ControlRequest::Shell {
+            peer: peer.to_string(),
+        },
+    )
+    .await?
+    {
+        ControlResponse::Shell { socket } => Ok(socket),
+        response => bail!("unexpected daemon response: {response:?}"),
+    }
+}
+
+/// The stdin pump's view of the session it feeds.
+///
+/// A shell session that ends without an exit status is replaced by a new one
+/// in the same terminal, so the pump has to be able to change where its bytes
+/// go and to stop forwarding them while nothing is connected.
+struct ShellInput {
+    /// The current session's local socket, `None` between sessions.
+    write: tokio::sync::Mutex<Option<tokio::net::unix::OwnedWriteHalf>>,
+    /// False from the loss of a session until its replacement first answers.
+    /// Bytes read while false are discarded, never replayed: the replacement is
+    /// a fresh shell with a different working directory and history from the
+    /// one the person was typing into, and a command meant for the old shell
+    /// must not run in the new one.
+    forwarding: AtomicBool,
+    /// Bytes discarded while not forwarding, reported once forwarding resumes.
+    discarded: AtomicUsize,
+    /// Stdin reached end of file, so nobody is there to type into a replacement.
+    eof: AtomicBool,
+    /// Ctrl-C typed while not forwarding: the person wants out of the wait.
+    interrupted: AtomicBool,
+    interrupt: tokio::sync::Notify,
+}
+
+impl ShellInput {
+    fn new() -> Self {
+        Self {
+            write: tokio::sync::Mutex::new(None),
+            forwarding: AtomicBool::new(true),
+            discarded: AtomicUsize::new(0),
+            eof: AtomicBool::new(false),
+            interrupted: AtomicBool::new(false),
+            interrupt: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Connect to a session socket, tell the remote PTY the window size, and
+    /// make it the pump's destination.
+    async fn attach(&self, socket: &Path) -> Result<tokio::net::unix::OwnedReadHalf> {
+        let stream = tokio::net::UnixStream::connect(socket).await?;
+        let (read, mut write) = stream.into_split();
+        let (cols, rows) = terminal_size();
+        shell::write_client_resize(&mut write, rows, cols).await?;
+        *self.write.lock().await = Some(write);
+        Ok(read)
+    }
+
+    /// The session is gone: stop forwarding until a replacement answers.
+    async fn detach(&self) {
+        *self.write.lock().await = None;
+        self.forwarding.store(false, Ordering::SeqCst);
+        self.discarded.store(0, Ordering::SeqCst);
+        self.interrupted.store(false, Ordering::SeqCst);
+    }
+
+    /// The replacement answered. Returns how many bytes were discarded meanwhile.
+    fn resume_forwarding(&self) -> usize {
+        self.forwarding.store(true, Ordering::SeqCst);
+        self.interrupted.store(false, Ordering::SeqCst);
+        self.discarded.swap(0, Ordering::SeqCst)
+    }
+
+    fn is_forwarding(&self) -> bool {
+        self.forwarding.load(Ordering::SeqCst)
+    }
+
+    fn stdin_closed(&self) -> bool {
+        self.eof.load(Ordering::SeqCst)
+    }
+
+    fn take_interrupt(&self) -> bool {
+        self.interrupted.swap(false, Ordering::SeqCst)
+    }
+
+    async fn resize(&self) {
+        let (cols, rows) = terminal_size();
+        if let Some(write) = self.write.lock().await.as_mut() {
+            // A failed write is the session going away; the reader reports it.
+            let _ = shell::write_client_resize(write, rows, cols).await;
+        }
+    }
+
+    async fn pump_stdin(self: Arc<Self>) -> Result<()> {
         let mut stdin = tokio::io::stdin();
         let mut buf = [0u8; 8192];
         loop {
             let read = stdin.read(&mut buf).await?;
             if read == 0 {
-                shell::write_client_eof(&mut *stdin_write.lock().await).await?;
-                return Ok::<(), anyhow::Error>(());
+                self.eof.store(true, Ordering::SeqCst);
+                if let Some(write) = self.write.lock().await.as_mut() {
+                    let _ = shell::write_client_eof(write).await;
+                }
+                return Ok(());
             }
-            shell::write_client_stdin(&mut *stdin_write.lock().await, &buf[..read]).await?;
+            if self.is_forwarding() {
+                if let Some(write) = self.write.lock().await.as_mut() {
+                    // A failed write is the session going away; the reader
+                    // reports the loss, and these bytes are part of it.
+                    let _ = shell::write_client_stdin(write, &buf[..read]).await;
+                }
+                continue;
+            }
+            self.discarded.fetch_add(read, Ordering::SeqCst);
+            if buf[..read].contains(&0x03) {
+                self.interrupted.store(true, Ordering::SeqCst);
+                self.interrupt.notify_one();
+            }
         }
-    });
+    }
+}
+
+/// Renders daemon status and client notices on stderr.
+///
+/// Status frames describe a wait in progress ("reconnecting attempt 3 in
+/// 2.0s", "probing remote shell protocol again in 5.0s") and arrive once per
+/// attempt. On a terminal they overwrite one line with a carriage return instead
+/// of scrolling the session away; everything else ends that line first, so
+/// shell output and notices start on a fresh one.
+struct ShellNotices {
+    stderr: tokio::io::Stderr,
+    /// Raw mode leaves output post-processing off, so a newline alone would not
+    /// return the carriage.
+    line_end: &'static [u8],
+    overwrite_status: bool,
+    status_open: bool,
+}
+
+impl ShellNotices {
+    fn new(raw: bool) -> Self {
+        Self {
+            stderr: tokio::io::stderr(),
+            line_end: if raw { b"\r\n" } else { b"\n" },
+            overwrite_status: raw && std::io::stderr().is_terminal(),
+            status_open: false,
+        }
+    }
+
+    async fn status(&mut self, message: &str) -> Result<()> {
+        if self.overwrite_status {
+            self.stderr.write_all(b"\r\x1b[K").await?;
+            self.stderr.write_all(message.as_bytes()).await?;
+            self.status_open = true;
+        } else {
+            self.stderr.write_all(message.as_bytes()).await?;
+            self.stderr.write_all(self.line_end).await?;
+        }
+        self.stderr.flush().await?;
+        Ok(())
+    }
+
+    async fn line(&mut self, message: &str) -> Result<()> {
+        self.end_status().await?;
+        self.stderr.write_all(message.as_bytes()).await?;
+        self.stderr.write_all(self.line_end).await?;
+        self.stderr.flush().await?;
+        Ok(())
+    }
+
+    /// Terminate an overwriting status line so what follows starts fresh.
+    async fn end_status(&mut self) -> Result<()> {
+        if self.status_open {
+            self.status_open = false;
+            self.stderr.write_all(self.line_end).await?;
+            self.stderr.flush().await?;
+        }
+        Ok(())
+    }
+}
+
+enum ShellSessionEnd {
+    Exited(i32),
+    /// The local socket closed without an exit status. `answered` says whether
+    /// the remote shell ever produced output on this session.
+    Lost {
+        answered: bool,
+    },
+    /// Ctrl-C typed while waiting for a replacement shell to answer.
+    Interrupted,
+    /// The replacement shell did not answer within the deadline.
+    DeadlinePassed,
+}
+
+enum ReplacementOutcome {
+    Connected(tokio::net::unix::OwnedReadHalf),
+    Interrupted,
+    DeadlinePassed,
+}
+
+/// Drive one `fabric shell` command: a resumable session, and when that session
+/// ends without an exit status, a replacement shell in the same terminal.
+///
+/// Same PTY when possible: a transport loss shorter than the server's detached
+/// TTL resumes in place inside the daemon and never reaches this loop. What
+/// reaches it is a session the server refused to resume (a remote daemon
+/// restart, a sleep past the TTL) or a socket that simply closed. A session that
+/// had answered is replaced, visibly; a session that never answered ended in a
+/// refusal the daemon has already explained, and the command ends as before.
+async fn run_shell_client(home: &FabricHome, peer: &str, socket: PathBuf) -> Result<i32> {
+    let mut signals = ShellSignals::new()?;
+    let terminal = TerminalModeGuard::enable_if_terminal()?;
+    let input = Arc::new(ShellInput::new());
+    let mut read = input.attach(&socket).await?;
+    let stdin_task = tokio::spawn(input.clone().pump_stdin());
 
     let mut stdout = tokio::io::stdout();
-    let mut stderr = tokio::io::stderr();
-    let mut exit_code = None;
+    let mut notices = ShellNotices::new(terminal.is_enabled());
+    let mut answer_deadline = None;
 
+    let exit_code = loop {
+        let end = run_shell_session(
+            &mut read,
+            &input,
+            &mut signals,
+            &terminal,
+            &mut notices,
+            &mut stdout,
+            peer,
+            answer_deadline,
+        )
+        .await?;
+        match end {
+            ShellSessionEnd::Exited(code) => break code,
+            ShellSessionEnd::Interrupted => {
+                notices
+                    .line(&format!(
+                        "fabric: interrupted while waiting for a new remote shell to {peer:?}"
+                    ))
+                    .await?;
+                break 130;
+            }
+            ShellSessionEnd::DeadlinePassed => {
+                notices
+                    .line(&format!(
+                        "fabric: no new remote shell to {peer:?} answered within {}m; giving up",
+                        SHELL_REPLACEMENT_DEADLINE.as_secs() / 60
+                    ))
+                    .await?;
+                break 1;
+            }
+            ShellSessionEnd::Lost { answered } => {
+                if !answered || input.stdin_closed() {
+                    notices
+                        .line(&format!(
+                            "fabric: peer {peer:?} closed service \"shell\" before it returned an exit status"
+                        ))
+                        .await?;
+                    break 1;
+                }
+                notices
+                    .line(&format!(
+                        "fabric: remote shell to {peer:?} ended without an exit status; starting a new shell"
+                    ))
+                    .await?;
+                input.detach().await;
+                let deadline = tokio::time::Instant::now() + SHELL_REPLACEMENT_DEADLINE;
+                match wait_for_replacement_shell(home, peer, &input, &mut notices, deadline).await?
+                {
+                    ReplacementOutcome::Connected(replacement) => {
+                        read = replacement;
+                        answer_deadline = Some(deadline);
+                    }
+                    ReplacementOutcome::Interrupted => {
+                        notices
+                            .line(&format!(
+                                "fabric: interrupted while waiting for a new remote shell to {peer:?}"
+                            ))
+                            .await?;
+                        break 130;
+                    }
+                    ReplacementOutcome::DeadlinePassed => {
+                        notices
+                            .line(&format!(
+                                "fabric: no new remote shell to {peer:?} answered within {}m; giving up",
+                                SHELL_REPLACEMENT_DEADLINE.as_secs() / 60
+                            ))
+                            .await?;
+                        break 1;
+                    }
+                }
+            }
+        }
+    };
+
+    stdin_task.abort();
+    let _ = stdin_task.await;
+    terminal.restore()?;
+    stdout.flush().await?;
+    Ok(exit_code)
+}
+
+/// Pump one session until it exits, is lost, or the person gives up on it.
+/// `answer_deadline` is set for a replacement session until it first answers.
+#[allow(clippy::too_many_arguments)]
+async fn run_shell_session(
+    read: &mut tokio::net::unix::OwnedReadHalf,
+    input: &ShellInput,
+    signals: &mut ShellSignals,
+    terminal: &TerminalModeGuard,
+    notices: &mut ShellNotices,
+    stdout: &mut tokio::io::Stdout,
+    peer: &str,
+    mut answer_deadline: Option<tokio::time::Instant>,
+) -> Result<ShellSessionEnd> {
+    let mut answered = false;
     loop {
         tokio::select! {
-            frame = shell::read_server_frame(&mut read) => {
+            frame = shell::read_server_frame(read) => {
                 let Some(frame) = frame? else {
-                    break;
+                    return Ok(ShellSessionEnd::Lost { answered });
                 };
                 match frame {
                     ServerFrame::Output(bytes) => {
+                        if !answered {
+                            answered = true;
+                            if answer_deadline.take().is_some() {
+                                let discarded = input.resume_forwarding();
+                                let mut ready =
+                                    format!("fabric: new remote shell to {peer:?} is ready");
+                                if discarded > 0 {
+                                    ready.push_str(&format!(
+                                        " ({discarded} bytes typed while disconnected were discarded)"
+                                    ));
+                                }
+                                notices.line(&ready).await?;
+                            }
+                        }
+                        notices.end_status().await?;
                         stdout.write_all(&bytes).await?;
                         stdout.flush().await?;
                     }
                     ServerFrame::Error(message) => {
-                        stderr
-                            .write_all(format!("fabric: peer {peer:?} ").as_bytes())
-                            .await?;
-                        stderr.write_all(message.as_bytes()).await?;
-                        stderr.write_all(b"\n").await?;
-                        stderr.flush().await?;
+                        notices.line(&format!("fabric: peer {peer:?} {message}")).await?;
                     }
                     ServerFrame::Status(message) => {
-                        stderr.write_all(message.as_bytes()).await?;
-                        stderr.write_all(b"\n").await?;
-                        stderr.flush().await?;
+                        notices.status(&message).await?;
                     }
                     ServerFrame::Exit(code) => {
-                        exit_code = Some(normalize_exit_code(code));
-                        break;
+                        notices.end_status().await?;
+                        return Ok(ShellSessionEnd::Exited(normalize_exit_code(code)));
                     }
                 }
             }
             signal = signals.recv() => {
                 match signal {
-                    ShellSignal::Resize => {
-                        let (cols, rows) = terminal_size();
-                        shell::write_client_resize(&mut *write.lock().await, rows, cols).await?;
-                    }
+                    ShellSignal::Resize => input.resize().await,
                     ShellSignal::Suspend => {
                         terminal.restore()?;
                         suspend_current_process();
                         terminal.reenter_raw()?;
-                        let (cols, rows) = terminal_size();
-                        shell::write_client_resize(&mut *write.lock().await, rows, cols).await?;
+                        input.resize().await;
                     }
                     ShellSignal::Terminate(signal) => {
                         terminal.restore()?;
@@ -3155,25 +3454,69 @@ async fn run_shell_client(socket: &PathBuf, peer: &str) -> Result<i32> {
                     }
                 }
             }
+            _ = input.interrupt.notified(), if !input.is_forwarding() => {
+                if input.take_interrupt() {
+                    notices.end_status().await?;
+                    return Ok(ShellSessionEnd::Interrupted);
+                }
+            }
+            _ = tokio::time::sleep_until(answer_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                if answer_deadline.is_some() => {
+                notices.end_status().await?;
+                return Ok(ShellSessionEnd::DeadlinePassed);
+            }
         }
     }
+}
 
-    stdin_task.abort();
-    let _ = stdin_task.await;
-    terminal.restore()?;
-    if exit_code.is_none() {
-        stderr
-            .write_all(
-                format!(
-                    "fabric: peer {peer:?} closed service \"shell\" before it returned an exit status\n"
-                )
-                .as_bytes(),
-            )
-            .await?;
+/// Obtain and connect a replacement shell socket, retrying while the local
+/// daemon is itself unavailable (it may be restarting too), until `deadline`.
+async fn wait_for_replacement_shell(
+    home: &FabricHome,
+    peer: &str,
+    input: &ShellInput,
+    notices: &mut ShellNotices,
+    deadline: tokio::time::Instant,
+) -> Result<ReplacementOutcome> {
+    let mut local_unavailable_reported = false;
+    loop {
+        match request_shell_socket(home, peer).await {
+            Ok(socket) => match input.attach(&socket).await {
+                Ok(read) => return Ok(ReplacementOutcome::Connected(read)),
+                Err(error) => {
+                    notices
+                        .status(&format!(
+                            "fabric: new shell socket is not ready ({error:#}); retrying"
+                        ))
+                        .await?;
+                }
+            },
+            Err(error) => {
+                if !local_unavailable_reported {
+                    local_unavailable_reported = true;
+                    notices
+                        .line(&format!(
+                            "fabric: local daemon unavailable ({error:#}); retrying every {}s for up to {}m",
+                            SHELL_REPLACEMENT_LOCAL_RETRY.as_secs(),
+                            SHELL_REPLACEMENT_DEADLINE.as_secs() / 60
+                        ))
+                        .await?;
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(ReplacementOutcome::DeadlinePassed);
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(SHELL_REPLACEMENT_LOCAL_RETRY) => {}
+            _ = tokio::time::sleep_until(deadline) => return Ok(ReplacementOutcome::DeadlinePassed),
+            _ = input.interrupt.notified() => {
+                if input.take_interrupt() {
+                    return Ok(ReplacementOutcome::Interrupted);
+                }
+            }
+        }
     }
-    stdout.flush().await?;
-    stderr.flush().await?;
-    Ok(exit_code.unwrap_or(1))
 }
 
 /// Drive the client side of a `fabric exec` session over the daemon-provided

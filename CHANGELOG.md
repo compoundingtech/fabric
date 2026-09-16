@@ -21,6 +21,20 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Changed
 
+- **`fabric shell` comes back on its own after the remote daemon restarts or a
+  laptop sleeps past the resume window.** A session the server refused to
+  resume used to end the command with code 1 about 1.2 s after the restart, and
+  the person retyped it. Now a shell that had answered is replaced in the same
+  terminal: the client reports the refused resume, says `starting a new shell`,
+  and announces the fresh PTY when it answers, 1.98 to 2.02 s after a restart on
+  a two-daemon pair (3 runs). Input typed while disconnected is discarded and
+  counted, never replayed into a shell with a different working directory;
+  Ctrl-C while disconnected exits with 130; the replacement gives up after 5
+  minutes. A session that never answered, or one lost after stdin closed, ends
+  the command as before. Short losses still resume the same PTY in place, 0.53 s
+  after a forced drop, unchanged. Daemon retry status lines now overwrite one
+  terminal line with a carriage return instead of scrolling the session away.
+
 - **The dormant `fabric/sync-ipc/1` local bridge now has a frozen contract.**
   Versioned, bounded control frames negotiate peer resolution, raw sync streams,
   status, shutdown, and structured errors. The socket is owner-only, verifies

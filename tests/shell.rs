@@ -385,30 +385,33 @@ async fn resumable_shell_one_survives_transport_drop() -> Result<()> {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn shell_past_detached_ttl_reports_the_session_is_gone() -> Result<()> {
-    // Issue #21, the daily-use question: a MacBook sleeps longer than the 60s
-    // detached TTL, now 15 minutes, the server reaps the PTY, and the client
-    // wakes up. This test forces expiry rather than waiting for it, so the
-    // retention value does not affect what it proves.
+async fn shell_starts_a_new_session_after_the_remote_daemon_restarts() -> Result<()> {
+    // The daily-use question behind issue #21: a laptop sleeps longer than the
+    // 15 minute detached TTL, or the remote daemon restarts, and the client
+    // wakes up to a server that has no memory of its session. The PTY cannot
+    // survive either event: the session store is in memory and the shell is a
+    // child of the process that went away.
     //
-    // Expiry has to be forced deterministically, or this test proves nothing,
-    // and two obvious ways to force it do not work. Dropping the tunnel and
-    // reaping shortly after does not: `debug block-tunnels` is only consulted
-    // on the generic exposure accept path, not on the builtin resumable-shell
-    // one, so the client reattaches inside the gap and the reap skips a session
-    // that still has an attach. SIGSTOP on the `fabric shell` process does not
-    // either: the tunnel client lives in the local daemon, not in the CLI, so
-    // freezing the CLI leaves the daemon reconnecting and resuming on its own.
+    // What used to happen is pinned by history: the client reported that the
+    // session could not resume and exited 1, and a person retyped the command.
+    // This test asks for the command to stay up instead. The loss is still
+    // reported, the refused resume is still never turned into a silent
+    // replacement, and then a NEW shell is started and announced, in the same
+    // terminal, so the person is back at a prompt without retyping anything.
     //
-    // Restarting the server daemon is deterministic and needs no timing at all.
-    // The session store is in memory, so the restarted daemon cannot know any
-    // session id, which is the same rejection an expired session produces and
-    // the same thing a laptop finds after sleeping past the TTL.
+    // Expiry has to be forced deterministically, or this proves nothing, and
+    // two obvious ways do not work. Dropping the tunnel and reaping shortly
+    // after does not: `debug block-tunnels` is only consulted on the generic
+    // exposure accept path, not on the builtin resumable-shell one, so the
+    // client reattaches inside the gap and the reap skips a session that still
+    // has an attach. SIGSTOP on the `fabric shell` process does not either: the
+    // tunnel client lives in the local daemon, not in the CLI, so freezing the
+    // CLI leaves the daemon reconnecting and resuming on its own.
     //
-    // What this pins is that the client treats that rejection as terminal. It
-    // does not silently attach to a fresh shell, which would let someone type
-    // into a session that is not theirs, and it does not retry a session the
-    // server has already refused, which would hang with no error and no exit.
+    // Restarting the server daemon is deterministic and needs no timing. The
+    // restarted daemon cannot know any session id, which is the same rejection
+    // an expired session produces and the same thing a laptop finds after
+    // sleeping past the TTL.
     let server_dir = TempDir::new()?;
     let client_dir = TempDir::new()?;
     let server_home = FabricHome::new(server_dir.path());
@@ -448,15 +451,17 @@ async fn shell_past_detached_ttl_reports_the_session_is_gone() -> Result<()> {
         .context("failed to spawn resumable fabric shell")?;
     let mut stdin = shell_child.stdin.take().context("shell stdin missing")?;
     let mut stdout = shell_child.stdout.take().context("shell stdout missing")?;
+    let mut stderr = shell_child.stderr.take().context("shell stderr missing")?;
 
-    // Mark the session, then prove the marker is unique to this PTY.
+    // Mark the PTY so a replacement can be told from a resume.
     stdin
-        .write_all(b"MARK=original; printf '%s-%s\n' before sleep\n")
+        .write_all(b"MARK=original; printf '%s-%s\n' before restart\n")
         .await?;
-    read_until_marker(&mut stdout, b"before-sleep").await?;
+    read_until_marker(&mut stdout, b"before-restart").await?;
 
     // Lose the session for real: the restarted daemon keeps its identity and
     // its allow-list, and has no memory of any session.
+    let restarted_at = Instant::now();
     server.shutdown().await?;
     let server = start_shell_server(server_home.clone()).await?;
     trust_peer(
@@ -468,38 +473,49 @@ async fn shell_past_detached_ttl_reports_the_session_is_gone() -> Result<()> {
     )
     .await?;
 
-    let mut stderr = shell_child.stderr.take().context("shell stderr missing")?;
-    let reader = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        let _ = tokio::time::timeout(Duration::from_secs(30), stderr.read_to_end(&mut buf)).await;
-        buf
-    });
-    let waited = tokio::time::timeout(Duration::from_secs(30), shell_child.wait()).await;
-    let reported = String::from_utf8_lossy(&reader.await.unwrap_or_default()).into_owned();
-
-    let Ok(status) = waited else {
-        let _ = shell_child.kill().await;
-        let _ = shell_child.wait().await;
-        bail!("shell never exited after its session was lost; it reported:\n{reported}");
-    };
-    let status = status.context("failed to wait for shell")?;
-
-    // A resume cannot legitimately succeed against a daemon that just lost its
-    // session store, so seeing one means the test measured the wrong thing.
+    // The loss is reported and the resume is refused: a resume cannot
+    // legitimately succeed against a daemon that just lost its session store,
+    // so seeing one means the test measured the wrong thing.
+    let reported = read_until_marker(&mut stderr, b"remote shell could not resume").await?;
+    let reported = String::from_utf8_lossy(&reported).into_owned();
     assert!(
         !reported.contains("session resumed"),
         "session was not actually lost; the client resumed it:\n{reported}"
     );
-    assert_ne!(
-        status.code(),
-        Some(0),
-        "shell exited cleanly despite losing its remote session:\n{reported}"
-    );
-    // The message has to name the session and say it is not coming back.
-    // "reconnecting" with no resolution is the failure this pins against.
     assert!(
-        reported.contains("remote shell could not resume") && reported.contains("expired"),
-        "shell exited without reporting that the remote session is gone:\n{reported}"
+        reported.contains("expired"),
+        "the refusal did not name the expired session:\n{reported}"
+    );
+
+    // Then the command stays up and says what it is doing. The stderr pipe
+    // closing here is the old behaviour: the client exited instead.
+    read_until_marker(&mut stderr, b"starting a new shell")
+        .await
+        .context("client did not announce a replacement shell")?;
+    read_until_marker(&mut stderr, b"is ready")
+        .await
+        .context("client did not announce the replacement shell as ready")?;
+    let restart_to_ready = restarted_at.elapsed();
+
+    // The replacement is a fresh PTY: the marker set before the restart is not
+    // there. Typing only after "is ready" is what a person does too, since
+    // input typed while disconnected is discarded rather than replayed into a
+    // shell with a different working directory and history.
+    stdin
+        .write_all(b"printf 'fresh-%s\n' \"${MARK:-pty}\"; exit 0\n")
+        .await?;
+    read_until_marker(&mut stdout, b"fresh-pty")
+        .await
+        .context("the replacement shell did not answer as a fresh PTY")?;
+    drop(stdin);
+
+    let status = tokio::time::timeout(Duration::from_secs(30), shell_child.wait())
+        .await
+        .context("replacement shell did not exit")??;
+    assert_eq!(status.code(), Some(0), "exit was not the replacement shell's");
+    eprintln!(
+        "MEASURE restart_to_replacement_ready_ms={}",
+        restart_to_ready.as_millis()
     );
 
     client.shutdown().await?;
