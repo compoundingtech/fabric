@@ -31,6 +31,10 @@ const SERVER_ERROR: u8 = 20;
 pub(crate) const EXIT_EXEC_DISABLED: i32 = 126;
 /// Exit code sent when the requested command could not be spawned (mirrors sh 127).
 const EXIT_SPAWN_FAILED: i32 = 127;
+/// How long to keep forwarding pipe output after the command has exited. The
+/// command's own output is already in the pipe buffers by then, so this only
+/// bounds how long a descendant holding the pipes can delay the exit frame.
+const EXIT_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 
 #[derive(Debug)]
 pub enum ServerFrame {
@@ -157,11 +161,21 @@ where
     let mut client_buf = [0u8; 1];
     let mut out_done = false;
     let mut err_done = false;
+    let mut status = None;
 
-    // Drain both pipes concurrently so a chatty stderr can't deadlock stdout.
-    // Keep reading the client side after argv so a quiet child cannot hide a
-    // disconnected caller.
-    while !out_done || !err_done {
+    // Drain both pipes concurrently so a chatty stderr can't deadlock stdout,
+    // and watch the child at the same time. Keep reading the client side after
+    // argv so a quiet child cannot hide a disconnected caller.
+    //
+    // The child's exit, not the pipes' end of file, is the end of the command.
+    // A command that starts something in the background and exits leaves that
+    // background process holding the inherited pipes, and waiting for them to
+    // close made the caller live exactly as long as the stranger did: 5.08 s
+    // for a `sleep 5 &` against 0.06 s for the same command without it,
+    // measured live. What the command wrote before exiting is already in the
+    // pipe buffers, so it is drained below; what a descendant writes later is
+    // not the command's output.
+    while !(out_done && err_done) && status.is_none() {
         tokio::select! {
             result = recv.read(&mut client_buf) => match result? {
                 0 => return Ok(()),
@@ -175,16 +189,39 @@ where
                 0 => err_done = true,
                 n => write_server_frame(send, ServerFrame::Stderr(err_buf[..n].to_vec())).await?,
             },
+            result = child.wait() => status = Some(result.context("exec wait failed")?),
         }
     }
 
-    let status = tokio::select! {
-        result = child.wait() => result.context("exec wait failed")?,
-        result = recv.read(&mut client_buf) => match result? {
-            0 => return Ok(()),
-            _ => bail!("unexpected exec client data after argv"),
+    let status = match status {
+        Some(status) => status,
+        None => tokio::select! {
+            result = child.wait() => result.context("exec wait failed")?,
+            result = recv.read(&mut client_buf) => match result? {
+                0 => return Ok(()),
+                _ => bail!("unexpected exec client data after argv"),
+            },
         },
     };
+
+    // The command has exited. Forward what it left in the pipes, then stop at
+    // end of file or after a short silence, whichever comes first: a pipe that
+    // stays open now belongs to a descendant that outlived the command.
+    let drain_until = tokio::time::Instant::now() + EXIT_DRAIN_GRACE;
+    while !(out_done && err_done) {
+        tokio::select! {
+            result = stdout.read(&mut out_buf), if !out_done => match result? {
+                0 => out_done = true,
+                n => write_server_frame(send, ServerFrame::Stdout(out_buf[..n].to_vec())).await?,
+            },
+            result = stderr.read(&mut err_buf), if !err_done => match result? {
+                0 => err_done = true,
+                n => write_server_frame(send, ServerFrame::Stderr(err_buf[..n].to_vec())).await?,
+            },
+            _ = tokio::time::sleep_until(drain_until) => break,
+        }
+    }
+
     // `code()` is None when the child was killed by a signal; report 1 there.
     write_server_frame(send, ServerFrame::Exit(status.code().unwrap_or(1))).await
 }
@@ -471,6 +508,66 @@ mod tests {
             .unwrap()
             .expect("the exec server task panicked")
             .expect("the exec server rejected client EOF");
+    }
+
+    /// A command that starts a background child and exits is over when it
+    /// exits. The child inherited the pipes and keeps them open; the exit frame
+    /// must not wait for it.
+    #[tokio::test]
+    async fn serve_exec_session_reports_exit_while_a_background_child_holds_the_pipes() {
+        let dir = TempDir::new().unwrap();
+        let pid_file = dir.path().join("background.pid");
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf before; /bin/sleep 30 & printf '%s' \"$!\" > \"$1\"; exit 5".to_string(),
+            "fabric-test".to_string(),
+            pid_file.display().to_string(),
+        ];
+        // A duplex, not a slice: a slice reads as end of file once the argv is
+        // consumed, which the server rightly takes for a disconnected caller.
+        let (mut client_send, mut server_recv) = tokio::io::duplex(4096);
+        write_client_argv(&mut client_send, &argv).await.unwrap();
+
+        let started = std::time::Instant::now();
+        let mut server_to_client = Vec::new();
+        let served = tokio::time::timeout(
+            Duration::from_secs(5),
+            serve_exec_session(&mut server_recv, &mut server_to_client, "test-peer"),
+        )
+        .await;
+        drop(client_send);
+        let elapsed = started.elapsed();
+        // Reap the orphaned background child whatever the outcome.
+        if let Ok(pid) = fs::read_to_string(&pid_file).map(|s| s.trim().parse::<i32>().unwrap_or(0))
+            && pid > 0
+        {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        served
+            .expect("the exec session waited for a background child instead of the command")
+            .expect("the exec session failed");
+
+        let mut reader = server_to_client.as_slice();
+        let mut stdout = Vec::new();
+        let mut exit = None;
+        while let Some(frame) = read_server_frame(&mut reader).await.unwrap() {
+            match frame {
+                ServerFrame::Stdout(b) => stdout.extend_from_slice(&b),
+                ServerFrame::Exit(code) => {
+                    exit = Some(code);
+                    break;
+                }
+                ServerFrame::Error(msg) => panic!("unexpected error frame: {msg}"),
+                ServerFrame::Stderr(_) => {}
+            }
+        }
+        assert_eq!(stdout, b"before", "output written before the exit was lost");
+        assert_eq!(exit, Some(5));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the exit frame took {elapsed:?}; it waited for the background child"
+        );
     }
 
     #[tokio::test]

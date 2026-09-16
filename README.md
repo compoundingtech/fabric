@@ -314,6 +314,16 @@ like `ssh -t`), so job control, `stty`, and full-screen programs work.
 TTY**, so `fabric exec <peer> -- bash -i` reports "no job control" / "stdin isn't a
 terminal". That is expected: use `fabric shell` when you want an interactive shell.
 
+`fabric exec` returns when the remote command exits, with that command's exit
+code. A process the command leaves running in the background keeps running, but
+it does not keep `fabric exec` alive: the exit frame follows the command's last
+output after a 200 ms grace, and anything the background process writes to the
+inherited pipes after that is not forwarded. Redirect its output on the remote
+side if you need it. Measured on a two-daemon pair on 2026-09-16, the client
+returned 0.23 s after a command that left a `sleep 15 &` behind, against 17.4 s
+before the change; live on the fleet the same shape cost 5.08 s for a
+`sleep 5 &` before the change, when the `sleep` closed the pipes.
+
 **Gotcha — the remote shell runs in the daemon's session, not your login
 session.** `fabric shell` spawns the shell as a child of the remote fabric daemon.
 On a managed install that daemon runs under launchd/systemd — a **non-GUI** session
