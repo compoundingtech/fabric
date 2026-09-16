@@ -525,6 +525,107 @@ async fn shell_starts_a_new_session_after_the_remote_daemon_restarts() -> Result
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shell_waits_for_its_own_daemon_to_restart_and_starts_a_new_session() -> Result<()> {
+    // The other daemon that can go away is the client's own. Its restart
+    // closes the local socket the CLI holds with no exit status, and for a
+    // moment there is nobody to ask for a replacement: the control socket is
+    // gone too. The CLI has to keep asking, once a second, until the daemon is
+    // back, and then start a new shell exactly as it does after a remote
+    // restart. The server still holds the old session detached; that is the
+    // server's business and expires on its own.
+    let server_dir = TempDir::new()?;
+    let client_dir = TempDir::new()?;
+    let server_home = FabricHome::new(server_dir.path());
+    let client_home = FabricHome::new(client_dir.path());
+    let server = start_shell_server(server_home.clone()).await?;
+    let client = FabricNode::start(client_home.clone()).await?;
+    trust_peer(
+        &server_home,
+        &server,
+        client.id(),
+        Some("client"),
+        Some(client.addr()),
+    )
+    .await?;
+    trust_peer(
+        &client_home,
+        &client,
+        server.id(),
+        Some("server"),
+        Some(server.addr()),
+    )
+    .await?;
+
+    let mut shell_child = tokio::process::Command::new(fabric_bin())
+        .arg("--home")
+        .arg(client_home.root())
+        .arg("shell")
+        .arg("server")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("failed to spawn resumable fabric shell")?;
+    let mut stdin = shell_child.stdin.take().context("shell stdin missing")?;
+    let mut stdout = shell_child.stdout.take().context("shell stdout missing")?;
+    let mut stderr = shell_child.stderr.take().context("shell stderr missing")?;
+
+    stdin
+        .write_all(b"MARK=original; printf '%s-%s-%s\n' before local restart\n")
+        .await?;
+    read_until_marker(&mut stdout, b"before-local-restart").await?;
+
+    // The client's own daemon goes away and comes back with the same identity.
+    client.shutdown().await?;
+    let announced = read_until_marker(&mut stderr, b"starting a new shell").await?;
+    assert!(
+        !String::from_utf8_lossy(&announced).contains("session resumed"),
+        "the session should have been lost, not resumed:\n{}",
+        String::from_utf8_lossy(&announced)
+    );
+    // Long enough for at least one refused request to the absent daemon.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let client = FabricNode::start(client_home.clone()).await?;
+    trust_peer(
+        &server_home,
+        &server,
+        client.id(),
+        Some("client"),
+        Some(client.addr()),
+    )
+    .await?;
+
+    let ready = read_until_marker(&mut stderr, b"is ready")
+        .await
+        .context("client did not announce the replacement shell as ready")?;
+    // Not asserted: whether the client asked before the daemon was back is a
+    // race with the restart. Shown so a run can be read.
+    eprintln!(
+        "client stderr while its daemon restarted:\n{}{}",
+        String::from_utf8_lossy(&announced),
+        String::from_utf8_lossy(&ready)
+    );
+    stdin
+        .write_all(b"printf 'fresh-%s\n' \"${MARK:-pty}\"; exit 0\n")
+        .await?;
+    read_until_marker(&mut stdout, b"fresh-pty")
+        .await
+        .context("the replacement shell did not answer as a fresh PTY")?;
+    drop(stdin);
+
+    let status = tokio::time::timeout(Duration::from_secs(30), shell_child.wait())
+        .await
+        .context("replacement shell did not exit")??;
+    assert_eq!(status.code(), Some(0), "exit was not the replacement shell's");
+
+    client.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shell_sigterm_restores_exact_terminal_mode() -> Result<()> {
     let server_dir = TempDir::new()?;
     let client_dir = TempDir::new()?;
@@ -1107,8 +1208,8 @@ async fn wait_for_restart_complete(home: &FabricHome) -> Result<()> {
 }
 
 async fn read_until_marker<R: AsyncRead + Unpin>(read: &mut R, marker: &[u8]) -> Result<Vec<u8>> {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        let mut output = Vec::new();
+    let mut output = Vec::new();
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
         let mut chunk = [0u8; 4096];
         loop {
             let count = read.read(&mut chunk).await?;
@@ -1121,12 +1222,20 @@ async fn read_until_marker<R: AsyncRead + Unpin>(read: &mut R, marker: &[u8]) ->
             }
             output.extend_from_slice(&chunk[..count]);
             if output.windows(marker.len()).any(|window| window == marker) {
-                return Ok(output);
+                return Ok(());
             }
         }
     })
-    .await
-    .context("timed out waiting for shell output marker")?
+    .await;
+    match result {
+        Ok(Ok(())) => Ok(output),
+        Ok(Err(error)) => Err(error),
+        Err(_) => bail!(
+            "timed out waiting for shell output marker {:?}; output so far={}",
+            String::from_utf8_lossy(marker),
+            String::from_utf8_lossy(&output)
+        ),
+    }
 }
 
 #[cfg(unix)]
