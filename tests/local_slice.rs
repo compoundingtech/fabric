@@ -1610,6 +1610,42 @@ async fn exec_exits_when_the_command_exits_even_if_a_background_child_holds_its_
         client_lifetime.saturating_sub(control_lifetime)
     );
 
+    // Every way a remote command can end must end its local client: success
+    // and failure with a background child left behind, a death by signal, and
+    // a command that never started. Each is bounded by the same difference
+    // against the warm control, and each reports the code the shell would.
+    // The shell's own code for an exec that cannot start differs by shell
+    // (126 or 127); the point is that the client ends with the shell's code.
+    let shapes: [(&str, &'static str, &[i32]); 4] = [
+        ("success with a background child", "printf ok; sleep 15 & exit 0", &[0]),
+        ("failure with a background child", "printf no; sleep 15 & exit 9", &[9]),
+        ("killed by a signal", "sleep 15 & kill -TERM $$", &[1]),
+        (
+            "command that does not exist",
+            "exec /nonexistent/fabric-test-binary",
+            &[126, 127],
+        ),
+    ];
+    for (name, script, expected) in shapes {
+        let (output, lifetime) = exec(script).await?;
+        eprintln!(
+            "MEASURE shape={name:?} client_lifetime_ms={} exit={:?}",
+            lifetime.as_millis(),
+            output.status.code()
+        );
+        assert!(
+            output.status.code().is_some_and(|code| expected.contains(&code)),
+            "{name}: exit {:?}, expected one of {expected:?}; stdout={:?} stderr={:?}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            lifetime.saturating_sub(control_lifetime) < Duration::from_secs(2),
+            "{name}: the client lived {lifetime:?} against a control of {control_lifetime:?}"
+        );
+    }
+
     client.shutdown().await?;
     server.shutdown().await?;
     Ok(())
