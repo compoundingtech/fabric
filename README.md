@@ -112,9 +112,11 @@ application of received state.
 
 Whether an unavailable peer matters is decided by the active session, route,
 sync, or consuming workload—not by a fleet-wide Fabric health classification.
-Remote shell continuity across all detach cases and daemon sleep/wake
-self-healing remain open work in [issue #21](https://github.com/compoundingtech/fabric/issues/21)
-and [PR #22](https://github.com/compoundingtech/fabric/pull/22). A future remote
+A `fabric shell` resumes the same PTY across a short loss and starts a new
+shell in the same terminal when the remote daemon restarted or the loss outlived
+the resume window (see the shell continuity notes under "Local Two-Node Test").
+Daemon sleep/wake self-healing remains open work in
+[issue #21](https://github.com/compoundingtech/fabric/issues/21). A future remote
 st2 PTY attachment composes with this boundary: Fabric transports the stream,
 while st2/PTY owns the PTY child, terminal policy, and lifecycle/expiry.
 
@@ -1669,8 +1671,25 @@ bounds how long a session lives, not how much it holds.
 > stated reason not to raise the TTL further, so that reason no longer applies.
 
 Past the window, the client does not retry a session the server has already
-refused: it reports `remote shell could not resume`, names the expired session,
-and exits non-zero, so a dead session ends promptly instead of hanging.
-Restarting the remote daemon has the same effect, because the session store is
-in memory. What is lost in both cases is the PTY and its scrollback, not just
-the connection; only outages shorter than the window resume in place.
+refused: it reports `remote shell could not resume` and names the expired
+session. Restarting the remote daemon has the same effect, because the session
+store is in memory. What is lost in both cases is the PTY and its scrollback,
+not just the connection; only outages shorter than the window resume in place.
+
+The command itself does not end there. A shell that had answered before its
+session was lost is replaced, in the same raw terminal: the client says
+`starting a new shell`, asks its local daemon for a new session to the same
+peer (and keeps asking once a second if that daemon is itself restarting), and
+announces `new remote shell ... is ready` when the fresh PTY first answers.
+Measured on a two-daemon pair on 2026-09-16, a held shell whose remote daemon
+restarted was back at a fresh prompt 1.98 to 2.02 s after the restart (3 runs);
+before this change the command exited with code 1 after 1.19 to 1.32 s (3
+runs) and the person retyped it. Bytes typed between the loss and the first
+answer are discarded and counted, never replayed: the new shell has a different
+working directory and history from the one they were meant for. Ctrl-C while
+disconnected ends the command with code 130. The replacement is bounded: if no
+new shell answers within 5 minutes the client gives up with code 1. A session
+that never answered ends the command as before, because that is what a refusal
+looks like, and so does a session lost after stdin reached end of file, because
+nobody is left to type. While a reconnect is in progress the daemon's status
+lines overwrite one line on the terminal instead of scrolling the session away.
