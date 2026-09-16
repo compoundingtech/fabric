@@ -53,6 +53,18 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **`fabric exec` returns when the remote command exits, even if the command
+  left a background process holding its output pipes.** The exec server waited
+  for both pipes to reach end of file before reporting the exit status, so a
+  command such as `sh -c 'something & exit'` kept the local client alive for as
+  long as the background process lived: 5.08 s for a `sleep 5 &` against 0.06 s
+  without it, measured live on 2026-09-16. The server now watches the child
+  while it drains, and once the command has exited it forwards what the command
+  left in the pipes, waits at most 200 ms more, and sends the exit frame. On a
+  two-daemon pair the client now returns 0.23 s after a command that left a
+  `sleep 15 &` behind, against 17.4 s before. The background process keeps
+  running; only its later output is no longer the command's.
+
 - **A network change now re-proves every held peer connection instead of
   trusting the endpoint's own online state.** After the debounced notice the
   daemon asks each peer whose shared connection it still holds to answer one

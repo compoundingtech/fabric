@@ -1522,6 +1522,136 @@ async fn exec_names_the_peer_and_service_when_the_peer_acl_refuses_it() -> Resul
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_exits_when_the_command_exits_even_if_a_background_child_holds_its_pipes() -> Result<()> {
+    // A command that starts something in the background and exits is an
+    // ordinary thing to run remotely. The background child inherits the
+    // command's stdout and stderr, and the exec server used to wait for both
+    // pipes to reach end of file before it reported the exit status, so the
+    // local `fabric exec` lived exactly as long as that child did: measured
+    // live at 5.08 s for a `sleep 5 &` against 0.06 s for the same command
+    // without it. The remote command's exit is the event to report; output a
+    // stranger writes to the inherited pipes afterwards is not the command's.
+    let _guard = local_slice_guard().await;
+    let server_dir = TempDir::new()?;
+    let client_dir = TempDir::new()?;
+    let server_home = FabricHome::new(server_dir.path());
+    let client_home = FabricHome::new(client_dir.path());
+    let server = FabricNode::start(server_home.clone()).await?;
+    let client = FabricNode::start(client_home.clone()).await?;
+    trust_peer_allowing(
+        &server_home,
+        &server,
+        client.id(),
+        Some("client"),
+        Some(client.addr()),
+        &["exec", "echo"],
+    )
+    .await?;
+    trust_peer(
+        &client_home,
+        &client,
+        server.id(),
+        Some("server"),
+        Some(server.addr()),
+    )
+    .await?;
+    assert_eq!(client.ping("server").await?.bytes, 32);
+
+    // Control: the same command with nothing left behind. Most of this time is
+    // two fresh daemons meeting for the first time, which is why the property
+    // below is the difference, not the absolute.
+    let exec = |script: &'static str| {
+        let home = client_home.root().to_path_buf();
+        async move {
+            let started = Instant::now();
+            let output = tokio::time::timeout(
+                FABRIC_COMMAND_TIMEOUT,
+                tokio::process::Command::new(fabric_bin())
+                    .arg("--home")
+                    .arg(home)
+                    .args(["exec", "server", "--", "sh", "-c", script])
+                    .output(),
+            )
+            .await
+            .with_context(|| format!("fabric exec did not return for {script:?}"))??;
+            Ok::<_, anyhow::Error>((output, started.elapsed()))
+        }
+    };
+    let (control, control_lifetime) = exec("printf done; exit 3").await?;
+    assert_eq!(
+        control.status.code(),
+        Some(3),
+        "stderr: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+
+    let (output, client_lifetime) = exec("printf done; sleep 15 & exit 3").await?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!(
+        "MEASURE exec_client_lifetime_ms={} control_ms={} exit={:?}",
+        client_lifetime.as_millis(),
+        control_lifetime.as_millis(),
+        output.status.code()
+    );
+
+    assert_eq!(output.status.code(), Some(3), "stderr: {stderr}");
+    assert_eq!(stdout, "done", "stderr: {stderr}");
+    // The command exits at once. Anything near the child's 15 s is the client
+    // waiting for a pipe the command no longer owns; the exit frame may follow
+    // the final output by at most the server's short drain grace.
+    assert!(
+        client_lifetime < Duration::from_secs(5),
+        "fabric exec lived {client_lifetime:?} after a command that exited at once"
+    );
+    assert!(
+        client_lifetime.saturating_sub(control_lifetime) < Duration::from_secs(2),
+        "a background child added {:?} to the client's lifetime (control {control_lifetime:?})",
+        client_lifetime.saturating_sub(control_lifetime)
+    );
+
+    // Every way a remote command can end must end its local client: success
+    // and failure with a background child left behind, a death by signal, and
+    // a command that never started. Each is bounded by the same difference
+    // against the warm control, and each reports the code the shell would.
+    // The shell's own code for an exec that cannot start differs by shell
+    // (126 or 127); the point is that the client ends with the shell's code.
+    let shapes: [(&str, &'static str, &[i32]); 4] = [
+        ("success with a background child", "printf ok; sleep 15 & exit 0", &[0]),
+        ("failure with a background child", "printf no; sleep 15 & exit 9", &[9]),
+        ("killed by a signal", "sleep 15 & kill -TERM $$", &[1]),
+        (
+            "command that does not exist",
+            "exec /nonexistent/fabric-test-binary",
+            &[126, 127],
+        ),
+    ];
+    for (name, script, expected) in shapes {
+        let (output, lifetime) = exec(script).await?;
+        eprintln!(
+            "MEASURE shape={name:?} client_lifetime_ms={} exit={:?}",
+            lifetime.as_millis(),
+            output.status.code()
+        );
+        assert!(
+            output.status.code().is_some_and(|code| expected.contains(&code)),
+            "{name}: exit {:?}, expected one of {expected:?}; stdout={:?} stderr={:?}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            lifetime.saturating_sub(control_lifetime) < Duration::from_secs(2),
+            "{name}: the client lived {lifetime:?} against a control of {control_lifetime:?}"
+        );
+    }
+
+    client.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_file_remains_authoritative_when_daemon_config_is_created() -> Result<()> {
     let _guard = local_slice_guard().await;
     let node_a_dir = TempDir::new()?;
