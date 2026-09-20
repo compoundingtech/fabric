@@ -476,8 +476,9 @@ async fn shell_starts_a_new_session_after_the_remote_daemon_restarts() -> Result
     // The loss is reported and the resume is refused: a resume cannot
     // legitimately succeed against a daemon that just lost its session store,
     // so seeing one means the test measured the wrong thing.
-    let reported = read_until_marker(&mut stderr, b"remote shell could not resume").await?;
-    let reported = String::from_utf8_lossy(&reported).into_owned();
+    let mut seen = Vec::new();
+    read_more_until_marker(&mut stderr, &mut seen, b"remote shell could not resume").await?;
+    let reported = String::from_utf8_lossy(&seen).into_owned();
     assert!(
         !reported.contains("session resumed"),
         "session was not actually lost; the client resumed it:\n{reported}"
@@ -488,11 +489,12 @@ async fn shell_starts_a_new_session_after_the_remote_daemon_restarts() -> Result
     );
 
     // Then the command stays up and says what it is doing. The stderr pipe
-    // closing here is the old behaviour: the client exited instead.
-    read_until_marker(&mut stderr, b"starting a new shell")
+    // closing here is the old behaviour: the client exited instead. The three
+    // notices can arrive in one read, so each search covers everything seen.
+    read_more_until_marker(&mut stderr, &mut seen, b"starting a new shell")
         .await
         .context("client did not announce a replacement shell")?;
-    read_until_marker(&mut stderr, b"is ready")
+    read_more_until_marker(&mut stderr, &mut seen, b"is ready")
         .await
         .context("client did not announce the replacement shell as ready")?;
     let restart_to_ready = restarted_at.elapsed();
@@ -578,11 +580,12 @@ async fn shell_waits_for_its_own_daemon_to_restart_and_starts_a_new_session() ->
 
     // The client's own daemon goes away and comes back with the same identity.
     client.shutdown().await?;
-    let announced = read_until_marker(&mut stderr, b"starting a new shell").await?;
+    let mut seen = Vec::new();
+    read_more_until_marker(&mut stderr, &mut seen, b"starting a new shell").await?;
     assert!(
-        !String::from_utf8_lossy(&announced).contains("session resumed"),
+        !String::from_utf8_lossy(&seen).contains("session resumed"),
         "the session should have been lost, not resumed:\n{}",
-        String::from_utf8_lossy(&announced)
+        String::from_utf8_lossy(&seen)
     );
     // Long enough for at least one refused request to the absent daemon.
     tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -596,15 +599,14 @@ async fn shell_waits_for_its_own_daemon_to_restart_and_starts_a_new_session() ->
     )
     .await?;
 
-    let ready = read_until_marker(&mut stderr, b"is ready")
+    read_more_until_marker(&mut stderr, &mut seen, b"is ready")
         .await
         .context("client did not announce the replacement shell as ready")?;
     // Not asserted: whether the client asked before the daemon was back is a
     // race with the restart. Shown so a run can be read.
     eprintln!(
-        "client stderr while its daemon restarted:\n{}{}",
-        String::from_utf8_lossy(&announced),
-        String::from_utf8_lossy(&ready)
+        "client stderr while its daemon restarted:\n{}",
+        String::from_utf8_lossy(&seen)
     );
     stdin
         .write_all(b"printf 'fresh-%s\n' \"${MARK:-pty}\"; exit 0\n")
@@ -1204,6 +1206,50 @@ async fn wait_for_restart_complete(home: &FabricHome) -> Result<()> {
             bail!("timed out waiting for restart completion; last log: {current}");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Like `read_until_marker`, but on a stream read in several steps: `seen`
+/// keeps everything read so far, and a marker that already arrived in an
+/// earlier chunk is found there instead of being waited for. A read returns
+/// whole chunks, so two notices written microseconds apart land in one read;
+/// searching only what arrives after the previous marker missed the second
+/// notice on a fast runner and timed out on a line that had already passed.
+async fn read_more_until_marker<R: AsyncRead + Unpin>(
+    read: &mut R,
+    seen: &mut Vec<u8>,
+    marker: &[u8],
+) -> Result<()> {
+    let contains = |buffer: &[u8]| buffer.windows(marker.len()).any(|window| window == marker);
+    if contains(seen) {
+        return Ok(());
+    }
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut chunk = [0u8; 4096];
+        loop {
+            let count = read.read(&mut chunk).await?;
+            if count == 0 {
+                bail!(
+                    "shell output closed before marker {:?}; output={}",
+                    String::from_utf8_lossy(marker),
+                    String::from_utf8_lossy(seen)
+                );
+            }
+            seen.extend_from_slice(&chunk[..count]);
+            if contains(seen) {
+                return Ok(());
+            }
+        }
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error),
+        Err(_) => bail!(
+            "timed out waiting for shell output marker {:?}; output so far={}",
+            String::from_utf8_lossy(marker),
+            String::from_utf8_lossy(seen)
+        ),
     }
 }
 
