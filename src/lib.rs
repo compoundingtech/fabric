@@ -12,6 +12,7 @@ pub mod daemon;
 pub mod doctor;
 pub mod exec;
 pub mod gitremote;
+pub mod join;
 pub mod mux;
 pub mod pathwatch;
 pub mod sendfile;
