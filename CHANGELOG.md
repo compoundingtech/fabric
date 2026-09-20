@@ -8,6 +8,20 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Added
 
+- **`fabric join <ssh-host>` pairs with a machine you can already ssh to, in one
+  command and both directions.** It runs `fabric id` there over your own ssh
+  (config, agent and prompts included), trusts that id here under the host's
+  name, and runs `fabric add` and `fabric reload-peers` there for this machine.
+  Nothing is copied but two public keys; what it writes is what the six manual
+  steps wrote. `--allow` is what the far side lets this machine use (default
+  `shell,exec`, what an ssh login already amounts to); `--grant` is what this
+  machine lets the far side use (default nothing). A repeat without those flags
+  keeps a known peer's grants on both sides. `fabric join --all` joins every
+  named `Host` in `~/.ssh/config`, the list of machines a person has already
+  named for themselves; several hosts can also be passed at once. A far side
+  without fabric is reported with the install command. Exit code 1 if any host
+  was not joined.
+
 - **A change to a synced folder can be staged, reviewed, and published on
   purpose.** `fabric sync stage <target>` makes a staged copy under the fabric
   home, outside every synced folder, and records the published file's hash as

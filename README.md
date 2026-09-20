@@ -79,8 +79,9 @@ See [Expose And Dial A Service](#expose-and-dial-a-service) for the next step.
 Adding a new machine — say a travel laptop — to a mesh that already has peers
 (say your desktop and a server) is the same mutual-trust step as above, done once
 per existing peer. There is **no auto-pairing/discovery of trust**: you exchange
-**NodeIDs by hand**. Trust is symmetric, so the new machine AND each existing peer
-must each `fabric add` the other. Nothing is copied between machines except NodeID
+**NodeIDs by hand**, or let `fabric join` exchange them over an ssh connection
+you already have (next section). Trust is symmetric, so the new machine AND each
+existing peer must each `fabric add` the other. Nothing is copied between machines except NodeID
 strings — they are public keys, safe to paste anywhere. The new machine generates
 its own identity on first start; you do **not** copy any file (identity, peers,
 config) from an existing machine.
@@ -119,6 +120,47 @@ Daemon sleep/wake self-healing remains open work in
 [issue #21](https://github.com/compoundingtech/fabric/issues/21). A future remote
 st2 PTY attachment composes with this boundary: Fabric transports the stream,
 while st2/PTY owns the PTY child, terminal policy, and lifecycle/expiry.
+
+### One command, if you can already ssh to the other machine
+
+```sh
+fabric join server            # an alias from ~/.ssh/config, or user@host
+fabric join --all             # every named Host in ~/.ssh/config
+fabric join server laptop desk  # several at once
+```
+
+`fabric join` uses the ssh you already have, with your own config, agent and
+prompts, to run `fabric id` on the far machine, trust that id here under the
+host's name, and run `fabric add` plus `fabric reload-peers` there for this
+machine. Nothing is copied but two public keys, and what it writes is exactly
+what the manual steps below write; `fabric remove` on each side undoes it.
+
+What each side grants is separate, because ssh access is one-directional:
+
+- `--allow shell,exec` (the default) is what the far machine lets **this**
+  machine use, which is what an ssh login already amounts to. Add `sync` or an
+  exposed name deliberately.
+- `--grant` is what this machine lets the **far** machine use; the default is
+  nothing, because being able to ssh somewhere never let it reach you.
+
+A join is safe to repeat: without `--allow` or `--grant`, a peer either side
+already knows keeps the grants it has. `--name` sets the name the far side
+records for this machine (default: this host's short name). `--local-only`
+writes trust here and leaves the far side alone. `--dry-run` prints the plan.
+
+`--all` reads the named `Host` entries in `~/.ssh/config` (patterns such as
+`Host *` and negations are skipped; `Include` files are not followed). That
+file is the list of machines a person has already named for themselves, with
+the user, port and key each one needs; `known_hosts` is not used, because it
+is a record of every host ever contacted, including services that will never
+run fabric, and is often hashed. In `--all` mode, or with more than one host,
+ssh runs without prompts, so a host that would ask for a passphrase or a new
+host key is reported as not joined rather than stalling the rest. The exit
+code is 1 if any host was not joined; the ones that were are trusted on both
+sides.
+
+If the far machine has no fabric yet, the join says so and prints the install
+command; run it there, then join again.
 
 ### 1. On the NEW machine — install, start the managed daemon, print its NodeID
 

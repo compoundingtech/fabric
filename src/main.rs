@@ -109,6 +109,40 @@ enum Commands {
         #[arg(long = "allow", value_delimiter = ',')]
         allow: Option<Vec<String>>,
     },
+    /// Pair with a machine you can already ssh to: one command, both directions.
+    ///
+    /// Runs `fabric id` there over your own ssh (config, agent and prompts
+    /// included), trusts that id here under the host's name, then runs
+    /// `fabric add` and `fabric reload-peers` there for this machine. Nothing is
+    /// copied but two public keys. What it writes is exactly what the manual
+    /// `fabric add` steps write; `fabric remove` on each side undoes it.
+    Join {
+        /// ssh destinations: aliases from ~/.ssh/config or user@host.
+        hosts: Vec<String>,
+        /// Join every named Host in ~/.ssh/config (patterns like `*` are skipped).
+        /// ssh runs without prompts in this mode, so a host that would ask for a
+        /// passphrase or a new host key is reported, not joined.
+        #[arg(long)]
+        all: bool,
+        /// Services that machine lets THIS machine use. Default: shell,exec, which
+        /// is what an ssh login already amounts to. Add sync or an exposed name
+        /// deliberately.
+        #[arg(long = "allow", value_delimiter = ',')]
+        allow: Option<Vec<String>>,
+        /// Services THIS machine lets that machine use. Default: none, because
+        /// being able to ssh somewhere never let it reach you.
+        #[arg(long = "grant", value_delimiter = ',')]
+        grant: Option<Vec<String>>,
+        /// The name that machine records for this one. Default: this host's name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Only write trust here; leave the far side's peers.toml alone.
+        #[arg(long)]
+        local_only: bool,
+        /// Print what would be joined and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Remove a trusted peer by NodeID or name.
     Remove { peer: String },
     /// Send one file to a peer's inbox. One shot, one direction, no deletes.
@@ -724,6 +758,19 @@ async fn main() -> Result<()> {
                     SyncBook::load(&home)?.validate_against(&book)?;
                     book.save(&home)?;
                     let _ = send_control(&home, ControlRequest::ReloadPeers).await;
+                }
+                Commands::Join {
+                    hosts,
+                    all,
+                    allow,
+                    grant,
+                    name,
+                    local_only,
+                    dry_run,
+                } => {
+                    let code = run_join(&home, hosts, all, allow, grant, name, local_only, dry_run)
+                        .await?;
+                    std::process::exit(code);
                 }
                 Commands::SendFile { peer, path, r#as } => {
                     let name = match r#as {
@@ -3517,6 +3564,248 @@ async fn wait_for_replacement_shell(
             }
         }
     }
+}
+
+/// One joined host, or why it was not.
+struct JoinOutcome {
+    host: String,
+    result: Result<String>,
+}
+
+/// `fabric join`: see the command's help. Returns the process exit code: 0 when
+/// every host joined, 1 when any did not.
+#[allow(clippy::too_many_arguments)]
+async fn run_join(
+    home: &FabricHome,
+    hosts: Vec<String>,
+    all: bool,
+    allow: Option<Vec<String>>,
+    grant: Option<Vec<String>>,
+    name: Option<String>,
+    local_only: bool,
+    dry_run: bool,
+) -> Result<i32> {
+    use fabric::join;
+
+    let allow = match allow {
+        Some(services) => join::AllowPolicy::Explicit(services),
+        None => join::AllowPolicy::DefaultIfNew(
+            join::DEFAULT_ALLOW
+                .iter()
+                .map(|service| service.to_string())
+                .collect(),
+        ),
+    };
+    let allow_services = match &allow {
+        join::AllowPolicy::Explicit(services) | join::AllowPolicy::DefaultIfNew(services) => {
+            services.clone()
+        }
+    };
+    for service in allow_services.iter().chain(grant.iter().flatten()) {
+        join::validate_token("service", service)?;
+    }
+    let local_name = match name {
+        Some(name) => name,
+        // The short name: `hostname` may answer with a domain suffix the far
+        // side has no use for.
+        None => fabric::ca::hostname()
+            .split('.')
+            .next()
+            .unwrap_or("this machine")
+            .to_string(),
+    };
+    join::validate_token("name", &local_name)?;
+
+    let mut targets = hosts;
+    if all {
+        let home_dir = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .context("HOME is not set; pass hosts explicitly instead of --all")?;
+        let path = join::ssh_config_path(&home_dir);
+        let config = match fs::read_to_string(&path) {
+            Ok(config) => config,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read {}", path.display()));
+            }
+        };
+        let found = join::ssh_config_hosts(&config);
+        if found.is_empty() && targets.is_empty() {
+            bail!(
+                "no named Host entries in {}; add one per machine there, or pass hosts on the \
+                 command line",
+                path.display()
+            );
+        }
+        for host in found {
+            if !targets.contains(&host) {
+                targets.push(host);
+            }
+        }
+    }
+    if targets.is_empty() {
+        bail!("nothing to join: pass one or more ssh hosts, or --all");
+    }
+    for host in &targets {
+        join::validate_token("host", host)?;
+    }
+
+    let local_id = load_or_create_identity(home)?.public();
+    let grant_text = match &grant {
+        Some(services) if !services.is_empty() => services.join(","),
+        Some(_) => "-".to_string(),
+        None => "- (a known peer keeps its grants)".to_string(),
+    };
+    let allow_text = match &allow {
+        join::AllowPolicy::Explicit(services) if services.is_empty() => "-".to_string(),
+        join::AllowPolicy::Explicit(services) => services.join(","),
+        join::AllowPolicy::DefaultIfNew(services) => {
+            format!("{} (a known peer keeps its grants)", services.join(","))
+        }
+    };
+    if dry_run {
+        for host in &targets {
+            println!("would join\t{host}\tallow there={allow_text}\tgrant here={grant_text}\tas={local_name}");
+        }
+        return Ok(0);
+    }
+
+    let batch = all || targets.len() > 1;
+    let mut outcomes = Vec::new();
+    for host in &targets {
+        let result = join_one(
+            home,
+            host,
+            local_id,
+            &local_name,
+            &allow,
+            grant.as_deref(),
+            local_only,
+            batch,
+        )
+        .await;
+        outcomes.push(JoinOutcome {
+            host: host.clone(),
+            result,
+        });
+    }
+
+    let mut failed = 0;
+    for outcome in &outcomes {
+        match &outcome.result {
+            Ok(summary) => println!("joined\t{}\t{summary}", outcome.host),
+            Err(error) => {
+                failed += 1;
+                eprintln!("fabric: {} was not joined: {error:#}", outcome.host);
+            }
+        }
+    }
+    if failed == 0 {
+        Ok(0)
+    } else {
+        eprintln!(
+            "fabric: {failed} of {} host(s) not joined; the ones that were are trusted on both sides",
+            outcomes.len()
+        );
+        Ok(1)
+    }
+}
+
+/// Join a single host. Trust is written here first, so a far side that then
+/// fails leaves this machine able to see the peer once someone adds it there.
+#[allow(clippy::too_many_arguments)]
+async fn join_one(
+    home: &FabricHome,
+    host: &str,
+    local_id: iroh::EndpointId,
+    local_name: &str,
+    allow: &fabric::join::AllowPolicy,
+    grant: Option<&[String]>,
+    local_only: bool,
+    batch: bool,
+) -> Result<String> {
+    use fabric::join;
+
+    let output = join::ssh_run(host, &join::remote_id_command(), batch)?;
+    let stdout = join::classify(&output).map_err(anyhow::Error::from)?;
+    let remote_id = join::parse_remote_id(&stdout)?;
+    if remote_id == local_id {
+        bail!("that is this machine (same fabric id); nothing to join");
+    }
+
+    let mut book = PeerBook::load(home)?;
+    let previous = book
+        .peers()
+        .iter()
+        .find(|peer| peer.id == remote_id)
+        .map(|peer| peer.allow.clone());
+    // No --grant: a peer already here keeps what it has (add_with_allow
+    // preserves an existing entry's allow when given None); a new one gets
+    // nothing, which is what an omitted --allow means everywhere in fabric.
+    let effective_grant = grant
+        .map(<[String]>::to_vec)
+        .or_else(|| previous.clone())
+        .unwrap_or_default();
+    warn_if_permissions_would_stop_a_sync(home, &Some(effective_grant.clone()))?;
+    book.add_with_allow(
+        remote_id,
+        Some(host.to_string()),
+        None,
+        grant.map(<[String]>::to_vec),
+    );
+    SyncBook::load(home)?.validate_against(&book)?;
+    book.save(home)?;
+    let local_daemon = send_control(home, ControlRequest::ReloadPeers).await.is_ok();
+
+    let mut summary = format!(
+        "id={remote_id}\tgrant here={}",
+        if effective_grant.is_empty() {
+            "-".to_string()
+        } else {
+            effective_grant.join(",")
+        }
+    );
+    if let Some(previous) = previous
+        && previous != effective_grant
+    {
+        summary.push_str(&format!(
+            " (was {})",
+            if previous.is_empty() {
+                "-".to_string()
+            } else {
+                previous.join(",")
+            }
+        ));
+    }
+    if !local_daemon {
+        summary.push_str("\tlocal daemon not running; trust applies when it starts");
+    }
+
+    if local_only {
+        summary.push_str("\tfar side untouched (--local-only)");
+        return Ok(summary);
+    }
+
+    let output = join::ssh_run(
+        host,
+        &join::remote_add_command(local_id, local_name, allow),
+        batch,
+    )?;
+    let far = join::classify(&output).map_err(anyhow::Error::from)?;
+    summary.push_str(&format!(
+        "\tallow there={}\tas={local_name}",
+        match allow {
+            join::AllowPolicy::Explicit(services) if services.is_empty() => "-".to_string(),
+            join::AllowPolicy::Explicit(services) => services.join(","),
+            join::AllowPolicy::DefaultIfNew(services) => {
+                format!("{} if new, kept if known", services.join(","))
+            }
+        }
+    ));
+    if !far.contains("reloaded") {
+        summary.push_str("\tits daemon did not reload; trust applies when it starts");
+    }
+    Ok(summary)
 }
 
 /// Drive the client side of a `fabric exec` session over the daemon-provided
