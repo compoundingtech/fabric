@@ -1745,3 +1745,23 @@ that never answered ends the command as before, because that is what a refusal
 looks like, and so does a session lost after stdin reached end of file, because
 nobody is left to type. While a reconnect is in progress the daemon's status
 lines overwrite one line on the terminal instead of scrolling the session away.
+
+Whatever a session did to the terminal in front of you is undone when the
+session ends, and before a replacement shell starts. A program inside the remote
+shell that dies without cleaning up (an attach client whose daemon restarted, an
+editor killed mid-screen) leaves your terminal in the alternate screen, with
+mouse movement and focus changes arriving as escape sequences and the cursor
+hidden; the remote prompt comes back, but on a terminal that is hard to use. The
+client cannot see that program die. It can see every byte the session wrote,
+so it keeps track of the private modes the session set and has not cleared
+(alternate screen, bracketed paste, mouse and focus reporting, synchronized
+output, cursor visibility, application cursor keys and keypad, auto-wrap,
+origin mode), the application keypad and text attributes, and writes exactly
+the matching resets: when the session exits, when it is lost and replaced (the
+resets come before `starting a new shell`, so the new shell starts on a clean
+terminal), on an error, and before the client re-raises a signal that ends it.
+Termios is restored exactly on the same paths. A session that set nothing gets
+no bytes. While the outer shell is still up and the inner program has died, the
+terminal stays as that program left it: nothing reaches the client to act on,
+and the reset belongs to the program that set the modes; `reset` at the remote
+prompt, or leaving the shell, puts it back.

@@ -67,6 +67,23 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **`fabric shell` puts the local terminal back when a session ends or is
+  replaced, undoing what the session set and nothing else.** A program inside
+  the remote shell that dies without cleaning up (an attach client whose daemon
+  restarted, an editor killed mid-screen) leaves the terminal in front of the
+  person in the alternate screen, reporting every mouse movement and window
+  focus change as escape sequences, with the cursor hidden. The client cannot
+  see that program die, but every byte that set those modes passed through it,
+  so it now tracks the private modes a session sets and resets (alternate
+  screen, bracketed paste, mouse and focus reporting, synchronized output,
+  cursor visibility, application cursor keys and keypad, auto-wrap, origin
+  mode), the application keypad and text attributes, and writes the matching
+  resets when the session exits, when it is lost and a new shell replaces it
+  (before the loss is announced, so the new shell starts on a clean terminal),
+  on an error, and before re-raising a terminating signal. Termios was already
+  restored exactly on every path and still is. A session that set nothing gets
+  no bytes, and modes it cleared itself are not reset again.
+
 - **`fabric exec` returns when the remote command exits, even if the command
   left a background process holding its output pipes.** The exec server waited
   for both pipes to reach end of file before reporting the exit status, so a
