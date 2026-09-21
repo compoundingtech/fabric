@@ -3,6 +3,7 @@ use std::{
     io::Write,
     path::Path,
     process::{Command, Output, Stdio},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -1285,7 +1286,7 @@ async fn read_until_marker<R: AsyncRead + Unpin>(read: &mut R, marker: &[u8]) ->
 }
 
 #[cfg(unix)]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct TerminalSnapshot {
     input: libc::tcflag_t,
     output: libc::tcflag_t,
@@ -1321,4 +1322,417 @@ fn sh_quote(value: &str) -> String {
 
 fn sh_quote_path(path: &Path) -> String {
     sh_quote(&path.display().to_string())
+}
+
+/// What a program inside the remote shell writes when it behaves like a
+/// terminal multiplexer's attach client: raw termios on the remote pty, then
+/// the alternate screen, bracketed paste, mouse and focus reporting,
+/// synchronized output, a hidden cursor, the application keypad and a text
+/// attribute. It prints a marker with its pid and blocks, so a test can kill
+/// it before it cleans anything up, which is what a lost daemon does to it.
+#[cfg(unix)]
+const INNER_PROGRAM: &[u8] = b"sh -c 'stty raw -echo; printf \"\\033[?1049h\\033[?2004h\\033[?1000h\\033[?1006h\\033[?1004h\\033[?2026h\\033[?25l\\033=\\033[1;31m\"; printf \"INNER-%s-%s-END\\n\" PID $$; exec sleep 60'\n";
+
+/// The bytes the inner program puts on the local terminal, contiguous.
+#[cfg(unix)]
+const INNER_MODES_SET: &[u8] =
+    b"\x1b[?1049h\x1b[?2004h\x1b[?1000h\x1b[?1006h\x1b[?1004h\x1b[?2026h\x1b[?25l\x1b=\x1b[1;31m";
+
+/// Modes the inner program set that no shell prompt touches on its own, so a
+/// reset of them after the program died can only have come from the client.
+#[cfg(unix)]
+const MODES_ONLY_THE_CLIENT_RESETS: &[u16] = &[1049, 1000, 1006, 1004, 2026];
+
+#[cfg(unix)]
+struct PtyShell {
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    writer: Box<dyn Write + Send>,
+    /// Everything the local terminal has received, stdout and stderr alike.
+    seen: Arc<Mutex<Vec<u8>>>,
+    terminal_fd: std::os::fd::RawFd,
+    before: TerminalSnapshot,
+}
+
+#[cfg(unix)]
+impl PtyShell {
+    fn spawn(client_home: &FabricHome, peer: &str) -> Result<Self> {
+        let pair = native_pty_system().openpty(PtySize::default())?;
+        let terminal_fd = pair
+            .master
+            .as_raw_fd()
+            .context("pseudo-terminal did not expose a raw fd")?;
+        let before = terminal_snapshot(terminal_fd)?;
+        let mut command = CommandBuilder::new(fabric_bin());
+        command.arg("--home");
+        command.arg(client_home.root());
+        command.arg("shell");
+        command.arg(peer);
+        let child = pair.slave.spawn_command(command)?;
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader()?;
+        let writer = pair.master.take_writer()?;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => sink.lock().unwrap().extend_from_slice(&chunk[..count]),
+                }
+            }
+        });
+        Ok(Self {
+            _master: pair.master,
+            child,
+            writer,
+            seen,
+            terminal_fd,
+            before,
+        })
+    }
+
+    fn pid(&self) -> Result<libc::pid_t> {
+        Ok(self
+            .child
+            .process_id()
+            .context("shell child has no process id")? as libc::pid_t)
+    }
+
+    fn seen(&self) -> Vec<u8> {
+        self.seen.lock().unwrap().clone()
+    }
+
+    /// Index just past the first `marker` at or after `from`, waiting for it.
+    async fn wait_for(&self, marker: &[u8], from: usize) -> Result<usize> {
+        let started = Instant::now();
+        loop {
+            let seen = self.seen();
+            if let Some(at) = find_from(&seen, marker, from) {
+                return Ok(at + marker.len());
+            }
+            if started.elapsed() > Duration::from_secs(30) {
+                bail!(
+                    "timed out waiting for {:?} on the terminal; seen={}",
+                    String::from_utf8_lossy(marker),
+                    String::from_utf8_lossy(&seen)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Type the inner program and wait for it to be running with its modes
+    /// set. Returns its pid and the index just past its marker.
+    async fn start_inner_program(&mut self) -> Result<(libc::pid_t, usize)> {
+        self.writer.write_all(INNER_PROGRAM)?;
+        self.writer.flush()?;
+        // The shell echoes the typed line, which contains "-END" as text, so
+        // the pid marker (which the echo cannot contain) is waited for first.
+        let digits_at = self.wait_for(b"INNER-PID-", 0).await?;
+        let after_marker = self.wait_for(b"-END", digits_at).await?;
+        let seen = self.seen();
+        let digits = &seen[digits_at..after_marker - b"-END".len()];
+        let pid: libc::pid_t = std::str::from_utf8(digits)?.trim().parse()?;
+        assert!(
+            find_from(&seen, INNER_MODES_SET, 0).is_some(),
+            "the inner program's mode sequences did not reach the local terminal as bytes; seen={}",
+            String::from_utf8_lossy(&seen)
+        );
+        Ok((pid, after_marker))
+    }
+
+    async fn wait(self) -> Result<(portable_pty::ExitStatus, TerminalSnapshot, Vec<u8>)> {
+        // The master stays open until the child has exited on its own: closing
+        // it would hang the child up, which is not the exit under test.
+        let Self {
+            _master,
+            mut child,
+            writer,
+            seen,
+            terminal_fd,
+            before: _,
+        } = self;
+        let status = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::task::spawn_blocking(move || child.wait()),
+        )
+        .await
+        .context("fabric shell did not exit")???;
+        // The reader thread drains what the exiting client wrote last.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let after = terminal_snapshot(terminal_fd)?;
+        let seen = seen.lock().unwrap().clone();
+        drop(writer);
+        drop(_master);
+        Ok((status, after, seen))
+    }
+}
+
+#[cfg(unix)]
+fn find_from(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if from > haystack.len() {
+        return None;
+    }
+    haystack[from..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|at| at + from)
+}
+
+#[cfg(unix)]
+fn rfind_from(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if from > haystack.len() {
+        return None;
+    }
+    haystack[from..]
+        .windows(needle.len())
+        .rposition(|window| window == needle)
+        .map(|at| at + from)
+}
+
+/// The last thing done to a private mode after `from`: Some(true) set,
+/// Some(false) reset, None untouched.
+#[cfg(unix)]
+fn last_private_mode_op(seen: &[u8], from: usize, mode: u16) -> Option<bool> {
+    let set = rfind_from(seen, format!("\x1b[?{mode}h").as_bytes(), from);
+    let reset = rfind_from(seen, format!("\x1b[?{mode}l").as_bytes(), from);
+    match (set, reset) {
+        (None, None) => None,
+        (Some(_), None) => Some(true),
+        (None, Some(_)) => Some(false),
+        (Some(set), Some(reset)) => Some(set > reset),
+    }
+}
+
+/// The parameters of the last SGR sequence after `from`, if any.
+#[cfg(unix)]
+fn last_sgr_params(seen: &[u8], from: usize) -> Option<String> {
+    let mut last = None;
+    let mut at = from;
+    while let Some(start) = find_from(seen, b"\x1b[", at) {
+        at = start + 2;
+        let body_end = seen[at..]
+            .iter()
+            .position(|byte| !(byte.is_ascii_digit() || *byte == b';'))
+            .map(|len| at + len);
+        if let Some(end) = body_end
+            && seen[end] == b'm'
+        {
+            last = Some(String::from_utf8_lossy(&seen[at..end]).into_owned());
+        }
+    }
+    last
+}
+
+/// Every mode the inner program set has been put back, whoever did it, and the
+/// ones only the client would touch were reset after `from`.
+#[cfg(unix)]
+fn assert_terminal_put_back(seen: &[u8], from: usize, what: &str) {
+    let shown = String::from_utf8_lossy(&seen[from.min(seen.len())..]).replace('\x1b', "\\e");
+    for mode in [1049, 2004, 1000, 1006, 1004, 2026] {
+        assert_eq!(
+            last_private_mode_op(seen, from, mode),
+            Some(false),
+            "{what}: mode {mode} was not left reset; after the marker: {shown}"
+        );
+    }
+    assert_eq!(
+        last_private_mode_op(seen, from, 25),
+        Some(true),
+        "{what}: the cursor was not shown again; after the marker: {shown}"
+    );
+    let keypad_application = rfind_from(seen, b"\x1b=", from);
+    let keypad_numeric = rfind_from(seen, b"\x1b>", from);
+    assert!(
+        keypad_numeric > keypad_application,
+        "{what}: the keypad was left in application mode; after the marker: {shown}"
+    );
+    let sgr = last_sgr_params(seen, from);
+    assert!(
+        sgr.as_deref().is_some_and(|params| params
+            .split(';')
+            .all(|param| param.is_empty() || param.parse::<u32>() == Ok(0))),
+        "{what}: text attributes were left set (last SGR {sgr:?}); after the marker: {shown}"
+    );
+    for mode in MODES_ONLY_THE_CLIENT_RESETS {
+        assert!(
+            find_from(seen, format!("\x1b[?{mode}l").as_bytes(), from).is_some(),
+            "{what}: no reset of mode {mode} after the marker, so the client did not clean up: {shown}"
+        );
+    }
+}
+
+#[cfg(unix)]
+async fn pty_shell_pair() -> Result<(
+    TempDir,
+    TempDir,
+    FabricHome,
+    FabricHome,
+    FabricNode,
+    FabricNode,
+)> {
+    let server_dir = TempDir::new()?;
+    let client_dir = TempDir::new()?;
+    let server_home = FabricHome::new(server_dir.path());
+    let client_home = FabricHome::new(client_dir.path());
+    let server = start_shell_server(server_home.clone()).await?;
+    let client = FabricNode::start(client_home.clone()).await?;
+    trust_peer(
+        &server_home,
+        &server,
+        client.id(),
+        Some("client"),
+        Some(client.addr()),
+    )
+    .await?;
+    trust_peer(
+        &client_home,
+        &client,
+        server.id(),
+        Some("server"),
+        Some(server.addr()),
+    )
+    .await?;
+    Ok((
+        server_dir,
+        client_dir,
+        server_home,
+        client_home,
+        server,
+        client,
+    ))
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shell_exit_puts_the_terminal_back_after_a_program_inside_it_died_uncleanly() -> Result<()>
+{
+    // A program attached inside the remote shell (a multiplexer's attach
+    // client, an editor) puts the terminal in front of the person into the
+    // alternate screen with mouse reporting and a hidden cursor, and then its
+    // daemon goes away and it is killed before it can undo any of that. The
+    // remote shell comes back to a prompt; the local terminal is still in
+    // those modes, and every mouse movement now arrives as text. The outer
+    // client cannot see the inner program die, but it can see what the
+    // session did to the terminal, and when the session ends it puts the
+    // terminal back, and restores termios exactly as before.
+    let (_server_dir, _client_dir, _server_home, client_home, server, client) =
+        pty_shell_pair().await?;
+    let mut shell = PtyShell::spawn(&client_home, "server")?;
+    let before = shell.before.clone();
+    let (inner_pid, after_marker) = shell.start_inner_program().await?;
+
+    let killed = unsafe { libc::kill(inner_pid, libc::SIGKILL) };
+    assert_eq!(killed, 0, "could not kill the inner program");
+    // Back at the remote prompt, with the terminal still polluted. Leave with
+    // an explicit status: a bare `exit` would carry the killed program's 137.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    shell.writer.write_all(b"exit 0\n")?;
+    shell.writer.flush()?;
+
+    let (status, after, seen) = shell.wait().await?;
+    assert!(status.success(), "fabric shell exit status: {status:?}");
+    assert_eq!(
+        after, before,
+        "fabric shell did not restore the exact pre-existing terminal mode"
+    );
+    assert_terminal_put_back(&seen, after_marker, "exit after the inner program died");
+
+    client.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacement_shell_starts_on_a_terminal_put_back_first() -> Result<()> {
+    // The remote daemon restarts while a program inside the shell holds the
+    // terminal in the alternate screen with mouse reporting on. The session is
+    // lost and the client starts a new shell in the same terminal. That new
+    // shell must not start inside the old program's alternate screen with the
+    // mouse still reporting: the client resets what the old session set before
+    // it announces the loss, and does not reset anything again at the end,
+    // because the fresh shell set nothing.
+    let (_server_dir, _client_dir, server_home, client_home, server, client) =
+        pty_shell_pair().await?;
+    let mut shell = PtyShell::spawn(&client_home, "server")?;
+    let before = shell.before.clone();
+    let (_inner_pid, after_marker) = shell.start_inner_program().await?;
+
+    server.shutdown().await?;
+    let server = start_shell_server(server_home.clone()).await?;
+    trust_peer(
+        &client_home,
+        &client,
+        server.id(),
+        Some("server"),
+        Some(server.addr()),
+    )
+    .await?;
+
+    let announced = shell
+        .wait_for(b"starting a new shell", after_marker)
+        .await?;
+    let seen = shell.seen();
+    let notice_at = announced - b"starting a new shell".len();
+    assert_terminal_put_back(&seen[..notice_at], after_marker, "loss of the session");
+    shell.wait_for(b"is ready", announced).await?;
+    shell.writer.write_all(b"exit\n")?;
+    shell.writer.flush()?;
+
+    let (status, after, seen) = shell.wait().await?;
+    assert!(status.success(), "fabric shell exit status: {status:?}");
+    assert_eq!(
+        after, before,
+        "fabric shell did not restore the exact pre-existing terminal mode"
+    );
+    let leaves = seen
+        .windows(b"\x1b[?1049l".len())
+        .filter(|window| *window == b"\x1b[?1049l")
+        .count();
+    assert_eq!(
+        leaves,
+        1,
+        "the alternate screen was left once for the lost session and never again: {}",
+        String::from_utf8_lossy(&seen[after_marker..]).replace('\x1b', "\\e")
+    );
+
+    client.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_signal_ending_the_shell_puts_the_terminal_back_first() -> Result<()> {
+    // The client is told to stop (SIGINT from another terminal, SIGTERM from a
+    // parent) while the session holds the terminal in the alternate screen. It
+    // already restored termios before re-raising the signal; it must also put
+    // the emulator back, or the person's terminal stays in the alternate screen
+    // with the cursor hidden after the process is gone.
+    let (_server_dir, _client_dir, _server_home, client_home, server, client) =
+        pty_shell_pair().await?;
+    let mut shell = PtyShell::spawn(&client_home, "server")?;
+    let before = shell.before.clone();
+    let (_inner_pid, after_marker) = shell.start_inner_program().await?;
+
+    let signalled = unsafe { libc::kill(shell.pid()?, libc::SIGINT) };
+    assert_eq!(signalled, 0, "could not signal fabric shell");
+
+    let (status, after, seen) = shell.wait().await?;
+    assert!(
+        !status.success(),
+        "fabric shell should have died of the signal: {status:?}"
+    );
+    assert_eq!(
+        after, before,
+        "fabric shell did not restore the exact pre-existing terminal mode"
+    );
+    assert_terminal_put_back(&seen, after_marker, "a signal ending the client");
+
+    client.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
 }

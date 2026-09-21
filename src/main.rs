@@ -28,7 +28,7 @@ use fabric::{
     sync::config::{SyncBook, SyncEntry, SyncPeers, SyncPolicy},
     sync::staging,
     telemetry::{PeerTelemetry, TelemetryWindow},
-    terminal::TerminalModeGuard,
+    terminal::{TerminalModeGuard, TerminalState},
     update,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -3313,6 +3313,46 @@ impl ShellNotices {
     }
 }
 
+/// The emulator state this session changes, tracked from the bytes it writes,
+/// when stdout is a terminal. `None` when it is not: a pipe gets the session's
+/// bytes and nothing of ours.
+fn track_terminal_state() -> Option<TerminalState> {
+    std::io::stdout().is_terminal().then(TerminalState::new)
+}
+
+/// Put the terminal back after a session: undo what it set and forget it. A
+/// program inside the remote shell that died without cleaning up, or a session
+/// that ended mid-screen, left these behind; the person is about to get their
+/// terminal back, or a new shell is about to start on it.
+async fn put_terminal_back(
+    stdout: &mut tokio::io::Stdout,
+    state: &mut Option<TerminalState>,
+) -> Result<()> {
+    if let Some(state) = state {
+        let bytes = state.cleanup();
+        state.clear();
+        if !bytes.is_empty() {
+            stdout.write_all(&bytes).await?;
+            stdout.flush().await?;
+        }
+    }
+    Ok(())
+}
+
+/// The same, synchronously, for the path that re-raises a signal and never
+/// returns to the runtime.
+fn put_terminal_back_blocking(state: &mut Option<TerminalState>) {
+    if let Some(state) = state {
+        let bytes = state.cleanup();
+        state.clear();
+        if !bytes.is_empty() {
+            let mut stdout = std::io::stdout().lock();
+            let _ = std::io::Write::write_all(&mut stdout, &bytes);
+            let _ = std::io::Write::flush(&mut stdout);
+        }
+    }
+}
+
 enum ShellSessionEnd {
     Exited(i32),
     /// The local socket closed without an exit status. `answered` says whether
@@ -3344,6 +3384,7 @@ enum ReplacementOutcome {
 async fn run_shell_client(home: &FabricHome, peer: &str, socket: PathBuf) -> Result<i32> {
     let mut signals = ShellSignals::new()?;
     let terminal = TerminalModeGuard::enable_if_terminal()?;
+    let mut terminal_state = track_terminal_state();
     let input = Arc::new(ShellInput::new());
     let mut read = input.attach(&socket).await?;
     let stdin_task = tokio::spawn(input.clone().pump_stdin());
@@ -3352,86 +3393,98 @@ async fn run_shell_client(home: &FabricHome, peer: &str, socket: PathBuf) -> Res
     let mut notices = ShellNotices::new(terminal.is_enabled());
     let mut answer_deadline = None;
 
-    let exit_code = loop {
-        let end = run_shell_session(
-            &mut read,
-            &input,
-            &mut signals,
-            &terminal,
-            &mut notices,
-            &mut stdout,
-            peer,
-            answer_deadline,
-        )
-        .await?;
-        match end {
-            ShellSessionEnd::Exited(code) => break code,
-            ShellSessionEnd::Interrupted => {
-                notices
-                    .line(&format!(
-                        "fabric: interrupted while waiting for a new remote shell to {peer:?}"
-                    ))
-                    .await?;
-                break 130;
-            }
-            ShellSessionEnd::DeadlinePassed => {
-                notices
-                    .line(&format!(
-                        "fabric: no new remote shell to {peer:?} answered within {}m; giving up",
-                        SHELL_REPLACEMENT_DEADLINE.as_secs() / 60
-                    ))
-                    .await?;
-                break 1;
-            }
-            ShellSessionEnd::Lost { answered } => {
-                if !answered || input.stdin_closed() {
+    let outcome: Result<i32> = async {
+        loop {
+            let end = run_shell_session(
+                &mut read,
+                &input,
+                &mut signals,
+                &terminal,
+                &mut terminal_state,
+                &mut notices,
+                &mut stdout,
+                peer,
+                answer_deadline,
+            )
+            .await?;
+            match end {
+                ShellSessionEnd::Exited(code) => break Ok(code),
+                ShellSessionEnd::Interrupted => {
                     notices
                         .line(&format!(
-                            "fabric: peer {peer:?} closed service \"shell\" before it returned an exit status"
+                            "fabric: interrupted while waiting for a new remote shell to {peer:?}"
                         ))
                         .await?;
-                    break 1;
+                    break Ok(130);
                 }
-                notices
-                    .line(&format!(
-                        "fabric: remote shell to {peer:?} ended without an exit status; starting a new shell"
-                    ))
-                    .await?;
-                input.detach().await;
-                let deadline = tokio::time::Instant::now() + SHELL_REPLACEMENT_DEADLINE;
-                match wait_for_replacement_shell(home, peer, &input, &mut notices, deadline).await?
-                {
-                    ReplacementOutcome::Connected(replacement) => {
-                        read = replacement;
-                        answer_deadline = Some(deadline);
-                    }
-                    ReplacementOutcome::Interrupted => {
+                ShellSessionEnd::DeadlinePassed => {
+                    notices
+                        .line(&format!(
+                            "fabric: no new remote shell to {peer:?} answered within {}m; giving up",
+                            SHELL_REPLACEMENT_DEADLINE.as_secs() / 60
+                        ))
+                        .await?;
+                    break Ok(1);
+                }
+                ShellSessionEnd::Lost { answered } => {
+                    if !answered || input.stdin_closed() {
                         notices
                             .line(&format!(
-                                "fabric: interrupted while waiting for a new remote shell to {peer:?}"
+                                "fabric: peer {peer:?} closed service \"shell\" before it returned an exit status"
                             ))
                             .await?;
-                        break 130;
+                        break Ok(1);
                     }
-                    ReplacementOutcome::DeadlinePassed => {
-                        notices
-                            .line(&format!(
-                                "fabric: no new remote shell to {peer:?} answered within {}m; giving up",
-                                SHELL_REPLACEMENT_DEADLINE.as_secs() / 60
-                            ))
-                            .await?;
-                        break 1;
+                    // The lost session's programs are gone with it; the new
+                    // shell starts on a terminal put back first, and the
+                    // loss is announced on that clean terminal.
+                    put_terminal_back(&mut stdout, &mut terminal_state).await?;
+                    notices
+                        .line(&format!(
+                            "fabric: remote shell to {peer:?} ended without an exit status; starting a new shell"
+                        ))
+                        .await?;
+                    input.detach().await;
+                    let deadline = tokio::time::Instant::now() + SHELL_REPLACEMENT_DEADLINE;
+                    match wait_for_replacement_shell(home, peer, &input, &mut notices, deadline)
+                        .await?
+                    {
+                        ReplacementOutcome::Connected(replacement) => {
+                            read = replacement;
+                            answer_deadline = Some(deadline);
+                        }
+                        ReplacementOutcome::Interrupted => {
+                            notices
+                                .line(&format!(
+                                    "fabric: interrupted while waiting for a new remote shell to {peer:?}"
+                                ))
+                                .await?;
+                            break Ok(130);
+                        }
+                        ReplacementOutcome::DeadlinePassed => {
+                            notices
+                                .line(&format!(
+                                    "fabric: no new remote shell to {peer:?} answered within {}m; giving up",
+                                    SHELL_REPLACEMENT_DEADLINE.as_secs() / 60
+                                ))
+                                .await?;
+                            break Ok(1);
+                        }
                     }
                 }
             }
         }
-    };
+    }
+    .await;
 
     stdin_task.abort();
     let _ = stdin_task.await;
+    // Whatever ended the command, an exit, an error or a refusal, the session
+    // may have left the terminal mid-screen. Put it back before termios.
+    put_terminal_back(&mut stdout, &mut terminal_state).await?;
     terminal.restore()?;
     stdout.flush().await?;
-    Ok(exit_code)
+    outcome
 }
 
 /// Pump one session until it exits, is lost, or the person gives up on it.
@@ -3442,6 +3495,7 @@ async fn run_shell_session(
     input: &ShellInput,
     signals: &mut ShellSignals,
     terminal: &TerminalModeGuard,
+    terminal_state: &mut Option<TerminalState>,
     notices: &mut ShellNotices,
     stdout: &mut tokio::io::Stdout,
     peer: &str,
@@ -3470,6 +3524,9 @@ async fn run_shell_session(
                                 notices.line(&ready).await?;
                             }
                         }
+                        if let Some(state) = terminal_state.as_mut() {
+                            state.observe(&bytes);
+                        }
                         notices.end_status().await?;
                         stdout.write_all(&bytes).await?;
                         stdout.flush().await?;
@@ -3496,6 +3553,7 @@ async fn run_shell_session(
                         input.resize().await;
                     }
                     ShellSignal::Terminate(signal) => {
+                        put_terminal_back_blocking(terminal_state);
                         terminal.restore()?;
                         terminate_with_signal(signal);
                     }
