@@ -1565,7 +1565,14 @@ fn assert_terminal_put_back(seen: &[u8], from: usize, what: &str) {
 }
 
 #[cfg(unix)]
-async fn pty_shell_pair() -> Result<(TempDir, TempDir, FabricHome, FabricHome, FabricNode, FabricNode)> {
+async fn pty_shell_pair() -> Result<(
+    TempDir,
+    TempDir,
+    FabricHome,
+    FabricHome,
+    FabricNode,
+    FabricNode,
+)> {
     let server_dir = TempDir::new()?;
     let client_dir = TempDir::new()?;
     let server_home = FabricHome::new(server_dir.path());
@@ -1588,12 +1595,20 @@ async fn pty_shell_pair() -> Result<(TempDir, TempDir, FabricHome, FabricHome, F
         Some(server.addr()),
     )
     .await?;
-    Ok((server_dir, client_dir, server_home, client_home, server, client))
+    Ok((
+        server_dir,
+        client_dir,
+        server_home,
+        client_home,
+        server,
+        client,
+    ))
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn shell_exit_puts_the_terminal_back_after_a_program_inside_it_died_uncleanly() -> Result<()> {
+async fn shell_exit_puts_the_terminal_back_after_a_program_inside_it_died_uncleanly() -> Result<()>
+{
     // A program attached inside the remote shell (a multiplexer's attach
     // client, an editor) puts the terminal in front of the person into the
     // alternate screen with mouse reporting and a hidden cursor, and then its
@@ -1657,7 +1672,9 @@ async fn a_replacement_shell_starts_on_a_terminal_put_back_first() -> Result<()>
     )
     .await?;
 
-    let announced = shell.wait_for(b"starting a new shell", after_marker).await?;
+    let announced = shell
+        .wait_for(b"starting a new shell", after_marker)
+        .await?;
     let seen = shell.seen();
     let notice_at = announced - b"starting a new shell".len();
     assert_terminal_put_back(&seen[..notice_at], after_marker, "loss of the session");
@@ -1676,7 +1693,8 @@ async fn a_replacement_shell_starts_on_a_terminal_put_back_first() -> Result<()>
         .filter(|window| *window == b"\x1b[?1049l")
         .count();
     assert_eq!(
-        leaves, 1,
+        leaves,
+        1,
         "the alternate screen was left once for the lost session and never again: {}",
         String::from_utf8_lossy(&seen[after_marker..]).replace('\x1b', "\\e")
     );
@@ -1704,7 +1722,10 @@ async fn a_signal_ending_the_shell_puts_the_terminal_back_first() -> Result<()> 
     assert_eq!(signalled, 0, "could not signal fabric shell");
 
     let (status, after, seen) = shell.wait().await?;
-    assert!(!status.success(), "fabric shell should have died of the signal: {status:?}");
+    assert!(
+        !status.success(),
+        "fabric shell should have died of the signal: {status:?}"
+    );
     assert_eq!(
         after, before,
         "fabric shell did not restore the exact pre-existing terminal mode"
