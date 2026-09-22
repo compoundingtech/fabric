@@ -969,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "fabric"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "blake3",
