@@ -67,6 +67,17 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **`fabric update` no longer spends GitHub's API rate limit.** The latest
+  release, its commit, and the direction of the change were three calls to
+  `api.github.com`, which allows 60 unauthenticated requests an hour per
+  network address, shared by every machine behind it. Machines checking on a
+  timer used that up, and every check then failed with a bare `403 Forbidden`.
+  The updater now reads the tag from the `releases/latest` redirect, the
+  commit from the repository's Git ref advertisement, and orders releases by
+  their version numbers. None of that is metered or needs a token. A request
+  that does meet a used-up rate limit now says so, with the reset time,
+  instead of leaving a person to read a 403 as a problem with their machine.
+
 - **`fabric shell` puts the local terminal back when a session ends or is
   replaced, undoing what the session set and nothing else.** A program inside
   the remote shell that dies without cleaning up (an attach client whose daemon

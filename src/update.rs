@@ -55,8 +55,118 @@ pub fn release_asset_url(tag: &str, asset: &str) -> String {
     format!("https://github.com/{RELEASE_REPO}/releases/download/{tag}/{asset}")
 }
 
-pub fn latest_release_api_url() -> String {
-    format!("https://api.github.com/repos/{RELEASE_REPO}/releases/latest")
+/// The page GitHub redirects to the newest release. NOT the REST API:
+/// `api.github.com` allows 60 unauthenticated requests an hour per network
+/// address, shared by every machine behind that address, and a fleet that
+/// checks for updates on a timer spends that budget on nothing. The redirect
+/// carries the tag in its `Location` header and is not metered.
+pub fn latest_release_url() -> String {
+    format!("https://github.com/{RELEASE_REPO}/releases/latest")
+}
+
+/// Git's own ref advertisement for the release repository. Also not metered:
+/// it is the smart-HTTP protocol, not the REST API. It names every ref with
+/// its commit, which is how a tag becomes the `+commit` the binary reports.
+pub fn ref_advertisement_url() -> String {
+    format!("https://github.com/{RELEASE_REPO}.git/info/refs?service=git-upload-pack")
+}
+
+/// The tag a `releases/latest` redirect points at.
+///
+/// GitHub answers `releases/latest` with a 302 to `releases/tag/<tag>`. The tag
+/// is percent-encoded in that URL (`+` arrives as `%2B`), so decode it.
+pub fn tag_from_latest_redirect(location: &str) -> Result<String> {
+    let (_, encoded) = location.split_once("/releases/tag/").with_context(|| {
+        format!("{location} is not a release page, so there may be no release yet")
+    })?;
+    let encoded = encoded
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('/');
+    let tag = percent_decode(encoded)?;
+    if tag.is_empty() {
+        bail!("{location} names no release tag");
+    }
+    Ok(tag)
+}
+
+fn percent_decode(text: &str) -> Result<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let byte = bytes
+                .get(i + 1..i + 3)
+                .and_then(|pair| std::str::from_utf8(pair).ok())
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                .with_context(|| format!("{text} has a broken percent escape"))?;
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).with_context(|| format!("{text} is not UTF-8 once decoded"))
+}
+
+/// The commit a tag names, read from a Git ref advertisement.
+///
+/// The advertisement is pkt-line framed: four hex digits of length (counting
+/// themselves) then the payload, `0000` as a flush. The first payload is the
+/// service banner, the first ref carries a NUL and the capabilities after it,
+/// and an annotated tag lists its own object and then `<tag>^{}` for the
+/// commit it points at, which is the one a build reports.
+pub fn commit_for_tag_in_advertisement(advertisement: &[u8], tag: &str) -> Result<String> {
+    let wanted = format!("refs/tags/{tag}");
+    let peeled = format!("{wanted}^{{}}");
+    let mut found: Option<String> = None;
+    for payload in pkt_lines(advertisement) {
+        let payload = payload.split(|byte| *byte == 0).next().unwrap_or_default();
+        let line = String::from_utf8_lossy(payload);
+        let mut fields = line.split_whitespace();
+        let (Some(sha), Some(name)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        if name == peeled {
+            return Ok(sha.to_string());
+        }
+        if name == wanted {
+            found = Some(sha.to_string());
+        }
+    }
+    found.with_context(|| format!("the release repository has no tag {tag}"))
+}
+
+/// Split pkt-line framing into payloads, dropping flush packets. Bytes that are
+/// not framed, which is what a non-Git answer to that URL looks like, yield
+/// nothing rather than a guess.
+fn pkt_lines(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut lines = Vec::new();
+    let mut rest = bytes;
+    while rest.len() >= 4 {
+        let Some(len) = std::str::from_utf8(&rest[..4])
+            .ok()
+            .and_then(|hex| usize::from_str_radix(hex, 16).ok())
+        else {
+            break;
+        };
+        if len == 0 {
+            rest = &rest[4..];
+            continue;
+        }
+        if len < 4 || len > rest.len() {
+            break;
+        }
+        lines.push(&rest[4..len]);
+        rest = &rest[len..];
+    }
+    lines
 }
 
 /// Decide where the artifact comes from, refusing the combination that would
@@ -218,33 +328,14 @@ fn version_for_tag_commit(tag: &str, commit: &str) -> Result<String> {
     Ok(format!("{version}+{}", &commit[..7]))
 }
 
-fn release_tag_commit_api_url(tag: &str) -> String {
-    format!("https://api.github.com/repos/{RELEASE_REPO}/commits/{tag}")
-}
-
-fn parse_release_tag_commit(body: &[u8]) -> Result<String> {
-    let json: serde_json::Value = serde_json::from_slice(body)
-        .context("the release tag API returned something that is not JSON")?;
-    let commit = json
-        .get("sha")
-        .and_then(|sha| sha.as_str())
-        .context("the release tag API returned no commit")?;
-    if !(7..=40).contains(&commit.len())
-        || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        bail!("the release tag API returned an invalid Git commit: {commit}");
-    }
-    Ok(commit.to_string())
-}
-
 async fn expected_version_for_tag(tag: &str) -> Result<String> {
     let version = version_for_tag(tag);
     if version.contains('+') {
         release_commit(version)?;
         return Ok(version.to_string());
     }
-    let body = fetch(&release_tag_commit_api_url(tag)).await?;
-    let commit = parse_release_tag_commit(&body)?;
+    let advertisement = fetch(&ref_advertisement_url()).await?;
+    let commit = commit_for_tag_in_advertisement(&advertisement, tag)?;
     version_for_tag_commit(tag, &commit)
 }
 
@@ -267,33 +358,36 @@ fn release_commit(version: &str) -> Result<&str> {
     Ok(commit)
 }
 
-fn release_direction_from_compare(status: &str) -> Result<ReleaseDirection> {
-    match status {
-        "identical" => Ok(ReleaseDirection::Current),
-        "ahead" => Ok(ReleaseDirection::Upgrade),
-        "behind" => Ok(ReleaseDirection::Downgrade),
-        "diverged" => Ok(ReleaseDirection::Diverged),
-        other => bail!("the release API returned an unknown comparison status: {other}"),
+/// The three numbers a release version carries, for ordering releases without
+/// asking anyone. Every release bumps the package version in its own pull
+/// request and the tag sits on that merge, so a larger number is a later
+/// release, and the same number on a different commit is a build that was
+/// never released as that version.
+fn release_number(version: &str) -> Result<(u64, u64, u64)> {
+    let number = version.split('+').next().unwrap_or_default();
+    let mut parts = number.split('.').map(|part| part.parse::<u64>());
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(Ok(major)), Some(Ok(minor)), Some(Ok(patch)), None) => Ok((major, minor, patch)),
+        _ => bail!("the version is not a release number: {version}"),
     }
 }
 
-async fn release_direction(installed: &str, available: &str) -> Result<ReleaseDirection> {
+/// Which way an update would go. Decided here, from the two version strings,
+/// rather than by asking GitHub's compare API which commit descends from which:
+/// that call was metered, and the answer is already in the numbers.
+fn release_direction(installed: &str, available: &str) -> Result<ReleaseDirection> {
     if installed == available {
         return Ok(ReleaseDirection::Current);
     }
-    let installed_commit = release_commit(installed)?;
-    let available_commit = release_commit(available)?;
-    let url = format!(
-        "https://api.github.com/repos/{RELEASE_REPO}/compare/{installed_commit}...{available_commit}"
-    );
-    let body = fetch(&url).await?;
-    let json: serde_json::Value = serde_json::from_slice(&body)
-        .context("the release comparison API returned something that is not JSON")?;
-    let status = json
-        .get("status")
-        .and_then(|status| status.as_str())
-        .context("the release comparison API returned no status")?;
-    release_direction_from_compare(status)
+    let installed_number = release_number(installed)?;
+    let available_number = release_number(available)?;
+    release_commit(installed)?;
+    release_commit(available)?;
+    Ok(match available_number.cmp(&installed_number) {
+        std::cmp::Ordering::Greater => ReleaseDirection::Upgrade,
+        std::cmp::Ordering::Less => ReleaseDirection::Downgrade,
+        std::cmp::Ordering::Equal => ReleaseDirection::Diverged,
+    })
 }
 
 fn enforce_release_direction(
@@ -364,7 +458,7 @@ pub async fn fetch(url: &str) -> Result<Vec<u8>> {
         .with_context(|| format!("failed to reach {url}"))?;
     let status = response.status();
     if !status.is_success() {
-        bail!("{url} returned {status}");
+        bail!("{}", describe_failure(url, status, response.headers()));
     }
     Ok(response
         .bytes()
@@ -373,15 +467,73 @@ pub async fn fetch(url: &str) -> Result<Vec<u8>> {
         .to_vec())
 }
 
-/// The tag GitHub currently marks as latest.
+/// Say what a refused request means, in the one case where the status alone
+/// misleads. GitHub answers a used-up rate limit with `403 Forbidden`, and a
+/// person reads that as something wrong with their own machine. The headers on
+/// that answer say exactly what happened and when it ends, so say that.
+fn describe_failure(
+    url: &str,
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> String {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+    };
+    let remaining = header("x-ratelimit-remaining").and_then(|value| value.parse::<u64>().ok());
+    let reset = header("x-ratelimit-reset").and_then(|value| value.parse::<i64>().ok());
+    if let (Some(0), Some(reset)) = (remaining, reset) {
+        let limit = header("x-ratelimit-limit")
+            .map(|limit| format!(" of {limit} requests per hour"))
+            .unwrap_or_default();
+        let at = time::OffsetDateTime::from_unix_timestamp(reset)
+            .ok()
+            .and_then(|at| {
+                at.format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            })
+            .unwrap_or_else(|| reset.to_string());
+        let wait = (reset - time::OffsetDateTime::now_utc().unix_timestamp()).max(0);
+        return format!(
+            "{url} returned {status}: GitHub's rate limit{limit} for this network address \
+             is used up. It resets at {at}, in {} min. Nothing is wrong with this machine; \
+             every machine behind the same address shares that budget.",
+            (wait + 59) / 60
+        );
+    }
+    if let Some(after) = header("retry-after") {
+        return format!("{url} returned {status}; retry after {after} s");
+    }
+    format!("{url} returned {status}")
+}
+
+/// The tag GitHub currently marks as latest, read from where `releases/latest`
+/// redirects rather than from the metered API.
 pub async fn latest_tag() -> Result<String> {
-    let body = fetch(&latest_release_api_url()).await?;
-    let json: serde_json::Value =
-        serde_json::from_slice(&body).context("the release API returned something that is not JSON")?;
-    json.get("tag_name")
-        .and_then(|tag| tag.as_str())
-        .map(str::to_string)
-        .context("the release API returned no tag_name")
+    let url = latest_release_url();
+    ensure_crypto_provider();
+    let response = reqwest::Client::builder()
+        .user_agent(concat!("fabric/", env!("CARGO_PKG_VERSION")))
+        // The answer IS the redirect. Following it would fetch a page and lose
+        // the one header that carries the tag.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("failed to reach {url}"))?;
+    let status = response.status();
+    if !status.is_redirection() {
+        bail!("{}", describe_failure(&url, status, response.headers()));
+    }
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .with_context(|| format!("{url} redirected without saying where"))?;
+    tag_from_latest_redirect(location)
 }
 
 /// Where the binary that the SERVICE MANAGER runs actually lives.
@@ -1330,7 +1482,7 @@ pub async fn run(home: &crate::config::FabricHome, options: UpdateOptions) -> Re
     println!("source\t{url}");
 
     let release_direction = if let Some(available) = &expected_version {
-        match release_direction(&installed, available).await {
+        match release_direction(&installed, available) {
             Ok(direction) => Some(direction),
             Err(error) if options.allow_downgrade => {
                 eprintln!(
@@ -1831,23 +1983,142 @@ mod tests {
     }
 
     #[test]
-    fn github_compare_status_has_one_unambiguous_direction() {
+    fn release_numbers_order_releases_without_a_network() {
         assert_eq!(
-            release_direction_from_compare("ahead").unwrap(),
+            release_direction("0.2.11+7f4da21", "0.2.12+addb212").unwrap(),
             ReleaseDirection::Upgrade
         );
         assert_eq!(
-            release_direction_from_compare("behind").unwrap(),
+            release_direction("0.2.12+addb212", "0.2.11+7f4da21").unwrap(),
             ReleaseDirection::Downgrade
         );
         assert_eq!(
-            release_direction_from_compare("identical").unwrap(),
+            release_direction("0.2.12+addb212", "0.2.12+addb212").unwrap(),
             ReleaseDirection::Current
         );
+        // The same number on a different build was never released as that version.
         assert_eq!(
-            release_direction_from_compare("diverged").unwrap(),
+            release_direction("0.2.12+c097743", "0.2.12+addb212").unwrap(),
             ReleaseDirection::Diverged
         );
+        // Numeric, not lexical: 0.2.9 is older than 0.2.10.
+        assert_eq!(
+            release_direction("0.2.9+1234567", "0.2.10+89abcde").unwrap(),
+            ReleaseDirection::Upgrade
+        );
+        // A build that cannot say what it is cannot be ordered, and says so.
+        assert!(release_direction("unknown", "0.2.12+addb212").is_err());
+    }
+
+    #[test]
+    fn the_latest_tag_is_read_from_the_redirect_target() {
+        assert_eq!(
+            tag_from_latest_redirect(
+                "https://github.com/compoundingtech/fabric/releases/tag/v0.2.12"
+            )
+            .unwrap(),
+            "v0.2.12"
+        );
+        // Older tags carried the build commit, and GitHub encodes the plus.
+        assert_eq!(
+            tag_from_latest_redirect(
+                "https://github.com/compoundingtech/fabric/releases/tag/v0.2.0%2B76376d4"
+            )
+            .unwrap(),
+            "v0.2.0+76376d4"
+        );
+    }
+
+    #[test]
+    fn a_redirect_that_is_not_a_release_page_is_refused() {
+        let error = tag_from_latest_redirect("https://github.com/compoundingtech/fabric/releases")
+            .expect_err("a page with no tag was accepted");
+        assert!(format!("{error}").contains("no release"), "{error}");
+    }
+
+    fn pkt(payload: &str) -> Vec<u8> {
+        let mut out = format!("{:04x}", payload.len() + 4).into_bytes();
+        out.extend_from_slice(payload.as_bytes());
+        out
+    }
+
+    /// A ref advertisement framed exactly as GitHub sends it: the service
+    /// banner, a flush, the first ref with its capabilities after a NUL, then
+    /// the refs, then a flush.
+    fn advertisement(refs: &[String]) -> Vec<u8> {
+        let mut out = pkt("# service=git-upload-pack\n");
+        out.extend_from_slice(b"0000");
+        for line in refs {
+            out.extend(pkt(&format!("{line}\n")));
+        }
+        out.extend_from_slice(b"0000");
+        out
+    }
+
+    const LIGHT: &str = "addb2126341e99ae9ab599961251bd20ae6684e9";
+    const OBJECT: &str = "1111111111111111111111111111111111111111";
+    const PEELED: &str = "2222222222222222222222222222222222222222";
+    const HEAD: &str = "3333333333333333333333333333333333333333";
+
+    #[test]
+    fn a_tag_resolves_to_its_commit_in_the_ref_advertisement() {
+        let body = advertisement(&[
+            format!("{HEAD} HEAD\0multi_ack thin-pack side-band symref=HEAD:refs/heads/main"),
+            format!("{HEAD} refs/heads/main"),
+            format!("{LIGHT} refs/tags/v0.2.12"),
+            format!("{OBJECT} refs/tags/v0.2.13"),
+            format!("{PEELED} refs/tags/v0.2.13^{{}}"),
+        ]);
+        assert_eq!(
+            commit_for_tag_in_advertisement(&body, "v0.2.12").unwrap(),
+            LIGHT
+        );
+        // An annotated tag's own object is not a commit; the peeled line is.
+        assert_eq!(
+            commit_for_tag_in_advertisement(&body, "v0.2.13").unwrap(),
+            PEELED
+        );
+        let error = commit_for_tag_in_advertisement(&body, "v9.9.9")
+            .expect_err("an absent tag resolved to a commit");
+        assert!(format!("{error}").contains("v9.9.9"), "{error}");
+    }
+
+    #[test]
+    fn an_answer_that_is_not_a_ref_advertisement_names_the_missing_tag() {
+        let error = commit_for_tag_in_advertisement(b"<html>not git</html>", "v0.2.12")
+            .expect_err("html resolved to a commit");
+        assert!(format!("{error}").contains("v0.2.12"), "{error}");
+    }
+
+    #[test]
+    fn a_used_up_rate_limit_is_explained_with_its_reset_time() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ratelimit-limit", "60".parse().unwrap());
+        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        headers.insert("x-ratelimit-reset", "1790082677".parse().unwrap());
+        let message = describe_failure(
+            "https://api.github.com/x",
+            reqwest::StatusCode::FORBIDDEN,
+            &headers,
+        );
+        assert!(message.contains("rate limit"), "{message}");
+        assert!(message.contains("60 requests"), "{message}");
+        assert!(message.contains("2026-09-22T13:11:17Z"), "{message}");
+        assert!(
+            message.contains("Nothing is wrong with this machine"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_plain_refusal_is_reported_as_its_status() {
+        let headers = reqwest::header::HeaderMap::new();
+        let message = describe_failure(
+            "https://example.test/x",
+            reqwest::StatusCode::FORBIDDEN,
+            &headers,
+        );
+        assert_eq!(message, "https://example.test/x returned 403 Forbidden");
     }
 
     /// The one refusal that matters. `--url` with no hash means running bytes
@@ -2088,23 +2359,19 @@ mod tests {
         );
     }
 
+    /// The whole point of the change: nothing the updater asks for is metered.
     #[test]
-    fn the_release_tag_commit_reply_must_name_a_commit() {
+    fn the_release_lookups_never_touch_the_metered_api() {
+        for url in [latest_release_url(), ref_advertisement_url()] {
+            assert!(
+                url.starts_with("https://github.com/compoundingtech/fabric"),
+                "{url}"
+            );
+            assert!(!url.contains("api.github.com"), "{url}");
+        }
         assert_eq!(
-            parse_release_tag_commit(br#"{"sha":"4dc0cac80674c3996dd546b5979e59b5b0316773"}"#)
-                .unwrap(),
-            "4dc0cac80674c3996dd546b5979e59b5b0316773"
-        );
-        assert!(parse_release_tag_commit(br#"{"sha":"main"}"#).is_err());
-        assert!(parse_release_tag_commit(br#"{"message":"not found"}"#).is_err());
-        assert!(parse_release_tag_commit(b"not json").is_err());
-    }
-
-    #[test]
-    fn the_release_tag_commit_url_names_the_pasted_tag() {
-        assert_eq!(
-            release_tag_commit_api_url("v0.2.5"),
-            "https://api.github.com/repos/compoundingtech/fabric/commits/v0.2.5"
+            ref_advertisement_url(),
+            "https://github.com/compoundingtech/fabric.git/info/refs?service=git-upload-pack"
         );
     }
 
