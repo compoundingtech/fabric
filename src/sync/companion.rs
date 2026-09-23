@@ -168,6 +168,71 @@ impl CompanionHandle {
     }
 }
 
+/// A daemon and its companion, started together in one process.
+///
+/// The harness shape for every test that needs sync: the daemon delegates, the
+/// companion in this process owns it, and both go through the same two
+/// sockets production uses. Derefs to the node so a test reads ids, addresses
+/// and state as before; `shutdown` stops the companion first so the lease is
+/// free before the daemon goes.
+pub struct HostedNode {
+    node: crate::daemon::FabricNode,
+    companion: Option<CompanionHandle>,
+}
+
+impl HostedNode {
+    pub async fn start(home: FabricHome) -> Result<Self> {
+        Self::start_with_options(home, crate::daemon::DaemonOptions::default()).await
+    }
+
+    pub async fn start_with_options(
+        home: FabricHome,
+        options: crate::daemon::DaemonOptions,
+    ) -> Result<Self> {
+        let node = crate::daemon::FabricNode::start_with_daemon_options(home.clone(), options).await?;
+        let companion = match options.sync_owner {
+            crate::daemon::SyncOwner::Embedded => None,
+            crate::daemon::SyncOwner::Companion => {
+                let handle = start(home).await?;
+                handle.wait_until_active(Duration::from_secs(30)).await?;
+                Some(handle)
+            }
+        };
+        Ok(Self { node, companion })
+    }
+
+    pub fn node(&self) -> &crate::daemon::FabricNode {
+        &self.node
+    }
+
+    pub fn companion(&self) -> Option<&CompanionHandle> {
+        self.companion.as_ref()
+    }
+
+    /// The engine, wherever it runs, for a test that drives a pass on purpose.
+    pub async fn engine(&self) -> Option<Arc<SyncEngine<IpcSyncTransport>>> {
+        match &self.companion {
+            Some(companion) => companion.engine().await,
+            None => None,
+        }
+    }
+
+    pub async fn shutdown(self) -> Result<()> {
+        if let Some(companion) = self.companion {
+            companion.shutdown().await?;
+        }
+        self.node.shutdown().await
+    }
+}
+
+impl std::ops::Deref for HostedNode {
+    type Target = crate::daemon::FabricNode;
+
+    fn deref(&self) -> &Self::Target {
+        &self.node
+    }
+}
+
 /// Start the companion runtime for `home`.
 ///
 /// Binds the companion's bridge socket and begins the heartbeat. Returns as

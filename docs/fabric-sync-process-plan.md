@@ -4,8 +4,9 @@ Date: 2026-09-04
 
 Status: approved for implementation on 2026-09-04.
 
-Implementation: steps 1 through 6 are merged. The embedded engine remains the
-production owner until step 7 activates the companion.
+Implementation: steps 1 through 7 are merged. The companion owns sync in
+production; the embedded engine remains in the binary, inactive, until step 8
+removes it.
 
 Step 6 as built differs from the sketch below in two places. The inbound open
 carries no sync name: the companion reads the wire hello itself, so the daemon

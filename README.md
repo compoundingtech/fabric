@@ -954,12 +954,12 @@ fabric service uninstall
 
 Install, inspect, or remove the OS user services. `install` starts/restarts the
 daemon and its independent `fabric-sync` companion. It enables both services
-for future user sessions. The companion runs in compatibility standby while
-the daemon owns embedded sync.
+for future user sessions. The companion owns file sync; the daemon delegates
+to it over the local bridge.
 
-With the companion as sync owner, that same standby process runs the engine
-and holds the state lease; when it stops, configured entries report
-`runtime=unavailable` and the daemon serves everything else.
+That same standby process runs the engine and holds the state lease; when it
+stops, configured entries report `runtime=unavailable` and the daemon serves
+everything else.
 
 `status` reports `fabric.service` and `fabric-sync.service` on Linux. It reports
 `com.compoundingtech.fabric` and `com.compoundingtech.fabric-sync` on macOS.
@@ -1055,14 +1055,17 @@ The sync engine receives explicit config and state paths instead of the daemon
 home. It holds `<home>/sync/owner.lock` for its lifetime, so a second engine
 fails before it reads or changes the same state.
 
-The package ships a separately supervised `fabric-sync` companion. Which
-process runs the engine is the daemon's sync owner. With the embedded owner,
-the default of this release, the daemon runs the engine and the companion
-stays in compatibility standby: it reports its presence and holds no lease.
-With the companion owner, the daemon constructs no engine; the companion takes
-the lease, watches the folders, and reaches every peer through the daemon. A
-companion started with `--standby` does whichever the daemon it attaches to
-grants, so the same service definition serves both.
+The package ships a separately supervised `fabric-sync` companion, and the
+companion owns sync: the daemon constructs no engine; the companion takes the
+state lease, watches the folders, and reaches every peer through the daemon.
+A companion started with `--standby` does whichever the daemon it attaches to
+grants, so the same service definition served the transition. With the
+companion stopped, absent, or a different build, no file sync runs and nothing
+falls back: status and doctor say `runtime=unavailable` with the reason, a peer
+syncing toward the machine is told `unavailable`, and every other service runs
+normally. The daemon can still be started with `FABRIC_SYNC_OWNER=embedded`
+for a measurement against the old in-process engine until that path is
+removed.
 
 The `fabric/sync-ipc/1` Unix bridge carries the companion path. Two owner-only
 sockets under `<home>/run/`: the daemon's `sync-ipc.sock` takes the companion's
