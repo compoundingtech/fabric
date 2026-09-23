@@ -509,12 +509,14 @@ pub struct DaemonOptions {
 /// local bridge.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SyncOwner {
-    /// The daemon constructs and runs the engine itself.
-    #[default]
+    /// The daemon constructs and runs the engine itself. The owner every
+    /// release before the process boundary ran, kept for the mixed-fleet
+    /// matrix until the embedded engine is removed.
     Embedded,
     /// The daemon delegates sync to the companion. With no companion attached,
     /// configured entries report `runtime=unavailable`, an inbound peer gets an
     /// explicit unavailable reply, and every other service runs normally.
+    #[default]
     Companion,
 }
 
@@ -5796,8 +5798,8 @@ mod tests {
         let warnings = syncs.unknown_explicit_selectors(&PeerBook::load(&home)?);
         assert_eq!(warnings, vec![("catalog", vec!["mac"])]);
 
-        let node = FabricNode::start(home).await?;
-        let engine = node.state().sync_engine().unwrap();
+        let node = sync::companion::HostedNode::start(home).await?;
+        let engine = node.engine().await.expect("the companion owns sync");
         engine.sync_once("catalog").await?;
         let status = engine.status().await;
         assert_eq!(
@@ -5813,7 +5815,7 @@ mod tests {
         let home = FabricHome::new(dir.path());
         trust_named_peer(&home, "silber")?;
         write_test_sync(&home, dir.path().join("catalog"), "silber")?;
-        let node = FabricNode::start(home.clone()).await?;
+        let node = sync::companion::HostedNode::start(home.clone()).await?;
 
         write_test_sync(&home, dir.path().join("catalog"), "mac")?;
         let error = process_control_request(ControlRequest::SyncReload, node.state())
@@ -5821,13 +5823,13 @@ mod tests {
             .unwrap_err();
         assert!(format!("{error:#}").contains("unknown peer selector \"mac\""));
 
-        let status = node.state().sync_engine().unwrap().status().await;
+        let status = node.engine().await.expect("the companion owns sync").status().await;
         assert_eq!(status[0].peers.selectors(), &["silber"]);
         node.shutdown().await
     }
 
     #[tokio::test]
-    async fn daemon_reports_the_frozen_sync_ipc_contract_and_embedded_owner() -> Result<()> {
+    async fn daemon_reports_the_frozen_sync_ipc_contract_and_the_companion_owner() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let node = FabricNode::start(FabricHome::new(dir.path())).await?;
         let response = process_control_request(
@@ -5846,7 +5848,7 @@ mod tests {
                 assert_eq!(version, crate::version_string());
                 assert_eq!(sync_ipc_magic, sync::ipc::IPC_MAGIC);
                 assert_eq!(sync_ipc_version, sync::ipc::IPC_VERSION);
-                assert_eq!(owner, "embedded");
+                assert_eq!(owner, "companion");
             }
             other => panic!("wrong compatibility response: {other:?}"),
         }
@@ -5863,7 +5865,7 @@ mod tests {
             runtime,
             ControlResponse::SyncRuntimeStatus {
                 runtime: SyncRuntimeStatus { owner, companion }
-            } if owner == "embedded" && companion == "absent"
+            } if owner == "unavailable" && companion == "absent"
         ));
 
         let rejected = process_control_request(
@@ -5883,7 +5885,9 @@ mod tests {
             "incompatible"
         );
 
-        let accepted = process_control_request(
+        // A matching build that announces no bridge socket cannot be reached,
+        // so it is not granted ownership either.
+        let unreachable = process_control_request(
             ControlRequest::SyncCompanionHello {
                 version: crate::version_string(),
                 sync_ipc_magic: sync::ipc::IPC_MAGIC.to_string(),
@@ -5892,27 +5896,49 @@ mod tests {
             },
             node.state(),
         )
+        .await
+        .expect_err("a companion with no socket was granted sync");
+        assert!(format!("{unreachable:#}").contains("no bridge socket"));
+
+        let socket = node.state().home.sync_companion_socket_path();
+        let accepted = process_control_request(
+            ControlRequest::SyncCompanionHello {
+                version: crate::version_string(),
+                sync_ipc_magic: sync::ipc::IPC_MAGIC.to_string(),
+                sync_ipc_version: sync::ipc::IPC_VERSION,
+                companion_socket: Some(socket.clone()),
+            },
+            node.state(),
+        )
         .await?;
-        assert!(matches!(
-            accepted,
-            ControlResponse::SyncIpcCompatibility { owner, .. } if owner == "embedded"
-        ));
+        match accepted {
+            ControlResponse::SyncIpcCompatibility {
+                owner,
+                nonce,
+                daemon_socket,
+                node_id,
+                ..
+            } => {
+                assert_eq!(owner, "companion");
+                assert_eq!(nonce.as_deref(), Some(node.state().sync_ipc_nonce.as_str()));
+                assert_eq!(daemon_socket, Some(node.state().home.sync_ipc_socket_path()));
+                assert_eq!(node_id, Some(node.id().to_string()));
+            }
+            other => panic!("wrong hello response: {other:?}"),
+        }
         assert_eq!(
             node.state().sync_runtime_status().await,
-            SyncRuntimeStatus {
-                owner: "embedded".to_string(),
-                companion: "standby".to_string(),
-            }
+            SyncRuntimeStatus::new("companion", "active")
         );
 
         *node.state().sync_companion.lock().await = Some(CompanionPresence {
             seen: Instant::now() - SYNC_COMPANION_PRESENCE_WINDOW - Duration::from_secs(1),
-            state: "standby",
-            socket: None,
+            state: "active",
+            socket: Some(socket),
         });
         assert_eq!(
-            node.state().sync_runtime_status().await.companion,
-            "absent",
+            node.state().sync_runtime_status().await,
+            SyncRuntimeStatus::unavailable("absent"),
             "a dead companion must not remain healthy forever"
         );
         node.shutdown().await

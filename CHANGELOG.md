@@ -6,6 +6,22 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ## [Unreleased]
 
+### Changed
+
+- **The `fabric-sync` companion owns file sync. The daemon no longer
+  constructs a sync engine.** On every machine that takes this release the
+  supervised companion, which already ran in standby, acquires the state lease
+  and runs the engine the moment the new daemon grants it; the daemon keeps the
+  remote `fabric/sync/1` listener, the `sync` permission gate, and the operator
+  report, and reaches the engine over the local bridge. Nothing in
+  `syncs.toml`, `peers.toml`, the durable sync state, or the service
+  definitions changes. With the companion stopped, absent, or a different
+  build, no file sync runs and nothing falls back: `fabric status`, `sync ls`
+  and `doctor` say `runtime=unavailable` with the reason, a peer syncing toward
+  the machine is told `unavailable`, and every other service runs normally. The
+  embedded engine remains in the binary for the mixed-fleet matrix and for
+  `FABRIC_SYNC_OWNER=embedded` measurements until it is removed.
+
 ### Added
 
 - **The sync engine can run in the `fabric-sync` companion, behind both

@@ -2766,20 +2766,21 @@ async fn a_long_outage_does_not_time_out_permanently() -> Result<()> {
     Ok(())
 }
 
-/// The permanent latency test. The command, workload, window, and bounds do
-/// not change while sync is extracted; what changes is where the walk runs.
+/// The permanent latency test. The command, workload, window, and bounds did
+/// not change while sync was extracted; what changed is where the walk runs.
+/// Since activation the hold runs in the companion runtime and the measured
+/// pipe stays in the daemon.
 #[cfg(all(unix, debug_assertions))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn sync_walks_do_not_delay_exec_pipe_delivery() -> Result<()> {
-    sync_walks_do_not_delay_exec_pipe_delivery_with(fabric::daemon::SyncOwner::Embedded).await
+    sync_walks_do_not_delay_exec_pipe_delivery_with(fabric::daemon::SyncOwner::Companion).await
 }
 
-/// The same test with the walk held in the companion process's runtime and the
-/// measured pipe in the daemon. Same bounds, same window, same workload.
+/// The same test on the embedded owner, kept until that engine path is removed.
 #[cfg(all(unix, debug_assertions))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn sync_walks_do_not_delay_exec_pipe_delivery_through_the_companion() -> Result<()> {
-    sync_walks_do_not_delay_exec_pipe_delivery_with(fabric::daemon::SyncOwner::Companion).await
+async fn sync_walks_do_not_delay_exec_pipe_delivery_with_the_embedded_engine() -> Result<()> {
+    sync_walks_do_not_delay_exec_pipe_delivery_with(fabric::daemon::SyncOwner::Embedded).await
 }
 
 #[cfg(all(unix, debug_assertions))]

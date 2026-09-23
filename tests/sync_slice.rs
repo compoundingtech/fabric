@@ -10,6 +10,7 @@ use fabric::{
     config::{FabricHome, PeerBook},
     control::{ControlRequest, ControlResponse, SyncEntryStatus},
     daemon::{FabricNode, send_control},
+    sync::companion::HostedNode,
 };
 use tempfile::TempDir;
 use tokio::sync::Mutex;
@@ -107,8 +108,8 @@ async fn catalog_sync_propagates_new_file_and_a_delete_sticks() -> Result<()> {
     write_sync(a_dir.path(), &a_catalog, "catalog");
     write_sync(b_dir.path(), &b_catalog, "catalog");
 
-    let node_a = FabricNode::start(a_home.clone()).await?;
-    let node_b = FabricNode::start(b_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
+    let node_b = HostedNode::start(b_home.clone()).await?;
 
     // Mutual trust with address hints for deterministic same-machine dialing.
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
@@ -161,8 +162,8 @@ async fn bus_update_beats_equal_version_delete_then_archive_survives_restart() -
     write_sync(a_dir.path(), &a_bus, "bus");
     write_sync(b_dir.path(), &b_bus, "bus");
 
-    let node_a = FabricNode::start(a_home.clone()).await?;
-    let node_b = FabricNode::start(b_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
+    let node_b = HostedNode::start(b_home.clone()).await?;
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
     trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
 
@@ -182,10 +183,10 @@ async fn bus_update_beats_equal_version_delete_then_archive_survives_restart() -
     std::fs::write(&a_inbox, b"concurrent update")?;
     std::fs::remove_file(&b_inbox)?;
 
-    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
     // Force A to persist its local v2 Present while B is offline.
     reload_sync(&a_home).await?;
-    let node_b = FabricNode::start(b_home.clone()).await?;
+    let node_b = HostedNode::start(b_home.clone()).await?;
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
     trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
     reload_sync(&b_home).await?;
@@ -216,9 +217,9 @@ async fn bus_update_beats_equal_version_delete_then_archive_survives_restart() -
     // tombstone must remain authoritative and the archived bytes must remain.
     node_b.shutdown().await?;
     node_a.shutdown().await?;
-    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
     reload_sync(&a_home).await?;
-    let node_b = FabricNode::start(b_home.clone()).await?;
+    let node_b = HostedNode::start(b_home.clone()).await?;
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
     trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
     reload_sync(&b_home).await?;
@@ -252,8 +253,8 @@ async fn a_staged_file_does_not_reach_a_peer_until_published() -> Result<()> {
     write_sync(a_dir.path(), &a_bus, "bus");
     write_sync(b_dir.path(), &b_bus, "bus");
 
-    let node_a = FabricNode::start(a_home.clone()).await?;
-    let node_b = FabricNode::start(b_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
+    let node_b = HostedNode::start(b_home.clone()).await?;
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
     trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
 
@@ -285,7 +286,7 @@ async fn a_staged_file_does_not_reach_a_peer_until_published() -> Result<()> {
 
     // Restart A with the file still staged. Nothing may publish it.
     node_a.shutdown().await?;
-    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
     trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
     reload_sync(&a_home).await?;
@@ -349,8 +350,8 @@ async fn production_status_exposes_exact_inbound_scan_ledger() -> Result<()> {
     write_sync(a_dir.path(), &a_bus, "bus");
     write_sync(b_dir.path(), &b_bus, "bus");
 
-    let node_a = FabricNode::start(a_home.clone()).await?;
-    let node_b = FabricNode::start(b_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
+    let node_b = HostedNode::start(b_home.clone()).await?;
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
     trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
 

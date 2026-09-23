@@ -59,6 +59,7 @@ use fabric::{
     config::{FabricHome, PeerBook, generate_identity_file},
     control::ControlRequest,
     daemon::{FabricNode, send_control},
+    sync::companion::HostedNode,
 };
 use tempfile::TempDir;
 use tokio::sync::Mutex;
@@ -200,8 +201,8 @@ async fn converged_peers_report_the_same_digest() -> Result<()> {
     write_sync(a_dir.path(), &a_folder, "bus");
     write_sync(b_dir.path(), &b_folder, "bus");
 
-    let node_a = FabricNode::start(a_home.clone()).await?;
-    let node_b = FabricNode::start(b_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
+    let node_b = HostedNode::start(b_home.clone()).await?;
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
     trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
 
@@ -297,8 +298,8 @@ async fn bus_delete_propagates_and_stays_deleted() -> Result<()> {
     write_sync(a_dir.path(), &a_folder, "bus");
     write_sync(b_dir.path(), &b_folder, "bus");
 
-    let node_a = FabricNode::start(a_home.clone()).await?;
-    let node_b = FabricNode::start(b_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
+    let node_b = HostedNode::start(b_home.clone()).await?;
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
     trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
 
@@ -345,8 +346,8 @@ async fn bus_delete_while_peer_away_does_not_resurrect_on_return() -> Result<()>
     write_sync(a_dir.path(), &a_folder, "bus");
     write_sync(b_dir.path(), &b_folder, "bus");
 
-    let node_a = FabricNode::start(a_home.clone()).await?;
-    let node_b = FabricNode::start(b_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
+    let node_b = HostedNode::start(b_home.clone()).await?;
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
     trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
 
@@ -369,7 +370,7 @@ async fn bus_delete_while_peer_away_does_not_resurrect_on_return() -> Result<()>
     );
 
     // B comes back holding its stale present copy.
-    let node_b = FabricNode::start(b_home.clone()).await?;
+    let node_b = HostedNode::start(b_home.clone()).await?;
     trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
     reload_sync(&b_home).await?;
 
@@ -434,8 +435,8 @@ async fn an_excluded_path_never_reaches_a_peer() -> Result<()> {
     write_sync_with_include(a_dir.path(), &a_folder, "catalog", "plans/**");
     write_sync_with_include(b_dir.path(), &b_folder, "catalog", "plans/**");
 
-    let node_a = FabricNode::start(a_home.clone()).await?;
-    let node_b = FabricNode::start(b_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
+    let node_b = HostedNode::start(b_home.clone()).await?;
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
     trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
 
@@ -499,8 +500,8 @@ async fn catalog_delete_while_peer_away_does_not_resurrect_on_return() -> Result
     write_sync(a_dir.path(), &a_folder, "catalog");
     write_sync(b_dir.path(), &b_folder, "catalog");
 
-    let node_a = FabricNode::start(a_home.clone()).await?;
-    let node_b = FabricNode::start(b_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
+    let node_b = HostedNode::start(b_home.clone()).await?;
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
     trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
 
@@ -523,7 +524,7 @@ async fn catalog_delete_while_peer_away_does_not_resurrect_on_return() -> Result
     );
 
     // B returns still holding the bytes. This is where it used to resurrect.
-    let node_b = FabricNode::start(b_home.clone()).await?;
+    let node_b = HostedNode::start(b_home.clone()).await?;
     trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
     reload_sync(&b_home).await?;
 
@@ -565,7 +566,7 @@ async fn a_path_dropped_from_include_is_forgotten_not_deleted() -> Result<()> {
     std::fs::create_dir_all(a_folder.join("keep"))?;
     write_sync_with_include(a_dir.path(), &a_folder, "catalog", "**");
 
-    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
 
     let doomed = a_folder.join("plans/live-work.md");
     let kept = a_folder.join("keep/other.md");
@@ -629,8 +630,8 @@ async fn a_replica_stores_the_origin_metadata_verbatim() -> Result<()> {
     write_sync(a_dir.path(), &a_folder, "bus");
     write_sync(b_dir.path(), &b_folder, "bus");
 
-    let node_a = FabricNode::start(a_home.clone()).await?;
-    let node_b = FabricNode::start(b_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
+    let node_b = HostedNode::start(b_home.clone()).await?;
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
     trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
 
@@ -761,8 +762,8 @@ async fn a_small_change_must_not_ship_the_whole_manifest() -> Result<()> {
         std::fs::write(a_folder.join(format!("f{i}.txt")), format!("content {i}\n"))?;
     }
 
-    let node_a = FabricNode::start(a_home.clone()).await?;
-    let node_b = FabricNode::start(b_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
+    let node_b = HostedNode::start(b_home.clone()).await?;
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
     trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
     reload_sync(&a_home).await?;
@@ -901,8 +902,8 @@ async fn a_path_outside_the_receivers_include_is_not_deleted() -> Result<()> {
     write_sync_with_includes(a_dir.path(), &a_folder, "bus", &["docs/**", "keep/**"]);
     write_sync_with_includes(b_dir.path(), &b_folder, "bus", &["keep/**"]);
 
-    let node_a = FabricNode::start(a_home.clone()).await?;
-    let node_b = FabricNode::start(b_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
+    let node_b = HostedNode::start(b_home.clone()).await?;
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
     trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
 
@@ -987,8 +988,8 @@ async fn a_delete_sticks_starting_from_either_peer() -> Result<()> {
     write_sync(a_dir.path(), &a_folder, "bus");
     write_sync(b_dir.path(), &b_folder, "bus");
 
-    let node_a = FabricNode::start(a_home.clone()).await?;
-    let node_b = FabricNode::start(b_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
+    let node_b = HostedNode::start(b_home.clone()).await?;
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
     trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
 
@@ -1076,9 +1077,9 @@ async fn a_change_and_a_delete_cross_a_peer_that_is_only_a_relay() -> Result<()>
         write_sync(dir.path(), folder, "bus");
     }
 
-    let a = FabricNode::start(homes[0].clone()).await?;
-    let b = FabricNode::start(homes[1].clone()).await?;
-    let c = FabricNode::start(homes[2].clone()).await?;
+    let a = HostedNode::start(homes[0].clone()).await?;
+    let b = HostedNode::start(homes[1].clone()).await?;
+    let c = HostedNode::start(homes[2].clone()).await?;
 
     // A — B — C. A and C are never introduced.
     trust_peer(&homes[0], &a, b.id(), "b", b.addr()).await?;
@@ -1224,8 +1225,8 @@ async fn a_node_that_loses_its_log_converges_instead_of_staying_behind() -> Resu
     write_sync(a_dir.path(), &a_folder, "bus");
     write_sync(b_dir.path(), &b_folder, "bus");
 
-    let node_a = FabricNode::start(a_home.clone()).await?;
-    let node_b = FabricNode::start(b_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
+    let node_b = HostedNode::start(b_home.clone()).await?;
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
     trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
 
@@ -1266,7 +1267,7 @@ async fn a_node_that_loses_its_log_converges_instead_of_staying_behind() -> Resu
     assert!(!lost.is_empty(), "A's log was empty");
     std::fs::remove_file(&log)?;
 
-    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
 
     // Neither change may be lost, and neither may be resurrected as a delete.
@@ -1336,8 +1337,8 @@ async fn a_peer_holding_a_stale_cursor_still_repairs_a_node_that_fell_behind() -
     write_sync(a_dir.path(), &a_folder, "bus");
     write_sync(b_dir.path(), &b_folder, "bus");
 
-    let node_a = FabricNode::start(a_home.clone()).await?;
-    let node_b = FabricNode::start(b_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
+    let node_b = HostedNode::start(b_home.clone()).await?;
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
     trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
 
@@ -1383,7 +1384,7 @@ async fn a_peer_holding_a_stale_cursor_still_repairs_a_node_that_fell_behind() -
     let _ = std::fs::remove_file(&log);
     std::fs::remove_file(a_folder.join("only-on-b.md"))?;
 
-    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
 
     assert!(
@@ -1448,8 +1449,8 @@ async fn a_missing_remote_entry_reports_a_configuration_error() -> Result<()> {
     std::fs::create_dir_all(&a_folder)?;
     write_sync(a_dir.path(), &a_folder, "bus");
 
-    let node_a = FabricNode::start(a_home.clone()).await?;
-    let node_b = FabricNode::start(b_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
+    let node_b = HostedNode::start(b_home.clone()).await?;
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
     trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
 
@@ -1506,7 +1507,7 @@ async fn an_entry_that_names_an_unknown_peer_says_so() -> Result<()> {
     );
     b_peers.save(&b_home)?;
 
-    let node_b = FabricNode::start(b_home.clone()).await?;
+    let node_b = HostedNode::start(b_home.clone()).await?;
 
     // Put the resolvable peer in A's allow list before A starts. A must start
     // with the whole candidate config, keep transport available for node-b,
@@ -1521,7 +1522,7 @@ async fn an_entry_that_names_an_unknown_peer_says_so() -> Result<()> {
     );
     a_peers.save(&a_home)?;
 
-    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
 
     assert!(
         wait_for_file(&b_folder.join("arrives.md"), b"via node-b").await,
@@ -1552,7 +1553,7 @@ async fn a_wildcard_entry_with_no_trusted_peers_says_so() -> Result<()> {
     let a_folder = a_dir.path().join("shared");
     std::fs::create_dir_all(&a_folder)?;
     write_sync(a_dir.path(), &a_folder, "bus");
-    let node_a = FabricNode::start(a_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
     std::fs::write(a_folder.join("lonely.md"), b"nobody to send to")?;
     reload_sync(&a_home).await?;
 
@@ -1595,8 +1596,8 @@ async fn a_peer_denied_sync_makes_the_entry_report_stopped_not_clean() -> Result
     write_sync(a_dir.path(), &a_folder, "bus");
     write_sync(b_dir.path(), &b_folder, "bus");
 
-    let node_a = FabricNode::start(a_home.clone()).await?;
-    let node_b = FabricNode::start(b_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
+    let node_b = HostedNode::start(b_home.clone()).await?;
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
 
     // B trusts A for `web` only. A's sync will be refused, and B is otherwise
@@ -1696,8 +1697,8 @@ async fn deleting_a_path_outside_the_include_does_not_delete_it_on_a_peer() -> R
     write_sync_with_includes(a_dir.path(), &a_folder, "catalog", &["keep/**", "plans/**"]);
     write_sync_with_includes(b_dir.path(), &b_folder, "catalog", &["keep/**", "plans/**"]);
 
-    let node_a = FabricNode::start(a_home.clone()).await?;
-    let node_b = FabricNode::start(b_home.clone()).await?;
+    let node_a = HostedNode::start(a_home.clone()).await?;
+    let node_b = HostedNode::start(b_home.clone()).await?;
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
     trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
 
