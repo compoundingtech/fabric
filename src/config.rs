@@ -198,6 +198,25 @@ impl FabricHome {
         self.root.join("run/control.sock")
     }
 
+    /// The daemon's bridge socket, where the sync companion sends its requests.
+    pub fn sync_ipc_socket_path(&self) -> PathBuf {
+        self.root
+            .join("run")
+            .join(crate::sync::ipc::DAEMON_SOCKET_NAME)
+    }
+
+    /// The companion's bridge socket, where the daemon sends its requests.
+    pub fn sync_companion_socket_path(&self) -> PathBuf {
+        self.root
+            .join("run")
+            .join(crate::sync::ipc::COMPANION_SOCKET_NAME)
+    }
+
+    /// The companion's daily-rotated log, beside the daemon's validation log.
+    pub fn sync_log_prefix(&self) -> &'static str {
+        "fabric-sync.log"
+    }
+
     pub fn log_path(&self) -> PathBuf {
         self.root.join("logs/daemon.log")
     }

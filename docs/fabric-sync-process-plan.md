@@ -4,8 +4,15 @@ Date: 2026-09-04
 
 Status: approved for implementation on 2026-09-04.
 
-Implementation: steps 1 through 5 are merged. The embedded engine remains the
-production owner.
+Implementation: steps 1 through 6 are merged. The embedded engine remains the
+production owner until step 7 activates the companion.
+
+Step 6 as built differs from the sketch below in two places. The inbound open
+carries no sync name: the companion reads the wire hello itself, so the daemon
+never parses `fabric/sync/1` bytes on the way through. And the companion keeps
+the `--standby` argument under the service manager: it owns sync the moment the
+daemon it attaches to grants ownership, so the activation step changes no
+service definition and the rollback inventory gains no row.
 
 ## Decisions
 

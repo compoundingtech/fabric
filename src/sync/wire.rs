@@ -147,6 +147,28 @@ fn validate_blobs(blobs: &[(ContentHash, Vec<u8>)]) -> Result<()> {
     Ok(())
 }
 
+/// The phrase a daemon without a sync owner puts in its error reply. The
+/// client side classifies it as `unavailable`: not a refusal a person must fix
+/// in `peers.toml`, and not weather the engine should wait out.
+pub const SYNC_UNAVAILABLE_MARKER: &str = "sync is unavailable on this peer";
+
+/// Answer a peer's hello with one error reply and nothing else.
+///
+/// The hello is read and discarded first, because the client writes it before
+/// it reads anything and a large manifest would otherwise block behind the
+/// unread bytes. Nothing about the hello is acted on.
+pub(crate) async fn refuse_hello<S>(mut stream: S, message: &str) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let _hello = read_len_bytes(&mut stream, MAX_JSON_FRAME)
+        .await
+        .context("reading the sync hello before refusing it")?;
+    write_error_reply(&mut stream, message).await?;
+    let _ = stream.shutdown().await;
+    Ok(())
+}
+
 async fn write_error_reply<W: AsyncWrite + Unpin>(w: &mut W, message: &str) -> Result<()> {
     let reply = ReplyHeader {
         manifest: Manifest::new(),
@@ -600,12 +622,17 @@ where
     ))
 }
 
-struct IdleTimeoutStream<S> {
+pub(crate) struct IdleTimeoutStream<S> {
     inner: S,
     peer: String,
     idle_timeout: Duration,
     read_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
     write_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+/// Wrap a stream so that `idle_timeout` without progress ends it with an error.
+pub(crate) fn idle_timeout_stream<S>(inner: S, peer: &str, idle_timeout: Duration) -> IdleTimeoutStream<S> {
+    IdleTimeoutStream::new(inner, peer, idle_timeout)
 }
 
 impl<S> IdleTimeoutStream<S> {

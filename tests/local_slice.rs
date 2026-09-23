@@ -2766,9 +2766,26 @@ async fn a_long_outage_does_not_time_out_permanently() -> Result<()> {
     Ok(())
 }
 
+/// The permanent latency test. The command, workload, window, and bounds do
+/// not change while sync is extracted; what changes is where the walk runs.
 #[cfg(all(unix, debug_assertions))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn sync_walks_do_not_delay_exec_pipe_delivery() -> Result<()> {
+    sync_walks_do_not_delay_exec_pipe_delivery_with(fabric::daemon::SyncOwner::Embedded).await
+}
+
+/// The same test with the walk held in the companion process's runtime and the
+/// measured pipe in the daemon. Same bounds, same window, same workload.
+#[cfg(all(unix, debug_assertions))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn sync_walks_do_not_delay_exec_pipe_delivery_through_the_companion() -> Result<()> {
+    sync_walks_do_not_delay_exec_pipe_delivery_with(fabric::daemon::SyncOwner::Companion).await
+}
+
+#[cfg(all(unix, debug_assertions))]
+async fn sync_walks_do_not_delay_exec_pipe_delivery_with(
+    owner: fabric::daemon::SyncOwner,
+) -> Result<()> {
     let _guard = local_slice_guard().await;
     let target_dir = TempDir::new()?;
     let source_dir = TempDir::new()?;
@@ -2783,8 +2800,20 @@ async fn sync_walks_do_not_delay_exec_pipe_delivery() -> Result<()> {
     write_latency_sync(&source_home, &source_folder)?;
     fs::write(target_folder.join(".fabric-test-walk-hold-ms"), b"500")?;
 
-    let target = FabricNode::start(target_home.clone()).await?;
-    let source = FabricNode::start(source_home.clone()).await?;
+    let options = fabric::daemon::DaemonOptions {
+        sync_owner: owner,
+        ..fabric::daemon::DaemonOptions::default()
+    };
+    let target = FabricNode::start_with_daemon_options(target_home.clone(), options).await?;
+    let source = FabricNode::start_with_daemon_options(source_home.clone(), options).await?;
+    let mut companions = Vec::new();
+    if owner == fabric::daemon::SyncOwner::Companion {
+        for home in [&target_home, &source_home] {
+            let companion = fabric::sync::companion::start(home.clone()).await?;
+            companion.wait_until_active(Duration::from_secs(20)).await?;
+            companions.push(companion);
+        }
+    }
     trust_peer(
         &target_home,
         &target,
@@ -2860,6 +2889,9 @@ async fn sync_walks_do_not_delay_exec_pipe_delivery() -> Result<()> {
     keep_writing.store(false, Ordering::Release);
     writer.join().expect("the filesystem writer panicked");
     let scans_after = sync_full_scans(&target_home, "latency").await?;
+    for companion in companions {
+        companion.shutdown().await?;
+    }
     source.shutdown().await?;
     target.shutdown().await?;
 

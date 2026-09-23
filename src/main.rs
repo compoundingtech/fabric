@@ -3032,6 +3032,24 @@ fn daemon_options(
         server_session_max_total,
         server_session_max_per_peer,
         server_session_detached_ttl_secs,
+        sync_owner: sync_owner_from_env(),
+    }
+}
+
+/// Which process runs sync, for one daemon. The default is the build's; the
+/// environment can pin either owner for a measurement or a mixed-fleet check
+/// against the same binary. Any other value is the default, loudly.
+fn sync_owner_from_env() -> fabric::daemon::SyncOwner {
+    match std::env::var("FABRIC_SYNC_OWNER").ok().as_deref().map(str::trim) {
+        None | Some("") => fabric::daemon::SyncOwner::default(),
+        Some("embedded") => fabric::daemon::SyncOwner::Embedded,
+        Some("companion") => fabric::daemon::SyncOwner::Companion,
+        Some(other) => {
+            eprintln!(
+                "fabric: FABRIC_SYNC_OWNER={other:?} is not embedded or companion; using the default"
+            );
+            fabric::daemon::SyncOwner::default()
+        }
     }
 }
 
