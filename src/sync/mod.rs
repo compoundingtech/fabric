@@ -1,36 +1,29 @@
-//! `fabric sync` — a generic, reusable file-sync primitive.
+//! What the core keeps of file sync: the declarative config, the staging
+//! commands, the local bridge to the `fabric-sync` process, and the few
+//! definitions the engine crate shares with it.
 //!
-//! A config file (`syncs.toml`) lists sync *entries*; the running fabric daemon
-//! reads it and continuously ensures each entry's `folder` stays converged with
-//! its `peers` under its `policy`. The sync *semantics* — union merge,
-//! newer-wins conflict resolution, per-policy delete handling, echo/loop
-//! prevention, convergence — live here in fabric, above a swappable transport
-//! backend, so the same backend-agnostic test suite pins behaviour regardless of
-//! which backend moves the bytes.
+//! The engine itself, the wire sessions, the manifest algebra, the durable
+//! state and the companion runtime live in the `fabric-sync` crate. The daemon
+//! authorizes and forwards sync streams and reports status; it never builds
+//! the engine.
 //!
-//! Layers:
+//! Layers here:
 //! - [`config`]: the declarative `syncs.toml` surface (what tools/humans edit).
-//! - [`manifest`]: the pure reconciliation core (versioned per-file state, merge,
-//!   diff) — deterministic and heavily property-tested, no I/O.
-//! - [`delta`]: what changed here and which peer has seen it, so a pass can ship
-//!   the changed paths instead of the whole manifest.
+//! - [`staging`]: stage a change beside a synced folder and publish on purpose.
+//! - [`ipc`]: the `fabric/sync-ipc/1` bridge, both sockets.
+//! - [`frame`]: the wire framing, the idle bound, and the unavailable reply.
+//! - [`model`], [`peers`]: content identity, path form, atomic write, peer refs.
 
-pub mod companion;
 pub mod config;
-pub mod delta;
-pub mod engine;
+pub mod frame;
 pub mod glob;
 pub mod ipc;
-pub mod manifest;
-pub mod node;
-pub mod paths;
+pub mod model;
+pub mod peers;
 pub mod staging;
-pub mod wire;
 
 pub use config::{PolicyRules, SyncBook, SyncEntry, SyncPeers, SyncPolicy};
-pub use delta::{ChangeBuffer, Cursor};
-pub use engine::{PeerRef, PeerSyncState, SYNC_LOG_TARGET, SyncEngine, SyncStatus, SyncTransport};
-pub use manifest::{FileMeta, Manifest, ManifestDiff};
-pub use node::{Reconciled, SyncNode, content_hash};
-pub use paths::{SyncOwnerLease, SyncOwnerLeaseState, SyncPaths};
+pub use frame::SYNC_UNAVAILABLE_MARKER;
+pub use model::{ContentHash, content_hash, normalize_path, sanitize_name, write_atomic_with_mode};
+pub use peers::{PeerRef, ResolvedPeers};
 pub use staging::{PublishFile, StagedFile};

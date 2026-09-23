@@ -10,8 +10,8 @@ use fabric::{
     config::{FabricHome, PeerBook},
     control::{ControlRequest, ControlResponse, SyncEntryStatus},
     daemon::{FabricNode, send_control},
-    sync::companion::HostedNode,
 };
+use fabric_sync::companion::HostedNode;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 

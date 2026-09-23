@@ -59,8 +59,8 @@ use fabric::{
     config::{FabricHome, PeerBook, generate_identity_file},
     control::ControlRequest,
     daemon::{FabricNode, send_control},
-    sync::companion::HostedNode,
 };
+use fabric_sync::companion::HostedNode;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 

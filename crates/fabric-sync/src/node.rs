@@ -26,14 +26,12 @@ use std::{
     sync::Arc,
 };
 
-use super::config::PolicyRules;
+use fabric::sync::config::PolicyRules;
 use super::delta::ChangeBuffer;
 use super::manifest::{Author, ContentHash, Entry, FileMeta, Manifest, Tombstone};
 
 /// BLAKE3 content hash of `bytes` — the transfer identity for a file's content.
-pub fn content_hash(bytes: &[u8]) -> ContentHash {
-    ContentHash(*blake3::hash(bytes).as_bytes())
-}
+pub use fabric::sync::content_hash;
 
 /// One node's sync state for a single entry: its manifest plus the content it
 /// holds. The content store is keyed by hash so identical content is stored and
@@ -527,7 +525,7 @@ impl SyncNode {
     fn peer_path_in_scope(&self, path: &str) -> bool {
         match &self.include {
             None => true,
-            Some(globs) => crate::sync::glob::matches_any(globs, path),
+            Some(globs) => fabric::sync::glob::matches_any(globs, path),
         }
     }
 
@@ -775,7 +773,7 @@ mod tests {
     /// the sweep and still says `sweep_tombstones: false`, so a sweep test
     /// written against it would pass while production behaved differently.
     fn bus() -> PolicyRules {
-        crate::sync::config::SyncPolicy::Bus.rules()
+        fabric::sync::config::SyncPolicy::Bus.rules()
     }
 
     /// One node holding a tombstone for `path`, deleted at `deleted_secs`, with

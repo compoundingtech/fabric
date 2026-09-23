@@ -1,7 +1,7 @@
 //! The sync companion runtime: the engine, hosted outside the daemon.
 //!
 //! `fabric-sync` runs this under the OS service manager. Tests run it in
-//! process beside a [`crate::daemon::FabricNode`]. Either way it is the same
+//! process beside a [`fabric::daemon::FabricNode`]. Either way it is the same
 //! code on the same two sockets, so what a test proves is what production runs.
 //!
 //! The runtime has one loop that talks to the daemon and one listener that the
@@ -30,18 +30,15 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{
-    SyncEngine, SyncPaths,
-    ipc::{
-        self, IpcClient, IpcError, IpcErrorKind, IpcListener, IpcNonce, IpcRequest,
-        IpcRequestKind, IpcResponse, IpcRuntimeState, IpcStatus, IpcSyncTransport,
-    },
-    manifest::Author,
-};
-use crate::{
+use crate::{SyncEngine, SyncPaths, manifest::Author, transport::IpcSyncTransport};
+use fabric::{
     config::FabricHome,
     control::{ControlRequest, ControlResponse},
     daemon::send_control,
+    sync::ipc::{
+        self, IpcClient, IpcError, IpcErrorKind, IpcListener, IpcNonce, IpcRequest,
+        IpcRequestKind, IpcResponse, IpcRuntimeState, IpcStatus,
+    },
 };
 
 /// How often an attached companion tells the daemon it is alive. The daemon
@@ -176,32 +173,29 @@ impl CompanionHandle {
 /// and state as before; `shutdown` stops the companion first so the lease is
 /// free before the daemon goes.
 pub struct HostedNode {
-    node: crate::daemon::FabricNode,
+    node: fabric::daemon::FabricNode,
     companion: Option<CompanionHandle>,
 }
 
 impl HostedNode {
     pub async fn start(home: FabricHome) -> Result<Self> {
-        Self::start_with_options(home, crate::daemon::DaemonOptions::default()).await
+        Self::start_with_options(home, fabric::daemon::DaemonOptions::default()).await
     }
 
     pub async fn start_with_options(
         home: FabricHome,
-        options: crate::daemon::DaemonOptions,
+        options: fabric::daemon::DaemonOptions,
     ) -> Result<Self> {
-        let node = crate::daemon::FabricNode::start_with_daemon_options(home.clone(), options).await?;
-        let companion = match options.sync_owner {
-            crate::daemon::SyncOwner::Embedded => None,
-            crate::daemon::SyncOwner::Companion => {
-                let handle = start(home).await?;
-                handle.wait_until_active(Duration::from_secs(30)).await?;
-                Some(handle)
-            }
-        };
-        Ok(Self { node, companion })
+        let node = fabric::daemon::FabricNode::start_with_daemon_options(home.clone(), options).await?;
+        let handle = start(home).await?;
+        handle.wait_until_active(Duration::from_secs(30)).await?;
+        Ok(Self {
+            node,
+            companion: Some(handle),
+        })
     }
 
-    pub fn node(&self) -> &crate::daemon::FabricNode {
+    pub fn node(&self) -> &fabric::daemon::FabricNode {
         &self.node
     }
 
@@ -226,7 +220,7 @@ impl HostedNode {
 }
 
 impl std::ops::Deref for HostedNode {
-    type Target = crate::daemon::FabricNode;
+    type Target = fabric::daemon::FabricNode;
 
     fn deref(&self) -> &Self::Target {
         &self.node
@@ -283,7 +277,7 @@ impl Companion {
             let changed = *self.phase.borrow() != phase;
             if changed {
                 tracing::info!(
-                    target: super::SYNC_LOG_TARGET,
+                    target: crate::SYNC_LOG_TARGET,
                     event = "companion_phase",
                     phase = %phase.describe(),
                     "sync companion phase changed"
@@ -303,7 +297,7 @@ impl Companion {
 
     async fn heartbeat(&self) -> CompanionPhase {
         let request = ControlRequest::SyncCompanionHello {
-            version: crate::version_string(),
+            version: fabric::version_string(),
             sync_ipc_magic: ipc::IPC_MAGIC.to_string(),
             sync_ipc_version: ipc::IPC_VERSION,
             companion_socket: Some(self.home.sync_companion_socket_path()),
@@ -409,7 +403,7 @@ impl Companion {
         let runner = engine.clone();
         tokio::spawn(async move {
             if let Err(error) = runner.run().await {
-                tracing::warn!(target: super::SYNC_LOG_TARGET, %error, "sync engine stopped");
+                tracing::warn!(target: crate::SYNC_LOG_TARGET, %error, "sync engine stopped");
             }
         });
         *slot = Some(RunningEngine {
@@ -438,7 +432,7 @@ impl Companion {
         while Arc::strong_count(&engine) > 1 {
             if tokio::time::Instant::now() > deadline {
                 tracing::warn!(
-                    target: super::SYNC_LOG_TARGET,
+                    target: crate::SYNC_LOG_TARGET,
                     holders = Arc::strong_count(&engine) - 1,
                     "sync engine tasks did not stop within 10 s; releasing the lease anyway"
                 );
@@ -458,12 +452,12 @@ impl Companion {
                         let companion = self.clone();
                         tokio::spawn(async move {
                             if let Err(error) = companion.handle(stream).await {
-                                tracing::debug!(target: super::SYNC_LOG_TARGET, %error, "sync bridge request failed");
+                                tracing::debug!(target: crate::SYNC_LOG_TARGET, %error, "sync bridge request failed");
                             }
                         });
                     }
                     Err(error) => {
-                        tracing::warn!(target: super::SYNC_LOG_TARGET, %error, "sync bridge accept failed");
+                        tracing::warn!(target: crate::SYNC_LOG_TARGET, %error, "sync bridge accept failed");
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
@@ -565,7 +559,7 @@ impl Companion {
                             request_id,
                             published
                                 .into_iter()
-                                .map(|file| crate::control::SyncPublishedFile {
+                                .map(|file| fabric::control::SyncPublishedFile {
                                     rel: file.rel,
                                     version: file.version,
                                     hash: file.hash.to_hex(),
@@ -626,20 +620,20 @@ async fn refuse(stream: &mut UnixStream, request_id: u64, message: &str) -> Resu
 }
 
 fn publish_files(
-    files: Vec<crate::control::SyncPublishFile>,
-) -> Result<Vec<super::staging::PublishFile>> {
+    files: Vec<fabric::control::SyncPublishFile>,
+) -> Result<Vec<fabric::sync::staging::PublishFile>> {
     files
         .into_iter()
         .map(|file| {
             let base = match file.base {
                 Some(hex) => Some(
-                    super::manifest::ContentHash::from_hex(&hex).ok_or_else(|| {
+                    fabric::sync::ContentHash::from_hex(&hex).ok_or_else(|| {
                         anyhow::anyhow!("{}: the base is not a content hash", file.rel)
                     })?,
                 ),
                 None => None,
             };
-            Ok(super::staging::PublishFile {
+            Ok(fabric::sync::staging::PublishFile {
                 rel: file.rel,
                 bytes: file.bytes,
                 executable: file.executable,

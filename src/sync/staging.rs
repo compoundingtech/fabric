@@ -14,7 +14,7 @@
 //! has shipped, which is what a fleet that rolls one machine at a time needs.
 //!
 //! Publishing writes the staged bytes to the target path and forgets the
-//! staged copy. [`crate::sync::SyncEngine::publish_staged`] does that under the
+//! staged copy. the engine's `publish_staged` does that under the
 //! entry's operation guard so a set of files is one scan, one persist, and one
 //! reconcile on each peer. [`publish_locally`] is the fallback when no daemon
 //! answers or the daemon predates the request.
@@ -33,9 +33,7 @@ use crate::config::FabricHome;
 
 use super::{
     config::{SyncBook, SyncEntry},
-    engine::{sanitize_name, write_atomic_with_mode},
-    manifest::{ContentHash, Manifest},
-    node::content_hash,
+    model::{ContentHash, content_hash, normalize_path, sanitize_name, write_atomic_with_mode},
 };
 
 /// The directory under the fabric home that holds every staged file.
@@ -186,7 +184,7 @@ fn rel_inside(folder: &Path, target: &Path) -> Option<String> {
         let canonical = folder.canonicalize().ok()?;
         target.strip_prefix(canonical).ok()
     })?;
-    Manifest::normalize_path(&rel.to_string_lossy())
+    normalize_path(&rel.to_string_lossy())
 }
 
 /// Resolve `target` to exactly one entry, by folder and then by include.
@@ -383,7 +381,7 @@ fn staged_rels(dir: &Path) -> Result<BTreeSet<String>> {
             let Ok(rel) = path.strip_prefix(root) else {
                 continue;
             };
-            let Some(norm) = Manifest::normalize_path(&rel.to_string_lossy()) else {
+            let Some(norm) = normalize_path(&rel.to_string_lossy()) else {
                 continue;
             };
             if norm == SIDECAR_NAME || norm.ends_with(TEMP_SUFFIX) {

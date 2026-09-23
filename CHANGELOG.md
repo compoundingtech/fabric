@@ -6,6 +6,26 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ## [Unreleased]
 
+### Removed
+
+- **The sync engine is out of the `fabric` binary.** The repository is a
+  workspace: the core `fabric` crate keeps what the daemon needs to authorize
+  and forward sync streams and to report status, which is the `syncs.toml`
+  config and its validation, the staging commands, the local bridge, the wire
+  framing with the unavailable reply, and a few shared definitions (content
+  hash, path form, atomic write, peer refs). Everything that decides what to
+  sync lives in the new `fabric-sync` crate: the manifest algebra, a node's
+  durable state, the wire sessions, the engine, the state lease, the bridge
+  transport, and the companion runtime. The embedded engine path, the
+  `FABRIC_SYNC_OWNER` knob, and the daemon's in-process sync transport are
+  gone; a daemon always delegates. The core went from 53,911 lines of Rust to
+  36,334, of which 2,873 are sync; `fabric-sync` is 17,502. Nothing on the wire,
+  in `syncs.toml`, in the durable state, or in the service definitions changed;
+  the release archive still ships exactly `fabric` and `fabric-sync`.
+- The mixed-fleet matrix now runs its old side as a real deployed binary from
+  before the process boundary (`FABRIC_OLD_BIN`), which is the build a roaming
+  peer still runs; there is no other embedded engine to stand in for it.
+
 ### Changed
 
 - **The `fabric-sync` companion owns file sync. The daemon no longer

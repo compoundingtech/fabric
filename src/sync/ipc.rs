@@ -28,10 +28,12 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{UnixListener, UnixStream},
-    sync::Mutex,
 };
 
-use super::{PeerRef, SyncNode, SyncPeers, SyncTransport, engine::ResolvedPeers};
+use super::{
+    SyncPeers,
+    peers::{PeerRef, ResolvedPeers},
+};
 use crate::control::{SyncEntryStatus, SyncPublishFile, SyncPublishedFile};
 
 pub const IPC_MAGIC: &str = "fabric/sync-ipc/1";
@@ -734,102 +736,6 @@ impl IpcClient {
     }
 }
 
-/// The engine's transport when it runs in the companion: every peer lookup and
-/// every outbound reconcile goes to the daemon over the bridge.
-///
-/// The session it talks to can change while the engine runs, because a daemon
-/// restart mints a new nonce. Until the companion re-attaches, a lookup resolves
-/// nothing and a reconcile fails with a local error, which the engine reports as
-/// unreachable rather than as a network fault it must recover from.
-#[derive(Clone, Default)]
-pub struct IpcSyncTransport {
-    session: Arc<std::sync::RwLock<Option<IpcClient>>>,
-}
-
-impl IpcSyncTransport {
-    /// A transport attached to one fixed daemon session.
-    pub fn new(socket_path: impl Into<PathBuf>, nonce: IpcNonce) -> Self {
-        let transport = Self::default();
-        transport.attach(IpcClient::new(socket_path, nonce));
-        transport
-    }
-
-    /// A transport with no daemon session yet.
-    pub fn detached() -> Self {
-        Self::default()
-    }
-
-    pub fn attach(&self, client: IpcClient) {
-        *self.session.write().unwrap() = Some(client);
-    }
-
-    pub fn detach(&self) {
-        *self.session.write().unwrap() = None;
-    }
-
-    pub fn session(&self) -> Option<IpcClient> {
-        self.session.read().unwrap().clone()
-    }
-
-    pub fn socket_path(&self) -> Option<PathBuf> {
-        self.session().map(|client| client.socket_path.clone())
-    }
-
-    fn client(&self) -> Result<IpcClient> {
-        self.session()
-            .context("the sync companion is not attached to a fabric daemon")
-    }
-
-    pub async fn resolve_peers(&self, peers: &SyncPeers) -> Result<ResolvedPeers> {
-        self.client()?.resolve_peers(peers).await
-    }
-
-    pub async fn open_outbound(&self, peer: PeerRef, sync_name: String) -> Result<UnixStream> {
-        self.client()?.open_outbound(peer, sync_name).await
-    }
-
-    pub async fn status(&self) -> Result<IpcStatus> {
-        self.client()?.status().await
-    }
-
-    pub async fn shutdown(&self) -> Result<()> {
-        self.client()?.shutdown().await
-    }
-
-    #[cfg(test)]
-    fn with_timeout(self, timeout: Duration) -> Self {
-        if let Some(client) = self.session() {
-            self.attach(client.with_timeout(timeout));
-        }
-        self
-    }
-}
-
-impl SyncTransport for IpcSyncTransport {
-    async fn peers_for(&self, peers: &SyncPeers) -> ResolvedPeers {
-        match self.resolve_peers(peers).await {
-            Ok(resolved) => resolved,
-            Err(_) => ResolvedPeers {
-                peers: Vec::new(),
-                unresolved: match peers {
-                    SyncPeers::Wildcard(selector) => vec![selector.clone()],
-                    SyncPeers::List(selectors) => selectors.clone(),
-                },
-            },
-        }
-    }
-
-    async fn reconcile(
-        &self,
-        peer: PeerRef,
-        name: String,
-        node: Arc<Mutex<SyncNode>>,
-    ) -> Result<super::Reconciled> {
-        let stream = self.open_outbound(peer.clone(), name.clone()).await?;
-        super::wire::run_client(stream, node, &name, &peer.id).await
-    }
-}
-
 /// Carry raw sync-wire bytes after the control handshake completes.
 pub async fn relay_raw<A, B>(mut left: A, mut right: B) -> Result<(u64, u64)>
 where
@@ -846,65 +752,28 @@ where
 mod tests {
     use std::{
         os::unix::fs::PermissionsExt,
-        sync::Arc,
         time::{Duration, Instant},
     };
 
     use anyhow::Result;
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        sync::Mutex,
-    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
-    use crate::sync::{SyncNode, SyncPeers, SyncTransport, manifest::Author, node::content_hash};
 
-    async fn reference_server(
-        listener: IpcListener,
-        nonce: IpcNonce,
-        remote: Arc<Mutex<SyncNode>>,
-    ) -> Result<()> {
+    /// A listener that answers every valid request with a status and a
+    /// shutdown, so the client side can be exercised without an engine.
+    async fn status_server(listener: IpcListener, nonce: IpcNonce) -> Result<()> {
         loop {
             let Some((mut stream, request)) = listener.accept_request(&nonce).await? else {
                 continue;
             };
             match request.kind {
-                IpcRequestKind::ResolvePeers { .. } => {
-                    write_response(
-                        &mut stream,
-                        &IpcResponse::peers(
-                            request.request_id,
-                            vec![IpcPeer {
-                                key: "remote-key".into(),
-                                id: "remote".into(),
-                                roaming: false,
-                            }],
-                            Vec::new(),
-                        ),
-                    )
-                    .await?;
-                }
-                IpcRequestKind::OpenOutbound { peer, sync_name } => {
-                    if peer.key != "remote-key" || sync_name != "catalog" {
-                        write_response(
-                            &mut stream,
-                            &IpcResponse::error(
-                                request.request_id,
-                                IpcError::new(IpcErrorKind::NotFound, "unknown sync target"),
-                            ),
-                        )
+                IpcRequestKind::Shutdown => {
+                    write_response(&mut stream, &IpcResponse::shutting_down(request.request_id))
                         .await?;
-                        continue;
-                    }
-                    write_response(&mut stream, &IpcResponse::ready(request.request_id)).await?;
-                    let target = remote.clone();
-                    crate::sync::wire::run_server(stream, "reference-client", move |hello| {
-                        let target = target.clone();
-                        async move { Ok((hello.name == "catalog").then_some((target, ()))) }
-                    })
-                    .await?;
+                    return Ok(());
                 }
-                IpcRequestKind::Status => {
+                _ => {
                     write_response(
                         &mut stream,
                         &IpcResponse::status(
@@ -918,33 +787,12 @@ mod tests {
                     )
                     .await?;
                 }
-                IpcRequestKind::Shutdown => {
-                    write_response(&mut stream, &IpcResponse::shutting_down(request.request_id))
-                        .await?;
-                    return Ok(());
-                }
-                IpcRequestKind::OpenInbound { .. }
-                | IpcRequestKind::Reload
-                | IpcRequestKind::Publish { .. } => {
-                    write_response(
-                        &mut stream,
-                        &IpcResponse::error(
-                            request.request_id,
-                            IpcError::new(
-                                IpcErrorKind::Unavailable,
-                                "no inbound engine in this test",
-                            ),
-                        ),
-                    )
-                    .await?;
-                }
             }
         }
     }
 
-    async fn reference_transport() -> Result<(
-        IpcSyncTransport,
-        Arc<Mutex<SyncNode>>,
+    async fn status_client() -> Result<(
+        IpcClient,
         tokio::task::JoinHandle<Result<()>>,
         tempfile::TempDir,
     )> {
@@ -952,44 +800,24 @@ mod tests {
         let socket = dir.path().join("sync.sock");
         let nonce = IpcNonce::new("0123456789abcdef")?;
         let listener = IpcListener::bind(&socket)?;
-        let remote = Arc::new(Mutex::new(SyncNode::new(Author([2; 32]))));
-        remote
-            .lock()
-            .await
-            .local_write("remote.md", b"over the bridge", 0, 0);
-        let server = tokio::spawn(reference_server(listener, nonce.clone(), remote.clone()));
-        Ok((IpcSyncTransport::new(socket, nonce), remote, server, dir))
+        let server = tokio::spawn(status_server(listener, nonce.clone()));
+        Ok((IpcClient::new(socket, nonce), server, dir))
     }
 
     #[tokio::test]
-    async fn ipc_transport_passes_peer_and_reconcile_conformance() -> Result<()> {
-        let (transport, _remote, server, _dir) = reference_transport().await?;
-        let peers = transport.peers_for(&SyncPeers::Wildcard("*".into())).await;
-        assert_eq!(peers.unresolved, Vec::<String>::new());
-        assert_eq!(peers.peers.len(), 1);
-        assert_eq!(peers.peers[0].key, "remote-key");
-
-        let local = Arc::new(Mutex::new(SyncNode::new(Author([1; 32]))));
-        let stats = transport
-            .reconcile(peers.peers[0].clone(), "catalog".into(), local.clone())
-            .await?;
-        assert!(!stats.is_noop());
-        let local = local.lock().await;
-        assert!(local.manifest().get("remote.md").is_some());
-        assert!(local.has_content(&content_hash(b"over the bridge")));
-        drop(local);
-
-        assert_eq!(transport.status().await?.state, IpcRuntimeState::Ready);
-        transport.shutdown().await?;
+    async fn a_valid_request_gets_a_status_and_a_shutdown_ends_the_server() -> Result<()> {
+        let (client, server, _dir) = status_client().await?;
+        assert_eq!(client.status().await?.state, IpcRuntimeState::Ready);
+        client.shutdown().await?;
         server.await??;
         Ok(())
     }
 
     #[tokio::test]
     async fn a_wrong_instance_nonce_gets_a_structured_refusal() -> Result<()> {
-        let (transport, _remote, server, _dir) = reference_transport().await?;
-        let wrong = IpcSyncTransport::new(
-            transport.socket_path().unwrap(),
+        let (client, server, _dir) = status_client().await?;
+        let wrong = IpcClient::new(
+            client.socket_path().to_path_buf(),
             IpcNonce::new("fedcba9876543210")?,
         );
         let error = wrong
@@ -997,16 +825,14 @@ mod tests {
             .await
             .expect_err("the wrong nonce was accepted");
         assert!(format!("{error:#}").contains("unauthorized"));
-
-        transport.shutdown().await?;
+        client.shutdown().await?;
         server.await??;
         Ok(())
     }
 
     #[tokio::test]
     async fn an_incompatible_version_gets_a_structured_refusal() -> Result<()> {
-        let (transport, _remote, server, _dir) = reference_transport().await?;
-        let client = transport.session().unwrap();
+        let (client, server, _dir) = status_client().await?;
         let mut stream = UnixStream::connect(client.socket_path()).await?;
         let mut request = IpcRequest::new(client.nonce().clone(), 41, IpcRequestKind::Status);
         request.version = IPC_VERSION + 1;
@@ -1021,8 +847,7 @@ mod tests {
                 }
             }
         ));
-
-        transport.shutdown().await?;
+        client.shutdown().await?;
         server.await??;
         Ok(())
     }
@@ -1034,7 +859,6 @@ mod tests {
         request
             .required_features
             .push("future-critical-field".into());
-
         let error = request
             .validate(&nonce)
             .expect_err("an unknown required feature was ignored");
@@ -1054,7 +878,7 @@ mod tests {
                 display_label: Some("hetz".into()),
             },
         );
-        let (mut writer, mut reader) = tokio::io::duplex(MAX_CONTROL_FRAME);
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
         write_message(&mut writer, &sent).await?;
         let received: IpcRequest = read_message(&mut reader).await?;
         received.validate(&nonce)?;
@@ -1078,7 +902,6 @@ mod tests {
             .await
             .expect_err("an oversized control frame was accepted");
         assert!(format!("{error:#}").contains("exceeds"));
-
         let mut byte = [0u8; 1];
         assert!(
             tokio::time::timeout(Duration::from_millis(20), reader.read_exact(&mut byte))
@@ -1121,9 +944,8 @@ mod tests {
         let socket = dir.path().join("sync.sock");
         let _listener = IpcListener::bind(&socket)?;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o660))?;
-        let transport = IpcSyncTransport::new(socket, IpcNonce::new("0123456789abcdef")?);
-
-        let error = transport
+        let client = IpcClient::new(socket, IpcNonce::new("0123456789abcdef")?);
+        let error = client
             .status()
             .await
             .expect_err("the client accepted a group-writable bridge socket");
@@ -1136,17 +958,14 @@ mod tests {
         let (mut left_client, left_relay) = UnixStream::pair()?;
         let (right_relay, mut right_client) = UnixStream::pair()?;
         let relay = tokio::spawn(relay_raw(left_relay, right_relay));
-
         left_client.write_all(b"left to right").await?;
         let mut from_left = vec![0; 13];
         right_client.read_exact(&mut from_left).await?;
         assert_eq!(from_left, b"left to right");
-
         right_client.write_all(b"right to left").await?;
         let mut from_right = vec![0; 13];
         left_client.read_exact(&mut from_right).await?;
         assert_eq!(from_right, b"right to left");
-
         left_client.shutdown().await?;
         right_client.shutdown().await?;
         let copied = tokio::time::timeout(Duration::from_secs(1), relay).await???;
@@ -1164,11 +983,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             Result::<()>::Ok(())
         });
-        let transport = IpcSyncTransport::new(socket, IpcNonce::new("0123456789abcdef")?)
+        let client = IpcClient::new(socket, IpcNonce::new("0123456789abcdef")?)
             .with_timeout(Duration::from_millis(20));
-
         let started = Instant::now();
-        let error = transport
+        let error = client
             .status()
             .await
             .expect_err("a stalled handshake had no deadline");

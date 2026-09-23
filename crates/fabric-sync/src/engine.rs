@@ -34,9 +34,14 @@ use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
-use crate::config::FabricHome;
+use fabric::config::FabricHome;
 
-use super::config::{PolicyRules, SyncBook, SyncEntry, SyncPeers};
+use fabric::sync::{
+    PeerRef, ResolvedPeers,
+    config::{PolicyRules, SyncBook, SyncEntry, SyncPeers},
+    model::{sanitize_name, write_atomic_with_mode},
+};
+
 use super::manifest::{Author, ContentHash, Entry, FileMeta, Manifest};
 use super::node::{Reconciled, SweepEvidence, SyncNode, content_hash};
 use super::paths::{SyncOwnerLease, SyncPaths};
@@ -197,44 +202,8 @@ impl EngineWriteJournal {
 
 /// A peer selected for a reconcile.
 ///
-/// `key` is transport-owned and opaque to the engine. `id` is the display name
-/// used in status, logs, and sync cursors. No address or peer policy crosses
-/// this process-neutral boundary.
-#[derive(Debug, Clone)]
-pub struct PeerRef {
-    pub key: String,
-    pub id: String,
-    pub roaming: bool,
-}
-
 /// The swappable transport that carries a client-side reconcile to a peer.
 /// A host process can implement it without giving the engine host state.
-/// What an entry's peer selector resolves to right now, INCLUDING what it did
-/// not resolve to.
-///
-/// A selector that matches nothing used to be dropped here without a record.
-/// The engine then looped over the peers that did resolve, recorded nothing for
-/// the one that did not, and every status surface called the entry clean and
-/// syncing with every peer. That is what a typo in `syncs.toml` looks like from
-/// day one, and what renaming a peer with `fabric add` looks like the moment
-/// after. Finding 3 of the 2026-08-29 review.
-#[derive(Debug, Clone, Default)]
-pub struct ResolvedPeers {
-    pub peers: Vec<PeerRef>,
-    /// Selectors from the entry's `peers` that name no peer in the book. For a
-    /// wildcard that selects nobody at all, the single selector `"*"`.
-    pub unresolved: Vec<String>,
-}
-
-impl ResolvedPeers {
-    pub fn all(peers: Vec<PeerRef>) -> Self {
-        Self {
-            peers,
-            unresolved: Vec::new(),
-        }
-    }
-}
-
 pub trait SyncTransport: Send + Sync + 'static {
     /// The peers an entry's selector resolves to right now (membership follows
     /// `peers.toml` for the `"*"` wildcard), and the selectors it could not
@@ -732,11 +701,11 @@ impl PeerSyncState {
 }
 
 fn classify_reconcile_error(message: &str) -> PeerSyncState {
-    if crate::config::Denied::is_refusal(message) {
+    if fabric::config::Denied::is_refusal(message) {
         PeerSyncState::Refused
     } else if message.contains("no local sync entry named") {
         PeerSyncState::MissingEntry
-    } else if message.contains(crate::sync::wire::SYNC_UNAVAILABLE_MARKER)
+    } else if message.contains(fabric::sync::SYNC_UNAVAILABLE_MARKER)
         || message.contains("not attached to a fabric daemon")
     {
         PeerSyncState::Unavailable
@@ -1026,7 +995,7 @@ impl<T: SyncTransport> SyncEngine<T> {
     /// missing local content takes the guarded path below.
     pub(crate) async fn prepare_inbound_for_hello(
         &self,
-        hello: &crate::sync::wire::HelloInfo,
+        hello: &crate::wire::HelloInfo,
     ) -> Result<Option<PreparedInbound>> {
         let Some(entry) = self.entries.read().await.get(&hello.name).cloned() else {
             return Ok(None);
@@ -1171,7 +1140,7 @@ impl<T: SyncTransport> SyncEngine<T> {
     pub async fn publish_staged(
         &self,
         name: &str,
-        files: Vec<super::staging::PublishFile>,
+        files: Vec<fabric::sync::staging::PublishFile>,
         force: bool,
     ) -> Result<Vec<PublishedFile>> {
         let Some(entry) = self.entries.read().await.get(name).cloned() else {
@@ -1204,7 +1173,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                     .and_then(|recorded| recorded.meta())
                     .map(|meta| meta.hash);
                 if current != file.base && !force {
-                    refusals.push(super::staging::refusal_line(
+                    refusals.push(fabric::sync::staging::refusal_line(
                         &file.rel, file.base, current,
                     ));
                 }
@@ -2005,7 +1974,7 @@ impl<T: SyncTransport> SyncEngine<T> {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         let resolver_engine = self.clone();
-        let outcome = crate::sync::wire::run_server_with_idle_timeout(
+        let outcome = crate::wire::run_server_with_idle_timeout(
             stream,
             peer,
             move |hello| {
@@ -4254,51 +4223,11 @@ pub(crate) const METADATA_ONLY_CHANGES_DO_NOT_PROPAGATE: () = ();
 /// syncs the attributes git syncs, and git deliberately does not track mtime.
 /// `FileMeta` still carries one, but it is informational only: see the note on
 /// that field, and on [`METADATA_ONLY_CHANGES_DO_NOT_PROPAGATE`].
-pub(crate) fn write_atomic_with_mode(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
-    write_atomic_inner(path, bytes, executable)
-}
-
-/// Write bytes atomically, for fabric's own state files, which are never
-/// executable.
 #[cfg(test)]
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    write_atomic_inner(path, bytes, false)
+    write_atomic_with_mode(path, bytes, false)
 }
 
-fn write_atomic_inner(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
-    let tmp = path.with_extension(format!(
-        "{}.fabric-tmp",
-        path.extension().and_then(|e| e.to_str()).unwrap_or("")
-    ));
-    std::fs::write(&tmp, bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
-    // Set the mode on the temp file, before the rename, so the file never
-    // appears at its final path with the wrong permissions.
-    if executable && let Err(error) = set_executable(&tmp) {
-        // A failed chmod must not fail the write. The content is what the sync
-        // is for, and a non-executable copy is recoverable by hand; a lost file
-        // is not.
-        eprintln!(
-            "fabric: could not set the executable bit on {}: {error:#}",
-            tmp.display()
-        );
-    }
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("failed to rename into {}", path.display()))?;
-    Ok(())
-}
-
-/// Write a file atomically AND durably, for a snapshot the log is about to be
-/// truncated against.
-///
-/// `write_atomic` renames without flushing, which is fine for a file nothing is
-/// traded against: a crash loses the write and the next pass repeats it. It is
-/// NOT fine for the snapshot. Truncating the log against bytes that are still
-/// only in the page cache is the one ordering in this design that loses data:
-/// the log is gone, the snapshot never landed, and neither the filesystem nor a
-/// peer knows what the manifest used to say.
-///
-/// So the temp file is flushed before the rename, and the directory after it, so
-/// the rename itself survives too.
 fn write_atomic_durable(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension(format!(
         "{}.fabric-tmp",
@@ -4329,17 +4258,9 @@ fn write_atomic_durable(path: &Path, bytes: &[u8]) -> Result<()> {
 ///
 /// Mark a file executable, mirroring git's 755. Only the executable bits are
 /// touched; fabric replicates no other permission bit, because git does not.
-fn set_executable(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)
-        .with_context(|| format!("failed to stat {}", path.display()))?
-        .permissions();
-    let mode = perms.mode();
-    perms.set_mode(mode | 0o111);
-    std::fs::set_permissions(path, perms)
-        .with_context(|| format!("failed to set the executable bit on {}", path.display()))?;
-    Ok(())
-}
+
+#[cfg(test)]
+use fabric::sync::model::set_executable;
 
 /// Read whether a file is executable, the way git decides it.
 fn is_executable(meta: &std::fs::Metadata) -> bool {
@@ -4498,18 +4419,6 @@ fn now_secs() -> i64 {
 }
 
 /// Make a sync name safe to use as a directory component for its manifest store.
-pub(crate) fn sanitize_name(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
 /// Start a recursive filesystem watcher on `root`, forwarding a unit signal on
 /// every event. The returned watcher must be kept alive for events to flow.
 fn watcher_event_is_mutation(kind: &notify::EventKind) -> bool {
@@ -4723,8 +4632,8 @@ fn spawn_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync::config::SyncPolicy;
-    use crate::sync::manifest::{Author, Entry, FileMeta, Tombstone};
+    use fabric::sync::config::SyncPolicy;
+    use crate::manifest::{Author, Entry, FileMeta, Tombstone};
     use std::sync::{Mutex as StdMutex, Weak};
 
     #[test]
@@ -7160,7 +7069,7 @@ mod tests {
             let server_name = name.clone();
             let label = client_label(&node).await;
             let server = tokio::spawn(async move {
-                crate::sync::wire::run_server(server_end, &label, move |hello| async move {
+                crate::wire::run_server(server_end, &label, move |hello| async move {
                     Ok(if hello.name == server_name {
                         Some((target, ()))
                     } else {
@@ -7169,7 +7078,7 @@ mod tests {
                 })
                 .await
             });
-            let stats = crate::sync::wire::run_client(client_end, node, &name, &peer.id).await?;
+            let stats = crate::wire::run_client(client_end, node, &name, &peer.id).await?;
             let _ = server.await;
             Ok(stats)
         }
@@ -7246,7 +7155,7 @@ mod tests {
             let label = client_label(&node).await;
             let server = tokio::spawn(async move {
                 let (_, _, prepared) =
-                    crate::sync::wire::run_server(server_end, &label, move |hello| {
+                    crate::wire::run_server(server_end, &label, move |hello| {
                         let engine = resolver_target.clone();
                         async move {
                             let prepared = engine.prepare_inbound_for_hello(&hello).await?;
@@ -7256,7 +7165,7 @@ mod tests {
                     .await?;
                 target.complete_inbound(prepared).await
             });
-            let stats = crate::sync::wire::run_client(client_end, node, &name, &peer.id).await?;
+            let stats = crate::wire::run_client(client_end, node, &name, &peer.id).await?;
             server.await??;
             Ok(stats)
         }
@@ -8253,7 +8162,7 @@ mod tests {
             let marker = dir.path().join(format!("snapshot-{attempt}.committed"));
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
-                .arg("sync::engine::tests::snapshot_commit_pause_child")
+                .arg("engine::tests::snapshot_commit_pause_child")
                 .arg("--nocapture")
                 .env("FABRIC_TEST_SNAPSHOT_CRASH_HOME", dir.path())
                 .env("FABRIC_TEST_PAUSE_AFTER_STATE_COMMIT", &marker)
@@ -8352,7 +8261,7 @@ mod tests {
         let label = client_label(&remote).await;
         let server = tokio::spawn(async move {
             let (_, stats, prepared) =
-                crate::sync::wire::run_server(server_end, &label, move |hello| {
+                crate::wire::run_server(server_end, &label, move |hello| {
                     let engine = resolver_engine.clone();
                     async move {
                         let prepared = engine.prepare_inbound_for_hello(&hello).await?;
@@ -8363,7 +8272,7 @@ mod tests {
             engine.complete_inbound(prepared).await?;
             Ok::<_, anyhow::Error>(stats)
         });
-        crate::sync::wire::run_client(client_end, remote, "bus", "inbound-wire-peer")
+        crate::wire::run_client(client_end, remote, "bus", "inbound-wire-peer")
             .await
             .unwrap();
         server.await.unwrap().unwrap()
@@ -10122,7 +10031,7 @@ mod tests {
         let (client_end, server_end) = tokio::io::duplex(1 << 20);
         let resolver_engine = engine.clone();
         let server = tokio::spawn(async move {
-            crate::sync::wire::run_server(server_end, "repair-peer", move |hello| {
+            crate::wire::run_server(server_end, "repair-peer", move |hello| {
                 let engine = resolver_engine.clone();
                 async move {
                     let prepared = engine.prepare_inbound(&hello.name).await?;
@@ -10131,7 +10040,7 @@ mod tests {
             })
             .await
         });
-        crate::sync::wire::run_client(client_end, remote, "bus", "repair-server")
+        crate::wire::run_client(client_end, remote, "bus", "repair-server")
             .await
             .unwrap();
         let (_, _, prepared) = server.await.unwrap().unwrap();
@@ -10673,13 +10582,13 @@ mod tests {
         let node = prepared.node();
         let (client_end, server_end) = tokio::io::duplex(1 << 20);
         let server = tokio::spawn(async move {
-            crate::sync::wire::run_server(server_end, "window-peer", move |hello| async move {
+            crate::wire::run_server(server_end, "window-peer", move |hello| async move {
                 assert_eq!(hello.name, "bus");
                 Ok(Some((node, prepared)))
             })
             .await
         });
-        crate::sync::wire::run_client(client_end, remote, "bus", "window-server")
+        crate::wire::run_client(client_end, remote, "bus", "window-server")
             .await
             .unwrap();
         let (_, _, prepared) = server.await.unwrap().unwrap();
@@ -10746,7 +10655,7 @@ mod tests {
         // says inbox/archived.md is Present when the atomic archive lands.
         let remote_manifest = remote.lock().await.manifest().clone();
         let prepared = engine
-            .prepare_inbound_for_hello(&crate::sync::wire::HelloInfo {
+            .prepare_inbound_for_hello(&crate::wire::HelloInfo {
                 name: "bus".to_string(),
                 manifest: Arc::new(remote_manifest),
                 is_delta: false,
@@ -10765,13 +10674,13 @@ mod tests {
         let (client_end, server_end) = tokio::io::duplex(1 << 20);
         let node = prepared.node();
         let server = tokio::spawn(async move {
-            crate::sync::wire::run_server(server_end, "test-peer", move |hello| async move {
+            crate::wire::run_server(server_end, "test-peer", move |hello| async move {
                 assert_eq!(hello.name, "bus");
                 Ok(Some((node, prepared)))
             })
             .await
         });
-        crate::sync::wire::run_client(client_end, remote, "bus", "test-server")
+        crate::wire::run_client(client_end, remote, "bus", "test-server")
             .await
             .unwrap();
         let (_, _, prepared) = server.await.unwrap().unwrap();
@@ -11390,7 +11299,7 @@ mod tests {
         let home_a = FabricHome::new(dir_a.path());
         let book_a = SyncBook::load(&home_a).unwrap();
 
-        let staged = crate::sync::staging::stage(
+        let staged = fabric::sync::staging::stage(
             &home_a,
             &book_a,
             &dir_a.path().join("resources/draft.md"),
@@ -11444,7 +11353,7 @@ mod tests {
         let (dir_a, dir_b, a, b, ta, tb) = staged_pair().await;
         let home_a = FabricHome::new(dir_a.path());
         let book_a = SyncBook::load(&home_a).unwrap();
-        let staged = crate::sync::staging::stage(
+        let staged = fabric::sync::staging::stage(
             &home_a,
             &book_a,
             &dir_a.path().join("resources/draft.md"),
@@ -11497,12 +11406,12 @@ mod tests {
             ("three.md", &b"three"[..]),
         ] {
             let staged =
-                crate::sync::staging::stage(&home_a, &book_a, &root_a.join(rel), None, None)
+                fabric::sync::staging::stage(&home_a, &book_a, &root_a.join(rel), None, None)
                     .unwrap();
             std::fs::write(&staged.staged_path, bytes).unwrap();
         }
         let (_entry, files) =
-            crate::sync::staging::read_for_publish(&home_a, &book_a, "bus", &[]).unwrap();
+            fabric::sync::staging::read_for_publish(&home_a, &book_a, "bus", &[]).unwrap();
         assert_eq!(files.len(), 3);
         let rels: Vec<String> = files.iter().map(|file| file.rel.clone()).collect();
 
@@ -11539,9 +11448,9 @@ mod tests {
         assert_eq!(std::fs::read(root_b.join("notes/two.md")).unwrap(), b"two");
         assert_eq!(std::fs::read(root_b.join("three.md")).unwrap(), b"three");
 
-        crate::sync::staging::forget(&home_a, "bus", &rels).unwrap();
+        fabric::sync::staging::forget(&home_a, "bus", &rels).unwrap();
         assert!(
-            crate::sync::staging::list(&home_a, &book_a, Some("bus"))
+            fabric::sync::staging::list(&home_a, &book_a, Some("bus"))
                 .unwrap()
                 .is_empty(),
             "published files must leave the staging tree"
@@ -11556,7 +11465,7 @@ mod tests {
         let book_a = SyncBook::load(&home_a).unwrap();
         let root_a = dir_a.path().join("resources");
         let staged =
-            crate::sync::staging::stage(&home_a, &book_a, &root_a.join("seed.md"), None, None)
+            fabric::sync::staging::stage(&home_a, &book_a, &root_a.join("seed.md"), None, None)
                 .unwrap();
         assert_eq!(
             staged.base.as_deref(),
@@ -11570,7 +11479,7 @@ mod tests {
         a.sync_once("bus").await.unwrap();
 
         let (_entry, files) =
-            crate::sync::staging::read_for_publish(&home_a, &book_a, "bus", &[]).unwrap();
+            fabric::sync::staging::read_for_publish(&home_a, &book_a, "bus", &[]).unwrap();
         let error = a
             .publish_staged("bus", files.clone(), false)
             .await
@@ -11601,11 +11510,11 @@ mod tests {
         let book_a = SyncBook::load(&home_a).unwrap();
         let root_a = dir_a.path().join("resources");
         let staged =
-            crate::sync::staging::stage(&home_a, &book_a, &root_a.join("quiet.md"), None, None)
+            fabric::sync::staging::stage(&home_a, &book_a, &root_a.join("quiet.md"), None, None)
                 .unwrap();
         std::fs::write(&staged.staged_path, b"quiet bytes").unwrap();
         let (_entry, files) =
-            crate::sync::staging::read_for_publish(&home_a, &book_a, "bus", &[]).unwrap();
+            fabric::sync::staging::read_for_publish(&home_a, &book_a, "bus", &[]).unwrap();
         a.publish_staged("bus", files, false).await.unwrap();
 
         // The watcher then reports the daemon's own atomic write. The receipt
@@ -11674,7 +11583,7 @@ mod tests {
         });
         book.save(&home).unwrap();
 
-        let error = crate::sync::staging::stage(&home, &book, &root.join("notes.txt"), None, None)
+        let error = fabric::sync::staging::stage(&home, &book, &root.join("notes.txt"), None, None)
             .unwrap_err();
         let detail = format!("{error:#}");
         assert!(
@@ -11682,13 +11591,13 @@ mod tests {
             "a target no include glob matches must be refused by name: {detail}"
         );
         assert!(
-            crate::sync::staging::list(&home, &book, None)
+            fabric::sync::staging::list(&home, &book, None)
                 .unwrap()
                 .is_empty(),
             "a refused stage leaves nothing behind"
         );
 
-        let error = crate::sync::staging::stage(
+        let error = fabric::sync::staging::stage(
             &home,
             &book,
             &dir.path().join("elsewhere/notes.md"),
@@ -11712,7 +11621,7 @@ mod tests {
             policy: SyncPolicy::Bus,
             include: None,
         });
-        let error = crate::sync::staging::stage(
+        let error = fabric::sync::staging::stage(
             &home,
             &wide,
             &dir.path().join("anything.md"),
@@ -11726,7 +11635,7 @@ mod tests {
             "a staging tree inside a folder must be refused: {detail}"
         );
         assert!(
-            !crate::sync::staging::staging_root(&home).join("home").exists(),
+            !fabric::sync::staging::staging_root(&home).join("home").exists(),
             "a refused stage must write nothing into the folder"
         );
     }

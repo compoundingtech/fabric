@@ -12,12 +12,12 @@ use anyhow::{Context, Result};
 use fabric::{
     config::FabricHome,
     control::{ControlRequest, ControlResponse},
-    sync::{SyncOwnerLease, SyncOwnerLeaseState, SyncPaths, ipc},
+    sync::ipc,
 };
+use fabric_sync::{SyncOwnerLease, SyncOwnerLeaseState, SyncPaths};
 
-fn fabric_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_fabric")
-}
+mod support;
+use support::fabric_bin;
 
 fn sync_bin() -> &'static str {
     env!("CARGO_BIN_EXE_fabric-sync")

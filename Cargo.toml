@@ -1,3 +1,9 @@
+[workspace]
+members = [".", "crates/fabric-sync"]
+# `cargo build` at the root builds both binaries, which is what the release
+# workflow, the nix package, and a plain checkout expect.
+default-members = [".", "crates/fabric-sync"]
+
 [package]
 name = "fabric"
 version = "0.2.14"
