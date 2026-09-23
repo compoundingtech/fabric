@@ -637,7 +637,9 @@ impl IpcClient {
             .context("the sync IPC request did not leave within the handshake timeout")??;
         let response: IpcResponse = tokio::time::timeout(reply_within, read_message(&mut stream))
             .await
-            .context("the sync IPC response did not arrive within its bound")??;
+            .with_context(|| {
+                format!("the sync IPC response did not arrive within its handshake timeout of {reply_within:?}")
+            })??;
         Ok((stream, response.into_kind(request_id)?))
     }
 
