@@ -355,7 +355,10 @@ async fn a_running_companion_reattaches_after_the_daemon_restarts() -> Result<()
         sync_owner: SyncOwner::Companion,
         ..DaemonOptions::default()
     };
-    let placeholder = FabricNode::start(FabricHome::new(TempDir::new()?.path())).await?;
+    // A placeholder node in its own live home fills the slot while a's daemon
+    // is down; the directory must outlive the placeholder.
+    let placeholder_dir = TempDir::new()?;
+    let placeholder = FabricNode::start(FabricHome::new(placeholder_dir.path())).await?;
     let stopped = std::mem::replace(&mut a.node, placeholder);
     stopped.shutdown().await?;
     let companion = a.companion.as_ref().expect("started");
