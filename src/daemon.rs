@@ -50,6 +50,10 @@ use crate::{
         self,
         config::{SyncBook, SyncPeers},
         engine::{PeerRef, ResolvedPeers, SyncEngine, SyncTransport},
+        ipc::{
+            self as sync_ipc, IpcClient, IpcError, IpcErrorKind, IpcListener, IpcNonce,
+            IpcRequestKind, IpcResponse, IpcRuntimeState,
+        },
         manifest::Author as SyncAuthor,
         node::SyncNode,
         paths::SyncPaths,
@@ -135,6 +139,12 @@ const PEER_HEALTH_RECOVER_INITIAL_BACKOFF: Duration = Duration::from_secs(30);
 const PEER_HEALTH_RECOVER_MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
 /// The companion sends every 10 seconds. Three missed heartbeats mean absent.
 const SYNC_COMPANION_PRESENCE_WINDOW: Duration = Duration::from_secs(30);
+/// How long a status, reload, or publish waits for the companion to answer
+/// before the entry is reported as `timed-out`.
+const SYNC_COMPANION_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// A relayed sync stream whose remote side moves no bytes for this long is
+/// over. Longer than the wire's own idle bound, so the wire decides first.
+const SYNC_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const PATH_QUALITY_ABSOLUTE_FLOOR: Duration = Duration::from_secs(1);
 const PATH_QUALITY_BASELINE_MULTIPLIER: u32 = 8;
 const PATH_QUALITY_CONSECUTIVE_SAMPLES: usize = 3;
@@ -446,8 +456,28 @@ pub struct DaemonState {
     /// The file-sync engine, set once just after this state is constructed (it
     /// needs a handle back to the state to dial peers).
     sync_engine: OnceLock<Arc<SyncEngine<IrohSyncTransport>>>,
-    /// The last companion heartbeat and its compatibility classification.
-    sync_companion_seen: Mutex<Option<(Instant, &'static str)>>,
+    /// Which process owns sync for this daemon.
+    sync_owner: SyncOwner,
+    /// The nonce every bridge request in either direction must carry. Minted
+    /// once per daemon process and handed to the companion over the control
+    /// socket, so a companion attached to a previous daemon cannot join this one.
+    sync_ipc_nonce: IpcNonce,
+    /// The last companion heartbeat: when, its classification, and where its
+    /// bridge listener is.
+    sync_companion: Mutex<Option<CompanionPresence>>,
+}
+
+#[derive(Debug, Clone)]
+struct CompanionPresence {
+    seen: Instant,
+    state: &'static str,
+    socket: Option<PathBuf>,
+}
+
+fn fresh_sync_ipc_nonce() -> IpcNonce {
+    let raw = rand::random::<[u8; 24]>();
+    let hex: String = raw.iter().map(|byte| format!("{byte:02x}")).collect();
+    IpcNonce::new(hex).expect("48 hex characters are a valid nonce")
 }
 
 #[derive(Debug, Clone)]
@@ -463,6 +493,25 @@ pub struct DaemonOptions {
     pub server_session_max_total: Option<usize>,
     pub server_session_max_per_peer: Option<usize>,
     pub server_session_detached_ttl_secs: Option<u64>,
+    /// Which process runs the sync engine for this daemon.
+    pub sync_owner: SyncOwner,
+}
+
+/// Which process runs the sync engine.
+///
+/// The daemon keeps the remote `fabric/sync/1` listener, the `sync` permission
+/// gate, and the operator report in both cases. What moves is where the engine
+/// lives: in this process, or in the `fabric-sync` companion reached over the
+/// local bridge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SyncOwner {
+    /// The daemon constructs and runs the engine itself.
+    #[default]
+    Embedded,
+    /// The daemon delegates sync to the companion. With no companion attached,
+    /// configured entries report `runtime=unavailable`, an inbound peer gets an
+    /// explicit unavailable reply, and every other service runs normally.
+    Companion,
 }
 
 impl DaemonOptions {
@@ -1060,7 +1109,9 @@ impl DaemonState {
             telemetry,
             last_probe_transport: Arc::new(StdRwLock::new(HashMap::new())),
             sync_engine: OnceLock::new(),
-            sync_companion_seen: Mutex::new(None),
+            sync_owner: options.sync_owner,
+            sync_ipc_nonce: fresh_sync_ipc_nonce(),
+            sync_companion: Mutex::new(None),
         }))
     }
 
@@ -1098,19 +1149,88 @@ impl DaemonState {
         self.sync_engine.get().cloned()
     }
 
-    async fn sync_runtime_status(&self) -> SyncRuntimeStatus {
-        let companion = match *self.sync_companion_seen.lock().await {
-            Some((seen, state)) if seen.elapsed() <= SYNC_COMPANION_PRESENCE_WINDOW => state,
+    pub fn sync_owner(&self) -> SyncOwner {
+        self.sync_owner
+    }
+
+    /// The companion's current classification, or `absent` when its last
+    /// heartbeat is older than the presence window.
+    async fn sync_companion_state(&self) -> &'static str {
+        match self.sync_companion.lock().await.as_ref() {
+            Some(presence) if presence.seen.elapsed() <= SYNC_COMPANION_PRESENCE_WINDOW => {
+                presence.state
+            }
             _ => "absent",
-        };
-        SyncRuntimeStatus {
-            owner: "embedded".to_string(),
-            companion: companion.to_string(),
         }
     }
 
-    async fn record_sync_companion_state(&self, state: &'static str) {
-        *self.sync_companion_seen.lock().await = Some((Instant::now(), state));
+    /// A client for the companion's bridge, when one is attached and alive.
+    async fn sync_companion_client(&self) -> Option<IpcClient> {
+        let presence = self.sync_companion.lock().await.clone()?;
+        if presence.seen.elapsed() > SYNC_COMPANION_PRESENCE_WINDOW || presence.state != "active"
+        {
+            return None;
+        }
+        Some(IpcClient::new(presence.socket?, self.sync_ipc_nonce.clone()))
+    }
+
+    async fn sync_runtime_status(&self) -> SyncRuntimeStatus {
+        let companion = self.sync_companion_state().await;
+        match self.sync_owner {
+            SyncOwner::Embedded => SyncRuntimeStatus::new("embedded", companion),
+            SyncOwner::Companion if companion == "active" => {
+                SyncRuntimeStatus::new("companion", companion)
+            }
+            SyncOwner::Companion => SyncRuntimeStatus::unavailable(companion),
+        }
+    }
+
+    /// Every configured entry's status, and who answered for it.
+    ///
+    /// When this daemon delegates sync and the companion does not answer, the
+    /// entries come back empty with the runtime marked unavailable and one
+    /// reason; the CLI then lists what `syncs.toml` configures with
+    /// `runtime=unavailable`. A configured entry never reads as "no entries".
+    async fn sync_status_snapshot(&self) -> (Vec<SyncEntryStatus>, SyncRuntimeStatus) {
+        match self.sync_owner {
+            SyncOwner::Embedded => {
+                let entries = match self.sync_engine() {
+                    Some(engine) => engine.status().await.into_iter().map(Into::into).collect(),
+                    None => Vec::new(),
+                };
+                (entries, self.sync_runtime_status().await)
+            }
+            SyncOwner::Companion => {
+                let Some(client) = self.sync_companion_client().await else {
+                    return (Vec::new(), self.sync_runtime_status().await);
+                };
+                match tokio::time::timeout(SYNC_COMPANION_REQUEST_TIMEOUT, client.status()).await {
+                    Ok(Ok(status)) if status.state == IpcRuntimeState::Ready => {
+                        (status.entries, SyncRuntimeStatus::new("companion", "active"))
+                    }
+                    Ok(Ok(status)) => (
+                        status.entries,
+                        SyncRuntimeStatus::unavailable(match status.state {
+                            IpcRuntimeState::Starting => "starting",
+                            _ => "not-owning",
+                        }),
+                    ),
+                    Ok(Err(error)) => {
+                        debug!(%error, "the sync companion did not answer a status request");
+                        (Vec::new(), SyncRuntimeStatus::unavailable("error"))
+                    }
+                    Err(_) => (Vec::new(), SyncRuntimeStatus::unavailable("timed-out")),
+                }
+            }
+        }
+    }
+
+    async fn record_sync_companion_state(&self, state: &'static str, socket: Option<PathBuf>) {
+        *self.sync_companion.lock().await = Some(CompanionPresence {
+            seen: Instant::now(),
+            state,
+            socket,
+        });
     }
 
     fn endpoint_handle(&self) -> CurrentEndpoint {
@@ -2344,17 +2464,21 @@ impl FabricNode {
         let state = DaemonState::new(home, cancel, options).await?;
 
         // Build the file-sync engine with a weak handle back to the state (so it
-        // can dial peers) and start watching configured folders.
-        let author = sync_author(state.id());
-        let transport = IrohSyncTransport::new(Arc::downgrade(&state));
-        let paths = SyncPaths::new(state.home.syncs_path(), state.home.root().join("sync"));
-        let engine = SyncEngine::new(paths, author, transport, state.cancel.clone()).await?;
-        let _ = state.sync_engine.set(engine.clone());
-        tokio::spawn(async move {
-            if let Err(error) = engine.run().await {
-                warn!(%error, "sync engine stopped");
-            }
-        });
+        // can dial peers) and start watching configured folders. Only when this
+        // process owns sync: a delegating daemon never constructs an engine, so
+        // there is exactly one place the state lease can be taken from.
+        if options.sync_owner == SyncOwner::Embedded {
+            let author = sync_author(state.id());
+            let transport = IrohSyncTransport::new(Arc::downgrade(&state));
+            let paths = SyncPaths::new(state.home.syncs_path(), state.home.root().join("sync"));
+            let engine = SyncEngine::new(paths, author, transport, state.cancel.clone()).await?;
+            let _ = state.sync_engine.set(engine.clone());
+            tokio::spawn(async move {
+                if let Err(error) = engine.run().await {
+                    warn!(%error, "sync engine stopped");
+                }
+            });
+        }
 
         spawn_outgoing_mux_accepts(&state).await?;
 
@@ -2590,9 +2714,16 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
     }
     let control_listener = UnixListener::bind(&control_path)
         .with_context(|| format!("failed to bind {}", control_path.display()))?;
+    let sync_ipc_path = state.home.sync_ipc_socket_path();
+    if sync_ipc_path.exists() {
+        fs::remove_file(&sync_ipc_path)
+            .with_context(|| format!("failed to remove stale {}", sync_ipc_path.display()))?;
+    }
+    let sync_ipc_listener = IpcListener::bind(&sync_ipc_path)?;
 
     tokio::select! {
         result = run_control_socket(control_listener, state.clone()) => result?,
+        result = run_sync_ipc_socket(sync_ipc_listener, state.clone()) => result?,
         result = run_iroh_accept_loop(state.clone()) => result?,
         result = run_network_rehome_loop(state.clone()) => result?,
         result = run_endpoint_health_poll_loop(state.clone()) => result?,
@@ -2605,6 +2736,7 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
     state.cancel.cancel();
     close_endpoint_bounded(&state.current_endpoint(), "daemon shutdown").await;
     let _ = fs::remove_file(control_path);
+    let _ = fs::remove_file(sync_ipc_path);
     let dial_sockets: Vec<DialSocket> = state
         .dial_sockets
         .lock()
@@ -3549,14 +3681,29 @@ async fn process_control_request(
             }
         }
         ControlRequest::SyncReload => {
-            if let Some(engine) = state.sync_engine() {
-                let book = SyncBook::load(&state.home)?;
-                let peers = state.peer_book.read().await;
-                book.validate_against(&peers)?;
-                drop(peers);
-                engine.reload_book(book).await?;
-                for name in engine.names().await {
-                    let _ = engine.sync_once(&name).await;
+            // The daemon validates against the peer book it holds; the engine,
+            // wherever it runs, never reads peer policy.
+            let book = SyncBook::load(&state.home)?;
+            let peers = state.peer_book.read().await;
+            book.validate_against(&peers)?;
+            drop(peers);
+            match state.sync_owner {
+                SyncOwner::Embedded => {
+                    if let Some(engine) = state.sync_engine() {
+                        engine.reload_book(book).await?;
+                        for name in engine.names().await {
+                            let _ = engine.sync_once(&name).await;
+                        }
+                    }
+                }
+                SyncOwner::Companion => {
+                    let client = state
+                        .sync_companion_client()
+                        .await
+                        .context(SYNC_COMPANION_ABSENT)?;
+                    tokio::time::timeout(SYNC_COMPANION_REQUEST_TIMEOUT, client.reload())
+                        .await
+                        .context("the sync companion did not answer the reload in time")??;
                 }
             }
             ControlResponse::Ok
@@ -3580,66 +3727,28 @@ async fn process_control_request(
             }
         }
         ControlRequest::SyncStatus => {
-            let entries = match state.sync_engine() {
-                Some(engine) => engine
-                    .status()
-                    .await
-                    .into_iter()
-                    .map(|status| SyncEntryStatus {
-                        delta_fallbacks: status.delta_fallbacks,
-                        full_payload_sends: status.full_payload_sends,
-                        content_bytes: status.content_bytes,
-                        stopped_peers: status.stopped_peers,
-                        digest: status.digest,
-                        name: status.name,
-                        folder: status.folder.display().to_string(),
-                        policy: status.policy.to_string(),
-                        peers: peers_display(&status.peers),
-                        files: status.present,
-                        present: status.present,
-                        tombstones: status.tombstones,
-                        observed: status.observed,
-                        missing: status.missing,
-                        unexpected: status.unexpected,
-                        mismatched: status.mismatched,
-                        scan_issues: status.scan_issues,
-                        full_scans: status.full_scans,
-                        inbound_noop_transactions: status.inbound_noop_transactions,
-                        inbound_guarded_transactions: status.inbound_guarded_transactions,
-                        sync_passes: status.sync_passes,
-                        scan_micros: status.scan_micros,
-                        materialize_micros: status.materialize_micros,
-                        persist_micros: status.persist_micros,
-                        reconcile_micros: status.reconcile_micros,
-                        reconcile_wire_bytes: status.reconcile_wire_bytes,
-                        reconcile_failures: status.reconcile_failures,
-                        sweep: status
-                            .sweep
-                            .as_ref()
-                            .map(|state| state.token())
-                            .unwrap_or_default(),
-                    })
-                    .collect(),
-                None => Vec::new(),
-            };
-            ControlResponse::SyncStatus {
-                entries,
-                runtime: state.sync_runtime_status().await,
-            }
+            let (entries, runtime) = state.sync_status_snapshot().await;
+            ControlResponse::SyncStatus { entries, runtime }
         }
         ControlRequest::SyncIpcCompatibility => ControlResponse::SyncIpcCompatibility {
             version: crate::version_string(),
             sync_ipc_magic: sync::ipc::IPC_MAGIC.to_string(),
             sync_ipc_version: sync::ipc::IPC_VERSION,
-            owner: "embedded".to_string(),
+            owner: sync_owner_token(state.sync_owner).to_string(),
+            nonce: None,
+            daemon_socket: None,
+            node_id: None,
         },
         ControlRequest::SyncCompanionHello {
             version,
             sync_ipc_magic,
             sync_ipc_version,
+            companion_socket,
         } => {
             if version != crate::version_string() {
-                state.record_sync_companion_state("incompatible").await;
+                state
+                    .record_sync_companion_state("incompatible", companion_socket)
+                    .await;
                 bail!(
                     "fabric-sync is {version}, but the daemon is {}",
                     crate::version_string()
@@ -3648,58 +3757,105 @@ async fn process_control_request(
             if sync_ipc_magic != sync::ipc::IPC_MAGIC
                 || sync_ipc_version != sync::ipc::IPC_VERSION
             {
-                state.record_sync_companion_state("incompatible").await;
+                state
+                    .record_sync_companion_state("incompatible", companion_socket)
+                    .await;
                 bail!(
                     "fabric-sync IPC is {sync_ipc_magic} version {sync_ipc_version}; expected {} version {}",
                     sync::ipc::IPC_MAGIC,
                     sync::ipc::IPC_VERSION
                 );
             }
-            state.record_sync_companion_state("standby").await;
-            ControlResponse::SyncIpcCompatibility {
-                version: crate::version_string(),
-                sync_ipc_magic: sync::ipc::IPC_MAGIC.to_string(),
-                sync_ipc_version: sync::ipc::IPC_VERSION,
-                owner: "embedded".to_string(),
+            match state.sync_owner {
+                SyncOwner::Embedded => {
+                    state
+                        .record_sync_companion_state("standby", companion_socket)
+                        .await;
+                    ControlResponse::SyncIpcCompatibility {
+                        version: crate::version_string(),
+                        sync_ipc_magic: sync::ipc::IPC_MAGIC.to_string(),
+                        sync_ipc_version: sync::ipc::IPC_VERSION,
+                        owner: "embedded".to_string(),
+                        nonce: None,
+                        daemon_socket: None,
+                        node_id: None,
+                    }
+                }
+                SyncOwner::Companion => {
+                    if companion_socket.is_none() {
+                        state
+                            .record_sync_companion_state("incompatible", None)
+                            .await;
+                        bail!("fabric-sync announced no bridge socket, so the daemon cannot reach it");
+                    }
+                    state
+                        .record_sync_companion_state("active", companion_socket)
+                        .await;
+                    ControlResponse::SyncIpcCompatibility {
+                        version: crate::version_string(),
+                        sync_ipc_magic: sync::ipc::IPC_MAGIC.to_string(),
+                        sync_ipc_version: sync::ipc::IPC_VERSION,
+                        owner: "companion".to_string(),
+                        nonce: Some(state.sync_ipc_nonce.as_str().to_string()),
+                        daemon_socket: Some(state.home.sync_ipc_socket_path()),
+                        node_id: Some(state.id().to_string()),
+                    }
+                }
             }
         }
         ControlRequest::SyncRuntimeStatus => ControlResponse::SyncRuntimeStatus {
             runtime: state.sync_runtime_status().await,
         },
         ControlRequest::SyncPublish { name, files, force } => {
-            let Some(engine) = state.sync_engine() else {
-                anyhow::bail!("this daemon does not own sync, so it cannot publish");
-            };
-            let files = files
-                .into_iter()
-                .map(|file| {
-                    let base = match file.base {
-                        Some(hex) => Some(
-                            crate::sync::manifest::ContentHash::from_hex(&hex).ok_or_else(|| {
-                                anyhow::anyhow!("{}: the base is not a content hash", file.rel)
-                            })?,
-                        ),
-                        None => None,
+            let files = match state.sync_owner {
+                SyncOwner::Companion => {
+                    let client = state
+                        .sync_companion_client()
+                        .await
+                        .context(SYNC_COMPANION_ABSENT)?;
+                    client.publish(name, files, force).await?
+                }
+                SyncOwner::Embedded => {
+                    let Some(engine) = state.sync_engine() else {
+                        anyhow::bail!("this daemon does not own sync, so it cannot publish");
                     };
-                    Ok(crate::sync::staging::PublishFile {
-                        rel: file.rel,
-                        bytes: file.bytes,
-                        executable: file.executable,
-                        base,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let published = engine.publish_staged(&name, files, force).await?;
-            ControlResponse::SyncPublished {
-                files: published
-                    .into_iter()
-                    .map(|file| crate::control::SyncPublishedFile {
-                        rel: file.rel,
-                        version: file.version,
-                        hash: file.hash.to_hex(),
-                    })
-                    .collect(),
-            }
+                    let files = files
+                        .into_iter()
+                        .map(|file| {
+                            let base = match file.base {
+                                Some(hex) => Some(
+                                    crate::sync::manifest::ContentHash::from_hex(&hex).ok_or_else(
+                                        || {
+                                            anyhow::anyhow!(
+                                                "{}: the base is not a content hash",
+                                                file.rel
+                                            )
+                                        },
+                                    )?,
+                                ),
+                                None => None,
+                            };
+                            Ok(crate::sync::staging::PublishFile {
+                                rel: file.rel,
+                                bytes: file.bytes,
+                                executable: file.executable,
+                                base,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    engine
+                        .publish_staged(&name, files, force)
+                        .await?
+                        .into_iter()
+                        .map(|file| crate::control::SyncPublishedFile {
+                            rel: file.rel,
+                            version: file.version,
+                            hash: file.hash.to_hex(),
+                        })
+                        .collect()
+                }
+            };
+            ControlResponse::SyncPublished { files }
         }
         ControlRequest::Shutdown => {
             state.cancel.cancel();
@@ -4271,48 +4427,198 @@ async fn handle_sync_stream(
     recv: RecvStream,
     state: Arc<DaemonState>,
 ) -> Result<()> {
-    let Some(engine) = state.sync_engine() else {
-        let mut send = send;
-        send.reset(0u32.into())?;
-        return Ok(());
-    };
     let stream = tokio::io::join(recv, send);
-    let resolver_engine = engine.clone();
-    let peer = peer.to_string();
-    let outcome = sync::wire::run_server_with_idle_timeout(
-        stream,
-        &peer,
-        move |hello| {
-            let engine = resolver_engine.clone();
-            async move {
-                let prepared = engine.prepare_inbound_for_hello(&hello).await?;
-                Ok(prepared.map(|prepared| (prepared.node(), prepared)))
-            }
-        },
-        INBOUND_SYNC_IDLE_TIMEOUT,
-    )
-    .await;
-    match outcome {
-        Ok((name, stats, prepared)) => {
-            // The serving side's numbers used to stop here, which is how a
-            // fallback taken while serving a peer stayed invisible.
-            engine.record_inbound(&name, &stats).await;
-            if !stats.is_noop() {
-                debug!(sync = %name, ?stats, "served sync reconcile");
-            }
-            // Re-scan changes that landed during the session, then persist and
-            // materialize while the inbound operation guard is still held.
-            if let Err(error) = engine.complete_inbound(prepared).await {
-                debug!(sync = %name, %error, "sync completion failed");
-            }
-            // AFTER completion, which ends by marking the generation durable.
-            // What we just adopted still has to reach every peer that is not
-            // the one we adopted it from.
-            engine.note_inbound_adoption(&name, &stats).await;
+    let peer_label = peer.to_string();
+    match state.sync_owner {
+        SyncOwner::Embedded => {
+            let Some(engine) = state.sync_engine() else {
+                return sync::wire::refuse_hello(
+                    stream,
+                    &format!(
+                        "{}: this daemon runs no sync engine",
+                        sync::wire::SYNC_UNAVAILABLE_MARKER
+                    ),
+                )
+                .await;
+            };
+            engine
+                .serve_inbound(stream, &peer_label, INBOUND_SYNC_IDLE_TIMEOUT)
+                .await;
+            Ok(())
         }
-        Err(error) => debug!(peer = %peer, %error, "sync serve failed"),
+        SyncOwner::Companion => {
+            // The peer is authenticated and permitted by the time it is here;
+            // the companion learns who it is from this header and nothing else.
+            let Some(client) = state.sync_companion_client().await else {
+                debug!(peer = %peer_label, "refusing inbound sync: no companion is attached");
+                return sync::wire::refuse_hello(
+                    stream,
+                    &format!(
+                        "{}: no sync companion is attached",
+                        sync::wire::SYNC_UNAVAILABLE_MARKER
+                    ),
+                )
+                .await;
+            };
+            let display_label = state
+                .peer_book
+                .read()
+                .await
+                .peers()
+                .iter()
+                .find(|configured| configured.id == peer)
+                .and_then(|configured| configured.name.clone());
+            let local = match client.open_inbound(peer_label.clone(), display_label).await {
+                Ok(local) => local,
+                Err(error) => {
+                    debug!(peer = %peer_label, %error, "refusing inbound sync: the companion did not accept it");
+                    return sync::wire::refuse_hello(
+                        stream,
+                        &format!("{}: {error:#}", sync::wire::SYNC_UNAVAILABLE_MARKER),
+                    )
+                    .await;
+                }
+            };
+            relay_sync_stream(stream, local, &peer_label).await
+        }
+    }
+}
+
+/// Carry raw sync-wire bytes between a remote stream and the companion's
+/// socket. The remote side wears the idle bound: a peer that stops sending
+/// mid-session ends the relay, and the companion's own wire idle timeout has
+/// already fired by then.
+async fn relay_sync_stream<R>(remote: R, local: UnixStream, peer: &str) -> Result<()>
+where
+    R: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let remote = sync::wire::idle_timeout_stream(remote, peer, SYNC_RELAY_IDLE_TIMEOUT);
+    match sync_ipc::relay_raw(remote, local).await {
+        Ok((to_local, to_remote)) => {
+            debug!(peer, to_local, to_remote, "relayed sync stream");
+            Ok(())
+        }
+        Err(error) => {
+            debug!(peer, %error, "sync relay ended with an error");
+            Ok(())
+        }
+    }
+}
+
+/// The message a control request gets when this daemon delegates sync and no
+/// companion is attached. Same words every time, so a person recognises it.
+const SYNC_COMPANION_ABSENT: &str =
+    "this daemon delegates sync to fabric-sync, but no sync companion is attached";
+
+fn sync_owner_token(owner: SyncOwner) -> &'static str {
+    match owner {
+        SyncOwner::Embedded => "embedded",
+        SyncOwner::Companion => "companion",
+    }
+}
+
+/// Serve the companion's requests on the daemon's bridge socket.
+async fn run_sync_ipc_socket(listener: IpcListener, state: Arc<DaemonState>) -> Result<()> {
+    loop {
+        tokio::select! {
+            _ = state.cancel.cancelled() => break,
+            accepted = listener.accept_stream() => match accepted {
+                Ok(stream) => {
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = handle_sync_ipc_request(stream, state).await {
+                            debug!(%error, "sync bridge request failed");
+                        }
+                    });
+                }
+                Err(error) => {
+                    warn!(%error, "sync bridge accept failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
     }
     Ok(())
+}
+
+async fn handle_sync_ipc_request(mut stream: UnixStream, state: Arc<DaemonState>) -> Result<()> {
+    let request = sync_ipc::read_request(&mut stream).await?;
+    let request_id = request.request_id;
+    if let Err(error) = request.validate(&state.sync_ipc_nonce) {
+        sync_ipc::write_response(&mut stream, &IpcResponse::error(request_id, error)).await?;
+        return Ok(());
+    }
+    match request.kind {
+        IpcRequestKind::ResolvePeers { selectors } => {
+            let peers: SyncPeers = selectors.into();
+            let resolved = resolve_sync_peers(&state, &peers).await;
+            sync_ipc::write_response(
+                &mut stream,
+                &IpcResponse::peers(
+                    request_id,
+                    resolved.peers.into_iter().map(Into::into).collect(),
+                    resolved.unresolved,
+                ),
+            )
+            .await
+        }
+        IpcRequestKind::OpenOutbound { peer, sync_name } => {
+            if state.sync_owner != SyncOwner::Companion {
+                sync_ipc::write_response(
+                    &mut stream,
+                    &IpcResponse::error(
+                        request_id,
+                        IpcError::new(
+                            IpcErrorKind::Unavailable,
+                            "this daemon owns embedded sync and opens no streams for a companion",
+                        ),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+            let peer: PeerRef = peer.into();
+            let label = peer.id.clone();
+            match open_outbound_sync_stream(&state, &peer).await {
+                Ok(remote) => {
+                    sync_ipc::write_response(&mut stream, &IpcResponse::ready(request_id)).await?;
+                    let remote = tokio::io::join(remote.recv, remote.send);
+                    debug!(peer = %label, sync = %sync_name, "relaying outbound sync stream");
+                    relay_sync_stream(remote, stream, &label).await
+                }
+                Err(error) => {
+                    // The text travels verbatim: a refusal keeps its wire
+                    // marker, so the companion's engine reports `denied`, not
+                    // weather.
+                    sync_ipc::write_response(
+                        &mut stream,
+                        &IpcResponse::error(
+                            request_id,
+                            IpcError::new(IpcErrorKind::Unavailable, format!("{error:#}")),
+                        ),
+                    )
+                    .await
+                }
+            }
+        }
+        IpcRequestKind::OpenInbound { .. }
+        | IpcRequestKind::Status
+        | IpcRequestKind::Reload
+        | IpcRequestKind::Publish { .. }
+        | IpcRequestKind::Shutdown => {
+            sync_ipc::write_response(
+                &mut stream,
+                &IpcResponse::error(
+                    request_id,
+                    IpcError::new(
+                        IpcErrorKind::InvalidRequest,
+                        "the daemon's bridge socket resolves peers and opens outbound streams only",
+                    ),
+                ),
+            )
+            .await
+        }
+    }
 }
 
 fn accepted_alpns(exposures: &HashMap<Vec<u8>, Exposure>) -> Vec<Vec<u8>> {
@@ -4360,31 +4666,7 @@ impl SyncTransport for IrohSyncTransport {
         let Some(state) = self.state.upgrade() else {
             return ResolvedPeers::default();
         };
-        let book = state.peer_book.read().await;
-        let mut resolved = ResolvedPeers::default();
-        match peers {
-            SyncPeers::Wildcard(selector) => {
-                for peer in book.peers() {
-                    resolved.peers.push(peer_ref(peer));
-                }
-                // "Every trusted peer" on a machine that trusts nobody is
-                // nobody, and that is worth a line rather than a clean report.
-                if resolved.peers.is_empty() {
-                    resolved.unresolved.push(selector.clone());
-                }
-            }
-            SyncPeers::List(selectors) => {
-                for selector in selectors {
-                    match book.peers().iter().find(|p| {
-                        p.id.to_string() == *selector || p.name.as_deref() == Some(selector)
-                    }) {
-                        Some(peer) => resolved.peers.push(peer_ref(peer)),
-                        None => resolved.unresolved.push(selector.clone()),
-                    }
-                }
-            }
-        }
-        resolved
+        resolve_sync_peers(&state, peers).await
     }
 
     async fn reconcile(
@@ -4396,54 +4678,90 @@ impl SyncTransport for IrohSyncTransport {
         let Some(state) = self.state.upgrade() else {
             bail!("daemon is shutting down");
         };
-        // OUR OWN policy applies to our own outbound sync, and that is not
-        // symmetry for its own sake.
-        //
-        // Sync is bidirectional. Refusing a peer's incoming reconcile stops
-        // nothing on its own, because we still dial THEM and pull the same
-        // files. A one-way denial of a two-way protocol denies nothing, which
-        // is what `a_peer_denied_sync_makes_the_entry_report_stopped_not_clean`
-        // found: the file arrived anyway.
-        //
-        // So "this peer may not sync with me" also means "I will not sync with
-        // it". The refusal carries the same wire phrase as a remote one, so it
-        // is reported as `denied` rather than as a network fault.
-        let peer_id: EndpointId = peer
-            .key
-            .parse()
-            .with_context(|| format!("sync peer {} has an invalid transport key", peer.id))?;
-        let addr = {
-            let book = state.peer_book.read().await;
-            let configured = book
-                .peers()
-                .iter()
-                .find(|configured| configured.id == peer_id)
-                .with_context(|| format!("sync peer {} is no longer trusted", peer.id))?;
-            configured
-                .addr
-                .clone()
-                .unwrap_or_else(|| EndpointAddr::new(configured.id))
-        };
-        // The IDENTITY, from the address, NOT `peer.id`.
-        //
-        // `PeerRef.id` is a display label: the peer's name when it has one and
-        // the id only as a fallback. Keying policy on it silently skipped this
-        // check for every named peer, which is exactly the mistake the header
-        // in `peers.toml` warns about, made minutes after writing it. The test
-        // caught it; reading the code did not.
-        if let Err(denied) = state.may(&addr.id, "sync").await {
-            bail!("{denied}");
-        }
-        let stream = state
-            .open_peer_stream(
-                &addr,
-                std::str::from_utf8(SYNC_ALPN).expect("sync ALPN is UTF-8"),
-                mux::StreamActivity::Application,
-            )
-            .await?;
+        let stream = open_outbound_sync_stream(&state, &peer).await?;
         let joined = tokio::io::join(stream.recv, stream.send);
         sync::wire::run_client(joined, node, &name, &peer.id).await
     }
+}
+
+/// What an entry's peer selector resolves to against `peers.toml` right now.
+/// The one resolver behind both the embedded transport and the bridge.
+async fn resolve_sync_peers(state: &DaemonState, peers: &SyncPeers) -> ResolvedPeers {
+    let book = state.peer_book.read().await;
+    let mut resolved = ResolvedPeers::default();
+    match peers {
+        SyncPeers::Wildcard(selector) => {
+            for peer in book.peers() {
+                resolved.peers.push(peer_ref(peer));
+            }
+            // "Every trusted peer" on a machine that trusts nobody is
+            // nobody, and that is worth a line rather than a clean report.
+            if resolved.peers.is_empty() {
+                resolved.unresolved.push(selector.clone());
+            }
+        }
+        SyncPeers::List(selectors) => {
+            for selector in selectors {
+                match book.peers().iter().find(|p| {
+                    p.id.to_string() == *selector || p.name.as_deref() == Some(selector)
+                }) {
+                    Some(peer) => resolved.peers.push(peer_ref(peer)),
+                    None => resolved.unresolved.push(selector.clone()),
+                }
+            }
+        }
+    }
+    resolved
+}
+
+/// Open an authenticated, permitted `fabric/sync` stream to `peer`. The one
+/// gate behind both the embedded transport and the bridge.
+async fn open_outbound_sync_stream(state: &DaemonState, peer: &PeerRef) -> Result<mux::MuxStream> {
+    // OUR OWN policy applies to our own outbound sync, and that is not
+    // symmetry for its own sake.
+    //
+    // Sync is bidirectional. Refusing a peer's incoming reconcile stops
+    // nothing on its own, because we still dial THEM and pull the same
+    // files. A one-way denial of a two-way protocol denies nothing, which
+    // is what `a_peer_denied_sync_makes_the_entry_report_stopped_not_clean`
+    // found: the file arrived anyway.
+    //
+    // So "this peer may not sync with me" also means "I will not sync with
+    // it". The refusal carries the same wire phrase as a remote one, so it
+    // is reported as `denied` rather than as a network fault.
+    let peer_id: EndpointId = peer
+        .key
+        .parse()
+        .with_context(|| format!("sync peer {} has an invalid transport key", peer.id))?;
+    let addr = {
+        let book = state.peer_book.read().await;
+        let configured = book
+            .peers()
+            .iter()
+            .find(|configured| configured.id == peer_id)
+            .with_context(|| format!("sync peer {} is no longer trusted", peer.id))?;
+        configured
+            .addr
+            .clone()
+            .unwrap_or_else(|| EndpointAddr::new(configured.id))
+    };
+    // The IDENTITY, from the address, NOT `peer.id`.
+    //
+    // `PeerRef.id` is a display label: the peer's name when it has one and
+    // the id only as a fallback. Keying policy on it silently skipped this
+    // check for every named peer, which is exactly the mistake the header
+    // in `peers.toml` warns about, made minutes after writing it. The test
+    // caught it; reading the code did not.
+    if let Err(denied) = state.may(&addr.id, "sync").await {
+        bail!("{denied}");
+    }
+    state
+        .open_peer_stream(
+            &addr,
+            std::str::from_utf8(SYNC_ALPN).expect("sync ALPN is UTF-8"),
+            mux::StreamActivity::Application,
+        )
+        .await
 }
 
 fn peer_ref(peer: &Peer) -> PeerRef {
@@ -5514,6 +5832,7 @@ mod tests {
                 sync_ipc_magic,
                 sync_ipc_version,
                 owner,
+                ..
             } => {
                 assert_eq!(version, crate::version_string());
                 assert_eq!(sync_ipc_magic, sync::ipc::IPC_MAGIC);
@@ -5543,6 +5862,7 @@ mod tests {
                 version: "different-build".to_string(),
                 sync_ipc_magic: sync::ipc::IPC_MAGIC.to_string(),
                 sync_ipc_version: sync::ipc::IPC_VERSION,
+                companion_socket: None,
             },
             node.state(),
         )
@@ -5559,6 +5879,7 @@ mod tests {
                 version: crate::version_string(),
                 sync_ipc_magic: sync::ipc::IPC_MAGIC.to_string(),
                 sync_ipc_version: sync::ipc::IPC_VERSION,
+                companion_socket: None,
             },
             node.state(),
         )
@@ -5575,10 +5896,11 @@ mod tests {
             }
         );
 
-        *node.state().sync_companion_seen.lock().await = Some((
-            Instant::now() - SYNC_COMPANION_PRESENCE_WINDOW - Duration::from_secs(1),
-            "standby",
-        ));
+        *node.state().sync_companion.lock().await = Some(CompanionPresence {
+            seen: Instant::now() - SYNC_COMPANION_PRESENCE_WINDOW - Duration::from_secs(1),
+            state: "standby",
+            socket: None,
+        });
         assert_eq!(
             node.state().sync_runtime_status().await.companion,
             "absent",

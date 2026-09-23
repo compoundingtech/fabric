@@ -957,6 +957,10 @@ daemon and its independent `fabric-sync` companion. It enables both services
 for future user sessions. The companion runs in compatibility standby while
 the daemon owns embedded sync.
 
+With the companion as sync owner, that same standby process runs the engine
+and holds the state lease; when it stops, configured entries report
+`runtime=unavailable` and the daemon serves everything else.
+
 `status` reports `fabric.service` and `fabric-sync.service` on Linux. It reports
 `com.compoundingtech.fabric` and `com.compoundingtech.fabric-sync` on macOS.
 `uninstall` stops the companion first, then the daemon. It removes only the
@@ -1051,13 +1055,22 @@ The sync engine receives explicit config and state paths instead of the daemon
 home. It holds `<home>/sync/owner.lock` for its lifetime, so a second engine
 fails before it reads or changes the same state.
 
-The package ships a separately supervised `fabric-sync` companion. It reports
-its presence to the daemon, but it stays in compatibility standby. It does not
-acquire the sync-owner lease or start folder watchers. The daemon remains the
-embedded sync owner.
+The package ships a separately supervised `fabric-sync` companion. Which
+process runs the engine is the daemon's sync owner. With the embedded owner,
+the default of this release, the daemon runs the engine and the companion
+stays in compatibility standby: it reports its presence and holds no lease.
+With the companion owner, the daemon constructs no engine; the companion takes
+the lease, watches the folders, and reaches every peer through the daemon. A
+companion started with `--standby` does whichever the daemon it attaches to
+grants, so the same service definition serves both.
 
-The library also defines a dormant `fabric/sync-ipc/1` Unix bridge. Its
-owner-only socket uses bounded, versioned control messages, then carries raw
+The `fabric/sync-ipc/1` Unix bridge carries the companion path. Two owner-only
+sockets under `<home>/run/`: the daemon's `sync-ipc.sock` takes the companion's
+peer lookups and outbound stream requests; the companion's
+`sync-companion.sock` takes the daemon's inbound streams, status, reload, and
+publish. Both check a nonce the daemon mints per process and hands the
+companion over the control socket, with the daemon's node id as the sync
+author. Control messages are bounded and versioned, then a stream carries raw
 `fabric/sync/1` bytes. No production request selects this bridge yet.
 
 `fabric status`, `fabric sync ls`, and `fabric doctor` report the sync owner and

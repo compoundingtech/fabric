@@ -15,6 +15,7 @@
 //! - [`delta`]: what changed here and which peer has seen it, so a pass can ship
 //!   the changed paths instead of the whole manifest.
 
+pub mod companion;
 pub mod config;
 pub mod delta;
 pub mod engine;
@@ -28,7 +29,7 @@ pub mod wire;
 
 pub use config::{PolicyRules, SyncBook, SyncEntry, SyncPeers, SyncPolicy};
 pub use delta::{ChangeBuffer, Cursor};
-pub use engine::{PeerRef, SYNC_LOG_TARGET, SyncEngine, SyncStatus, SyncTransport};
+pub use engine::{PeerRef, PeerSyncState, SYNC_LOG_TARGET, SyncEngine, SyncStatus, SyncTransport};
 pub use manifest::{FileMeta, Manifest, ManifestDiff};
 pub use node::{Reconciled, SyncNode, content_hash};
 pub use paths::{SyncOwnerLease, SyncOwnerLeaseState, SyncPaths};

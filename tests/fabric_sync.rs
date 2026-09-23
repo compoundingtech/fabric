@@ -98,6 +98,9 @@ fn check_validates_the_running_embedded_owner_without_mutating_state() -> Result
             sync_ipc_magic: ipc::IPC_MAGIC.to_string(),
             sync_ipc_version: ipc::IPC_VERSION,
             owner: "embedded".to_string(),
+            nonce: None,
+            daemon_socket: None,
+            node_id: None,
         };
         let stream = reader.get_mut();
         serde_json::to_writer(&mut *stream, &response)?;
@@ -160,6 +163,9 @@ fn standby_registers_without_acquiring_the_sync_lease() -> Result<()> {
             sync_ipc_magic: ipc::IPC_MAGIC.to_string(),
             sync_ipc_version: ipc::IPC_VERSION,
             owner: "embedded".to_string(),
+            nonce: None,
+            daemon_socket: None,
+            node_id: None,
         };
         let stream = reader.get_mut();
         serde_json::to_writer(&mut *stream, &response)?;

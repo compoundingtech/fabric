@@ -8,6 +8,35 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Added
 
+- **The sync engine can run in the `fabric-sync` companion, behind both
+  directions of the local bridge.** A daemon started with the companion as its
+  sync owner constructs no engine: the companion acquires the state lease,
+  watches the folders, and asks the daemon for every peer lookup and every
+  outbound stream over the daemon's bridge socket; the daemon forwards each
+  authenticated inbound `fabric/sync/1` stream to the companion's bridge socket
+  as raw bytes. One nonce per daemon process authenticates both sockets, and
+  the daemon hands it to the companion with its node id (the sync author) when
+  the companion attaches. A daemon restart mints a new nonce; a running
+  companion re-attaches within seconds and keeps its state. When the companion
+  is stopped, absent, or a different build, the daemon serves everything else,
+  `fabric status`, `sync ls`, and `doctor` say `runtime=unavailable` with the
+  reason, and a peer that syncs toward the machine is told `unavailable` in the
+  wire reply rather than left to read it as the network. The default owner is
+  still the daemon's embedded engine; the companion path is selected by the
+  daemon option (or `FABRIC_SYNC_OWNER=companion` for a measurement). The
+  supervised `fabric-sync --standby` process already owns sync the moment a
+  daemon grants it, so service definitions do not change.
+- **A process-boundary test suite** runs the four-way mixed matrix (embedded to
+  embedded, companion to embedded, embedded to companion, companion to
+  companion: two-way change, delete, equal digests, no fallback), the lease
+  passing to and from the companion, a stopped and an incompatible companion,
+  a daemon restart under a running companion, a rejected reload, and the real
+  `fabric-sync` process killed with SIGKILL mid-pass and recovering on restart
+  with one owner. The permanent exec-pipe latency test runs a second time with
+  the walk held in the companion, same bounds. An ignored Linux measurement
+  compares content throughput, wire bytes, CPU, and peak RSS of the embedded
+  and bridge paths over the same fixed window with real processes.
+
 - **`fabric join <ssh-host>` pairs with a machine you can already ssh to, in one
   command and both directions.** It runs `fabric id` there over your own ssh
   (config, agent and prompts included), trusts that id here under the host's

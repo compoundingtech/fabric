@@ -106,6 +106,9 @@ jobs:
       - name: Fabric sync diagnostic contract
         run: timeout 5m cargo test --locked --test fabric_sync -- --test-threads=1
 
+      - name: Sync process boundary and mixed fleet
+        run: timeout 15m cargo test --locked --test sync_process -- --test-threads=1
+
       - name: Serial local multi-node daemon slice
         run: timeout 15m cargo test --locked --test local_slice -- --test-threads=1
 

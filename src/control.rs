@@ -94,11 +94,16 @@ pub enum ControlRequest {
     SyncStatus,
     /// Report whether this build can host the companion sync process.
     SyncIpcCompatibility,
-    /// Register one compatibility-standby heartbeat from the companion.
+    /// Register one heartbeat from the companion. When the daemon delegates
+    /// sync, the answer carries the session the companion needs to attach:
+    /// the daemon's bridge socket, the instance nonce, and the sync author.
     SyncCompanionHello {
         version: String,
         sync_ipc_magic: String,
         sync_ipc_version: u16,
+        /// Where the daemon can reach this companion's bridge listener.
+        #[serde(default)]
+        companion_socket: Option<PathBuf>,
     },
     /// Report which process owns sync and whether its companion is present.
     SyncRuntimeStatus,
@@ -118,7 +123,7 @@ pub enum ControlRequest {
 }
 
 /// One file of a `SyncPublish` request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncPublishFile {
     /// The path inside the synced folder, in manifest form.
     pub rel: String,
@@ -133,7 +138,7 @@ pub struct SyncPublishFile {
 }
 
 /// One file of a `SyncPublished` response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncPublishedFile {
     pub rel: String,
     pub version: u64,
@@ -234,7 +239,19 @@ pub enum ControlResponse {
         version: String,
         sync_ipc_magic: String,
         sync_ipc_version: u16,
+        /// `embedded` when this daemon runs its own engine, `companion` when
+        /// it delegates sync to the companion process.
         owner: String,
+        /// The daemon-instance nonce, only when `owner` is `companion` and the
+        /// caller is the companion. A restart mints a new one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nonce: Option<String>,
+        /// The daemon's bridge socket for the companion's requests.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        daemon_socket: Option<PathBuf>,
+        /// This daemon's public node id, the stable sync author.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node_id: Option<String>,
     },
     SyncRuntimeStatus {
         runtime: SyncRuntimeStatus,
@@ -251,12 +268,69 @@ pub enum ControlResponse {
 pub struct SyncRuntimeStatus {
     /// `embedded`, `companion`, or `unavailable`.
     pub owner: String,
-    /// `standby`, `active`, `absent`, `incompatible`, or `unknown`.
+    /// `standby`, `active`, `absent`, `incompatible`, `timed-out`, `lease-busy`,
+    /// or `unknown`.
     pub companion: String,
 }
 
+impl SyncRuntimeStatus {
+    pub fn new(owner: &str, companion: &str) -> Self {
+        Self {
+            owner: owner.to_string(),
+            companion: companion.to_string(),
+        }
+    }
+
+    pub fn unavailable(reason: &str) -> Self {
+        Self::new("unavailable", reason)
+    }
+}
+
+impl From<crate::sync::SyncStatus> for SyncEntryStatus {
+    fn from(status: crate::sync::SyncStatus) -> Self {
+        let peers = match &status.peers {
+            crate::sync::SyncPeers::Wildcard(_) => "*".to_string(),
+            crate::sync::SyncPeers::List(list) => list.join(","),
+        };
+        SyncEntryStatus {
+            delta_fallbacks: status.delta_fallbacks,
+            full_payload_sends: status.full_payload_sends,
+            content_bytes: status.content_bytes,
+            stopped_peers: status.stopped_peers,
+            digest: status.digest,
+            name: status.name,
+            folder: status.folder.display().to_string(),
+            policy: status.policy.to_string(),
+            peers,
+            files: status.present,
+            present: status.present,
+            tombstones: status.tombstones,
+            observed: status.observed,
+            missing: status.missing,
+            unexpected: status.unexpected,
+            mismatched: status.mismatched,
+            scan_issues: status.scan_issues,
+            full_scans: status.full_scans,
+            inbound_noop_transactions: status.inbound_noop_transactions,
+            inbound_guarded_transactions: status.inbound_guarded_transactions,
+            sync_passes: status.sync_passes,
+            scan_micros: status.scan_micros,
+            materialize_micros: status.materialize_micros,
+            persist_micros: status.persist_micros,
+            reconcile_micros: status.reconcile_micros,
+            reconcile_wire_bytes: status.reconcile_wire_bytes,
+            reconcile_failures: status.reconcile_failures,
+            sweep: status
+                .sweep
+                .as_ref()
+                .map(|state| state.token())
+                .unwrap_or_default(),
+        }
+    }
+}
+
 /// One configured sync entry's status, for `fabric sync ls`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncEntryStatus {
     pub name: String,
     pub folder: String,

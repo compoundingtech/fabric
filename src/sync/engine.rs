@@ -710,6 +710,10 @@ pub enum PeerSyncState {
     MissingEntry,
     /// Local or remote sync data exceeds a wire limit.
     TooLarge,
+    /// The remote daemon is up but has no sync owner right now: its companion
+    /// is stopped, absent, or incompatible. Not the network, and not a
+    /// permission. It converges when that machine's companion returns.
+    Unavailable,
 }
 
 impl PeerSyncState {
@@ -722,6 +726,7 @@ impl PeerSyncState {
             PeerSyncState::Unknown => "unknown",
             PeerSyncState::MissingEntry => "missing-entry",
             PeerSyncState::TooLarge => "too-large",
+            PeerSyncState::Unavailable => "unavailable",
         }
     }
 }
@@ -731,6 +736,10 @@ fn classify_reconcile_error(message: &str) -> PeerSyncState {
         PeerSyncState::Refused
     } else if message.contains("no local sync entry named") {
         PeerSyncState::MissingEntry
+    } else if message.contains(crate::sync::wire::SYNC_UNAVAILABLE_MARKER)
+        || message.contains("not attached to a fabric daemon")
+    {
+        PeerSyncState::Unavailable
     } else if message.contains("sync")
         && (message.contains("exceeds limit") || message.contains("-byte limit"))
     {
@@ -1988,6 +1997,49 @@ impl<T: SyncTransport> SyncEngine<T> {
     /// Recording forward debt costs one pass on the node that received
     /// something, and nothing when nothing arrives. That is the propagation
     /// cost and there is no cheaper honest version of it.
+    /// Serve one inbound reconcile on `stream` for `peer`, then materialize
+    /// what the peer pushed. The one place both hosts of the engine, the
+    /// embedded daemon path and the companion, run the accepting side.
+    pub async fn serve_inbound<S>(self: &Arc<Self>, stream: S, peer: &str, idle_timeout: Duration)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let resolver_engine = self.clone();
+        let outcome = crate::sync::wire::run_server_with_idle_timeout(
+            stream,
+            peer,
+            move |hello| {
+                let engine = resolver_engine.clone();
+                async move {
+                    let prepared = engine.prepare_inbound_for_hello(&hello).await?;
+                    Ok(prepared.map(|prepared| (prepared.node(), prepared)))
+                }
+            },
+            idle_timeout,
+        )
+        .await;
+        match outcome {
+            Ok((name, stats, prepared)) => {
+                // The serving side's numbers used to stop here, which is how a
+                // fallback taken while serving a peer stayed invisible.
+                self.record_inbound(&name, &stats).await;
+                if !stats.is_noop() {
+                    tracing::debug!(sync = %name, ?stats, "served sync reconcile");
+                }
+                // Re-scan changes that landed during the session, then persist
+                // and materialize while the inbound operation guard is still held.
+                if let Err(error) = self.complete_inbound(prepared).await {
+                    tracing::debug!(sync = %name, %error, "sync completion failed");
+                }
+                // AFTER completion, which ends by marking the generation
+                // durable. What we just adopted still has to reach every peer
+                // that is not the one we adopted it from.
+                self.note_inbound_adoption(&name, &stats).await;
+            }
+            Err(error) => tracing::debug!(peer = %peer, %error, "sync serve failed"),
+        }
+    }
+
     pub async fn note_inbound_adoption(&self, name: &str, stats: &Reconciled) {
         if stats.pulled == 0 {
             return;

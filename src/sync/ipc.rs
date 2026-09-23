@@ -1,4 +1,13 @@
-//! The dormant local bridge between `fabric-sync` and `fabric`.
+//! The local bridge between `fabric-sync` and `fabric`.
+//!
+//! Two owner-only Unix sockets, one nonce. The daemon listens on
+//! `<home>/run/sync-ipc.sock` for the companion's requests (resolve peers, open
+//! an outbound stream). The companion listens on
+//! `<home>/run/sync-companion.sock` for the daemon's requests (open an inbound
+//! stream, status, reload, publish, shutdown). Both sides validate every request
+//! against the daemon-instance nonce, which the daemon hands the companion over
+//! the control socket when it attaches. After the bounded handshake a stream
+//! carries raw `fabric/sync/1` bytes; the bridge adds no framing of its own.
 
 use std::{
     fmt,
@@ -23,11 +32,20 @@ use tokio::{
 };
 
 use super::{PeerRef, SyncNode, SyncPeers, SyncTransport, engine::ResolvedPeers};
+use crate::control::{SyncEntryStatus, SyncPublishFile, SyncPublishedFile};
 
 pub const IPC_MAGIC: &str = "fabric/sync-ipc/1";
 pub const IPC_VERSION: u16 = 1;
-pub const MAX_CONTROL_FRAME: usize = 16 * 1024;
+/// The largest control frame either side will encode or accept. A publish
+/// request carries the reviewed file bytes and a status snapshot carries every
+/// entry's counters, so this is a bound against a runaway frame, not a budget
+/// for a handshake. Both sockets are owner-only and nonce-checked.
+pub const MAX_CONTROL_FRAME: usize = 64 * 1024 * 1024;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The daemon's socket name for the companion's requests.
+pub const DAEMON_SOCKET_NAME: &str = "sync-ipc.sock";
+/// The companion's socket name for the daemon's requests.
+pub const COMPANION_SOCKET_NAME: &str = "sync-companion.sock";
 
 /// A daemon-instance value that prevents a stale local process from joining a
 /// new daemon. The daemon creates and distributes the value outside this API.
@@ -36,6 +54,10 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct IpcNonce(String);
 
 impl IpcNonce {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
     pub fn new(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
         if !(16..=128).contains(&value.len()) || !value.is_ascii() {
@@ -56,6 +78,15 @@ impl fmt::Debug for IpcNonce {
 pub enum IpcPeerSelector {
     Wildcard(String),
     List(Vec<String>),
+}
+
+impl From<IpcPeerSelector> for SyncPeers {
+    fn from(value: IpcPeerSelector) -> Self {
+        match value {
+            IpcPeerSelector::Wildcard(selector) => Self::Wildcard(selector),
+            IpcPeerSelector::List(selectors) => Self::List(selectors),
+        }
+    }
 }
 
 impl From<&SyncPeers> for IpcPeerSelector {
@@ -105,13 +136,25 @@ pub enum IpcRequestKind {
         peer: IpcPeer,
         sync_name: String,
     },
+    /// The daemon forwards one authenticated remote sync stream. The companion
+    /// reads the wire hello itself, so no sync name travels in the header: the
+    /// daemon never parses `fabric/sync/1` bytes on the way through.
     OpenInbound {
         authenticated_peer_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_label: Option<String>,
-        sync_name: String,
     },
     Status,
+    /// Re-read `syncs.toml` and run one pass per entry. The daemon validated the
+    /// file against `peers.toml` before asking.
+    Reload,
+    /// Publish reviewed bytes into one entry under its operation guard.
+    Publish {
+        name: String,
+        files: Vec<SyncPublishFile>,
+        #[serde(default)]
+        force: bool,
+    },
     Shutdown,
 }
 
@@ -240,6 +283,9 @@ pub enum IpcRuntimeState {
 pub struct IpcStatus {
     pub state: IpcRuntimeState,
     pub active_sessions: u32,
+    /// Every configured entry's status, in the shape the control socket reports.
+    #[serde(default)]
+    pub entries: Vec<SyncEntryStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -254,6 +300,9 @@ pub enum IpcResponseKind {
         status: IpcStatus,
     },
     ShuttingDown,
+    Published {
+        files: Vec<SyncPublishedFile>,
+    },
     Error {
         error: IpcError,
     },
@@ -294,6 +343,10 @@ impl IpcResponse {
 
     pub fn shutting_down(request_id: u64) -> Self {
         Self::new(request_id, IpcResponseKind::ShuttingDown)
+    }
+
+    pub fn published(request_id: u64, files: Vec<SyncPublishedFile>) -> Self {
+        Self::new(request_id, IpcResponseKind::Published { files })
     }
 
     pub fn error(request_id: u64, error: IpcError) -> Self {
@@ -364,7 +417,7 @@ where
     serde_json::from_slice(&encoded).context("decoding a sync IPC control frame")
 }
 
-async fn read_request(stream: &mut UnixStream) -> Result<IpcRequest> {
+pub async fn read_request(stream: &mut UnixStream) -> Result<IpcRequest> {
     tokio::time::timeout(HANDSHAKE_TIMEOUT, read_message(stream))
         .await
         .context("the sync IPC request did not arrive within 5 seconds")?
@@ -406,7 +459,10 @@ impl IpcListener {
         })
     }
 
-    async fn accept_stream(&self) -> Result<UnixStream> {
+    /// Accept one same-user client and nothing more. The caller reads and
+    /// validates the request, which lets it answer a request it cannot yet
+    /// authenticate (no daemon session) with a structured refusal.
+    pub async fn accept_stream(&self) -> Result<UnixStream> {
         let (stream, _) = self.listener.accept().await?;
         verify_same_user(&stream)?;
         Ok(stream)
@@ -510,17 +566,17 @@ fn verify_same_user(_stream: &UnixStream) -> Result<()> {
     bail!("sync IPC peer credential checks are unsupported on this platform")
 }
 
-/// The client-side transport for the local bridge. No production path creates
-/// this type until the companion process is ready for activation.
+/// One side's client for the other side's socket: a socket path and the
+/// daemon-instance nonce that authenticates every request on it.
 #[derive(Clone)]
-pub struct IpcSyncTransport {
+pub struct IpcClient {
     socket_path: PathBuf,
     nonce: IpcNonce,
     next_request_id: Arc<AtomicU64>,
     timeout: Duration,
 }
 
-impl IpcSyncTransport {
+impl IpcClient {
     pub fn new(socket_path: impl Into<PathBuf>, nonce: IpcNonce) -> Self {
         Self {
             socket_path: socket_path.into(),
@@ -532,6 +588,15 @@ impl IpcSyncTransport {
 
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    pub fn nonce(&self) -> &IpcNonce {
+        &self.nonce
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     async fn request(&self, kind: IpcRequestKind) -> Result<(UnixStream, IpcResponseKind)> {
@@ -574,6 +639,8 @@ impl IpcSyncTransport {
         })
     }
 
+    /// Ask the daemon for an authenticated outbound stream to `peer`. The
+    /// returned stream carries raw sync-wire bytes from here on.
     pub async fn open_outbound(&self, peer: PeerRef, sync_name: String) -> Result<UnixStream> {
         let (stream, response) = self
             .request(IpcRequestKind::OpenOutbound {
@@ -587,12 +654,54 @@ impl IpcSyncTransport {
         Ok(stream)
     }
 
+    /// Hand the companion one authenticated inbound stream. The returned stream
+    /// carries raw sync-wire bytes from here on.
+    pub async fn open_inbound(
+        &self,
+        authenticated_peer_id: String,
+        display_label: Option<String>,
+    ) -> Result<UnixStream> {
+        let (stream, response) = self
+            .request(IpcRequestKind::OpenInbound {
+                authenticated_peer_id,
+                display_label,
+            })
+            .await?;
+        if response != IpcResponseKind::Ready {
+            bail!("the sync IPC inbound request received the wrong response kind");
+        }
+        Ok(stream)
+    }
+
     pub async fn status(&self) -> Result<IpcStatus> {
         let (_, response) = self.request(IpcRequestKind::Status).await?;
         let IpcResponseKind::Status { status } = response else {
             bail!("the sync IPC status request received the wrong response kind");
         };
         Ok(status)
+    }
+
+    pub async fn reload(&self) -> Result<()> {
+        let (_, response) = self.request(IpcRequestKind::Reload).await?;
+        if response != IpcResponseKind::Ready {
+            bail!("the sync IPC reload request received the wrong response kind");
+        }
+        Ok(())
+    }
+
+    pub async fn publish(
+        &self,
+        name: String,
+        files: Vec<SyncPublishFile>,
+        force: bool,
+    ) -> Result<Vec<SyncPublishedFile>> {
+        let (_, response) = self
+            .request(IpcRequestKind::Publish { name, files, force })
+            .await?;
+        let IpcResponseKind::Published { files } = response else {
+            bail!("the sync IPC publish request received the wrong response kind");
+        };
+        Ok(files)
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -602,10 +711,75 @@ impl IpcSyncTransport {
         }
         Ok(())
     }
+}
+
+/// The engine's transport when it runs in the companion: every peer lookup and
+/// every outbound reconcile goes to the daemon over the bridge.
+///
+/// The session it talks to can change while the engine runs, because a daemon
+/// restart mints a new nonce. Until the companion re-attaches, a lookup resolves
+/// nothing and a reconcile fails with a local error, which the engine reports as
+/// unreachable rather than as a network fault it must recover from.
+#[derive(Clone, Default)]
+pub struct IpcSyncTransport {
+    session: Arc<std::sync::RwLock<Option<IpcClient>>>,
+}
+
+impl IpcSyncTransport {
+    /// A transport attached to one fixed daemon session.
+    pub fn new(socket_path: impl Into<PathBuf>, nonce: IpcNonce) -> Self {
+        let transport = Self::default();
+        transport.attach(IpcClient::new(socket_path, nonce));
+        transport
+    }
+
+    /// A transport with no daemon session yet.
+    pub fn detached() -> Self {
+        Self::default()
+    }
+
+    pub fn attach(&self, client: IpcClient) {
+        *self.session.write().unwrap() = Some(client);
+    }
+
+    pub fn detach(&self) {
+        *self.session.write().unwrap() = None;
+    }
+
+    pub fn session(&self) -> Option<IpcClient> {
+        self.session.read().unwrap().clone()
+    }
+
+    pub fn socket_path(&self) -> Option<PathBuf> {
+        self.session().map(|client| client.socket_path.clone())
+    }
+
+    fn client(&self) -> Result<IpcClient> {
+        self.session()
+            .context("the sync companion is not attached to a fabric daemon")
+    }
+
+    pub async fn resolve_peers(&self, peers: &SyncPeers) -> Result<ResolvedPeers> {
+        self.client()?.resolve_peers(peers).await
+    }
+
+    pub async fn open_outbound(&self, peer: PeerRef, sync_name: String) -> Result<UnixStream> {
+        self.client()?.open_outbound(peer, sync_name).await
+    }
+
+    pub async fn status(&self) -> Result<IpcStatus> {
+        self.client()?.status().await
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        self.client()?.shutdown().await
+    }
 
     #[cfg(test)]
-    fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+    fn with_timeout(self, timeout: Duration) -> Self {
+        if let Some(client) = self.session() {
+            self.attach(client.with_timeout(timeout));
+        }
         self
     }
 }
@@ -717,6 +891,7 @@ mod tests {
                             IpcStatus {
                                 state: IpcRuntimeState::Ready,
                                 active_sessions: 0,
+                                entries: Vec::new(),
                             },
                         ),
                     )
@@ -727,7 +902,9 @@ mod tests {
                         .await?;
                     return Ok(());
                 }
-                IpcRequestKind::OpenInbound { .. } => {
+                IpcRequestKind::OpenInbound { .. }
+                | IpcRequestKind::Reload
+                | IpcRequestKind::Publish { .. } => {
                     write_response(
                         &mut stream,
                         &IpcResponse::error(
@@ -791,7 +968,7 @@ mod tests {
     async fn a_wrong_instance_nonce_gets_a_structured_refusal() -> Result<()> {
         let (transport, _remote, server, _dir) = reference_transport().await?;
         let wrong = IpcSyncTransport::new(
-            transport.socket_path().to_path_buf(),
+            transport.socket_path().unwrap(),
             IpcNonce::new("fedcba9876543210")?,
         );
         let error = wrong
@@ -808,8 +985,9 @@ mod tests {
     #[tokio::test]
     async fn an_incompatible_version_gets_a_structured_refusal() -> Result<()> {
         let (transport, _remote, server, _dir) = reference_transport().await?;
-        let mut stream = UnixStream::connect(transport.socket_path()).await?;
-        let mut request = IpcRequest::new(transport.nonce.clone(), 41, IpcRequestKind::Status);
+        let client = transport.session().unwrap();
+        let mut stream = UnixStream::connect(client.socket_path()).await?;
+        let mut request = IpcRequest::new(client.nonce().clone(), 41, IpcRequestKind::Status);
         request.version = IPC_VERSION + 1;
         write_message(&mut stream, &request).await?;
         let response: IpcResponse = read_message(&mut stream).await?;
@@ -853,7 +1031,6 @@ mod tests {
             IpcRequestKind::OpenInbound {
                 authenticated_peer_id: "node-id-from-daemon".into(),
                 display_label: Some("hetz".into()),
-                sync_name: "catalog".into(),
             },
         );
         let (mut writer, mut reader) = tokio::io::duplex(MAX_CONTROL_FRAME);
@@ -866,17 +1043,15 @@ mod tests {
             IpcRequestKind::OpenInbound {
                 authenticated_peer_id,
                 display_label: Some(display_label),
-                sync_name,
             } if authenticated_peer_id == "node-id-from-daemon"
                 && display_label == "hetz"
-                && sync_name == "catalog"
         ));
         Ok(())
     }
 
     #[tokio::test]
     async fn control_frames_refuse_oversized_payloads_before_writing() {
-        let (mut writer, mut reader) = tokio::io::duplex(MAX_CONTROL_FRAME * 2);
+        let (mut writer, mut reader) = tokio::io::duplex(64);
         let oversized = "x".repeat(MAX_CONTROL_FRAME + 1);
         let error = write_message(&mut writer, &oversized)
             .await

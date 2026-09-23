@@ -6,12 +6,12 @@ use fabric::{
     config::FabricHome,
     control::{ControlRequest, ControlResponse},
     daemon::send_control,
-    sync::{SyncBook, SyncOwnerLease, SyncOwnerLeaseState, SyncPaths, ipc},
+    sync::{SyncBook, SyncOwnerLease, SyncOwnerLeaseState, SyncPaths, companion, ipc},
 };
 
 #[derive(Debug, Parser)]
 #[command(name = "fabric-sync")]
-#[command(about = "Diagnostic companion for fabric file sync")]
+#[command(about = "The fabric file-sync companion process")]
 #[command(group(ArgGroup::new("action").required(true).multiple(false).args(["version", "check", "standby"])))]
 struct Cli {
     /// Print the build version.
@@ -22,7 +22,8 @@ struct Cli {
     #[arg(long)]
     check: bool,
 
-    /// Run the supervised compatibility standby.
+    /// Run under the service manager. Standby while the daemon owns embedded
+    /// sync; own sync the moment the daemon delegates it.
     #[arg(long, hide = true)]
     standby: bool,
 
@@ -31,7 +32,7 @@ struct Cli {
     home: Option<PathBuf>,
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.version {
@@ -42,17 +43,21 @@ async fn main() -> Result<()> {
     if cli.check {
         return check(home).await;
     }
-    standby(home).await
+    serve(home).await
 }
 
-async fn standby(home: FabricHome) -> Result<()> {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+/// The supervised mode. One line to stdout per phase change, so a service log
+/// says what the process was doing without being verbose while it does it.
+async fn serve(home: FabricHome) -> Result<()> {
+    companion::init_companion_tracing(&home)?;
+    let handle = companion::start(home).await?;
     let mut previous = String::new();
+    let mut ticks = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => return Ok(()),
-            _ = interval.tick() => {
-                let state = standby_heartbeat(&home).await;
+            _ = shutdown_signal() => break,
+            _ = ticks.tick() => {
+                let state = handle.phase().describe();
                 if state != previous {
                     println!("runtime\t{state}");
                     previous = state;
@@ -60,23 +65,22 @@ async fn standby(home: FabricHome) -> Result<()> {
             }
         }
     }
+    handle.shutdown().await
 }
 
-async fn standby_heartbeat(home: &FabricHome) -> String {
-    let request = ControlRequest::SyncCompanionHello {
-        version: fabric::version_string(),
-        sync_ipc_magic: ipc::IPC_MAGIC.to_string(),
-        sync_ipc_version: ipc::IPC_VERSION,
-    };
-    match send_control(home, request).await {
-        Ok(ControlResponse::SyncIpcCompatibility { owner, .. }) if owner == "embedded" => {
-            "standby; daemon owns embedded sync".to_string()
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
         }
-        Ok(ControlResponse::SyncIpcCompatibility { owner, .. }) => {
-            format!("unavailable; daemon granted unsupported owner {owner}")
-        }
-        Ok(response) => format!("unavailable; unexpected daemon response {response:?}"),
-        Err(error) => format!("unavailable; {error:#}"),
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
@@ -95,6 +99,7 @@ async fn check(home: FabricHome) -> Result<()> {
         sync_ipc_magic,
         sync_ipc_version,
         owner,
+        ..
     } = response
     else {
         bail!("the daemon returned the wrong sync compatibility response");
@@ -115,6 +120,7 @@ async fn check(home: FabricHome) -> Result<()> {
     }
     println!("daemon\tok\t{version}");
     println!("ipc\tok\t{sync_ipc_magic}\t{sync_ipc_version}");
+    println!("daemon owner\t{owner}");
     Ok(())
 }
 
