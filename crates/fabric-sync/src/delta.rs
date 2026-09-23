@@ -29,7 +29,7 @@
 //!
 //! # Why a local sequence rather than a version vector
 //!
-//! [`crate::sync::manifest::FileMeta::version`] is per-path Lamport, NOT a
+//! [`crate::manifest::FileMeta::version`] is per-path Lamport, NOT a
 //! per-author sequence, so a vector over authors cannot describe what a peer
 //! holds. This sequence is local, dense and gap-free by construction, and it is
 //! only ever compared against cursors this same node handed out.
@@ -67,7 +67,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::sync::manifest::Manifest;
+use crate::manifest::Manifest;
 
 /// A per-peer cursor into some node's [`ChangeBuffer`].
 ///
@@ -245,7 +245,7 @@ impl ChangeBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync::manifest::{Author, ContentHash, Entry, FileMeta};
+    use crate::manifest::{Author, ContentHash, Entry, FileMeta};
     use proptest::prelude::*;
 
     fn present(version: u64, hash_n: u8) -> Entry {

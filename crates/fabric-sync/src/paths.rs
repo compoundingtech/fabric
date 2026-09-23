@@ -51,8 +51,8 @@ impl SyncPaths {
 }
 
 #[cfg(test)]
-impl From<crate::config::FabricHome> for SyncPaths {
-    fn from(home: crate::config::FabricHome) -> Self {
+impl From<fabric::config::FabricHome> for SyncPaths {
+    fn from(home: fabric::config::FabricHome) -> Self {
         Self::new(home.syncs_path(), home.root().join("sync"))
     }
 }

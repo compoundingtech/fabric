@@ -1,0 +1,34 @@
+[package]
+name = "fabric-sync"
+version = "0.2.14"
+edition = "2024"
+description = "The fabric file-sync engine and its supervised companion process"
+repository = "https://github.com/compoundingtech/fabric"
+
+[lib]
+name = "fabric_sync"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fabric-sync"
+path = "src/main.rs"
+
+[dependencies]
+fabric = { path = "../.." }
+anyhow = "1"
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+iroh = "1.0.2"
+libc = "0.2"
+notify = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"

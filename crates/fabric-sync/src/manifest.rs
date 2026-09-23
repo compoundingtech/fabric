@@ -20,7 +20,7 @@
 //!
 //! Delete handling (tombstones) is modelled here so the wire format is stable,
 //! but *policy* — whether deletes are created/applied/swept — is decided one
-//! layer up (see [`crate::sync::config::PolicyRules`]). Catalog policy never
+//! layer up (see [`fabric::sync::config::PolicyRules`]). Catalog policy never
 //! creates a tombstone; bus policy does.
 
 use std::collections::{BTreeMap, btree_map};
@@ -30,34 +30,9 @@ use std::cell::Cell;
 
 use serde::{Deserialize, Serialize};
 
-/// A content identity — the BLAKE3 hash of a file's bytes. Two files with the
-/// same `ContentHash` have identical content (used for transfer dedup).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ContentHash(pub [u8; 32]);
-
-impl ContentHash {
-    /// Parse the 64-character form that `to_hex` writes. `None` for any other
-    /// length or a non-hex character.
-    pub fn from_hex(hex: &str) -> Option<Self> {
-        if hex.len() != 64 || !hex.is_ascii() {
-            return None;
-        }
-        let mut out = [0u8; 32];
-        for (index, chunk) in hex.as_bytes().chunks(2).enumerate() {
-            let pair = std::str::from_utf8(chunk).ok()?;
-            out[index] = u8::from_str_radix(pair, 16).ok()?;
-        }
-        Some(Self(out))
-    }
-
-    pub fn to_hex(self) -> String {
-        let mut s = String::with_capacity(64);
-        for byte in self.0 {
-            s.push_str(&format!("{byte:02x}"));
-        }
-        s
-    }
-}
+/// A content identity, shared with the core so the staging commands and the
+/// engine agree on it byte for byte.
+pub use fabric::sync::ContentHash;
 
 /// A deterministic author identity used only to break version ties. In the
 /// running daemon this is a peer's iroh NodeID bytes; in tests it is arbitrary.
@@ -96,7 +71,7 @@ pub struct FileMeta {
     /// asymmetry: adding a field with a default is safe, removing one is not.
     ///
     /// A chmod on an ALREADY SYNCED file does not propagate. See
-    /// [`crate::sync::engine::METADATA_ONLY_CHANGES_DO_NOT_PROPAGATE`].
+    /// [`crate::engine::METADATA_ONLY_CHANGES_DO_NOT_PROPAGATE`].
     #[serde(default)]
     pub executable: bool,
     /// The origin's modification time. **Informational only.**
@@ -251,21 +226,7 @@ impl Manifest {
     /// path that escapes the folder root (contains `..`) or is absolute — those
     /// must never enter a manifest.
     pub fn normalize_path(path: &str) -> Option<String> {
-        if path.starts_with('/') || path.starts_with('\\') {
-            return None;
-        }
-        let mut parts = Vec::new();
-        for part in path.split(['/', '\\']) {
-            match part {
-                "" | "." => continue,
-                ".." => return None,
-                other => parts.push(other),
-            }
-        }
-        if parts.is_empty() {
-            return None;
-        }
-        Some(parts.join("/"))
+        fabric::sync::normalize_path(path)
     }
 
     pub fn len(&self) -> usize {

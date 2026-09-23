@@ -4,9 +4,18 @@ Date: 2026-09-04
 
 Status: approved for implementation on 2026-09-04.
 
-Implementation: steps 1 through 7 are merged. The companion owns sync in
-production; the embedded engine remains in the binary, inactive, until step 8
-removes it.
+Implementation: all eight steps are merged. The companion owns sync in
+production and the engine is out of the `fabric` binary.
+
+Step 8 as built goes further than the sketch below, on the principal's words of
+2026-09-23: the sync engine leaves the core entirely, and fabric keeps only what
+it needs to authorize and forward sync streams and to report status. The
+repository is a workspace; the `fabric-sync` crate holds the manifest algebra,
+the node state, the wire sessions, the engine, the lease, the bridge transport
+and the companion runtime; the core keeps the `syncs.toml` config, the staging
+commands, the bridge, the wire framing with the unavailable reply, and the few
+shared definitions (content hash, path form, atomic write, peer refs). The
+mixed-fleet matrix runs its old side as a deployed pre-boundary binary.
 
 Step 6 as built differs from the sketch below in two places. The inbound open
 carries no sync name: the companion reads the wire hello itself, so the daemon

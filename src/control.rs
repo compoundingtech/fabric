@@ -286,49 +286,6 @@ impl SyncRuntimeStatus {
     }
 }
 
-impl From<crate::sync::SyncStatus> for SyncEntryStatus {
-    fn from(status: crate::sync::SyncStatus) -> Self {
-        let peers = match &status.peers {
-            crate::sync::SyncPeers::Wildcard(_) => "*".to_string(),
-            crate::sync::SyncPeers::List(list) => list.join(","),
-        };
-        SyncEntryStatus {
-            delta_fallbacks: status.delta_fallbacks,
-            full_payload_sends: status.full_payload_sends,
-            content_bytes: status.content_bytes,
-            stopped_peers: status.stopped_peers,
-            digest: status.digest,
-            name: status.name,
-            folder: status.folder.display().to_string(),
-            policy: status.policy.to_string(),
-            peers,
-            files: status.present,
-            present: status.present,
-            tombstones: status.tombstones,
-            observed: status.observed,
-            missing: status.missing,
-            unexpected: status.unexpected,
-            mismatched: status.mismatched,
-            scan_issues: status.scan_issues,
-            full_scans: status.full_scans,
-            inbound_noop_transactions: status.inbound_noop_transactions,
-            inbound_guarded_transactions: status.inbound_guarded_transactions,
-            sync_passes: status.sync_passes,
-            scan_micros: status.scan_micros,
-            materialize_micros: status.materialize_micros,
-            persist_micros: status.persist_micros,
-            reconcile_micros: status.reconcile_micros,
-            reconcile_wire_bytes: status.reconcile_wire_bytes,
-            reconcile_failures: status.reconcile_failures,
-            sweep: status
-                .sweep
-                .as_ref()
-                .map(|state| state.token())
-                .unwrap_or_default(),
-        }
-    }
-}
-
 /// One configured sync entry's status, for `fabric sync ls`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncEntryStatus {

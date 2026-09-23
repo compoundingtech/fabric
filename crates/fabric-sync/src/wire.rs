@@ -21,26 +21,19 @@
 //! Content is framed as raw length-prefixed bytes — never JSON-encoded — so file
 //! payloads do not pay base64/array bloat.
 
-use std::{
-    future::Future,
-    io,
-    pin::Pin,
-    sync::Arc,
-    task::{Context as TaskContext, Poll},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use super::manifest::{ContentHash, Manifest};
 use super::node::{Reconciled, SyncNode, content_hash};
+use fabric::sync::frame::{
+    MAX_JSON_FRAME, read_len_bytes, read_u32, write_len_bytes, write_u32,
+};
 
-/// Largest JSON control frame accepted (manifests are metadata-only, so this is
-/// generous headroom, not a content limit).
-const MAX_JSON_FRAME: usize = 64 * 1024 * 1024;
 /// Largest single content blob accepted (per file).
 pub(crate) const MAX_BLOB: usize = 512 * 1024 * 1024;
 /// Largest blob count in one bundle.
@@ -91,33 +84,6 @@ struct ReplyHeader {
 
 // ---- framing primitives ----
 
-async fn write_u32<W: AsyncWrite + Unpin>(w: &mut W, v: u32) -> Result<()> {
-    w.write_all(&v.to_be_bytes()).await?;
-    Ok(())
-}
-
-async fn read_u32<R: AsyncRead + Unpin>(r: &mut R) -> Result<u32> {
-    let mut buf = [0u8; 4];
-    r.read_exact(&mut buf).await?;
-    Ok(u32::from_be_bytes(buf))
-}
-
-async fn write_len_bytes<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> Result<()> {
-    write_u32(w, bytes.len() as u32).await?;
-    w.write_all(bytes).await?;
-    Ok(())
-}
-
-async fn read_len_bytes<R: AsyncRead + Unpin>(r: &mut R, max: usize) -> Result<Vec<u8>> {
-    let len = read_u32(r).await? as usize;
-    if len > max {
-        bail!("sync frame of {len} bytes exceeds limit {max}");
-    }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).await?;
-    Ok(buf)
-}
-
 async fn write_blobs<W: AsyncWrite + Unpin>(
     w: &mut W,
     blobs: &[(ContentHash, Vec<u8>)],
@@ -147,42 +113,8 @@ fn validate_blobs(blobs: &[(ContentHash, Vec<u8>)]) -> Result<()> {
     Ok(())
 }
 
-/// The phrase a daemon without a sync owner puts in its error reply. The
-/// client side classifies it as `unavailable`: not a refusal a person must fix
-/// in `peers.toml`, and not weather the engine should wait out.
-pub const SYNC_UNAVAILABLE_MARKER: &str = "sync is unavailable on this peer";
-
-/// Answer a peer's hello with one error reply and nothing else.
-///
-/// The hello is read and discarded first, because the client writes it before
-/// it reads anything and a large manifest would otherwise block behind the
-/// unread bytes. Nothing about the hello is acted on.
-pub(crate) async fn refuse_hello<S>(mut stream: S, message: &str) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let _hello = read_len_bytes(&mut stream, MAX_JSON_FRAME)
-        .await
-        .context("reading the sync hello before refusing it")?;
-    write_error_reply(&mut stream, message).await?;
-    let _ = stream.shutdown().await;
-    Ok(())
-}
-
-async fn write_error_reply<W: AsyncWrite + Unpin>(w: &mut W, message: &str) -> Result<()> {
-    let reply = ReplyHeader {
-        manifest: Manifest::new(),
-        wanted: Vec::new(),
-        error: Some(message.to_string()),
-        digest: String::new(),
-        is_delta: false,
-    };
-    write_len_bytes(w, &serde_json::to_vec(&reply)?).await?;
-    // An older client ignores `error` and still expects the bundle count.
-    write_u32(w, 0).await?;
-    w.flush().await?;
-    Ok(())
-}
+pub use fabric::sync::frame::SYNC_UNAVAILABLE_MARKER;
+use fabric::sync::frame::write_error_reply;
 
 /// A content bundle read from the wire: how many blobs stored and their bytes.
 #[derive(Debug, Clone, Copy, Default)]
@@ -622,143 +554,6 @@ where
     ))
 }
 
-pub(crate) struct IdleTimeoutStream<S> {
-    inner: S,
-    peer: String,
-    idle_timeout: Duration,
-    read_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
-    write_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
-}
-
-/// Wrap a stream so that `idle_timeout` without progress ends it with an error.
-pub(crate) fn idle_timeout_stream<S>(inner: S, peer: &str, idle_timeout: Duration) -> IdleTimeoutStream<S> {
-    IdleTimeoutStream::new(inner, peer, idle_timeout)
-}
-
-impl<S> IdleTimeoutStream<S> {
-    fn new(inner: S, peer: &str, idle_timeout: Duration) -> Self {
-        Self {
-            inner,
-            peer: peer.to_string(),
-            idle_timeout,
-            read_deadline: None,
-            write_deadline: None,
-        }
-    }
-
-    fn timeout_error(&self) -> io::Error {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "inbound sync session deadline elapsed for peer {}: no I/O progress for {} ms",
-                self.peer,
-                self.idle_timeout.as_millis()
-            ),
-        )
-    }
-}
-
-fn deadline_elapsed(
-    deadline: &mut Option<Pin<Box<tokio::time::Sleep>>>,
-    idle_timeout: Duration,
-    cx: &mut TaskContext<'_>,
-) -> bool {
-    deadline
-        .get_or_insert_with(|| Box::pin(tokio::time::sleep(idle_timeout)))
-        .as_mut()
-        .poll(cx)
-        .is_ready()
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for IdleTimeoutStream<S> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        let filled_before = buf.filled().len();
-        match Pin::new(&mut this.inner).poll_read(cx, buf) {
-            Poll::Ready(result) => {
-                if buf.filled().len() > filled_before {
-                    this.read_deadline = None;
-                }
-                Poll::Ready(result)
-            }
-            Poll::Pending => {
-                if deadline_elapsed(&mut this.read_deadline, this.idle_timeout, cx) {
-                    this.read_deadline = None;
-                    Poll::Ready(Err(this.timeout_error()))
-                } else {
-                    Poll::Pending
-                }
-            }
-        }
-    }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for IdleTimeoutStream<S> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        match Pin::new(&mut this.inner).poll_write(cx, buf) {
-            Poll::Ready(result) => {
-                if matches!(&result, Ok(written) if *written > 0) {
-                    this.write_deadline = None;
-                }
-                Poll::Ready(result)
-            }
-            Poll::Pending => {
-                if deadline_elapsed(&mut this.write_deadline, this.idle_timeout, cx) {
-                    this.write_deadline = None;
-                    Poll::Ready(Err(this.timeout_error()))
-                } else {
-                    Poll::Pending
-                }
-            }
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        match Pin::new(&mut this.inner).poll_flush(cx) {
-            Poll::Ready(result) => {
-                this.write_deadline = None;
-                Poll::Ready(result)
-            }
-            Poll::Pending => {
-                if deadline_elapsed(&mut this.write_deadline, this.idle_timeout, cx) {
-                    this.write_deadline = None;
-                    Poll::Ready(Err(this.timeout_error()))
-                } else {
-                    Poll::Pending
-                }
-            }
-        }
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        match Pin::new(&mut this.inner).poll_shutdown(cx) {
-            Poll::Ready(result) => {
-                this.write_deadline = None;
-                Poll::Ready(result)
-            }
-            Poll::Pending => {
-                if deadline_elapsed(&mut this.write_deadline, this.idle_timeout, cx) {
-                    this.write_deadline = None;
-                    Poll::Ready(Err(this.timeout_error()))
-                } else {
-                    Poll::Pending
-                }
-            }
-        }
-    }
-}
-
 /// Run an inbound wire session with an I/O progress deadline. The resolver
 /// context stays alive for the session, so timeout releases its operation guard.
 pub(crate) async fn run_server_with_idle_timeout<S, F, Fut, C>(
@@ -773,7 +568,7 @@ where
     Fut: std::future::Future<Output = Result<Option<(Arc<Mutex<SyncNode>>, C)>>>,
 {
     run_server(
-        IdleTimeoutStream::new(stream, peer, idle_timeout),
+        fabric::sync::frame::idle_timeout_stream(stream, peer, idle_timeout),
         peer,
         resolve,
     )
@@ -1356,7 +1151,7 @@ mod tests {
         };
 
         reconcile(a.clone(), b.clone()).await;
-        let bus = crate::sync::config::PolicyRules {
+        let bus = fabric::sync::config::PolicyRules {
             propagate_deletes: true,
             sweep_tombstones: true,
         };

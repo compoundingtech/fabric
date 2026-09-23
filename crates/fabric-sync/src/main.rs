@@ -6,8 +6,9 @@ use fabric::{
     config::FabricHome,
     control::{ControlRequest, ControlResponse},
     daemon::send_control,
-    sync::{SyncBook, SyncOwnerLease, SyncOwnerLeaseState, SyncPaths, companion, ipc},
+    sync::{SyncBook, ipc},
 };
+use fabric_sync::{SyncOwnerLease, SyncOwnerLeaseState, SyncPaths, companion};
 
 #[derive(Debug, Parser)]
 #[command(name = "fabric-sync")]

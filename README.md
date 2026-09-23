@@ -1055,17 +1055,22 @@ The sync engine receives explicit config and state paths instead of the daemon
 home. It holds `<home>/sync/owner.lock` for its lifetime, so a second engine
 fails before it reads or changes the same state.
 
-The package ships a separately supervised `fabric-sync` companion, and the
-companion owns sync: the daemon constructs no engine; the companion takes the
-state lease, watches the folders, and reaches every peer through the daemon.
-A companion started with `--standby` does whichever the daemon it attaches to
-grants, so the same service definition served the transition. With the
-companion stopped, absent, or a different build, no file sync runs and nothing
-falls back: status and doctor say `runtime=unavailable` with the reason, a peer
+The repository is a Cargo workspace of two crates that ship together. The
+core `fabric` crate is the daemon and CLI; of file sync it keeps only what the
+daemon needs to authorize and forward sync streams and to report status: the
+`syncs.toml` config and its validation, the `fabric sync` staging commands, the
+local bridge, the wire framing with the unavailable reply, and a few shared
+definitions. The `fabric-sync` crate (`crates/fabric-sync`) is the engine and
+the supervised companion process: the manifest algebra, a node's durable state,
+the wire sessions, the folder watchers and passes, the state lease, and the
+runtime that attaches to the daemon over the bridge. The daemon never builds
+the engine; the companion owns sync. It takes the state lease, watches the
+folders, and reaches every peer through the daemon. A companion started with
+`--standby` does whichever the daemon it attaches to grants. With the companion
+stopped, absent, or a different build, no file sync runs and nothing falls
+back: status and doctor say `runtime=unavailable` with the reason, a peer
 syncing toward the machine is told `unavailable`, and every other service runs
-normally. The daemon can still be started with `FABRIC_SYNC_OWNER=embedded`
-for a measurement against the old in-process engine until that path is
-removed.
+normally.
 
 The `fabric/sync-ipc/1` Unix bridge carries the companion path. Two owner-only
 sockets under `<home>/run/`: the daemon's `sync-ipc.sock` takes the companion's

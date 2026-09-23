@@ -26,9 +26,14 @@ use anyhow::{Context, Result, bail};
 use fabric::{
     config::{FabricHome, PeerBook},
     control::{ControlRequest, ControlResponse, SyncEntryStatus, SyncRuntimeStatus},
-    daemon::{DaemonOptions, FabricNode, SyncOwner, send_control},
-    sync::{SyncOwnerLease, SyncOwnerLeaseState, SyncPaths, companion},
+    daemon::{FabricNode, send_control},
 };
+use fabric_sync::{SyncOwnerLease, SyncOwnerLeaseState, SyncPaths, companion};
+
+mod support;
+#[allow(unused_imports)]
+use support::{fabric_bin as fabric_binary, old_fabric_bin};
+
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 
@@ -37,54 +42,143 @@ static SYNC_PROCESS_LOCK: Mutex<()> = Mutex::const_new(());
 
 const ENTRY: &str = "shared";
 
+/// Which build a node runs. `New` is this build: a daemon in this process and a
+/// companion in this process, through the same two sockets production uses.
+/// `Old` is a deployed binary from before the process boundary, run as its own
+/// process with its embedded engine: the peer a roaming laptop still is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    New,
+    Old,
+}
+
+enum Daemon {
+    New(FabricNode),
+    Old {
+        child: std::process::Child,
+        bin: String,
+        id: iroh::EndpointId,
+        addr: iroh::EndpointAddr,
+    },
+}
+
 struct Node {
     _dir: TempDir,
     home: FabricHome,
     folder: PathBuf,
-    node: FabricNode,
+    daemon: Daemon,
     companion: Option<companion::CompanionHandle>,
-    owner: SyncOwner,
+    side: Side,
 }
 
 impl Node {
-    async fn start(owner: SyncOwner, policy: &str) -> Result<Self> {
+    async fn start(side: Side, policy: &str) -> Result<Self> {
         let dir = TempDir::new()?;
         let home = FabricHome::new(dir.path());
         let folder = dir.path().join("folder");
         std::fs::create_dir_all(&folder)?;
         write_sync(&home, &folder, policy)?;
-        let node = FabricNode::start_with_daemon_options(
-            home.clone(),
-            DaemonOptions {
-                sync_owner: owner,
-                ..DaemonOptions::default()
-            },
-        )
-        .await?;
-        let companion = match owner {
-            SyncOwner::Embedded => None,
-            SyncOwner::Companion => {
+        let (daemon, companion) = match side {
+            Side::New => {
+                let node = FabricNode::start(home.clone()).await?;
                 let handle = companion::start(home.clone()).await?;
                 handle.wait_until_active(Duration::from_secs(20)).await?;
-                Some(handle)
+                (Daemon::New(node), Some(handle))
+            }
+            Side::Old => {
+                let bin = old_fabric_bin().context("FABRIC_OLD_BIN names no deployed binary")?;
+                home.prepare()?;
+                fabric::config::generate_identity_file(&home.identity_path())?;
+                let child = Command::new(&bin)
+                    .arg("--home")
+                    .arg(home.root())
+                    .arg("daemon")
+                    // A 0.2.14 binary can own sync either way; the ones before
+                    // it ignore this and own it embedded. Both are old to us.
+                    .env("FABRIC_SYNC_OWNER", "embedded")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()?;
+                for _ in 0..200 {
+                    if send_control(&home, ControlRequest::Status).await.is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                let id: iroh::EndpointId = old_cli(&bin, &home, &["id"])?.trim().parse()?;
+                let addr: iroh::EndpointAddr = serde_json::from_str(old_cli(&bin, &home, &["addr"])?.trim())?;
+                (
+                    Daemon::Old {
+                        child,
+                        bin,
+                        id,
+                        addr,
+                    },
+                    None,
+                )
             }
         };
         Ok(Self {
             _dir: dir,
             home,
             folder,
-            node,
+            daemon,
             companion,
-            owner,
+            side,
         })
+    }
+
+    fn id(&self) -> iroh::EndpointId {
+        match &self.daemon {
+            Daemon::New(node) => node.id(),
+            Daemon::Old { id, .. } => *id,
+        }
+    }
+
+    fn addr(&self) -> iroh::EndpointAddr {
+        match &self.daemon {
+            Daemon::New(node) => node.addr(),
+            Daemon::Old { addr, .. } => addr.clone(),
+        }
+    }
+
+    async fn reload_peers(&self) -> Result<()> {
+        match &self.daemon {
+            Daemon::New(node) => node.state().reload_peers().await,
+            Daemon::Old { bin, .. } => old_cli(bin, &self.home, &["reload-peers"]).map(|_| ()),
+        }
     }
 
     async fn stop(self) -> Result<()> {
         if let Some(companion) = self.companion {
             companion.shutdown().await?;
         }
-        self.node.shutdown().await
+        match self.daemon {
+            Daemon::New(node) => node.shutdown().await,
+            Daemon::Old { mut child, .. } => {
+                unsafe {
+                    libc::kill(child.id() as i32, libc::SIGTERM);
+                }
+                child.wait()?;
+                Ok(())
+            }
+        }
     }
+}
+
+fn old_cli(bin: &str, home: &FabricHome, args: &[&str]) -> Result<String> {
+    let output = Command::new(bin)
+        .arg("--home")
+        .arg(home.root())
+        .args(args)
+        .output()?;
+    if !output.status.success() {
+        bail!(
+            "old fabric {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8(output.stdout)?)
 }
 
 fn write_sync(home: &FabricHome, folder: &Path, policy: &str) -> Result<()> {
@@ -97,13 +191,13 @@ fn write_sync(home: &FabricHome, folder: &Path, policy: &str) -> Result<()> {
 async fn trust(a: &Node, b: &Node, name: &str) -> Result<()> {
     let mut peers = PeerBook::load(&a.home)?;
     peers.add_with_allow(
-        b.node.id(),
+        b.id(),
         Some(name.to_string()),
-        Some(b.node.addr()),
+        Some(b.addr()),
         Some(vec!["sync".to_string()]),
     );
     peers.save(&a.home)?;
-    a.node.state().reload_peers().await?;
+    a.reload_peers().await?;
     Ok(())
 }
 
@@ -175,22 +269,22 @@ async fn prove_pair(a: &Node, b: &Node) -> Result<()> {
     assert!(
         wait_for_file(&b.folder.join("from-a.txt"), b"written on a").await,
         "{:?} -> {:?}: a's file never reached b",
-        a.owner,
-        b.owner
+        a.side,
+        b.side
     );
     std::fs::write(b.folder.join("from-b.txt"), b"written on b")?;
     assert!(
         wait_for_file(&a.folder.join("from-b.txt"), b"written on b").await,
         "{:?} -> {:?}: b's file never reached a",
-        a.owner,
-        b.owner
+        a.side,
+        b.side
     );
     std::fs::remove_file(a.folder.join("from-a.txt"))?;
     assert!(
         wait_for_missing(&b.folder.join("from-a.txt")).await,
         "{:?} -> {:?}: a's delete never reached b",
-        a.owner,
-        b.owner
+        a.side,
+        b.side
     );
     wait_for_equal_digests(a, b).await?;
     let (sa, sb) = (entry_status(&a.home).await?, entry_status(&b.home).await?);
@@ -203,20 +297,26 @@ async fn prove_pair(a: &Node, b: &Node) -> Result<()> {
     Ok(())
 }
 
-fn runtime_of(owner: SyncOwner) -> SyncRuntimeStatus {
-    match owner {
-        SyncOwner::Embedded => SyncRuntimeStatus::new("embedded", "absent"),
-        SyncOwner::Companion => SyncRuntimeStatus::new("companion", "active"),
+fn runtime_of(side: Side) -> &'static str {
+    match side {
+        Side::Old => "embedded",
+        Side::New => "companion",
     }
 }
 
-async fn matrix_case(a_owner: SyncOwner, b_owner: SyncOwner) -> Result<()> {
+/// One matrix case. A case with an old side needs `FABRIC_OLD_BIN`; without it
+/// the case says so and proves nothing, which CI prevents by setting it.
+async fn matrix_case(a_side: Side, b_side: Side) -> Result<()> {
+    if (a_side == Side::Old || b_side == Side::Old) && old_fabric_bin().is_none() {
+        println!("SKIPPED: set FABRIC_OLD_BIN to a deployed pre-boundary fabric binary");
+        return Ok(());
+    }
     let _guard = SYNC_PROCESS_LOCK.lock().await;
-    let a = Node::start(a_owner, "bus").await?;
-    let b = Node::start(b_owner, "bus").await?;
+    let a = Node::start(a_side, "bus").await?;
+    let b = Node::start(b_side, "bus").await?;
     pair(&a, &b).await?;
-    assert_eq!(sync_status(&a.home).await?.1, runtime_of(a_owner));
-    assert_eq!(sync_status(&b.home).await?.1, runtime_of(b_owner));
+    assert_eq!(sync_status(&a.home).await?.1.owner, runtime_of(a_side));
+    assert_eq!(sync_status(&b.home).await?.1.owner, runtime_of(b_side));
     prove_pair(&a, &b).await?;
     a.stop().await?;
     b.stop().await
@@ -224,29 +324,29 @@ async fn matrix_case(a_owner: SyncOwner, b_owner: SyncOwner) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mixed_fleet_old_daemon_to_old_daemon() -> Result<()> {
-    matrix_case(SyncOwner::Embedded, SyncOwner::Embedded).await
+    matrix_case(Side::Old, Side::Old).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mixed_fleet_new_companion_to_old_daemon() -> Result<()> {
-    matrix_case(SyncOwner::Companion, SyncOwner::Embedded).await
+    matrix_case(Side::New, Side::Old).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mixed_fleet_old_daemon_to_new_companion() -> Result<()> {
-    matrix_case(SyncOwner::Embedded, SyncOwner::Companion).await
+    matrix_case(Side::Old, Side::New).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mixed_fleet_new_companion_to_new_companion() -> Result<()> {
-    matrix_case(SyncOwner::Companion, SyncOwner::Companion).await
+    matrix_case(Side::New, Side::New).await
 }
 
 /// A delegating daemon never takes the state lease; the companion holds it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_companion_holds_the_lease_and_the_daemon_constructs_no_engine() -> Result<()> {
     let _guard = SYNC_PROCESS_LOCK.lock().await;
-    let mut a = Node::start(SyncOwner::Companion, "catalog").await?;
+    let mut a = Node::start(Side::New, "catalog").await?;
     let paths = SyncPaths::new(a.home.syncs_path(), a.home.root().join("sync"));
     assert_eq!(SyncOwnerLease::probe(&paths)?, SyncOwnerLeaseState::Held);
     let (entries, runtime) = sync_status(&a.home).await?;
@@ -270,8 +370,8 @@ async fn the_companion_holds_the_lease_and_the_daemon_constructs_no_engine() -> 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stopped_companion_leaves_the_daemon_healthy_and_is_reported_as_unavailable() -> Result<()> {
     let _guard = SYNC_PROCESS_LOCK.lock().await;
-    let mut a = Node::start(SyncOwner::Companion, "bus").await?;
-    let b = Node::start(SyncOwner::Embedded, "bus").await?;
+    let mut a = Node::start(Side::New, "bus").await?;
+    let b = Node::start(Side::New, "bus").await?;
     pair(&a, &b).await?;
 
     a.companion.take().expect("started").shutdown().await?;
@@ -316,7 +416,7 @@ async fn a_stopped_companion_leaves_the_daemon_healthy_and_is_reported_as_unavai
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_incompatible_companion_is_refused_and_named() -> Result<()> {
     let _guard = SYNC_PROCESS_LOCK.lock().await;
-    let mut a = Node::start(SyncOwner::Companion, "bus").await?;
+    let mut a = Node::start(Side::New, "bus").await?;
     a.companion.take().expect("started").shutdown().await?;
     let refused = send_control(
         &a.home,
@@ -343,34 +443,36 @@ async fn an_incompatible_companion_is_refused_and_named() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_running_companion_reattaches_after_the_daemon_restarts() -> Result<()> {
     let _guard = SYNC_PROCESS_LOCK.lock().await;
-    let mut a = Node::start(SyncOwner::Companion, "bus").await?;
-    let b = Node::start(SyncOwner::Embedded, "bus").await?;
+    let mut a = Node::start(Side::New, "bus").await?;
+    let b = Node::start(Side::New, "bus").await?;
     pair(&a, &b).await?;
     std::fs::write(a.folder.join("before.txt"), b"before the restart")?;
     assert!(wait_for_file(&b.folder.join("before.txt"), b"before the restart").await);
 
     // The shape of every update: the daemon goes down and comes back while the
     // companion keeps running.
-    let options = DaemonOptions {
-        sync_owner: SyncOwner::Companion,
-        ..DaemonOptions::default()
-    };
     // A placeholder node in its own live home fills the slot while a's daemon
     // is down; the directory must outlive the placeholder.
     let placeholder_dir = TempDir::new()?;
     let placeholder = FabricNode::start(FabricHome::new(placeholder_dir.path())).await?;
-    let stopped = std::mem::replace(&mut a.node, placeholder);
-    stopped.shutdown().await?;
+    let stopped = std::mem::replace(&mut a.daemon, Daemon::New(placeholder));
+    match stopped {
+        Daemon::New(node) => node.shutdown().await?,
+        Daemon::Old { .. } => unreachable!("a is this build"),
+    }
     let companion = a.companion.as_ref().expect("started");
     companion
         .wait_for(Duration::from_secs(30), |phase| !phase.is_active())
         .await
         .context("the companion never noticed the daemon leaving")?;
     let placeholder = std::mem::replace(
-        &mut a.node,
-        FabricNode::start_with_daemon_options(a.home.clone(), options).await?,
+        &mut a.daemon,
+        Daemon::New(FabricNode::start(a.home.clone()).await?),
     );
-    placeholder.shutdown().await?;
+    match placeholder {
+        Daemon::New(node) => node.shutdown().await?,
+        Daemon::Old { .. } => unreachable!("the placeholder is this build"),
+    }
     // b must re-trust a's new address; the identity is the same.
     trust(&b, &a, "a").await?;
 
@@ -409,8 +511,8 @@ async fn a_running_companion_reattaches_after_the_daemon_restarts() -> Result<()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reload_reaches_the_companion_and_a_bad_one_is_refused_first() -> Result<()> {
     let _guard = SYNC_PROCESS_LOCK.lock().await;
-    let a = Node::start(SyncOwner::Companion, "bus").await?;
-    let b = Node::start(SyncOwner::Companion, "bus").await?;
+    let a = Node::start(Side::New, "bus").await?;
+    let b = Node::start(Side::New, "bus").await?;
     pair(&a, &b).await?;
 
     let second = a.home.root().join("second");
@@ -487,9 +589,9 @@ fn count_files(folder: &Path) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_companion_killed_mid_pass_recovers_on_restart_with_one_owner() -> Result<()> {
     let _guard = SYNC_PROCESS_LOCK.lock().await;
-    let mut a = Node::start(SyncOwner::Companion, "bus").await?;
+    let mut a = Node::start(Side::New, "bus").await?;
     a.companion.take().expect("started").shutdown().await?;
-    let b = Node::start(SyncOwner::Embedded, "bus").await?;
+    let b = Node::start(Side::New, "bus").await?;
     pair(&a, &b).await?;
     // Slow every walk on a so the pass has a middle to be killed in.
     #[cfg(debug_assertions)]
@@ -592,7 +694,7 @@ mod throughput {
     };
 
     fn fabric_bin() -> String {
-        env!("CARGO_BIN_EXE_fabric").to_string()
+        fabric_binary().to_string()
     }
 
     fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {

@@ -1003,6 +1003,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "fabric-sync"
+version = "0.2.14"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "fabric",
+ "iroh",
+ "libc",
+ "notify",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
