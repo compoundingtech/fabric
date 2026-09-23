@@ -466,13 +466,15 @@ impl Companion {
                 let Some(engine) = self.engine().await else {
                     return refuse(&mut stream, request_id, "no sync engine is running here").await;
                 };
+                // One pass per entry BEFORE the answer, as the embedded owner
+                // did: a caller that reloads and then reads status must see
+                // the passes the reload caused, not a promise of them.
                 match engine.reload().await {
                     Ok(()) => {
-                        ipc::write_response(&mut stream, &IpcResponse::ready(request_id)).await?;
                         for name in engine.names().await {
                             let _ = engine.sync_once(&name).await;
                         }
-                        Ok(())
+                        ipc::write_response(&mut stream, &IpcResponse::ready(request_id)).await
                     }
                     Err(error) => {
                         ipc::write_response(

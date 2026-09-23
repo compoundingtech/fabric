@@ -139,9 +139,13 @@ const PEER_HEALTH_RECOVER_INITIAL_BACKOFF: Duration = Duration::from_secs(30);
 const PEER_HEALTH_RECOVER_MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
 /// The companion sends every 10 seconds. Three missed heartbeats mean absent.
 const SYNC_COMPANION_PRESENCE_WINDOW: Duration = Duration::from_secs(30);
-/// How long a status, reload, or publish waits for the companion to answer
-/// before the entry is reported as `timed-out`.
+/// How long a status request waits for the companion to answer before the
+/// entries are reported as `timed-out`.
 const SYNC_COMPANION_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a reload or publish waits. Both run one pass per entry against
+/// real peers before they answer, as the embedded owner did, so they are
+/// bounded by a pass, not by a handshake.
+const SYNC_COMPANION_WORK_TIMEOUT: Duration = sync_ipc::WORK_TIMEOUT;
 /// A relayed sync stream whose remote side moves no bytes for this long is
 /// over. Longer than the wire's own idle bound, so the wire decides first.
 const SYNC_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -3701,7 +3705,7 @@ async fn process_control_request(
                         .sync_companion_client()
                         .await
                         .context(SYNC_COMPANION_ABSENT)?;
-                    tokio::time::timeout(SYNC_COMPANION_REQUEST_TIMEOUT, client.reload())
+                    tokio::time::timeout(SYNC_COMPANION_WORK_TIMEOUT, client.reload())
                         .await
                         .context("the sync companion did not answer the reload in time")??;
                 }
@@ -3813,7 +3817,12 @@ async fn process_control_request(
                         .sync_companion_client()
                         .await
                         .context(SYNC_COMPANION_ABSENT)?;
-                    client.publish(name, files, force).await?
+                    tokio::time::timeout(
+                        SYNC_COMPANION_WORK_TIMEOUT,
+                        client.publish(name, files, force),
+                    )
+                    .await
+                    .context("the sync companion did not answer the publish in time")??
                 }
                 SyncOwner::Embedded => {
                     let Some(engine) = state.sync_engine() else {

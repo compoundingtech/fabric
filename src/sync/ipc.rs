@@ -42,6 +42,10 @@ pub const IPC_VERSION: u16 = 1;
 /// for a handshake. Both sockets are owner-only and nonce-checked.
 pub const MAX_CONTROL_FRAME: usize = 64 * 1024 * 1024;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a reload or publish reply may take. Both run one pass per entry
+/// against real peers before they answer, so the bound is a pass, not a
+/// handshake.
+pub const WORK_TIMEOUT: Duration = Duration::from_secs(120);
 /// The daemon's socket name for the companion's requests.
 pub const DAEMON_SOCKET_NAME: &str = "sync-ipc.sock";
 /// The companion's socket name for the daemon's requests.
@@ -573,6 +577,9 @@ pub struct IpcClient {
     socket_path: PathBuf,
     nonce: IpcNonce,
     next_request_id: Arc<AtomicU64>,
+    /// The bound on connecting and on the handshake frames. Not a bound on
+    /// the work a request causes: a reload runs a pass before it answers, so
+    /// its reply is awaited separately by the caller.
     timeout: Duration,
 }
 
@@ -600,6 +607,16 @@ impl IpcClient {
     }
 
     async fn request(&self, kind: IpcRequestKind) -> Result<(UnixStream, IpcResponseKind)> {
+        self.request_within(kind, self.timeout).await
+    }
+
+    /// One request whose reply is awaited for `reply_within` rather than the
+    /// handshake bound.
+    async fn request_within(
+        &self,
+        kind: IpcRequestKind,
+        reply_within: Duration,
+    ) -> Result<(UnixStream, IpcResponseKind)> {
         verify_owner_only_socket(&self.socket_path)?;
         let request_id = self
             .next_request_id
@@ -618,9 +635,9 @@ impl IpcClient {
         tokio::time::timeout(self.timeout, write_message(&mut stream, &request))
             .await
             .context("the sync IPC request did not leave within the handshake timeout")??;
-        let response: IpcResponse = tokio::time::timeout(self.timeout, read_message(&mut stream))
+        let response: IpcResponse = tokio::time::timeout(reply_within, read_message(&mut stream))
             .await
-            .context("the sync IPC response did not arrive within the handshake timeout")??;
+            .context("the sync IPC response did not arrive within its bound")??;
         Ok((stream, response.into_kind(request_id)?))
     }
 
@@ -682,7 +699,9 @@ impl IpcClient {
     }
 
     pub async fn reload(&self) -> Result<()> {
-        let (_, response) = self.request(IpcRequestKind::Reload).await?;
+        let (_, response) = self
+            .request_within(IpcRequestKind::Reload, WORK_TIMEOUT)
+            .await?;
         if response != IpcResponseKind::Ready {
             bail!("the sync IPC reload request received the wrong response kind");
         }
@@ -696,7 +715,7 @@ impl IpcClient {
         force: bool,
     ) -> Result<Vec<SyncPublishedFile>> {
         let (_, response) = self
-            .request(IpcRequestKind::Publish { name, files, force })
+            .request_within(IpcRequestKind::Publish { name, files, force }, WORK_TIMEOUT)
             .await?;
         let IpcResponseKind::Published { files } = response else {
             bail!("the sync IPC publish request received the wrong response kind");
