@@ -7574,9 +7574,12 @@ mod tests {
         // PROOF 1: a live bidirectional local client blocks the recycle.
         assert_eq!(state.client_attaches.attached(), 1);
         let generation = state.endpoint_handle().generation;
-        let outcome = state
-            .recycle_endpoint_if_generation(generation, "half-close: still bidirectional")
-            .await?;
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            state.recycle_endpoint_if_generation(generation, "half-close: still bidirectional"),
+        )
+        .await
+        .context("the refused recycle did not return within 30s")??;
         assert!(
             matches!(outcome, EndpointRecycleOutcome::SessionsAttached { .. }),
             "a live bidirectional local client must block the recycle, got {outcome:?}"
@@ -7618,9 +7621,12 @@ mod tests {
         );
 
         // The recycle that releasing allowed now proceeds.
-        let outcome = state
-            .recycle_endpoint_if_generation(generation, "half-close: input finished")
-            .await?;
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            state.recycle_endpoint_if_generation(generation, "half-close: input finished"),
+        )
+        .await
+        .context("the permitted recycle did not return within 30s")??;
         assert!(
             matches!(outcome, EndpointRecycleOutcome::Recycled),
             "with local input finished the recycle must proceed, got {outcome:?}"
@@ -7655,8 +7661,12 @@ mod tests {
             "delayed output must arrive exactly once across the recycle, saw {occurrences} in {text:?} (read result: {read_result:?})"
         );
 
-        client.shutdown().await?;
-        server.shutdown().await?;
+        tokio::time::timeout(Duration::from_secs(30), client.shutdown())
+            .await
+            .context("the client daemon did not shut down within 30s")??;
+        tokio::time::timeout(Duration::from_secs(30), server.shutdown())
+            .await
+            .context("the server daemon did not shut down within 30s")??;
         Ok(())
     }
 
