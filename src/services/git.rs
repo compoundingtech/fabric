@@ -11,7 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use iroh::EndpointId;
+use fabric_service_api::{Access, BoxFuture, Grants, PeerStream, Protocol, Service};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -19,14 +19,11 @@ use tokio::{
     sync::{Semaphore, mpsc},
 };
 
-use crate::{
-    config::{Denied, FabricHome, GitAccess, PeerBook, validate_git_remote_name},
-    control::{ControlRequest, ControlResponse},
-    daemon::send_control,
-};
-
 pub const GIT_ALPN: &[u8] = b"fabric/git/1";
 pub const GIT_PROTOCOL: &str = "fabric/git/1";
+/// The service's name. A peer's grant for it is narrower than this word: it
+/// names one remote and one kind of access (see [`GitOperation::permission`]).
+pub const SERVICE: &str = "git";
 const MAX_CONTROL_FRAME: usize = 16 * 1024;
 const MAX_OUTPUT_FRAME: usize = 64 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -41,11 +38,10 @@ pub enum GitOperation {
 }
 
 impl GitOperation {
-    fn access(self) -> GitAccess {
-        match self {
-            Self::Read => GitAccess::Read,
-            Self::Write => GitAccess::Write,
-        }
+    /// The grant a peer needs for this operation on `remote`, in the words
+    /// `fabric git grant` writes.
+    pub fn permission(self, remote: &str) -> String {
+        format!("git/{remote}/{}", self.name())
     }
 
     fn name(self) -> &'static str {
@@ -79,7 +75,9 @@ enum SessionResponse {
         requester: String,
         required: String,
     },
-    Unavailable { message: String },
+    Unavailable {
+        message: String,
+    },
     Busy,
 }
 
@@ -93,7 +91,7 @@ enum OutputFrame {
 #[derive(Debug, Clone)]
 pub struct GitSessionLimits {
     total: Arc<Semaphore>,
-    per_peer: Arc<Mutex<HashMap<EndpointId, usize>>>,
+    per_peer: Arc<Mutex<HashMap<String, usize>>>,
     max_per_peer: usize,
 }
 
@@ -112,10 +110,10 @@ impl GitSessionLimits {
         }
     }
 
-    fn try_acquire(&self, peer: EndpointId) -> Option<GitSessionPermit> {
+    fn try_acquire(&self, peer: &str) -> Option<GitSessionPermit> {
         let total = self.total.clone().try_acquire_owned().ok()?;
         let mut counts = self.per_peer.lock().unwrap();
-        let count = counts.entry(peer).or_default();
+        let count = counts.entry(peer.to_string()).or_default();
         if *count >= self.max_per_peer {
             return None;
         }
@@ -123,7 +121,7 @@ impl GitSessionLimits {
         drop(counts);
         Some(GitSessionPermit {
             _total: total,
-            peer,
+            peer: peer.to_string(),
             per_peer: self.per_peer.clone(),
         })
     }
@@ -131,8 +129,8 @@ impl GitSessionLimits {
 
 struct GitSessionPermit {
     _total: tokio::sync::OwnedSemaphorePermit,
-    peer: EndpointId,
-    per_peer: Arc<Mutex<HashMap<EndpointId, usize>>>,
+    peer: String,
+    per_peer: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl Drop for GitSessionPermit {
@@ -144,6 +142,61 @@ impl Drop for GitSessionPermit {
                 counts.remove(&self.peer);
             }
         }
+    }
+}
+
+const PROTOCOLS: &[Protocol] = &[Protocol {
+    alpn: GIT_ALPN,
+    resumable: false,
+    accept_event: "builtin_git_accept",
+}];
+
+/// Git's smart protocol, served from the repositories this machine shared.
+#[derive(Debug, Clone, Default)]
+pub struct Git {
+    limits: GitSessionLimits,
+}
+
+impl Git {
+    pub fn new(limits: GitSessionLimits) -> Self {
+        Self { limits }
+    }
+}
+
+impl Service for Git {
+    fn name(&self) -> &'static str {
+        SERVICE
+    }
+
+    fn protocols(&self) -> &'static [Protocol] {
+        PROTOCOLS
+    }
+
+    /// The grant names a remote and an operation, and only the request says
+    /// which, so the service checks it after reading the request.
+    fn access(&self) -> Access {
+        Access::Grants
+    }
+
+    fn serve(&self, stream: PeerStream) -> BoxFuture<'static, Result<()>> {
+        let limits = self.limits.clone();
+        Box::pin(async move {
+            let PeerStream {
+                peer,
+                read,
+                write,
+                grants,
+                ..
+            } = stream;
+            let grants = grants.context("the base network gave Git no grants to check")?;
+            serve_session(read, write, grants.as_ref(), peer, limits).await
+        })
+    }
+
+    /// Git's helper reconnects through the same local socket for every fetch
+    /// and push to a peer.
+    fn shares_local_socket(&self) -> bool {
+        true
     }
 }
 
@@ -200,13 +253,24 @@ pub fn install_helper_for(binary: &Path) -> Result<PathBuf> {
     Ok(helper)
 }
 
-pub async fn run_remote_helper() -> Result<i32> {
+/// Run as Git's `git-remote-fabric` helper.
+///
+/// `prepare` runs once the URL is known to be a fabric one, and returns what
+/// opens the local daemon's socket for a peer's Git service. The helper knows
+/// nothing about the daemon beyond that socket.
+pub async fn run_remote_helper<P, C, F, S>(prepare: P) -> Result<i32>
+where
+    P: FnOnce() -> Result<C>,
+    C: FnOnce(String) -> F,
+    F: std::future::Future<Output = Result<S>>,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let args = std::env::args().collect::<Vec<_>>();
     let url = args
         .get(2)
         .context("Git did not supply a fabric:// remote URL")?;
     let (peer, remote) = parse_url(url)?;
-    let home = FabricHome::resolve(None)?;
+    let connect = prepare()?;
 
     let mut input = tokio::io::BufReader::new(tokio::io::stdin());
     let mut output = tokio::io::stdout();
@@ -224,7 +288,7 @@ pub async fn run_remote_helper() -> Result<i32> {
             "connect git-upload-pack" => {
                 let raw_input = input.into_inner();
                 return run_connected_helper(
-                    &home,
+                    connect,
                     &peer,
                     &remote,
                     GitOperation::Read,
@@ -236,7 +300,7 @@ pub async fn run_remote_helper() -> Result<i32> {
             "connect git-receive-pack" => {
                 let raw_input = input.into_inner();
                 return run_connected_helper(
-                    &home,
+                    connect,
                     &peer,
                     &remote,
                     GitOperation::Write,
@@ -251,8 +315,8 @@ pub async fn run_remote_helper() -> Result<i32> {
     }
 }
 
-async fn run_connected_helper<R, W>(
-    home: &FabricHome,
+async fn run_connected_helper<C, F, S, R, W>(
+    connect: C,
     peer: &str,
     remote: &str,
     operation: GitOperation,
@@ -260,6 +324,9 @@ async fn run_connected_helper<R, W>(
     mut output: W,
 ) -> Result<i32>
 where
+    C: FnOnce(String) -> F,
+    F: std::future::Future<Output = Result<S>>,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
@@ -269,21 +336,7 @@ where
         git_protocol: valid_git_protocol(std::env::var("GIT_PROTOCOL").ok())?,
     };
     let (stream, response) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-        let response = send_control(
-            home,
-            ControlRequest::Git {
-                peer: peer.to_string(),
-            },
-        )
-        .await
-        .with_context(|| "the running Fabric daemon could not open a Git transport")?;
-        let socket = match response {
-            ControlResponse::Git { socket } => socket,
-            other => bail!("the running Fabric daemon returned an unexpected reply: {other:?}"),
-        };
-        let mut stream = tokio::net::UnixStream::connect(&socket)
-            .await
-            .with_context(|| format!("failed to connect to Fabric at {}", socket.display()))?;
+        let mut stream = connect(peer.to_string()).await?;
         write_json(&mut stream, &request).await?;
         let response = read_json::<_, SessionResponse>(&mut stream).await?;
         Ok::<_, anyhow::Error>((stream, response))
@@ -319,7 +372,7 @@ where
 
     output.write_all(b"\n").await?;
     output.flush().await?;
-    let (mut remote_read, mut remote_write) = stream.into_split();
+    let (mut remote_read, mut remote_write) = tokio::io::split(stream);
     let input_task = tokio::spawn(async move {
         let mut input = input;
         tokio::io::copy(&mut input, &mut remote_write).await?;
@@ -350,32 +403,25 @@ where
 pub async fn serve_session<R, W>(
     mut recv: R,
     mut send: W,
-    book: PeerBook,
-    peer: EndpointId,
+    grants: &dyn Grants,
+    peer: String,
     limits: GitSessionLimits,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let request = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        read_json::<_, SessionRequest>(&mut recv),
-    )
-    .await
-    .context("the peer did not send a Git request within 10 seconds")??;
-    validate_git_remote_name(&request.remote)?;
-    let required = request.operation.access().permission(&request.remote);
-    let requester = book
-        .peers()
-        .iter()
-        .find(|entry| entry.id == peer)
-        .and_then(|entry| entry.name.clone())
-        .unwrap_or_else(|| peer.to_string());
-    let permission = book.may(&peer, &required);
-    let remote = book.git_remote(&request.remote);
+    let request =
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, read_json::<_, SessionRequest>(&mut recv))
+            .await
+            .context("the peer did not send a Git request within 10 seconds")??;
+    validate_remote_name(&request.remote)?;
+    let required = request.operation.permission(&request.remote);
+    let requester = grants.peer_name().unwrap_or_else(|| peer.clone());
+    let permission = grants.may(&required);
+    let remote = grants.shared(&request.remote);
     if permission.is_err() || remote.is_none() {
-        let no_grants = matches!(permission, Err(Denied::NoGrants { .. }));
+        let no_grants = matches!(permission, Err(denial) if denial.no_grants);
         write_json(
             &mut send,
             &SessionResponse::Denied {
@@ -389,7 +435,7 @@ where
         return Ok(());
     }
     let remote = remote.unwrap();
-    if !remote.path.is_dir() {
+    if !remote.is_dir() {
         write_json(
             &mut send,
             &SessionResponse::Unavailable {
@@ -403,7 +449,7 @@ where
         send.shutdown().await?;
         return Ok(());
     }
-    let Some(_permit) = limits.try_acquire(peer) else {
+    let Some(_permit) = limits.try_acquire(&peer) else {
         write_json(&mut send, &SessionResponse::Busy).await?;
         send.shutdown().await?;
         return Ok(());
@@ -412,8 +458,8 @@ where
     let mut command = Command::new("git");
     command
         .arg(request.operation.git_service())
-        .arg(&remote.path)
-        .env("FABRIC_PEER", peer.to_string())
+        .arg(&remote)
+        .env("FABRIC_PEER", &peer)
         .env("FABRIC_GIT_REMOTE", &request.remote)
         .env("FABRIC_GIT_ACCESS", request.operation.name())
         .stdin(Stdio::piped())
@@ -500,7 +546,10 @@ where
     }
 }
 
-async fn write_output_frames<W>(mut output: W, mut frames: mpsc::Receiver<OutputFrame>) -> Result<()>
+async fn write_output_frames<W>(
+    mut output: W,
+    mut frames: mpsc::Receiver<OutputFrame>,
+) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
@@ -508,6 +557,27 @@ where
         write_output_frame(&mut output, &frame).await?;
     }
     output.shutdown().await?;
+    Ok(())
+}
+
+/// The rule for a shared remote's name: one short URL segment, so a name can
+/// never be a path. The daemon applies the same rule when a remote is shared.
+pub fn validate_remote_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("Git remote name cannot be empty");
+    }
+    if name.len() > 64 {
+        bail!("Git remote name must be 64 bytes or less");
+    }
+    if matches!(name, "." | "..") {
+        bail!("Git remote name cannot be a dot segment");
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!("Git remote name may contain only ASCII letters, digits, dot, underscore, and dash");
+    }
     Ok(())
 }
 
@@ -520,7 +590,7 @@ fn parse_url(url: &str) -> Result<(String, String)> {
         bail!("Git remote URL must be fabric://<peer>/<remote>, got {url:?}");
     }
     validate_url_segment(parts[0], "peer")?;
-    validate_git_remote_name(parts[1])?;
+    validate_remote_name(parts[1])?;
     Ok((parts[0].to_string(), parts[1].to_string()))
 }
 
@@ -681,8 +751,8 @@ mod tests {
     #[test]
     fn the_session_limits_are_immediate_and_per_peer() {
         let limits = GitSessionLimits::new(3, 2);
-        let first = iroh::SecretKey::generate().public();
-        let second = iroh::SecretKey::generate().public();
+        let first = "first-peer";
+        let second = "second-peer";
         let a = limits.try_acquire(first).unwrap();
         let b = limits.try_acquire(first).unwrap();
         assert!(limits.try_acquire(first).is_none());

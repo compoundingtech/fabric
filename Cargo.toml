@@ -1,5 +1,9 @@
 [workspace]
-members = [".", "crates/fabric-sync"]
+members = [
+    ".",
+    "crates/fabric-sync",
+    "crates/fabric-service-api",
+]
 # `cargo build` at the root builds both binaries, which is what the release
 # workflow, the nix package, and a plain checkout expect.
 default-members = [".", "crates/fabric-sync"]
@@ -12,6 +16,7 @@ description = "Local socket facade for iroh-backed cross-machine transports"
 repository = "https://github.com/compoundingtech/fabric"
 
 [dependencies]
+fabric-service-api = { path = "crates/fabric-service-api" }
 anyhow = "1"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }

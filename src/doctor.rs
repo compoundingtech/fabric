@@ -1523,7 +1523,7 @@ mod tests {
     #[test]
     fn exit_126_identifies_an_exec_policy_refusal() {
         let refusal = classify_peer_version_failure(
-            Some(crate::exec::EXIT_EXEC_DISABLED),
+            Some(fabric_service_api::REFUSED_EXIT_CODE),
             "",
             "peer \"bluey\" refused service \"exec\"",
         );
@@ -1821,7 +1821,7 @@ fn classify_peer_version_failure(
         .find(|line| !line.is_empty())
         .unwrap_or("the command failed")
         .to_string();
-    if exit_code == Some(crate::exec::EXIT_EXEC_DISABLED) {
+    if exit_code == Some(fabric_service_api::REFUSED_EXIT_CODE) {
         PeerVersionError::PolicyRefusal(reason)
     } else {
         PeerVersionError::Failed(reason)

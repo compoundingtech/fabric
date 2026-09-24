@@ -45,7 +45,8 @@ use crate::{
     control::{
         ControlRequest, ControlResponse, PeerReachability, SyncEntryStatus, SyncRuntimeStatus,
     },
-    exec, gitremote, mux, pathwatch, shell,
+    mux, pathwatch,
+    services::{self, Access, Bridge, Notice, PeerStream, Service, Services},
     sync::{
         self,
         config::{SyncBook, SyncPeers},
@@ -62,21 +63,12 @@ use crate::{
 const BUILTIN_ECHO_ALPN: &[u8] = b"fabric/echo/0";
 const SYNC_ALPN: &[u8] = b"fabric/sync/1";
 const ECHO_SERVICE: &str = "echo";
-const SHELL_SERVICE: &str = "shell";
-const EXEC_SERVICE: &str = "exec";
 const SYNC_SERVICE: &str = "sync";
 
-/// Every built-in name accepted by a peer's explicit `allow` list.
-///
-/// A permission transcription uses this list plus the daemon's live exposure
-/// names. Keep it tied to `service_name_for_alpn`, which enforces the gate.
-pub const BUILTIN_SERVICE_NAMES: [&str; 5] = [
-    SHELL_SERVICE,
-    EXEC_SERVICE,
-    SYNC_SERVICE,
-    ECHO_SERVICE,
-    crate::sendfile::SERVICE,
-];
+/// The protocols the base network answers itself. No service may claim one.
+pub(crate) fn is_base_network_alpn(alpn: &[u8]) -> bool {
+    alpn == mux::MUX_ALPN || alpn == BUILTIN_ECHO_ALPN || alpn == SYNC_ALPN
+}
 const REACHABILITY_TIMEOUT: Duration = Duration::from_secs(3);
 const INCOMING_FAILURE_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const INCOMING_FAILURE_MAX_BACKOFF: Duration = Duration::from_secs(5);
@@ -438,7 +430,8 @@ pub struct DaemonState {
     mux_stream_slots: Arc<Semaphore>,
     peer_connections: Arc<mux::PeerConnections>,
     opened_mux_connections: Mutex<Option<mpsc::UnboundedReceiver<Connection>>>,
-    git_sessions: gitremote::GitSessionLimits,
+    /// Everything served above the base network: exec, shell, Git, send-file.
+    services: Services,
     cancel: CancellationToken,
     /// Durable loss/resume counters. Survives a restart, unlike the log lines
     /// that were previously the only record.
@@ -595,11 +588,14 @@ impl Exposure {
     }
 }
 
-fn load_persisted_exposures(home: &FabricHome) -> Result<HashMap<Vec<u8>, Exposure>> {
+fn load_persisted_exposures(
+    home: &FabricHome,
+    services: &Services,
+) -> Result<HashMap<Vec<u8>, Exposure>> {
     let mut exposures = HashMap::new();
     for expose in FabricConfig::load(home)?.exposes() {
         let alpn = validate_protocol(&expose.protocol)?;
-        if matches_reserved_alpn(&alpn) {
+        if matches_reserved_alpn(services, &alpn) {
             bail!(
                 "{:?} in {} is reserved for fabric's built-in protocols",
                 expose.protocol,
@@ -747,12 +743,13 @@ fn resolve_server_session_settings(
 async fn build_daemon_endpoint(
     home: &FabricHome,
     allowed: Arc<RwLock<HashSet<EndpointId>>>,
+    services: &Services,
     exposures: &HashMap<Vec<u8>, Exposure>,
 ) -> Result<Endpoint> {
     let secret_key = load_or_create_identity(home)?;
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
-        .alpns(accepted_alpns(exposures))
+        .alpns(accepted_alpns(services, exposures))
         .hooks(AllowListHook { allowed })
         .bind()
         .await?;
@@ -1016,6 +1013,7 @@ impl DaemonState {
         home: FabricHome,
         cancel: CancellationToken,
         options: DaemonOptions,
+        services: Services,
     ) -> Result<Arc<Self>> {
         home.prepare()?;
         let config = FabricConfig::load(&home)?;
@@ -1030,9 +1028,9 @@ impl DaemonState {
                 "sync entry has unknown peer selectors and will stay stopped"
             );
         }
-        let exposures = load_persisted_exposures(&home)?;
+        let exposures = load_persisted_exposures(&home, &services)?;
         let allowed = Arc::new(RwLock::new(peer_book.trusted_ids()));
-        let endpoint = build_daemon_endpoint(&home, allowed.clone(), &exposures).await?;
+        let endpoint = build_daemon_endpoint(&home, allowed.clone(), &services, &exposures).await?;
         let generation = next_endpoint_generation(&home, 0)?;
         let (endpoint_tx, _) = watch::channel(CurrentEndpoint {
             generation,
@@ -1081,7 +1079,7 @@ impl DaemonState {
             mux_stream_slots: Arc::new(Semaphore::new(MAX_INCOMING_HANDLERS)),
             peer_connections: Arc::new(mux::PeerConnections::new(local_id, opened_mux_tx)),
             opened_mux_connections: Mutex::new(Some(opened_mux_rx)),
-            git_sessions: gitremote::GitSessionLimits::default(),
+            services,
             cancel,
             telemetry,
             last_probe_transport: Arc::new(StdRwLock::new(HashMap::new())),
@@ -1249,7 +1247,7 @@ impl DaemonState {
 
     async fn expose_socket(&self, protocol: &str, socket: PathBuf, persist: bool) -> Result<()> {
         let alpn = validate_protocol(protocol)?;
-        if matches_reserved_alpn(&alpn) {
+        if matches_reserved_alpn(&self.services, &alpn) {
             bail!("{protocol:?} is reserved for fabric's built-in protocols");
         }
         if !socket.is_absolute() {
@@ -1268,7 +1266,7 @@ impl DaemonState {
         let mut exposures = self.exposures.write().await;
         exposures.insert(alpn, Exposure::Socket(socket));
         self.current_endpoint()
-            .set_alpns(accepted_alpns(&exposures));
+            .set_alpns(accepted_alpns(&self.services, &exposures));
         Ok(())
     }
 
@@ -1283,7 +1281,7 @@ impl DaemonState {
         persist: bool,
     ) -> Result<()> {
         let alpn = validate_protocol(protocol)?;
-        if matches_reserved_alpn(&alpn) {
+        if matches_reserved_alpn(&self.services, &alpn) {
             bail!("{protocol:?} is reserved for fabric's built-in protocols");
         }
         validate_tcp_addr(&addr)?;
@@ -1297,7 +1295,7 @@ impl DaemonState {
         let mut exposures = self.exposures.write().await;
         exposures.insert(alpn, Exposure::Tcp { addr });
         self.current_endpoint()
-            .set_alpns(accepted_alpns(&exposures));
+            .set_alpns(accepted_alpns(&self.services, &exposures));
         Ok(())
     }
 
@@ -1319,7 +1317,7 @@ impl DaemonState {
         persist: bool,
     ) -> Result<()> {
         let alpn = validate_protocol(protocol)?;
-        if matches_reserved_alpn(&alpn) {
+        if matches_reserved_alpn(&self.services, &alpn) {
             bail!("{protocol:?} is reserved for fabric's built-in protocols");
         }
         if argv.is_empty() {
@@ -1348,7 +1346,7 @@ impl DaemonState {
             },
         );
         self.current_endpoint()
-            .set_alpns(accepted_alpns(&exposures));
+            .set_alpns(accepted_alpns(&self.services, &exposures));
         Ok(())
     }
 
@@ -1373,7 +1371,7 @@ impl DaemonState {
 
     pub async fn unexpose(&self, protocol: &str) -> Result<()> {
         let alpn = validate_protocol(protocol)?;
-        if matches_reserved_alpn(&alpn) {
+        if matches_reserved_alpn(&self.services, &alpn) {
             bail!("{protocol:?} is reserved for fabric's built-in protocols");
         }
 
@@ -1384,7 +1382,7 @@ impl DaemonState {
         let mut exposures = self.exposures.write().await;
         exposures.remove(&alpn);
         self.current_endpoint()
-            .set_alpns(accepted_alpns(&exposures));
+            .set_alpns(accepted_alpns(&self.services, &exposures));
         Ok(())
     }
 
@@ -1455,6 +1453,88 @@ impl DaemonState {
     pub async fn dial(&self, peer: &str, protocol: &str) -> Result<PathBuf> {
         let alpn = validate_protocol(protocol)?;
         self.dial_alpn(peer, protocol, alpn, true).await
+    }
+
+    /// A local socket that reaches `peer`'s `name` service with the newest
+    /// protocol the service speaks: a fresh socket per command unless the
+    /// service shares one. The socket is named after the service's oldest
+    /// protocol, as it was before a service spoke two.
+    async fn dial_service(&self, peer: &str, name: &str) -> Result<PathBuf> {
+        let service = self
+            .services
+            .named(name)
+            .with_context(|| format!("this daemon serves no {name:?} service"))?
+            .clone();
+        let (Some(newest), Some(oldest)) =
+            (service.protocols().first(), service.protocols().last())
+        else {
+            bail!("the {name:?} service speaks no protocol");
+        };
+        self.dial_alpn(
+            peer,
+            oldest.name(),
+            newest.alpn.to_vec(),
+            service.shares_local_socket(),
+        )
+        .await
+    }
+
+    /// Open an authenticated stream to `peer`, named by id or by its name in
+    /// `peers.toml`, for the protocol `alpn`.
+    pub(crate) async fn open_stream(
+        &self,
+        peer: &str,
+        alpn: &[u8],
+    ) -> Result<tokio::io::Join<RecvStream, SendStream>> {
+        let addr = {
+            let book = self.peer_book.read().await;
+            let found = book
+                .peers()
+                .iter()
+                .find(|candidate| {
+                    candidate.id.to_string() == peer || candidate.name.as_deref() == Some(peer)
+                })
+                .cloned();
+            let found = found.with_context(|| format!("peer {peer:?} is not trusted"))?;
+            found
+                .addr
+                .clone()
+                .unwrap_or_else(|| EndpointAddr::new(found.id))
+        };
+        let protocol = std::str::from_utf8(alpn).context("protocol is not UTF-8")?;
+        let stream = self
+            .open_peer_stream(&addr, protocol, mux::StreamActivity::Application)
+            .await
+            .with_context(|| format!("dialling {peer}"))?;
+        Ok(tokio::io::join(stream.recv, stream.send))
+    }
+
+    /// Hand an arriving stream to `service`, with the peer's grants when the
+    /// service checks its own.
+    async fn service_stream(
+        &self,
+        service: &Arc<dyn Service>,
+        peer: EndpointId,
+        send: SendStream,
+        recv: RecvStream,
+    ) -> PeerStream {
+        let grants = match service.access() {
+            Access::AllowList => None,
+            Access::Grants => {
+                let book = self.peer_book.read().await.clone();
+                Some(
+                    Arc::new(services::BookGrants::new(book, peer, service.name()))
+                        as Arc<dyn fabric_service_api::Grants>,
+                )
+            }
+        };
+        PeerStream {
+            peer: peer.to_string(),
+            read: Box::new(recv),
+            write: Box::new(send),
+            closed: CancellationToken::new(),
+            grants,
+        }
     }
 
     pub async fn dial_tcp(&self, peer: &str, protocol: &str, bind: String) -> Result<String> {
@@ -1540,33 +1620,50 @@ impl DaemonState {
         let listener_cancel = CancellationToken::new();
         let lease = DialListenerLease::new(self.active_dial_listeners.clone());
 
-        // Built-in exec and legacy shell/0 remain one-shot raw framed streams.
-        // Resumable shell/1 negotiates its own tunnel path and falls back to
-        // shell/0 when the peer does not advertise the new ALPN.
-        let listener_task = if alpn == exec::EXEC_ALPN
-            || alpn == shell::SHELL_ALPN
-            || alpn == gitremote::GIT_ALPN
-        {
-            tokio::spawn(run_raw_dial_socket(
+        // A service's one-shot protocol is one raw stream per local connection.
+        // A resumable protocol negotiates its own tunnel session and falls back
+        // to the service's one-shot protocol when the peer does not speak it.
+        let listener_task = match self.services.find(&alpn) {
+            Some((service, protocol)) if protocol.resumable => {
+                tokio::spawn(run_resumable_dial_socket(
+                    listener,
+                    self.endpoint_rx(),
+                    self.home.clone(),
+                    peer.to_string(),
+                    peer_addr.clone(),
+                    service.clone(),
+                    protocol,
+                    listener_cancel.clone(),
+                    self.cancel.clone(),
+                    self.tunnel_drop_rx(),
+                    self.dial_failures.clone(),
+                    self.dial_slots.clone(),
+                    self.peer_connections.clone(),
+                    lease,
+                    self.client_attaches.clone(),
+                    self.connection_recorder(),
+                ))
+            }
+            Some((service, _)) => tokio::spawn(run_raw_dial_socket(
                 listener,
                 self.endpoint_rx(),
                 peer.to_string(),
                 peer_addr.clone(),
                 alpn,
+                service.clone(),
                 listener_cancel.clone(),
                 self.cancel.clone(),
                 self.dial_failures.clone(),
                 self.dial_slots.clone(),
                 self.peer_connections.clone(),
                 lease,
-            ))
-        } else if alpn == shell::RESUMABLE_SHELL_ALPN {
-            tokio::spawn(run_shell_dial_socket(
+            )),
+            None => tokio::spawn(run_dial_socket(
                 listener,
                 self.endpoint_rx(),
                 self.home.clone(),
                 peer.to_string(),
-                peer_addr.clone(),
+                alpn,
                 listener_cancel.clone(),
                 self.cancel.clone(),
                 self.tunnel_drop_rx(),
@@ -1576,24 +1673,7 @@ impl DaemonState {
                 lease,
                 self.client_attaches.clone(),
                 self.connection_recorder(),
-            ))
-        } else {
-            tokio::spawn(run_dial_socket(
-                listener,
-                self.endpoint_rx(),
-                self.home.clone(),
-                peer.to_string(),
-                alpn,
-                listener_cancel.clone(),
-                self.cancel.clone(),
-                self.tunnel_drop_rx(),
-                self.dial_failures.clone(),
-                self.dial_slots.clone(),
-                self.peer_connections.clone(),
-                lease,
-                self.client_attaches.clone(),
-                self.connection_recorder(),
-            ))
+            )),
         };
         sockets.insert(
             key,
@@ -1788,7 +1868,7 @@ impl DaemonState {
                 (ProbeOutcome::Supported, Some(elapsed), transport, None)
             }
             Ok(Err(error)) => {
-                if shell_resumable_alpn_unsupported(&error)
+                if alpn_unsupported(&error)
                     || error
                         .chain()
                         .any(|cause| cause.to_string().contains("is not exposed"))
@@ -2324,7 +2404,8 @@ impl DaemonState {
         let rss_before_bytes = current_rss_bytes();
         let exposures = self.exposures.read().await;
         let new_endpoint =
-            build_daemon_endpoint(&self.home, self.allowed.clone(), &exposures).await?;
+            build_daemon_endpoint(&self.home, self.allowed.clone(), &self.services, &exposures)
+                .await?;
         drop(exposures);
 
         if new_endpoint.id() != old.endpoint.id() {
@@ -2414,8 +2495,19 @@ impl FabricNode {
         home: FabricHome,
         options: DaemonOptions,
     ) -> Result<Self> {
+        let services = services::builtin(&home);
+        Self::start_with_services(home, options, services).await
+    }
+
+    /// Start a daemon that serves `services` above its base network, in place of
+    /// the built-in set.
+    pub async fn start_with_services(
+        home: FabricHome,
+        options: DaemonOptions,
+        services: Services,
+    ) -> Result<Self> {
         let cancel = CancellationToken::new();
-        let state = DaemonState::new(home, cancel, options).await?;
+        let state = DaemonState::new(home, cancel, options, services).await?;
 
         spawn_outgoing_mux_accepts(&state).await?;
 
@@ -3565,31 +3657,15 @@ async fn process_control_request(
             }
         }
         ControlRequest::Shell { peer } => {
-            let socket = state
-                .dial_alpn(
-                    &peer,
-                    shell::SHELL_PROTOCOL,
-                    shell::RESUMABLE_SHELL_ALPN.to_vec(),
-                    false,
-                )
-                .await?;
+            let socket = state.dial_service(&peer, "shell").await?;
             ControlResponse::Shell { socket }
         }
         ControlRequest::Exec { peer } => {
-            let socket = state
-                .dial_alpn(&peer, exec::EXEC_PROTOCOL, exec::EXEC_ALPN.to_vec(), false)
-                .await?;
+            let socket = state.dial_service(&peer, "exec").await?;
             ControlResponse::Exec { socket }
         }
         ControlRequest::Git { peer } => {
-            let socket = state
-                .dial_alpn(
-                    &peer,
-                    gitremote::GIT_PROTOCOL,
-                    gitremote::GIT_ALPN.to_vec(),
-                    true,
-                )
-                .await?;
+            let socket = state.dial_service(&peer, "git").await?;
             ControlResponse::Git { socket }
         }
         ControlRequest::DropTunnelConnections => {
@@ -3645,7 +3721,7 @@ async fn process_control_request(
                     });
                 }
             };
-            match send_file_to_peer(&state, &peer, &name, &path).await {
+            match services::send_file(&state, &peer, &name, &path).await {
                 Ok(()) => ControlResponse::SentFile { peer, name, bytes },
                 Err(error) => ControlResponse::Error {
                     message: format!("{error:#}"),
@@ -3867,24 +3943,19 @@ impl DaemonState {
 /// The name a person would write in `allow` for this ALPN.
 ///
 /// The ALPN is the protocol string verbatim, so an exposed service is simply
-/// its own name. The built-ins get the short word someone would actually type,
-/// and BOTH shell ALPNs answer to `shell`: a permission should be about the
+/// its own name. The base network's own protocols and every registered service
+/// get the short word someone would actually type, and every protocol of one
+/// service answers to that service's word: a permission should be about the
 /// service, not about which wire version negotiated it.
-fn service_name_for_alpn(alpn: &[u8]) -> String {
+fn service_name_for_alpn(services: &Services, alpn: &[u8]) -> String {
     if alpn == BUILTIN_ECHO_ALPN {
         return ECHO_SERVICE.to_string();
     }
-    if alpn == shell::SHELL_ALPN || alpn == shell::RESUMABLE_SHELL_ALPN {
-        return SHELL_SERVICE.to_string();
-    }
-    if alpn == exec::EXEC_ALPN {
-        return EXEC_SERVICE.to_string();
+    if let Some((service, _)) = services.find(alpn) {
+        return service.name().to_string();
     }
     if alpn == SYNC_ALPN {
         return SYNC_SERVICE.to_string();
-    }
-    if alpn == crate::sendfile::SEND_FILE_ALPN {
-        return crate::sendfile::SERVICE.to_string();
     }
     String::from_utf8_lossy(alpn).to_string()
 }
@@ -3918,7 +3989,7 @@ async fn process_incoming_iroh(
 
     // A generic exposure that does not exist is refused before the handshake,
     // exactly as before.
-    let exposure = if matches_reserved_alpn(&alpn) {
+    let exposure = if matches_reserved_alpn(&state.services, &alpn) {
         None
     } else {
         let found = {
@@ -3939,24 +4010,25 @@ async fn process_incoming_iroh(
         return Ok(());
     }
 
-    // Git checks its qualified grant after it reads the requested remote and
-    // operation. The handshake already proved that the peer is trusted.
-    if alpn == gitremote::GIT_ALPN {
-        log_connection_paths("builtin_git_accept", &connection);
-        handle_git(connection, state).await?;
-        return Ok(());
-    }
+    let service = state
+        .services
+        .find(&alpn)
+        .map(|(service, protocol)| (service.clone(), protocol));
 
-    // ONE GATE for ordinary services: echo, both shells, exec, sync, and every
-    // generic exposure. Git uses the exact repository grant above.
+    // ONE GATE for ordinary services: echo, sync, every service that leaves
+    // the decision to its grant, and every generic exposure. A service that
+    // checks a narrower grant itself (Git) reads its request first; the
+    // handshake already proved that the peer is trusted.
     //
     // Trusted and permitted are two different questions. `AllowListHook`
     // answered the first at handshake; this answers the second, and it needs
     // the ALPN, which the hook cannot see.
-    let service = service_name_for_alpn(&alpn);
-    if let Err(denied) = state.may(&connection.remote_id(), &service).await {
-        deny_connection(&connection, &service, &denied).await;
-        return Ok(());
+    if !matches!(&service, Some((service, _)) if service.access() == Access::Grants) {
+        let name = service_name_for_alpn(&state.services, &alpn);
+        if let Err(denied) = state.may(&connection.remote_id(), &name).await {
+            deny_connection(&connection, &name, &denied).await;
+            return Ok(());
+        }
     }
 
     if alpn == BUILTIN_ECHO_ALPN {
@@ -3964,29 +4036,14 @@ async fn process_incoming_iroh(
         handle_builtin_echo(connection, state).await?;
         return Ok(());
     }
-    if alpn == shell::SHELL_ALPN {
-        log_connection_paths("builtin_legacy_shell_accept", &connection);
-        handle_builtin_legacy_shell(connection, state).await?;
-        return Ok(());
-    }
-    if alpn == shell::RESUMABLE_SHELL_ALPN {
-        log_connection_paths("builtin_resumable_shell_accept", &connection);
-        handle_builtin_resumable_shell(connection, state).await?;
-        return Ok(());
-    }
-    if alpn == exec::EXEC_ALPN {
-        log_connection_paths("builtin_exec_accept", &connection);
-        handle_builtin_exec(connection, state).await?;
+    if let Some((service, protocol)) = service {
+        log_connection_paths(protocol.accept_event, &connection);
+        handle_service_connection(connection, service, protocol, state).await?;
         return Ok(());
     }
     if alpn == SYNC_ALPN {
         log_sync_connection_paths(&connection);
         handle_sync(connection, state).await?;
-        return Ok(());
-    }
-    if alpn == crate::sendfile::SEND_FILE_ALPN {
-        log_connection_paths("send_file_accept", &connection);
-        handle_send_file(connection, state).await?;
         return Ok(());
     }
 
@@ -4014,67 +4071,31 @@ async fn process_incoming_iroh(
     Ok(())
 }
 
-/// Dial a peer and hand it one file.
-async fn send_file_to_peer(
-    state: &Arc<DaemonState>,
-    peer: &str,
-    name: &str,
-    path: &std::path::Path,
-) -> Result<()> {
-    let addr = {
-        let book = state.peer_book.read().await;
-        let found = book
-            .peers()
-            .iter()
-            .find(|candidate| {
-                candidate.id.to_string() == peer || candidate.name.as_deref() == Some(peer)
-            })
-            .cloned();
-        let found = found.with_context(|| format!("peer {peer:?} is not trusted"))?;
-        found
-            .addr
-            .clone()
-            .unwrap_or_else(|| EndpointAddr::new(found.id))
-    };
-    let stream = state
-        .open_peer_stream(
-            &addr,
-            std::str::from_utf8(crate::sendfile::SEND_FILE_ALPN).expect("send-file ALPN is UTF-8"),
-            mux::StreamActivity::Application,
-        )
-        .await
-        .with_context(|| format!("dialling {peer}"))?;
-    let joined = tokio::io::join(stream.recv, stream.send);
-    crate::sendfile::send_file(joined, name, path).await
-}
-
-/// Accept one file into this peer's inbox.
-///
-/// The peer's own id names the inbox, taken from the CONNECTION rather than
-/// from anything the sender said, so a peer cannot choose where its files land.
-async fn handle_send_file(connection: Connection, state: Arc<DaemonState>) -> Result<()> {
-    let peer = connection.remote_id();
-    let (send, recv) = connection.accept_bi().await?;
-    receive_file_stream(peer, send, recv, state).await?;
-    connection.closed().await;
-    Ok(())
-}
-
-async fn receive_file_stream(
-    peer: EndpointId,
-    send: SendStream,
-    recv: RecvStream,
+/// Serve a service on a connection opened for one of its protocols.
+async fn handle_service_connection(
+    connection: Connection,
+    service: Arc<dyn Service>,
+    protocol: &'static services::Protocol,
     state: Arc<DaemonState>,
 ) -> Result<()> {
-    let stream = tokio::io::join(recv, send);
-    match crate::sendfile::receive(stream, &state.home, &peer.to_string()).await {
-        Ok(path) => {
-            info!(peer = %peer, path = %path.display(), "received a file");
-        }
-        Err(error) => {
-            debug!(peer = %peer, %error, "refused or failed to receive a file");
-        }
+    let peer = connection.remote_id();
+    let (send, recv) = connection.accept_bi().await?;
+    if protocol.resumable {
+        return tunnel::serve_connection(
+            connection,
+            send,
+            recv,
+            peer,
+            tunnel::ServerTarget::Service(tunnel::ServiceTarget(service)),
+            None,
+            state.tunnel_sessions.clone(),
+            state.tunnel_drop_rx(),
+        )
+        .await;
     }
+    let stream = state.service_stream(&service, peer, send, recv).await;
+    service.serve(stream).await?;
+    connection.closed().await;
     Ok(())
 }
 
@@ -4083,55 +4104,6 @@ async fn handle_builtin_echo(connection: Connection, state: Arc<DaemonState>) ->
     let (mut send, mut recv) = connection.accept_bi().await?;
     tokio::io::copy(&mut recv, &mut send).await?;
     send.finish()?;
-    connection.closed().await;
-    Ok(())
-}
-
-async fn handle_builtin_legacy_shell(
-    connection: Connection,
-    _state: Arc<DaemonState>,
-) -> Result<()> {
-    let peer = connection.remote_id().to_string();
-    let (mut send, mut recv) = connection.accept_bi().await?;
-    shell::serve_shell_session(&mut recv, &mut send, &peer).await?;
-    send.finish()?;
-    connection.closed().await;
-    Ok(())
-}
-
-async fn handle_builtin_resumable_shell(
-    connection: Connection,
-    state: Arc<DaemonState>,
-) -> Result<()> {
-    let peer_id = connection.remote_id();
-    let (send, recv) = connection.accept_bi().await?;
-    tunnel::serve_connection(
-        connection,
-        send,
-        recv,
-        peer_id,
-        tunnel::ServerTarget::Shell { allowed: true },
-        None,
-        state.tunnel_sessions.clone(),
-        state.tunnel_drop_rx(),
-    )
-    .await
-}
-
-async fn handle_builtin_exec(connection: Connection, _state: Arc<DaemonState>) -> Result<()> {
-    let peer = connection.remote_id().to_string();
-    let (mut send, mut recv) = connection.accept_bi().await?;
-    exec::serve_exec_session(&mut recv, &mut send, &peer).await?;
-    send.finish()?;
-    connection.closed().await;
-    Ok(())
-}
-
-async fn handle_git(connection: Connection, state: Arc<DaemonState>) -> Result<()> {
-    let peer = connection.remote_id();
-    let (send, recv) = connection.accept_bi().await?;
-    let book = state.peer_book.read().await.clone();
-    gitremote::serve_session(recv, send, book, peer, state.git_sessions.clone()).await?;
     connection.closed().await;
     Ok(())
 }
@@ -4196,12 +4168,13 @@ async fn handle_mux_stream(
         return Ok(());
     }
 
-    let exposure = if matches_reserved_alpn(alpn) {
+    let reserved = matches_reserved_alpn(&state.services, alpn);
+    let exposure = if reserved {
         None
     } else {
         state.exposures.read().await.get(alpn).cloned()
     };
-    if !matches_reserved_alpn(alpn) && exposure.is_none() {
+    if !reserved && exposure.is_none() {
         mux::write_denied(
             &mut send,
             &format!("service {:?} is not exposed", header.protocol),
@@ -4210,9 +4183,13 @@ async fn handle_mux_stream(
         return Ok(());
     }
 
-    if alpn != gitremote::GIT_ALPN {
-        let service = service_name_for_alpn(alpn);
-        if let Err(denied) = state.may(&connection.remote_id(), &service).await {
+    let service = state
+        .services
+        .find(alpn)
+        .map(|(service, protocol)| (service.clone(), protocol));
+    if !matches!(&service, Some((service, _)) if service.access() == Access::Grants) {
+        let name = service_name_for_alpn(&state.services, alpn);
+        if let Err(denied) = state.may(&connection.remote_id(), &name).await {
             mux::write_denied(&mut send, &denied.to_string()).await?;
             return Ok(());
         }
@@ -4228,41 +4205,26 @@ async fn handle_mux_stream(
         state.builtin_echo_hits.fetch_add(1, Ordering::SeqCst);
         tokio::io::copy(&mut recv, &mut send).await?;
         send.finish()?;
-    } else if alpn == shell::SHELL_ALPN {
-        let peer = connection.remote_id().to_string();
-        shell::serve_shell_session(&mut recv, &mut send, &peer).await?;
-        send.finish()?;
-    } else if alpn == shell::RESUMABLE_SHELL_ALPN {
+    } else if let Some((service, protocol)) = service {
         let peer = connection.remote_id();
-        tunnel::serve_connection(
-            connection,
-            send,
-            recv,
-            peer,
-            tunnel::ServerTarget::Shell { allowed: true },
-            Some(state.peer_connections.clone()),
-            state.tunnel_sessions.clone(),
-            state.tunnel_drop_rx(),
-        )
-        .await?;
-    } else if alpn == exec::EXEC_ALPN {
-        let peer = connection.remote_id().to_string();
-        exec::serve_exec_session(&mut recv, &mut send, &peer).await?;
-        send.finish()?;
-    } else if alpn == gitremote::GIT_ALPN {
-        let book = state.peer_book.read().await.clone();
-        gitremote::serve_session(
-            recv,
-            send,
-            book,
-            connection.remote_id(),
-            state.git_sessions.clone(),
-        )
-        .await?;
+        if protocol.resumable {
+            tunnel::serve_connection(
+                connection,
+                send,
+                recv,
+                peer,
+                tunnel::ServerTarget::Service(tunnel::ServiceTarget(service)),
+                Some(state.peer_connections.clone()),
+                state.tunnel_sessions.clone(),
+                state.tunnel_drop_rx(),
+            )
+            .await?;
+        } else {
+            let stream = state.service_stream(&service, peer, send, recv).await;
+            service.serve(stream).await?;
+        }
     } else if alpn == SYNC_ALPN {
         handle_sync_stream(connection.remote_id(), send, recv, state).await?;
-    } else if alpn == crate::sendfile::SEND_FILE_ALPN {
-        receive_file_stream(connection.remote_id(), send, recv, state).await?;
     } else if let Some(exposure) = exposure {
         let peer = connection.remote_id();
         tunnel::serve_connection(
@@ -4450,31 +4412,21 @@ async fn handle_sync_ipc_request(mut stream: UnixStream, state: Arc<DaemonState>
     }
 }
 
-fn accepted_alpns(exposures: &HashMap<Vec<u8>, Exposure>) -> Vec<Vec<u8>> {
+fn accepted_alpns(services: &Services, exposures: &HashMap<Vec<u8>, Exposure>) -> Vec<Vec<u8>> {
     let mut alpns = Vec::with_capacity(exposures.len() + 8);
     if mux::MUX_ENABLED {
         alpns.push(mux::MUX_ALPN.to_vec());
     }
     alpns.push(BUILTIN_ECHO_ALPN.to_vec());
-    alpns.push(shell::SHELL_ALPN.to_vec());
-    alpns.push(shell::RESUMABLE_SHELL_ALPN.to_vec());
-    alpns.push(exec::EXEC_ALPN.to_vec());
+    alpns.extend(services.alpns().map(<[u8]>::to_vec));
     alpns.push(SYNC_ALPN.to_vec());
-    alpns.push(crate::sendfile::SEND_FILE_ALPN.to_vec());
-    alpns.push(gitremote::GIT_ALPN.to_vec());
     alpns.extend(exposures.keys().cloned());
     alpns
 }
 
-fn matches_reserved_alpn(alpn: &[u8]) -> bool {
-    alpn == mux::MUX_ALPN
-        || alpn == crate::sendfile::SEND_FILE_ALPN
-        || alpn == BUILTIN_ECHO_ALPN
-        || alpn == shell::SHELL_ALPN
-        || alpn == shell::RESUMABLE_SHELL_ALPN
-        || alpn == exec::EXEC_ALPN
-        || alpn == SYNC_ALPN
-        || alpn == gitremote::GIT_ALPN
+/// A protocol nobody may expose: the base network's own, or a service's.
+fn matches_reserved_alpn(services: &Services, alpn: &[u8]) -> bool {
+    is_base_network_alpn(alpn) || services.find(alpn).is_some()
 }
 
 /// What an entry's peer selector resolves to against `peers.toml` right now.
@@ -4847,12 +4799,15 @@ async fn run_dial_socket(
     }
 }
 
-async fn run_shell_dial_socket(
+#[allow(clippy::too_many_arguments)]
+async fn run_resumable_dial_socket(
     listener: UnixListener,
     endpoint_rx: watch::Receiver<CurrentEndpoint>,
     home: FabricHome,
     peer: String,
     peer_addr: EndpointAddr,
+    service: Arc<dyn Service>,
+    protocol: &'static services::Protocol,
     listener_cancel: CancellationToken,
     daemon_cancel: CancellationToken,
     drop_rx: watch::Receiver<u64>,
@@ -4863,7 +4818,7 @@ async fn run_shell_dial_socket(
     gauge: Arc<tunnel::ClientAttachGauge>,
     recorder: ConnectionRecorder,
 ) {
-    let backoff_key = BackoffKey::dial(&peer, shell::RESUMABLE_SHELL_ALPN);
+    let backoff_key = BackoffKey::dial(&peer, protocol.alpn);
     loop {
         tokio::select! {
             biased;
@@ -4888,6 +4843,7 @@ async fn run_shell_dial_socket(
                 let home = home.clone();
                 let peer = peer.clone();
                 let peer_addr = peer_addr.clone();
+                let service = service.clone();
                 let cancel = daemon_cancel.clone();
                 let drop_rx = drop_rx.clone();
                 let dial_failures = dial_failures.clone();
@@ -4900,13 +4856,16 @@ async fn run_shell_dial_socket(
                     if !dial_failures.wait(&backoff_key, &cancel).await {
                         return;
                     }
-                    match handle_shell_dial_socket_connection(
+                    let failure = format!("{} dial socket connection failed", service.name());
+                    match handle_resumable_dial_socket_connection(
                         local,
                         endpoint_rx,
                         peer_connections,
                         home,
                         peer,
                         peer_addr,
+                        service,
+                        protocol,
                         cancel,
                         drop_rx,
                         gauge,
@@ -4917,7 +4876,7 @@ async fn run_shell_dial_socket(
                         Ok(()) => dial_failures.record_success(&backoff_key).await,
                         Err(error) => {
                             dial_failures
-                                .record_failure(&backoff_key, "shell dial socket connection failed", &error)
+                                .record_failure(&backoff_key, &failure, &error)
                                 .await;
                         }
                     }
@@ -4928,18 +4887,25 @@ async fn run_shell_dial_socket(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_shell_dial_socket_connection(
+async fn handle_resumable_dial_socket_connection(
     mut local: UnixStream,
     mut endpoint_rx: watch::Receiver<CurrentEndpoint>,
     peer_connections: Arc<mux::PeerConnections>,
     home: FabricHome,
     peer: String,
     peer_addr: EndpointAddr,
+    service: Arc<dyn Service>,
+    protocol: &'static services::Protocol,
     cancel: CancellationToken,
     drop_rx: watch::Receiver<u64>,
     gauge: Arc<tunnel::ClientAttachGauge>,
     recorder: ConnectionRecorder,
 ) -> Result<()> {
+    let name = service.name();
+    let fallback = service
+        .protocols()
+        .iter()
+        .find(|candidate| !candidate.resumable);
     let mut attempt = 0usize;
     loop {
         let current_peer_addr = PeerBook::load(&home)
@@ -4963,25 +4929,30 @@ async fn handle_shell_dial_socket_connection(
                 &endpoint.endpoint,
                 endpoint.generation,
                 &current_peer_addr,
-                std::str::from_utf8(shell::RESUMABLE_SHELL_ALPN)
-                    .expect("shell ALPN is UTF-8"),
+                protocol.name(),
                 mux::StreamActivity::Application,
             ) => connected,
         };
         match connected {
             Ok(connection) => {
-                // Protocol selection ends here. Once shell/1 has attached, its
-                // reconnect loop must remain shell/1 so it resumes this exact
-                // remote PTY rather than starting a legacy replacement.
-                let notices =
-                    shell_client_notices(peer.clone(), generation, gauge.clone(), recorder.clone());
+                // Protocol selection ends here. Once the resumable protocol has
+                // attached, its reconnect loop must remain on it so it resumes
+                // this exact remote session rather than starting a one-shot
+                // replacement.
+                let notices = service_client_notices(
+                    service.clone(),
+                    peer.clone(),
+                    generation,
+                    gauge.clone(),
+                    recorder.clone(),
+                );
                 return tunnel::run_client_connection_with_initial(
                     local,
                     endpoint_rx,
                     peer_connections,
                     home,
                     peer,
-                    shell::RESUMABLE_SHELL_ALPN.to_vec(),
+                    protocol.alpn.to_vec(),
                     cancel,
                     drop_rx,
                     Some(notices),
@@ -4991,45 +4962,49 @@ async fn handle_shell_dial_socket_connection(
             }
             Err(error) => {
                 if mux::is_permanent_stream_denial(&error) {
-                    let message = format!("refused service \"shell\": {error}");
-                    let _ = shell::serve_shell_failure(
+                    let refusal = error.to_string();
+                    write_service_notice(
                         &mut local,
-                        &message,
-                        shell::EXIT_SHELL_DISABLED,
+                        service.as_ref(),
+                        Notice::Refused { error: &refusal },
                     )
-                    .await;
-                    return Err(error).context("peer refused resumable shell");
+                    .await
+                    .ok();
+                    return Err(error).context(format!("peer refused resumable {name}"));
                 }
                 if tunnel::is_permanent_failure(&error) {
-                    return Err(error.context("peer refused resumable shell"));
+                    return Err(error.context(format!("peer refused resumable {name}")));
                 }
-                if shell_resumable_alpn_unsupported(&error) {
-                    write_shell_protocol_status(
-                        &mut local,
-                        "peer does not support resumable shell; using legacy shell/0",
-                    )
-                    .await?;
-                    return run_legacy_shell_after_selection(
+                if let Some(fallback) = fallback
+                    && alpn_unsupported(&error)
+                {
+                    write_service_notice(&mut local, service.as_ref(), Notice::FallingBack).await?;
+                    return run_fallback_after_selection(
                         local,
                         endpoint_rx,
                         home,
                         peer,
                         current_peer_addr,
+                        service,
+                        protocol,
+                        fallback,
                         cancel,
                     )
                     .await;
                 }
                 attempt = attempt.saturating_add(1);
-                let delay = shell_protocol_probe_delay(attempt);
-                write_shell_protocol_status(
+                let delay = protocol_probe_delay(attempt);
+                let error = format!("{error:#}");
+                write_service_notice(
                     &mut local,
-                    &format!(
-                        "connection unavailable ({error:#}); probing remote shell protocol again in {:.1}s",
-                        delay.as_secs_f32()
-                    ),
+                    service.as_ref(),
+                    Notice::Probing {
+                        error: &error,
+                        delay,
+                    },
                 )
                 .await?;
-                if !wait_for_shell_protocol_retry(delay, &cancel, &mut endpoint_rx).await {
+                if !wait_for_protocol_retry(delay, &cancel, &mut endpoint_rx).await {
                     return Ok(());
                 }
             }
@@ -5037,12 +5012,18 @@ async fn handle_shell_dial_socket_connection(
     }
 }
 
-async fn run_legacy_shell_after_selection(
+/// The peer does not speak the service's resumable protocol: connect its
+/// one-shot protocol directly, retrying until a session starts.
+#[allow(clippy::too_many_arguments)]
+async fn run_fallback_after_selection(
     mut local: UnixStream,
     mut endpoint_rx: watch::Receiver<CurrentEndpoint>,
     home: FabricHome,
     peer: String,
     peer_addr: EndpointAddr,
+    service: Arc<dyn Service>,
+    newest: &'static services::Protocol,
+    fallback: &'static services::Protocol,
     cancel: CancellationToken,
 ) -> Result<()> {
     let mut attempt = 0usize;
@@ -5060,29 +5041,35 @@ async fn run_legacy_shell_after_selection(
                 }
                 continue;
             }
-            connected = endpoint.connect(current_peer_addr, shell::SHELL_ALPN) => connected,
+            connected = endpoint.connect(current_peer_addr, fallback.alpn) => connected,
         };
         match connected {
             Ok(connection) => {
                 let (send, recv) = connection.open_bi().await?;
-                return pipe_framed_unix_iroh(local, send, recv).await;
+                return pipe_unix_iroh(local, send, recv, service.bridge()).await;
             }
             Err(error) => {
                 let error = anyhow::Error::new(error);
-                if shell_resumable_alpn_unsupported(&error) {
-                    return Err(error.context("peer supports neither shell/1 nor shell/0"));
+                if alpn_unsupported(&error) {
+                    return Err(error.context(format!(
+                        "peer supports neither {} nor {}",
+                        short_protocol_name(newest),
+                        short_protocol_name(fallback)
+                    )));
                 }
                 attempt = attempt.saturating_add(1);
-                let delay = shell_protocol_probe_delay(attempt);
-                write_shell_protocol_status(
+                let delay = protocol_probe_delay(attempt);
+                let error = format!("{error:#}");
+                write_service_notice(
                     &mut local,
-                    &format!(
-                        "legacy shell unavailable ({error:#}); retrying before session start in {:.1}s",
-                        delay.as_secs_f32()
-                    ),
+                    service.as_ref(),
+                    Notice::RetryingFallback {
+                        error: &error,
+                        delay,
+                    },
                 )
                 .await?;
-                if !wait_for_shell_protocol_retry(delay, &cancel, &mut endpoint_rx).await {
+                if !wait_for_protocol_retry(delay, &cancel, &mut endpoint_rx).await {
                     return Ok(());
                 }
             }
@@ -5090,19 +5077,30 @@ async fn run_legacy_shell_after_selection(
     }
 }
 
-async fn write_shell_protocol_status(local: &mut UnixStream, message: &str) -> Result<()> {
-    local
-        .write_all(&shell::encode_server_status(message)?)
-        .await?;
+/// `shell/1` for `fabric/shell/1`: the words an error names a protocol by.
+fn short_protocol_name(protocol: &services::Protocol) -> &'static str {
+    let name = protocol.name();
+    name.strip_prefix("fabric/").unwrap_or(name)
+}
+
+/// Tell a service's local command something in the service's own framing.
+async fn write_service_notice(
+    local: &mut UnixStream,
+    service: &dyn Service,
+    notice: Notice<'_>,
+) -> Result<()> {
+    if let Some(bytes) = service.notice(&notice) {
+        local.write_all(&bytes).await?;
+    }
     Ok(())
 }
 
-fn shell_protocol_probe_delay(attempt: usize) -> Duration {
+fn protocol_probe_delay(attempt: usize) -> Duration {
     const STEPS_MS: &[u64] = &[100, 250, 500, 1_000, 2_000, 5_000, 10_000, 15_000];
     Duration::from_millis(STEPS_MS[attempt.saturating_sub(1).min(STEPS_MS.len() - 1)])
 }
 
-async fn wait_for_shell_protocol_retry(
+async fn wait_for_protocol_retry(
     delay: Duration,
     cancel: &CancellationToken,
     endpoint_rx: &mut watch::Receiver<CurrentEndpoint>,
@@ -5115,7 +5113,7 @@ async fn wait_for_shell_protocol_retry(
     }
 }
 
-fn shell_resumable_alpn_unsupported(error: &anyhow::Error) -> bool {
+fn alpn_unsupported(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         let message = cause.to_string().to_ascii_lowercase();
         message.contains("peer doesn't support any known protocol")
@@ -5172,14 +5170,6 @@ impl ConnectionRecorder {
     }
 }
 
-/// Shell connection notices, rendered twice on purpose.
-///
-/// The shell client sees a status frame in its terminal, and the daemon log gets
-/// the same event in a line an operator can read. Before this, a dropped session
-/// left one failure line in the service log and nothing about the attempt to get
-/// it back, so "did my shell recover" was unanswerable from the log. Each line
-/// names the peer and the endpoint generation, which is the route context that
-/// distinguishes a peer roaming from this endpoint being rebuilt underneath it.
 /// Connection notices for a generic dial: logged, never written to the stream.
 ///
 /// A generic dial carries raw bytes for somebody else's protocol, so the status
@@ -5233,15 +5223,29 @@ fn generic_dial_notices(
     .with_gauge(gauge)
 }
 
-fn shell_client_notices(
+/// A resumable service's connection notices, rendered twice on purpose.
+///
+/// The service's local command sees them in its own framing, and the daemon
+/// log gets the same event in a line an operator can read. Before this, a
+/// dropped shell session left one failure line in the service log and nothing
+/// about the attempt to get it back, so "did my shell recover" was unanswerable
+/// from the log. Each line names the peer and the endpoint generation, which is
+/// the route context that distinguishes a peer roaming from this endpoint being
+/// rebuilt underneath it.
+fn service_client_notices(
+    service: Arc<dyn Service>,
     peer: String,
     generation: u64,
     gauge: Arc<tunnel::ClientAttachGauge>,
     recorder: ConnectionRecorder,
 ) -> tunnel::ClientConnectionNotices {
+    let name = service.name();
+    let reconnecting_event = format!("{name}_session_reconnecting");
+    let resumed_event = format!("{name}_session_resumed");
+    let resume_failed_event = format!("{name}_session_resume_failed");
     tunnel::ClientConnectionNotices::new(move |event| {
         recorder.record(&peer, event);
-        let encoded = match event {
+        match event {
             tunnel::ClientConnectionEvent::Reconnecting {
                 attempt,
                 delay,
@@ -5249,52 +5253,52 @@ fn shell_client_notices(
             } => {
                 warn!(
                     target: VALIDATION_LOG_TARGET,
-                    event = "shell_session_reconnecting",
+                    event = reconnecting_event.as_str(),
                     peer = %peer,
                     generation,
                     attempt,
                     delay_ms = delay.as_millis() as u64,
                     error = %error,
-                    "shell session lost its transport; reconnecting"
+                    "{name} session lost its transport; reconnecting"
                 );
                 eprintln!(
-                    "fabric: shell session to {peer:?} lost connection ({error}); reconnect attempt {attempt} in {:.1}s (endpoint generation {generation})",
+                    "fabric: {name} session to {peer:?} lost connection ({error}); reconnect attempt {attempt} in {:.1}s (endpoint generation {generation})",
                     delay.as_secs_f32()
                 );
-                shell::encode_server_status(&format!(
-                    "connection lost ({error}); reconnecting attempt {attempt} in {:.1}s",
-                    delay.as_secs_f32()
-                ))
+                service.notice(&Notice::Reconnecting {
+                    error,
+                    attempt: *attempt,
+                    delay: *delay,
+                })
             }
             tunnel::ClientConnectionEvent::Resumed => {
                 info!(
                     target: VALIDATION_LOG_TARGET,
-                    event = "shell_session_resumed",
+                    event = resumed_event.as_str(),
                     peer = %peer,
                     generation,
-                    "shell session resumed after reconnect"
+                    "{name} session resumed after reconnect"
                 );
                 eprintln!(
-                    "fabric: shell session to {peer:?} resumed (endpoint generation {generation})"
+                    "fabric: {name} session to {peer:?} resumed (endpoint generation {generation})"
                 );
-                shell::encode_server_status("connection restored; remote shell session resumed")
+                service.notice(&Notice::Resumed)
             }
             tunnel::ClientConnectionEvent::Failed { error } => {
                 warn!(
                     target: VALIDATION_LOG_TARGET,
-                    event = "shell_session_resume_failed",
+                    event = resume_failed_event.as_str(),
                     peer = %peer,
                     generation,
                     error = %error,
-                    "shell session could not resume"
+                    "{name} session could not resume"
                 );
                 eprintln!(
-                    "fabric: shell session to {peer:?} could NOT resume: {error} (endpoint generation {generation})"
+                    "fabric: {name} session to {peer:?} could NOT resume: {error} (endpoint generation {generation})"
                 );
-                shell::encode_server_error(&format!("remote shell could not resume: {error}"))
+                service.notice(&Notice::ResumeFailed { error })
             }
-        };
-        encoded.ok()
+        }
     })
     .with_gauge(gauge)
 }
@@ -5384,6 +5388,7 @@ async fn run_raw_dial_socket(
     peer: String,
     peer_addr: EndpointAddr,
     alpn: Vec<u8>,
+    service: Arc<dyn Service>,
     listener_cancel: CancellationToken,
     daemon_cancel: CancellationToken,
     dial_failures: Arc<FailureBackoff>,
@@ -5416,6 +5421,7 @@ async fn run_raw_dial_socket(
                 let peer = peer.clone();
                 let peer_addr = peer_addr.clone();
                 let alpn = alpn.clone();
+                let service = service.clone();
                 let cancel = daemon_cancel.clone();
                 let dial_failures = dial_failures.clone();
                 let backoff_key = backoff_key.clone();
@@ -5431,6 +5437,7 @@ async fn run_raw_dial_socket(
                         peer,
                         peer_addr,
                         alpn,
+                        service,
                         peer_connections,
                     )
                     .await
@@ -5454,6 +5461,7 @@ async fn handle_raw_dial_socket_connection(
     peer: String,
     peer_addr: EndpointAddr,
     alpn: Vec<u8>,
+    service: Arc<dyn Service>,
     peer_connections: Arc<mux::PeerConnections>,
 ) -> Result<()> {
     let protocol = std::str::from_utf8(&alpn).context("protocol is not UTF-8")?;
@@ -5469,61 +5477,33 @@ async fn handle_raw_dial_socket_connection(
     {
         Ok(stream) => stream,
         Err(error) => {
-            if alpn == exec::EXEC_ALPN {
-                let (message, exit_code) = if mux::is_permanent_stream_denial(&error) {
-                    (
-                        format!("refused service \"exec\": {error}"),
-                        exec::EXIT_EXEC_DISABLED,
-                    )
-                } else {
-                    (format!("failed to start service \"exec\": {error}"), 1)
-                };
-                // Preserve the dial error for diagnostics and backoff. The
-                // frame is for the local CLI, which otherwise sees only EOF.
-                let _ = exec::serve_exec_failure(&mut local, &message, exit_code).await;
-            }
+            // Preserve the dial error for diagnostics and backoff. The notice is
+            // for the local command, which otherwise sees only EOF.
+            let message = error.to_string();
+            let notice = if mux::is_permanent_stream_denial(&error) {
+                Notice::Refused { error: &message }
+            } else {
+                Notice::Unavailable { error: &message }
+            };
+            let _ = write_service_notice(&mut local, service.as_ref(), notice).await;
             let context = format!("dial to peer {peer:?} failed: {error}");
             return Err(error).context(context);
         }
     };
-    if alpn == exec::EXEC_ALPN {
-        pipe_framed_unix_iroh(local, stream.send, stream.recv).await?;
-    } else {
-        pipe_unix_iroh(local, stream.send, stream.recv).await?;
-    }
-    Ok(())
+    pipe_unix_iroh(local, stream.send, stream.recv, service.bridge()).await
 }
 
-/// Keep receiving framed replies after the peer stops its receive direction.
+/// Join a local command's socket to the peer's stream until both are done.
 ///
-/// A policy refusal sends Error and Exit, then closes without reading the
-/// request frames. That stopped send direction must not cancel the useful reply.
-async fn pipe_framed_unix_iroh(
-    local: UnixStream,
-    mut send: SendStream,
-    mut recv: RecvStream,
-) -> Result<()> {
-    let (mut local_read, mut local_write) = local.into_split();
-    let to_remote = async {
-        tokio::io::copy(&mut local_read, &mut send).await?;
-        send.finish()?;
-        Ok::<(), anyhow::Error>(())
-    };
-    let to_local = async {
-        tokio::io::copy(&mut recv, &mut local_write).await?;
-        let _ = local_write.shutdown().await;
-        Ok::<(), anyhow::Error>(())
-    };
-    let (to_remote, to_local) = tokio::join!(to_remote, to_local);
-    to_local?;
-    to_remote?;
-    Ok(())
-}
-
+/// [`Bridge::WholeReply`] keeps receiving the reply after the peer stops its
+/// receive direction: a policy refusal sends Error and Exit, then closes
+/// without reading the request frames, and that stopped send direction must not
+/// cancel the useful reply.
 async fn pipe_unix_iroh(
     local: UnixStream,
     mut send: SendStream,
     mut recv: RecvStream,
+    bridge: Bridge,
 ) -> Result<()> {
     let (mut local_read, mut local_write) = local.into_split();
     let to_remote = async {
@@ -5536,7 +5516,16 @@ async fn pipe_unix_iroh(
         let _ = local_write.shutdown().await;
         Ok::<(), anyhow::Error>(())
     };
-    tokio::try_join!(to_remote, to_local)?;
+    match bridge {
+        Bridge::FirstError => {
+            tokio::try_join!(to_remote, to_local)?;
+        }
+        Bridge::WholeReply => {
+            let (to_remote, to_local) = tokio::join!(to_remote, to_local);
+            to_local?;
+            to_remote?;
+        }
+    }
     Ok(())
 }
 
@@ -5544,6 +5533,7 @@ async fn pipe_unix_iroh(
 mod tests {
     use super::*;
     use crate::sync::config::{SyncEntry, SyncPolicy};
+    use crate::services::{exec, shell};
 
     fn write_test_sync(home: &FabricHome, folder: PathBuf, selector: &str) -> Result<()> {
         fs::create_dir_all(&folder)?;
@@ -5830,7 +5820,11 @@ mod tests {
 
     #[test]
     fn a_production_endpoint_advertises_generation_aware_mux() {
-        let alpns = accepted_alpns(&HashMap::new());
+        let dir = tempfile::tempdir().unwrap();
+        let alpns = accepted_alpns(
+            &services::builtin(&FabricHome::new(dir.path())),
+            &HashMap::new(),
+        );
 
         assert!(alpns.iter().any(|alpn| alpn == mux::MUX_ALPN));
         assert!(alpns.iter().any(|alpn| alpn == BUILTIN_ECHO_ALPN));
@@ -8324,19 +8318,31 @@ mod tests {
 
     #[test]
     fn explicit_acl_names_match_every_builtin_gate_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let services = services::builtin(&FabricHome::new(dir.path()));
         let mapped = [
-            service_name_for_alpn(shell::SHELL_ALPN),
-            service_name_for_alpn(exec::EXEC_ALPN),
-            service_name_for_alpn(SYNC_ALPN),
-            service_name_for_alpn(BUILTIN_ECHO_ALPN),
-            service_name_for_alpn(crate::sendfile::SEND_FILE_ALPN),
+            service_name_for_alpn(&services, shell::SHELL_ALPN),
+            service_name_for_alpn(&services, exec::EXEC_ALPN),
+            service_name_for_alpn(&services, SYNC_ALPN),
+            service_name_for_alpn(&services, BUILTIN_ECHO_ALPN),
+            service_name_for_alpn(&services, crate::services::send_file::SEND_FILE_ALPN),
+            service_name_for_alpn(&services, crate::services::git::GIT_ALPN),
         ];
-        assert_eq!(mapped, BUILTIN_SERVICE_NAMES.map(str::to_string));
         assert_eq!(
-            service_name_for_alpn(shell::RESUMABLE_SHELL_ALPN),
-            SHELL_SERVICE,
+            mapped,
+            ["shell", "exec", "sync", "echo", "send-file", "git"]
+        );
+        assert_eq!(
+            service_name_for_alpn(&services, shell::RESUMABLE_SHELL_ALPN),
+            "shell",
             "both shell wire versions must use one permission name"
         );
+        // Every protocol of every service answers to that service's word.
+        for name in services.names() {
+            for protocol in services.named(name).unwrap().protocols() {
+                assert_eq!(service_name_for_alpn(&services, protocol.alpn), name);
+            }
+        }
     }
 
     /// Finding 9 of the 2026-08-29 review. When the OS network monitor stops,
@@ -8359,12 +8365,10 @@ mod tests {
 
         let dir = tempfile::tempdir()?;
         let cancel = CancellationToken::new();
-        let state = DaemonState::new(
-            FabricHome::new(dir.path()),
-            cancel.clone(),
-            DaemonOptions::default(),
-        )
-        .await?;
+        let home = FabricHome::new(dir.path());
+        let services = services::builtin(&home);
+        let state =
+            DaemonState::new(home, cancel.clone(), DaemonOptions::default(), services).await?;
 
         let loop_task = tokio::spawn(run_rehome_updates(state.clone(), MonitorStopped));
 

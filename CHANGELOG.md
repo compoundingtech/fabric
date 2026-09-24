@@ -28,6 +28,24 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Changed
 
+- **The daemon serves exec, shell, Git and send-file through a registry, on
+  a small service interface.** The new `fabric-service-api` crate is what a
+  service needs from the base network: an authenticated stream from one peer
+  for one service, the word its grant uses, and a way to tell its local
+  command about a refusal or a reconnect in its own framing. The four built-in
+  services are modules under `src/services/` that reach the core only through
+  that interface, which a test enforces; the daemon dispatches inbound
+  connections, mux streams, resumable sessions and local dial sockets through
+  the registry, and the shell's resumable dial with its fallback to `shell/0`
+  became the base network's resumable dial for any service. A daemon can be
+  started with other services, and a test registers one the daemon has never
+  heard of. The services stayed in the core crate on purpose: as four crates of
+  their own they grew the release binary by about 0.8 percent, because a
+  release build copies each generic instantiation into every crate that uses
+  it; as modules the binary is slightly smaller than before. Nothing on the
+  wire, in the config files, in the service definitions or in command output
+  changed; the received-a-file log line moved from the `fabric::daemon` target
+  to `fabric::send_file`.
 - **The `fabric-sync` companion owns file sync. The daemon no longer
   constructs a sync engine.** On every machine that takes this release the
   supervised companion, which already ran in standby, acquires the state lease

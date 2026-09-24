@@ -975,6 +975,7 @@ dependencies = [
  "blake3",
  "clap",
  "crossterm",
+ "fabric-service-api",
  "flate2",
  "iroh",
  "libc",
@@ -1000,6 +1001,15 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "fabric-service-api"
+version = "0.2.15"
+dependencies = [
+ "anyhow",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
