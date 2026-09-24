@@ -28,6 +28,21 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Changed
 
+- **exec, shell, Git and send-file live in their own crates, on a small
+  service interface.** `fabric-service-api` is what a service needs from the
+  base network: an authenticated stream from one peer for one service, the
+  words its grant uses, and a way to tell its local command about a refusal or
+  a reconnect in its own framing. `fabric-exec`, `fabric-shell` (with the
+  terminal handling and the interactive client), `fabric-git` (with the
+  `git-remote-fabric` helper) and `fabric-send-file` depend on that crate and
+  on nothing in the core. The daemon serves them through a registry: inbound
+  connections, mux streams, resumable sessions and local dial sockets all
+  dispatch on it, and the shell's resumable dial with its fallback to
+  `shell/0` became the base network's resumable dial for any service. The core
+  went from 36,334 lines of Rust to 33,347. Nothing on the wire, in the config
+  files, in the service definitions or in command output changed; the
+  received-a-file log line moved from the `fabric::daemon` target to
+  `fabric::send_file`.
 - **The `fabric-sync` companion owns file sync. The daemon no longer
   constructs a sync engine.** On every machine that takes this release the
   supervised companion, which already ran in standby, acquires the state lease
