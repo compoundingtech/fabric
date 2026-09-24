@@ -61,11 +61,7 @@ where
 }
 
 /// Send a complete failure response when exec cannot start a remote command.
-pub async fn serve_exec_failure<W>(
-    send: &mut W,
-    message: &str,
-    exit_code: i32,
-) -> Result<()>
+pub async fn serve_exec_failure<W>(send: &mut W, message: &str, exit_code: i32) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
@@ -557,12 +553,18 @@ mod tests {
     async fn serve_exec_session_reports_spawn_failure() {
         let argv = vec!["this-binary-does-not-exist-xyz".to_string()];
         let mut client_to_server = Vec::new();
-        write_client_argv(&mut client_to_server, &argv).await.unwrap();
-
-        let mut server_to_client = Vec::new();
-        serve_exec_session(&mut client_to_server.as_slice(), &mut server_to_client, "test-peer")
+        write_client_argv(&mut client_to_server, &argv)
             .await
             .unwrap();
+
+        let mut server_to_client = Vec::new();
+        serve_exec_session(
+            &mut client_to_server.as_slice(),
+            &mut server_to_client,
+            "test-peer",
+        )
+        .await
+        .unwrap();
 
         let mut reader = server_to_client.as_slice();
         let mut saw_error = false;
@@ -726,7 +728,11 @@ mod notice_tests {
 
     #[tokio::test]
     async fn a_refusal_reaches_the_local_command_as_error_then_126() {
-        let bytes = Exec.notice(&Notice::Refused { error: "not permitted" }).unwrap();
+        let bytes = Exec
+            .notice(&Notice::Refused {
+                error: "not permitted",
+            })
+            .unwrap();
         assert!(matches!(
             frames(bytes).await.as_slice(),
             [ServerFrame::Error(message), ServerFrame::Exit(126)]
@@ -736,7 +742,9 @@ mod notice_tests {
 
     #[tokio::test]
     async fn an_unopened_stream_reaches_the_local_command_as_error_then_1() {
-        let bytes = Exec.notice(&Notice::Unavailable { error: "timed out" }).unwrap();
+        let bytes = Exec
+            .notice(&Notice::Unavailable { error: "timed out" })
+            .unwrap();
         assert!(matches!(
             frames(bytes).await.as_slice(),
             [ServerFrame::Error(message), ServerFrame::Exit(1)]

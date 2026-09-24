@@ -75,7 +75,9 @@ enum SessionResponse {
         requester: String,
         required: String,
     },
-    Unavailable { message: String },
+    Unavailable {
+        message: String,
+    },
     Busy,
 }
 
@@ -409,12 +411,10 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let request = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        read_json::<_, SessionRequest>(&mut recv),
-    )
-    .await
-    .context("the peer did not send a Git request within 10 seconds")??;
+    let request =
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, read_json::<_, SessionRequest>(&mut recv))
+            .await
+            .context("the peer did not send a Git request within 10 seconds")??;
     validate_remote_name(&request.remote)?;
     let required = request.operation.permission(&request.remote);
     let requester = grants.peer_name().unwrap_or_else(|| peer.clone());
@@ -546,7 +546,10 @@ where
     }
 }
 
-async fn write_output_frames<W>(mut output: W, mut frames: mpsc::Receiver<OutputFrame>) -> Result<()>
+async fn write_output_frames<W>(
+    mut output: W,
+    mut frames: mpsc::Receiver<OutputFrame>,
+) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {

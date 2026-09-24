@@ -1030,8 +1030,7 @@ impl DaemonState {
         }
         let exposures = load_persisted_exposures(&home, &services)?;
         let allowed = Arc::new(RwLock::new(peer_book.trusted_ids()));
-        let endpoint =
-            build_daemon_endpoint(&home, allowed.clone(), &services, &exposures).await?;
+        let endpoint = build_daemon_endpoint(&home, allowed.clone(), &services, &exposures).await?;
         let generation = next_endpoint_generation(&home, 0)?;
         let (endpoint_tx, _) = watch::channel(CurrentEndpoint {
             generation,
@@ -1523,8 +1522,10 @@ impl DaemonState {
             Access::AllowList => None,
             Access::Grants => {
                 let book = self.peer_book.read().await.clone();
-                Some(Arc::new(services::BookGrants::new(book, peer, service.name()))
-                    as Arc<dyn fabric_service_api::Grants>)
+                Some(
+                    Arc::new(services::BookGrants::new(book, peer, service.name()))
+                        as Arc<dyn fabric_service_api::Grants>,
+                )
             }
         };
         PeerStream {
@@ -4977,8 +4978,7 @@ async fn handle_resumable_dial_socket_connection(
                 if let Some(fallback) = fallback
                     && alpn_unsupported(&error)
                 {
-                    write_service_notice(&mut local, service.as_ref(), Notice::FallingBack)
-                        .await?;
+                    write_service_notice(&mut local, service.as_ref(), Notice::FallingBack).await?;
                     return run_fallback_after_selection(
                         local,
                         endpoint_rx,
@@ -8329,7 +8329,10 @@ mod tests {
             service_name_for_alpn(&services, fabric_send_file::SEND_FILE_ALPN),
             service_name_for_alpn(&services, fabric_git::GIT_ALPN),
         ];
-        assert_eq!(mapped, ["shell", "exec", "sync", "echo", "send-file", "git"]);
+        assert_eq!(
+            mapped,
+            ["shell", "exec", "sync", "echo", "send-file", "git"]
+        );
         assert_eq!(
             service_name_for_alpn(&services, shell::RESUMABLE_SHELL_ALPN),
             "shell",
@@ -8365,8 +8368,8 @@ mod tests {
         let cancel = CancellationToken::new();
         let home = FabricHome::new(dir.path());
         let services = services::builtin(&home);
-        let state = DaemonState::new(home, cancel.clone(), DaemonOptions::default(), services)
-            .await?;
+        let state =
+            DaemonState::new(home, cancel.clone(), DaemonOptions::default(), services).await?;
 
         let loop_task = tokio::spawn(run_rehome_updates(state.clone(), MonitorStopped));
 

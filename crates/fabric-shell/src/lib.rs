@@ -67,11 +67,7 @@ where
 }
 
 /// Send a complete failure response when a shell session cannot start.
-pub async fn serve_shell_failure<W>(
-    send: &mut W,
-    message: &str,
-    exit_code: i32,
-) -> Result<()>
+pub async fn serve_shell_failure<W>(send: &mut W, message: &str, exit_code: i32) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
@@ -418,7 +414,7 @@ fn encode_frame(kind: u8, payload: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Notice, Service, Shell, ServerFrame, encode_server_status, read_server_frame};
+    use super::{Notice, ServerFrame, Service, Shell, encode_server_status, read_server_frame};
     use std::time::Duration;
 
     async fn frames(bytes: Vec<u8>) -> Vec<ServerFrame> {
@@ -455,15 +451,28 @@ mod tests {
             "peer does not support resumable shell; using legacy shell/0"
         );
         assert_eq!(
-            only_status(Notice::Probing { error: "gone: reset", delay }).await,
+            only_status(Notice::Probing {
+                error: "gone: reset",
+                delay
+            })
+            .await,
             "connection unavailable (gone: reset); probing remote shell protocol again in 2.5s"
         );
         assert_eq!(
-            only_status(Notice::RetryingFallback { error: "gone", delay }).await,
+            only_status(Notice::RetryingFallback {
+                error: "gone",
+                delay
+            })
+            .await,
             "legacy shell unavailable (gone); retrying before session start in 2.5s"
         );
         assert_eq!(
-            only_status(Notice::Reconnecting { error: "lost", attempt: 3, delay }).await,
+            only_status(Notice::Reconnecting {
+                error: "lost",
+                attempt: 3,
+                delay
+            })
+            .await,
             "connection lost (lost); reconnecting attempt 3 in 2.5s"
         );
         assert_eq!(
@@ -474,7 +483,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_session_that_cannot_resume_is_an_error() {
-        let bytes = Shell.notice(&Notice::ResumeFailed { error: "expired" }).unwrap();
+        let bytes = Shell
+            .notice(&Notice::ResumeFailed { error: "expired" })
+            .unwrap();
         assert!(matches!(
             frames(bytes).await.as_slice(),
             [ServerFrame::Error(message)] if message == "remote shell could not resume: expired"

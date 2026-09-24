@@ -518,7 +518,6 @@ where
     }
 }
 
-
 fn terminal_size() -> (u16, u16) {
     if std::io::stdout().is_terminal()
         && let Ok((cols, rows)) = crossterm::terminal::size()
@@ -531,7 +530,6 @@ fn terminal_size() -> (u16, u16) {
 fn normalize_exit_code(code: i32) -> i32 {
     code.clamp(0, 255)
 }
-
 
 enum ShellSignal {
     Resize,
@@ -619,4 +617,3 @@ fn terminate_with_signal(signal: i32) -> ! {
 fn terminate_with_signal(_signal: i32) -> ! {
     std::process::exit(1)
 }
-

@@ -129,7 +129,13 @@ pub fn inbox_for(inbox: &Path, peer: &str) -> PathBuf {
 fn sanitize_peer(peer: &str) -> String {
     let cleaned: String = peer
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if cleaned.is_empty() {
         "unknown".to_string()
@@ -151,9 +157,8 @@ pub fn name_is_safe(name: &str) -> bool {
     if path.is_absolute() {
         return false;
     }
-    path.components().all(|component| {
-        matches!(component, Component::Normal(part) if !part.is_empty())
-    })
+    path.components()
+        .all(|component| matches!(component, Component::Normal(part) if !part.is_empty()))
 }
 
 /// Resolve where a named file lands, refusing anything that escapes.
@@ -225,7 +230,9 @@ where
         name: name.to_string(),
         len,
     })?;
-    stream.write_all(&(header.len() as u32).to_be_bytes()).await?;
+    stream
+        .write_all(&(header.len() as u32).to_be_bytes())
+        .await?;
     stream.write_all(&header).await?;
     // Exactly `len` bytes, streamed rather than buffered.
     let copied = tokio::io::copy(&mut reader.take(len), &mut stream).await?;
@@ -300,7 +307,10 @@ where
         // The sender closed early or the transport dropped. Do not commit a
         // short file, and do not ack it.
         let _ = std::fs::remove_file(&temp);
-        bail!("received {copied} of {} bytes before the stream ended", header.len);
+        bail!(
+            "received {copied} of {} bytes before the stream ended",
+            header.len
+        );
     }
     std::fs::rename(&temp, &target)
         .with_context(|| format!("renaming into {}", target.display()))?;
@@ -372,8 +382,7 @@ mod tests {
 
         let (client, server) = tokio::io::duplex(1 << 20);
         let home_for_server = dir.path().join("inbox");
-        let receiver =
-            tokio::spawn(async move { receive(server, &home_for_server, "hetz").await });
+        let receiver = tokio::spawn(async move { receive(server, &home_for_server, "hetz").await });
         send(client, "sub/notes.bin", &payload).await.unwrap();
         let landed = receiver.await.unwrap().unwrap();
 
@@ -397,8 +406,7 @@ mod tests {
 
         let (client, server) = tokio::io::duplex(64 * 1024);
         let home_for_server = dir.path().join("inbox");
-        let receiver =
-            tokio::spawn(async move { receive(server, &home_for_server, "hetz").await });
+        let receiver = tokio::spawn(async move { receive(server, &home_for_server, "hetz").await });
         // send_from_reader with a reader (not a held slice) is the streaming API
         // the daemon uses for a file on disk.
         send_from_reader(client, "big.bin", payload.len() as u64, payload.as_slice())
@@ -418,8 +426,7 @@ mod tests {
         let home = dir.path().join("inbox");
         let (mut client, server) = tokio::io::duplex(1 << 16);
         let home_for_server = dir.path().join("inbox");
-        let receiver =
-            tokio::spawn(async move { receive(server, &home_for_server, "hetz").await });
+        let receiver = tokio::spawn(async move { receive(server, &home_for_server, "hetz").await });
 
         // Hand-write a header claiming 1000 bytes, then send 10 and close.
         let header = serde_json::to_vec(&Header {
@@ -454,8 +461,7 @@ mod tests {
 
         let (mut client, server) = tokio::io::duplex(1 << 16);
         let home_for_server = dir.path().join("inbox");
-        let receiver =
-            tokio::spawn(async move { receive(server, &home_for_server, "hetz").await });
+        let receiver = tokio::spawn(async move { receive(server, &home_for_server, "hetz").await });
 
         // Hand-built, bypassing `send` entirely, the way a hostile peer would.
         let header = serde_json::to_vec(&Header {

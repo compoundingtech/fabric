@@ -100,8 +100,16 @@ async fn ask(client: &FabricNode) -> Result<String> {
 async fn a_service_built_on_the_public_interface_hears_the_proven_peer() -> Result<()> {
     let server_dir = TempDir::new()?;
     let client_dir = TempDir::new()?;
-    let (server_home, server) = start(&server_dir, with_whoami(&FabricHome::new(server_dir.path()))).await?;
-    let (client_home, client) = start(&client_dir, with_whoami(&FabricHome::new(client_dir.path()))).await?;
+    let (server_home, server) = start(
+        &server_dir,
+        with_whoami(&FabricHome::new(server_dir.path())),
+    )
+    .await?;
+    let (client_home, client) = start(
+        &client_dir,
+        with_whoami(&FabricHome::new(client_dir.path())),
+    )
+    .await?;
     trust(&server_home, &server, &client, "client", &["whoami"]).await?;
     trust(&client_home, &client, &server, "server", &[]).await?;
 
@@ -116,8 +124,16 @@ async fn a_service_built_on_the_public_interface_hears_the_proven_peer() -> Resu
 async fn the_base_network_refuses_a_service_the_peer_was_not_granted() -> Result<()> {
     let server_dir = TempDir::new()?;
     let client_dir = TempDir::new()?;
-    let (server_home, server) = start(&server_dir, with_whoami(&FabricHome::new(server_dir.path()))).await?;
-    let (client_home, client) = start(&client_dir, with_whoami(&FabricHome::new(client_dir.path()))).await?;
+    let (server_home, server) = start(
+        &server_dir,
+        with_whoami(&FabricHome::new(server_dir.path())),
+    )
+    .await?;
+    let (client_home, client) = start(
+        &client_dir,
+        with_whoami(&FabricHome::new(client_dir.path())),
+    )
+    .await?;
     trust(&server_home, &server, &client, "client", &["echo"]).await?;
     trust(&client_home, &client, &server, "server", &[]).await?;
 
@@ -140,8 +156,16 @@ async fn the_base_network_refuses_a_service_the_peer_was_not_granted() -> Result
 async fn a_daemon_does_not_answer_a_service_it_was_not_given() -> Result<()> {
     let server_dir = TempDir::new()?;
     let client_dir = TempDir::new()?;
-    let (server_home, server) = start(&server_dir, services::builtin(&FabricHome::new(server_dir.path()))).await?;
-    let (client_home, client) = start(&client_dir, with_whoami(&FabricHome::new(client_dir.path()))).await?;
+    let (server_home, server) = start(
+        &server_dir,
+        services::builtin(&FabricHome::new(server_dir.path())),
+    )
+    .await?;
+    let (client_home, client) = start(
+        &client_dir,
+        with_whoami(&FabricHome::new(client_dir.path())),
+    )
+    .await?;
     trust(&server_home, &server, &client, "client", &["whoami"]).await?;
     trust(&client_home, &client, &server, "server", &[]).await?;
 

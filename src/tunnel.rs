@@ -82,7 +82,9 @@ pub struct ServiceTarget(pub Arc<dyn Service>);
 
 impl fmt::Debug for ServiceTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("ServiceTarget").field(&self.0.name()).finish()
+        f.debug_tuple("ServiceTarget")
+            .field(&self.0.name())
+            .finish()
     }
 }
 
