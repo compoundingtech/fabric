@@ -140,6 +140,9 @@ jobs:
       - name: Shell and restart contract
         run: timeout 15m cargo test --locked -p fabric --test shell -- --test-threads=1
 
+      - name: A service built on the base network's public interface
+        run: timeout 5m cargo test --locked -p fabric --test services -- --test-threads=1
+
       # A NEW FILE IN tests/ DOES NOT RUN HERE UNLESS SOMEBODY ADDS A STEP FOR
       # IT, and forgetting is silent: the suite goes green while the new tests
       # never execute. That has now happened twice, once for the binary's own
