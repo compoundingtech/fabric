@@ -6,6 +6,10 @@
 //! that watches folders and drives passes, and the companion runtime that
 //! hosts the engine behind the local bridge.
 //!
+//! This crate does not depend on the daemon's. It reaches the base network
+//! through `fabric-service-api` (the refusal it may be told) and the daemon's
+//! files and sockets through `fabric-config`; only its tests start a daemon.
+//!
 //! Layers:
 //! - [`manifest`]: the pure reconciliation core (versioned per-file state,
 //!   merge, diff), deterministic and heavily property-tested, no I/O.
@@ -27,10 +31,10 @@ pub mod paths;
 pub mod transport;
 pub mod wire;
 
-pub use companion::{CompanionHandle, CompanionPhase, HostedNode};
+pub use companion::{CompanionHandle, CompanionPhase};
 pub use delta::{ChangeBuffer, Cursor};
 pub use engine::{PeerSyncState, SYNC_LOG_TARGET, SyncEngine, SyncStatus, SyncTransport};
-pub use fabric::sync::{
+pub use fabric_config::sync::{
     ContentHash, PeerRef, PolicyRules, ResolvedPeers, SyncBook, SyncEntry, SyncPeers, SyncPolicy,
     content_hash,
 };
@@ -39,13 +43,13 @@ pub use node::{Reconciled, SyncNode};
 pub use paths::{SyncOwnerLease, SyncOwnerLeaseState, SyncPaths};
 pub use transport::IpcSyncTransport;
 
-impl From<SyncStatus> for fabric::control::SyncEntryStatus {
+impl From<SyncStatus> for fabric_config::sync::status::SyncEntryStatus {
     fn from(status: SyncStatus) -> Self {
         let peers = match &status.peers {
             SyncPeers::Wildcard(_) => "*".to_string(),
             SyncPeers::List(list) => list.join(","),
         };
-        fabric::control::SyncEntryStatus {
+        fabric_config::sync::status::SyncEntryStatus {
             delta_fallbacks: status.delta_fallbacks,
             full_payload_sends: status.full_payload_sends,
             content_bytes: status.content_bytes,
@@ -90,7 +94,7 @@ mod tests {
     /// build; pin its bytes to what this crate's `Manifest::new()` serializes.
     #[test]
     fn the_core_empty_manifest_matches_the_engine_empty_manifest() {
-        let core = serde_json::to_value(fabric::sync::frame::EmptyManifest {
+        let core = serde_json::to_value(fabric_config::sync::frame::EmptyManifest {
             entries: Default::default(),
         })
         .unwrap();

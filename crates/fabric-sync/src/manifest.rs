@@ -20,7 +20,7 @@
 //!
 //! Delete handling (tombstones) is modelled here so the wire format is stable,
 //! but *policy* — whether deletes are created/applied/swept — is decided one
-//! layer up (see [`fabric::sync::config::PolicyRules`]). Catalog policy never
+//! layer up (see [`fabric_config::sync::config::PolicyRules`]). Catalog policy never
 //! creates a tombstone; bus policy does.
 
 use std::collections::{BTreeMap, btree_map};
@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 /// A content identity, shared with the core so the staging commands and the
 /// engine agree on it byte for byte.
-pub use fabric::sync::ContentHash;
+pub use fabric_config::sync::ContentHash;
 
 /// A deterministic author identity used only to break version ties. In the
 /// running daemon this is a peer's iroh NodeID bytes; in tests it is arbitrary.
@@ -226,7 +226,7 @@ impl Manifest {
     /// path that escapes the folder root (contains `..`) or is absolute — those
     /// must never enter a manifest.
     pub fn normalize_path(path: &str) -> Option<String> {
-        fabric::sync::normalize_path(path)
+        fabric_config::sync::normalize_path(path)
     }
 
     pub fn len(&self) -> usize {

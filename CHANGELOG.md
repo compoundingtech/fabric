@@ -28,6 +28,21 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Changed
 
+- **`fabric-sync` no longer depends on the daemon's crate.** What the two
+  processes share, the fabric home's layout, `syncs.toml` and its validation,
+  the staging commands, the local bridge, the wire framing, the status types
+  and the build version, moved from the core into a new `fabric-config` crate
+  that both depend on; the core re-exports it, so every `fabric::sync` path
+  still resolves. The companion speaks its few control-socket messages from
+  that crate, pinned to the daemon's definitions by a test. `fabric sync ls`,
+  `stage`, `staged`, `publish` and `discard` now run in `fabric-sync`: `fabric
+  sync` parses them exactly as before and hands them to the `fabric-sync`
+  installed beside it, so their output and columns are unchanged, and
+  `fabric-sync sync <command>` runs them directly. `add`, `rm` and `reload`
+  still run in `fabric`, because `add` checks selectors against the daemon's
+  peer book. On Linux the companion binary is about 1 MB smaller, because it no
+  longer carries the unwinding tables the linker kept for daemon code it never
+  ran; on macOS the commands' code moved from one binary to the other.
 - **The daemon serves exec, shell, Git and send-file through a registry, on
   a small service interface.** The new `fabric-service-api` crate is what a
   service needs from the base network: an authenticated stream from one peer

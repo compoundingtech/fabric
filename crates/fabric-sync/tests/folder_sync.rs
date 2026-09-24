@@ -60,7 +60,8 @@ use fabric::{
     control::ControlRequest,
     daemon::{FabricNode, send_control},
 };
-use fabric_sync::companion::HostedNode;
+mod support;
+use support::HostedNode;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 

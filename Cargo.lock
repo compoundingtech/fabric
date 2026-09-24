@@ -975,6 +975,7 @@ dependencies = [
  "blake3",
  "clap",
  "crossterm",
+ "fabric-config",
  "fabric-service-api",
  "flate2",
  "iroh",
@@ -1004,6 +1005,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fabric-config"
+version = "0.2.16"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "fabric-service-api"
 version = "0.2.16"
 dependencies = [
@@ -1020,6 +1036,8 @@ dependencies = [
  "blake3",
  "clap",
  "fabric",
+ "fabric-config",
+ "fabric-service-api",
  "iroh",
  "libc",
  "notify",

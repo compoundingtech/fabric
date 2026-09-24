@@ -31,6 +31,19 @@ pub type StreamWrite = Box<dyn AsyncWrite + Send + Unpin>;
 /// a refusal from a command that ran and failed.
 pub const REFUSED_EXIT_CODE: i32 = 126;
 
+/// The phrase a refusal carries across the wire.
+///
+/// A wire contract, not a log string: the refusing side closes the stream with
+/// a sentence containing it, and the dialling side matches on it to tell a
+/// refusal apart from a peer that is merely away. Those need different
+/// reactions: one waits for the network, the other waits for a person.
+pub const REFUSAL_MARKER: &str = "not permitted for service";
+
+/// Did this error come from a peer refusing us, rather than from the network?
+pub fn is_refusal(error: &str) -> bool {
+    error.contains(REFUSAL_MARKER)
+}
+
 /// One authenticated stream from one peer for one service.
 pub struct PeerStream {
     /// The peer's id as the handshake proved it: never a name the peer chose.

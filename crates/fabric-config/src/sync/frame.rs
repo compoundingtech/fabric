@@ -121,7 +121,11 @@ pub struct IdleTimeoutStream<S> {
 }
 
 /// Wrap a stream so that `idle_timeout` without progress ends it with an error.
-pub fn idle_timeout_stream<S>(inner: S, peer: &str, idle_timeout: Duration) -> IdleTimeoutStream<S> {
+pub fn idle_timeout_stream<S>(
+    inner: S,
+    peer: &str,
+    idle_timeout: Duration,
+) -> IdleTimeoutStream<S> {
     IdleTimeoutStream::new(inner, peer, idle_timeout)
 }
 

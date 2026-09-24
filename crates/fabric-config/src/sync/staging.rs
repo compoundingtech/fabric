@@ -29,7 +29,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::FabricHome;
+use crate::FabricHome;
 
 use super::{
     config::{SyncBook, SyncEntry},
@@ -194,7 +194,10 @@ pub fn resolve_target(
     entry_hint: Option<&str>,
 ) -> Result<ResolvedTarget> {
     if !target.is_absolute() {
-        bail!("the target must be an absolute path, got {}", target.display());
+        bail!(
+            "the target must be an absolute path, got {}",
+            target.display()
+        );
     }
     let inside: Vec<(&SyncEntry, String)> = book
         .entries()
@@ -367,7 +370,9 @@ pub fn stage(
 /// temp file an interrupted write left behind.
 fn staged_rels(dir: &Path) -> Result<BTreeSet<String>> {
     fn walk(root: &Path, dir: &Path, out: &mut BTreeSet<String>) -> Result<()> {
-        for child in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        for child in
+            fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))?
+        {
             let child = child?;
             let path = child.path();
             let file_type = child.file_type()?;
@@ -455,7 +460,11 @@ pub fn read_for_publish(
                 target.display()
             );
         }
-        let base = match sidecar.files.get(&rel).and_then(|record| record.base.as_deref()) {
+        let base = match sidecar
+            .files
+            .get(&rel)
+            .and_then(|record| record.base.as_deref())
+        {
             Some(hex) => Some(
                 ContentHash::from_hex(hex)
                     .with_context(|| format!("{rel}: the recorded base is not a content hash"))?,

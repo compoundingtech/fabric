@@ -34,9 +34,9 @@ use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
-use fabric::config::FabricHome;
+use fabric_config::FabricHome;
 
-use fabric::sync::{
+use fabric_config::sync::{
     PeerRef, ResolvedPeers,
     config::{PolicyRules, SyncBook, SyncEntry, SyncPeers},
     model::{sanitize_name, write_atomic_with_mode},
@@ -701,11 +701,11 @@ impl PeerSyncState {
 }
 
 fn classify_reconcile_error(message: &str) -> PeerSyncState {
-    if fabric::config::Denied::is_refusal(message) {
+    if fabric_service_api::is_refusal(message) {
         PeerSyncState::Refused
     } else if message.contains("no local sync entry named") {
         PeerSyncState::MissingEntry
-    } else if message.contains(fabric::sync::SYNC_UNAVAILABLE_MARKER)
+    } else if message.contains(fabric_config::sync::SYNC_UNAVAILABLE_MARKER)
         || message.contains("not attached to a fabric daemon")
     {
         PeerSyncState::Unavailable
@@ -1140,7 +1140,7 @@ impl<T: SyncTransport> SyncEngine<T> {
     pub async fn publish_staged(
         &self,
         name: &str,
-        files: Vec<fabric::sync::staging::PublishFile>,
+        files: Vec<fabric_config::sync::staging::PublishFile>,
         force: bool,
     ) -> Result<Vec<PublishedFile>> {
         let Some(entry) = self.entries.read().await.get(name).cloned() else {
@@ -1173,7 +1173,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                     .and_then(|recorded| recorded.meta())
                     .map(|meta| meta.hash);
                 if current != file.base && !force {
-                    refusals.push(fabric::sync::staging::refusal_line(
+                    refusals.push(fabric_config::sync::staging::refusal_line(
                         &file.rel, file.base, current,
                     ));
                 }
@@ -4260,7 +4260,7 @@ fn write_atomic_durable(path: &Path, bytes: &[u8]) -> Result<()> {
 /// touched; fabric replicates no other permission bit, because git does not.
 
 #[cfg(test)]
-use fabric::sync::model::set_executable;
+use fabric_config::sync::model::set_executable;
 
 /// Read whether a file is executable, the way git decides it.
 fn is_executable(meta: &std::fs::Metadata) -> bool {
@@ -4632,7 +4632,7 @@ fn spawn_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fabric::sync::config::SyncPolicy;
+    use fabric_config::sync::config::SyncPolicy;
     use crate::manifest::{Author, Entry, FileMeta, Tombstone};
     use std::sync::{Mutex as StdMutex, Weak};
 
@@ -11299,7 +11299,7 @@ mod tests {
         let home_a = FabricHome::new(dir_a.path());
         let book_a = SyncBook::load(&home_a).unwrap();
 
-        let staged = fabric::sync::staging::stage(
+        let staged = fabric_config::sync::staging::stage(
             &home_a,
             &book_a,
             &dir_a.path().join("resources/draft.md"),
@@ -11353,7 +11353,7 @@ mod tests {
         let (dir_a, dir_b, a, b, ta, tb) = staged_pair().await;
         let home_a = FabricHome::new(dir_a.path());
         let book_a = SyncBook::load(&home_a).unwrap();
-        let staged = fabric::sync::staging::stage(
+        let staged = fabric_config::sync::staging::stage(
             &home_a,
             &book_a,
             &dir_a.path().join("resources/draft.md"),
@@ -11406,12 +11406,12 @@ mod tests {
             ("three.md", &b"three"[..]),
         ] {
             let staged =
-                fabric::sync::staging::stage(&home_a, &book_a, &root_a.join(rel), None, None)
+                fabric_config::sync::staging::stage(&home_a, &book_a, &root_a.join(rel), None, None)
                     .unwrap();
             std::fs::write(&staged.staged_path, bytes).unwrap();
         }
         let (_entry, files) =
-            fabric::sync::staging::read_for_publish(&home_a, &book_a, "bus", &[]).unwrap();
+            fabric_config::sync::staging::read_for_publish(&home_a, &book_a, "bus", &[]).unwrap();
         assert_eq!(files.len(), 3);
         let rels: Vec<String> = files.iter().map(|file| file.rel.clone()).collect();
 
@@ -11448,9 +11448,9 @@ mod tests {
         assert_eq!(std::fs::read(root_b.join("notes/two.md")).unwrap(), b"two");
         assert_eq!(std::fs::read(root_b.join("three.md")).unwrap(), b"three");
 
-        fabric::sync::staging::forget(&home_a, "bus", &rels).unwrap();
+        fabric_config::sync::staging::forget(&home_a, "bus", &rels).unwrap();
         assert!(
-            fabric::sync::staging::list(&home_a, &book_a, Some("bus"))
+            fabric_config::sync::staging::list(&home_a, &book_a, Some("bus"))
                 .unwrap()
                 .is_empty(),
             "published files must leave the staging tree"
@@ -11465,7 +11465,7 @@ mod tests {
         let book_a = SyncBook::load(&home_a).unwrap();
         let root_a = dir_a.path().join("resources");
         let staged =
-            fabric::sync::staging::stage(&home_a, &book_a, &root_a.join("seed.md"), None, None)
+            fabric_config::sync::staging::stage(&home_a, &book_a, &root_a.join("seed.md"), None, None)
                 .unwrap();
         assert_eq!(
             staged.base.as_deref(),
@@ -11479,7 +11479,7 @@ mod tests {
         a.sync_once("bus").await.unwrap();
 
         let (_entry, files) =
-            fabric::sync::staging::read_for_publish(&home_a, &book_a, "bus", &[]).unwrap();
+            fabric_config::sync::staging::read_for_publish(&home_a, &book_a, "bus", &[]).unwrap();
         let error = a
             .publish_staged("bus", files.clone(), false)
             .await
@@ -11510,11 +11510,11 @@ mod tests {
         let book_a = SyncBook::load(&home_a).unwrap();
         let root_a = dir_a.path().join("resources");
         let staged =
-            fabric::sync::staging::stage(&home_a, &book_a, &root_a.join("quiet.md"), None, None)
+            fabric_config::sync::staging::stage(&home_a, &book_a, &root_a.join("quiet.md"), None, None)
                 .unwrap();
         std::fs::write(&staged.staged_path, b"quiet bytes").unwrap();
         let (_entry, files) =
-            fabric::sync::staging::read_for_publish(&home_a, &book_a, "bus", &[]).unwrap();
+            fabric_config::sync::staging::read_for_publish(&home_a, &book_a, "bus", &[]).unwrap();
         a.publish_staged("bus", files, false).await.unwrap();
 
         // The watcher then reports the daemon's own atomic write. The receipt
@@ -11583,7 +11583,7 @@ mod tests {
         });
         book.save(&home).unwrap();
 
-        let error = fabric::sync::staging::stage(&home, &book, &root.join("notes.txt"), None, None)
+        let error = fabric_config::sync::staging::stage(&home, &book, &root.join("notes.txt"), None, None)
             .unwrap_err();
         let detail = format!("{error:#}");
         assert!(
@@ -11591,13 +11591,13 @@ mod tests {
             "a target no include glob matches must be refused by name: {detail}"
         );
         assert!(
-            fabric::sync::staging::list(&home, &book, None)
+            fabric_config::sync::staging::list(&home, &book, None)
                 .unwrap()
                 .is_empty(),
             "a refused stage leaves nothing behind"
         );
 
-        let error = fabric::sync::staging::stage(
+        let error = fabric_config::sync::staging::stage(
             &home,
             &book,
             &dir.path().join("elsewhere/notes.md"),
@@ -11621,7 +11621,7 @@ mod tests {
             policy: SyncPolicy::Bus,
             include: None,
         });
-        let error = fabric::sync::staging::stage(
+        let error = fabric_config::sync::staging::stage(
             &home,
             &wide,
             &dir.path().join("anything.md"),
@@ -11635,7 +11635,7 @@ mod tests {
             "a staging tree inside a folder must be refused: {detail}"
         );
         assert!(
-            !fabric::sync::staging::staging_root(&home).join("home").exists(),
+            !fabric_config::sync::staging::staging_root(&home).join("home").exists(),
             "a refused stage must write nothing into the folder"
         );
     }

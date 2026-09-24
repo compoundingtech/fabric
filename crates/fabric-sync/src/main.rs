@@ -1,20 +1,19 @@
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
-use clap::{ArgGroup, Parser};
-use fabric::{
-    config::FabricHome,
-    control::{ControlRequest, ControlResponse},
-    daemon::send_control,
-    sync::{SyncBook, ipc},
+use clap::{ArgGroup, Args, Parser, Subcommand};
+use fabric_config::{
+    FabricHome,
+    daemon_control::{self, Request as ControlRequest, Response as ControlResponse},
+    sync::{SyncBook, cli::SyncCommands, ipc},
 };
 use fabric_sync::{SyncOwnerLease, SyncOwnerLeaseState, SyncPaths, companion};
 
-#[derive(Debug, Parser)]
-#[command(name = "fabric-sync")]
-#[command(about = "The fabric file-sync companion process")]
-#[command(group(ArgGroup::new("action").required(true).multiple(false).args(["version", "check", "standby"])))]
-struct Cli {
+mod commands;
+
+/// The process modes. Flattened into both parsers below.
+#[derive(Debug, Args)]
+struct Modes {
     /// Print the build version.
     #[arg(long)]
     version: bool,
@@ -33,15 +32,66 @@ struct Cli {
     home: Option<PathBuf>,
 }
 
+/// What the service manager runs, and everything but the sync commands.
+///
+/// It does not know the `sync` subcommand on purpose. Building that command
+/// tree at startup kept about 180 KiB more resident in a companion that runs
+/// all day and never uses it.
+#[derive(Debug, Parser)]
+#[command(name = "fabric-sync")]
+#[command(about = "The fabric file-sync companion process")]
+#[command(
+    after_help = "fabric-sync sync <COMMAND> runs the `fabric sync` commands that list \
+                        entries and stage and publish changes."
+)]
+#[command(group(ArgGroup::new("action").required(true).multiple(false).args(["version", "check", "standby"])))]
+struct Cli {
+    #[command(flatten)]
+    modes: Modes,
+}
+
+/// The same, with the sync commands, parsed only when `sync` is asked for.
+#[derive(Debug, Parser)]
+#[command(name = "fabric-sync")]
+#[command(about = "The fabric file-sync companion process")]
+#[command(group(ArgGroup::new("action").required(true).multiple(false).args(["version", "check", "standby"])))]
+#[command(subcommand_negates_reqs = true)]
+struct CliWithSync {
+    #[command(flatten)]
+    modes: Modes,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// List sync entries, and stage and publish changes to synced files; the
+    /// same commands as `fabric sync`, which hands them here.
+    Sync {
+        #[command(subcommand)]
+        command: SyncCommands,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
-    if cli.version {
-        println!("{}", fabric::version_string());
+    let modes = if std::env::args_os().skip(1).any(|arg| arg == "sync") {
+        let cli = CliWithSync::parse();
+        if let Some(Command::Sync { command }) = cli.command {
+            let home = FabricHome::resolve(cli.modes.home)?;
+            return commands::run(&home, command).await;
+        }
+        cli.modes
+    } else {
+        Cli::parse().modes
+    };
+    if modes.version {
+        println!("{}", fabric_config::version_string());
         return Ok(());
     }
-    let home = FabricHome::resolve(cli.home)?;
-    if cli.check {
+    let home = FabricHome::resolve(modes.home)?;
+    if modes.check {
         return check(home).await;
     }
     serve(home).await
@@ -94,7 +144,7 @@ async fn check(home: FabricHome) -> Result<()> {
     println!("state\tok\t{}", paths.state_root().display());
     println!("owner\t{}", lease_name(lease));
 
-    let response = send_control(&home, ControlRequest::SyncIpcCompatibility).await?;
+    let response = daemon_control::send(&home, ControlRequest::SyncIpcCompatibility).await?;
     let ControlResponse::SyncIpcCompatibility {
         version,
         sync_ipc_magic,
@@ -105,7 +155,7 @@ async fn check(home: FabricHome) -> Result<()> {
     else {
         bail!("the daemon returned the wrong sync compatibility response");
     };
-    let local = fabric::version_string();
+    let local = fabric_config::version_string();
     if version != local {
         bail!("fabric-sync is {local}, but the daemon is {version}");
     }
