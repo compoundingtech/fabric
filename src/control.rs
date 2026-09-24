@@ -3,6 +3,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub use fabric_config::sync::status::{
+    SyncEntryStatus, SyncPublishFile, SyncPublishedFile, SyncRuntimeStatus,
+};
+
 use crate::{
     mux::CurrentConnectionHealth,
     telemetry::{PeerTelemetry, TelemetryWindow},
@@ -120,29 +124,6 @@ pub enum ControlRequest {
         force: bool,
     },
     Shutdown,
-}
-
-/// One file of a `SyncPublish` request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SyncPublishFile {
-    /// The path inside the synced folder, in manifest form.
-    pub rel: String,
-    pub bytes: Vec<u8>,
-    #[serde(default)]
-    pub executable: bool,
-    /// The hex content hash of the published file when this was staged, or
-    /// `None` when there was no published file. The daemon refuses to publish
-    /// over a file that moved since, unless forced.
-    #[serde(default)]
-    pub base: Option<String>,
-}
-
-/// One file of a `SyncPublished` response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SyncPublishedFile {
-    pub rel: String,
-    pub version: u64,
-    pub hash: String,
 }
 
 fn default_persist() -> bool {
@@ -264,123 +245,6 @@ pub enum ControlResponse {
     },
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SyncRuntimeStatus {
-    /// `embedded`, `companion`, or `unavailable`.
-    pub owner: String,
-    /// `standby`, `active`, `absent`, `incompatible`, `timed-out`, `lease-busy`,
-    /// or `unknown`.
-    pub companion: String,
-}
-
-impl SyncRuntimeStatus {
-    pub fn new(owner: &str, companion: &str) -> Self {
-        Self {
-            owner: owner.to_string(),
-            companion: companion.to_string(),
-        }
-    }
-
-    pub fn unavailable(reason: &str) -> Self {
-        Self::new("unavailable", reason)
-    }
-}
-
-/// One configured sync entry's status, for `fabric sync ls`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SyncEntryStatus {
-    pub name: String,
-    pub folder: String,
-    pub policy: String,
-    pub peers: String,
-    /// Legacy logical-Present count retained on the local control wire so an
-    /// older client can still decode a newer daemon response.
-    pub files: usize,
-    #[serde(default)]
-    pub present: usize,
-    #[serde(default)]
-    pub tombstones: usize,
-    #[serde(default)]
-    pub observed: usize,
-    #[serde(default)]
-    pub missing: usize,
-    #[serde(default)]
-    pub unexpected: usize,
-    #[serde(default)]
-    pub mismatched: usize,
-    /// Existing paths the last scan could not read as syncable files.
-    #[serde(default)]
-    pub scan_issues: Vec<(String, String)>,
-    /// Monotonic full-folder scan attempts for this entry instance.
-    #[serde(default)]
-    pub full_scans: u64,
-    /// Monotonic exact-manifest, complete-content inbound fast paths.
-    #[serde(default)]
-    pub inbound_noop_transactions: u64,
-    /// Monotonic inbound transactions that selected guarded reconciliation.
-    #[serde(default)]
-    pub inbound_guarded_transactions: u64,
-    /// Calls to `sync_once`, and the only correct denominator for a per-pass
-    /// cost. NOT `full_scans`: `scan_entry` also runs for inbound transactions,
-    /// so no constant converts `full_scans` into a pass count.
-    #[serde(default)]
-    pub sync_passes: u64,
-    /// Cumulative microseconds inside each phase of `sync_once`. Two samples
-    /// and a division describe the present; a total describes the past.
-    #[serde(default)]
-    pub scan_micros: u64,
-    #[serde(default)]
-    pub materialize_micros: u64,
-    #[serde(default)]
-    pub persist_micros: u64,
-    #[serde(default)]
-    pub reconcile_micros: u64,
-    /// Every byte this entry put on or took off the wire, cumulative, INCLUDING
-    /// the manifest shipped on every pass. Counted client-side, so summing
-    /// across the fleet counts each transfer once.
-    #[serde(default)]
-    pub reconcile_wire_bytes: u64,
-    /// Peer reconciles that returned an error, cumulative. A number that MOVES
-    /// between two samples is a fault happening now; a large total on an old
-    /// daemon may be history.
-    #[serde(default)]
-    pub reconcile_failures: u64,
-    /// Why the tombstone sweep did or did not forget anything, as a short
-    /// stable token. Empty from a daemon that predates the field, which is why
-    /// it carries `#[serde(default)]` like the counters above.
-    #[serde(default)]
-    pub sweep: String,
-    /// Peers this entry is NOT syncing with, and why, as `peer:reason`.
-    ///
-    /// `away` is an expected roaming-peer absence. `denied` means a person must
-    /// edit `peers.toml`; `unreachable` means the network will fix itself.
-    #[serde(default)]
-    pub stopped_peers: Vec<(String, String)>,
-    /// Payloads this node SENT carrying its whole manifest, whatever the
-    /// reason: first contact, a peer too old for deltas, a restart, or a cursor
-    /// that stalled until its delta grew back to the whole manifest.
-    ///
-    /// Read it BESIDE `reconcile_wire_bytes`, which is counted on the initiator
-    /// and includes the responder's reply. High bytes with a low count here
-    /// means this machine is RECEIVING full payloads, not sending them.
-    #[serde(default)]
-    pub full_payload_sends: u64,
-    /// Bytes of file content the daemon holds in memory for this entry. It was
-    /// unbounded once, and this is the number that would have said so.
-    #[serde(default)]
-    pub content_bytes: u64,
-    /// Reconciles that fell back to full state because a payload was
-    /// incomplete. Zero is healthy. A number that RISES between two samples is a
-    /// bug report: a cursor described state a peer did not hold.
-    #[serde(default)]
-    pub delta_fallbacks: u64,
-    /// Lattice-point fingerprint of this entry's manifest. Empty from a daemon
-    /// that predates the field. Compare it ACROSS peers: equal means converged,
-    /// unequal means diverged. Counts cannot tell you this.
-    #[serde(default)]
-    pub digest: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerReachability {
     pub id: String,
@@ -399,6 +263,175 @@ pub struct PeerReachability {
 mod tests {
     use super::*;
     use crate::telemetry::{LatencySummary, PeerTelemetry};
+    use fabric_config::daemon_control::{
+        Request as CompanionRequest, Response as CompanionResponse,
+    };
+
+    /// The companion writes its two control messages without this crate. Each
+    /// must be the same JSON as the daemon's own definition, in both
+    /// directions, or a companion and a daemon of one build stop talking.
+    #[test]
+    fn the_companions_control_messages_are_the_daemons() {
+        let hello = CompanionRequest::SyncCompanionHello {
+            version: "0.2.16+abc1234".into(),
+            sync_ipc_magic: "fabric/sync-ipc".into(),
+            sync_ipc_version: 1,
+            companion_socket: Some(PathBuf::from("/home/run/sync-companion.sock")),
+        };
+        let daemon_hello = ControlRequest::SyncCompanionHello {
+            version: "0.2.16+abc1234".into(),
+            sync_ipc_magic: "fabric/sync-ipc".into(),
+            sync_ipc_version: 1,
+            companion_socket: Some(PathBuf::from("/home/run/sync-companion.sock")),
+        };
+        assert_eq!(
+            serde_json::to_value(&hello).unwrap(),
+            serde_json::to_value(&daemon_hello).unwrap()
+        );
+        let parsed: ControlRequest =
+            serde_json::from_slice(&serde_json::to_vec(&hello).unwrap()).unwrap();
+        assert!(matches!(parsed, ControlRequest::SyncCompanionHello { .. }));
+        assert_eq!(
+            serde_json::to_value(CompanionRequest::SyncIpcCompatibility).unwrap(),
+            serde_json::to_value(ControlRequest::SyncIpcCompatibility).unwrap()
+        );
+
+        for (nonce, daemon_socket, node_id) in [
+            (
+                Some("ab".repeat(24)),
+                Some(PathBuf::from("/home/run/sync-ipc.sock")),
+                Some("cd".repeat(32)),
+            ),
+            (None, None, None),
+        ] {
+            let daemon = ControlResponse::SyncIpcCompatibility {
+                version: "0.2.16+abc1234".into(),
+                sync_ipc_magic: "fabric/sync-ipc".into(),
+                sync_ipc_version: 1,
+                owner: "companion".into(),
+                nonce: nonce.clone(),
+                daemon_socket: daemon_socket.clone(),
+                node_id: node_id.clone(),
+            };
+            let companion = CompanionResponse::SyncIpcCompatibility {
+                version: "0.2.16+abc1234".into(),
+                sync_ipc_magic: "fabric/sync-ipc".into(),
+                sync_ipc_version: 1,
+                owner: "companion".into(),
+                nonce,
+                daemon_socket,
+                node_id,
+            };
+            assert_eq!(
+                serde_json::from_value::<CompanionResponse>(serde_json::to_value(&daemon).unwrap())
+                    .unwrap(),
+                companion
+            );
+            assert_eq!(
+                serde_json::to_value(&companion).unwrap(),
+                serde_json::to_value(&daemon).unwrap()
+            );
+        }
+        let error = ControlResponse::Error {
+            message: "fabric-sync 0.2.15 cannot attach to 0.2.16".into(),
+        };
+        assert_eq!(
+            serde_json::from_value::<CompanionResponse>(serde_json::to_value(&error).unwrap())
+                .unwrap(),
+            CompanionResponse::Error {
+                message: "fabric-sync 0.2.15 cannot attach to 0.2.16".into()
+            }
+        );
+        assert_eq!(
+            serde_json::from_value::<CompanionResponse>(
+                serde_json::to_value(ControlResponse::Ok).unwrap()
+            )
+            .unwrap(),
+            CompanionResponse::Ok
+        );
+        assert_eq!(
+            serde_json::from_value::<CompanionResponse>(
+                serde_json::to_value(ControlResponse::Restarting {
+                    log: PathBuf::from("/home/logs/restart.log"),
+                    allow_shell: false,
+                })
+                .unwrap()
+            )
+            .unwrap(),
+            CompanionResponse::Other
+        );
+
+        // The `fabric sync` commands' three.
+        for (companion, daemon) in [
+            (CompanionRequest::SyncReload, ControlRequest::SyncReload),
+            (CompanionRequest::SyncStatus, ControlRequest::SyncStatus),
+            (
+                CompanionRequest::SyncPublish {
+                    name: "catalog".into(),
+                    files: vec![SyncPublishFile {
+                        rel: "a/b.md".into(),
+                        bytes: b"hello".to_vec(),
+                        executable: true,
+                        base: Some("ef".repeat(32)),
+                    }],
+                    force: true,
+                },
+                ControlRequest::SyncPublish {
+                    name: "catalog".into(),
+                    files: vec![SyncPublishFile {
+                        rel: "a/b.md".into(),
+                        bytes: b"hello".to_vec(),
+                        executable: true,
+                        base: Some("ef".repeat(32)),
+                    }],
+                    force: true,
+                },
+            ),
+        ] {
+            assert_eq!(
+                serde_json::to_value(&companion).unwrap(),
+                serde_json::to_value(&daemon).unwrap()
+            );
+        }
+        let entry = SyncEntryStatus {
+            name: "catalog".into(),
+            folder: "/catalog".into(),
+            digest: "0123456789abcdef".into(),
+            stopped_peers: vec![("hetz".into(), "denied".into())],
+            sync_passes: 7,
+            ..SyncEntryStatus::default()
+        };
+        let status = ControlResponse::SyncStatus {
+            entries: vec![entry.clone()],
+            runtime: SyncRuntimeStatus::new("companion", "active"),
+        };
+        assert_eq!(
+            serde_json::from_value::<CompanionResponse>(serde_json::to_value(&status).unwrap())
+                .unwrap(),
+            CompanionResponse::SyncStatus {
+                entries: vec![entry],
+                runtime: SyncRuntimeStatus::new("companion", "active"),
+            }
+        );
+        let published = ControlResponse::SyncPublished {
+            files: vec![SyncPublishedFile {
+                rel: "a/b.md".into(),
+                version: 3,
+                hash: "ab".repeat(32),
+            }],
+        };
+        assert_eq!(
+            serde_json::from_value::<CompanionResponse>(serde_json::to_value(&published).unwrap())
+                .unwrap(),
+            CompanionResponse::SyncPublished {
+                files: vec![SyncPublishedFile {
+                    rel: "a/b.md".into(),
+                    version: 3,
+                    hash: "ab".repeat(32),
+                }],
+            }
+        );
+    }
 
     fn populated_peer() -> PeerTelemetry {
         let mut reconnect = LatencySummary::default();

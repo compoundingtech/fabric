@@ -14,7 +14,8 @@ name = "fabric-sync"
 path = "src/main.rs"
 
 [dependencies]
-fabric = { path = "../.." }
+fabric-config = { path = "../fabric-config" }
+fabric-service-api = { path = "../fabric-service-api" }
 anyhow = "1"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
@@ -30,5 +31,8 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+# Only the tests start a daemon beside the companion; the companion itself
+# reaches the daemon through its two sockets and nothing else.
+fabric = { path = "../.." }
 proptest = "1"
 tempfile = "3"

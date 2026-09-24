@@ -30,11 +30,11 @@ use tokio::{
     net::{UnixListener, UnixStream},
 };
 
+use super::status::{SyncEntryStatus, SyncPublishFile, SyncPublishedFile};
 use super::{
     SyncPeers,
     peers::{PeerRef, ResolvedPeers},
 };
-use crate::control::{SyncEntryStatus, SyncPublishFile, SyncPublishedFile};
 
 pub const IPC_MAGIC: &str = "fabric/sync-ipc/1";
 pub const IPC_VERSION: u16 = 1;

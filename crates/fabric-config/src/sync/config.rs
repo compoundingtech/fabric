@@ -15,7 +15,14 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{FabricHome, PeerBook};
+use crate::FabricHome;
+
+/// The peers a sync entry may name: the daemon's trusted peers, by their
+/// local name or their full id. The daemon's peer book implements it; sync
+/// never reads grants, only whether a selector names a peer at all.
+pub trait KnownPeers {
+    fn knows(&self, selector: &str) -> bool;
+}
 
 /// Named policy preset for a sync entry.
 ///
@@ -278,7 +285,7 @@ impl SyncBook {
     ///
     /// The wildcard remains valid when the peer list is empty. An explicit
     /// selector must match one peer by its local name or exact NodeID.
-    pub fn validate_against(&self, peers: &PeerBook) -> Result<()> {
+    pub fn validate_against(&self, peers: &impl KnownPeers) -> Result<()> {
         self.validate()?;
         if let Some((entry, selectors)) = self.unknown_explicit_selectors(peers).first() {
             bail!(
@@ -293,7 +300,7 @@ impl SyncBook {
     /// Group unknown explicit selectors by sync entry for one startup warning.
     pub fn unknown_explicit_selectors<'a>(
         &'a self,
-        peers: &PeerBook,
+        peers: &impl KnownPeers,
     ) -> Vec<(&'a str, Vec<&'a str>)> {
         self.entries
             .iter()
@@ -302,13 +309,7 @@ impl SyncBook {
                     .peers
                     .selectors()
                     .iter()
-                    .filter(|selector| {
-                        let selector = selector.as_str();
-                        !peers.peers().iter().any(|peer| {
-                            peer.name.as_deref() == Some(selector)
-                                || peer.id.to_string() == selector
-                        })
-                    })
+                    .filter(|selector| !peers.knows(selector))
                     .map(String::as_str)
                     .collect::<Vec<_>>();
                 (!unknown.is_empty()).then_some((entry.name.as_str(), unknown))
@@ -704,11 +705,21 @@ mod tests {
         );
     }
 
+    /// Peers by local name and full id, the way the daemon's peer book answers.
+    struct TrustedPeers(Vec<(&'static str, String)>);
+
+    impl KnownPeers for TrustedPeers {
+        fn knows(&self, selector: &str) -> bool {
+            self.0
+                .iter()
+                .any(|(name, id)| *name == selector || id == selector)
+        }
+    }
+
     #[test]
     fn explicit_selectors_must_name_a_trusted_peer() {
-        let mut peers = PeerBook::default();
-        let id = iroh::SecretKey::generate().public();
-        peers.add(id, Some("silber".into()), None);
+        let id = "b".repeat(64);
+        let peers = TrustedPeers(vec![("silber", id.clone())]);
 
         let by_name = parse(
             r#"
@@ -764,6 +775,6 @@ mod tests {
         )
         .unwrap();
 
-        book.validate_against(&PeerBook::default()).unwrap();
+        book.validate_against(&TrustedPeers(Vec::new())).unwrap();
     }
 }

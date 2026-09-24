@@ -14,7 +14,7 @@ use std::{
 use anyhow::{Context, Result};
 use tokio::{net::UnixStream, sync::Mutex};
 
-use fabric::sync::{
+use fabric_config::sync::{
     PeerRef, ResolvedPeers, SyncPeers,
     ipc::{IpcClient, IpcNonce, IpcStatus},
 };
@@ -111,7 +111,7 @@ mod tests {
     use std::sync::Arc;
 
     use anyhow::Result;
-    use fabric::sync::ipc::{
+    use fabric_config::sync::ipc::{
         IpcError, IpcErrorKind, IpcListener, IpcNonce, IpcPeer, IpcRequestKind, IpcResponse,
         IpcRuntimeState, IpcStatus, write_response,
     };

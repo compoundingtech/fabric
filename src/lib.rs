@@ -15,19 +15,18 @@ pub mod mux;
 pub mod pathwatch;
 pub mod service;
 pub mod services;
-pub mod sync;
+/// What the daemon shares with the sync companion, re-exported where it used
+/// to live so every `fabric::sync` path still resolves.
+pub use fabric_config::sync;
 pub mod telemetry;
 mod tunnel;
 pub mod update;
 
 const SPIKE_ALPN: &[u8] = b"fabric/spike/echo/0";
 
+/// The build this binary reports, the same string its sync companion reports.
 pub fn version_string() -> String {
-    format!(
-        "{}+{}",
-        env!("CARGO_PKG_VERSION"),
-        option_env!("FABRIC_BUILD_SHA").unwrap_or("unknown")
-    )
+    fabric_config::version_string()
 }
 
 pub async fn iroh_spike_round_trip(payload: &[u8]) -> Result<Vec<u8>> {

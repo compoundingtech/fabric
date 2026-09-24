@@ -3698,7 +3698,7 @@ async fn process_control_request(
             // wherever it runs, never reads peer policy.
             let book = SyncBook::load(&state.home)?;
             let peers = state.peer_book.read().await;
-            book.validate_against(&peers)?;
+            book.validate_against(&*peers)?;
             drop(peers);
             drop(book);
             let client = state

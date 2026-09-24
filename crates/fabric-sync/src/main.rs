@@ -1,19 +1,21 @@
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
-use clap::{ArgGroup, Parser};
-use fabric::{
-    config::FabricHome,
-    control::{ControlRequest, ControlResponse},
-    daemon::send_control,
-    sync::{SyncBook, ipc},
+use clap::{ArgGroup, Parser, Subcommand};
+use fabric_config::{
+    FabricHome,
+    daemon_control::{self, Request as ControlRequest, Response as ControlResponse},
+    sync::{SyncBook, cli::SyncCommands, ipc},
 };
 use fabric_sync::{SyncOwnerLease, SyncOwnerLeaseState, SyncPaths, companion};
+
+mod commands;
 
 #[derive(Debug, Parser)]
 #[command(name = "fabric-sync")]
 #[command(about = "The fabric file-sync companion process")]
 #[command(group(ArgGroup::new("action").required(true).multiple(false).args(["version", "check", "standby"])))]
+#[command(subcommand_negates_reqs = true)]
 struct Cli {
     /// Print the build version.
     #[arg(long)]
@@ -31,13 +33,30 @@ struct Cli {
     /// Use an isolated fabric state root.
     #[arg(long, global = true)]
     home: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// List sync entries, and stage and publish changes to synced files; the
+    /// same commands as `fabric sync`, which hands them here.
+    Sync {
+        #[command(subcommand)]
+        command: SyncCommands,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(Command::Sync { command }) = cli.command {
+        let home = FabricHome::resolve(cli.home)?;
+        return commands::run(&home, command).await;
+    }
     if cli.version {
-        println!("{}", fabric::version_string());
+        println!("{}", fabric_config::version_string());
         return Ok(());
     }
     let home = FabricHome::resolve(cli.home)?;
@@ -94,7 +113,7 @@ async fn check(home: FabricHome) -> Result<()> {
     println!("state\tok\t{}", paths.state_root().display());
     println!("owner\t{}", lease_name(lease));
 
-    let response = send_control(&home, ControlRequest::SyncIpcCompatibility).await?;
+    let response = daemon_control::send(&home, ControlRequest::SyncIpcCompatibility).await?;
     let ControlResponse::SyncIpcCompatibility {
         version,
         sync_ipc_magic,
@@ -105,7 +124,7 @@ async fn check(home: FabricHome) -> Result<()> {
     else {
         bail!("the daemon returned the wrong sync compatibility response");
     };
-    let local = fabric::version_string();
+    let local = fabric_config::version_string();
     if version != local {
         bail!("fabric-sync is {local}, but the daemon is {version}");
     }

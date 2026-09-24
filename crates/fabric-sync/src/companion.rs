@@ -1,8 +1,8 @@
 //! The sync companion runtime: the engine, hosted outside the daemon.
 //!
 //! `fabric-sync` runs this under the OS service manager. Tests run it in
-//! process beside a [`fabric::daemon::FabricNode`]. Either way it is the same
-//! code on the same two sockets, so what a test proves is what production runs.
+//! process beside a daemon. Either way it is the same code on the same two
+//! sockets, so what a test proves is what production runs.
 //!
 //! The runtime has one loop that talks to the daemon and one listener that the
 //! daemon talks to. Every ten seconds it sends a hello over the control socket.
@@ -31,10 +31,9 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{SyncEngine, SyncPaths, manifest::Author, transport::IpcSyncTransport};
-use fabric::{
-    config::FabricHome,
-    control::{ControlRequest, ControlResponse},
-    daemon::send_control,
+use fabric_config::{
+    FabricHome,
+    daemon_control::{self, Request as ControlRequest, Response as ControlResponse},
     sync::ipc::{
         self, IpcClient, IpcError, IpcErrorKind, IpcListener, IpcNonce, IpcRequest,
         IpcRequestKind, IpcResponse, IpcRuntimeState, IpcStatus,
@@ -165,68 +164,6 @@ impl CompanionHandle {
     }
 }
 
-/// A daemon and its companion, started together in one process.
-///
-/// The harness shape for every test that needs sync: the daemon delegates, the
-/// companion in this process owns it, and both go through the same two
-/// sockets production uses. Derefs to the node so a test reads ids, addresses
-/// and state as before; `shutdown` stops the companion first so the lease is
-/// free before the daemon goes.
-pub struct HostedNode {
-    node: fabric::daemon::FabricNode,
-    companion: Option<CompanionHandle>,
-}
-
-impl HostedNode {
-    pub async fn start(home: FabricHome) -> Result<Self> {
-        Self::start_with_options(home, fabric::daemon::DaemonOptions::default()).await
-    }
-
-    pub async fn start_with_options(
-        home: FabricHome,
-        options: fabric::daemon::DaemonOptions,
-    ) -> Result<Self> {
-        let node = fabric::daemon::FabricNode::start_with_daemon_options(home.clone(), options).await?;
-        let handle = start(home).await?;
-        handle.wait_until_active(Duration::from_secs(30)).await?;
-        Ok(Self {
-            node,
-            companion: Some(handle),
-        })
-    }
-
-    pub fn node(&self) -> &fabric::daemon::FabricNode {
-        &self.node
-    }
-
-    pub fn companion(&self) -> Option<&CompanionHandle> {
-        self.companion.as_ref()
-    }
-
-    /// The engine, wherever it runs, for a test that drives a pass on purpose.
-    pub async fn engine(&self) -> Option<Arc<SyncEngine<IpcSyncTransport>>> {
-        match &self.companion {
-            Some(companion) => companion.engine().await,
-            None => None,
-        }
-    }
-
-    pub async fn shutdown(self) -> Result<()> {
-        if let Some(companion) = self.companion {
-            companion.shutdown().await?;
-        }
-        self.node.shutdown().await
-    }
-}
-
-impl std::ops::Deref for HostedNode {
-    type Target = fabric::daemon::FabricNode;
-
-    fn deref(&self) -> &Self::Target {
-        &self.node
-    }
-}
-
 /// Start the companion runtime for `home`.
 ///
 /// Binds the companion's bridge socket and begins the heartbeat. Returns as
@@ -297,12 +234,12 @@ impl Companion {
 
     async fn heartbeat(&self) -> CompanionPhase {
         let request = ControlRequest::SyncCompanionHello {
-            version: fabric::version_string(),
+            version: fabric_config::version_string(),
             sync_ipc_magic: ipc::IPC_MAGIC.to_string(),
             sync_ipc_version: ipc::IPC_VERSION,
             companion_socket: Some(self.home.sync_companion_socket_path()),
         };
-        match send_control(&self.home, request).await {
+        match daemon_control::send(&self.home, request).await {
             Ok(ControlResponse::SyncIpcCompatibility {
                 owner,
                 nonce,
@@ -559,7 +496,7 @@ impl Companion {
                             request_id,
                             published
                                 .into_iter()
-                                .map(|file| fabric::control::SyncPublishedFile {
+                                .map(|file| fabric_config::sync::status::SyncPublishedFile {
                                     rel: file.rel,
                                     version: file.version,
                                     hash: file.hash.to_hex(),
@@ -620,20 +557,20 @@ async fn refuse(stream: &mut UnixStream, request_id: u64, message: &str) -> Resu
 }
 
 fn publish_files(
-    files: Vec<fabric::control::SyncPublishFile>,
-) -> Result<Vec<fabric::sync::staging::PublishFile>> {
+    files: Vec<fabric_config::sync::status::SyncPublishFile>,
+) -> Result<Vec<fabric_config::sync::staging::PublishFile>> {
     files
         .into_iter()
         .map(|file| {
             let base = match file.base {
                 Some(hex) => Some(
-                    fabric::sync::ContentHash::from_hex(&hex).ok_or_else(|| {
+                    fabric_config::sync::ContentHash::from_hex(&hex).ok_or_else(|| {
                         anyhow::anyhow!("{}: the base is not a content hash", file.rel)
                     })?,
                 ),
                 None => None,
             };
-            Ok(fabric::sync::staging::PublishFile {
+            Ok(fabric_config::sync::staging::PublishFile {
                 rel: file.rel,
                 bytes: file.bytes,
                 executable: file.executable,

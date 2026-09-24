@@ -30,7 +30,7 @@ use tokio::sync::Mutex;
 
 use super::manifest::{ContentHash, Manifest};
 use super::node::{Reconciled, SyncNode, content_hash};
-use fabric::sync::frame::{
+use fabric_config::sync::frame::{
     MAX_JSON_FRAME, read_len_bytes, read_u32, write_len_bytes, write_u32,
 };
 
@@ -113,8 +113,8 @@ fn validate_blobs(blobs: &[(ContentHash, Vec<u8>)]) -> Result<()> {
     Ok(())
 }
 
-pub use fabric::sync::frame::SYNC_UNAVAILABLE_MARKER;
-use fabric::sync::frame::write_error_reply;
+pub use fabric_config::sync::frame::SYNC_UNAVAILABLE_MARKER;
+use fabric_config::sync::frame::write_error_reply;
 
 /// A content bundle read from the wire: how many blobs stored and their bytes.
 #[derive(Debug, Clone, Copy, Default)]
@@ -568,7 +568,7 @@ where
     Fut: std::future::Future<Output = Result<Option<(Arc<Mutex<SyncNode>>, C)>>>,
 {
     run_server(
-        fabric::sync::frame::idle_timeout_stream(stream, peer, idle_timeout),
+        fabric_config::sync::frame::idle_timeout_stream(stream, peer, idle_timeout),
         peer,
         resolve,
     )
@@ -1151,7 +1151,7 @@ mod tests {
         };
 
         reconcile(a.clone(), b.clone()).await;
-        let bus = fabric::sync::config::PolicyRules {
+        let bus = fabric_config::sync::config::PolicyRules {
             propagate_deletes: true,
             sweep_tombstones: true,
         };
