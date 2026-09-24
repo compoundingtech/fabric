@@ -1,6 +1,6 @@
 [package]
 name = "fabric-config"
-version = "0.2.16"
+version = "0.2.17"
 edition = "2024"
 description = "The files and local contracts the fabric daemon and its sync companion share"
 repository = "https://github.com/compoundingtech/fabric"
