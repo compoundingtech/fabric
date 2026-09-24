@@ -969,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "fabric"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1005,7 +1005,7 @@ dependencies = [
 
 [[package]]
 name = "fabric-service-api"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "anyhow",
  "tokio",
@@ -1014,7 +1014,7 @@ dependencies = [
 
 [[package]]
 name = "fabric-sync"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "anyhow",
  "blake3",

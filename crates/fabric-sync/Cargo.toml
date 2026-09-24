@@ -1,6 +1,6 @@
 [package]
 name = "fabric-sync"
-version = "0.2.15"
+version = "0.2.16"
 edition = "2024"
 description = "The fabric file-sync engine and its supervised companion process"
 repository = "https://github.com/compoundingtech/fabric"
