@@ -23,11 +23,12 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+use fabric_service_api::{PeerStream, Service};
+
 use crate::{
     config::{FabricHome, PeerBook},
     daemon::CurrentEndpoint,
     mux::{MuxStream, PeerConnections, StreamActivity},
-    shell,
 };
 
 // Resumable byte tunnel used by generic `fabric dial` sockets. Each local Unix
@@ -71,9 +72,18 @@ pub enum ServerTarget {
         argv: Vec<String>,
         limit: Arc<ExecLimit>,
     },
-    Shell {
-        allowed: bool,
-    },
+    /// A registered service, served on the session's byte stream.
+    Service(ServiceTarget),
+}
+
+/// A service as a tunnel target.
+#[derive(Clone)]
+pub struct ServiceTarget(pub Arc<dyn Service>);
+
+impl fmt::Debug for ServiceTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ServiceTarget").field(&self.0.name()).finish()
+    }
 }
 
 #[derive(Debug)]
@@ -1938,38 +1948,33 @@ async fn create_server_session(
         ServerTarget::Exec { argv, limit } => {
             spawn_exec_session(session_id, peer_id, argv, limit).await
         }
-        ServerTarget::Shell { allowed } => spawn_shell_session(session_id, peer_id, allowed).await,
+        ServerTarget::Service(ServiceTarget(service)) => {
+            spawn_service_session(session_id, peer_id, service).await
+        }
     }
 }
 
-async fn spawn_shell_session(
+async fn spawn_service_session(
     session_id: TunnelSessionId,
     peer_id: EndpointId,
-    allowed: bool,
+    service: Arc<dyn Service>,
 ) -> Result<(Arc<TunnelSession>, LocalRead)> {
-    let (service, tunnel) = tokio::io::duplex(64 * 1024);
-    let (service_read, service_write) = tokio::io::split(service);
+    let (service_end, tunnel) = tokio::io::duplex(64 * 1024);
+    let (service_read, service_write) = tokio::io::split(service_end);
     let (tunnel_read, tunnel_write) = tokio::io::split(tunnel);
     let kill = CancellationToken::new();
-    let shell_kill = kill.clone();
+    let name = service.name();
+    let serving = service.serve(PeerStream {
+        peer: peer_id.to_string(),
+        read: Box::new(service_read),
+        write: Box::new(service_write),
+        closed: kill.clone(),
+        grants: None,
+    });
     tokio::spawn(async move {
-        let mut read = service_read;
-        let mut write = service_write;
-        let result = if allowed {
-            shell::serve_shell_session_until(
-                &mut read,
-                &mut write,
-                &peer_id.to_string(),
-                shell_kill,
-            )
-            .await
-        } else {
-            shell::serve_shell_disabled(&mut write).await
-        };
-        if let Err(error) = result {
-            eprintln!("fabric: shell session {session_id} failed: {error:#}");
+        if let Err(error) = serving.await {
+            eprintln!("fabric: {name} session {session_id} failed: {error:#}");
         }
-        let _ = write.shutdown().await;
     });
 
     Ok(TunnelSession::new_parts_with_cleanup(

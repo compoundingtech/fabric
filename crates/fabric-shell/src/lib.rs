@@ -1,9 +1,13 @@
+//! `fabric shell`: a login shell on a peer's PTY, the terminal handling on the
+//! local side, and the service that serves it.
+
 use std::{
     io::{Read, Write},
     sync::mpsc as std_mpsc,
 };
 
 use anyhow::{Context, Result, bail};
+use fabric_service_api::{BoxFuture, Bridge, Notice, PeerStream, Protocol, Service};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -17,6 +21,13 @@ pub const SHELL_ALPN: &[u8] = b"fabric/shell/0";
 pub const SHELL_PROTOCOL: &str = "fabric/shell/0";
 /// Resumable shell framing carried by the generic tunnel session protocol.
 pub const RESUMABLE_SHELL_ALPN: &[u8] = b"fabric/shell/1";
+/// The word a peer's allow array uses for this service. Both wire versions
+/// answer to it: a permission is about the service, not about which version
+/// negotiated it.
+pub const SERVICE: &str = "shell";
+
+pub mod client;
+pub mod terminal;
 
 const MAX_FRAME_LEN: usize = 1024 * 1024;
 const CLIENT_STDIN: u8 = 1;
@@ -26,7 +37,7 @@ const SERVER_OUTPUT: u8 = 17;
 const SERVER_EXIT: u8 = 18;
 const SERVER_ERROR: u8 = 19;
 const SERVER_STATUS: u8 = 20;
-pub(crate) const EXIT_SHELL_DISABLED: i32 = 126;
+pub const EXIT_SHELL_DISABLED: i32 = fabric_service_api::REFUSED_EXIT_CODE;
 
 #[derive(Debug)]
 pub enum ClientFrame {
@@ -56,7 +67,7 @@ where
 }
 
 /// Send a complete failure response when a shell session cannot start.
-pub(crate) async fn serve_shell_failure<W>(
+pub async fn serve_shell_failure<W>(
     send: &mut W,
     message: &str,
     exit_code: i32,
@@ -66,6 +77,94 @@ where
 {
     write_server_frame(send, ServerFrame::Error(message.to_string())).await?;
     write_server_frame(send, ServerFrame::Exit(exit_code)).await
+}
+
+const PROTOCOLS: &[Protocol] = &[
+    Protocol {
+        alpn: RESUMABLE_SHELL_ALPN,
+        resumable: true,
+        accept_event: "builtin_resumable_shell_accept",
+    },
+    Protocol {
+        alpn: SHELL_ALPN,
+        resumable: false,
+        accept_event: "builtin_legacy_shell_accept",
+    },
+];
+
+/// The shell service, as the base network sees it.
+#[derive(Debug, Default)]
+pub struct Shell;
+
+impl Service for Shell {
+    fn name(&self) -> &'static str {
+        SERVICE
+    }
+
+    fn protocols(&self) -> &'static [Protocol] {
+        PROTOCOLS
+    }
+
+    /// One PTY per stream. Inside a resumable session the stream is the
+    /// session's, and `closed` ends the PTY when the session is reaped.
+    fn serve(&self, stream: PeerStream) -> BoxFuture<'static, Result<()>> {
+        Box::pin(async move {
+            let PeerStream {
+                peer,
+                mut read,
+                mut write,
+                closed,
+                ..
+            } = stream;
+            serve_shell_session_until(&mut read, &mut write, &peer, closed).await?;
+            write.shutdown().await?;
+            Ok(())
+        })
+    }
+
+    fn notice(&self, notice: &Notice<'_>) -> Option<Vec<u8>> {
+        let encoded = match notice {
+            Notice::Refused { error } => {
+                let mut bytes =
+                    encode_server_error(&format!("refused service \"shell\": {error}")).ok()?;
+                bytes.extend(encode_frame(SERVER_EXIT, &EXIT_SHELL_DISABLED.to_be_bytes()).ok()?);
+                return Some(bytes);
+            }
+            Notice::Unavailable { .. } => return None,
+            Notice::FallingBack => {
+                encode_server_status("peer does not support resumable shell; using legacy shell/0")
+            }
+            Notice::Probing { error, delay } => encode_server_status(&format!(
+                "connection unavailable ({error}); probing remote shell protocol again in {:.1}s",
+                delay.as_secs_f32()
+            )),
+            Notice::RetryingFallback { error, delay } => encode_server_status(&format!(
+                "legacy shell unavailable ({error}); retrying before session start in {:.1}s",
+                delay.as_secs_f32()
+            )),
+            Notice::Reconnecting {
+                error,
+                attempt,
+                delay,
+            } => encode_server_status(&format!(
+                "connection lost ({error}); reconnecting attempt {attempt} in {:.1}s",
+                delay.as_secs_f32()
+            )),
+            Notice::Resumed => {
+                encode_server_status("connection restored; remote shell session resumed")
+            }
+            Notice::ResumeFailed { error } => {
+                encode_server_error(&format!("remote shell could not resume: {error}"))
+            }
+        };
+        encoded.ok()
+    }
+
+    /// A refusal arrives as Error and Exit on a stream whose request side the
+    /// peer already closed.
+    fn bridge(&self) -> Bridge {
+        Bridge::WholeReply
+    }
 }
 
 pub async fn serve_shell_session<R, W>(recv: &mut R, send: &mut W, peer: &str) -> Result<()>
@@ -319,7 +418,69 @@ fn encode_frame(kind: u8, payload: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServerFrame, encode_server_status, read_server_frame};
+    use super::{Notice, Service, Shell, ServerFrame, encode_server_status, read_server_frame};
+    use std::time::Duration;
+
+    async fn frames(bytes: Vec<u8>) -> Vec<ServerFrame> {
+        let mut read = bytes.as_slice();
+        let mut frames = Vec::new();
+        while let Some(frame) = read_server_frame(&mut read).await.unwrap() {
+            frames.push(frame);
+        }
+        frames
+    }
+
+    async fn only_status(notice: Notice<'_>) -> String {
+        match frames(Shell.notice(&notice).unwrap()).await.as_slice() {
+            [ServerFrame::Status(message)] => message.clone(),
+            other => panic!("expected one status frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_reaches_the_terminal_as_error_then_126() {
+        let bytes = Shell.notice(&Notice::Refused { error: "no" }).unwrap();
+        assert!(matches!(
+            frames(bytes).await.as_slice(),
+            [ServerFrame::Error(message), ServerFrame::Exit(126)]
+                if message == "refused service \"shell\": no"
+        ));
+    }
+
+    #[tokio::test]
+    async fn waits_in_progress_read_as_they_always_have() {
+        let delay = Duration::from_millis(2_500);
+        assert_eq!(
+            only_status(Notice::FallingBack).await,
+            "peer does not support resumable shell; using legacy shell/0"
+        );
+        assert_eq!(
+            only_status(Notice::Probing { error: "gone: reset", delay }).await,
+            "connection unavailable (gone: reset); probing remote shell protocol again in 2.5s"
+        );
+        assert_eq!(
+            only_status(Notice::RetryingFallback { error: "gone", delay }).await,
+            "legacy shell unavailable (gone); retrying before session start in 2.5s"
+        );
+        assert_eq!(
+            only_status(Notice::Reconnecting { error: "lost", attempt: 3, delay }).await,
+            "connection lost (lost); reconnecting attempt 3 in 2.5s"
+        );
+        assert_eq!(
+            only_status(Notice::Resumed).await,
+            "connection restored; remote shell session resumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_that_cannot_resume_is_an_error() {
+        let bytes = Shell.notice(&Notice::ResumeFailed { error: "expired" }).unwrap();
+        assert!(matches!(
+            frames(bytes).await.as_slice(),
+            [ServerFrame::Error(message)] if message == "remote shell could not resume: expired"
+        ));
+        assert!(Shell.notice(&Notice::Unavailable { error: "x" }).is_none());
+    }
 
     #[tokio::test]
     async fn reconnect_status_frame_round_trips() {

@@ -27,7 +27,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::config::FabricHome;
+use fabric_service_api::{BoxFuture, PeerStream, Protocol, Service};
 
 pub const SEND_FILE_ALPN: &[u8] = b"fabric/send-file/0";
 
@@ -44,6 +44,59 @@ pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 
+/// Under `fabric::`, so the daemon's log filter admits these lines.
+const LOG_TARGET: &str = "fabric::send_file";
+
+const PROTOCOLS: &[Protocol] = &[Protocol {
+    alpn: SEND_FILE_ALPN,
+    resumable: false,
+    accept_event: "send_file_accept",
+}];
+
+/// The receiving side: every file from a peer lands in that peer's directory
+/// under `inbox`.
+#[derive(Debug, Clone)]
+pub struct SendFile {
+    inbox: PathBuf,
+}
+
+impl SendFile {
+    pub fn new(inbox: PathBuf) -> Self {
+        Self { inbox }
+    }
+}
+
+impl Service for SendFile {
+    fn name(&self) -> &'static str {
+        SERVICE
+    }
+
+    fn protocols(&self) -> &'static [Protocol] {
+        PROTOCOLS
+    }
+
+    /// The peer's own id names the inbox, taken from the authenticated stream
+    /// rather than from anything the sender said, so a peer cannot choose where
+    /// its files land.
+    fn serve(&self, stream: PeerStream) -> BoxFuture<'static, Result<()>> {
+        let inbox = self.inbox.clone();
+        Box::pin(async move {
+            let PeerStream {
+                peer, read, write, ..
+            } = stream;
+            match receive(tokio::io::join(read, write), &inbox, &peer).await {
+                Ok(path) => {
+                    tracing::info!(target: LOG_TARGET, peer = %peer, path = %path.display(), "received a file");
+                }
+                Err(error) => {
+                    tracing::debug!(target: LOG_TARGET, peer = %peer, %error, "refused or failed to receive a file");
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Header {
     /// A RELATIVE path inside the receiver's inbox. Never absolute, never with
@@ -53,8 +106,8 @@ struct Header {
 }
 
 /// Where files from `peer` arrive.
-pub fn inbox_for(home: &FabricHome, peer: &str) -> PathBuf {
-    home.root().join("inbox").join(sanitize_peer(peer))
+pub fn inbox_for(inbox: &Path, peer: &str) -> PathBuf {
+    inbox.join(sanitize_peer(peer))
 }
 
 /// A peer's directory name, with anything path-shaped removed.
@@ -104,7 +157,7 @@ pub fn name_is_safe(name: &str) -> bool {
 }
 
 /// Resolve where a named file lands, refusing anything that escapes.
-pub fn destination(home: &FabricHome, peer: &str, name: &str) -> Result<PathBuf> {
+pub fn destination(inbox: &Path, peer: &str, name: &str) -> Result<PathBuf> {
     if !name_is_safe(name) {
         bail!(
             "{name:?} is not a name this can write. A destination must be a \
@@ -112,7 +165,7 @@ pub fn destination(home: &FabricHome, peer: &str, name: &str) -> Result<PathBuf>
              the inbox for the peer that sent it"
         );
     }
-    Ok(inbox_for(home, peer).join(name))
+    Ok(inbox_for(inbox, peer).join(name))
 }
 
 /// Send one file from a path, streaming it. The initiating half.
@@ -197,7 +250,7 @@ where
 /// Receive one file. The accepting half.
 ///
 /// Returns where it landed.
-pub async fn receive<S>(mut stream: S, home: &FabricHome, peer: &str) -> Result<PathBuf>
+pub async fn receive<S>(mut stream: S, inbox: &Path, peer: &str) -> Result<PathBuf>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -219,7 +272,7 @@ where
     }
     // THE CHECK THAT MATTERS. The sender ran one too, and that one is a
     // courtesy; this one is the boundary.
-    let target = destination(home, peer, &header.name)?;
+    let target = destination(inbox, peer, &header.name)?;
 
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)
@@ -280,8 +333,8 @@ mod tests {
     #[test]
     fn a_peer_calling_itself_a_path_cannot_escape_the_inbox() {
         let dir = tempfile::tempdir().unwrap();
-        let home = FabricHome::new(dir.path());
-        let inbox_root = home.root().join("inbox");
+        let home = dir.path().join("inbox");
+        let inbox_root = home.clone();
         for hostile in ["../..", "/etc", "..", "a/../../b"] {
             let path = inbox_for(&home, hostile);
             assert!(
@@ -297,7 +350,7 @@ mod tests {
     #[test]
     fn a_destination_always_lands_inside_the_peers_inbox() {
         let dir = tempfile::tempdir().unwrap();
-        let home = FabricHome::new(dir.path());
+        let home = dir.path().join("inbox");
         let inbox = inbox_for(&home, "hetz");
 
         let ok = destination(&home, "hetz", "sub/notes.md").unwrap();
@@ -314,11 +367,11 @@ mod tests {
     #[tokio::test]
     async fn a_file_arrives_intact_and_where_it_was_addressed() {
         let dir = tempfile::tempdir().unwrap();
-        let home = FabricHome::new(dir.path());
+        let home = dir.path().join("inbox");
         let payload: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
 
         let (client, server) = tokio::io::duplex(1 << 20);
-        let home_for_server = FabricHome::new(dir.path());
+        let home_for_server = dir.path().join("inbox");
         let receiver =
             tokio::spawn(async move { receive(server, &home_for_server, "hetz").await });
         send(client, "sub/notes.bin", &payload).await.unwrap();
@@ -343,7 +396,7 @@ mod tests {
         let payload: Vec<u8> = (0..(5 * 1024 * 1024u32)).map(|i| (i % 251) as u8).collect();
 
         let (client, server) = tokio::io::duplex(64 * 1024);
-        let home_for_server = FabricHome::new(dir.path());
+        let home_for_server = dir.path().join("inbox");
         let receiver =
             tokio::spawn(async move { receive(server, &home_for_server, "hetz").await });
         // send_from_reader with a reader (not a held slice) is the streaming API
@@ -362,9 +415,9 @@ mod tests {
     #[tokio::test]
     async fn a_short_stream_is_refused_and_leaves_no_file() {
         let dir = tempfile::tempdir().unwrap();
-        let home = FabricHome::new(dir.path());
+        let home = dir.path().join("inbox");
         let (mut client, server) = tokio::io::duplex(1 << 16);
-        let home_for_server = FabricHome::new(dir.path());
+        let home_for_server = dir.path().join("inbox");
         let receiver =
             tokio::spawn(async move { receive(server, &home_for_server, "hetz").await });
 
@@ -398,10 +451,9 @@ mod tests {
     #[tokio::test]
     async fn the_receiver_refuses_an_escape_the_sender_did_not_catch() {
         let dir = tempfile::tempdir().unwrap();
-        let home = FabricHome::new(dir.path());
 
         let (mut client, server) = tokio::io::duplex(1 << 16);
-        let home_for_server = FabricHome::new(dir.path());
+        let home_for_server = dir.path().join("inbox");
         let receiver =
             tokio::spawn(async move { receive(server, &home_for_server, "hetz").await });
 
@@ -425,7 +477,7 @@ mod tests {
             "the receiver accepted a path that escapes its inbox"
         );
         assert!(
-            !home.root().join("../../escaped.txt").exists(),
+            !dir.path().join("../../escaped.txt").exists(),
             "a file was written outside the inbox"
         );
     }

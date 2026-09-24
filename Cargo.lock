@@ -975,6 +975,11 @@ dependencies = [
  "blake3",
  "clap",
  "crossterm",
+ "fabric-exec",
+ "fabric-git",
+ "fabric-send-file",
+ "fabric-service-api",
+ "fabric-shell",
  "flate2",
  "iroh",
  "libc",
@@ -1000,6 +1005,64 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "fabric-exec"
+version = "0.2.15"
+dependencies = [
+ "anyhow",
+ "fabric-service-api",
+ "libc",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "fabric-git"
+version = "0.2.15"
+dependencies = [
+ "anyhow",
+ "fabric-service-api",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "fabric-send-file"
+version = "0.2.15"
+dependencies = [
+ "anyhow",
+ "fabric-service-api",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "fabric-service-api"
+version = "0.2.15"
+dependencies = [
+ "anyhow",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "fabric-shell"
+version = "0.2.15"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "fabric-service-api",
+ "libc",
+ "portable-pty",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

@@ -11,8 +11,8 @@ use anyhow::{Context, Result, bail};
 use fabric::{
     config::{FabricHome, PeerBook},
     daemon::{DaemonOptions, FabricNode},
-    shell::{self, ServerFrame},
 };
+use fabric_shell::{self as shell, ServerFrame};
 use iroh::{
     Endpoint,
     endpoint::{Connection, presets},

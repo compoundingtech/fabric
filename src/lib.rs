@@ -10,17 +10,13 @@ pub mod config;
 pub mod control;
 pub mod daemon;
 pub mod doctor;
-pub mod exec;
-pub mod gitremote;
 pub mod join;
 pub mod mux;
 pub mod pathwatch;
-pub mod sendfile;
 pub mod service;
-pub mod shell;
+pub mod services;
 pub mod sync;
 pub mod telemetry;
-pub mod terminal;
 mod tunnel;
 pub mod update;
 

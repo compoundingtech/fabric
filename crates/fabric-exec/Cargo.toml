@@ -1,0 +1,16 @@
+[package]
+name = "fabric-exec"
+version = "0.2.15"
+edition = "2024"
+description = "fabric exec: run one command on a peer and return its output and exit status"
+repository = "https://github.com/compoundingtech/fabric"
+
+[dependencies]
+fabric-service-api = { path = "../fabric-service-api" }
+anyhow = "1"
+tokio = { version = "1", features = ["io-util", "io-std", "process", "time", "macros", "rt"] }
+
+[dev-dependencies]
+libc = "0.2"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }

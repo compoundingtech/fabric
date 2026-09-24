@@ -1,7 +1,16 @@
 [workspace]
-members = [".", "crates/fabric-sync"]
+members = [
+    ".",
+    "crates/fabric-sync",
+    "crates/fabric-service-api",
+    "crates/fabric-exec",
+    "crates/fabric-git",
+    "crates/fabric-send-file",
+    "crates/fabric-shell",
+]
 # `cargo build` at the root builds both binaries, which is what the release
-# workflow, the nix package, and a plain checkout expect.
+# workflow, the nix package, and a plain checkout expect. The service crates
+# are libraries the fabric binary links, so building it builds them.
 default-members = [".", "crates/fabric-sync"]
 
 [package]
@@ -12,6 +21,11 @@ description = "Local socket facade for iroh-backed cross-machine transports"
 repository = "https://github.com/compoundingtech/fabric"
 
 [dependencies]
+fabric-service-api = { path = "crates/fabric-service-api" }
+fabric-exec = { path = "crates/fabric-exec" }
+fabric-git = { path = "crates/fabric-git" }
+fabric-send-file = { path = "crates/fabric-send-file" }
+fabric-shell = { path = "crates/fabric-shell" }
 anyhow = "1"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
