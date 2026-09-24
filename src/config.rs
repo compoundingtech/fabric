@@ -351,12 +351,13 @@ pub enum GitAccess {
 }
 
 impl GitAccess {
+    /// The grant this access needs on `remote`, in the Git service's words.
     pub fn permission(self, remote: &str) -> String {
         let operation = match self {
-            Self::Read => "read",
-            Self::Write => "write",
+            Self::Read => crate::services::git::GitOperation::Read,
+            Self::Write => crate::services::git::GitOperation::Write,
         };
-        format!("git/{remote}/{operation}")
+        operation.permission(remote)
     }
 }
 
@@ -1315,23 +1316,9 @@ fn assign_table_positions(table: &mut Table, next_position: &mut isize) {
     }
 }
 
+/// The Git service's rule for a shared remote's name.
 pub fn validate_git_remote_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        bail!("Git remote name cannot be empty");
-    }
-    if name.len() > 64 {
-        bail!("Git remote name must be 64 bytes or less");
-    }
-    if matches!(name, "." | "..") {
-        bail!("Git remote name cannot be a dot segment");
-    }
-    if !name
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-    {
-        bail!("Git remote name may contain only ASCII letters, digits, dot, underscore, and dash");
-    }
-    Ok(())
+    crate::services::git::validate_remote_name(name)
 }
 
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {

@@ -928,7 +928,7 @@ pub async fn supervise_restart(
             crate::service::restore_after_update_rollback(home, installed, companion_exists)
         },
     )?;
-    if let Err(error) = crate::gitremote::install_helper_for(&installed_path) {
+    if let Err(error) = crate::services::git::install_helper_for(&installed_path) {
         eprintln!("supervise\tGit helper repair failed: {error:#}");
     }
     if crate::service::wait_for_control_socket(home, SUPERVISE_READY_TIMEOUT) {
@@ -1620,7 +1620,7 @@ pub async fn run(home: &crate::config::FabricHome, options: UpdateOptions) -> Re
         return Ok(0);
     }
 
-    if let Err(error) = crate::gitremote::validate_helper_install(&installed_path) {
+    if let Err(error) = crate::services::git::validate_helper_install(&installed_path) {
         let _ = std::fs::remove_file(&staged);
         if let Some(path) = &staged_companion {
             let _ = std::fs::remove_file(path);
@@ -1672,7 +1672,7 @@ pub async fn run(home: &crate::config::FabricHome, options: UpdateOptions) -> Re
             return Err(error);
         }
     };
-    let helper = crate::gitremote::install_helper_for(&installed_path)?;
+    let helper = crate::services::git::install_helper_for(&installed_path)?;
     println!("installed\t{}", binary_version(&installed_path)?);
     if companion_path.exists() {
         println!("companion\t{}", binary_version(&companion_path)?);
@@ -1764,7 +1764,7 @@ async fn roll_back(
     } else {
         None
     };
-    if let Err(error) = crate::gitremote::validate_helper_install(installed_path) {
+    if let Err(error) = crate::services::git::validate_helper_install(installed_path) {
         let _ = std::fs::remove_file(&staged);
         if let Some(path) = &staged_companion {
             let _ = std::fs::remove_file(path);
@@ -1782,7 +1782,7 @@ async fn roll_back(
             return Err(error.context("fabric could not be rolled back; fabric-sync was restored"));
         }
     };
-    let helper = crate::gitremote::install_helper_for(installed_path)?;
+    let helper = crate::services::git::install_helper_for(installed_path)?;
     println!("installed\t{}", binary_version(installed_path)?);
     if companion_path.exists() {
         println!("companion\t{}", binary_version(&companion_path)?);

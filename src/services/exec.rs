@@ -12,6 +12,7 @@
 //! `exec`. An omitted grant denies the service.
 
 use anyhow::{Context, Result, bail};
+use fabric_service_api::{BoxFuture, Bridge, Notice, PeerStream, Protocol, Service};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     process::Command,
@@ -19,6 +20,8 @@ use tokio::{
 
 pub const EXEC_ALPN: &[u8] = b"fabric/exec/0";
 pub const EXEC_PROTOCOL: &str = "fabric/exec/0";
+/// The word a peer's allow array uses for this service.
+pub const SERVICE: &str = "exec";
 
 const MAX_FRAME_LEN: usize = 1024 * 1024;
 const CLIENT_ARGV: u8 = 1;
@@ -28,7 +31,7 @@ const SERVER_EXIT: u8 = 19;
 const SERVER_ERROR: u8 = 20;
 
 /// Exit code sent when policy refuses exec (mirrors `shell`'s 126).
-pub(crate) const EXIT_EXEC_DISABLED: i32 = 126;
+pub const EXIT_EXEC_DISABLED: i32 = fabric_service_api::REFUSED_EXIT_CODE;
 /// Exit code sent when the requested command could not be spawned (mirrors sh 127).
 const EXIT_SPAWN_FAILED: i32 = 127;
 /// How long to keep forwarding pipe output after the command has exited. The
@@ -58,16 +61,123 @@ where
 }
 
 /// Send a complete failure response when exec cannot start a remote command.
-pub(crate) async fn serve_exec_failure<W>(
-    send: &mut W,
-    message: &str,
-    exit_code: i32,
-) -> Result<()>
+pub async fn serve_exec_failure<W>(send: &mut W, message: &str, exit_code: i32) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     write_server_frame(send, ServerFrame::Error(message.to_string())).await?;
     write_server_frame(send, ServerFrame::Exit(exit_code)).await
+}
+
+const PROTOCOLS: &[Protocol] = &[Protocol {
+    alpn: EXEC_ALPN,
+    resumable: false,
+    accept_event: "builtin_exec_accept",
+}];
+
+/// The exec service, as the base network sees it.
+#[derive(Debug, Default)]
+pub struct Exec;
+
+impl Service for Exec {
+    fn name(&self) -> &'static str {
+        SERVICE
+    }
+
+    fn protocols(&self) -> &'static [Protocol] {
+        PROTOCOLS
+    }
+
+    fn serve(&self, stream: PeerStream) -> BoxFuture<'static, Result<()>> {
+        Box::pin(async move {
+            let PeerStream {
+                peer,
+                mut read,
+                mut write,
+                ..
+            } = stream;
+            serve_exec_session(&mut read, &mut write, &peer).await?;
+            write.shutdown().await?;
+            Ok(())
+        })
+    }
+
+    /// The local `fabric exec` otherwise sees only the stream end, and could
+    /// not tell a refusal (126) from a command that failed to start (1).
+    fn notice(&self, notice: &Notice<'_>) -> Option<Vec<u8>> {
+        let (message, exit_code) = match notice {
+            Notice::Refused { error } => (
+                format!("refused service \"exec\": {error}"),
+                EXIT_EXEC_DISABLED,
+            ),
+            Notice::Unavailable { error } => {
+                (format!("failed to start service \"exec\": {error}"), 1)
+            }
+            _ => return None,
+        };
+        let mut bytes = encode_frame(SERVER_ERROR, message.as_bytes())?;
+        bytes.extend(encode_frame(SERVER_EXIT, &exit_code.to_be_bytes())?);
+        Some(bytes)
+    }
+
+    fn bridge(&self) -> Bridge {
+        Bridge::WholeReply
+    }
+}
+
+/// Drive the client side of a `fabric exec` session over the daemon-provided
+/// socket: send the argv, forward the remote stdout/stderr to the local
+/// stdout/stderr on their own streams, and return the remote command's exit code.
+pub async fn run_client<S>(stream: S, peer: &str, cmd: &[String]) -> Result<i32>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut read, mut write) = tokio::io::split(stream);
+    write_client_argv(&mut write, cmd).await?;
+
+    let mut stdout = tokio::io::stdout();
+    let mut stderr = tokio::io::stderr();
+    let mut exit_code = None;
+
+    while let Some(frame) = read_server_frame(&mut read).await? {
+        match frame {
+            ServerFrame::Stdout(bytes) => {
+                stdout.write_all(&bytes).await?;
+                stdout.flush().await?;
+            }
+            ServerFrame::Stderr(bytes) => {
+                stderr.write_all(&bytes).await?;
+                stderr.flush().await?;
+            }
+            ServerFrame::Error(message) => {
+                stderr
+                    .write_all(format!("fabric: peer {peer:?} ").as_bytes())
+                    .await?;
+                stderr.write_all(message.as_bytes()).await?;
+                stderr.write_all(b"\n").await?;
+                stderr.flush().await?;
+            }
+            ServerFrame::Exit(code) => {
+                exit_code = Some(code.clamp(0, 255));
+                break;
+            }
+        }
+    }
+
+    if exit_code.is_none() {
+        stderr
+            .write_all(
+                format!(
+                    "fabric: peer {peer:?} closed service \"exec\" before it returned an exit status\n"
+                )
+                .as_bytes(),
+            )
+            .await?;
+    }
+
+    stdout.flush().await?;
+    stderr.flush().await?;
+    Ok(exit_code.unwrap_or(1))
 }
 
 /// Server side of an exec session: read the argv, spawn the command with no tty
@@ -312,6 +422,17 @@ where
     Ok(Some((header[0], payload)))
 }
 
+fn encode_frame(kind: u8, payload: &[u8]) -> Option<Vec<u8>> {
+    if payload.len() > MAX_FRAME_LEN {
+        return None;
+    }
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(kind);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    Some(frame)
+}
+
 async fn write_frame<W>(write: &mut W, kind: u8, payload: &[u8]) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -432,12 +553,18 @@ mod tests {
     async fn serve_exec_session_reports_spawn_failure() {
         let argv = vec!["this-binary-does-not-exist-xyz".to_string()];
         let mut client_to_server = Vec::new();
-        write_client_argv(&mut client_to_server, &argv).await.unwrap();
-
-        let mut server_to_client = Vec::new();
-        serve_exec_session(&mut client_to_server.as_slice(), &mut server_to_client, "test-peer")
+        write_client_argv(&mut client_to_server, &argv)
             .await
             .unwrap();
+
+        let mut server_to_client = Vec::new();
+        serve_exec_session(
+            &mut client_to_server.as_slice(),
+            &mut server_to_client,
+            "test-peer",
+        )
+        .await
+        .unwrap();
 
         let mut reader = server_to_client.as_slice();
         let mut saw_error = false;
@@ -583,6 +710,52 @@ mod tests {
             read_server_frame(&mut reader).await.unwrap(),
             Some(ServerFrame::Exit(EXIT_EXEC_DISABLED))
         ));
+    }
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::*;
+
+    async fn frames(bytes: Vec<u8>) -> Vec<ServerFrame> {
+        let mut read = bytes.as_slice();
+        let mut frames = Vec::new();
+        while let Some(frame) = read_server_frame(&mut read).await.unwrap() {
+            frames.push(frame);
+        }
+        frames
+    }
+
+    #[tokio::test]
+    async fn a_refusal_reaches_the_local_command_as_error_then_126() {
+        let bytes = Exec
+            .notice(&Notice::Refused {
+                error: "not permitted",
+            })
+            .unwrap();
+        assert!(matches!(
+            frames(bytes).await.as_slice(),
+            [ServerFrame::Error(message), ServerFrame::Exit(126)]
+                if message == "refused service \"exec\": not permitted"
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_unopened_stream_reaches_the_local_command_as_error_then_1() {
+        let bytes = Exec
+            .notice(&Notice::Unavailable { error: "timed out" })
+            .unwrap();
+        assert!(matches!(
+            frames(bytes).await.as_slice(),
+            [ServerFrame::Error(message), ServerFrame::Exit(1)]
+                if message == "failed to start service \"exec\": timed out"
+        ));
+    }
+
+    #[test]
+    fn exec_has_nothing_to_say_about_a_resumable_session() {
+        assert!(Exec.notice(&Notice::Resumed).is_none());
+        assert!(Exec.notice(&Notice::FallingBack).is_none());
     }
 }
 
