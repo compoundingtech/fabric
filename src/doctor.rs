@@ -464,10 +464,12 @@ fn version_findings(facts: &Facts) -> Vec<Finding> {
     let mut behind: Vec<&PeerFact> = Vec::new();
     let mut unknown: Vec<&PeerFact> = Vec::new();
     let mut policy_unavailable: Vec<&PeerFact> = Vec::new();
+    let mut away: Vec<&PeerFact> = Vec::new();
     for peer in &facts.peers {
         match &peer.version {
             Some(version) if version != &facts.own_version => behind.push(peer),
             Some(_) => {}
+            None if peer.roaming && peer.reachable == Some(false) => away.push(peer),
             None if matches!(peer.version_error, Some(PeerVersionError::PolicyRefusal(_))) => {
                 policy_unavailable.push(peer);
             }
@@ -492,12 +494,12 @@ fn version_findings(facts: &Facts) -> Vec<Finding> {
         );
     }
 
-    if !unknown.is_empty() || !policy_unavailable.is_empty() {
+    if !unknown.is_empty() || !policy_unavailable.is_empty() || !away.is_empty() {
         // Say what IS known as well. On the fleet's first real run this
         // reported one unknown peer and nothing else, so a reader could not
         // tell "one of three" from "one of one" — and the reassuring half is
         // the half that says how much of the fleet was actually checked.
-        let known = facts.peers.len() - unknown.len() - policy_unavailable.len();
+        let known = facts.peers.len() - unknown.len() - policy_unavailable.len() - away.len();
         if known > 0 && behind.is_empty() {
             out.push(Finding::new(
                 "versions",
@@ -547,9 +549,19 @@ fn version_findings(facts: &Facts) -> Vec<Finding> {
                 ),
             ));
         }
+        for peer in &away {
+            out.push(Finding::new(
+                "versions",
+                Verdict::Informational,
+                format!(
+                    "{} is away as expected for a roaming peer; its build can be checked when it returns",
+                    peer.label
+                ),
+            ));
+        }
     }
 
-    if behind.is_empty() && unknown.is_empty() && policy_unavailable.is_empty() {
+    if behind.is_empty() && unknown.is_empty() && policy_unavailable.is_empty() && away.is_empty() {
         out.push(Finding::new(
             "versions",
             Verdict::Ok,
@@ -1164,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn an_absent_roaming_peer_is_normal_but_its_build_is_unknown() {
+    fn an_absent_roaming_peer_is_normal_including_its_unavailable_build() {
         let mut facts = configured();
         facts.peers[0].label = "bluey".to_string();
         facts.peers[0].roaming = true;
@@ -1180,12 +1192,10 @@ mod tests {
         assert!(peers[0].detail.contains("away"));
         assert_eq!(syncs[0].verdict, Verdict::Ok);
         assert!(syncs[0].detail.contains("away"));
-        assert!(
-            find(&findings, "versions")
-                .iter()
-                .any(|finding| finding.verdict == Verdict::Unknown)
-        );
-        assert_eq!(exit_code(&findings), 3);
+        assert!(find(&findings, "versions").iter().all(|finding| {
+            !finding.verdict.needs_attention() && !finding.detail.contains("build is unknown")
+        }));
+        assert_eq!(exit_code(&findings), 0);
     }
 
     /// Finding 3 of the 2026-08-29 review. A peer named in `syncs.toml` that is
@@ -1535,7 +1545,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unreachable_roaming_peer_build_is_unknown_and_counts() {
+    fn an_unreachable_roaming_peer_build_does_not_need_attention() {
         let mut facts = configured();
         facts.peers[0].roaming = true;
         facts.peers[0].reachable = Some(false);
@@ -1545,13 +1555,12 @@ mod tests {
         let findings = diagnose(&facts);
         let versions = find(&findings, "versions");
         assert_eq!(versions.len(), 1);
-        assert_eq!(versions[0].verdict, Verdict::Unknown);
-        assert!(versions[0].detail.contains("unknown, roaming"));
-        assert!(versions[0].detail.contains("whole manifests"));
-        assert_eq!(exit_code(&findings), 3);
+        assert_eq!(versions[0].verdict, Verdict::Informational);
+        assert!(versions[0].detail.contains("away as expected"));
+        assert!(versions[0].detail.contains("when it returns"));
+        assert_eq!(exit_code(&findings), 0);
         let summary = closing(&facts, &findings);
-        assert_ne!(summary, "nothing to do.");
-        assert!(summary.contains("needs attention"));
+        assert_eq!(summary, "nothing to do.");
     }
 
     /// "one peer could not be asked" does not say one of how many.
