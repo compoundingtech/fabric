@@ -165,6 +165,28 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **`fabric exec` returns when the connection carrying its reply is lost.**
+  The daemon joins a local command's socket to the peer's stream and, for a
+  reply that must arrive whole, waited for both directions to finish. `fabric
+  exec` keeps its request direction open until the exit status arrives, so
+  when the connection was replaced or lost after the remote command had
+  already ended, the reply side failed, the daemon kept waiting on the request
+  side, and the command kept waiting on the daemon: the client stayed alive
+  with no output until someone killed it. The daemon now closes the command's
+  reply side when the reply fails and stops waiting on the request side, so the
+  command says the peer closed the service before it returned an exit status
+  and exits 1. A refusal still reaches the command whole, error and exit
+  status included.
+
+- **`fabric doctor` no longer fails because a roaming peer is away.** It
+  already rated an away roaming peer, and a sync waiting on it, as healthy,
+  but its version check could not ask the away peer for its build and called
+  that unknown, which made doctor exit 3 and anything built on it report a
+  failure. An away roaming peer's build is now information: doctor says it can
+  be checked when the peer returns, leaves it out of the count of peers that
+  answered, and exits 0. A peer that is reachable but does not say which build
+  it runs, or whose reachability could not be tested, still needs attention.
+
 - **`fabric update` no longer spends GitHub's API rate limit.** The latest
   release, its commit, and the direction of the change were three calls to
   `api.github.com`, which allows 60 unauthenticated requests an hour per
