@@ -5512,8 +5512,11 @@ async fn pipe_unix_iroh(
         Ok::<(), anyhow::Error>(())
     };
     let to_local = async {
-        tokio::io::copy(&mut recv, &mut local_write).await?;
+        let result = tokio::io::copy(&mut recv, &mut local_write).await;
+        // Also close the CLI's read half on a transport error. The CLI cannot
+        // close its request half until it receives an exit frame or EOF.
         let _ = local_write.shutdown().await;
+        result?;
         Ok::<(), anyhow::Error>(())
     };
     match bridge {
@@ -5521,9 +5524,21 @@ async fn pipe_unix_iroh(
             tokio::try_join!(to_remote, to_local)?;
         }
         Bridge::WholeReply => {
-            let (to_remote, to_local) = tokio::join!(to_remote, to_local);
-            to_local?;
-            to_remote?;
+            tokio::pin!(to_remote, to_local);
+            // A refusal can stop reading the request before sending Error and
+            // Exit, so a request-side error must not discard the reply. But a
+            // reply-side error must cancel the request copy: it may be waiting
+            // for the CLI, which is itself waiting for this reply to end.
+            tokio::select! {
+                reply = &mut to_local => {
+                    reply?;
+                    to_remote.await?;
+                }
+                request = &mut to_remote => {
+                    to_local.await?;
+                    request?;
+                }
+            }
         }
     }
     Ok(())
@@ -5534,6 +5549,50 @@ mod tests {
     use super::*;
     use crate::sync::config::{SyncEntry, SyncPolicy};
     use crate::services::{exec, shell};
+
+    /// A long quiet exec keeps its request half open while waiting for the exit
+    /// frame. If the connection is replaced after the remote command finishes,
+    /// the reply read fails; the bridge must release the local caller rather than
+    /// wait for that caller to close the request half first.
+    #[tokio::test]
+    async fn exec_bridge_releases_client_when_reply_connection_is_lost() -> Result<()> {
+        let client_endpoint = Endpoint::bind(iroh::endpoint::presets::N0).await?;
+        let server_endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![b"fabric/test-bridge/0".to_vec()])
+            .bind()
+            .await?;
+        let server = tokio::spawn({
+            let server_endpoint = server_endpoint.clone();
+            async move {
+                let incoming = server_endpoint.accept().await.expect("incoming connection");
+                let connection = incoming.await.expect("accepted connection");
+                let (_send, mut recv) = connection.accept_bi().await.expect("exec stream");
+                let mut request = [0u8; 1];
+                recv.read_exact(&mut request).await.expect("request byte");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                connection.close(0u32.into(), b"connection replaced after remote exit");
+            }
+        });
+        let connection = client_endpoint
+            .connect(server_endpoint.addr(), b"fabric/test-bridge/0")
+            .await?;
+        let (send, recv) = connection.open_bi().await?;
+        let (mut cli, local) = UnixStream::pair()?;
+        let bridge = tokio::spawn(pipe_unix_iroh(local, send, recv, Bridge::WholeReply));
+        cli.write_all(b"x").await?;
+        // Keep cli's write half open, as run_client does until it receives Exit.
+        let mut reply = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(3), cli.read(&mut reply)).await;
+        let bridge_result = tokio::time::timeout(Duration::from_secs(3), bridge).await;
+        assert!(read.is_ok(), "the CLI waited forever after the connection was lost");
+        assert_eq!(read.unwrap()?, 0, "the bridge did not close its reply half");
+        assert!(bridge_result.is_ok(), "the bridge waited for the CLI to close first");
+        assert!(bridge_result.unwrap()?.is_err(), "lost reply must be reported");
+        server.await?;
+        client_endpoint.close().await;
+        server_endpoint.close().await;
+        Ok(())
+    }
 
     fn write_test_sync(home: &FabricHome, folder: PathBuf, selector: &str) -> Result<()> {
         fs::create_dir_all(&folder)?;
