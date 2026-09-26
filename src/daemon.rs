@@ -18,6 +18,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, bail};
+use fabric_config::log_eprintln as eprintln;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId,
     endpoint::{

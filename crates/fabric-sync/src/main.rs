@@ -94,7 +94,11 @@ async fn main() -> Result<()> {
     if modes.check {
         return check(home).await;
     }
-    serve(home).await
+    if let Err(error) = serve(home).await {
+        fabric_config::log::stderr(&format!("Error: {error:?}"));
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// The supervised mode. One line to stdout per phase change, so a service log
@@ -110,7 +114,7 @@ async fn serve(home: FabricHome) -> Result<()> {
             _ = ticks.tick() => {
                 let state = handle.phase().describe();
                 if state != previous {
-                    println!("runtime\t{state}");
+                    fabric_config::log::stdout(&format!("runtime\t{state}"));
                     previous = state;
                 }
             }

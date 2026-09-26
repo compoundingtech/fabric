@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use fabric_config::log_eprintln as eprintln;
 use iroh::{EndpointAddr, EndpointId, SecretKey};
 use serde::{Deserialize, Serialize};
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, Value};

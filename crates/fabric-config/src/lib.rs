@@ -8,6 +8,7 @@
 
 pub mod daemon_control;
 mod home;
+pub mod log;
 pub mod sync;
 
 pub use home::FabricHome;

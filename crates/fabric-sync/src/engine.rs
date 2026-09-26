@@ -28,6 +28,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use fabric_config::log_eprintln as eprintln;
 
 use serde::{Deserialize, Serialize, ser::SerializeMap};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, mpsc};

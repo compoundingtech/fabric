@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use fabric_config::log_eprintln as eprintln;
 use iroh::{
     EndpointAddr, EndpointId,
     endpoint::{Connection, RecvStream, SendStream},
