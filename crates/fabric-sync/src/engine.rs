@@ -4635,6 +4635,10 @@ mod tests {
     use super::*;
     use fabric_config::sync::config::SyncPolicy;
     use crate::manifest::{Author, Entry, FileMeta, Tombstone};
+    // The glob import above also brings the timestamped service-log macro,
+    // which is ambiguous with the prelude's. Test diagnostics go to the test
+    // harness, which captures only the standard macro.
+    use std::eprintln;
     use std::sync::{Mutex as StdMutex, Weak};
 
     #[test]

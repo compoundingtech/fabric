@@ -5550,6 +5550,10 @@ mod tests {
     use super::*;
     use crate::sync::config::{SyncEntry, SyncPolicy};
     use crate::services::{exec, shell};
+    // The glob import above also brings the timestamped service-log macro,
+    // which is ambiguous with the prelude's. Test diagnostics go to the test
+    // harness, which captures only the standard macro.
+    use std::eprintln;
 
     /// A long quiet exec keeps its request half open while waiting for the exit
     /// frame. If the connection is replaced after the remote command finishes,
