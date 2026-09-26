@@ -77,6 +77,13 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Added
 
+- **Service logs say when each line was written.** The daemon and the
+  `fabric-sync` companion now start every line they write to their service
+  output with an RFC 3339 UTC timestamp. That covers each line of a multiline
+  error and a failure at startup. An event in `service.err.log` can now be
+  lined up with the other side's logs. Output that already went through the
+  tracing appenders had timestamps and is unchanged.
+
 - **The sync engine can run in the `fabric-sync` companion, behind both
   directions of the local bridge.** A daemon started with the companion as its
   sync owner constructs no engine: the companion acquires the state lease,
@@ -164,6 +171,23 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   transport. The embedded engine remains the production owner.
 
 ### Fixed
+
+- **A tunnel session ends when the service it carries is gone.** Suppose an
+  exposed service restarts while the consumer at the far end keeps writing.
+  The server could not write the replayed bytes to the dead socket, but it
+  kept the session. Every resume then passed the handshake and failed on the
+  same socket. The client resets its backoff on every handshake, so it resumed
+  about ten times a second for as long as the consumer kept writing: for hours,
+  on a live pair. A few of those ends counted against the shared peer
+  connection, which was replaced as often as every 1.5 seconds. Each
+  replacement cut every other stream on it, so a `fabric exec` in that window
+  stalled with no output while a quick retry often went through. Now the
+  server closes and forgets a session whose local endpoint is gone. The
+  client's next resume is refused, the client closes its consumer's socket,
+  and the consumer reconnects to the restarted service. A far side that stopped
+  reading an attach stream ("sending stopped by peer") is now an expected
+  detach, like a closed stream, and no longer counts against the shared
+  connection.
 
 - **`fabric exec` returns when the connection carrying its reply is lost.**
   The daemon joins a local command's socket to the peer's stream and, for a
