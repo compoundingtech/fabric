@@ -28,6 +28,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use fabric_config::log_eprintln as eprintln;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

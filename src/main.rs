@@ -1175,7 +1175,7 @@ async fn main() -> Result<()> {
                     server_session_max_per_peer,
                     server_session_detached_ttl_secs,
                 } => {
-                    run_daemon_with_options(
+                    if let Err(error) = run_daemon_with_options(
                         home,
                         daemon_options(
                             allow_shell,
@@ -1185,7 +1185,10 @@ async fn main() -> Result<()> {
                             server_session_detached_ttl_secs,
                         ),
                     )
-                    .await?;
+                    .await {
+                        fabric_config::log::stderr(&format!("Error: {error:?}"));
+                        std::process::exit(1);
+                    }
                 }
                 Commands::RestartDetacher { allow_shell } => {
                     run_restart_detacher(&home, allow_shell)?;
