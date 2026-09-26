@@ -1663,7 +1663,7 @@ impl ServerSessionStore {
         }
     }
 
-    async fn remove_new_session(&self, session: &Arc<TunnelSession>) {
+    async fn remove_session(&self, session: &Arc<TunnelSession>) {
         session.close_for_eviction().await;
         let mut sessions = self.inner.lock().await;
         if sessions
@@ -1842,7 +1842,7 @@ pub async fn serve_connection(
     };
     if session.peer_id() != peer_id {
         if is_new_session {
-            sessions.remove_new_session(&session).await;
+            sessions.remove_session(&session).await;
         }
         bail!("tunnel session {session_id} belongs to a different peer");
     }
@@ -1858,7 +1858,7 @@ pub async fn serve_connection(
     .await
     {
         if is_new_session {
-            sessions.remove_new_session(&session).await;
+            sessions.remove_session(&session).await;
         }
         return Err(error);
     }
@@ -1874,6 +1874,17 @@ pub async fn serve_connection(
         health
             .note_attach_failure("attached", attach_started.elapsed())
             .await;
+    }
+    if let Err(error) = &result
+        && error.downcast_ref::<LocalEndpointGone>().is_some()
+    {
+        // The service this session carried is gone, so no resume can deliver
+        // the bytes the client replays. A session kept past this let every
+        // resume pass the hello and fail on the same dead socket, about ten
+        // times a second for as long as the far consumer kept writing. Without
+        // the session the next resume is refused, and the client takes that
+        // refusal as final and closes its consumer's socket.
+        sessions.remove_session(&session).await;
     }
     sessions.reap_expired(sessions.detached_ttl).await;
     if let Err(error) = &result
@@ -1892,6 +1903,8 @@ pub async fn serve_connection(
 /// detach is the session ending: the far stream closed because its side
 /// finished, which every one-request session does within a second. Counting
 /// those replaced a healthy shared connection every few seconds on a live pair.
+/// A far side that stopped reading its stream is the same end seen from a
+/// write: only a working connection can deliver that stop.
 /// An `Ok` end with the session still incomplete means the transport went away
 /// under a live session, which is the case the counter exists for.
 fn attach_end_counts_against_connection(result: &Result<()>, session_complete: bool) -> bool {
@@ -1906,6 +1919,7 @@ fn is_expected_detach(error: &anyhow::Error) -> bool {
     error.contains("connection lost: closed")
         || error.contains("tunnel attach stream closed")
         || error.contains("closed: closed")
+        || error.contains("sending stopped by peer")
 }
 
 async fn send_tunnel_error(connection: &Connection, send: &mut SendStream, message: String) {
@@ -2605,13 +2619,15 @@ mod tests {
     /// its local side finished, the far stream closes, and the attach ends
     /// with "tunnel attach stream closed". That is the session ending, not
     /// the transport failing, and it must not count toward replacing the
-    /// shared peer connection.
+    /// shared peer connection. When the client was writing as the server
+    /// ended the attach, the same end arrives as "sending stopped by peer".
     #[test]
     fn a_clean_detach_does_not_count_against_the_connection() {
         for expected in [
             "tunnel attach stream closed",
             "connection lost: closed",
             "connection lost: closed: closed by peer",
+            "sending stopped by peer: error 0",
         ] {
             let ended = Err(anyhow::anyhow!("{expected}"));
             assert!(
