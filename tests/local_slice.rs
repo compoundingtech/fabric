@@ -1146,6 +1146,111 @@ async fn one_request_tcp_sessions_leave_the_shared_connection_alone() -> Result<
     Ok(())
 }
 
+/// When an exposed service restarts, the consumer at the far end can keep
+/// writing into the session that served it, the way a peer protocol's
+/// heartbeat does. The server cannot deliver those bytes. It used to keep the
+/// session anyway, so every resume passed the hello, failed on the same dead
+/// socket, and ended at once, and the client, reset by each hello, came back
+/// a tenth of a second later. On a live pair two such sessions reattached
+/// about ten times a second for fourteen hours. The attach ends they counted
+/// replaced the shared connection every few seconds, and every other stream
+/// on it went down too: an exec whose reply was lost that way just stalled.
+/// The session must end instead, closing the consumer's socket so it can
+/// reconnect, and the shared connection must stay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_whose_exposed_service_restarted_ends_and_leaves_the_connection_alone()
+-> Result<()> {
+    let _guard = local_slice_guard().await;
+    let node_a_dir = TempDir::new()?;
+    let node_b_dir = TempDir::new()?;
+    let node_a_home = FabricHome::new(node_a_dir.path());
+    let node_b_home = FabricHome::new(node_b_dir.path());
+
+    let node_a = FabricNode::start(node_a_home.clone()).await?;
+    let node_b = FabricNode::start(node_b_home.clone()).await?;
+
+    trust_peer(
+        &node_a_home,
+        &node_a,
+        node_b.id(),
+        Some("node-b"),
+        Some(node_b.addr()),
+    )
+    .await?;
+    trust_peer(
+        &node_b_home,
+        &node_b,
+        node_a.id(),
+        Some("node-a"),
+        Some(node_a.addr()),
+    )
+    .await?;
+
+    let (service_addr, restart, service_task) = spawn_restartable_tcp_service().await?;
+    run_fabric(
+        &node_a_home,
+        &["expose", "tcp-echo", "--tcp", service_addr.as_str()],
+    )?;
+    let local_addr = run_fabric(
+        &node_b_home,
+        &["dial", "node-a", "tcp-echo", "--tcp", "127.0.0.1:0"],
+    )?;
+    let mut consumer = TcpStream::connect(&local_addr).await?;
+    tcp_stream_round_trip(&mut consumer, b"before-restart").await?;
+    tokio::time::sleep(LOCAL_SLICE_SETTLE).await;
+    let before_client = connection_health(&node_b_home, "node-a").await?;
+    let before_server = connection_health(&node_a_home, "node-b").await?;
+
+    restart.notify_waiters();
+    let heartbeat = tokio::spawn(async move {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if consumer.write_all(b"heartbeat").await.is_err() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    });
+    assert!(
+        heartbeat.await?,
+        "the consumer's socket stayed open for 10 s after the service restarted: \
+         the dead session is still being resumed"
+    );
+    assert_eq!(
+        wait_for_dial_handlers(&node_b.state(), 0).await,
+        0,
+        "the dead session still holds its dial permit"
+    );
+
+    assert_eq!(
+        tcp_one_request(&local_addr, b"after-restart").await?,
+        b"after-restart",
+        "a new session must reach the restarted service"
+    );
+    tokio::time::sleep(LOCAL_SLICE_SETTLE).await;
+    let after_client = connection_health(&node_b_home, "node-a").await?;
+    let after_server = connection_health(&node_a_home, "node-b").await?;
+    for (side, before, after) in [
+        ("client", before_client, after_client),
+        ("server", before_server, after_server),
+    ] {
+        assert_eq!(
+            after.connection_id, before.connection_id,
+            "{side}: the dead session replaced the shared connection: {after:?}"
+        );
+        assert_eq!(
+            after.consecutive_attach_failures, 0,
+            "{side}: the dead session counted against the shared connection: {after:?}"
+        );
+    }
+
+    service_task.abort();
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persisted_tcp_expose_survives_daemon_restart() -> Result<()> {
     let _guard = local_slice_guard().await;
@@ -2099,6 +2204,30 @@ async fn spawn_tcp_echo_service() -> Result<(String, Arc<AtomicUsize>, JoinHandl
         }
     });
     Ok((addr, hits, task))
+}
+
+/// A TCP echo service whose open connections all close when `restart` fires,
+/// the way a local service drops its clients when it restarts. The listener
+/// stays up, as the restarted service's would.
+async fn spawn_restartable_tcp_service()
+-> Result<(String, Arc<tokio::sync::Notify>, JoinHandle<()>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?.to_string();
+    let restart = Arc::new(tokio::sync::Notify::new());
+    let task_restart = restart.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let restarted = task_restart.clone();
+            tokio::spawn(async move {
+                let restarted = restarted.notified();
+                tokio::select! {
+                    _ = tcp_echo_connection(stream) => {}
+                    _ = restarted => {}
+                }
+            });
+        }
+    });
+    Ok((addr, restart, task))
 }
 
 async fn echo_connection(stream: UnixStream) {
