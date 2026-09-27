@@ -112,6 +112,9 @@ jobs:
       - name: Update command contract
         run: timeout 5m cargo test --locked -p fabric --test update -- --test-threads=1
 
+      - name: Installer release lookup
+        run: timeout 5m cargo test --locked -p fabric --test install_script -- --test-threads=1
+
       - name: Join over ssh contract
         run: timeout 5m cargo test --locked -p fabric --test join -- --test-threads=1
 
