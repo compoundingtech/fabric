@@ -172,6 +172,17 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Fixed
 
+- **The installer no longer needs GitHub's API to find the latest release.**
+  `curl … | sh` asked `api.github.com` for the latest release. The API allows
+  60 unauthenticated requests an hour per network address, shared by every
+  machine behind it, so on a network that had spent them the installer could
+  not install anything. It now reads the tag from the `releases/latest`
+  redirect, which is not metered, the same way `fabric update` has since
+  0.2.13. It does this with curl, or with wget where there is no curl. A
+  pinned `--version` still makes no lookup at all. The README says how to
+  install or update to an exact version on a rate-limited network, including
+  from a fabric old enough to ask the API itself.
+
 - **A tunnel session ends when the service it carries is gone.** Suppose an
   exposed service restarts while the consumer at the far end keeps writing.
   The server could not write the replayed bytes to the dead socket, but it

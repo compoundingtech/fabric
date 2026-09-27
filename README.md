@@ -263,6 +263,44 @@ To pin a release:
 curl -sSf https://raw.githubusercontent.com/compoundingtech/fabric/main/install.sh | sh -s -- --version v0.1.7
 ```
 
+### On a network GitHub rate limits
+
+The installer finds the latest release from GitHub's `releases/latest`
+redirect, and so does `fabric update` since 0.2.13. That redirect is not rate
+limited. Older copies of the installer, and `fabric update` up to 0.2.12
+(with or without `--tag`), asked `api.github.com` instead. The API allows 60
+unauthenticated requests an hour per network address, shared by every machine
+behind it. Once a network has spent them, those commands fail with `403
+Forbidden`.
+
+An exact version needs no lookup at all. To read the newest tag without the
+API:
+
+```sh
+curl -sI https://github.com/compoundingtech/fabric/releases/latest | grep -i '^location'
+```
+
+Then install that version. The installer downloads only that release's
+archive and its `.sha256`:
+
+```sh
+curl -sSf https://raw.githubusercontent.com/compoundingtech/fabric/main/install.sh | sh -s -- --version v0.2.20
+```
+
+The installer replaces the binaries but not a running daemon. A machine that
+already runs fabric as a service should update itself instead, so the update
+verifies the restart and keeps a rollback. An installed fabric that asks the
+API when it updates can still do this without the API, as long as
+`fabric update --help` lists `--url`. Give `fabric update` the archive for its
+platform and that archive's published hash, both read from github.com:
+
+```sh
+tag=v0.2.20
+target=aarch64-apple-darwin   # or x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
+url="https://github.com/compoundingtech/fabric/releases/download/$tag/fabric-$target.tar.gz"
+fabric update --url "$url" --sha256 "$(curl -fsSL "$url.sha256" | cut -d ' ' -f 1)"
+```
+
 From a cloned repo:
 
 ```sh
