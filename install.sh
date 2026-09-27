@@ -79,24 +79,49 @@ fetch() {
   fi
 }
 
-fetch_stdout() {
-  url="$1"
+# Where GitHub's releases/latest page redirects, without following it. NOT the
+# REST API: api.github.com allows 60 unauthenticated requests an hour per network
+# address, shared by every machine behind it, so a network that has spent that
+# budget could not install at all. The redirect is not metered, and it is the
+# one `fabric update` reads.
+latest_release_location() {
+  url="$REPO_URL/releases/latest"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url"
+    curl -fsS -o /dev/null -w '%{redirect_url}' "$url"
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO- "$url"
+    # wget has no way to print a redirect without following it, but -S prints
+    # every response's headers, and the first Location is the redirect's.
+    wget -S --spider "$url" 2>&1 |
+      sed -n 's/^[[:space:]]*[Ll]ocation:[[:space:]]*\([^[:space:]]*\).*/\1/p' |
+      head -n 1
   else
     return 1
   fi
 }
 
+# The tag in a releases/tag/<tag> URL. GitHub percent-encodes a tag's `+`.
+# Anything else that is not a plain tag character is refused rather than used
+# to build a download URL.
+tag_from_release_location() {
+  case "$1" in
+    */releases/tag/?*) ;;
+    *) return 1 ;;
+  esac
+  tag=${1##*/releases/tag/}
+  tag=${tag%%[?#]*}
+  tag=${tag%/}
+  tag=$(printf '%s\n' "$tag" | sed 's/%2[Bb]/+/g')
+  case "$tag" in
+    ''|*[!A-Za-z0-9._+-]*) return 1 ;;
+  esac
+  echo "$tag"
+}
+
 resolve_target_tag() {
   case "$REQUESTED_VERSION" in
     latest)
-      raw=$(fetch_stdout "https://api.github.com/repos/$REPO/releases/latest") || return 1
-      tag=$(printf '%s\n' "$raw" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
-      [ -n "$tag" ] || return 1
-      echo "$tag"
+      location=$(latest_release_location) || return 1
+      tag_from_release_location "$location"
       ;;
     v*)
       echo "$REQUESTED_VERSION"
