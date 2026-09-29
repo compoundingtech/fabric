@@ -4,7 +4,7 @@
 //! `exec` runs a command with no tty, captures its stdout and stderr as separate
 //! streams, and propagates the remote process's exit code back as the local exit
 //! code. That makes `fabric exec <peer> -- <cmd...>` safe to script over
-//! (`out=$(fabric exec hetz -- cat /etc/hostname)`), with none of the
+//! (`out=$(fabric exec vps -- cat /etc/hostname)`), with none of the
 //! pipe-into-an-interactive-shell gymnastics.
 //!
 //! Security mirrors `shell`: this is arbitrary remote command execution. A

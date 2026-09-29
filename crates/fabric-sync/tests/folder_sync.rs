@@ -330,8 +330,8 @@ async fn bus_delete_propagates_and_stays_deleted() -> Result<()> {
 /// THE CASE FROM TONIGHT. Delete while a peer is away. The peer returns holding
 /// a stale present copy. The file must not come back.
 ///
-/// This is the obvious way a delete breaks and bluey is away most of the time by
-/// design, so it is not a corner case here, it is the normal case.
+/// This is the obvious way a delete breaks and a laptop is away most of the time
+/// by design, so it is not a corner case here, it is the normal case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bus_delete_while_peer_away_does_not_resurrect_on_return() -> Result<()> {
     let _guard = FOLDER_SYNC_LOCK.lock().await;
@@ -478,7 +478,7 @@ async fn an_excluded_path_never_reaches_a_peer() -> Result<()> {
 /// bytes. That second half is what let a single returning machine undo a delete
 /// for everybody.
 ///
-/// A returning peer is not a corner case. bluey is away most of the time by
+/// A returning peer is not a corner case. A laptop is away most of the time by
 /// design, and a machine that was asleep for a fortnight comes back holding
 /// exactly this stale state.
 ///

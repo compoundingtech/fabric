@@ -333,7 +333,7 @@ mod tests {
         assert!(!name_is_safe("../notes.md"));
         assert!(!name_is_safe("sub/../../notes.md"));
         assert!(!name_is_safe("/etc/passwd"));
-        assert!(!name_is_safe("/home/myobie/.ssh/authorized_keys"));
+        assert!(!name_is_safe("/home/example/.ssh/authorized_keys"));
         assert!(!name_is_safe(".."));
         assert!(!name_is_safe(""));
         assert!(!name_is_safe("   "));
@@ -361,12 +361,12 @@ mod tests {
     fn a_destination_always_lands_inside_the_peers_inbox() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("inbox");
-        let inbox = inbox_for(&home, "hetz");
+        let inbox = inbox_for(&home, "vps");
 
-        let ok = destination(&home, "hetz", "sub/notes.md").unwrap();
+        let ok = destination(&home, "vps", "sub/notes.md").unwrap();
         assert!(ok.starts_with(&inbox));
 
-        let refused = destination(&home, "hetz", "../../.ssh/authorized_keys");
+        let refused = destination(&home, "vps", "../../.ssh/authorized_keys");
         let error = refused.expect_err("an escaping destination was accepted");
         assert!(
             format!("{error:#}").contains("not a name this can write"),
@@ -383,11 +383,11 @@ mod tests {
         let (client, server) = tokio::io::duplex(1 << 20);
         let home_for_server = dir.path().join("inbox");
         let receiver =
-            tokio::spawn(async move { receive(server, &home_for_server, "hetz").await });
+            tokio::spawn(async move { receive(server, &home_for_server, "vps").await });
         send(client, "sub/notes.bin", &payload).await.unwrap();
         let landed = receiver.await.unwrap().unwrap();
 
-        assert_eq!(landed, inbox_for(&home, "hetz").join("sub/notes.bin"));
+        assert_eq!(landed, inbox_for(&home, "vps").join("sub/notes.bin"));
         assert_eq!(std::fs::read(&landed).unwrap(), payload);
         assert!(
             !landed.with_extension("fabric-partial").exists(),
@@ -408,7 +408,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(64 * 1024);
         let home_for_server = dir.path().join("inbox");
         let receiver =
-            tokio::spawn(async move { receive(server, &home_for_server, "hetz").await });
+            tokio::spawn(async move { receive(server, &home_for_server, "vps").await });
         // send_from_reader with a reader (not a held slice) is the streaming API
         // the daemon uses for a file on disk.
         send_from_reader(client, "big.bin", payload.len() as u64, payload.as_slice())
@@ -429,7 +429,7 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(1 << 16);
         let home_for_server = dir.path().join("inbox");
         let receiver =
-            tokio::spawn(async move { receive(server, &home_for_server, "hetz").await });
+            tokio::spawn(async move { receive(server, &home_for_server, "vps").await });
 
         // Hand-write a header claiming 1000 bytes, then send 10 and close.
         let header = serde_json::to_vec(&Header {
@@ -448,7 +448,7 @@ mod tests {
 
         let result = receiver.await.unwrap();
         assert!(result.is_err(), "a short transfer must not be committed");
-        let target = inbox_for(&home, "hetz").join("short.bin");
+        let target = inbox_for(&home, "vps").join("short.bin");
         assert!(!target.exists(), "a truncated file reached the inbox");
         assert!(!target.with_extension("fabric-partial").exists());
     }
@@ -465,7 +465,7 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(1 << 16);
         let home_for_server = dir.path().join("inbox");
         let receiver =
-            tokio::spawn(async move { receive(server, &home_for_server, "hetz").await });
+            tokio::spawn(async move { receive(server, &home_for_server, "vps").await });
 
         // Hand-built, bypassing `send` entirely, the way a hostile peer would.
         let header = serde_json::to_vec(&Header {

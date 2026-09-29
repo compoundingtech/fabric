@@ -265,7 +265,7 @@ enum Commands {
     Shell { peer: String },
     /// Run a command on a trusted peer non-interactively: stream its stdout and
     /// stderr back and exit with the remote command's exit code. The scriptable
-    /// counterpart to `shell`, e.g. `fabric exec hetz -- ls -la`.
+    /// counterpart to `shell`, e.g. `fabric exec vps -- ls -la`.
     Exec {
         /// The trusted peer to run the command on.
         peer: String,
@@ -1563,7 +1563,7 @@ mod permission_helpers_tests {
         let second = iroh::SecretKey::generate().public();
         book.add_with_allow(
             first,
-            Some("droppy".into()),
+            Some("desktop".into()),
             None,
             Some(
                 first_allow
@@ -1572,7 +1572,7 @@ mod permission_helpers_tests {
                     .collect(),
             ),
         );
-        book.add_with_allow(second, Some("hetz".into()), None, Some(vec!["sync".into()]));
+        book.add_with_allow(second, Some("vps".into()), None, Some(vec!["sync".into()]));
         book
     }
 
@@ -1580,7 +1580,7 @@ mod permission_helpers_tests {
     fn a_new_exposure_warns_only_when_every_peer_is_denied() {
         assert_eq!(
             peers_needing_new_service(&peer_book(&[]), "web"),
-            Some(vec!["droppy".into(), "hetz".into()])
+            Some(vec!["desktop".into(), "vps".into()])
         );
         assert_eq!(
             peers_needing_new_service(&peer_book(&["web"]), "web"),
@@ -1602,7 +1602,7 @@ mod connection_telemetry_tests {
     fn an_absent_roaming_peer_is_away_not_unreachable() {
         let peer = PeerReachability {
             id: "node-id".to_string(),
-            name: Some("bluey".to_string()),
+            name: Some("laptop".to_string()),
             roaming: true,
             reachable: false,
             bytes: None,
@@ -1613,7 +1613,7 @@ mod connection_telemetry_tests {
 
         assert_eq!(
             format_peer_reachability(&peer),
-            "bluey\tnode-id\taway\troaming peer"
+            "laptop\tnode-id\taway\troaming peer"
         );
     }
 
@@ -1695,13 +1695,13 @@ mod connection_telemetry_tests {
         let peer = probed_peer(&[80_000, 90_000], &[60_000, 64_000, 66_000]);
         assert_eq!(peer.losses, 0, "this fixture must be the healthy case");
         let lines = path_latency_lines(
-            &BTreeMap::from([("droppy".to_string(), peer)]),
-            &current(&["droppy"]),
+            &BTreeMap::from([("desktop".to_string(), peer)]),
+            &current(&["desktop"]),
         );
 
         assert_eq!(lines[0], "paths");
         assert!(
-            lines.iter().any(|line| line.contains("droppy")),
+            lines.iter().any(|line| line.contains("desktop")),
             "a peer with no losses must not vanish: {lines:?}"
         );
         assert!(
@@ -1720,8 +1720,8 @@ mod connection_telemetry_tests {
     fn the_busiest_path_is_listed_first() {
         let peer = probed_peer(&[80_000], &[60_000, 61_000, 62_000]);
         let lines = path_latency_lines(
-            &BTreeMap::from([("droppy".to_string(), peer)]),
-            &current(&["droppy"]),
+            &BTreeMap::from([("desktop".to_string(), peer)]),
+            &current(&["desktop"]),
         );
         let relay = lines.iter().position(|l| l.contains("relay")).unwrap();
         let direct = lines.iter().position(|l| l.contains("direct")).unwrap();
@@ -1744,8 +1744,8 @@ mod connection_telemetry_tests {
         // neither, so a bucketed statistic could not produce this number.
         let peer = probed_peer(&[40_000, 680_000], &[]);
         let lines = path_latency_lines(
-            &BTreeMap::from([("droppy".to_string(), peer)]),
-            &current(&["droppy"]),
+            &BTreeMap::from([("desktop".to_string(), peer)]),
+            &current(&["desktop"]),
         );
         let direct = lines.iter().find(|l| l.contains("direct")).unwrap();
         assert!(
@@ -1771,13 +1771,13 @@ mod connection_telemetry_tests {
             ..PeerTelemetry::default()
         };
         let lines = path_latency_lines(
-            &BTreeMap::from([("bluey".to_string(), peer)]),
-            &current(&["bluey"]),
+            &BTreeMap::from([("laptop".to_string(), peer)]),
+            &current(&["laptop"]),
         );
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("bluey") && l.contains("reachable 9/252")),
+                .any(|l| l.contains("laptop") && l.contains("reachable 9/252")),
             "an unreachable peer must still be listed: {lines:?}"
         );
     }
@@ -1794,8 +1794,8 @@ mod connection_telemetry_tests {
     /// silent rename here would make the documentation wrong.
     #[test]
     fn the_rendered_shape_matches_the_documented_one() {
-        let telemetry = BTreeMap::from([("hetz".to_string(), peer_with_losses())]);
-        let lines = connection_telemetry_lines(&telemetry, &test_window(), &current(&["hetz"]));
+        let telemetry = BTreeMap::from([("vps".to_string(), peer_with_losses())]);
+        let lines = connection_telemetry_lines(&telemetry, &test_window(), &current(&["vps"]));
         assert_eq!(
             lines[0],
             "session history (lifetime totals)\tsince 1970-01-01T00:00:00Z"
@@ -1804,7 +1804,7 @@ mod connection_telemetry_tests {
             lines[1],
             // p50 is a bucket bound, because a histogram cannot report better
             // than its bucket. The max is the exact largest sample seen.
-            "  hetz\tlifetime_lost=4 lifetime_resumed=4 lifetime_failed=0 lifetime_attempts=7 reconnect_p50=2.0s reconnect_max=4.5s"
+            "  vps\tlifetime_lost=4 lifetime_resumed=4 lifetime_failed=0 lifetime_attempts=7 reconnect_p50=2.0s reconnect_max=4.5s"
         );
         assert_eq!(
             lines[2],
@@ -1818,11 +1818,11 @@ mod connection_telemetry_tests {
     fn a_peer_with_no_loss_is_omitted() {
         let telemetry = BTreeMap::from([
             ("quiet".to_string(), PeerTelemetry::default()),
-            ("hetz".to_string(), peer_with_losses()),
+            ("vps".to_string(), peer_with_losses()),
         ]);
-        let lines = connection_telemetry_lines(&telemetry, &test_window(), &current(&["hetz"]));
+        let lines = connection_telemetry_lines(&telemetry, &test_window(), &current(&["vps"]));
         assert!(lines.iter().all(|line| !line.contains("quiet")));
-        assert!(lines.iter().any(|line| line.contains("hetz")));
+        assert!(lines.iter().any(|line| line.contains("vps")));
     }
 
     #[test]
@@ -1843,7 +1843,7 @@ mod connection_telemetry_tests {
     #[test]
     fn an_unfinished_reconnect_reports_a_dash_not_zero() {
         let telemetry = BTreeMap::from([(
-            "bluey".to_string(),
+            "laptop".to_string(),
             PeerTelemetry {
                 losses: 1,
                 resume_failures: 1,
@@ -1851,7 +1851,7 @@ mod connection_telemetry_tests {
                 ..PeerTelemetry::default()
             },
         )]);
-        let lines = connection_telemetry_lines(&telemetry, &test_window(), &current(&["bluey"]));
+        let lines = connection_telemetry_lines(&telemetry, &test_window(), &current(&["laptop"]));
         assert!(
             lines[1].contains("reconnect_p50=- reconnect_max=-"),
             "unexpected line: {}",
@@ -1866,14 +1866,14 @@ mod connection_telemetry_tests {
         latency.record(64_000);
         peer.probes_reachable = 1;
         peer.probe_latency.insert("relay".to_string(), latency);
-        let telemetry = BTreeMap::from([("droppy".to_string(), peer)]);
-        let current = current(&["hetz"]);
+        let telemetry = BTreeMap::from([("desktop".to_string(), peer)]);
+        let current = current(&["vps"]);
 
         let sessions = connection_telemetry_lines(&telemetry, &test_window(), &current);
         assert!(
             sessions
                 .iter()
-                .any(|line| line.contains("droppy [not in peers.toml]")),
+                .any(|line| line.contains("desktop [not in peers.toml]")),
             "a durable session total must not look current: {sessions:?}"
         );
 
@@ -1881,7 +1881,7 @@ mod connection_telemetry_tests {
         assert!(
             paths
                 .iter()
-                .any(|line| line.contains("droppy [not in peers.toml]")),
+                .any(|line| line.contains("desktop [not in peers.toml]")),
             "durable path totals need the same roster context: {paths:?}"
         );
     }
@@ -1903,7 +1903,7 @@ mod connection_telemetry_tests {
     #[test]
     fn current_connection_health_names_its_replacement_scope() {
         let lines = current_connection_health_lines(&BTreeMap::from([(
-            "bluey".to_string(),
+            "laptop".to_string(),
             fabric::mux::CurrentConnectionHealth {
                 connection_id: 19,
                 age_millis: 12_500,
@@ -1916,7 +1916,7 @@ mod connection_telemetry_tests {
         assert_eq!(lines[0], "current connections");
         assert_eq!(
             lines[1],
-            "  bluey\tid=19 age=12.5s attach_failures=2 last_failure=hello/750ms last_application_progress=450ms ago"
+            "  laptop\tid=19 age=12.5s attach_failures=2 last_failure=hello/750ms last_application_progress=450ms ago"
         );
     }
 }

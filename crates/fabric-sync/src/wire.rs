@@ -1112,12 +1112,12 @@ mod tests {
 
     #[tokio::test]
     async fn wire_pushes_new_file_to_peer() {
-        // The hetz-proof shape: a new file on the client lands on the server.
+        // The catalog-proof shape: a new file on the client lands on the server.
         let a = Arc::new(Mutex::new(SyncNode::new(author(1))));
         let b = Arc::new(Mutex::new(SyncNode::new(author(2))));
         a.lock()
             .await
-            .local_write("job-hetz.toml", b"host=hetz", 0, 0);
+            .local_write("job-vps.toml", b"host=vps", 0, 0);
 
         let (c, s) = tokio::io::duplex(1 << 20);
         let b2 = b.clone();
@@ -1129,8 +1129,8 @@ mod tests {
 
         let folder = b.lock().await.folder_state();
         assert_eq!(
-            folder.get("job-hetz.toml").map(Vec::as_slice),
-            Some(&b"host=hetz"[..])
+            folder.get("job-vps.toml").map(Vec::as_slice),
+            Some(&b"host=vps"[..])
         );
     }
 

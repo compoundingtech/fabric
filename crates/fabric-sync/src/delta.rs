@@ -394,7 +394,7 @@ mod tests {
     fn a_peer_acknowledgement_does_not_make_a_change_durable() {
         let mut buffer = ChangeBuffer::new();
         buffer.record("a.txt");
-        buffer.acknowledge("hetz", buffer.head());
+        buffer.acknowledge("vps", buffer.head());
         assert_eq!(
             buffer.durable_cursor(),
             0,
@@ -406,18 +406,18 @@ mod tests {
     #[test]
     fn an_unknown_peer_has_no_cursor_and_must_get_full_state() {
         let buffer = ChangeBuffer::new();
-        assert_eq!(buffer.cursor_for("hetz"), None);
+        assert_eq!(buffer.cursor_for("vps"), None);
     }
 
     #[test]
     fn acknowledging_then_resetting_returns_a_peer_to_full_state() {
         let mut buffer = ChangeBuffer::new();
         buffer.record("a.txt");
-        buffer.acknowledge("hetz", buffer.head());
-        assert_eq!(buffer.cursor_for("hetz"), Some(1));
-        buffer.reset_peer("hetz");
+        buffer.acknowledge("vps", buffer.head());
+        assert_eq!(buffer.cursor_for("vps"), Some(1));
+        buffer.reset_peer("vps");
         assert_eq!(
-            buffer.cursor_for("hetz"),
+            buffer.cursor_for("vps"),
             None,
             "a reset peer must be sent everything again"
         );
@@ -430,14 +430,14 @@ mod tests {
     fn one_silent_peer_holds_eviction_back_completely() {
         let mut buffer = ChangeBuffer::new();
         buffer.record("a.txt");
-        buffer.acknowledge("hetz", buffer.head());
+        buffer.acknowledge("vps", buffer.head());
         assert_eq!(
-            buffer.acked_by_all(&["hetz", "droppy"]),
+            buffer.acked_by_all(&["vps", "desktop"]),
             0,
-            "droppy has confirmed nothing, so nothing may be forgotten"
+            "desktop has confirmed nothing, so nothing may be forgotten"
         );
-        buffer.acknowledge("droppy", buffer.head());
-        assert_eq!(buffer.acked_by_all(&["hetz", "droppy"]), 1);
+        buffer.acknowledge("desktop", buffer.head());
+        assert_eq!(buffer.acked_by_all(&["vps", "desktop"]), 1);
     }
 
     #[test]
@@ -446,9 +446,9 @@ mod tests {
         buffer.record("a.txt");
         let slow = buffer.head();
         buffer.record("b.txt");
-        buffer.acknowledge("hetz", buffer.head());
-        buffer.acknowledge("droppy", slow);
-        assert_eq!(buffer.acked_by_all(&["hetz", "droppy"]), slow);
+        buffer.acknowledge("vps", buffer.head());
+        buffer.acknowledge("desktop", slow);
+        assert_eq!(buffer.acked_by_all(&["vps", "desktop"]), slow);
     }
 
     /// With no peers there is nothing to protect, but forgetting everything on

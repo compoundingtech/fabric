@@ -9,7 +9,7 @@
 //!
 //! It becomes necessary in two cases:
 //!
-//! 1. **Names.** `https://hetz.fabric:4000` needs a certificate for that name.
+//! 1. **Names.** `https://vps.fabric:4000` needs a certificate for that name.
 //! 2. **A listener that is not on loopback.** Dialling to `0.0.0.0:4000` so a
 //!    phone or a second laptop can reach it makes the URL
 //!    `http://192.168.1.x:4000`, which is NOT a secure context.
@@ -26,7 +26,7 @@
 //! against that root:
 //!
 //! ```text
-//! consumer                       hetz.fabric   evil.example.com
+//! consumer                       vps.fabric    evil.example.com
 //! macOS Security framework       successful    CSSMERR_TP_INVALID_CERTIFICATE
 //! OpenSSL 3.6.3 (macOS)          OK            verification failed
 //! OpenSSL 3.5.5 (Linux)          OK            verification failed
@@ -50,7 +50,7 @@ use crate::config::FabricHome;
 /// The DNS suffix every fabric name ends in, and the only one the CA may sign.
 ///
 /// The leading dot is what makes it a SUBTREE in RFC 5280 terms: it permits
-/// `hetz.fabric` and refuses `fabric` itself and anything else.
+/// `vps.fabric` and refuses `fabric` itself and anything else.
 pub const NAME_SUFFIX: &str = ".fabric";
 
 /// How long a freshly generated authority lasts.
@@ -328,8 +328,8 @@ mod tests {
 
     #[test]
     fn only_fabric_names_may_be_signed() {
-        assert!(name_is_permitted("hetz.fabric"));
-        assert!(name_is_permitted("web.droppy.fabric"));
+        assert!(name_is_permitted("vps.fabric"));
+        assert!(name_is_permitted("web.desktop.fabric"));
         assert!(name_is_permitted("localhost"));
 
         // The suffix alone is not a name inside the subtree.
@@ -380,7 +380,7 @@ mod tests {
         // thing standing between them is the constraint.
         let ca_key = KeyPair::from_pem(&ca.key_pem).unwrap();
         let issuer = Issuer::from_ca_cert_pem(&ca.cert_pem, ca_key).unwrap();
-        for (name, should_verify) in [("hetz.fabric", true), ("evil.example.com", false)] {
+        for (name, should_verify) in [("vps.fabric", true), ("evil.example.com", false)] {
             let key = KeyPair::generate().unwrap();
             let params = CertificateParams::new(vec![name.to_string()]).unwrap();
             let leaf = params.signed_by(&key, &issuer).unwrap();
@@ -421,7 +421,7 @@ mod tests {
     #[test]
     fn a_permitted_name_gets_a_certificate() {
         let ca = generate("test-host").unwrap();
-        let leaf = issue(&ca.cert_pem, &ca.key_pem, "hetz.fabric").unwrap();
+        let leaf = issue(&ca.cert_pem, &ca.key_pem, "vps.fabric").unwrap();
         assert!(leaf.cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(leaf.key_pem.contains("PRIVATE KEY"));
     }

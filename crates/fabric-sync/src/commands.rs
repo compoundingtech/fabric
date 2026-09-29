@@ -507,8 +507,8 @@ mod sync_ls_tests {
             full_payload_sends: 0,
             content_bytes: 0,
             stopped_peers: vec![
-                ("hetz".into(), "denied".into()),
-                ("bluey".into(), "away".into()),
+                ("vps".into(), "denied".into()),
+                ("laptop".into(), "away".into()),
             ],
             digest: "lattice-point-aaaa".into(),
             name: "catalog".to_string(),
@@ -573,13 +573,13 @@ mod sync_ls_tests {
                 "delta_fallbacks": 0,
                 "full_payload_sends": 0,
                 "content_bytes": 0,
-                "stopped_peers": ["hetz:denied"],
-                "away_peers": ["bluey"],
+                "stopped_peers": ["vps:denied"],
+                "away_peers": ["laptop"],
                 "digest": "lattice-point-aaaa"
             })
         );
-        assert_eq!(stopped_token(&status), "hetz:denied");
-        assert_eq!(away_token(&status), "bluey");
+        assert_eq!(stopped_token(&status), "vps:denied");
+        assert_eq!(away_token(&status), "laptop");
     }
 
     #[test]

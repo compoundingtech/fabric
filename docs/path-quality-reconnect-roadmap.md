@@ -5,30 +5,25 @@ proof and its 24-hour cost window remain.
 
 ## Live Repro
 
-Source: `/tmp/cos-fabric-watchdog.log`, reported 2026-07-17 23:29 CEST.
+Observed on a real laptop-to-server link in July 2026:
 
-Observed behavior:
-
-- `fabric ping hetzner` held a direct path with roughly 5 second RTT for more
+- `fabric ping server` held a direct path with roughly 5 second RTT for more
   than 30 minutes.
-- Both daemons were otherwise healthy:
-  - Mac: roughly 5 percent CPU and 98 MiB RSS.
-  - Hetzner: roughly 2 percent CPU, 180 MiB RSS, and idle load around 0.06.
-- Adjacent reachability checks were healthy:
-  - ICMP Mac to Hetzner public IP: 18 ms, 0 percent packet loss.
-  - ICMP Mac to Hetzner Tailscale IP: 18 ms, 0 percent packet loss.
-  - Tailscale ping: 18 ms.
-- A fabric restart recovered service, but only to roughly 46 ms over relay. It
-  did not immediately establish a fresh direct iroh path.
+- Both daemons were otherwise healthy, with normal CPU and memory.
+- Adjacent reachability checks between the same two machines, ICMP and a
+  separate VPN's own ping, answered in tens of milliseconds with no loss.
+- A fabric restart recovered service, but only to a relay path in the tens of
+  milliseconds. It did not immediately establish a fresh direct iroh path.
 
 This is a degraded-but-connected path. It is not a dead endpoint, not a memory
 threshold breach, and not a host network outage.
 
 The ICMP data does not prove that iroh's UDP hole-punched direct flow could have
-achieved 18 ms. The direct UDP flow may have degraded for causes ICMP would not
-show, such as stale NAT state, UDP rate limiting, or an asymmetric UDP path. The
-precise claim is that iroh's direct flow went bad, iroh did not detect or
-reselect away from that bad path, and restart fell back to a usable relay path.
+achieved the same latency. The direct UDP flow may have degraded for causes ICMP
+would not show, such as stale NAT state, UDP rate limiting, or an asymmetric UDP
+path. The precise claim is that iroh's direct flow went bad, iroh did not detect
+or reselect away from that bad path, and restart fell back to a usable relay
+path.
 
 ## Former Blind Spot
 
@@ -112,7 +107,7 @@ iroh exposes **no fine-grained per-path evict/re-select** API: only
 So a degraded-but-*validated* selected path cannot be individually dropped; the
 lever is re-dialing the connection to force fresh path selection.
 
-Decided build (Nathan, 2026-07-20):
+Decided build (2026-07-20):
 
 1. **Consolidate to exactly one multipath QUIC connection per machine-pair.**
    Multiplex every logical socket/tunnel as a QUIC stream on that shared
@@ -131,9 +126,8 @@ Decided build (Nathan, 2026-07-20):
 
 ## Future Experiment: Dual-Path Bonding (parked)
 
-Not to be built now — captured here at Nathan's request as a named future
-experiment. Once the single-multipath-connection-per-peer design is reliable and
-instrumented:
+Not to be built now — captured here as a named future experiment. Once the
+single-multipath-connection-per-peer design is reliable and instrumented:
 
 - Deliberately keep **two paths active at once** (e.g. a direct path and a relay
   path, or two direct paths across different interfaces) instead of only the one

@@ -276,13 +276,13 @@ mod tests {
             version: "0.2.16+abc1234".into(),
             sync_ipc_magic: "fabric/sync-ipc".into(),
             sync_ipc_version: 1,
-            companion_socket: Some(PathBuf::from("/home/run/sync-companion.sock")),
+            companion_socket: Some(PathBuf::from("/home/example/run/sync-companion.sock")),
         };
         let daemon_hello = ControlRequest::SyncCompanionHello {
             version: "0.2.16+abc1234".into(),
             sync_ipc_magic: "fabric/sync-ipc".into(),
             sync_ipc_version: 1,
-            companion_socket: Some(PathBuf::from("/home/run/sync-companion.sock")),
+            companion_socket: Some(PathBuf::from("/home/example/run/sync-companion.sock")),
         };
         assert_eq!(
             serde_json::to_value(&hello).unwrap(),
@@ -299,7 +299,7 @@ mod tests {
         for (nonce, daemon_socket, node_id) in [
             (
                 Some("ab".repeat(24)),
-                Some(PathBuf::from("/home/run/sync-ipc.sock")),
+                Some(PathBuf::from("/home/example/run/sync-ipc.sock")),
                 Some("cd".repeat(32)),
             ),
             (None, None, None),
@@ -352,7 +352,7 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<CompanionResponse>(
                 serde_json::to_value(ControlResponse::Restarting {
-                    log: PathBuf::from("/home/logs/restart.log"),
+                    log: PathBuf::from("/home/example/logs/restart.log"),
                     allow_shell: false,
                 })
                 .unwrap()
@@ -397,7 +397,7 @@ mod tests {
             name: "catalog".into(),
             folder: "/catalog".into(),
             digest: "0123456789abcdef".into(),
-            stopped_peers: vec![("hetz".into(), "denied".into())],
+            stopped_peers: vec![("vps".into(), "denied".into())],
             sync_passes: 7,
             ..SyncEntryStatus::default()
         };
@@ -474,13 +474,13 @@ mod tests {
             allow_shell: true,
             allow_exec: false,
             peers: Vec::new(),
-            connection_telemetry: BTreeMap::from([("droppy".to_string(), populated_peer())]),
+            connection_telemetry: BTreeMap::from([("desktop".to_string(), populated_peer())]),
             connection_telemetry_window: TelemetryWindow {
                 started_unix_seconds: Some(1_788_369_000),
                 reset_reason: None,
             },
             current_connection_health: BTreeMap::from([(
-                "droppy".to_string(),
+                "desktop".to_string(),
                 CurrentConnectionHealth {
                     connection_id: 7,
                     age_millis: 12_000,
@@ -506,7 +506,7 @@ mod tests {
                 current_connection_health,
                 ..
             } => {
-                let peer = &connection_telemetry["droppy"];
+                let peer = &connection_telemetry["desktop"];
                 assert_eq!(peer.losses, 1);
                 assert_eq!(peer.probes_reachable, 80);
                 assert!(
@@ -515,7 +515,7 @@ mod tests {
                 );
                 assert_eq!(peer.probe_latency["relay"].samples, 1);
                 assert_eq!(
-                    current_connection_health["droppy"].consecutive_attach_failures,
+                    current_connection_health["desktop"].consecutive_attach_failures,
                     2
                 );
                 assert_eq!(

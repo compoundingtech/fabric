@@ -875,7 +875,7 @@ mod tests {
             19,
             IpcRequestKind::OpenInbound {
                 authenticated_peer_id: "node-id-from-daemon".into(),
-                display_label: Some("hetz".into()),
+                display_label: Some("vps".into()),
             },
         );
         let (mut writer, mut reader) = tokio::io::duplex(4096);
@@ -889,7 +889,7 @@ mod tests {
                 authenticated_peer_id,
                 display_label: Some(display_label),
             } if authenticated_peer_id == "node-id-from-daemon"
-                && display_label == "hetz"
+                && display_label == "vps"
         ));
         Ok(())
     }

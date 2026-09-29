@@ -1,17 +1,17 @@
 # Dev-vs-prod isolation for fabric (and the general pattern)
 
-_Design for review, 2026-07-22 by fabric-claude. For Nathan + cos. Bring the
-design before big changes; this is that design._
+_Design, July 2026._
 
-## The problem (concrete, from this morning)
+## The problem
 
 We must **develop fabric** — build, run, restart, crash it — **without ever
-touching the production daemon** that is cos's *only path to hetz*, and without
-the launchd service fighting a dev instance. This morning's status-5 outage was
-exactly a **service-vs-manual race**: a managed launchd daemon and a manual
-`fabric up` both wanting the same daemon, on the same home, socket, identity, and
-service label. Nathan: *having fabric as a launchd/.service makes fabric
-development hard.* Fix the isolation, structurally.
+touching the production daemon**, which may be the only route other machines
+have to reach this one, and without the launchd service fighting a dev
+instance. The outage that prompted this design was exactly a
+**service-vs-manual race**: a managed launchd daemon and a manual `fabric up`
+both wanting the same daemon, on the same home, socket, identity, and service
+label. Having fabric as a launchd or systemd service makes fabric development
+hard unless the two are isolated structurally.
 
 ## What already isolates, and the two traps that don't
 
@@ -35,9 +35,9 @@ prod:
 2. **The CLI defaults to the prod home.** A `fabric` command with no
    `--home`/`FABRIC_HOME` targets `~/.local/share/fabric` = **prod**. A dev who
    forgets the flag runs `fabric down`/`restart`/`service install` against the
-   *production* daemon. (This is the home-mismatch trap cos hit; the `9f5391b` fix
-   aligned an explicit `--home <default-root>` with the CLI default, but the
-   forgot-the-flag case remains.)
+   *production* daemon. (This is the home-mismatch trap that has already been
+   hit; the `9f5391b` fix aligned an explicit `--home <default-root>` with the
+   CLI default, but the forgot-the-flag case remains.)
 
 ## Recommended model
 
@@ -70,7 +70,7 @@ Build + run + restart + crash a **dev** fabric (on `FABRIC_HOME=…-dev`) and th
 socket, identity, or service label. Verified by: two instances up at once, kill
 the dev one repeatedly, `fabric status` on prod stays reachable throughout.
 
-## The general pattern (for pty, pty-rust, st2)
+## The general pattern
 
 State it once, carry it to each owner:
 
@@ -86,14 +86,13 @@ network dependency; the pattern generalizes directly.
 
 ## Defense-in-depth: service `KillMode=process`
 
-Real incident, 2026-07-22 deploy: restarting hetz's fabric service SIGTERM'd the
-**entire agent fleet**, because a prior manual recovery had launched `convoy up`
-(and all agents) from inside a `fabric shell` — so those processes inherited
-fabric's systemd cgroup, and the unit's default `KillMode=control-group` kills the
-whole cgroup on stop/restart. (Primary fix was operational: the fleet was
-relaunched under its own `convoy-up.service` unit = isolated cgroup. And during
-the deploy we avoided the same class by having Nathan fire the hetz restart from
-ssh rather than from a `fabric shell` child.)
+Real incident, July 2026: restarting a Linux machine's fabric service
+SIGTERM'd **every long-running process that had been started from a `fabric
+shell`**. Those processes inherited fabric's systemd cgroup, and the unit's
+default `KillMode=control-group` kills the whole cgroup on stop/restart. (The
+primary fix was operational: relaunch such processes under their own service
+unit, which gives them an isolated cgroup, and restart fabric from ssh rather
+than from a `fabric shell` child.)
 
 Belt-and-suspenders for fabric itself: set the fabric service unit to
 **`KillMode=process`** so a restart kills only the daemon, never a neighbor that
@@ -114,12 +113,5 @@ Two places need it:
 
 - fabric's **generated** unit uses `KillMode=process`. Its unit-render test
   prevents the default cgroup-wide stop behavior from returning.
-- **hand-written** units like hetz's `fabric-keepalive.service` — an ops change,
-  not fabric code; flag to add `KillMode=process` when convenient.
-
-## Scope note
-
-This is design only — no big change yet, per the gate. If approved I'll implement
-the small, safe pieces first (service-install refuses non-default home; the
-mutating-op mismatch guard) and document the `FABRIC_HOME`-for-dev convention in
-the README; the `fabric dev` subcommand is optional follow-up.
+- **hand-written** units that wrap fabric — an ops change, not fabric code; add
+  `KillMode=process` to them as well.

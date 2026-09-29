@@ -151,9 +151,9 @@ pub(crate) const VALIDATION_LOG_TARGET: &str = "fabric::validation";
 /// What a backoff record is about.
 ///
 /// Failures have to be attributed, or they get charged to whoever dials next. A
-/// dial keys on the peer and the ALPN, because "hetz is unreachable" says nothing
-/// about droppy, and "droppy does not speak fabric/exec/0" says nothing about its
-/// shell. The accept loop keys on itself: it throttles before any connection
+/// dial keys on the peer and the ALPN, because "vps is unreachable" says nothing
+/// about desktop, and "desktop does not speak fabric/exec/0" says nothing about
+/// its shell. The accept loop keys on itself: it throttles before any connection
 /// exists, so there is no peer to attribute an accept failure to.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct BackoffKey {
@@ -5740,13 +5740,13 @@ mod tests {
     async fn rejected_peer_reload_keeps_the_last_valid_peer_book() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let home = FabricHome::new(dir.path());
-        let id = trust_named_peer(&home, "silber")?;
-        write_test_sync(&home, dir.path().join("catalog"), "silber")?;
+        let id = trust_named_peer(&home, "studio")?;
+        write_test_sync(&home, dir.path().join("catalog"), "studio")?;
         let node = FabricNode::start(home.clone()).await?;
 
         PeerBook::default().save(&home)?;
         let error = node.state().reload_peers().await.unwrap_err();
-        assert!(format!("{error:#}").contains("unknown peer selector \"silber\""));
+        assert!(format!("{error:#}").contains("unknown peer selector \"studio\""));
 
         let state = node.state();
         let peers = state.peer_book.read().await;
@@ -5763,13 +5763,13 @@ mod tests {
 
         let dir = tempfile::tempdir()?;
         let home = FabricHome::new(dir.path());
-        let id = trust_named_peer(&home, "silber")?;
+        let id = trust_named_peer(&home, "studio")?;
         let node = FabricNode::start(home.clone()).await?;
         fs::write(
             home.peers_path(),
             format!(
                 "allow_shell = true\nallow_exec = true\n\n\
-                 [[peers]]\nid = \"{id}\"\nname = \"silber\"\nallow = [\"sync\"]\n"
+                 [[peers]]\nid = \"{id}\"\nname = \"studio\"\nallow = [\"sync\"]\n"
             ),
         )?;
 
@@ -6363,11 +6363,11 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let node = FabricNode::start(FabricHome::new(temp.path())).await?;
         let state = node.state();
-        let bluey = iroh::SecretKey::generate().public();
+        let laptop = iroh::SecretKey::generate().public();
         let before = state.endpoint_handle().generation;
 
         state
-            .recover_unreachable_peer(bluey, "bluey", 3, Instant::now())
+            .recover_unreachable_peer(laptop, "laptop", 3, Instant::now())
             .await;
         assert_eq!(
             state.endpoint_handle().generation,
@@ -6376,7 +6376,7 @@ mod tests {
         );
 
         state
-            .recover_unreachable_peer(bluey, "bluey", 100, Instant::now())
+            .recover_unreachable_peer(laptop, "laptop", 100, Instant::now())
             .await;
         assert_eq!(state.endpoint_handle().generation, before);
 
@@ -6389,52 +6389,52 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let node = FabricNode::start(FabricHome::new(temp.path())).await?;
         let state = node.state();
-        let bluey = iroh::SecretKey::generate().public();
-        let hetz = iroh::SecretKey::generate().public();
+        let laptop = iroh::SecretKey::generate().public();
+        let vps = iroh::SecretKey::generate().public();
         let mut tracker = PeerHealthTracker::new(3, Duration::ZERO, Duration::ZERO);
         const OLD_RECYCLE_ATTEMPT: usize = 3;
         let now = Instant::now();
         let before = state.endpoint_handle().generation;
 
         assert_eq!(
-            tracker.on_probe(bluey, false, false, now),
+            tracker.on_probe(laptop, false, false, now),
             PeerHealthAction::None
         );
         assert_eq!(
-            tracker.on_probe(bluey, false, false, now),
+            tracker.on_probe(laptop, false, false, now),
             PeerHealthAction::None
         );
         for expected_attempt in 1..OLD_RECYCLE_ATTEMPT {
             let PeerHealthAction::Recover { attempt } =
-                tracker.on_probe(bluey, false, false, now)
+                tracker.on_probe(laptop, false, false, now)
             else {
-                panic!("bluey did not request recovery attempt {expected_attempt}");
+                panic!("laptop did not request recovery attempt {expected_attempt}");
             };
             assert_eq!(attempt, expected_attempt);
             state
-                .recover_unreachable_peer(bluey, "bluey", attempt, now)
+                .recover_unreachable_peer(laptop, "laptop", attempt, now)
                 .await;
         }
 
         assert_eq!(
-            tracker.on_probe(hetz, false, false, now),
+            tracker.on_probe(vps, false, false, now),
             PeerHealthAction::None,
-            "one missed hetz probe must stay below its own threshold"
+            "one missed vps probe must stay below its own threshold"
         );
         let PeerHealthAction::Recover { attempt } =
-            tracker.on_probe(bluey, false, false, now)
+            tracker.on_probe(laptop, false, false, now)
         else {
-            panic!("bluey did not retain its independent failure history");
+            panic!("laptop did not retain its independent failure history");
         };
         assert_eq!(attempt, OLD_RECYCLE_ATTEMPT);
         state
-            .recover_unreachable_peer(bluey, "bluey", attempt, now)
+            .recover_unreachable_peer(laptop, "laptop", attempt, now)
             .await;
 
         assert_eq!(
             state.endpoint_handle().generation,
             before,
-            "bluey's old absence replaced the shared endpoint after one hetz miss"
+            "laptop's old absence replaced the shared endpoint after one vps miss"
         );
 
         node.shutdown().await?;
@@ -6571,7 +6571,7 @@ mod tests {
 
     #[test]
     fn no_fixed_rss_threshold_exists_in_the_daemon() {
-        // Nathan's rule: Fabric must not enforce a fixed RSS recycle or kill limit
+        // Product rule: Fabric must not enforce a fixed RSS recycle or kill limit
         // before healthy working sets are measured. Asking the allocator to return
         // pages it already considers free is not such a limit. This pins that RSS
         // cannot recycle or stop the daemon at one total. Needles are split so this

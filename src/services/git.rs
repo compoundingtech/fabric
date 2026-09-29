@@ -703,17 +703,17 @@ mod tests {
     #[test]
     fn fabric_urls_are_strict_and_path_free() {
         assert_eq!(
-            parse_url("fabric://hetz/mandat").unwrap(),
-            ("hetz".to_string(), "mandat".to_string())
+            parse_url("fabric://vps/garden").unwrap(),
+            ("vps".to_string(), "garden".to_string())
         );
         for invalid in [
-            "https://hetz/mandat",
-            "fabric://hetz/a/b",
-            "fabric://user@hetz/mandat",
-            "fabric://hetz:443/mandat",
-            "fabric://hetz/../mandat",
-            "fabric://hetz/mandat?x=1",
-            "fabric://hetz/percent%20name",
+            "https://vps/garden",
+            "fabric://vps/a/b",
+            "fabric://user@vps/garden",
+            "fabric://vps:443/garden",
+            "fabric://vps/../garden",
+            "fabric://vps/garden?x=1",
+            "fabric://vps/percent%20name",
         ] {
             assert!(parse_url(invalid).is_err(), "invalid URL passed: {invalid}");
         }

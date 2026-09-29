@@ -1672,11 +1672,11 @@ mod tests {
     #[test]
     fn a_peer_without_an_allow_list_may_reach_nothing() {
         let mut book = PeerBook::default();
-        let hetz = an_id(1);
-        book.add(hetz, Some("hetz".into()), None);
+        let vps = an_id(1);
+        book.add(vps, Some("vps".into()), None);
         for service in ["sync", "shell", "anything-exposed-later"] {
             let denied = book
-                .may(&hetz, service)
+                .may(&vps, service)
                 .expect_err("an omitted allow list granted a service");
             assert!(
                 denied.to_string().contains("no grants"),
@@ -1710,19 +1710,19 @@ mod tests {
         let id = an_id(2);
         let mut book = PeerBook::default();
         book.add(id, Some("friend".into()), None);
-        book.share_git_remote("mandat", PathBuf::from("/srv/git/mandat.git"))
+        book.share_git_remote("garden", PathBuf::from("/srv/git/garden.git"))
             .unwrap();
-        book.grant_git_remote("mandat", "friend", GitAccess::Read)
+        book.grant_git_remote("garden", "friend", GitAccess::Read)
             .unwrap();
 
         let raw = toml::to_string_pretty(&book).unwrap();
         let restored: PeerBook = toml::from_str(&raw).unwrap();
         assert_eq!(
-            restored.git_remote("mandat").unwrap().path,
-            PathBuf::from("/srv/git/mandat.git")
+            restored.git_remote("garden").unwrap().path,
+            PathBuf::from("/srv/git/garden.git")
         );
-        assert_eq!(restored.may(&id, "git/mandat/read"), Ok(()));
-        assert!(restored.may(&id, "git/mandat/write").is_err());
+        assert_eq!(restored.may(&id, "git/garden/read"), Ok(()));
+        assert!(restored.may(&id, "git/garden/write").is_err());
     }
 
     #[test]
@@ -1735,11 +1735,11 @@ mod tests {
             None,
             Some(vec!["shell".into(), "exec".into(), "pty-view".into()]),
         );
-        book.share_git_remote("mandat", PathBuf::from("/srv/git/mandat.git"))
+        book.share_git_remote("garden", PathBuf::from("/srv/git/garden.git"))
             .unwrap();
 
-        assert!(book.may(&id, "git/mandat/read").is_err());
-        assert!(book.may(&id, "git/mandat/write").is_err());
+        assert!(book.may(&id, "git/garden/read").is_err());
+        assert!(book.may(&id, "git/garden/write").is_err());
     }
 
     #[test]
@@ -1747,16 +1747,16 @@ mod tests {
         let id = an_id(4);
         let mut book = PeerBook::default();
         book.add(id, Some("friend".into()), None);
-        for remote in ["mandat", "other"] {
+        for remote in ["garden", "other"] {
             book.share_git_remote(remote, PathBuf::from(format!("/srv/git/{remote}.git")))
                 .unwrap();
             book.grant_git_remote(remote, "friend", GitAccess::Read)
                 .unwrap();
         }
 
-        book.unshare_git_remote("mandat").unwrap();
-        assert!(book.git_remote("mandat").is_none());
-        assert!(book.may(&id, "git/mandat/read").is_err());
+        book.unshare_git_remote("garden").unwrap();
+        assert!(book.git_remote("garden").is_none());
+        assert!(book.may(&id, "git/garden/read").is_err());
         assert_eq!(book.may(&id, "git/other/read"), Ok(()));
     }
 
@@ -1771,13 +1771,13 @@ mod tests {
             );
         }
         assert!(
-            book.share_git_remote("mandat", PathBuf::from("relative/repo.git"))
+            book.share_git_remote("garden", PathBuf::from("relative/repo.git"))
                 .is_err()
         );
-        book.share_git_remote("mandat", PathBuf::from("/srv/git/mandat.git"))
+        book.share_git_remote("garden", PathBuf::from("/srv/git/garden.git"))
             .unwrap();
         assert!(
-            book.share_git_remote("mandat", PathBuf::from("/srv/git/other.git"))
+            book.share_git_remote("garden", PathBuf::from("/srv/git/other.git"))
                 .is_err(),
             "a share was silently rebound"
         );
@@ -1786,9 +1786,9 @@ mod tests {
     #[test]
     fn git_permissions_must_name_a_declared_remote_and_exact_operation() {
         let id = an_id(5);
-        for permission in ["git/missing/read", "git/mandat/admin", "git/mandat"] {
+        for permission in ["git/missing/read", "git/garden/admin", "git/garden"] {
             let mut book = PeerBook::default();
-            book.share_git_remote("mandat", PathBuf::from("/srv/git/mandat.git"))
+            book.share_git_remote("garden", PathBuf::from("/srv/git/garden.git"))
                 .unwrap();
             book.add_with_allow(
                 id,
@@ -1814,7 +1814,7 @@ mod tests {
         book.save(&home).unwrap();
         fs::set_permissions(home.peers_path(), fs::Permissions::from_mode(0o640)).unwrap();
 
-        book.share_git_remote("mandat", PathBuf::from("/srv/git/mandat.git"))
+        book.share_git_remote("garden", PathBuf::from("/srv/git/garden.git"))
             .unwrap();
         book.save(&home).unwrap();
 
@@ -1953,7 +1953,7 @@ mod tests {
 
     #[test]
     fn generic_exposures_cannot_take_the_git_namespace() {
-        let error = validate_protocol("git/mandat/read")
+        let error = validate_protocol("git/garden/read")
             .unwrap_err()
             .to_string();
         assert!(error.contains("reserved"), "wrong refusal: {error}");
@@ -2012,17 +2012,17 @@ mod tests {
     #[test]
     fn re_adding_a_peer_keeps_its_permissions() {
         let mut book = PeerBook::default();
-        let droppy = an_id(4);
+        let desktop = an_id(4);
         book.add_with_allow(
-            droppy,
-            Some("droppy".into()),
+            desktop,
+            Some("desktop".into()),
             None,
             Some(vec!["web".into()]),
         );
         book.peers[0].roaming = true;
-        book.add(droppy, Some("droppy".into()), None);
+        book.add(desktop, Some("desktop".into()), None);
         assert_eq!(
-            book.may(&droppy, "shell"),
+            book.may(&desktop, "shell"),
             Err(Denied::NotPermitted {
                 service: "shell".into()
             }),

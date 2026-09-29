@@ -340,11 +340,11 @@ CPU time. Every number will include its measurement window.
 
 ## Live acceptance
 
-The rollout will use the same live probes as build `0.2.1+48208e4`.
+The rollout will use the same live probes as earlier releases.
 
-1. Deploy hetz first after release approval.
+1. Deploy one always-on machine first after release approval.
 2. Prove mixed-version ping, exec, send-file, and sync health.
-3. Deploy Silber.
+3. Deploy the next machine.
 4. Prove equal clean digests and both doctor reports.
 5. Count full manifest clones in matched 10-second windows.
 6. Run five allocator windows of 30 seconds each.

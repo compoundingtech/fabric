@@ -7,15 +7,15 @@ Status: approved for implementation on 2026-09-04.
 Implementation: all eight steps are merged. The companion owns sync in
 production and the engine is out of the `fabric` binary.
 
-Step 8 as built goes further than the sketch below, on the principal's words of
-2026-09-23: the sync engine leaves the core entirely, and fabric keeps only what
-it needs to authorize and forward sync streams and to report status. The
-repository is a workspace; the `fabric-sync` crate holds the manifest algebra,
-the node state, the wire sessions, the engine, the lease, the bridge transport
-and the companion runtime; the core keeps the `syncs.toml` config, the staging
-commands, the bridge, the wire framing with the unavailable reply, and the few
-shared definitions (content hash, path form, atomic write, peer refs). The
-mixed-fleet matrix runs its old side as a deployed pre-boundary binary.
+Step 8 as built goes further than the sketch below, as decided on 2026-09-23:
+the sync engine leaves the core entirely, and fabric keeps only what it needs to
+authorize and forward sync streams and to report status. The repository is a
+workspace; the `fabric-sync` crate holds the manifest algebra, the node state,
+the wire sessions, the engine, the lease, the bridge transport and the companion
+runtime; the core keeps the `syncs.toml` config, the staging commands, the
+bridge, the wire framing with the unavailable reply, and the few shared
+definitions (content hash, path form, atomic write, peer refs). The mixed-fleet
+matrix runs its old side as a deployed pre-boundary binary.
 
 Step 6 as built differs from the sketch below in two places. The inbound open
 carries no sync name: the companion reads the wire hello itself, so the daemon
@@ -51,11 +51,11 @@ literal one-file config. They do not make that move part of this extraction.
 Combining the file move with the process move would mix two migrations and make
 each rollback depend on the other.
 
-If Nathan later selects one literal file, do it in a separate change after the
-upsert work lands. The daemon must parse the complete file and send validated
-sync entries through IPC. `fabric-sync` must still not parse peer policy. Until
-then, two sibling files provide one Fabric-owned config authority without a
-second companion config surface.
+If the project later selects one literal file, do it in a separate change after
+the upsert work lands. The daemon must parse the complete file and send
+validated sync entries through IPC. `fabric-sync` must still not parse peer
+policy. Until then, two sibling files provide one Fabric-owned config authority
+without a second companion config surface.
 
 ## The permanent latency test
 
@@ -121,9 +121,9 @@ window. It reports content bytes, wire bytes, wall time, daemon CPU,
 
 The bridge path must deliver at least 90 percent of the embedded path's content
 throughput during that fixed window. This threshold is set before measurement.
-If the bridge loses more than 10 percent, work stops before activation. The
-transport decision then returns to Nathan through Silber.cos. CPU and memory
-remain reported costs, but this plan does not set their limits.
+If the bridge loses more than 10 percent, work stops before activation and the
+transport decision is reopened. CPU and memory remain reported costs, but this
+plan does not set their limits.
 
 ## Ownership
 
@@ -202,8 +202,8 @@ receives its first paired archive. The transition release contains the complete
 pair-aware rollback reader and the macOS supervisor. It contains no companion.
 The reader restores both old processes when a companion existed. It removes the
 companion binary and OS service when no companion existed. The first paired
-archive is the later writer. This gate is per machine, so a roaming machine such
-as Bluey first receives a fabric-only archive when it returns.
+archive is the later writer. This gate is per machine, so a roaming machine
+first receives a fabric-only archive when it returns.
 
 The reader-before-writer rule applies to every update artifact. If a new release
 writes an artifact that an old rollback binary must read, the old binary must
@@ -213,11 +213,12 @@ follow this rule. A release plan must identify the reader for each new artifact
 before it permits the writer.
 
 Release `v0.2.3+bef869a` is a published one-member route. Release `0.2.4`
-publishes the canonical paired archive for the strict `0.2.2` server readers.
-It also publishes a distinct one-member compatibility archive for Bluey's
-strict `0.2.1` reader. Bluey selects that asset with an explicit URL and hash,
-so it needs only one supervised update. The `0.2.4` updater accepts both valid
-shapes, and later releases can return to paired archives only.
+publishes the canonical paired archive for the strict `0.2.2` server readers. It
+also publishes a distinct one-member compatibility archive for a machine still
+on the strict `0.2.1` reader. That machine selects the asset with an explicit
+URL and hash, so it needs only one supervised update. The `0.2.4` updater
+accepts both valid shapes, and later releases can return to paired archives
+only.
 
 ### Paired-install rollback inventory
 
@@ -401,12 +402,13 @@ an explicit sync-unavailable wire reply. An outbound companion request gets a
 structured local error. Neither case is classified as network weather.
 
 Deploy one machine first and prove both mixed directions. Continue one machine
-at a time. The release gate remains with Silber.cos. Reverting the complete
-binary pair restores the embedded owner and reads the unchanged state.
+at a time. The release gate remains with the release owner. Reverting the
+complete binary pair restores the embedded owner and reads the unchanged state.
 
 No paired archive may reach a machine until that machine runs a fabric-only
-release and has proved its rollback reader. Bluey follows the same gate when it
-returns. Its distinct `0.2.4` compatibility asset satisfies this reader gate.
+release and has proved its rollback reader. A roaming machine follows the same
+gate when it returns. The distinct `0.2.4` compatibility asset satisfies this
+reader gate.
 
 ### 8. Remove the dormant embedded engine
 
@@ -429,8 +431,8 @@ cleanup only. Reverting it does not change the active process architecture.
 ## Activation gates
 
 Each implementation pull request merges when its required tests and CI pass.
-Silber.cos owns the step 7 activation gate and every release and deployment
-gate.
+The release owner holds the step 7 activation gate and every release and
+deployment gate.
 
 Before any release, run every named real-machine gate. Some gates are ignored
 tests, and some are matched live measurements. Record the machine, commit,
@@ -446,44 +448,15 @@ These tests use isolated paths and services. They do not prove the production
 service names, install paths, home permissions, or service definitions.
 
 Before the transition release, run one rollback through the actual production
-service on Linux and macOS. Use hetz first and Silber second. Record every
-observed state and any manual cleanup. Do not use Bluey for this exercise.
+service on Linux and macOS. Use an always-on Linux machine first and a Mac
+second. Record every observed state and any manual cleanup. Do not use a
+roaming machine for this exercise.
 
 Test the recovery route from the actor who will use it before each deliberate
 outage. A reachable host and an open SSH port do not prove that the actor can
-log in. Fabric is the only working route to hetz for every agent and for
-Silber.cos. If Fabric fails there and cannot recover itself, Nathan must recover
-hetz personally. Silber.cos has local shell access on Silber and can repair that
-machine by hand.
-
-Both production rollback exercises passed on 2026-09-05 at exact main
-`ebfd0ec`. On hetz, the broken pair installed at 03:33:02Z. The systemd reader
-restored exact main at 03:34:00Z, and Fabric answered externally at 03:34:14Z.
-The observer depended on Fabric because no agent or Silber.cos could complete
-an SSH login. The exercise then restored fleet build `0.2.1+48208e4`.
-
-On Silber, the broken pair installed at 03:46:14Z. The launchd reader restored
-exact main on disk at 03:47:18Z. The control socket answered at 03:47:27Z. The
-transient job and plist disappeared, and the reader removed the new companion.
-Local shell observation stayed available. The exercise then restored fleet
-build `0.2.1+48208e4`. Doctor passed on both hosts after the exercises.
-
-The deployed `48208e4` reader also received the exact paired archive in an
-isolated home. It accepted the checksum, then refused the archive because it
-expected exactly one `fabric` member. It changed no executable or staging file.
-This clean refusal enforces the Release A order for that deployed reader. It is
-not a property of the Release A pair-aware reader.
-
-The first `offline_peer_cost_matches_control` gate passed on hetz at exact tag
-`v0.2.4+9b425d6` on 2026-09-05. The treatment added one peer that never answered
-and then restored the exact prior file digest. It sent 300 healthy-peer pings
-over 91.663 seconds. All pings passed, and none took more than one second.
-
-The matched resource traces each sampled the same daemon PID once per second
-for 379.095 seconds. Treatment used 5.925% of one core and had a 155,824 KiB RSS
-span. Control used 11.942% and had a 196,048 KiB span. Normal machine work was
-larger than the effect under test. Thus, the offline peer's cost was below this
-machine's noise floor. The daemon did not restart during the gate.
+log in. When Fabric is the only working route to a machine, a failure Fabric
+cannot recover from needs someone with another way in, such as a console or a
+local shell, and that route must be proved before the outage.
 
 For each release, run the treatment and control on the same Linux machine and
 deployed commit. Record CPU time, RSS minimum and maximum, and 300 healthy-peer
@@ -505,11 +478,11 @@ The process-boundary release needs all of these results:
 - A crash in each durable phase recovers without dual state ownership.
 - The bridge keeps at least 90 percent of embedded content throughput during the
   fixed 10-minute comparison. A larger loss stops activation and reopens the
-  transport decision with Nathan.
+  transport decision.
 - The Release A archive contains exactly `fabric`. The deployed `48208e4`
   reader refuses a paired archive without changing the machine.
 - Step 7 restores an archive with exactly `fabric` and `fabric-sync`. The
   updater verifies that matched pair.
 
 This plan changes where sync executes. It does not claim that the connection
-cache caused Nathan's earlier pauses, and it does not optimize sync memory.
+cache caused the earlier pauses, and it does not optimize sync memory.

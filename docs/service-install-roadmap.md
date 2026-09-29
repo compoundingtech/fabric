@@ -1,9 +1,10 @@
 # Fabric Managed Service Roadmap
 
 This is the queued roadmap for making `fabric daemon` a managed service across
-the machines Nathan actually uses. Roaming reconnect remains the higher priority;
-this work supports reliability by replacing hand-launched daemons, the watchdog
-hack, and one-off keepalive units with OS-native supervision.
+the Linux and macOS machines fabric runs on. Roaming reconnect remains the
+higher priority; this work supports reliability by replacing hand-launched
+daemons, the watchdog hack, and one-off keepalive units with OS-native
+supervision.
 
 ## Reference
 
@@ -79,7 +80,7 @@ macOS:
   Linux.
 - Write stdout/stderr to the fabric home log directory, not a system-wide root
   path.
-- Keep a LaunchDaemon/system mode as a later option only if Nathan wants a
+- Keep a LaunchDaemon/system mode as a later option only if someone needs a
   machine-wide service account.
 
 Windows:

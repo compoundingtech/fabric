@@ -507,10 +507,10 @@ mod tests {
     fn a_loss_and_resume_counts_once_and_measures_the_total() {
         let store = TelemetryStore::ephemeral();
         let base = Instant::now();
-        store.record_loss("droppy", Some("direct"), 1, base);
-        store.record_resume("droppy", Some("relay"), at(base, 2_500));
+        store.record_loss("desktop", Some("direct"), 1, base);
+        store.record_resume("desktop", Some("relay"), at(base, 2_500));
 
-        let peer = store.peer("droppy").expect("peer recorded");
+        let peer = store.peer("desktop").expect("peer recorded");
         assert_eq!(peer.losses, 1);
         assert_eq!(peer.resumes, 1);
         assert_eq!(peer.reconnect.samples, 1);
@@ -534,19 +534,19 @@ mod tests {
     fn nothing_moves_when_no_loss_happens() {
         let store = TelemetryStore::ephemeral();
         store.record_probe(
-            "droppy",
+            "desktop",
             true,
             Some("direct"),
             Some(Duration::from_millis(51)),
         );
         store.record_probe(
-            "droppy",
+            "desktop",
             true,
             Some("relay"),
             Some(Duration::from_millis(64)),
         );
 
-        let peer = store.peer("droppy").expect("peer recorded");
+        let peer = store.peer("desktop").expect("peer recorded");
         assert_eq!(peer.losses, 0, "a healthy probe must not record a loss");
         assert_eq!(peer.resumes, 0, "a healthy probe must not record a resume");
         assert_eq!(peer.resume_failures, 0);
@@ -564,12 +564,12 @@ mod tests {
         let base = Instant::now();
         // `attempt` is monotonic per session and never resets, so a second
         // break arrives with a higher number, not with 1.
-        store.record_loss("hetz", Some("direct"), 7, base);
-        store.record_loss("hetz", Some("direct"), 8, at(base, 500));
-        store.record_loss("hetz", Some("direct"), 9, at(base, 1_500));
-        store.record_resume("hetz", Some("direct"), at(base, 3_000));
+        store.record_loss("vps", Some("direct"), 7, base);
+        store.record_loss("vps", Some("direct"), 8, at(base, 500));
+        store.record_loss("vps", Some("direct"), 9, at(base, 1_500));
+        store.record_resume("vps", Some("direct"), at(base, 3_000));
 
-        let peer = store.peer("hetz").expect("peer recorded");
+        let peer = store.peer("vps").expect("peer recorded");
         assert_eq!(peer.losses, 1, "three retries are one break");
         assert_eq!(peer.reconnect_attempts, 3);
         assert_eq!(peer.resumes, 1);
@@ -585,10 +585,10 @@ mod tests {
     fn a_failed_resume_records_no_duration_and_frees_the_next_loss() {
         let store = TelemetryStore::ephemeral();
         let base = Instant::now();
-        store.record_loss("bluey", Some("direct"), 1, base);
-        store.record_resume_failure("bluey");
+        store.record_loss("laptop", Some("direct"), 1, base);
+        store.record_resume_failure("laptop");
 
-        let peer = store.peer("bluey").expect("peer recorded");
+        let peer = store.peer("laptop").expect("peer recorded");
         assert_eq!(peer.resume_failures, 1);
         assert_eq!(
             peer.reconnect.samples, 0,
@@ -597,15 +597,15 @@ mod tests {
 
         // The next genuine break must still count, which only works if the
         // failure cleared the in-flight entry.
-        store.record_loss("bluey", Some("relay"), 2, at(base, 10_000));
-        assert_eq!(store.peer("bluey").unwrap().losses, 2);
+        store.record_loss("laptop", Some("relay"), 2, at(base, 10_000));
+        assert_eq!(store.peer("laptop").unwrap().losses, 2);
     }
 
     #[test]
     fn a_resume_with_no_recorded_loss_reports_no_duration() {
         let store = TelemetryStore::ephemeral();
-        store.record_resume("droppy", Some("direct"), Instant::now());
-        let peer = store.peer("droppy").unwrap();
+        store.record_resume("desktop", Some("direct"), Instant::now());
+        let peer = store.peer("desktop").unwrap();
         assert_eq!(peer.resumes, 1);
         assert_eq!(
             peer.reconnect.samples, 0,
@@ -621,10 +621,10 @@ mod tests {
         let window;
         {
             let store = TelemetryStore::load(&path);
-            store.record_loss("droppy", Some("direct"), 1, base);
-            store.record_resume("droppy", Some("relay"), at(base, 1_200));
+            store.record_loss("desktop", Some("direct"), 1, base);
+            store.record_resume("desktop", Some("relay"), at(base, 1_200));
             store.record_probe(
-                "droppy",
+                "desktop",
                 true,
                 Some("relay"),
                 Some(Duration::from_millis(64)),
@@ -638,7 +638,7 @@ mod tests {
             window,
             "a daemon restart must not make old totals look new"
         );
-        let peer = reloaded.peer("droppy").expect("counts survive a restart");
+        let peer = reloaded.peer("desktop").expect("counts survive a restart");
         assert_eq!(peer.losses, 1);
         assert_eq!(peer.resumes, 1);
         assert_eq!(peer.resumes_by_path.get("relay"), Some(&1));
@@ -668,14 +668,14 @@ mod tests {
         let path = dir.path().join("telemetry.json");
         {
             let store = TelemetryStore::load(&path);
-            store.record_loss("droppy", Some("direct"), 1, Instant::now());
+            store.record_loss("desktop", Some("direct"), 1, Instant::now());
         }
 
         // The session this loss belonged to died with the old process, so a
         // resume after restart must not measure across the restart boundary.
         let reloaded = TelemetryStore::load(&path);
-        reloaded.record_resume("droppy", Some("direct"), Instant::now());
-        let peer = reloaded.peer("droppy").unwrap();
+        reloaded.record_resume("desktop", Some("direct"), Instant::now());
+        let peer = reloaded.peer("desktop").unwrap();
         assert_eq!(peer.losses, 1);
         assert_eq!(peer.resumes, 1);
         assert_eq!(
@@ -722,7 +722,7 @@ mod tests {
         // the counts are real, but the bounds that gave them meaning are gone.
         let store = TelemetryStore::load(&path);
         store.record_probe(
-            "droppy",
+            "desktop",
             true,
             Some("relay"),
             Some(Duration::from_millis(64)),
@@ -733,20 +733,20 @@ mod tests {
 
         let reloaded = TelemetryStore::load(&path);
         assert!(
-            reloaded.peer("droppy").is_none(),
+            reloaded.peer("desktop").is_none(),
             "counts from an unknown layout must be dropped; keeping them would \
              report latencies computed against bounds that never applied"
         );
 
         // And it still records normally afterwards, rather than staying broken.
         reloaded.record_probe(
-            "droppy",
+            "desktop",
             true,
             Some("relay"),
             Some(Duration::from_millis(70)),
         );
         assert_eq!(
-            reloaded.peer("droppy").unwrap().probe_latency["relay"].samples,
+            reloaded.peer("desktop").unwrap().probe_latency["relay"].samples,
             1
         );
     }
@@ -758,7 +758,7 @@ mod tests {
         {
             let store = TelemetryStore::load(&path);
             store.record_probe(
-                "hetz",
+                "vps",
                 true,
                 Some("direct"),
                 Some(Duration::from_millis(64)),
@@ -766,7 +766,7 @@ mod tests {
         }
         let reloaded = TelemetryStore::load(&path);
         assert_eq!(
-            reloaded.peer("hetz").map(|p| p.probes_reachable),
+            reloaded.peer("vps").map(|p| p.probes_reachable),
             Some(1),
             "the current version must survive a reload, or the check is too strict \
              and quietly discards every restart"
@@ -786,8 +786,8 @@ mod tests {
             Some("reset: telemetry snapshot was unreadable")
         );
         assert!(snapshot.window.started_unix_seconds.is_some());
-        store.record_loss("droppy", Some("direct"), 1, Instant::now());
-        assert_eq!(store.peer("droppy").unwrap().losses, 1);
+        store.record_loss("desktop", Some("direct"), 1, Instant::now());
+        assert_eq!(store.peer("desktop").unwrap().losses, 1);
     }
 
     #[test]
@@ -795,7 +795,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("telemetry.json");
         let store = TelemetryStore::load(&path);
-        store.record_loss("droppy", Some("direct"), 1, Instant::now());
+        store.record_loss("desktop", Some("direct"), 1, Instant::now());
 
         let mut encoded = serde_json::to_value(store.snapshot()).expect("snapshot serializes");
         encoded
@@ -805,7 +805,7 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&encoded).unwrap()).unwrap();
 
         let reloaded = TelemetryStore::load(&path);
-        assert_eq!(reloaded.peer("droppy").map(|peer| peer.losses), Some(1));
+        assert_eq!(reloaded.peer("desktop").map(|peer| peer.losses), Some(1));
         assert_eq!(
             reloaded.snapshot().window,
             TelemetryWindow::legacy_unknown(),
@@ -818,7 +818,7 @@ mod tests {
         let store = TelemetryStore::ephemeral();
         for _ in 0..10 {
             store.record_probe(
-                "droppy",
+                "desktop",
                 true,
                 Some("direct"),
                 Some(Duration::from_millis(50)),
@@ -826,15 +826,15 @@ mod tests {
         }
         for _ in 0..10 {
             store.record_probe(
-                "droppy",
+                "desktop",
                 true,
                 Some("relay"),
                 Some(Duration::from_millis(64)),
             );
         }
-        store.record_probe("droppy", false, None, None);
+        store.record_probe("desktop", false, None, None);
 
-        let peer = store.peer("droppy").unwrap();
+        let peer = store.peer("desktop").unwrap();
         assert_eq!(peer.probes_reachable, 20);
         assert_eq!(peer.probes_unreachable, 1);
         let direct = peer.probe_latency.get("direct").expect("direct measured");
@@ -850,8 +850,8 @@ mod tests {
     #[test]
     fn an_unreachable_probe_records_no_latency() {
         let store = TelemetryStore::ephemeral();
-        store.record_probe("bluey", false, None, None);
-        let peer = store.peer("bluey").unwrap();
+        store.record_probe("laptop", false, None, None);
+        let peer = store.peer("laptop").unwrap();
         assert_eq!(peer.probes_unreachable, 1);
         assert!(
             peer.probe_latency.is_empty(),
@@ -892,10 +892,10 @@ mod tests {
     fn a_populated_snapshot_survives_plain_json() {
         let store = TelemetryStore::ephemeral();
         let base = Instant::now();
-        store.record_loss("droppy", Some("direct"), 1, base);
-        store.record_resume("droppy", Some("relay"), base + Duration::from_millis(1_500));
+        store.record_loss("desktop", Some("direct"), 1, base);
+        store.record_resume("desktop", Some("relay"), base + Duration::from_millis(1_500));
         store.record_probe(
-            "droppy",
+            "desktop",
             true,
             Some("relay"),
             Some(Duration::from_millis(64)),
@@ -914,7 +914,7 @@ mod tests {
             "every counter must survive the control protocol unchanged"
         );
 
-        let peer = &decoded.peers["droppy"];
+        let peer = &decoded.peers["desktop"];
         assert_eq!(peer.losses, 1);
         assert_eq!(peer.reconnect.samples, 1);
         assert!(
@@ -934,7 +934,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("telemetry.json");
         let store = TelemetryStore::load(&path);
-        let peers = ["hetz", "droppy", "bluey", "mac"];
+        let peers = ["vps", "desktop", "laptop", "mac"];
         for round in 0..500u64 {
             for peer in peers {
                 let via = if round % 2 == 0 { "direct" } else { "relay" };
