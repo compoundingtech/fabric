@@ -8,6 +8,10 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Removed
 
+- Dated status and rollout documents: the parked single-server supervisor plan
+  and two July 2026 reliability reports. Their lasting design, how a peer probe
+  decides a peer is alive and why it stays simple, is now
+  `docs/peer-liveness.md`.
 - **The sync engine is out of the `fabric` binary.** The repository is a
   workspace: the core `fabric` crate keeps what the daemon needs to authorize
   and forward sync streams and to report status, which is the `syncs.toml`
@@ -77,6 +81,13 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Added
 
+- **CI refuses real machine, person, and agent names.** `bin/check-public-text`
+  fails on the names of real machines, home directories under `/home/` or
+  `/Users/` that are not an invented example, `person/` IDs that are not an
+  invented example, and internal agent and mission IDs. It runs as the
+  `public-text` job, after a self test that plants each kind of name and proves
+  the scan refuses it. Examples, tests, and docs now use invented names such as
+  `laptop`, `vps`, `/home/example`, and `person/alex`.
 - **Service logs say when each line was written.** The daemon and the
   `fabric-sync` companion now start every line they write to their service
   output with an RFC 3339 UTC timestamp. That covers each line of a multiline
@@ -410,9 +421,9 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   Status, doctor, and sync output report the peer as away. The daemon logs only
   the away and returned transitions.
 
-  A peer can have a different local name on each machine. The same NodeID is
-  `bluey` on Silber and `air` on hetz. The roaming setting follows the NodeID's
-  peer entry, not its local name.
+  A peer can have a different local name on each machine. The same NodeID can be
+  `laptop` on one machine and `travel` on another. The roaming setting follows
+  the NodeID's peer entry, not its local name.
 
 - **Peer traffic shares one multipath connection.** Fabric carries each Git,
   sync, shell, exec, send-file, echo, and exposed-service session as a stream on
@@ -840,7 +851,7 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   until restart.** The content store only grew: `local_write` and the wire
   receive path inserted, and nothing removed. Every superseded version of every
   file in every entry stayed resident. Finding 4 of the 2026-08-29 review, and a
-  sufficient cause for the 2.52 GB resident size recorded on Silber on 19 August.
+  sufficient cause for the 2.52 GB resident size recorded on a Mac on 19 August.
 
   The store is now bounded by the manifest: a blob stays while some Present
   entry names its hash and goes when none does, after a local write, a local
@@ -1033,6 +1044,6 @@ Reconstructed from git history; not a per-patch breakdown.
 ### Changed
 - Renamed/transferred to the `compoundingtech` GitHub org
   (`github.com/compoundingtech/fabric`; launchd label `com.compoundingtech.fabric`).
-- Roaming reliability + Hetzner RSS mitigation: in-process iroh endpoint recycle,
+- Roaming reliability + Linux server RSS mitigation: in-process iroh endpoint recycle,
   health poller, network-change debounce, bounded server tunnel sessions, and an
   RSS-triggered recycle with a raised (1 GiB) managed-service memory ceiling.
