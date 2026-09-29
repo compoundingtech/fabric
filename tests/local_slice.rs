@@ -47,7 +47,7 @@ async fn git_clone_push_and_revocation_use_exact_repository_grants() -> Result<(
     let source_dir = TempDir::new()?;
     let clone_root = TempDir::new()?;
     let helper_dir = TempDir::new()?;
-    let remote = server_dir.path().join("mandat.git");
+    let remote = server_dir.path().join("garden.git");
     let source = source_dir.path();
     let clone = clone_root.path().join("clone");
 
@@ -85,8 +85,8 @@ async fn git_clone_push_and_revocation_use_exact_repository_grants() -> Result<(
         Some(client.addr()),
         Some(vec!["echo".into()]),
     );
-    server_book.share_git_remote("mandat", remote.clone())?;
-    server_book.grant_git_remote("mandat", "client", GitAccess::Read)?;
+    server_book.share_git_remote("garden", remote.clone())?;
+    server_book.grant_git_remote("garden", "client", GitAccess::Read)?;
     server_book.save(&server_home)?;
     server.state().reload_peers().await?;
 
@@ -117,7 +117,7 @@ async fn git_clone_push_and_revocation_use_exact_repository_grants() -> Result<(
 
     let cloned = run_git_process(
         None,
-        &["clone", "fabric://server/mandat", clone.to_str().unwrap()],
+        &["clone", "fabric://server/garden", clone.to_str().unwrap()],
         &fabric_env,
     )?;
     assert_process_ok("fabric clone", &cloned)?;
@@ -142,7 +142,7 @@ async fn git_clone_push_and_revocation_use_exact_repository_grants() -> Result<(
     let hook = remote.join("hooks/pre-receive");
     fs::write(
         &hook,
-        b"#!/bin/sh\ntest \"$FABRIC_GIT_REMOTE\" = mandat || exit 90\ntest \"$FABRIC_GIT_ACCESS\" = write || exit 91\ntest -n \"$FABRIC_PEER\" || exit 92\nprintf ran > \"$GIT_DIR/fabric-hook-ran\"\n",
+        b"#!/bin/sh\ntest \"$FABRIC_GIT_REMOTE\" = garden || exit 90\ntest \"$FABRIC_GIT_ACCESS\" = write || exit 91\ntest -n \"$FABRIC_PEER\" || exit 92\nprintf ran > \"$GIT_DIR/fabric-hook-ran\"\n",
     )?;
     fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))?;
 
@@ -161,7 +161,7 @@ async fn git_clone_push_and_revocation_use_exact_repository_grants() -> Result<(
     assert!(!marker.exists(), "a denied push started Git or its hook");
 
     let mut server_book = PeerBook::load(&server_home)?;
-    server_book.grant_git_remote("mandat", "client", GitAccess::Write)?;
+    server_book.grant_git_remote("garden", "client", GitAccess::Write)?;
     server_book.save(&server_home)?;
     server.state().reload_peers().await?;
     let pushed = run_git_process(
@@ -174,7 +174,7 @@ async fn git_clone_push_and_revocation_use_exact_repository_grants() -> Result<(
     assert_eq!(fs::read(&marker)?, b"ran");
 
     let mut server_book = PeerBook::load(&server_home)?;
-    server_book.revoke_git_remote("mandat", "client", GitAccess::Write)?;
+    server_book.revoke_git_remote("garden", "client", GitAccess::Write)?;
     server_book.save(&server_home)?;
     server.state().reload_peers().await?;
     fs::write(clone.join("README.md"), b"third\n")?;
@@ -1806,8 +1806,9 @@ async fn peer_file_remains_authoritative_when_daemon_config_is_created() -> Resu
 /// socket. With all 32 held, every `shell`, `exec` and new dial on the machine
 /// waited with no error, while `status` and `ping` stayed green.
 ///
-/// Bluey is the peer that makes this live: it is unreachable most of the time
-/// by design, and anything that dials it and gives up leaves a permit behind.
+/// A roaming laptop is the peer that makes this live: it is unreachable most of
+/// the time by design, and anything that dials it and gives up leaves a permit
+/// behind.
 ///
 /// CONTROL: the 32 consumers must be seen holding 32 permits before they close,
 /// or "0 afterwards" proves nothing. And a fresh dial to a REAL peer must round
@@ -2415,8 +2416,8 @@ async fn time_until_tunnel_carries(local_addr: &str, payload: &[u8]) -> Result<D
     }
 }
 
-/// Stand up the dev-server shape Nathan actually uses: a TCP service on one
-/// machine, exposed, and dialed to a local port on the other.
+/// Stand up the everyday dev-server shape: a TCP service on one machine,
+/// exposed, and dialed to a local port on the other.
 async fn tcp_tunnel_pair() -> Result<(
     TempDir,
     TempDir,
@@ -2619,10 +2620,10 @@ async fn trust_peer_allowing(
 /// A peer restricted to other services cannot reach this one, and a permitted
 /// peer is unaffected.
 ///
-/// This is the sharing feature: "Johannes may dial my web and nothing else" is
-/// the same mechanism as "droppy may not". Both halves are asserted here,
-/// because a permission system that denies everything is as useless as one that
-/// permits everything.
+/// This is the sharing feature: "Alex may dial my web and nothing else" is the
+/// same mechanism as "desktop may not". Both halves are asserted here, because a
+/// permission system that denies everything is as useless as one that permits
+/// everything.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_peer_not_permitted_for_a_service_cannot_reach_it() -> Result<()> {
     let _guard = local_slice_guard().await;

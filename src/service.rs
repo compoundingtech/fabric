@@ -1621,7 +1621,7 @@ mod tests {
     /// is the "install at the wrong path" trap entered from the other side.
     #[test]
     fn the_unit_names_the_binary_it_was_given_not_the_one_rendering_it() -> Result<()> {
-        let home = FabricHome::new(Path::new("/home/nathan/.local/share/fabric"));
+        let home = FabricHome::new(Path::new("/home/alex/.local/share/fabric"));
         let spec = ServiceSpec::new("/usr/local/bin/fabric", home.root(), true, true, None)?;
 
         let unit = render_systemd_user_unit(&spec);
@@ -1649,7 +1649,7 @@ mod tests {
     /// issuing it.
     ///
     /// `fabric exec` runs its session inside `fabric.service`, so
-    /// `fabric exec hetz -- fabric service install` restarts the very cgroup the
+    /// `fabric exec vps -- fabric service install` restarts the very cgroup the
     /// caller lives in and dies partway through. That is reachable today with a
     /// command any of us might run.
     ///
@@ -1696,9 +1696,9 @@ mod tests {
 
     #[test]
     fn companion_units_run_only_the_compatibility_standby() -> Result<()> {
-        let home = FabricHome::new("/Users/nathan/.local/share/fabric");
+        let home = FabricHome::new("/Users/alex/.local/share/fabric");
         let spec = ServiceSpec::new(
-            "/Users/nathan/.local/bin/fabric",
+            "/Users/alex/.local/bin/fabric",
             home.root(),
             true,
             true,
@@ -1707,13 +1707,13 @@ mod tests {
 
         let unit = render_systemd_sync_user_unit(&spec)?;
         assert!(unit.contains("After=fabric.service"));
-        assert!(unit.contains("ExecStart=/Users/nathan/.local/bin/fabric-sync --home /Users/nathan/.local/share/fabric --standby"));
+        assert!(unit.contains("ExecStart=/Users/alex/.local/bin/fabric-sync --home /Users/alex/.local/share/fabric --standby"));
         assert!(unit.contains("Restart=on-failure"));
         assert!(!unit.contains(" daemon"));
 
         let plist = render_launch_sync_agent_plist(&home, &spec)?;
         assert!(plist.contains("<string>com.compoundingtech.fabric-sync</string>"));
-        assert!(plist.contains("<string>/Users/nathan/.local/bin/fabric-sync</string>"));
+        assert!(plist.contains("<string>/Users/alex/.local/bin/fabric-sync</string>"));
         assert!(plist.contains("<string>--standby</string>"));
         assert!(plist.contains("sync-service.out.log"));
         assert!(plist.contains("sync-service.err.log"));
@@ -1863,7 +1863,7 @@ mod tests {
 
     #[test]
     fn install_enables_the_label_before_bootstrapping_it() {
-        // The Bluey incident: `fabric service uninstall` runs `launchctl disable`,
+        // The roaming-laptop incident: `fabric service uninstall` runs `launchctl disable`,
         // that override persists, and a disabled label cannot be bootstrapped.
         // Enabling only after bootstrap made an uninstall poison every later
         // install with an opaque I/O error. This fake refuses to bootstrap while
@@ -1935,10 +1935,10 @@ mod tests {
 
     #[test]
     fn service_declares_no_memory_ceiling_unless_the_operator_sets_one() -> Result<()> {
-        // Nathan's rule: no fixed product memory policy while a healthy working
+        // Product rule: no fixed product memory policy while a healthy working
         // set is unmeasured. An install with no --memory-max-mb must emit neither
         // a systemd MemoryMax nor launchd resident-set limits.
-        let home = FabricHome::new(std::path::Path::new("/home/nathan/.local/share/fabric"));
+        let home = FabricHome::new(std::path::Path::new("/home/alex/.local/share/fabric"));
         let spec = ServiceSpec::new("/usr/local/bin/fabric", home.root(), true, true, None)?;
 
         let unit = render_systemd_user_unit(&spec);
@@ -1966,7 +1966,7 @@ mod tests {
     fn systemd_unit_runs_foreground_daemon_with_restart_and_memory_limit() -> Result<()> {
         let spec = ServiceSpec::new(
             "/usr/local/bin/fabric",
-            "/home/nathan/.local/share/fabric",
+            "/home/alex/.local/share/fabric",
             true,
             true,
             Some(512),
@@ -1975,7 +1975,7 @@ mod tests {
         let unit = render_systemd_user_unit(&spec);
 
         assert!(unit.contains(
-            "ExecStart=/usr/local/bin/fabric --home /home/nathan/.local/share/fabric daemon"
+            "ExecStart=/usr/local/bin/fabric --home /home/alex/.local/share/fabric daemon"
         ));
         assert!(!unit.contains("--allow-shell"));
         assert!(!unit.contains("--allow-exec"));
@@ -1990,7 +1990,7 @@ mod tests {
     fn systemd_restart_stops_only_the_daemon_process() -> Result<()> {
         let spec = ServiceSpec::new(
             "/usr/local/bin/fabric",
-            "/home/nathan/.local/share/fabric",
+            "/home/alex/.local/share/fabric",
             true,
             true,
             None,
@@ -2009,7 +2009,7 @@ mod tests {
     fn systemd_unit_quotes_paths_and_escapes_specifiers() -> Result<()> {
         let spec = ServiceSpec::new(
             "/Applications/Fabric Tools/fabric",
-            "/Users/nathan/Fabric 100%",
+            "/Users/alex/Fabric 100%",
             false,
             false,
             Some(256),
@@ -2017,16 +2017,16 @@ mod tests {
 
         let unit = render_systemd_user_unit(&spec);
 
-        assert!(unit.contains("ExecStart=\"/Applications/Fabric Tools/fabric\" --home \"/Users/nathan/Fabric 100%%\" daemon"));
-        assert!(unit.contains("WorkingDirectory=\"/Users/nathan/Fabric 100%%\""));
+        assert!(unit.contains("ExecStart=\"/Applications/Fabric Tools/fabric\" --home \"/Users/alex/Fabric 100%%\" daemon"));
+        assert!(unit.contains("WorkingDirectory=\"/Users/alex/Fabric 100%%\""));
         Ok(())
     }
 
     #[test]
     fn default_launch_agent_uses_one_gib_resident_set_headroom() -> Result<()> {
-        let home = FabricHome::new("/Users/nathan/.local/share/fabric");
+        let home = FabricHome::new("/Users/alex/.local/share/fabric");
         let spec = ServiceSpec::new(
-            "/Users/nathan/.local/bin/fabric",
+            "/Users/alex/.local/bin/fabric",
             home.root(),
             false,
             false,
@@ -2041,9 +2041,9 @@ mod tests {
 
     #[test]
     fn launch_agent_runs_foreground_daemon_with_keepalive_and_memory_limit() -> Result<()> {
-        let home = FabricHome::new("/Users/nathan/.local/share/fabric");
+        let home = FabricHome::new("/Users/alex/.local/share/fabric");
         let spec = ServiceSpec::new(
-            "/Users/nathan/.local/bin/fabric",
+            "/Users/alex/.local/bin/fabric",
             home.root(),
             true,
             true,
@@ -2053,9 +2053,9 @@ mod tests {
         let plist = render_launch_agent_plist(&home, &spec)?;
 
         assert!(plist.contains("<string>com.compoundingtech.fabric</string>"));
-        assert!(plist.contains("<string>/Users/nathan/.local/bin/fabric</string>"));
+        assert!(plist.contains("<string>/Users/alex/.local/bin/fabric</string>"));
         assert!(plist.contains("<string>--home</string>"));
-        assert!(plist.contains("<string>/Users/nathan/.local/share/fabric</string>"));
+        assert!(plist.contains("<string>/Users/alex/.local/share/fabric</string>"));
         assert!(plist.contains("<string>daemon</string>"));
         assert!(!plist.contains("<string>--allow-shell</string>"));
         assert!(!plist.contains("<string>--allow-exec</string>"));
@@ -2068,13 +2068,13 @@ mod tests {
 
     #[test]
     fn launch_agent_xml_escapes_paths() -> Result<()> {
-        let home = FabricHome::new("/Users/nathan/Fabric & Test");
+        let home = FabricHome::new("/Users/alex/Fabric & Test");
         let spec = ServiceSpec::new("/tmp/fabric<dev>", home.root(), false, false, Some(128))?;
 
         let plist = render_launch_agent_plist(&home, &spec)?;
 
         assert!(plist.contains("<string>/tmp/fabric&lt;dev&gt;</string>"));
-        assert!(plist.contains("<string>/Users/nathan/Fabric &amp; Test</string>"));
+        assert!(plist.contains("<string>/Users/alex/Fabric &amp; Test</string>"));
         assert!(!plist.contains("<string>--allow-shell</string>"));
         Ok(())
     }
@@ -2089,7 +2089,7 @@ mod plist_validity {
     /// system parser.
     #[test]
     fn rendered_plists_are_valid_property_lists() -> Result<()> {
-        let home = FabricHome::new(std::path::Path::new("/home/nathan/.local/share/fabric"));
+        let home = FabricHome::new(std::path::Path::new("/home/alex/.local/share/fabric"));
         for memory in [None, Some(512u64)] {
             let spec = ServiceSpec::new("/usr/local/bin/fabric", home.root(), true, true, memory)?;
             for (name, plist) in [

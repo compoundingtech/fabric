@@ -33,11 +33,11 @@ nothing tells you to look.
 | **The far machine restarts** — you restart your dev server while a browser is connected | The open connection does not survive because the process that owned it is gone. A new request during the outage fails within Fabric's three-second initial-connect bound. A client can then retry. A new request works when the peer returns. See "Whose problem is a page that stops updating" below. | During the outage 3.006 s; after restart 91.681 ms; one 9.87 s focused run on 2026-09-02 | `a_peer_restarting_mid_session_restores_service_without_intervention` |
 | **The far machine's fabric daemon restarts while you hold a `fabric shell`** — an update, or a `fabric restart` | The PTY dies with the daemon that owned it, so the session cannot resume. The client reports the refused resume, starts a new shell to the same peer in the same terminal, and says when it is ready. Input typed in between is discarded and counted, not replayed. It gives up after 5 minutes without an answer. | Fresh prompt 1.98 to 2.02 s after the restart (3 runs, 2026-09-16); before the change the command exited 1 after 1.19 to 1.32 s | `shell_starts_a_new_session_after_the_remote_daemon_restarts` |
 | A laptop sleeps with a `fabric shell` open, then wakes | Shorter than the 15 minute detached window, the same PTY resumes and unacknowledged bytes are replayed. Longer, the server has reaped the PTY and the wake looks like the row above: a new shell in the same terminal. | Same-PTY resume 0.53 s after a forced drop (3 runs, 2026-09-16). **`NOT PROVEN` on a real sleep/wake:** two daemons on one always-on machine cannot sleep, so the laptop measurement needs a person. | `resumable_shell_one_survives_transport_drop`, `shell_starts_a_new_session_after_the_remote_daemon_restarts` |
-| The direct path between the machines dies while a relay is available | `NOT PROVEN.` Two daemons on one machine cannot lose a direct path they never had, so this cannot be forced in a test here. It is not hypothetical: on the three-machine fleet today, 1,569 connections used a direct path and 1,463 used a relay, so both are in constant use. Proving the switch needs two real machines. | Unmeasured | `NOT PROVEN` |
+| The direct path between the machines dies while a relay is available | `NOT PROVEN.` Two daemons on one machine cannot lose a direct path they never had, so this cannot be forced in a test here. It is not hypothetical: on a real multi-machine network both direct and relay paths are in constant use. Proving the switch needs two real machines. | Unmeasured | `NOT PROVEN` |
 | A machine's address changes mid-session, as a laptop moving between networks does | The session survives without restarting the process, and the machine keeps its identity. Proven for one kind of tunnel. | Not separately measured | `generic_tunnel_survives_client_endpoint_recycle_without_process_restart`. **`NOT PROVEN` for TCP tunnels specifically.** |
 | A local network change (a VPN coming up, a Wi-Fi switch, an interface change) leaves the connection to a peer on a path that no longer answers | After the debounced notice the daemon asks each peer connection it still holds to answer one echo within 3 s and resets only the one that does not; the next request redials with fresh path selection. A connection that still answers is kept, and the endpoint is not rebuilt. One reset per peer per minute. | Reset 3.2 s after the change. Before this check: 64.6 s (the QUIC path-idle timeout, measured 2026-09-11) or the 60 s peer-probe backstop, whichever came first. | `a_network_change_resets_a_held_connection_that_stopped_answering_without_a_recycle`, `a_vpn_coming_up_keeps_a_held_connection_that_still_answers` |
-| A consumer opens one short TCP connection per request through a dial listener, so every request is a tunnel session that ends within a second | Each clean end is the session finishing, not the transport failing, so it no longer counts toward replacing the shared peer connection. Before the fix every third one replaced the connection. | On a live two-machine pair before the fix, the shared connection was replaced every one to four seconds (52 times in one hour on 2026-09-11) and never grew older than 4.0 s over 24 samples; after the fix, one connection on both sides with zero counted failures while its age grew past 264 s over six samples. | `one_request_tcp_sessions_leave_the_shared_connection_alone` |
-| A configured peer stays offline | Its failed connection attempt stays isolated. Healthy peer streams still open. Failed probes retain no connection. | Under 250 ms in the regression test. On hetz, 300 of 300 healthy pings passed over 91.663 seconds. | `offline_peer_cost_is_bounded_and_healthy_peer_stays_fast` |
+| A consumer opens one short TCP connection per request through a dial listener, so every request is a tunnel session that ends within a second | Each clean end is the session finishing, not the transport failing, so it no longer counts toward replacing the shared peer connection. Before the fix every third one replaced the connection. | On a real two-machine pair before the fix, the shared connection was replaced every few seconds and never lived longer than that; after the fix, one connection held on both sides with no counted failures. | `one_request_tcp_sessions_leave_the_shared_connection_alone` |
+| A configured peer stays offline | Its failed connection attempt stays isolated. Healthy peer streams still open. Failed probes retain no connection. | Under 250 ms in the regression test. A matched measurement on a real machine found no attributable cost (below). | `offline_peer_cost_is_bounded_and_healthy_peer_stays_fast` |
 
 ## What you see while it is broken
 
@@ -88,16 +88,12 @@ shell in the same terminal, announced, with typed-while-disconnected input
 discarded rather than replayed.
 
 **An offline peer still gets a health probe every 20 seconds.** This is extra
-work, but its fleet cost was not detectable on 2026-09-05. A 91.663-second
-treatment had six failed probes. All 300 healthy-peer pings passed, with no ping
-above one second.
-
-Two matched resource traces each used 380 one-second samples over 379.095
-seconds. The offline-peer treatment used 5.925% of one core. The no-offline-peer
-control used 11.942%, because unrelated work made the control busier. Treatment
-RSS spanned 155,824 KiB. Control RSS spanned 196,048 KiB. Both traces crossed the
-daemon's 128 MiB allocator sawtooth. These results show no attributable cost at
-this fleet size. They do not show that a failed probe costs nothing.
+work, but its cost was not detectable in a matched treatment-and-control
+measurement on a real machine: with one configured peer that never answered,
+every healthy-peer ping still passed within one second, and unrelated machine
+work moved CPU and resident memory more than the offline peer did. That shows no
+attributable cost on a small network. It does not show that a failed probe costs
+nothing.
 
 Remove a truly retired peer from `peers.toml` on every machine. This file is a
 local allow list, so removal on one machine does not remove trust elsewhere.

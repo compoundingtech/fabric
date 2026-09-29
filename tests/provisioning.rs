@@ -152,7 +152,7 @@ fn peers_lists_declarative_config_without_add() -> Result<()> {
 fn git_shares_and_peer_grants_live_in_peers_toml() -> Result<()> {
     let temp = TempDir::new()?;
     let home = temp.path().join("home");
-    let repository = temp.path().join("mandat.git");
+    let repository = temp.path().join("garden.git");
     fs::create_dir_all(&home)?;
     stdout(
         Command::new("git")
@@ -181,7 +181,7 @@ fn git_shares_and_peer_grants_live_in_peers_toml() -> Result<()> {
         Command::new(fabric_bin())
             .arg("--home")
             .arg(&home)
-            .args(["git", "share", "mandat"])
+            .args(["git", "share", "garden"])
             .arg(&repository)
             .output()?,
     )?;
@@ -191,7 +191,7 @@ fn git_shares_and_peer_grants_live_in_peers_toml() -> Result<()> {
         Command::new(fabric_bin())
             .arg("--home")
             .arg(&home)
-            .args(["git", "grant", "mandat", "friend", "--read-write"])
+            .args(["git", "grant", "garden", "friend", "--read-write"])
             .output()?,
     )?;
     let listed = stdout(
@@ -201,7 +201,7 @@ fn git_shares_and_peer_grants_live_in_peers_toml() -> Result<()> {
             .args(["git", "ls"])
             .output()?,
     )?;
-    assert!(listed.contains("mandat"));
+    assert!(listed.contains("garden"));
     assert!(listed.contains("bare"));
     assert!(listed.contains("read=friend"));
     assert!(listed.contains("write=friend"));
@@ -210,7 +210,7 @@ fn git_shares_and_peer_grants_live_in_peers_toml() -> Result<()> {
         Command::new(fabric_bin())
             .arg("--home")
             .arg(&home)
-            .args(["git", "revoke", "mandat", "friend", "--read"])
+            .args(["git", "revoke", "garden", "friend", "--read"])
             .output()?,
     )?;
     let raw = fs::read_to_string(home.join("peers.toml"))?;
@@ -218,20 +218,20 @@ fn git_shares_and_peer_grants_live_in_peers_toml() -> Result<()> {
         raw.contains("[[git_remotes]]"),
         "the Git remote table header changed:\n{raw}"
     );
-    assert!(raw.contains("git/mandat/write"));
-    assert!(!raw.contains("git/mandat/read"));
+    assert!(raw.contains("git/garden/write"));
+    assert!(!raw.contains("git/garden/read"));
     assert!(raw.contains("shell"));
 
     stdout(
         Command::new(fabric_bin())
             .arg("--home")
             .arg(&home)
-            .args(["git", "unshare", "mandat"])
+            .args(["git", "unshare", "garden"])
             .output()?,
     )?;
     let raw = fs::read_to_string(home.join("peers.toml"))?;
     assert!(!raw.contains("[[git_remotes]]"));
-    assert!(!raw.contains("git/mandat/"));
+    assert!(!raw.contains("git/garden/"));
     assert!(raw.contains("shell"));
     assert!(
         fs::read_dir(&home)?.all(|entry| {

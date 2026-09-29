@@ -14,7 +14,7 @@ otherwise would, and they fail honestly when they are absent.
 A commit written by an agent carries a trailer naming it:
 
 ```
-Agent: Silber.fabric
+Agent: laptop.example-worker
 ```
 
 It sits with the other trailers this repository already uses, such as `Gates:`.

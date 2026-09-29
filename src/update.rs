@@ -994,9 +994,9 @@ fn restore_rollback_binaries(installed_path: &Path, rollback: &Path) -> Result<b
 /// "A socket answers" is not verification. The supervisor is scheduled alongside
 /// the restart, and systemd batches timers by up to `AccuracySec`, so the two can
 /// fire together — at which point the OLD daemon is still up and still
-/// answering. It observed exactly that on droppy: supervisor and restart both
-/// ran at 10:58:39 and it reported success having possibly never seen the new
-/// binary at all.
+/// answering. It observed exactly that on a Linux peer: supervisor and restart
+/// both ran at 10:58:39 and it reported success having possibly never seen the
+/// new binary at all.
 ///
 /// If the new binary were broken, that race would report a healthy machine while
 /// the machine went down, which is the one outcome this whole mechanism exists to
@@ -1093,7 +1093,7 @@ pub fn supervisor_argv(
             // WITHOUT THIS THE DELAY IS A SUGGESTION, and the finding is worth
             // more than the flag.
             //
-            // systemd defaults to AccuracySec=1min and batches timers. On droppy
+            // systemd defaults to AccuracySec=1min and batches timers. On a peer
             // both this verifier and the +3s restart were scheduled at 10:58:16
             // and BOTH FIRED AT 10:58:39 — 23 seconds late, together. The two
             // delays encode an ORDER, restart then verify, and batching turned
@@ -1920,8 +1920,8 @@ mod tests {
     #[test]
     fn pending_verification_names_the_command_bound_and_outcomes() {
         let command = recovery_command(
-            Path::new("/Users/Nathan Example/.local/share/fabric"),
-            Path::new("/Users/Nathan Example/.local/bin/fabric.rollback-1"),
+            Path::new("/Users/Alex Example/.local/share/fabric"),
+            Path::new("/Users/Alex Example/.local/bin/fabric.rollback-1"),
             "generation-1",
             "0.2.1+new",
         );
@@ -1933,9 +1933,9 @@ mod tests {
         assert!(report.contains("version 0.2.1+old means rollback"));
         assert!(report.contains("no answer needs manual recovery"));
         assert!(report.contains("recover\t"));
-        assert!(command.starts_with("'/Users/Nathan Example/.local/bin/fabric.rollback-1'"));
+        assert!(command.starts_with("'/Users/Alex Example/.local/bin/fabric.rollback-1'"));
         assert!(command.ends_with("--restore-now"));
-        assert_eq!(shell_word("Nathan's Mac"), "'Nathan'\"'\"'s Mac'");
+        assert_eq!(shell_word("Alex's Mac"), "'Alex'\"'\"'s Mac'");
         assert!(!report.contains("control-socket\tready"));
     }
 
@@ -2740,9 +2740,9 @@ mod supervisor_tests {
     /// where it does the damage.
     #[test]
     fn the_supervisor_runs_detached_and_uses_the_known_good_binary() {
-        let rollback = Path::new("/home/n/.local/bin/fabric.rollback-1000");
+        let rollback = Path::new("/home/alex/.local/bin/fabric.rollback-1000");
         let (program, args) = supervisor_argv(
-            Path::new("/home/n/.local/share/fabric"),
+            Path::new("/home/alex/.local/share/fabric"),
             rollback,
             "generation-1",
             "0.2.0+abc1234",
@@ -2782,13 +2782,13 @@ mod supervisor_tests {
     }
 
     /// The two delays encode an ORDER: restart at +3s, verify at +12s. systemd
-    /// defaults to `AccuracySec=1min` and batches timers, which on droppy fired
-    /// both at the same instant and collapsed that order.
+    /// defaults to `AccuracySec=1min` and batches timers, which on a real peer
+    /// fired both at the same instant and collapsed that order.
     #[test]
     fn the_supervisor_timer_is_accurate_enough_for_its_own_delay() {
         let (_, args) = supervisor_argv(
-            Path::new("/home/n/.local/share/fabric"),
-            Path::new("/home/n/.local/bin/fabric.rollback-1000"),
+            Path::new("/home/alex/.local/share/fabric"),
+            Path::new("/home/alex/.local/bin/fabric.rollback-1000"),
             "generation-1",
             "0.2.0+abc1234",
         );
@@ -2805,8 +2805,8 @@ mod supervisor_tests {
     #[test]
     fn the_supervisor_is_told_what_a_healthy_restart_looks_like() {
         let (_, args) = supervisor_argv(
-            Path::new("/home/n/.local/share/fabric"),
-            Path::new("/home/n/.local/bin/fabric.rollback-1000"),
+            Path::new("/home/alex/.local/share/fabric"),
+            Path::new("/home/alex/.local/bin/fabric.rollback-1000"),
             "generation-1",
             "0.2.0+abc1234",
         );
@@ -2938,8 +2938,8 @@ mod supervisor_tests {
         let dir = tempfile::tempdir().unwrap();
         let spec = render_macos_supervisor(
             dir.path(),
-            Path::new("/Users/n/.local/bin/fabric"),
-            Path::new("/Users/n/.local/bin/fabric.rollback-1000"),
+            Path::new("/Users/alex/.local/bin/fabric"),
+            Path::new("/Users/alex/.local/bin/fabric.rollback-1000"),
             "generation-1",
             "fabric 0.2.1+new",
             501,

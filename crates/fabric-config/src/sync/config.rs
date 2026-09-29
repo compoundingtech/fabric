@@ -391,7 +391,7 @@ mod tests {
             [[sync]]
             name   = "pair"
             folder = "/data/pair"
-            peers  = ["workstation", "hetzner"]
+            peers  = ["workstation", "vps"]
             policy = "bus"
             "#,
         )
@@ -399,7 +399,7 @@ mod tests {
 
         let entry = &book.entries()[0];
         assert!(!entry.peers.is_wildcard());
-        assert_eq!(entry.peers.selectors(), &["workstation", "hetzner"]);
+        assert_eq!(entry.peers.selectors(), &["workstation", "vps"]);
         assert_eq!(entry.policy, SyncPolicy::Bus);
         assert!(entry.policy.rules().propagate_deletes);
         assert!(entry.policy.rules().sweep_tombstones);
@@ -719,14 +719,14 @@ mod tests {
     #[test]
     fn explicit_selectors_must_name_a_trusted_peer() {
         let id = "b".repeat(64);
-        let peers = TrustedPeers(vec![("silber", id.clone())]);
+        let peers = TrustedPeers(vec![("studio", id.clone())]);
 
         let by_name = parse(
             r#"
             [[sync]]
             name = "catalog"
             folder = "/catalog"
-            peers = ["silber"]
+            peers = ["studio"]
             policy = "catalog"
             "#,
         )

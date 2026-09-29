@@ -608,11 +608,11 @@ so rather than stopping the daemon. Delete the file to reset the counts.
 
 ```text
 current connections
-  hetz	id=19 age=12.5s attach_failures=0 last_failure=none last_application_progress=450ms ago
+  server	id=19 age=12.5s attach_failures=0 last_failure=none last_application_progress=450ms ago
 session history (lifetime totals)	since 2026-08-24T14:12:09Z
-  hetz	lifetime_lost=4 lifetime_resumed=4 lifetime_failed=0 lifetime_attempts=7 reconnect_p50=2.0s reconnect_max=4.5s
+  server	lifetime_lost=4 lifetime_resumed=4 lifetime_failed=0 lifetime_attempts=7 reconnect_p50=2.0s reconnect_max=4.5s
     lost_on=direct=3,relay=1 resumed_on=direct=2,relay=2
-  droppy [not in peers.toml]	lifetime_lost=3 lifetime_resumed=0 lifetime_failed=1 lifetime_attempts=10885 reconnect_p50=- reconnect_max=-
+  laptop [not in peers.toml]	lifetime_lost=3 lifetime_resumed=0 lifetime_failed=1 lifetime_attempts=10885 reconnect_p50=- reconnect_max=-
 ```
 
 The current block resets when Fabric replaces that exact shared connection.
@@ -650,10 +650,10 @@ what every probe during the displayed telemetry window measured, split by path:
 
 ```text
 paths
-  droppy	reachable 252/252
+  laptop	reachable 252/252
     relay 	78%	n=196	mean=83.0ms	max=316.0ms
     direct	22%	n=56	mean=84.7ms	max=680.8ms
-  hetz	reachable 252/252
+  server	reachable 252/252
     direct	99%	n=250	mean=64.8ms	max=335.3ms
     relay 	1%	n=2	mean=74.6ms	max=76.6ms
 ```
@@ -662,8 +662,8 @@ The busiest path is listed first, because which path a peer spends its time on
 is usually the finding. Compare the two rows for one peer, not one peer against
 another.
 
-Read the example: `hetz` holds a direct path 99% of the time at 64.8ms — a
-stable address. `droppy` sits on the **relay** 78% of the time, and when it does
+Read the example: `server` holds a direct path 99% of the time at 64.8ms — a
+stable address. `laptop` sits on the **relay** 78% of the time, and when it does
 get a direct path that path is no better on average and far worse at the tail,
 680.8ms against 316.0ms. That is what a peer behind a moving address looks like.
 
@@ -1462,11 +1462,11 @@ allow = []
 [[peers]]
 id = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 name = "server"
-allow = ["echo", "exec", "git/mandat/read", "send-file", "shell", "sync", "web"]
+allow = ["echo", "exec", "git/garden/read", "send-file", "shell", "sync", "web"]
 
 [[git_remotes]]
-name = "mandat"
-path = "/srv/git/mandat.git"
+name = "garden"
+path = "/srv/git/garden.git"
 ```
 
 Git grants use `git/<remote>/read` and `git/<remote>/write`. A shell, exec, or
@@ -1511,6 +1511,12 @@ If the daemon is not running yet, omit `fabric reload-peers`; `fabric up`,
 `fabric up --foreground`, and the managed service all read the file at startup.
 With `FABRIC_HOME=/srv/fabric`, install it as `/srv/fabric/peers.toml` and use
 that same environment for every Fabric command.
+
+Configuration management such as Nix or Ansible can generate `peers.toml` and
+`syncs.toml` per machine this way. The identity in `<home>/identity.toml` is the
+one piece it must not generate: it is a per-machine secret. Let the daemon
+create it on first start, or create it ahead of time with `fabric key gen --out`
+and install it out of band.
 
 Removing an entry and reloading prevents new connections from that NodeID.
 Reloading does not forcibly close an already active tunnel or shell; restart in
@@ -1640,34 +1646,31 @@ The printed socket on node B is the local pipe a consumer connects to.
 
 ## Live WAN Reconnect Test
 
-Use this procedure to validate Layer 1 over a real Mac-to-Hetzner link without
-restarting either daemon. Restarting the accept-side daemon is intentionally not
-part of this test because it would lose the server-side in-memory tunnel session.
+Use this procedure to validate Layer 1 over a real link between a laptop and a
+remote server without restarting either daemon. Restarting the accept-side
+daemon is intentionally not part of this test because it would lose the
+server-side in-memory tunnel session.
 
-The Hetzner supervisor model is undecided and the standalone systemd-per-daemon
-plan is parked. For the retained daemon run surfaces, see
-[docs/hetzner-supervisor-plan.md](docs/hetzner-supervisor-plan.md).
-
-On Hetzner, start a generic Unix echo service in one shell:
+On the server, start a generic Unix echo service in one shell:
 
 ```sh
 fabric debug echo --socket /tmp/fabric-wan-echo.sock
 ```
 
-In another Hetzner shell, expose it:
+In another server shell, expose it:
 
 ```sh
 fabric expose wan-echo --socket /tmp/fabric-wan-echo.sock
 ```
 
-On the Mac, dial the service and connect one long-lived local socket:
+On the laptop, dial the service and connect one long-lived local socket:
 
 ```sh
-SOCK=$(fabric dial hetzner wan-echo)
+SOCK=$(fabric dial server wan-echo)
 fabric debug unix-cat --socket "$SOCK"
 ```
 
-Type `before` and press Enter; it should echo immediately. Then, from Hetzner,
+Type `before` and press Enter; it should echo immediately. Then, on the server,
 force a clean generic-tunnel drop and temporarily reject reconnects:
 
 ```sh
@@ -1675,15 +1678,15 @@ fabric debug block-tunnels
 fabric debug drop-tunnels
 ```
 
-Back in the Mac `unix-cat` process, type `during-drop` and press Enter. It should
-not echo while blocked, but the process and local socket should stay open. Then
-unblock Hetzner:
+Back in the laptop's `unix-cat` process, type `during-drop` and press Enter. It
+should not echo while blocked, but the process and local socket should stay
+open. Then unblock the server:
 
 ```sh
 fabric debug unblock-tunnels
 ```
 
-The `during-drop` bytes should arrive on the Mac over the same `unix-cat`
+The `during-drop` bytes should arrive on the laptop over the same `unix-cat`
 process. Type `after` and press Enter to confirm the reattached tunnel continues
 to carry new bytes.
 

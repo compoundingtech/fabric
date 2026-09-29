@@ -61,7 +61,7 @@ pub struct FileMeta {
     /// | 022 | 0644 | 0755 |
     /// | 002 | 0664 | 0775 |
     ///
-    /// Observed on hetz and droppy on 2026-08-23: 0664 and 0775, both umask
+    /// Observed on two Linux peers on 2026-08-23: 0664 and 0775, both umask
     /// 002. Do NOT depend on an exact mode here; depend only on the executable
     /// bit. st2's render deliberately differs: it writes an exact mode that is
     /// immune to umask, so the two systems do not agree on the other bits and

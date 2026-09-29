@@ -1,5 +1,5 @@
 //! End-to-end `fabric sync` over real iroh on one machine — the local stand-in
-//! for the Mac -> Hetzner catalog proof. Two daemons, each with a catalog sync
+//! for the laptop -> server catalog proof. Two daemons, each with a catalog sync
 //! entry, mutually trusted: a file dropped on A propagates to B's folder over the
 //! `fabric/sync` ALPN, and a delete on B propagates to A and stays deleted.
 
@@ -116,15 +116,15 @@ async fn catalog_sync_propagates_new_file_and_a_delete_sticks() -> Result<()> {
     trust_peer(&a_home, &node_a, node_b.id(), "node-b", node_b.addr()).await?;
     trust_peer(&b_home, &node_b, node_a.id(), "node-a", node_a.addr()).await?;
 
-    // Drop a host=hetz job into A's catalog and drive a sync (mirrors the CLI's
+    // Drop a host=vps job into A's catalog and drive a sync (mirrors the CLI's
     // reload after `fabric sync add`).
-    std::fs::write(a_catalog.join("job-hetz.toml"), b"host=hetz")?;
+    std::fs::write(a_catalog.join("job-vps.toml"), b"host=vps")?;
     reload_sync(&a_home).await?;
 
     // B's daemon should watch + receive it fast.
-    let b_job = b_catalog.join("job-hetz.toml");
+    let b_job = b_catalog.join("job-vps.toml");
     assert!(
-        wait_for_file(&b_job, b"host=hetz").await,
+        wait_for_file(&b_job, b"host=vps").await,
         "job file did not propagate from A to B"
     );
 
@@ -138,11 +138,11 @@ async fn catalog_sync_propagates_new_file_and_a_delete_sticks() -> Result<()> {
         "catalog delete on B was undone on B"
     );
     assert!(
-        wait_for_missing(&a_catalog.join("job-hetz.toml")).await,
+        wait_for_missing(&a_catalog.join("job-vps.toml")).await,
         "catalog delete on B never reached A"
     );
     assert_stays_missing(&b_job).await;
-    assert_stays_missing(&a_catalog.join("job-hetz.toml")).await;
+    assert_stays_missing(&a_catalog.join("job-vps.toml")).await;
 
     node_b.shutdown().await?;
     node_a.shutdown().await?;

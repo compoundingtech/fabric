@@ -1287,7 +1287,7 @@ mod tests {
     /// A peer that never answers must keep a fixed amount of manager state and
     /// must not delay a healthy peer while 32 repeated probes fail.
     ///
-    /// The live control on hetz used 4.81 CPU-seconds over 93.339 seconds. A
+    /// The live control on a Linux server used 4.81 CPU-seconds over 93.339 seconds. A
     /// 342.087-second window with one offline peer used 17.09 CPU-seconds, or
     /// 4.996% of one core against the control's 5.153%. RSS followed the same
     /// bounded 128 MiB allocator sawtooth with and without the offline peer.

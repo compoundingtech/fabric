@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# Fail when a tracked file names a real machine, a real person's home
+# directory or person ID, or an internal agent or mission ID.
+#
+# This repository is public. Examples use invented names: hosts such as
+# laptop, server or peer-a; paths such as /home/example; person/alex;
+# agent/example/worker. The allow lists below hold the invented names, and
+# anything else after /home/, /Users/ or person/ fails.
+#
+# Usage:
+#   bin/check-public-text [REPO]   scan the tracked files of REPO (default: this one)
+#   bin/check-public-text --self-test
+#
+# The self test plants each kind of name in a scratch repository and proves
+# the scan fails on it, so a pattern that stops matching on some platform's
+# grep cannot turn this check into one that always passes.
+set -euo pipefail
+
+# The names of real machines. This file is the one place they appear, and the
+# scan skips it so that nothing else has to name them.
+hosts='hetz|bluey|silber|droppy'
+
+# Invented names that may follow /home/ or /Users/.
+homes='example|alex|alice|bob|runner|user|Shared'
+
+# Invented names that may follow person/.
+people='example|alex|alice|bob'
+
+self='bin/check-public-text'
+
+scan() {
+  local repo="$1" failed=0 hits
+  cd "$repo"
+
+  hits="$(git grep -n -I -i -E "$hosts" -- . ":(exclude)$self" || true)"
+  if [ -n "$hits" ]; then
+    printf 'real machine names:\n%s\n\n' "$hits"
+    failed=1
+  fi
+
+  hits="$(git grep -n -I -o -E '/(Users|home)/[A-Za-z0-9_-]+' -- . ":(exclude)$self" |
+    grep -v -i -E ":/(Users|home)/($homes)\$" || true)"
+  if [ -n "$hits" ]; then
+    printf 'home directories that are not an invented example:\n%s\n\n' "$hits"
+    failed=1
+  fi
+
+  hits="$(git grep -n -I -o -E '(^|[^A-Za-z0-9_])person/[A-Za-z0-9_-]+' -- . ":(exclude)$self" |
+    grep -v -i -E "person/($people)\$" || true)"
+  if [ -n "$hits" ]; then
+    printf 'person IDs that are not an invented example:\n%s\n\n' "$hits"
+    failed=1
+  fi
+
+  hits="$(git grep -n -I -E '(agent|mission|mission-run)/fleet/' -- . ":(exclude)$self" || true)"
+  if [ -n "$hits" ]; then
+    printf 'internal agent or mission IDs:\n%s\n\n' "$hits"
+    failed=1
+  fi
+
+  if [ "$failed" -ne 0 ]; then
+    printf 'Use invented examples instead: a host such as laptop or server,\n'
+    printf '/home/example, person/alex, agent/example/worker. An invented name\n'
+    printf 'that is refused belongs in the allow lists in %s.\n' "$self"
+    return 1
+  fi
+}
+
+self_test() {
+  local script
+  script="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  tmp="$(mktemp -d)" # global, so the EXIT trap still sees it
+  trap 'rm -rf "$tmp"' EXIT
+
+  # Each line must fail the scan on its own. The host names are built from
+  # the list above so this file still names each machine only once.
+  local planted=(
+    "$(printf '%s' "$hosts" | cut -d'|' -f1) is up"
+    "ssh $(printf '%s' "$hosts" | cut -d'|' -f2 | tr a-z A-Z) uptime"
+    "home = /Users/somebody/.local/share/fabric"
+    "home = /home/somebody/.local/share/fabric"
+    "requester person/somebody"
+    "assigned agent/fleet/fabric/worker"
+    "run mission-run/fleet/fabric/queue"
+  )
+  local allowed='home = /home/example/.local/share/fabric
+/Users/alex/.local/bin/fabric and /home/runner/work
+install to /Users/Alex Example/.local/bin/fabric
+requester person/alex, agent/example/worker
+a machine called laptop and one called server'
+
+  local n=0 line repo
+  for line in "${planted[@]}"; do
+    n=$((n + 1))
+    repo="$tmp/planted-$n"
+    mkdir -p "$repo/bin"
+    git -C "$repo" init -q
+    cp "$script" "$repo/$self"
+    printf '%s\n%s\n' "$allowed" "$line" >"$repo/notes.md"
+    git -C "$repo" add -A
+    if (scan "$repo") >/dev/null; then
+      echo "self test: the scan passed a file containing: $line" >&2
+      return 1
+    fi
+  done
+
+  repo="$tmp/clean"
+  mkdir -p "$repo/bin"
+  git -C "$repo" init -q
+  cp "$script" "$repo/$self"
+  printf '%s\n' "$allowed" >"$repo/notes.md"
+  git -C "$repo" add -A
+  if ! (scan "$repo"); then
+    echo "self test: the scan refused only invented examples" >&2
+    return 1
+  fi
+
+  echo "self test: $n planted names refused, invented examples accepted"
+}
+
+case "${1:-}" in
+  --self-test) self_test ;;
+  -h | --help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) scan "${1:-$(git rev-parse --show-toplevel)}" ;;
+esac

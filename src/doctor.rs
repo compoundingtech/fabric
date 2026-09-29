@@ -855,7 +855,7 @@ mod tests {
             },
             own_version: "0.2.0+abc".to_string(),
             peers: vec![PeerFact {
-                label: "hetz".to_string(),
+                label: "vps".to_string(),
                 roaming: false,
                 has_address: true,
                 has_grants: Some(true),
@@ -1178,11 +1178,11 @@ mod tests {
     #[test]
     fn an_absent_roaming_peer_is_normal_including_its_unavailable_build() {
         let mut facts = configured();
-        facts.peers[0].label = "bluey".to_string();
+        facts.peers[0].label = "laptop".to_string();
         facts.peers[0].roaming = true;
         facts.peers[0].reachable = Some(false);
         facts.peers[0].version = None;
-        facts.syncs[0].stopped = vec![("bluey".to_string(), "away".to_string())];
+        facts.syncs[0].stopped = vec![("laptop".to_string(), "away".to_string())];
 
         let findings = diagnose(&facts);
         let peers = find(&findings, "peer");
@@ -1206,12 +1206,12 @@ mod tests {
     #[test]
     fn a_sync_peer_that_resolves_to_nobody_is_named_as_such() {
         let mut facts = configured();
-        facts.syncs[0].stopped = vec![("hetzner".to_string(), "unknown".to_string())];
+        facts.syncs[0].stopped = vec![("vps".to_string(), "unknown".to_string())];
         let findings = diagnose(&facts);
         let syncs = find(&findings, "sync");
         let unknown = syncs
             .iter()
-            .find(|f| f.detail.contains("hetzner"))
+            .find(|f| f.detail.contains("vps"))
             .expect("no finding for the unknown peer");
         assert_eq!(unknown.verdict, Verdict::Problem);
         assert!(
@@ -1251,7 +1251,7 @@ mod tests {
     #[test]
     fn peer_version_carries_the_home_flag_before_exec() {
         let home = FabricHome::new(std::path::Path::new("/srv/fabric"));
-        let argv = peer_version_argv(&home, "hetz");
+        let argv = peer_version_argv(&home, "vps");
         let home_at = argv.iter().position(|a| a == "--home").expect("no --home flag");
         assert_eq!(argv.get(home_at + 1).map(String::as_str), Some("/srv/fabric"));
         let exec_at = argv.iter().position(|a| a == "exec").expect("no exec verb");
@@ -1262,7 +1262,7 @@ mod tests {
         // And it still runs the version query it describes.
         let dashes = argv.iter().position(|a| a == "--").expect("no argv separator");
         assert_eq!(&argv[dashes + 1..], ["fabric".to_string(), "--version".to_string()]);
-        assert_eq!(argv.get(exec_at + 1).map(String::as_str), Some("hetz"));
+        assert_eq!(argv.get(exec_at + 1).map(String::as_str), Some("vps"));
     }
 
     /// Finding 10: a unit file left in place by a `disable` is NOT "installed
@@ -1301,18 +1301,18 @@ mod tests {
     fn a_denied_sync_and_an_unreachable_one_read_differently() {
         let mut facts = configured();
         facts.syncs[0].stopped = vec![
-            ("droppy".to_string(), "denied".to_string()),
-            ("hetz".to_string(), "unreachable".to_string()),
+            ("desktop".to_string(), "denied".to_string()),
+            ("vps".to_string(), "unreachable".to_string()),
         ];
         let findings = diagnose(&facts);
         let syncs = find(&findings, "sync");
         let denied = syncs
             .iter()
-            .find(|f| f.detail.contains("droppy"))
+            .find(|f| f.detail.contains("desktop"))
             .expect("no finding for the denied peer");
         let unreachable = syncs
             .iter()
-            .find(|f| f.detail.contains("hetz"))
+            .find(|f| f.detail.contains("vps"))
             .expect("no finding for the unreachable peer");
 
         assert!(
@@ -1337,13 +1337,13 @@ mod tests {
     fn local_sync_faults_do_not_read_as_unreachable() {
         let mut facts = configured();
         facts.syncs[0].stopped = vec![
-            ("droppy".to_string(), "missing-entry".to_string()),
-            ("hetz".to_string(), "too-large".to_string()),
+            ("desktop".to_string(), "missing-entry".to_string()),
+            ("vps".to_string(), "too-large".to_string()),
         ];
         let findings = diagnose(&facts);
         let syncs = find(&findings, "sync");
 
-        for peer in ["droppy", "hetz"] {
+        for peer in ["desktop", "vps"] {
             let finding = syncs
                 .iter()
                 .find(|finding| finding.detail.contains(peer))
@@ -1360,7 +1360,7 @@ mod tests {
         assert!(
             syncs
                 .iter()
-                .find(|finding| finding.detail.contains("droppy"))
+                .find(|finding| finding.detail.contains("desktop"))
                 .unwrap()
                 .action
                 .as_deref()
@@ -1369,7 +1369,7 @@ mod tests {
         assert!(
             syncs
                 .iter()
-                .find(|finding| finding.detail.contains("hetz"))
+                .find(|finding| finding.detail.contains("vps"))
                 .unwrap()
                 .action
                 .as_deref()
@@ -1496,7 +1496,7 @@ mod tests {
         let versions = find(&findings, "versions");
         assert_eq!(versions[0].verdict, Verdict::Informational);
         assert!(
-            versions[0].detail.contains("hetz"),
+            versions[0].detail.contains("vps"),
             "the peer was not named: {}",
             versions[0].detail
         );
@@ -1535,10 +1535,10 @@ mod tests {
         let refusal = classify_peer_version_failure(
             Some(fabric_service_api::REFUSED_EXIT_CODE),
             "",
-            "peer \"bluey\" refused service \"exec\"",
+            "peer \"laptop\" refused service \"exec\"",
         );
         let failure =
-            classify_peer_version_failure(Some(1), "", "peer \"bluey\" closed service \"exec\"");
+            classify_peer_version_failure(Some(1), "", "peer \"laptop\" closed service \"exec\"");
 
         assert!(matches!(refusal, PeerVersionError::PolicyRefusal(_)));
         assert!(matches!(failure, PeerVersionError::Failed(_)));
@@ -1568,7 +1568,7 @@ mod tests {
     fn the_peers_that_did_answer_are_reported_too() {
         let mut facts = configured();
         facts.peers.push(PeerFact {
-            label: "droppy".to_string(),
+            label: "desktop".to_string(),
             roaming: false,
             has_address: true,
             has_grants: Some(true),
@@ -1608,7 +1608,7 @@ mod tests {
         let versions = find(&findings, "versions");
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].verdict, Verdict::Unknown);
-        assert!(versions[0].detail.contains("could not ask hetz"));
+        assert!(versions[0].detail.contains("could not ask vps"));
     }
 
     #[test]

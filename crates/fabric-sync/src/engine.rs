@@ -1941,8 +1941,8 @@ impl<T: SyncTransport> SyncEngine<T> {
     /// invisible: `delta_fallbacks` read zero while this node reset a cursor on
     /// every inbound exchange and sent that peer a whole manifest next time.
     ///
-    /// That is how droppy came to send Silber a full manifest repeatedly with
-    /// every counter reading healthy. `full_payload_sends` caught it because it
+    /// That is how one peer came to send another a full manifest repeatedly
+    /// with every counter reading healthy. `full_payload_sends` caught it because it
     /// lives on the node and both directions share it; this counter did not,
     /// because it lives on the entry and only one direction wrote to it.
     ///
@@ -3795,7 +3795,7 @@ fn materialize(node: &SyncNode, root: &Path, policy: PolicyRules) -> Result<()> 
 ///
 /// Materialization used to read and hash EVERY present file on EVERY pass. On a
 /// converged tree that answer is always "unchanged", so the read and the hash
-/// were pure waste. Measured on the live Silber daemon: one entry re-read and
+/// were pure waste. Measured on a live daemon: one entry re-read and
 /// re-hashed 70,157,702 bytes every 0.51 s, which is 136 MB/s, and
 /// `blake3_hash_many_neon` was 14.22% of one core.
 ///
@@ -4524,11 +4524,11 @@ impl WatchEventBatch {
 /// Whether a watched path can affect what this entry syncs.
 ///
 /// Issue #57. An entry watches its whole root, but it syncs only what its
-/// include globs select. On the live Silber daemon the declarations entry
-/// selects 64 of 14,368 files, and st2 continuously writes files it does not
-/// select: agent `status` files, and `pty/*.events.jsonl`. Every one of those
-/// writes woke a full scan, so a tree whose selected files had not changed for
-/// 101.6 hours was scanned about twice a second.
+/// include globs select. On a live daemon one entry selected 64 of 14,368
+/// files, and another tool continuously wrote files it does not select: agent
+/// `status` files, and `pty/*.events.jsonl`. Every one of those writes woke a
+/// full scan, so a tree whose selected files had not changed for 101.6 hours
+/// was scanned about twice a second.
 ///
 /// The default is to KEEP. An entry with no include globs selects everything,
 /// so `includes` returns true and nothing is dropped. Anything this cannot
@@ -5097,31 +5097,31 @@ mod tests {
 
     /// Every reason the sweep can refuse must be NAMED, not merely absent.
     ///
-    /// Nathan's rule on 2026-08-23: Bluey roams, and its reachability must
-    /// never cause a concern. The sweep refusing is normal and usually
+    /// The rule since 2026-08-23: a roaming peer's reachability must never
+    /// cause a concern. The sweep refusing is normal and usually
     /// correct. It refusing silently is the fault, because "waiting on a peer"
     /// and "nothing to sweep" looked identical from outside.
     #[test]
     fn every_sweep_refusal_says_why() {
-        let both = SyncPeers::List(vec!["hetz".into(), "droppy".into()]);
-        let resolved = vec![peer("hetz"), peer("droppy")];
+        let both = SyncPeers::List(vec!["vps".into(), "desktop".into()]);
+        let resolved = vec![peer("vps"), peer("desktop")];
 
         // 1. A peer that has never acked is NAMED.
-        let acks = HashMap::from([("hetz".to_string(), 500)]);
+        let acks = HashMap::from([("vps".to_string(), 500)]);
         assert_eq!(
             ack_gate(&both, &resolved, &acks),
-            SweepState::WaitingOnPeers(vec!["droppy".to_string()]),
+            SweepState::WaitingOnPeers(vec!["desktop".to_string()]),
             "the peer holding the sweep up must be named"
         );
         assert_eq!(
             ack_gate(&both, &resolved, &acks).token(),
-            "waiting-on:droppy"
+            "waiting-on:desktop"
         );
 
         // 2. A configured peer absent from the peer book is reported as such,
         //    and NOT as a missing ack. They are different problems.
         assert_eq!(
-            ack_gate(&both, &[peer("hetz")], &acks),
+            ack_gate(&both, &[peer("vps")], &acks),
             SweepState::PeersUnresolved {
                 configured: 2,
                 resolved: 1
@@ -5143,7 +5143,7 @@ mod tests {
         );
 
         // 4. The gate open, bounded by the SLOWEST peer.
-        let acks = HashMap::from([("hetz".to_string(), 500), ("droppy".to_string(), 300)]);
+        let acks = HashMap::from([("vps".to_string(), 500), ("desktop".to_string(), 300)]);
         assert_eq!(
             ack_gate(&both, &resolved, &acks),
             SweepState::Ready { acked_through: 300 },
@@ -5153,28 +5153,28 @@ mod tests {
 
     /// A roaming peer that is NOT configured on the entry cannot hold it up.
     ///
-    /// This is the state on Silber on 2026-08-23: both entries read
-    /// `peers=hetz,droppy`, and Bluey is only in the node peer book. The
-    /// hazard is latent, and this pins that it stays latent.
+    /// This is a real state seen on 2026-08-23: both entries named two
+    /// always-on peers, and the roaming laptop was only in the node peer book.
+    /// The hazard is latent, and this pins that it stays latent.
     #[test]
     fn a_peer_outside_the_entry_cannot_block_its_sweep() {
-        let configured = SyncPeers::List(vec!["hetz".into(), "droppy".into()]);
-        let resolved = vec![peer("hetz"), peer("droppy")];
-        let acks = HashMap::from([("hetz".to_string(), 500), ("droppy".to_string(), 500)]);
+        let configured = SyncPeers::List(vec!["vps".into(), "desktop".into()]);
+        let resolved = vec![peer("vps"), peer("desktop")];
+        let acks = HashMap::from([("vps".to_string(), 500), ("desktop".to_string(), 500)]);
 
         assert_eq!(
             ack_gate(&configured, &resolved, &acks),
             SweepState::Ready { acked_through: 500 },
-            "bluey is not configured on this entry, so it cannot gate it"
+            "laptop is not configured on this entry, so it cannot gate it"
         );
 
         // Adding it to the ENTRY is what would gate it, and that must show as a
         // named wait rather than as silence.
-        let with_bluey = SyncPeers::List(vec!["hetz".into(), "droppy".into(), "bluey".into()]);
-        let resolved = vec![peer("hetz"), peer("droppy"), peer("bluey")];
+        let with_laptop = SyncPeers::List(vec!["vps".into(), "desktop".into(), "laptop".into()]);
+        let resolved = vec![peer("vps"), peer("desktop"), peer("laptop")];
         assert_eq!(
-            ack_gate(&with_bluey, &resolved, &acks),
-            SweepState::WaitingOnPeers(vec!["bluey".to_string()])
+            ack_gate(&with_laptop, &resolved, &acks),
+            SweepState::WaitingOnPeers(vec!["laptop".to_string()])
         );
     }
 
@@ -5274,7 +5274,7 @@ mod tests {
 
     /// Issue #57: a write the entry does not sync must not wake a scan.
     ///
-    /// These are the paths st2 actually writes, taken from the live Silber
+    /// These are the shapes of paths a real tool writes, taken from a live
     /// catalog. Each one used to trigger a full scan of 14,368 files, which is
     /// why a tree whose selected files had not changed for 101.6 hours was
     /// scanned about twice a second.
@@ -5285,10 +5285,10 @@ mod tests {
         let cfg = declarations_like_entry(root);
 
         for noise in [
-            "agents/Silber/cos/status",
-            "agents/hetz/root/status",
-            "pty/Silber.fabric.events.jsonl",
-            "agents/Silber/cos/resources/archive/1785390445488-eavhqh.md",
+            "agents/studio/lead/status",
+            "agents/vps/root/status",
+            "pty/studio.worker.events.jsonl",
+            "agents/studio/lead/resources/archive/1785390445488-eavhqh.md",
         ] {
             let path = root.join(noise);
             assert!(
@@ -5312,10 +5312,10 @@ mod tests {
         let cfg = declarations_like_entry(root);
 
         for real in [
-            "agents/Silber/fabric/agent.kdl",
-            "agents/hetz/root/agent.kdl",
-            "agents/.hetz-backup-1786658066/st2/agent.kdl",
-            "_templates/Silber.root.AGENTS.md",
+            "agents/studio/worker/agent.kdl",
+            "agents/vps/root/agent.kdl",
+            "agents/.vps-backup-1786658066/st2/agent.kdl",
+            "_templates/studio.root.AGENTS.md",
             "plans/artifacts/fabric/pr25/f26618d/RECEIPT.md",
         ] {
             let path = root.join(real);
@@ -5334,10 +5334,10 @@ mod tests {
         let root = dir.path();
         let cfg = declarations_like_entry(root);
 
-        let agent_dir = root.join("agents/Silber/fabric");
+        let agent_dir = root.join("agents/studio/worker");
         std::fs::create_dir_all(&agent_dir).unwrap();
         assert!(
-            !cfg.includes("agents/Silber/fabric"),
+            !cfg.includes("agents/studio/worker"),
             "the directory itself does not match the glob"
         );
         assert!(
@@ -5399,8 +5399,8 @@ mod tests {
     async fn the_filter_survives_a_root_that_reaches_through_a_symlink() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        std::fs::create_dir_all(root.join("agents/Silber/cos")).unwrap();
-        std::fs::create_dir_all(root.join("agents/Silber/fabric")).unwrap();
+        std::fs::create_dir_all(root.join("agents/studio/lead")).unwrap();
+        std::fs::create_dir_all(root.join("agents/studio/worker")).unwrap();
 
         let (tx, mut rx) = mpsc::channel::<WatchEvent>(8);
         let work = EntryWork::new();
@@ -5424,7 +5424,7 @@ mod tests {
         let quiet_generation = work.mutation_generation.load(Ordering::Acquire);
 
         // Noise the entry does not sync. No event may reach the loop.
-        let noise = root.join("agents/Silber/cos/status");
+        let noise = root.join("agents/studio/lead/status");
         std::fs::write(&noise, b"available").unwrap();
         // Name what arrived. A bare "an event arrived" cannot tell a filter that
         // failed from setup noise that was late, and this test runs on two
@@ -5449,7 +5449,7 @@ mod tests {
         );
 
         // A real declaration change must still get through, promptly.
-        std::fs::write(root.join("agents/Silber/fabric/agent.kdl"), b"agent {}").unwrap();
+        std::fs::write(root.join("agents/studio/worker/agent.kdl"), b"agent {}").unwrap();
         let got = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
         assert!(
             matches!(got, Ok(Some(_))),
@@ -5476,14 +5476,14 @@ mod tests {
         let _watcher =
             spawn_watcher(&root, tx, work.clone(), declarations_like_entry(&root)).unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
-        std::fs::create_dir_all(root.join("agents/Silber/cos")).unwrap();
+        std::fs::create_dir_all(root.join("agents/studio/lead")).unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
         while tokio::time::timeout(Duration::from_millis(50), rx.recv())
             .await
             .is_ok()
         {}
 
-        std::fs::write(root.join("agents/Silber/cos/status"), b"available").unwrap();
+        std::fs::write(root.join("agents/studio/lead/status"), b"available").unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(1500), rx.recv())
                 .await
@@ -5496,8 +5496,8 @@ mod tests {
         // never started, so on its own it cannot fail. This proves the watcher
         // is alive and delivering on this very root, which is what makes the
         // silence above mean something.
-        std::fs::create_dir_all(root.join("agents/Silber/fabric")).unwrap();
-        std::fs::write(root.join("agents/Silber/fabric/agent.kdl"), b"agent {}").unwrap();
+        std::fs::create_dir_all(root.join("agents/studio/worker")).unwrap();
+        std::fs::write(root.join("agents/studio/worker/agent.kdl"), b"agent {}").unwrap();
         assert!(
             matches!(
                 tokio::time::timeout(Duration::from_secs(5), rx.recv()).await,
@@ -7000,7 +7000,7 @@ mod tests {
 
     /// A peer that is reachable enough to dial and always fails the reconcile.
     ///
-    /// That is what nine dead entries on hetz looked like for weeks: a peer
+    /// That is what nine dead entries on a server looked like for weeks: a peer
     /// named in the config that no peer actually served, so every pass dialled
     /// and every dial failed.
     #[derive(Default)]
@@ -7316,7 +7316,7 @@ mod tests {
     ///
     /// A RECONCILE THAT FAILS MUST BE COUNTED WHERE SOMEBODY LOOKS.
     ///
-    /// Nine dead entries on hetz failed every reconcile for weeks: 81 failures
+    /// Nine dead entries on a server failed every reconcile for weeks: 81 failures
     /// against 62 successes in 300 log lines. The daemon reported every one of
     /// them, at debug level, into a file nobody reads. Nothing in `fabric sync
     /// ls` moved, so the fault was loud and invisible at the same time.
@@ -8637,15 +8637,15 @@ mod tests {
         ta.add_peer("b", "catalog", b.node_for("catalog").await.unwrap());
         tb.add_peer("a", "catalog", a.node_for("catalog").await.unwrap());
 
-        // A drops a file (the hetz-proof shape) and syncs; B then pulls.
+        // A drops a file (the catalog-proof shape) and syncs; B then pulls.
         std::fs::create_dir_all(dir_a.path().join("catalog")).unwrap();
-        std::fs::write(dir_a.path().join("catalog/job.toml"), b"host=hetz").unwrap();
+        std::fs::write(dir_a.path().join("catalog/job.toml"), b"host=vps").unwrap();
         a.sync_once("catalog").await.unwrap();
         b.sync_once("catalog").await.unwrap();
 
         assert_eq!(
             std::fs::read(dir_b.path().join("catalog/job.toml")).unwrap(),
-            b"host=hetz"
+            b"host=vps"
         );
 
         // Converge fully, then a delete on B must stick on B and reach A. This

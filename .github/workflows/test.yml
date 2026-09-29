@@ -13,6 +13,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # This repository is public. Examples use invented names, never a real
+  # machine, a real person's home directory or person ID, or an internal agent
+  # or mission ID. The script holds the list and the allowed examples.
+  #
+  # The self test runs first because a scan whose pattern stopped matching on
+  # this runner's grep would pass everything, and look exactly like a clean tree.
+  public-text:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The scan refuses every kind of name it claims to
+        run: bin/check-public-text --self-test
+
+      - name: No real machine, person, or agent names
+        run: bin/check-public-text
+
   # The watcher is where the platforms genuinely differ, and for two days this
   # workflow certified a real bug as fixed because it only ever asked ubuntu.
   #
