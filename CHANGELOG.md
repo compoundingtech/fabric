@@ -13,6 +13,8 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   client disappearing during startup can no longer leave an orphaned shell
   that prevents orderly daemon shutdown. Normal shell output and exit status
   continue to drain before the session completes.
+- Partial shell frames retain their read progress while output, resize or
+  signal handling runs, preventing interleaved traffic from corrupting framing.
 
 ## [0.2.22] - 2026-09-30
 

@@ -235,9 +235,13 @@ where
     let result: Result<()> = async {
         // MasterPty is Send, not Sync: this loop owns it across its awaits.
         let master = master;
+        let incoming = next_client_frame(recv);
+        tokio::pin!(incoming);
         while !output_done || exit_code.is_none() {
             tokio::select! {
-                frame = read_client_frame(recv), if !stdin_done => {
+                frame = &mut incoming, if !stdin_done => {
+                    let (frame, recv) = frame;
+                    incoming.set(next_client_frame(recv));
                     match frame? {
                         Some(ClientFrame::Stdin(bytes)) => {
                             let _ = input_tx.send(Some(bytes));
@@ -296,6 +300,24 @@ where
     } else {
         Ok(())
     }
+}
+
+// A partial frame must remain alive when output wins the select. Returning
+// the reader lets the completed future be replaced without aliasing its borrow.
+async fn next_client_frame<R>(read: &mut R) -> (Result<Option<ClientFrame>>, &mut R)
+where
+    R: AsyncRead + Unpin,
+{
+    let frame = read_client_frame(read).await;
+    (frame, read)
+}
+
+pub(super) async fn next_server_frame<R>(read: &mut R) -> (Result<Option<ServerFrame>>, &mut R)
+where
+    R: AsyncRead + Unpin,
+{
+    let frame = read_server_frame(read).await;
+    (frame, read)
 }
 
 pub async fn read_client_frame<R>(read: &mut R) -> Result<Option<ClientFrame>>
@@ -435,17 +457,18 @@ mod tests {
     use super::{Notice, ServerFrame, Service, Shell, encode_server_status, read_server_frame};
     use std::time::Duration;
 
+    struct KillOnDrop(libc::pid_t);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            // The old implementation deliberately fails the assertion;
+            // reap its leaked child rather than hanging the test runtime.
+            unsafe { libc::kill(self.0, libc::SIGKILL) };
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_shell_stream_error_terminates_and_reaps_its_pty_child() -> anyhow::Result<()> {
-        struct KillOnDrop(libc::pid_t);
-        impl Drop for KillOnDrop {
-            fn drop(&mut self) {
-                // The old implementation deliberately fails the assertion;
-                // reap its leaked child rather than hanging the test runtime.
-                unsafe { libc::kill(self.0, libc::SIGKILL) };
-            }
-        }
         for output_error in [false, true] {
             let (server, client) = tokio::io::duplex(8192);
             let (mut recv, mut send) = tokio::io::split(server);
@@ -493,6 +516,129 @@ mod tests {
             }
             assert!(!alive, "shell stream error left its PTY child alive");
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_partial_shell_frame_survives_interleaved_pty_output() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        use std::{
+            pin::Pin,
+            sync::Arc,
+            sync::atomic::{AtomicUsize, Ordering},
+            task::{Context, Poll},
+        };
+        use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
+        use tokio::sync::Notify;
+
+        struct CountRead<R> {
+            inner: R,
+            bytes: Arc<AtomicUsize>,
+            changed: Arc<Notify>,
+        }
+        impl<R: AsyncRead + Unpin> AsyncRead for CountRead<R> {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                let before = buf.filled().len();
+                let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+                let consumed = buf.filled().len() - before;
+                if consumed != 0 {
+                    self.bytes.fetch_add(consumed, Ordering::SeqCst);
+                    self.changed.notify_one();
+                }
+                result
+            }
+        }
+        let gate_dir = tempfile::tempdir()?;
+        let gate = gate_dir.path().join("ready");
+        let program = format!(
+            "stty raw -echo; printf 'SHELLPID-%s-END\\n' $$; while [ ! -f '{}' ]; do sleep 0.01; done; printf 'INTERLEAVED\\n'; read ignored; printf 'FRAGMENT_REACHED\\n'; read final\n",
+            gate.display()
+        );
+        let (server, client) = tokio::io::duplex(8192);
+        let (recv, mut send) = tokio::io::split(server);
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let changed = Arc::new(Notify::new());
+        let mut recv = CountRead {
+            inner: recv,
+            bytes: bytes.clone(),
+            changed: changed.clone(),
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            super::serve_shell_session_until(&mut recv, &mut send, "peer", server_cancel).await
+        });
+        let (mut read, mut write) = tokio::io::split(client);
+        super::write_client_stdin(&mut write, program.as_bytes()).await?;
+        let mut seen = Vec::new();
+        let pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(ServerFrame::Output(chunk)) = read_server_frame(&mut read).await? {
+                    seen.extend(chunk);
+                    for candidate in String::from_utf8_lossy(&seen).split("SHELLPID-") {
+                        if let Some((digits, _)) = candidate.split_once("-END")
+                            && let Ok(pid) = digits.parse::<libc::pid_t>()
+                        {
+                            return Ok::<_, anyhow::Error>(pid);
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .context("waiting for shell PID")??;
+        let cleanup = KillOnDrop(pid);
+        // Deliver only the kind byte. Wait until the service consumed it,
+        // then make its other select branch win before delivering the length.
+        write.write_all(&[super::CLIENT_STDIN]).await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while bytes.load(Ordering::SeqCst) < 5 + program.len() + 1 {
+                changed.notified().await;
+            }
+        })
+        .await
+        .context("waiting for partial header consumption")?;
+        std::fs::write(gate, [])?;
+        seen.clear();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !String::from_utf8_lossy(&seen).contains("INTERLEAVED\n") {
+                if let Some(ServerFrame::Output(chunk)) = read_server_frame(&mut read).await? {
+                    seen.extend(chunk);
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("waiting for interleaved output")??;
+        write.write_all(&[0, 0, 0, 1, b'\n']).await?;
+        seen.clear();
+        let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+            while !String::from_utf8_lossy(&seen).contains("FRAGMENT_REACHED\n") {
+                match read_server_frame(&mut read).await? {
+                    Some(ServerFrame::Output(chunk)) => seen.extend(chunk),
+                    None => anyhow::bail!("shell ended before fragmented input arrived"),
+                    _ => {}
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        cancel.cancel();
+        let stopped = tokio::time::timeout(Duration::from_secs(5), task).await;
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if alive {
+            drop(cleanup);
+        } else {
+            std::mem::forget(cleanup);
+        }
+        delivered.context("waiting for fragmented input effect")??;
+        stopped.context("waiting for shell cancellation")???;
+        assert!(!alive, "cancelled shell left its PTY child alive");
         Ok(())
     }
 
