@@ -646,8 +646,11 @@ async fn a_replica_stores_the_origin_metadata_verbatim() -> Result<()> {
             std::fs::Permissions::from_mode(0o755),
         )?;
     }
+    // This guards replicated metadata, not watcher scheduling. Complete real
+    // wire passes before inspecting their durable results.
     std::fs::write(a_folder.join("doomed.md"), b"delete me")?;
     reload_sync(&a_home).await?;
+    node_a.engine().await.unwrap().sync_once("shared").await?;
     assert!(
         wait_for_file(&b_folder.join("run.sh"), b"#!/bin/sh\necho hi\n").await,
         "nothing reached B, so there is no replica to compare"
@@ -658,6 +661,7 @@ async fn a_replica_stores_the_origin_metadata_verbatim() -> Result<()> {
     );
     std::fs::remove_file(a_folder.join("doomed.md"))?;
     reload_sync(&a_home).await?;
+    node_a.engine().await.unwrap().sync_once("shared").await?;
     assert!(
         wait_for_missing(&b_folder.join("doomed.md")).await,
         "the delete never reached B, so there is no tombstone to compare"
