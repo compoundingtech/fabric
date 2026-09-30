@@ -687,6 +687,7 @@ async fn a_replica_stores_the_origin_metadata_verbatim() -> Result<()> {
         };
         if count(&a) == 3
             && count(&b) == 3
+            && a["entries"]["doomed.md"]["kind"].as_str() == Some("tombstone")
             && b["entries"]["doomed.md"]["kind"].as_str() == Some("tombstone")
         {
             pair = Some((a, b));
