@@ -393,9 +393,13 @@ async fn run_shell_session(
     mut answer_deadline: Option<tokio::time::Instant>,
 ) -> Result<ShellSessionEnd> {
     let mut answered = false;
+    let incoming = super::next_server_frame(read);
+    tokio::pin!(incoming);
     loop {
         tokio::select! {
-            frame = super::read_server_frame(read) => {
+            frame = &mut incoming => {
+                let (frame, read) = frame;
+                incoming.set(super::next_server_frame(read));
                 let Some(frame) = frame? else {
                     return Ok(ShellSessionEnd::Lost { answered });
                 };

@@ -4,6 +4,18 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+## [0.2.23] - 2026-09-30
+
+### Fixed
+
+- A shell whose framing or output stream fails now terminates and reaps its
+  PTY child and joins its blocking workers before returning the error. A
+  client disappearing during startup can no longer leave an orphaned shell
+  that prevents orderly daemon shutdown. Normal shell output and exit status
+  continue to drain before the session completes.
+- Partial shell frames retain their read progress while output, resize or
+  signal handling runs, preventing interleaved traffic from corrupting framing.
+
 ## [0.2.22] - 2026-09-30
 
 ### Fixed

@@ -2886,12 +2886,22 @@ mod tests {
         session.state.lock().await.drain_server_output = true;
         service.write_all(b"final response").await.unwrap();
         drop(service);
-        assert!(
-            !session
-                .accept_data(0, b"late input".to_vec())
+        // macOS may accept a write briefly after the other socket closes.
+        // Exercise the failed-write path once the kernel reports that close,
+        // keeping the output reader deliberately unpolled throughout.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut offset = 0;
+            while session
+                .accept_data(offset, b"late input".to_vec())
                 .await
                 .unwrap()
-        );
+            {
+                offset += 10;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the closed socket must eventually reject input");
         assert!(!session.local_input_ended().await);
         session.clone().run_local_reader(read).await.unwrap();
         assert_eq!(session.state.lock().await.buffered_bytes, 14);
