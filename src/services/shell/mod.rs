@@ -230,6 +230,7 @@ where
     let mut stdin_done = false;
     let mut output_done = false;
     let mut exit_code = None;
+    let mut cancelled = false;
 
     let result: Result<()> = async {
         // MasterPty is Send, not Sync: this loop owns it across its awaits.
@@ -268,6 +269,7 @@ where
                     let _ = input_tx.send(None);
                 }
                 _ = cancel.cancelled() => {
+                    cancelled = true;
                     return Ok(());
                 }
             }
@@ -287,7 +289,9 @@ where
     let _ = reader_task.await;
     let _ = writer_task.await;
     result?;
-    if let Some(code) = exit_code {
+    if cancelled {
+        Ok(())
+    } else if let Some(code) = exit_code {
         write_server_frame(send, ServerFrame::Exit(code)).await
     } else {
         Ok(())
