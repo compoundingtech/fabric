@@ -1414,7 +1414,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                 Ok(_) => PeerSyncState::Ok,
                 Err(error) => {
                     let state = classify_reconcile_error(&format!("{error:#}"));
-                    if peer.roaming && state == PeerSyncState::Unreachable {
+                    if state == PeerSyncState::Unreachable {
                         PeerSyncState::Away
                     } else {
                         state
@@ -1440,7 +1440,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                     sync = name,
                     peer = peer.id,
                     micros = elapsed_micros,
-                    "roaming sync peer is away"
+                    "sync peer is offline"
                 ),
                 (Some(PeerSyncState::Away), PeerSyncState::Ok) => tracing::info!(
                     target: SYNC_LOG_TARGET,
@@ -1448,7 +1448,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                     sync = name,
                     peer = peer.id,
                     micros = elapsed_micros,
-                    "roaming sync peer returned"
+                    "sync peer returned"
                 ),
                 _ => tracing::info!(
                     target: SYNC_LOG_TARGET,
@@ -1488,7 +1488,7 @@ impl<T: SyncTransport> SyncEngine<T> {
                         .insert(peer.id.clone(), now_secs());
                 }
                 Err(error) if observed_state == PeerSyncState::Away => {
-                    tracing::debug!(sync = name, peer = peer.id, %error, "roaming sync peer is away");
+                    tracing::debug!(sync = name, peer = peer.id, %error, "sync peer is offline");
                 }
                 Err(error) => {
                     entry
@@ -4633,8 +4633,8 @@ fn spawn_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fabric_config::sync::config::SyncPolicy;
     use crate::manifest::{Author, Entry, FileMeta, Tombstone};
+    use fabric_config::sync::config::SyncPolicy;
     // The glob import above also brings the timestamped service-log macro,
     // which is ambiguous with the prelude's. Test diagnostics go to the test
     // harness, which captures only the standard macro.
@@ -7006,6 +7006,7 @@ mod tests {
     #[derive(Default)]
     struct AlwaysFailingTransport {
         roaming: bool,
+        missing_entry: bool,
     }
 
     impl SyncTransport for AlwaysFailingTransport {
@@ -7023,7 +7024,10 @@ mod tests {
             _name: String,
             _node: Arc<Mutex<SyncNode>>,
         ) -> Result<Reconciled> {
-            anyhow::bail!("no peer serves this entry")
+            if self.missing_entry {
+                anyhow::bail!("no local sync entry named bus")
+            }
+            anyhow::bail!("peer is offline")
         }
     }
 
@@ -7159,15 +7163,14 @@ mod tests {
             let resolver_target = target.clone();
             let label = client_label(&node).await;
             let server = tokio::spawn(async move {
-                let (_, _, prepared) =
-                    crate::wire::run_server(server_end, &label, move |hello| {
-                        let engine = resolver_target.clone();
-                        async move {
-                            let prepared = engine.prepare_inbound_for_hello(&hello).await?;
-                            Ok(prepared.map(|prepared| (prepared.node(), prepared)))
-                        }
-                    })
-                    .await?;
+                let (_, _, prepared) = crate::wire::run_server(server_end, &label, move |hello| {
+                    let engine = resolver_target.clone();
+                    async move {
+                        let prepared = engine.prepare_inbound_for_hello(&hello).await?;
+                        Ok(prepared.map(|prepared| (prepared.node(), prepared)))
+                    }
+                })
+                .await?;
                 target.complete_inbound(prepared).await
             });
             let stats = crate::wire::run_client(client_end, node, &name, &peer.id).await?;
@@ -7334,7 +7337,10 @@ mod tests {
         let engine = SyncEngine::new(
             FabricHome::new(dir.path()),
             Author([1; 32]),
-            Arc::new(AlwaysFailingTransport { roaming: false }),
+            Arc::new(AlwaysFailingTransport {
+                roaming: false,
+                missing_entry: true,
+            }),
             CancellationToken::new(),
         )
         .await
@@ -7360,41 +7366,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_absent_roaming_peer_is_away_and_does_not_add_sync_failures() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("resources");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("a.md"), b"seed").unwrap();
-        write_bus_sync(dir.path(), &root);
+    async fn an_absent_peer_of_any_kind_is_away_and_does_not_add_sync_failures() {
+        for roaming in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("resources");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("a.md"), b"seed").unwrap();
+            write_bus_sync(dir.path(), &root);
 
-        let engine = SyncEngine::new(
-            FabricHome::new(dir.path()),
-            Author([1; 32]),
-            Arc::new(AlwaysFailingTransport { roaming: true }),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-        for _ in 0..3 {
-            engine.sync_once("bus").await.unwrap();
-        }
-
-        let status = engine
-            .status()
+            let engine = SyncEngine::new(
+                FabricHome::new(dir.path()),
+                Author([1; 32]),
+                Arc::new(AlwaysFailingTransport {
+                    roaming,
+                    missing_entry: false,
+                }),
+                CancellationToken::new(),
+            )
             .await
-            .into_iter()
-            .find(|entry| entry.name == "bus")
-            .expect("no status for the entry");
+            .unwrap();
 
-        assert_eq!(status.reconcile_failures, 0);
-        assert_eq!(
-            status.stopped_peers,
-            vec![(
-                "a-peer-that-does-not-serve-this-entry".to_string(),
-                "away".to_string()
-            )]
-        );
+            for _ in 0..3 {
+                engine.sync_once("bus").await.unwrap();
+            }
+
+            let status = engine
+                .status()
+                .await
+                .into_iter()
+                .find(|entry| entry.name == "bus")
+                .expect("no status for the entry");
+
+            assert_eq!(status.reconcile_failures, 0);
+            assert_eq!(
+                status.stopped_peers,
+                vec![(
+                    "a-peer-that-does-not-serve-this-entry".to_string(),
+                    "away".to_string()
+                )]
+            );
+        }
     }
 
     /// Finding 3 of the 2026-08-29 review, at the engine. A transport that
@@ -8265,15 +8276,14 @@ mod tests {
         let resolver_engine = engine.clone();
         let label = client_label(&remote).await;
         let server = tokio::spawn(async move {
-            let (_, stats, prepared) =
-                crate::wire::run_server(server_end, &label, move |hello| {
-                    let engine = resolver_engine.clone();
-                    async move {
-                        let prepared = engine.prepare_inbound_for_hello(&hello).await?;
-                        Ok(prepared.map(|prepared| (prepared.node(), prepared)))
-                    }
-                })
-                .await?;
+            let (_, stats, prepared) = crate::wire::run_server(server_end, &label, move |hello| {
+                let engine = resolver_engine.clone();
+                async move {
+                    let prepared = engine.prepare_inbound_for_hello(&hello).await?;
+                    Ok(prepared.map(|prepared| (prepared.node(), prepared)))
+                }
+            })
+            .await?;
             engine.complete_inbound(prepared).await?;
             Ok::<_, anyhow::Error>(stats)
         });
@@ -11314,7 +11324,9 @@ mod tests {
         .unwrap();
         std::fs::write(&staged.staged_path, b"not yet").unwrap();
         assert!(
-            !staged.staged_path.starts_with(dir_a.path().join("resources")),
+            !staged
+                .staged_path
+                .starts_with(dir_a.path().join("resources")),
             "the staged copy must live outside the synced folder"
         );
 
@@ -11410,9 +11422,14 @@ mod tests {
             ("notes/two.md", &b"two"[..]),
             ("three.md", &b"three"[..]),
         ] {
-            let staged =
-                fabric_config::sync::staging::stage(&home_a, &book_a, &root_a.join(rel), None, None)
-                    .unwrap();
+            let staged = fabric_config::sync::staging::stage(
+                &home_a,
+                &book_a,
+                &root_a.join(rel),
+                None,
+                None,
+            )
+            .unwrap();
             std::fs::write(&staged.staged_path, bytes).unwrap();
         }
         let (_entry, files) =
@@ -11464,14 +11481,19 @@ mod tests {
 
     #[tokio::test]
     async fn a_publish_after_the_published_file_changed_is_refused_and_force_publishes_the_next_version()
-    {
+     {
         let (dir_a, _dir_b, a, _b, _ta, _tb) = staged_pair().await;
         let home_a = FabricHome::new(dir_a.path());
         let book_a = SyncBook::load(&home_a).unwrap();
         let root_a = dir_a.path().join("resources");
-        let staged =
-            fabric_config::sync::staging::stage(&home_a, &book_a, &root_a.join("seed.md"), None, None)
-                .unwrap();
+        let staged = fabric_config::sync::staging::stage(
+            &home_a,
+            &book_a,
+            &root_a.join("seed.md"),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             staged.base.as_deref(),
             Some(content_hash(b"seed").to_hex().as_str()),
@@ -11502,8 +11524,14 @@ mod tests {
 
         let published = a.publish_staged("bus", files, true).await.unwrap();
         assert_eq!(published.len(), 1);
-        assert_eq!(published[0].version, 3, "seed v1, edit v2, forced publish v3");
-        assert_eq!(std::fs::read(root_a.join("seed.md")).unwrap(), b"staged edit");
+        assert_eq!(
+            published[0].version, 3,
+            "seed v1, edit v2, forced publish v3"
+        );
+        assert_eq!(
+            std::fs::read(root_a.join("seed.md")).unwrap(),
+            b"staged edit"
+        );
     }
 
     #[tokio::test]
@@ -11514,9 +11542,14 @@ mod tests {
         let home_a = FabricHome::new(dir_a.path());
         let book_a = SyncBook::load(&home_a).unwrap();
         let root_a = dir_a.path().join("resources");
-        let staged =
-            fabric_config::sync::staging::stage(&home_a, &book_a, &root_a.join("quiet.md"), None, None)
-                .unwrap();
+        let staged = fabric_config::sync::staging::stage(
+            &home_a,
+            &book_a,
+            &root_a.join("quiet.md"),
+            None,
+            None,
+        )
+        .unwrap();
         std::fs::write(&staged.staged_path, b"quiet bytes").unwrap();
         let (_entry, files) =
             fabric_config::sync::staging::read_for_publish(&home_a, &book_a, "bus", &[]).unwrap();
@@ -11588,8 +11621,9 @@ mod tests {
         });
         book.save(&home).unwrap();
 
-        let error = fabric_config::sync::staging::stage(&home, &book, &root.join("notes.txt"), None, None)
-            .unwrap_err();
+        let error =
+            fabric_config::sync::staging::stage(&home, &book, &root.join("notes.txt"), None, None)
+                .unwrap_err();
         let detail = format!("{error:#}");
         assert!(
             detail.contains("include") && detail.contains("notes.txt"),
@@ -11640,7 +11674,9 @@ mod tests {
             "a staging tree inside a folder must be refused: {detail}"
         );
         assert!(
-            !fabric_config::sync::staging::staging_root(&home).join("home").exists(),
+            !fabric_config::sync::staging::staging_root(&home)
+                .join("home")
+                .exists(),
             "a refused stage must write nothing into the folder"
         );
     }
@@ -11725,10 +11761,9 @@ mod tests {
         std::fs::write(root.join("late.md"), b"late").unwrap();
         transport.release.notify_one();
 
-        let published =
-            tokio::time::timeout(Duration::from_secs(5), transport.saw_late.notified())
-                .await
-                .is_ok();
+        let published = tokio::time::timeout(Duration::from_secs(5), transport.saw_late.notified())
+            .await
+            .is_ok();
         cancel.cancel();
         assert!(
             published,

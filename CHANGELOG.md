@@ -4,6 +4,33 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+## [0.2.21] - 2026-09-30
+
+### Fixed
+
+- Known-offline peers close new local dial requests immediately. Absence is
+  normal for every machine, including in the sync companion; background retries back off with jitter to about an
+  hour, without recording each retry as a connection failure.
+- Simultaneous connection admission converges on one connection without
+  closing an already-admitted connection or losing the generation-preface race.
+  A returning peer can replace a silent canonical path before its idle timeout.
+- Generic Unix and TCP dials persist by canonical peer ID and restore after a
+  daemon restart, including an allocated TCP port. Config writes are atomic and
+  daemon read-modify-write operations are serialized. `fabric undial` removes
+  the declaration and its listeners.
+- Interface, address, wake and relay-return notifications refresh paths and
+  announce to trusted peers while preserving usable sessions. An offline
+  uplink no longer causes repeated endpoint recycling.
+
+### Added
+
+- `fabric peer-events --watch` and the local `peer_events` control request:
+  cursor-based presence transitions, a daemon instance token and reset
+  snapshots. Consumers can wake a peer retry as soon as its connection returns.
+- Linux and macOS CI coverage for offline, restart, simultaneous-connect and
+  network-change contracts, including virtual five-minute/four-hour outages
+  with real endpoints returning at a changed UDP address.
+
 ## [Unreleased]
 
 ### Removed

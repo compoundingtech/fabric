@@ -96,12 +96,21 @@ rebuilt for that.
 ### Presence, partitions, and local ownership
 
 Fabric reports connection facts about each trusted peer by canonical NodeID.
-It reports a normal peer as reachable or unreachable. Set `roaming = true` for
-a peer that is expected to disconnect, such as a laptop. Fabric reports that
-peer as away while it is offline. Its absence does not add failures or cause
-endpoint recovery. Each health or sync path logs only its away and return
-transitions. It does not log each failed probe or pass. A durable `last_seen`
-status surface remains a desired gap.
+Any machine can be offline, including a server. Offline is normal; `roaming`
+remains descriptive metadata. Once absence is known, a new local dial closes
+immediately instead of holding the application until its timeout. Background
+connection attempts back off with jitter from seconds through minutes to about
+an hour, and reset when a connection, local address change, wake, or relay
+reconnection proves that another attempt is useful. A returning daemon connects
+to its trusted peers; the same authenticated connection carries traffic both
+ways. Healthy sessions survive network notifications without being torn down.
+
+`fabric peer-events --watch` streams newline-delimited JSON from a local,
+network-free event journal. Consumers can wake the affected peer immediately on
+`online: true`. The journal retains 256 transitions; a daemon restart or stale
+cursor produces `reset: true` and a current snapshot. The instance token, cursor,
+canonical `peer_id`, observed timestamp, path and cause are included in each
+batch. A durable `last_seen` surface remains a consumer responsibility.
 
 The architecture MUST isolate network partitions from unrelated local work:
 each machine and its local processes continue from their last instructions
@@ -825,9 +834,8 @@ fails.
 fabric status
 ```
 
-Show the running daemon's local state and echo-ping every trusted peer. A normal
-peer is reachable or unreachable. An offline peer with `roaming = true` is
-away. Reachable peers include latency and the `direct`, `relay`, or `mixed`
+Show the running daemon's local state and check every trusted peer. An absent
+peer is offline regardless of its machine kind. Reachable peers include latency and the `direct`, `relay`, or `mixed`
 transport path when iroh supplies it. Status also prints the daemon build.
 
 ```sh
@@ -928,7 +936,24 @@ fabric dial <peer> <protocol> --tcp <local-host:port>
 Create and print a local Unix socket path. Connections to that socket are
 tunneled to the peer's exposed protocol over iroh. With `--tcp`, fabric listens
 on the local TCP address and forwards each accepted connection to the peer's
-exposed protocol.
+exposed protocol. Generic Unix and TCP dial declarations persist in
+`config.toml`, keyed by canonical peer ID, and restore on daemon startup. A TCP
+bind with port zero persists the port actually allocated. An offline peer does
+not remove its listener. Remove all listeners for that peer and protocol with
+`fabric undial <peer> <protocol>`. Per-command shell and exec sockets stay
+transient.
+
+```sh
+fabric peer-events [--watch] [--instance TOKEN] [--after CURSOR]
+```
+
+Read cached peer transitions, optionally waiting for changes. A watch waits up
+to 30 seconds per batch by default (`--timeout-ms`, capped at 60 seconds). Idle
+batches contain no events. Retain `instance` and `cursor` for the next request;
+when `reset` is true, replace the consumer's cached presence with the snapshot.
+`cause` describes observed `connected`, `connection_closed` or `unreachable`
+facts; it does not guess why a remote machine returned. `path` is the observed
+`direct`, `relay`, or `mixed` path when available. `fabric addr` is unchanged.
 
 ### Expose And Dial A Service
 
@@ -945,9 +970,9 @@ fabric dial machine-b demo-http --tcp 127.0.0.1:9080
 ```
 
 Clients on machine A can now use `127.0.0.1:9080`. The exposure persists in
-fabric's config and returns when the daemon restarts; recreate the dial listener
-after restarting machine A's daemon. Run `fabric unexpose demo-http` on machine
-B when the exposure is no longer wanted.
+fabric's config and returns when the daemon restarts, as does the dial listener
+on machine A. Run `fabric unexpose demo-http` on machine B and
+`fabric undial machine-b demo-http` on machine A when they are no longer wanted.
 
 **8080 and 9080 above are examples, not recommendations.** Pick a port you have
 checked, and remember that **availability is not permission**: a port being free

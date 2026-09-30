@@ -1027,7 +1027,10 @@ impl Backoff {
     }
 
     fn next_delay(&mut self) -> Duration {
-        const STEPS_MS: &[u64] = &[100, 250, 500, 1000, 2000, 5000, 10000, 15000];
+        const STEPS_MS: &[u64] = &[
+            100, 250, 500, 1000, 2000, 5000, 10000, 15000, 30000, 60000, 120000, 300000, 600000,
+            1800000, 3600000,
+        ];
         let base = STEPS_MS[self.step.min(STEPS_MS.len() - 1)];
         self.step = (self.step + 1).min(STEPS_MS.len() - 1);
         let jitter = 80 + (rand::random::<u64>() % 41);
@@ -1170,6 +1173,8 @@ async fn run_client_attach_loop(
     mut initial_stream: Option<MuxStream>,
 ) -> Result<()> {
     let mut backoff = Backoff::new();
+    let mut presence_rx = connections.presence.subscribe();
+    let mut peer_presence_sequence = connections.presence.peer_sequence(session.peer_id());
 
     loop {
         if session.is_complete().await {
@@ -1221,8 +1226,17 @@ async fn run_client_attach_loop(
                         )
                         .await;
                 }
-                match wait_for_reconnect(delay, &cancel, &session, &mut drop_rx, &mut endpoint_rx)
-                    .await
+                match wait_for_reconnect(
+                    delay,
+                    &cancel,
+                    &session,
+                    &mut drop_rx,
+                    &mut endpoint_rx,
+                    &connections.presence,
+                    &mut presence_rx,
+                    &mut peer_presence_sequence,
+                )
+                .await
                 {
                     ReconnectWait::Retry => continue,
                     ReconnectWait::Stop => return Ok(()),
@@ -1232,7 +1246,16 @@ async fn run_client_attach_loop(
                 }
             }
             Err(error) => {
-                let message = format!("{error:#}");
+                // A temporary admission refusal is a reply from a live peer.
+                // It must not inherit an absent peer's long retry schedule.
+                if crate::mux::is_temporary_stream_denial(&error) {
+                    backoff.reset();
+                }
+                let message = if connections.presence.offline(session.peer_id()) {
+                    "peer is offline".into()
+                } else {
+                    format!("{error:#}")
+                };
                 if !session.has_attached().await || is_permanent_failure(&error) {
                     return fail_permanently(&session, notices.as_ref(), error).await;
                 }
@@ -1252,8 +1275,17 @@ async fn run_client_attach_loop(
                         )
                         .await;
                 }
-                match wait_for_reconnect(delay, &cancel, &session, &mut drop_rx, &mut endpoint_rx)
-                    .await
+                match wait_for_reconnect(
+                    delay,
+                    &cancel,
+                    &session,
+                    &mut drop_rx,
+                    &mut endpoint_rx,
+                    &connections.presence,
+                    &mut presence_rx,
+                    &mut peer_presence_sequence,
+                )
+                .await
                 {
                     ReconnectWait::Retry => continue,
                     ReconnectWait::Stop => return Ok(()),
@@ -1301,14 +1333,28 @@ async fn wait_for_reconnect(
     session: &TunnelSession,
     drop_rx: &mut watch::Receiver<u64>,
     endpoint_rx: &mut watch::Receiver<CurrentEndpoint>,
+    presence: &crate::presence::Presence,
+    presence_rx: &mut watch::Receiver<u64>,
+    peer_presence_sequence: &mut u64,
 ) -> ReconnectWait {
-    tokio::select! {
-        _ = tokio::time::sleep(delay) => ReconnectWait::Retry,
-        _ = cancel.cancelled() => ReconnectWait::Stop,
-        _ = session.done.cancelled() => ReconnectWait::Stop,
-        changed = drop_rx.changed() => if changed.is_ok() { ReconnectWait::Retry } else { ReconnectWait::Stop },
-        changed = endpoint_rx.changed() => if changed.is_ok() { ReconnectWait::Retry } else { ReconnectWait::Stop },
-        error = session.watch_local_endpoint() => ReconnectWait::LocalGone(error),
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return ReconnectWait::Retry,
+            _ = cancel.cancelled() => return ReconnectWait::Stop,
+            _ = session.done.cancelled() => return ReconnectWait::Stop,
+            changed = drop_rx.changed() => return if changed.is_ok() { ReconnectWait::Retry } else { ReconnectWait::Stop },
+            changed = endpoint_rx.changed() => return if changed.is_ok() { ReconnectWait::Retry } else { ReconnectWait::Stop },
+            changed = presence_rx.changed() => {
+                if changed.is_err() { return ReconnectWait::Stop; }
+                let sequence = presence.peer_sequence(session.peer_id());
+                let changed = sequence != *peer_presence_sequence;
+                *peer_presence_sequence = sequence;
+                if changed && !presence.offline(session.peer_id()) { return ReconnectWait::Retry; }
+            },
+            error = session.watch_local_endpoint() => return ReconnectWait::LocalGone(error),
+        }
     }
 }
 
@@ -1343,7 +1389,7 @@ async fn connect_and_attach(
             endpoint.generation,
             &peer_addr,
             protocol,
-            StreamActivity::Application,
+            if initial { StreamActivity::Application } else { StreamActivity::Probe },
         ) => {
             connected.with_context(|| {
                 if initial {
@@ -1816,7 +1862,8 @@ pub async fn serve_connection(
     drop_rx: watch::Receiver<u64>,
 ) -> Result<()> {
     attach_drop_closer(&connection, drop_rx);
-    let health = connections.map(|connections| AttachConnectionHealth::new(connections, &connection));
+    let health =
+        connections.map(|connections| AttachConnectionHealth::new(connections, &connection));
     let Some(Frame::Hello {
         session_id,
         recv_next,

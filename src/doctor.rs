@@ -218,7 +218,11 @@ pub fn diagnose(facts: &Facts) -> Vec<Finding> {
     } else {
         Finding::new(
             "identity",
-            if fresh { Verdict::Setup } else { Verdict::Problem },
+            if fresh {
+                Verdict::Setup
+            } else {
+                Verdict::Problem
+            },
             "this machine has no key, so no peer can recognise it",
         )
         .with_action("fabric key generate")
@@ -232,29 +236,39 @@ pub fn diagnose(facts: &Facts) -> Vec<Finding> {
         )
     } else {
         match facts.service {
-        ServiceEnablement::Enabled => {
-            Finding::new("service", Verdict::Ok, "installed, enabled, and will start on boot")
-        }
-        // The unit file exists but the manager will not start it on boot. This
-        // is NOT the same as "installed": a reboot leaves no daemon. It reads
-        // differently from "not installed" because the repair differs.
-        ServiceEnablement::PresentNotEnabled => Finding::new(
-            "service",
-            if fresh { Verdict::Setup } else { Verdict::Problem },
-            "the service is installed but not enabled, so it will not start after a reboot",
-        )
-        .with_action("fabric service install"),
-        ServiceEnablement::NotInstalled => Finding::new(
-            "service",
-            if fresh { Verdict::Setup } else { Verdict::Problem },
-            "fabric is not installed as a service, so it will not come back after a reboot",
-        )
-        .with_action("fabric service install"),
-        ServiceEnablement::Unknown => Finding::new(
-            "service",
-            Verdict::Unknown,
-            "could not tell whether fabric is enabled as a service",
-        ),
+            ServiceEnablement::Enabled => Finding::new(
+                "service",
+                Verdict::Ok,
+                "installed, enabled, and will start on boot",
+            ),
+            // The unit file exists but the manager will not start it on boot. This
+            // is NOT the same as "installed": a reboot leaves no daemon. It reads
+            // differently from "not installed" because the repair differs.
+            ServiceEnablement::PresentNotEnabled => Finding::new(
+                "service",
+                if fresh {
+                    Verdict::Setup
+                } else {
+                    Verdict::Problem
+                },
+                "the service is installed but not enabled, so it will not start after a reboot",
+            )
+            .with_action("fabric service install"),
+            ServiceEnablement::NotInstalled => Finding::new(
+                "service",
+                if fresh {
+                    Verdict::Setup
+                } else {
+                    Verdict::Problem
+                },
+                "fabric is not installed as a service, so it will not come back after a reboot",
+            )
+            .with_action("fabric service install"),
+            ServiceEnablement::Unknown => Finding::new(
+                "service",
+                Verdict::Unknown,
+                "could not tell whether fabric is enabled as a service",
+            ),
         }
     });
 
@@ -298,25 +312,41 @@ pub fn diagnose(facts: &Facts) -> Vec<Finding> {
                 ),
                 (ServiceEnablement::PresentNotEnabled, Some(false)) => Finding::new(
                     "sync service",
-                    if fresh { Verdict::Setup } else { Verdict::Problem },
+                    if fresh {
+                        Verdict::Setup
+                    } else {
+                        Verdict::Problem
+                    },
                     "the sync companion service is not enabled, and its binary is absent",
                 )
                 .with_action("install a matched fabric and fabric-sync pair"),
                 (ServiceEnablement::PresentNotEnabled, _) => Finding::new(
                     "sync service",
-                    if fresh { Verdict::Setup } else { Verdict::Problem },
+                    if fresh {
+                        Verdict::Setup
+                    } else {
+                        Verdict::Problem
+                    },
                     "the sync companion is installed but not enabled",
                 )
                 .with_action("fabric service install"),
                 (ServiceEnablement::NotInstalled, Some(true)) => Finding::new(
                     "sync service",
-                    if fresh { Verdict::Setup } else { Verdict::Problem },
+                    if fresh {
+                        Verdict::Setup
+                    } else {
+                        Verdict::Problem
+                    },
                     "the sync companion service is absent",
                 )
                 .with_action("fabric service install"),
                 (ServiceEnablement::NotInstalled, Some(false)) => Finding::new(
                     "sync service",
-                    if fresh { Verdict::Setup } else { Verdict::Problem },
+                    if fresh {
+                        Verdict::Setup
+                    } else {
+                        Verdict::Problem
+                    },
                     "the sync companion binary and service are absent",
                 )
                 .with_action("install a matched fabric and fabric-sync pair"),
@@ -337,7 +367,11 @@ pub fn diagnose(facts: &Facts) -> Vec<Finding> {
     out.push(if facts.sync_runtime.owner == "unavailable" {
         Finding::new(
             "sync runtime",
-            if fresh { Verdict::Setup } else { Verdict::Problem },
+            if fresh {
+                Verdict::Setup
+            } else {
+                Verdict::Problem
+            },
             "the sync runtime is unavailable",
         )
         .with_action("start the fabric daemon and sync companion")
@@ -393,7 +427,11 @@ pub fn diagnose(facts: &Facts) -> Vec<Finding> {
         out.push(
             Finding::new(
                 "peers",
-                if fresh { Verdict::Setup } else { Verdict::Problem },
+                if fresh {
+                    Verdict::Setup
+                } else {
+                    Verdict::Problem
+                },
                 "no peers are trusted, so there is nobody to reach",
             )
             .with_action("fabric add <their node id> <a name for them>"),
@@ -427,27 +465,11 @@ fn peer_finding(peer: &PeerFact) -> Finding {
     }
     match peer.reachable {
         Some(true) => Finding::new("peer", Verdict::Ok, format!("{label} is reachable")),
-        Some(false) if peer.roaming => Finding::new(
-            "peer",
-            Verdict::Ok,
-            format!("{label} is away as expected for a roaming peer"),
-        ),
-        Some(false) if !peer.has_address => Finding::new(
-            "peer",
-            Verdict::Problem,
-            format!("{label} is trusted but fabric does not know where it is"),
-        )
-        .with_action(format!(
-            "fabric add <its node id> {label} --addr-json '<its addr, from `fabric addr` there>'"
-        )),
         Some(false) => Finding::new(
             "peer",
-            Verdict::Problem,
-            format!("{label} is trusted and has an address, but is not answering"),
-        )
-        .with_action(format!(
-            "check that fabric is running there: fabric exec {label} -- fabric --version"
-        )),
+            Verdict::Informational,
+            format!("{label} is offline; it may return at any time"),
+        ),
         None => Finding::new(
             "peer",
             Verdict::Unknown,
@@ -469,7 +491,7 @@ fn version_findings(facts: &Facts) -> Vec<Finding> {
         match &peer.version {
             Some(version) if version != &facts.own_version => behind.push(peer),
             Some(_) => {}
-            None if peer.roaming && peer.reachable == Some(false) => away.push(peer),
+            None if peer.reachable == Some(false) => away.push(peer),
             None if matches!(peer.version_error, Some(PeerVersionError::PolicyRefusal(_))) => {
                 policy_unavailable.push(peer);
             }
@@ -554,7 +576,7 @@ fn version_findings(facts: &Facts) -> Vec<Finding> {
                 "versions",
                 Verdict::Informational,
                 format!(
-                    "{} is away as expected for a roaming peer; its build can be checked when it returns",
+                    "{} is offline; its build can be checked when it returns",
                     peer.label
                 ),
             ));
@@ -985,7 +1007,11 @@ mod tests {
         let peer = find(&findings, "peer")[0];
 
         assert_eq!(peer.verdict, Verdict::Problem);
-        assert!(peer.detail.contains("no grants"), "wrong detail: {}", peer.detail);
+        assert!(
+            peer.detail.contains("no grants"),
+            "wrong detail: {}",
+            peer.detail
+        );
         assert!(
             peer.action
                 .as_deref()
@@ -1085,7 +1111,10 @@ mod tests {
                 .filter(|f| f.verdict == Verdict::Problem)
                 .collect::<Vec<_>>()
         );
-        assert!(opening(&facts).is_some(), "it did not open by saying it is new");
+        assert!(
+            opening(&facts).is_some(),
+            "it did not open by saying it is new"
+        );
     }
 
     /// The same gap on a machine that WAS configured is a fault, not a step.
@@ -1188,8 +1217,8 @@ mod tests {
         let peers = find(&findings, "peer");
         let syncs = find(&findings, "sync");
 
-        assert_eq!(peers[0].verdict, Verdict::Ok);
-        assert!(peers[0].detail.contains("away"));
+        assert_eq!(peers[0].verdict, Verdict::Informational);
+        assert!(peers[0].detail.contains("offline"));
         assert_eq!(syncs[0].verdict, Verdict::Ok);
         assert!(syncs[0].detail.contains("away"));
         assert!(find(&findings, "versions").iter().all(|finding| {
@@ -1228,7 +1257,9 @@ mod tests {
             unknown.action
         );
         assert!(
-            !syncs.iter().any(|f| f.detail.contains("syncing with every peer")),
+            !syncs
+                .iter()
+                .any(|f| f.detail.contains("syncing with every peer")),
             "an entry syncing with nobody was still called clean and syncing with every peer"
         );
 
@@ -1252,16 +1283,28 @@ mod tests {
     fn peer_version_carries_the_home_flag_before_exec() {
         let home = FabricHome::new(std::path::Path::new("/srv/fabric"));
         let argv = peer_version_argv(&home, "vps");
-        let home_at = argv.iter().position(|a| a == "--home").expect("no --home flag");
-        assert_eq!(argv.get(home_at + 1).map(String::as_str), Some("/srv/fabric"));
+        let home_at = argv
+            .iter()
+            .position(|a| a == "--home")
+            .expect("no --home flag");
+        assert_eq!(
+            argv.get(home_at + 1).map(String::as_str),
+            Some("/srv/fabric")
+        );
         let exec_at = argv.iter().position(|a| a == "exec").expect("no exec verb");
         assert!(
             home_at < exec_at,
             "--home must come before the exec subcommand or clap rejects it: {argv:?}"
         );
         // And it still runs the version query it describes.
-        let dashes = argv.iter().position(|a| a == "--").expect("no argv separator");
-        assert_eq!(&argv[dashes + 1..], ["fabric".to_string(), "--version".to_string()]);
+        let dashes = argv
+            .iter()
+            .position(|a| a == "--")
+            .expect("no argv separator");
+        assert_eq!(
+            &argv[dashes + 1..],
+            ["fabric".to_string(), "--version".to_string()]
+        );
         assert_eq!(argv.get(exec_at + 1).map(String::as_str), Some("vps"));
     }
 
@@ -1279,10 +1322,15 @@ mod tests {
                 .iter()
                 .any(|f| f.verdict == Verdict::Problem && f.detail.contains("not enabled")),
             "a disabled-but-present service did not read as a problem: {:?}",
-            service.iter().map(|f| (&f.verdict, &f.detail)).collect::<Vec<_>>()
+            service
+                .iter()
+                .map(|f| (&f.verdict, &f.detail))
+                .collect::<Vec<_>>()
         );
         assert!(
-            !service.iter().any(|f| f.detail.contains("installed, enabled")),
+            !service
+                .iter()
+                .any(|f| f.detail.contains("installed, enabled")),
             "a disabled service was still called enabled"
         );
 
@@ -1321,7 +1369,10 @@ mod tests {
             denied.detail
         );
         assert!(
-            denied.action.as_deref().is_some_and(|a| a.contains("peers.toml")),
+            denied
+                .action
+                .as_deref()
+                .is_some_and(|a| a.contains("peers.toml")),
             "a denied sync did not say what to edit"
         );
         assert!(
@@ -1476,7 +1527,9 @@ mod tests {
         };
         let findings = diagnose(&facts);
         assert!(
-            find(&findings, "ca").iter().all(|f| f.verdict == Verdict::Ok),
+            find(&findings, "ca")
+                .iter()
+                .all(|f| f.verdict == Verdict::Ok),
             "an uninstalled authority was reported as something to fix"
         );
     }
@@ -1556,7 +1609,7 @@ mod tests {
         let versions = find(&findings, "versions");
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].verdict, Verdict::Informational);
-        assert!(versions[0].detail.contains("away as expected"));
+        assert!(versions[0].detail.contains("offline"));
         assert!(versions[0].detail.contains("when it returns"));
         assert_eq!(exit_code(&findings), 0);
         let summary = closing(&facts, &findings);
@@ -1588,9 +1641,7 @@ mod tests {
             versions.iter().map(|f| &f.detail).collect::<Vec<_>>()
         );
         assert!(
-            versions
-                .iter()
-                .any(|f| f.verdict == Verdict::Informational),
+            versions.iter().any(|f| f.verdict == Verdict::Informational),
             "the policy-unavailable peer stopped being reported"
         );
     }
@@ -1598,7 +1649,7 @@ mod tests {
     /// Reachability and build agreement are separate facts. A failed dial must
     /// not turn the build check into an affirmative fleet-wide answer.
     #[test]
-    fn an_unreachable_peer_build_is_unknown() {
+    fn an_offline_peer_build_can_be_checked_when_it_returns() {
         let mut facts = configured();
         facts.peers[0].reachable = Some(false);
         facts.peers[0].version = None;
@@ -1607,8 +1658,8 @@ mod tests {
         let findings = diagnose(&facts);
         let versions = find(&findings, "versions");
         assert_eq!(versions.len(), 1);
-        assert_eq!(versions[0].verdict, Verdict::Unknown);
-        assert!(versions[0].detail.contains("could not ask vps"));
+        assert_eq!(versions[0].verdict, Verdict::Informational);
+        assert!(versions[0].detail.contains("when it returns"));
     }
 
     #[test]
@@ -1635,11 +1686,9 @@ mod tests {
 use anyhow::Result;
 
 use crate::ca;
-use crate::service::ServiceEnablement;
 use crate::config::{FabricHome, PeerBook};
-use crate::control::{
-    ControlRequest, ControlResponse, PeerReachability, SyncRuntimeStatus,
-};
+use crate::control::{ControlRequest, ControlResponse, PeerReachability, SyncRuntimeStatus};
+use crate::service::ServiceEnablement;
 
 /// Where the OS service definition would live on this platform.
 
@@ -1740,11 +1789,11 @@ where
                 folder_exists: folder.exists(),
                 folder,
                 drift_clean: runtime.is_some_and(|entry| {
-                    entry.missing == 0
-                        && entry.mismatched == 0
-                        && entry.scan_issues.is_empty()
+                    entry.missing == 0 && entry.mismatched == 0 && entry.scan_issues.is_empty()
                 }),
-                scan_issues: runtime.map(|entry| entry.scan_issues.clone()).unwrap_or_default(),
+                scan_issues: runtime
+                    .map(|entry| entry.scan_issues.clone())
+                    .unwrap_or_default(),
                 stopped: runtime
                     .map(|entry| entry.stopped_peers.clone())
                     .unwrap_or_default(),
@@ -1795,8 +1844,8 @@ fn peer_version_argv(home: &FabricHome, label: &str) -> Vec<String> {
 }
 
 fn peer_version(home: &FabricHome, label: &str) -> std::result::Result<String, PeerVersionError> {
-    let exe = std::env::current_exe()
-        .map_err(|error| PeerVersionError::Failed(error.to_string()))?;
+    let exe =
+        std::env::current_exe().map_err(|error| PeerVersionError::Failed(error.to_string()))?;
     let output = std::process::Command::new(exe)
         .args(peer_version_argv(home, label))
         .output()
@@ -1892,7 +1941,12 @@ pub fn report(facts: &Facts, findings: &[Finding]) -> i32 {
         println!();
     }
     for finding in findings {
-        println!("{:<8} {:<9} {}", finding.verdict.token(), finding.check, finding.detail);
+        println!(
+            "{:<8} {:<9} {}",
+            finding.verdict.token(),
+            finding.check,
+            finding.detail
+        );
         if let Some(action) = &finding.action {
             println!("{:<8} {:<9}   try: {action}", "", "");
         }
@@ -1905,7 +1959,10 @@ pub fn report(facts: &Facts, findings: &[Finding]) -> i32 {
 
 fn closing(facts: &Facts, findings: &[Finding]) -> String {
     let code = exit_code(findings);
-    let count = findings.iter().filter(|f| f.verdict.needs_attention()).count();
+    let count = findings
+        .iter()
+        .filter(|f| f.verdict.needs_attention())
+        .count();
     if code == 0 {
         "nothing to do.".to_string()
     } else if opening(facts).is_some() {
