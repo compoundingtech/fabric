@@ -317,6 +317,9 @@ struct TunnelState {
     reconnect_attempts: u64,
     last_error: Option<String>,
     ever_attached: bool,
+    /// A service may exit after queuing its last reply. Deliver that reply
+    /// before treating its closed local socket as an expired server session.
+    drain_server_output: bool,
 }
 
 pub struct TunnelSession {
@@ -434,6 +437,7 @@ impl TunnelSession {
                 reconnect_attempts: 0,
                 last_error: None,
                 ever_attached: false,
+                drain_server_output: false,
             }),
             notify: Notify::new(),
             done: CancellationToken::new(),
@@ -689,6 +693,17 @@ impl TunnelSession {
             }
         };
         if let Some(error) = write_failed {
+            {
+                let state = self.state.lock().await;
+                if state.drain_server_output
+                    && (state.send_closed.is_none() || state.send_acked < state.send_next)
+                {
+                    // The reader may still be collecting the service's final
+                    // response. Do not acknowledge input it could not consume,
+                    // or close output before the reader and peer have drained it.
+                    return Ok(false);
+                }
+            }
             // Nobody is holding the other end of the local socket any more. End
             // the send side for the same reason an abrupt local read close does:
             // only a recorded close makes the writer emit `Frame::Close`, which
@@ -774,8 +789,13 @@ impl TunnelSession {
     /// EOF there is a consumer by definition, and the reader is the cheaper
     /// instrument.
     pub async fn probe_local_endpoint(&self) -> Result<()> {
-        if !self.local_input_ended().await {
-            return Ok(());
+        {
+            let state = self.state.lock().await;
+            if state.send_closed.is_none()
+                || (state.drain_server_output && state.send_acked < state.send_next)
+            {
+                return Ok(());
+            }
         }
         let failed = {
             let mut write = self.local_write.lock().await;
@@ -1639,6 +1659,7 @@ impl ServerSessionStore {
         self.ensure_room_for(peer_id).await?;
 
         let (session, local_read) = create_server_session(session_id, peer_id, target).await?;
+        session.state.lock().await.drain_server_output = true;
         match self.insert_created(session.clone()).await {
             Ok(None) => {
                 tokio::spawn(session.clone().run_local_reader(local_read));
@@ -2773,7 +2794,7 @@ mod tests {
     /// kills every request-then-half-close protocol while its peer is away.
     #[tokio::test]
     async fn a_consumer_that_closed_its_socket_is_detected_without_remote_output() {
-        let (consumer, local) = tokio::net::UnixStream::pair().unwrap();
+        let (mut consumer, local) = tokio::net::UnixStream::pair().unwrap();
         let (session, read) = TunnelSession::new(session_id(1), peer_id(), local);
         let reader = tokio::spawn(session.clone().run_local_reader(read));
 
@@ -2785,8 +2806,10 @@ mod tests {
 
         // The consumer gives up entirely. The reader sees EOF, and nothing
         // else in the session can see anything.
+        consumer.write_all(b"abandoned request").await.unwrap();
         drop(consumer);
         let _ = reader.await;
+        assert!(session.state.lock().await.buffered_bytes > 0);
         assert!(
             session.local_input_ended().await,
             "the reader must have recorded the EOF, or the probe is gated off"
@@ -2801,6 +2824,78 @@ mod tests {
             "the retry loop matches on the type, not the prose: {error:#}"
         );
         assert!(is_permanent_failure(&error));
+    }
+
+    #[tokio::test]
+    async fn a_finished_server_drains_its_final_output_before_expiring() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("finished-service.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let service = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"final exit status").await.unwrap();
+        });
+        let store = ServerSessionStore::new(
+            ServerSessionLimits {
+                max_total: 8,
+                max_per_peer: 8,
+            },
+            Duration::from_secs(60),
+        );
+        let (session, _) = store
+            .get_or_create(
+                session_id(4),
+                peer_id(),
+                ServerTarget::UnixSocket(path),
+                false,
+            )
+            .await
+            .unwrap();
+        service.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !session.local_input_ended().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(session.state.lock().await.buffered_bytes, 17);
+        session
+            .probe_local_endpoint()
+            .await
+            .expect("the service exited, but its final output still needs delivery");
+        assert!(
+            !session
+                .accept_data(0, b"late input".to_vec())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            session.recv_next().await,
+            0,
+            "unconsumed input must not be acknowledged"
+        );
+        session.apply_peer_ack(17).await;
+        assert!(session.probe_local_endpoint().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn late_input_does_not_close_server_output_before_its_reader_runs() {
+        let (mut service, local) = tokio::net::UnixStream::pair().unwrap();
+        let (session, read) = TunnelSession::new(session_id(5), peer_id(), local);
+        session.state.lock().await.drain_server_output = true;
+        service.write_all(b"final response").await.unwrap();
+        drop(service);
+        assert!(
+            !session
+                .accept_data(0, b"late input".to_vec())
+                .await
+                .unwrap()
+        );
+        assert!(!session.local_input_ended().await);
+        session.clone().run_local_reader(read).await.unwrap();
+        assert_eq!(session.state.lock().await.buffered_bytes, 14);
+        session.probe_local_endpoint().await.unwrap();
     }
 
     /// The control. A consumer that half-closed is still there, and must still

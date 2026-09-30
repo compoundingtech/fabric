@@ -652,6 +652,10 @@ async fn a_replica_stores_the_origin_metadata_verbatim() -> Result<()> {
         wait_for_file(&b_folder.join("run.sh"), b"#!/bin/sh\necho hi\n").await,
         "nothing reached B, so there is no replica to compare"
     );
+    assert!(
+        wait_for_file(&b_folder.join("doomed.md"), b"delete me").await,
+        "the file to delete never reached B"
+    );
     std::fs::remove_file(a_folder.join("doomed.md"))?;
     reload_sync(&a_home).await?;
     assert!(
@@ -681,7 +685,10 @@ async fn a_replica_stores_the_origin_metadata_verbatim() -> Result<()> {
                 .map(|o| o.len())
                 .unwrap_or(0)
         };
-        if count(&a) == 3 && count(&b) == 3 {
+        if count(&a) == 3
+            && count(&b) == 3
+            && b["entries"]["doomed.md"]["kind"].as_str() == Some("tombstone")
+        {
             pair = Some((a, b));
             break;
         }

@@ -21,6 +21,8 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 - Interface, address, wake and relay-return notifications refresh paths and
   announce to trusted peers while preserving usable sessions. An offline
   uplink no longer causes repeated endpoint recycling.
+- Finished services drain their buffered final response before their tunnel
+  expires, preserving a replacement shell's exit status during restart races.
 
 ### Added
 
