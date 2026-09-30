@@ -1543,7 +1543,14 @@ async fn an_entry_that_names_an_unknown_peer_says_so() -> Result<()> {
          so the entry is broken for a reason this test is not about"
     );
 
-    let stopped = stopped_peers_of(&a_home).await;
+    // The positive control proves node-b receives traffic. Its last outbound
+    // pass can still report normal absence while startup replaces a connection;
+    // that independent observation says nothing about selector resolution.
+    let stopped: Vec<_> = stopped_peers_of(&a_home)
+        .await
+        .into_iter()
+        .filter(|(_, reason)| reason == "unknown")
+        .collect();
     assert_eq!(
         stopped,
         vec![("nobody".to_string(), "unknown".to_string())],
