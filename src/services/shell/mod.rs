@@ -231,53 +231,67 @@ where
     let mut output_done = false;
     let mut exit_code = None;
 
-    while !output_done || exit_code.is_none() {
-        tokio::select! {
-            frame = read_client_frame(recv), if !stdin_done => {
-                match frame? {
-                    Some(ClientFrame::Stdin(bytes)) => {
-                        let _ = input_tx.send(Some(bytes));
-                    }
-                    Some(ClientFrame::Resize { rows, cols }) => {
-                        master.resize(PtySize {
-                            rows,
-                            cols,
-                            pixel_width: 0,
-                            pixel_height: 0,
-                        })?;
-                    }
-                    Some(ClientFrame::Eof) | None => {
-                        let _ = input_tx.send(None);
-                        stdin_done = true;
+    let result: Result<()> = async {
+        // MasterPty is Send, not Sync: this loop owns it across its awaits.
+        let master = master;
+        while !output_done || exit_code.is_none() {
+            tokio::select! {
+                frame = read_client_frame(recv), if !stdin_done => {
+                    match frame? {
+                        Some(ClientFrame::Stdin(bytes)) => {
+                            let _ = input_tx.send(Some(bytes));
+                        }
+                        Some(ClientFrame::Resize { rows, cols }) => {
+                            master.resize(PtySize {
+                                rows,
+                                cols,
+                                pixel_width: 0,
+                                pixel_height: 0,
+                            })?;
+                        }
+                        Some(ClientFrame::Eof) | None => {
+                            let _ = input_tx.send(None);
+                            stdin_done = true;
+                        }
                     }
                 }
-            }
-            output = output_rx.recv(), if !output_done => {
-                match output {
-                    Some(bytes) => write_server_frame(send, ServerFrame::Output(bytes)).await?,
-                    None => output_done = true,
+                output = output_rx.recv(), if !output_done => {
+                    match output {
+                        Some(bytes) => write_server_frame(send, ServerFrame::Output(bytes)).await?,
+                        None => output_done = true,
+                    }
                 }
-            }
-            status = &mut wait_task, if exit_code.is_none() => {
-                let status = status.context("shell wait task failed")??;
-                let code = status.exit_code().min(i32::MAX as u32) as i32;
-                exit_code = Some(code);
-                let _ = input_tx.send(None);
-            }
-            _ = cancel.cancelled() => {
-                let _ = tokio::task::spawn_blocking(move || child_killer.kill()).await;
-                let _ = input_tx.send(None);
-                let _ = wait_task.await;
-                let _ = reader_task.await;
-                let _ = writer_task.await;
-                return Ok(());
+                status = &mut wait_task, if exit_code.is_none() => {
+                    let status = status.context("shell wait task failed")??;
+                    let code = status.exit_code().min(i32::MAX as u32) as i32;
+                    exit_code = Some(code);
+                    let _ = input_tx.send(None);
+                }
+                _ = cancel.cancelled() => {
+                    return Ok(());
+                }
             }
         }
+        Ok(())
     }
+    .await;
 
+    // A framing or output error owns the same cleanup as cancellation. Leaving
+    // early via `?` otherwise detaches the blocking PTY reader and child wait.
+    if exit_code.is_none() {
+        let _ = tokio::task::spawn_blocking(move || child_killer.kill()).await;
+        let _ = input_tx.send(None);
+        let _ = wait_task.await;
+    }
+    drop(input_tx);
     let _ = reader_task.await;
     let _ = writer_task.await;
-    write_server_frame(send, ServerFrame::Exit(exit_code.unwrap_or(1))).await
+    result?;
+    if let Some(code) = exit_code {
+        write_server_frame(send, ServerFrame::Exit(code)).await
+    } else {
+        Ok(())
+    }
 }
 
 pub async fn read_client_frame<R>(read: &mut R) -> Result<Option<ClientFrame>>
@@ -416,6 +430,67 @@ fn encode_frame(kind: u8, payload: &[u8]) -> Result<Vec<u8>> {
 mod tests {
     use super::{Notice, ServerFrame, Service, Shell, encode_server_status, read_server_frame};
     use std::time::Duration;
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_shell_stream_error_terminates_and_reaps_its_pty_child() -> anyhow::Result<()> {
+        struct KillOnDrop(libc::pid_t);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                // The old implementation deliberately fails the assertion;
+                // reap its leaked child rather than hanging the test runtime.
+                unsafe { libc::kill(self.0, libc::SIGKILL) };
+            }
+        }
+        for output_error in [false, true] {
+            let (server, client) = tokio::io::duplex(8192);
+            let (mut recv, mut send) = tokio::io::split(server);
+            let task = tokio::spawn(async move {
+                super::serve_shell_session(&mut recv, &mut send, "peer").await
+            });
+            let (mut read, mut write) = tokio::io::split(client);
+            let program: &[u8] = if output_error {
+                b"stty raw -echo; printf 'SHELLPID-%s-END\\n' $$; while :; do printf .; sleep 0.05; done\n"
+            } else {
+                b"stty raw -echo; printf 'SHELLPID-%s-END\\n' $$; read ignored; exec sleep 60\n"
+            };
+            super::write_client_stdin(&mut write, program).await?;
+            let pid = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut seen = Vec::new();
+                loop {
+                    if let Some(ServerFrame::Output(bytes)) = read_server_frame(&mut read).await? {
+                        seen.extend(bytes);
+                        for candidate in String::from_utf8_lossy(&seen).split("SHELLPID-") {
+                            if let Some((digits, _)) = candidate.split_once("-END")
+                                && let Ok(pid) = digits.parse::<libc::pid_t>()
+                            {
+                                return Ok::<_, anyhow::Error>(pid);
+                            }
+                        }
+                    }
+                }
+            })
+            .await??;
+            let cleanup = KillOnDrop(pid);
+            if output_error {
+                drop(read);
+                drop(write);
+            } else {
+                super::write_frame(&mut write, 255, &[]).await?;
+            }
+            let result = tokio::time::timeout(Duration::from_secs(5), task).await??;
+            assert!(result.is_err(), "the stream failure was swallowed");
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            if alive {
+                drop(cleanup);
+            } else {
+                // The service reaped the PID. Never signal a reused PID.
+                std::mem::forget(cleanup);
+            }
+            assert!(!alive, "shell stream error left its PTY child alive");
+        }
+        Ok(())
+    }
 
     async fn frames(bytes: Vec<u8>) -> Vec<ServerFrame> {
         let mut read = bytes.as_slice();
