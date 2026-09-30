@@ -685,12 +685,9 @@ async fn shell_sigterm_restores_exact_terminal_mode() -> Result<()> {
     if killed == -1 {
         return Err(std::io::Error::last_os_error().into());
     }
-    tokio::time::timeout(
-        Duration::from_secs(30),
-        tokio::task::spawn_blocking(move || child.wait()),
-    )
-    .await
-    .context("fabric shell did not terminate after SIGTERM")???;
+    wait_for_pty_child(child.as_mut())
+        .await
+        .context("fabric shell did not terminate after SIGTERM")?;
 
     let after = terminal_snapshot(terminal_fd)?;
     assert_eq!(
@@ -1316,6 +1313,27 @@ fn terminal_snapshot(fd: std::os::fd::RawFd) -> Result<TerminalSnapshot> {
     })
 }
 
+/// A timeout around spawn_blocking(child.wait()) cannot cancel that wait:
+/// Tokio then waits forever for it while dropping the test runtime. Poll the
+/// child instead, and reap it on timeout so CI reports the failing assertion.
+#[cfg(unix)]
+async fn wait_for_pty_child(
+    child: &mut dyn portable_pty::Child,
+) -> Result<portable_pty::ExitStatus> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if started.elapsed() >= Duration::from_secs(30) {
+            child.kill()?;
+            child.wait()?;
+            bail!("fabric shell did not exit within 30 seconds");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -1454,12 +1472,7 @@ impl PtyShell {
             terminal_fd,
             before: _,
         } = self;
-        let status = tokio::time::timeout(
-            Duration::from_secs(30),
-            tokio::task::spawn_blocking(move || child.wait()),
-        )
-        .await
-        .context("fabric shell did not exit")???;
+        let status = wait_for_pty_child(child.as_mut()).await?;
         // The reader thread drains what the exiting client wrote last.
         tokio::time::sleep(Duration::from_millis(200)).await;
         let after = terminal_snapshot(terminal_fd)?;
