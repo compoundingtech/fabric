@@ -4,6 +4,15 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+## [0.2.22] - 2026-09-30
+
+### Fixed
+
+- An echo probe whose transport closes during simultaneous startup retries
+  once on the selected connection. Permission refusals remain immediate and
+  repeated closures remain bounded. This avoids a false reachability failure
+  when canonical connection selection replaces the first probe's path.
+
 ## [0.2.21] - 2026-09-30
 
 ### Fixed

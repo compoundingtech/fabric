@@ -1429,46 +1429,60 @@ impl DaemonState {
     ) -> Result<PingOutcome> {
         let nonce = rand::random::<[u8; 32]>();
         let started = std::time::Instant::now();
-        let stream = self
-            .peer_connections
-            .open_stream(
-                &endpoint.endpoint,
-                endpoint.generation,
-                &peer_addr,
-                std::str::from_utf8(BUILTIN_ECHO_ALPN).expect("built-in ALPN is UTF-8"),
-                mux::StreamActivity::Probe,
-            )
-            .await
-            .with_context(|| format!("failed to connect to {peer:?} built-in echo"))?;
-        let connection = stream.connection;
-        let mut send = stream.send;
-        let mut recv = stream.recv;
-
-        send.write_all(&nonce).await?;
-        send.finish()?;
-
-        let response = recv.read_to_end(nonce.len() + 1).await?;
-        let round_trip = started.elapsed();
-        let mut transport = classify_connection_transport(&connection);
-        if transport.is_none()
-            && let Some(info) = endpoint.endpoint.remote_info(peer_addr.id).await
-        {
-            transport = classify_remote_transport(&info);
+        for attempt in 0..2 {
+            let stream = self
+                .peer_connections
+                .open_stream(
+                    &endpoint.endpoint,
+                    endpoint.generation,
+                    &peer_addr,
+                    std::str::from_utf8(BUILTIN_ECHO_ALPN).expect("built-in ALPN is UTF-8"),
+                    mux::StreamActivity::Probe,
+                )
+                .await
+                .with_context(|| format!("failed to connect to {peer:?} built-in echo"))?;
+            let connection = stream.connection;
+            let mut send = stream.send;
+            let mut recv = stream.recv;
+            let response: Result<Vec<u8>> = async {
+                send.write_all(&nonce).await?;
+                send.finish()?;
+                Ok(recv.read_to_end(nonce.len() + 1).await?)
+            }
+            .await;
+            let response = match response {
+                Ok(response) => response,
+                Err(_) if attempt == 0 && connection.close_reason().is_some() => {
+                    // Canonical connection selection can close the first path
+                    // after its stream opened. Echo is idempotent: retry once
+                    // on the selected path, keeping real absence bounded.
+                    self.peer_connections.presence.retry_peer_now(peer_addr.id);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let round_trip = started.elapsed();
+            let mut transport = classify_connection_transport(&connection);
+            if transport.is_none()
+                && let Some(info) = endpoint.endpoint.remote_info(peer_addr.id).await
+            {
+                transport = classify_remote_transport(&info);
+            }
+            if response != nonce {
+                bail!(
+                    "ping nonce mismatch from {peer:?}: sent {} bytes, got {} bytes",
+                    nonce.len(),
+                    response.len()
+                );
+            }
+            return Ok(PingOutcome {
+                peer: peer_addr.id.to_string(),
+                bytes: response.len(),
+                round_trip,
+                transport,
+            });
         }
-        if response != nonce {
-            bail!(
-                "ping nonce mismatch from {peer:?}: sent {} bytes, got {} bytes",
-                nonce.len(),
-                response.len()
-            );
-        }
-
-        Ok(PingOutcome {
-            peer: peer_addr.id.to_string(),
-            bytes: response.len(),
-            round_trip,
-            transport,
-        })
+        unreachable!("each final probe attempt returns its result")
     }
 
     pub async fn dial(&self, peer: &str, protocol: &str) -> Result<PathBuf> {
@@ -8706,6 +8720,83 @@ mod tests {
         .spawn();
         let _ = tokio::time::timeout(ENDPOINT_ONLINE_TIMEOUT, router.endpoint().online()).await;
         Ok((router, peer))
+    }
+
+    #[derive(Debug, Clone)]
+    struct ClosingEchoPeer {
+        requests: Arc<AtomicUsize>,
+        close_every_request: bool,
+    }
+
+    impl iroh::protocol::ProtocolHandler for ClosingEchoPeer {
+        async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
+            mux::PeerConnections::accept_generation(&connection, 0)
+                .await
+                .map_err(|error| {
+                    iroh::protocol::AcceptError::from_err(std::io::Error::other(format!(
+                        "{error:#}"
+                    )))
+                })?;
+            while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                let peer = self.clone();
+                let connection = connection.clone();
+                tokio::spawn(async move {
+                    if mux::MuxStreamHeader::read(&mut recv).await.is_err() {
+                        return;
+                    }
+                    if mux::write_ready(&mut send).await.is_err() {
+                        return;
+                    }
+                    let Ok(nonce) = recv.read_to_end(64).await else {
+                        return;
+                    };
+                    if peer.requests.fetch_add(1, Ordering::SeqCst) == 0 || peer.close_every_request
+                    {
+                        connection.close(0u32.into(), b"fabric duplicate mux connection");
+                    } else {
+                        let _ = send.write_all(&nonce).await;
+                        let _ = send.finish();
+                    }
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_ping_retries_one_closed_transport_without_an_unbounded_loop() -> Result<()> {
+        for close_every_request in [false, true] {
+            let peer = ClosingEchoPeer {
+                requests: Arc::new(AtomicUsize::new(0)),
+                close_every_request,
+            };
+            let router =
+                iroh::protocol::Router::builder(Endpoint::builder(presets::N0).bind().await?)
+                    .accept(mux::MUX_ALPN, peer.clone())
+                    .spawn();
+            let _ = tokio::time::timeout(ENDPOINT_ONLINE_TIMEOUT, router.endpoint().online()).await;
+            let dir = tempfile::tempdir()?;
+            let home = FabricHome::new(dir.path());
+            let node = FabricNode::start(home.clone()).await?;
+            trust_test_peer(
+                &home,
+                &node,
+                router.endpoint().id(),
+                "peer",
+                router.endpoint().addr(),
+            )
+            .await?;
+            let outcome = tokio::time::timeout(Duration::from_secs(5), node.ping("peer")).await?;
+            if close_every_request {
+                assert!(outcome.is_err());
+            } else {
+                assert_eq!(outcome?.bytes, 32);
+            }
+            assert_eq!(peer.requests.load(Ordering::SeqCst), 2);
+            node.shutdown().await?;
+            router.shutdown().await?;
+        }
+        Ok(())
     }
 
     /// Interface updates the test writes, standing in for the OS monitor.
