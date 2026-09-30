@@ -1221,6 +1221,15 @@ pub enum PersistedExposeTarget {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedDial {
+    /// Stable peer identity; renaming a local alias must not redirect a listener.
+    pub peer: String,
+    pub protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp: Option<String>,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct FabricConfig {
     // Keep these values through unrelated config saves until PeerBook migrates
@@ -1250,6 +1259,8 @@ pub struct FabricConfig {
     peers: Vec<Peer>,
     #[serde(default)]
     exposes: Vec<PersistedExpose>,
+    #[serde(default)]
+    dials: Vec<PersistedDial>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1304,7 +1315,7 @@ impl FabricConfig {
         home.prepare()?;
         self.validate()?;
         let raw = toml::to_string_pretty(self)?;
-        fs::write(home.config_path(), raw)?;
+        write_atomic(&home.config_path(), raw.as_bytes())?;
         Ok(())
     }
 
@@ -1327,6 +1338,24 @@ impl FabricConfig {
     /// `None` clears the ceiling, which is what `--no-memory-max-mb` asks for.
     pub fn set_memory_max_mb(&mut self, memory_max_mb: Option<u64>) {
         self.memory_max_mb = memory_max_mb;
+    }
+
+    pub fn dials(&self) -> &[PersistedDial] {
+        &self.dials
+    }
+
+    pub fn upsert_dial(&mut self, dial: PersistedDial) {
+        self.dials.retain(|entry| {
+            !(entry.peer == dial.peer && entry.protocol == dial.protocol && entry.tcp == dial.tcp)
+        });
+        self.dials.push(dial);
+        self.dials
+            .sort_by(|a, b| (&a.peer, &a.protocol, &a.tcp).cmp(&(&b.peer, &b.protocol, &b.tcp)));
+    }
+
+    pub fn remove_dial(&mut self, peer: &str, protocol: &str) {
+        self.dials
+            .retain(|entry| entry.peer != peer || entry.protocol != protocol);
     }
 
     pub fn exposes(&self) -> &[PersistedExpose] {
@@ -1360,6 +1389,19 @@ impl FabricConfig {
             self.server_sessions.detached_ttl_secs,
         )?;
 
+        let mut dials = HashSet::new();
+        for dial in &self.dials {
+            dial.peer
+                .parse::<EndpointId>()
+                .context("invalid persisted dial peer id")?;
+            validate_protocol(&dial.protocol)?;
+            if let Some(tcp) = &dial.tcp {
+                validate_tcp_addr(tcp)?;
+            }
+            if !dials.insert((&dial.peer, &dial.protocol, &dial.tcp)) {
+                bail!("duplicate persisted dial");
+            }
+        }
         let mut protocols = HashSet::new();
         for expose in &self.exposes {
             validate_protocol(&expose.protocol)?;

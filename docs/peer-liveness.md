@@ -17,19 +17,37 @@ true because it only says that this endpoint reached a relay. Without an active
 check, nothing re-resolves the peer or fails over to the relay, and the peer
 stays unreachable in both directions until a daemon restarts.
 
-So the daemon probes each trusted peer on an interval
-(`PEER_HEALTH_PROBE_INTERVAL`, 20 s; `FABRIC_PEER_HEALTH_SECS` overrides and
-`0` disables). The probe is the built-in echo service that `fabric ping` uses,
-over the shared peer connection. After three consecutive failures
-(`PEER_HEALTH_FAILURES_BEFORE_RECOVER`) the daemon drives recovery for that one
-peer: it closes only that peer's cached connection, and the next probe dials a
-new one, which refreshes discovery and lets iroh select a direct or relay path
-again. No other peer and not the endpoint is touched. Repeated recovery for a
-peer that stays down backs off from 30 s to 10 minutes so a peer that is
-genuinely off does not cause recovery churn.
+The daemon retains a cheap presence cache and probes idle trusted peers on an
+interval (`PEER_HEALTH_PROBE_INTERVAL`, 20 s; `FABRIC_PEER_HEALTH_SECS` overrides
+and `0` disables periodic probing). Recent application progress skips the idle
+probe. An authenticated mux connection is evidence of life even without an echo
+grant. The echo probe also measures latency and direct/relay path selection.
 
-The same probe records per-peer latency and whether the path was direct or
-relay, which is what `fabric status` reports under `paths`.
+Any machine can be offline. Once absence is cached, new local dial requests
+close immediately. Actual connection attempts use exponential backoff with
+jitter, growing from seconds through minutes to about an hour. Repeated failed
+probes do not add error counters or trigger endpoint rebuilds. Permission and
+configuration errors remain separate. An explicit `fabric probe` requests one
+fresh measurement under its own deadline.
+
+A starting or returning daemon announces to its trusted peers by connecting;
+that authenticated connection can carry traffic in both directions. Interface,
+address, wake and relay-return notifications refresh paths and announce again.
+Identical interface notifications are ignored. Healthy sessions stay up.
+
+Simultaneous connects use a deterministic canonical direction. When a fresh
+connection would lose to an older cached path, Fabric checks that old path's
+admission response within two seconds. A refusal still proves life; silence
+allows the fresh connection to replace it before the QUIC idle timeout. The
+check holds no global peer-map lock. This handles a peer returning while the
+other machine still holds its stale address/path state.
+
+`fabric peer-events --watch` reads a bounded local event journal without an idle
+network probe or disk write. New authenticated connections and offline
+transitions carry canonical peer IDs, observed timestamps, path/cause, sequence
+and a daemon instance token. A new connection signals life even when the old
+handle had not timed out yet. Consumers reset their affected retry immediately.
+A stale cursor or daemon restart returns a current snapshot with `reset: true`.
 
 ## Prior art
 
@@ -60,8 +78,8 @@ fabric takes the simple end:
 - **The Erlang idle-only rule.** A probe is skipped when recent application
   traffic on that peer's connection already proved it reachable during the same
   interval. Real traffic is the heartbeat; the probe exists for idle links.
-- **A three-failure threshold**, close to Erlang's rule of several missed ticks,
-  so one lost probe does not trigger recovery.
+- **Cached absence with jittered backoff.** A returning machine connects to its
+  peers, so recovery does not wait out the quiet retry schedule.
 - **No indirect probes and no gossip.** Those are the scale-out step if fabric
   ever needs tens of nodes, not something a small network should pay for.
 

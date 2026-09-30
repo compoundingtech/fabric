@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use fabric::{
-    config::{FabricHome, GitAccess, PeerBook, generate_identity_file},
+    config::{FabricConfig, FabricHome, GitAccess, PeerBook, generate_identity_file},
     control::{ControlRequest, ControlResponse},
     daemon::{FabricNode, send_control},
 };
@@ -1627,7 +1627,8 @@ async fn exec_names_the_peer_and_service_when_the_peer_acl_refuses_it() -> Resul
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exec_exits_when_the_command_exits_even_if_a_background_child_holds_its_pipes() -> Result<()> {
+async fn exec_exits_when_the_command_exits_even_if_a_background_child_holds_its_pipes() -> Result<()>
+{
     // A command that starts something in the background and exits is an
     // ordinary thing to run remotely. The background child inherits the
     // command's stdout and stderr, and the exec server used to wait for both
@@ -1722,8 +1723,16 @@ async fn exec_exits_when_the_command_exits_even_if_a_background_child_holds_its_
     // The shell's own code for an exec that cannot start differs by shell
     // (126 or 127); the point is that the client ends with the shell's code.
     let shapes: [(&str, &'static str, &[i32]); 4] = [
-        ("success with a background child", "printf ok; sleep 15 & exit 0", &[0]),
-        ("failure with a background child", "printf no; sleep 15 & exit 9", &[9]),
+        (
+            "success with a background child",
+            "printf ok; sleep 15 & exit 0",
+            &[0],
+        ),
+        (
+            "failure with a background child",
+            "printf no; sleep 15 & exit 9",
+            &[9],
+        ),
         ("killed by a signal", "sleep 15 & kill -TERM $$", &[1]),
         (
             "command that does not exist",
@@ -1739,7 +1748,10 @@ async fn exec_exits_when_the_command_exits_even_if_a_background_child_holds_its_
             output.status.code()
         );
         assert!(
-            output.status.code().is_some_and(|code| expected.contains(&code)),
+            output
+                .status
+                .code()
+                .is_some_and(|code| expected.contains(&code)),
             "{name}: exit {:?}, expected one of {expected:?}; stdout={:?} stderr={:?}",
             output.status.code(),
             String::from_utf8_lossy(&output.stdout),
@@ -1810,9 +1822,8 @@ async fn peer_file_remains_authoritative_when_daemon_config_is_created() -> Resu
 /// the time by design, and anything that dials it and gives up leaves a permit
 /// behind.
 ///
-/// CONTROL: the 32 consumers must be seen holding 32 permits before they close,
-/// or "0 afterwards" proves nothing. And a fresh dial to a REAL peer must round
-/// trip afterwards, because that is the symptom a person sees.
+/// Each offline consumer must see EOF or reset within 200 ms, and a fresh
+/// dial to a real peer must still round-trip after the flood.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_abandoned_dial_to_an_unreachable_peer_releases_its_permit() -> Result<()> {
     let _guard = local_slice_guard().await;
@@ -1863,13 +1874,16 @@ async fn an_abandoned_dial_to_an_unreachable_peer_releases_its_permit() -> Resul
     for _ in 0..max {
         consumers.push(UnixStream::connect(&ghost_socket).await?);
     }
-    let held = wait_for_dial_handlers(&state, max).await;
-    assert_eq!(
-        held, max,
-        "POSITIVE CONTROL FAILED: {max} consumers did not take {max} permits, so \
-         their release below would prove nothing"
-    );
-
+    // Cached offline requests must end promptly, never occupy the whole cap.
+    for consumer in &mut consumers {
+        let mut byte = [0u8; 1];
+        let closed =
+            tokio::time::timeout(Duration::from_millis(200), consumer.read(&mut byte)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+            "an offline consumer retained its permit"
+        );
+    }
     // Every consumer gives up. Nobody is waiting on any of these sessions now.
     drop(consumers);
 
@@ -2896,3 +2910,159 @@ async fn a_long_outage_does_not_time_out_permanently() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registered_dials_and_default_exposure_survive_both_daemon_restarts() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let a_home = FabricHome::new(a_dir.path());
+    let b_home = FabricHome::new(b_dir.path());
+    let a = FabricNode::start(a_home.clone()).await?;
+    let b = FabricNode::start(b_home.clone()).await?;
+    trust_peer(&a_home, &a, b.id(), Some("node-b"), Some(b.addr())).await?;
+    trust_peer(&b_home, &b, a.id(), Some("node-a"), Some(a.addr())).await?;
+    a.expose_exec("stdio-cat", vec!["/bin/cat".into()]).await?;
+    let socket = b.dial("node-a", "stdio-cat").await?;
+    let addr = b
+        .dial_tcp("node-a", "stdio-cat", "127.0.0.1:0".into())
+        .await?;
+    assert_eq!(tcp_round_trip(&addr, b"before").await?, b"before");
+    b.shutdown().await?;
+    a.shutdown().await?;
+    let a = FabricNode::start(a_home.clone()).await?;
+    let b = FabricNode::start(b_home.clone()).await?;
+    // Address hints are refreshed just as discovery would refresh them in a mesh.
+    trust_peer(&a_home, &a, b.id(), Some("node-b"), Some(b.addr())).await?;
+    trust_peer(&b_home, &b, a.id(), Some("node-a"), Some(a.addr())).await?;
+    assert_status_exposes(&a_home, "stdio-cat").await?;
+    assert!(
+        socket.exists(),
+        "the registered Unix dial vanished on daemon restart"
+    );
+    assert_eq!(
+        unix_round_trip(&socket, b"after-unix").await?,
+        b"after-unix"
+    );
+    assert_eq!(tcp_round_trip(&addr, b"after-tcp").await?, b"after-tcp");
+    run_fabric(&b_home, &["undial", "node-a", "stdio-cat"])?;
+    assert!(!socket.exists());
+    assert!(FabricConfig::load(&b_home)?.dials().is_empty());
+    b.shutdown().await?;
+    let b = FabricNode::start(b_home.clone()).await?;
+    assert!(
+        !socket.exists(),
+        "an undialed listener returned after restart"
+    );
+    assert!(TcpStream::connect(&addr).await.is_err());
+    b.shutdown().await?;
+    a.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_offline_peer_closes_new_tcp_requests_in_milliseconds_without_retry_errors() -> Result<()>
+{
+    let _guard = local_slice_guard().await;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let a_home = FabricHome::new(a_dir.path());
+    let b_home = FabricHome::new(b_dir.path());
+    let a = FabricNode::start(a_home.clone()).await?;
+    let b = FabricNode::start(b_home.clone()).await?;
+    trust_peer(&a_home, &a, b.id(), Some("node-b"), Some(b.addr())).await?;
+    trust_peer(&b_home, &b, a.id(), Some("node-a"), Some(a.addr())).await?;
+    a.expose_exec("stdio-cat", vec!["/bin/cat".into()]).await?;
+    let addr = b
+        .dial_tcp("node-a", "stdio-cat", "127.0.0.1:0".into())
+        .await?;
+    assert_eq!(tcp_round_trip(&addr, b"online").await?, b"online");
+    let a_id = a.id();
+    a.shutdown().await?;
+    // One bounded discovery attempt establishes absence; later requests use it.
+    let mut initial = TcpStream::connect(&addr).await?;
+    let mut byte = [0u8; 1];
+    let _ = tokio::time::timeout(Duration::from_secs(5), initial.read(&mut byte)).await?;
+    for _ in 0..4 {
+        let mut request = TcpStream::connect(&addr).await?;
+        let started = Instant::now();
+        let result =
+            tokio::time::timeout(Duration::from_millis(200), request.read(&mut byte)).await;
+        assert!(
+            matches!(result, Ok(Ok(0)) | Ok(Err(_))),
+            "offline TCP request hung for {:?}",
+            started.elapsed()
+        );
+    }
+    let response = send_control(&b_home, ControlRequest::ReachabilityStatus).await?;
+    let ControlResponse::ReachabilityStatus {
+        connection_telemetry,
+        ..
+    } = response
+    else {
+        unreachable!()
+    };
+    assert!(
+        connection_telemetry
+            .values()
+            .all(|stats| stats.resume_failures == 0 && stats.probes_unreachable == 0),
+        "absence was counted as an error: {connection_telemetry:?}"
+    );
+    let returned_at = Instant::now();
+    let a = FabricNode::start(a_home.clone()).await?;
+    assert_eq!(a.id(), a_id);
+    // B retains its old address hint. A announces itself from its new port;
+    // no re-dial, peer reload or helper on B is allowed here.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(answer) = tcp_round_trip(&addr, b"returned").await {
+                assert_eq!(answer, b"returned");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    println!(
+        "cached offline requests <=200 ms; return tunnel ready in {:?}",
+        returned_at.elapsed()
+    );
+    b.shutdown().await?;
+    a.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_online_signal_answers_without_an_application_request() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let a_home = FabricHome::new(a_dir.path());
+    let b_home = FabricHome::new(b_dir.path());
+    let a = FabricNode::start(a_home.clone()).await?;
+    let b = FabricNode::start(b_home.clone()).await?;
+    trust_peer(&a_home, &a, b.id(), Some("node-b"), Some(b.addr())).await?;
+    trust_peer(&b_home, &b, a.id(), Some("node-a"), Some(a.addr())).await?;
+    let mut socket = UnixStream::connect(a_home.control_socket_path()).await?;
+    socket
+        .write_all(b"{\"type\":\"peer_events\",\"after\":0,\"timeout_ms\":3000}\n")
+        .await?;
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(4), socket.read_to_end(&mut raw)).await??;
+    let response: serde_json::Value = serde_json::from_slice(&raw)?;
+    assert_eq!(
+        response["type"], "peer_events",
+        "no online subscription: {response}"
+    );
+    assert!(
+        response["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["peer_id"] == b.id().to_string() && event["online"] == true),
+        "the daemon did not announce its peer without a consumer: {response}"
+    );
+    b.shutdown().await?;
+    a.shutdown().await?;
+    Ok(())
+}

@@ -317,6 +317,9 @@ struct TunnelState {
     reconnect_attempts: u64,
     last_error: Option<String>,
     ever_attached: bool,
+    /// A service may exit after queuing its last reply. Deliver that reply
+    /// before treating its closed local socket as an expired server session.
+    drain_server_output: bool,
 }
 
 pub struct TunnelSession {
@@ -434,6 +437,7 @@ impl TunnelSession {
                 reconnect_attempts: 0,
                 last_error: None,
                 ever_attached: false,
+                drain_server_output: false,
             }),
             notify: Notify::new(),
             done: CancellationToken::new(),
@@ -689,6 +693,17 @@ impl TunnelSession {
             }
         };
         if let Some(error) = write_failed {
+            {
+                let state = self.state.lock().await;
+                if state.drain_server_output
+                    && (state.send_closed.is_none() || state.send_acked < state.send_next)
+                {
+                    // The reader may still be collecting the service's final
+                    // response. Do not acknowledge input it could not consume,
+                    // or close output before the reader and peer have drained it.
+                    return Ok(false);
+                }
+            }
             // Nobody is holding the other end of the local socket any more. End
             // the send side for the same reason an abrupt local read close does:
             // only a recorded close makes the writer emit `Frame::Close`, which
@@ -774,8 +789,13 @@ impl TunnelSession {
     /// EOF there is a consumer by definition, and the reader is the cheaper
     /// instrument.
     pub async fn probe_local_endpoint(&self) -> Result<()> {
-        if !self.local_input_ended().await {
-            return Ok(());
+        {
+            let state = self.state.lock().await;
+            if state.send_closed.is_none()
+                || (state.drain_server_output && state.send_acked < state.send_next)
+            {
+                return Ok(());
+            }
         }
         let failed = {
             let mut write = self.local_write.lock().await;
@@ -1027,7 +1047,10 @@ impl Backoff {
     }
 
     fn next_delay(&mut self) -> Duration {
-        const STEPS_MS: &[u64] = &[100, 250, 500, 1000, 2000, 5000, 10000, 15000];
+        const STEPS_MS: &[u64] = &[
+            100, 250, 500, 1000, 2000, 5000, 10000, 15000, 30000, 60000, 120000, 300000, 600000,
+            1800000, 3600000,
+        ];
         let base = STEPS_MS[self.step.min(STEPS_MS.len() - 1)];
         self.step = (self.step + 1).min(STEPS_MS.len() - 1);
         let jitter = 80 + (rand::random::<u64>() % 41);
@@ -1170,6 +1193,8 @@ async fn run_client_attach_loop(
     mut initial_stream: Option<MuxStream>,
 ) -> Result<()> {
     let mut backoff = Backoff::new();
+    let mut presence_rx = connections.presence.subscribe();
+    let mut peer_presence_sequence = connections.presence.peer_sequence(session.peer_id());
 
     loop {
         if session.is_complete().await {
@@ -1221,8 +1246,17 @@ async fn run_client_attach_loop(
                         )
                         .await;
                 }
-                match wait_for_reconnect(delay, &cancel, &session, &mut drop_rx, &mut endpoint_rx)
-                    .await
+                match wait_for_reconnect(
+                    delay,
+                    &cancel,
+                    &session,
+                    &mut drop_rx,
+                    &mut endpoint_rx,
+                    &connections.presence,
+                    &mut presence_rx,
+                    &mut peer_presence_sequence,
+                )
+                .await
                 {
                     ReconnectWait::Retry => continue,
                     ReconnectWait::Stop => return Ok(()),
@@ -1232,7 +1266,16 @@ async fn run_client_attach_loop(
                 }
             }
             Err(error) => {
-                let message = format!("{error:#}");
+                // A temporary admission refusal is a reply from a live peer.
+                // It must not inherit an absent peer's long retry schedule.
+                if crate::mux::is_temporary_stream_denial(&error) {
+                    backoff.reset();
+                }
+                let message = if connections.presence.offline(session.peer_id()) {
+                    "peer is offline".into()
+                } else {
+                    format!("{error:#}")
+                };
                 if !session.has_attached().await || is_permanent_failure(&error) {
                     return fail_permanently(&session, notices.as_ref(), error).await;
                 }
@@ -1252,8 +1295,17 @@ async fn run_client_attach_loop(
                         )
                         .await;
                 }
-                match wait_for_reconnect(delay, &cancel, &session, &mut drop_rx, &mut endpoint_rx)
-                    .await
+                match wait_for_reconnect(
+                    delay,
+                    &cancel,
+                    &session,
+                    &mut drop_rx,
+                    &mut endpoint_rx,
+                    &connections.presence,
+                    &mut presence_rx,
+                    &mut peer_presence_sequence,
+                )
+                .await
                 {
                     ReconnectWait::Retry => continue,
                     ReconnectWait::Stop => return Ok(()),
@@ -1301,14 +1353,28 @@ async fn wait_for_reconnect(
     session: &TunnelSession,
     drop_rx: &mut watch::Receiver<u64>,
     endpoint_rx: &mut watch::Receiver<CurrentEndpoint>,
+    presence: &crate::presence::Presence,
+    presence_rx: &mut watch::Receiver<u64>,
+    peer_presence_sequence: &mut u64,
 ) -> ReconnectWait {
-    tokio::select! {
-        _ = tokio::time::sleep(delay) => ReconnectWait::Retry,
-        _ = cancel.cancelled() => ReconnectWait::Stop,
-        _ = session.done.cancelled() => ReconnectWait::Stop,
-        changed = drop_rx.changed() => if changed.is_ok() { ReconnectWait::Retry } else { ReconnectWait::Stop },
-        changed = endpoint_rx.changed() => if changed.is_ok() { ReconnectWait::Retry } else { ReconnectWait::Stop },
-        error = session.watch_local_endpoint() => ReconnectWait::LocalGone(error),
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return ReconnectWait::Retry,
+            _ = cancel.cancelled() => return ReconnectWait::Stop,
+            _ = session.done.cancelled() => return ReconnectWait::Stop,
+            changed = drop_rx.changed() => return if changed.is_ok() { ReconnectWait::Retry } else { ReconnectWait::Stop },
+            changed = endpoint_rx.changed() => return if changed.is_ok() { ReconnectWait::Retry } else { ReconnectWait::Stop },
+            changed = presence_rx.changed() => {
+                if changed.is_err() { return ReconnectWait::Stop; }
+                let sequence = presence.peer_sequence(session.peer_id());
+                let changed = sequence != *peer_presence_sequence;
+                *peer_presence_sequence = sequence;
+                if changed && !presence.offline(session.peer_id()) { return ReconnectWait::Retry; }
+            },
+            error = session.watch_local_endpoint() => return ReconnectWait::LocalGone(error),
+        }
     }
 }
 
@@ -1343,7 +1409,7 @@ async fn connect_and_attach(
             endpoint.generation,
             &peer_addr,
             protocol,
-            StreamActivity::Application,
+            if initial { StreamActivity::Application } else { StreamActivity::Probe },
         ) => {
             connected.with_context(|| {
                 if initial {
@@ -1593,6 +1659,7 @@ impl ServerSessionStore {
         self.ensure_room_for(peer_id).await?;
 
         let (session, local_read) = create_server_session(session_id, peer_id, target).await?;
+        session.state.lock().await.drain_server_output = true;
         match self.insert_created(session.clone()).await {
             Ok(None) => {
                 tokio::spawn(session.clone().run_local_reader(local_read));
@@ -1816,7 +1883,8 @@ pub async fn serve_connection(
     drop_rx: watch::Receiver<u64>,
 ) -> Result<()> {
     attach_drop_closer(&connection, drop_rx);
-    let health = connections.map(|connections| AttachConnectionHealth::new(connections, &connection));
+    let health =
+        connections.map(|connections| AttachConnectionHealth::new(connections, &connection));
     let Some(Frame::Hello {
         session_id,
         recv_next,
@@ -2726,7 +2794,7 @@ mod tests {
     /// kills every request-then-half-close protocol while its peer is away.
     #[tokio::test]
     async fn a_consumer_that_closed_its_socket_is_detected_without_remote_output() {
-        let (consumer, local) = tokio::net::UnixStream::pair().unwrap();
+        let (mut consumer, local) = tokio::net::UnixStream::pair().unwrap();
         let (session, read) = TunnelSession::new(session_id(1), peer_id(), local);
         let reader = tokio::spawn(session.clone().run_local_reader(read));
 
@@ -2738,8 +2806,10 @@ mod tests {
 
         // The consumer gives up entirely. The reader sees EOF, and nothing
         // else in the session can see anything.
+        consumer.write_all(b"abandoned request").await.unwrap();
         drop(consumer);
         let _ = reader.await;
+        assert!(session.state.lock().await.buffered_bytes > 0);
         assert!(
             session.local_input_ended().await,
             "the reader must have recorded the EOF, or the probe is gated off"
@@ -2754,6 +2824,78 @@ mod tests {
             "the retry loop matches on the type, not the prose: {error:#}"
         );
         assert!(is_permanent_failure(&error));
+    }
+
+    #[tokio::test]
+    async fn a_finished_server_drains_its_final_output_before_expiring() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("finished-service.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let service = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"final exit status").await.unwrap();
+        });
+        let store = ServerSessionStore::new(
+            ServerSessionLimits {
+                max_total: 8,
+                max_per_peer: 8,
+            },
+            Duration::from_secs(60),
+        );
+        let (session, _) = store
+            .get_or_create(
+                session_id(4),
+                peer_id(),
+                ServerTarget::UnixSocket(path),
+                false,
+            )
+            .await
+            .unwrap();
+        service.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !session.local_input_ended().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(session.state.lock().await.buffered_bytes, 17);
+        session
+            .probe_local_endpoint()
+            .await
+            .expect("the service exited, but its final output still needs delivery");
+        assert!(
+            !session
+                .accept_data(0, b"late input".to_vec())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            session.recv_next().await,
+            0,
+            "unconsumed input must not be acknowledged"
+        );
+        session.apply_peer_ack(17).await;
+        assert!(session.probe_local_endpoint().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn late_input_does_not_close_server_output_before_its_reader_runs() {
+        let (mut service, local) = tokio::net::UnixStream::pair().unwrap();
+        let (session, read) = TunnelSession::new(session_id(5), peer_id(), local);
+        session.state.lock().await.drain_server_output = true;
+        service.write_all(b"final response").await.unwrap();
+        drop(service);
+        assert!(
+            !session
+                .accept_data(0, b"late input".to_vec())
+                .await
+                .unwrap()
+        );
+        assert!(!session.local_input_ended().await);
+        session.clone().run_local_reader(read).await.unwrap();
+        assert_eq!(session.state.lock().await.buffered_bytes, 14);
+        session.probe_local_endpoint().await.unwrap();
     }
 
     /// The control. A consumer that half-closed is still there, and must still

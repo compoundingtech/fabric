@@ -49,7 +49,7 @@ jobs:
   # rest. Widen it when something escapes it, not before.
   macos:
     runs-on: macos-14
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -70,6 +70,10 @@ jobs:
       - name: Adversarial folder sync matrix
         timeout-minutes: 15
         run: cargo test --locked -p fabric-sync --test folder_sync -- --test-threads=1
+
+      - name: Local daemon offline, restart, and tunnel contract
+        timeout-minutes: 15
+        run: cargo test --locked -p fabric --test local_slice -- --test-threads=1
 
   deterministic:
     runs-on: ubuntu-24.04

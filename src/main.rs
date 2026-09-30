@@ -231,6 +231,19 @@ enum Commands {
         #[arg(long)]
         tcp: Option<String>,
     },
+    /// Remove durable Unix and TCP listeners for this peer and protocol.
+    Undial { peer: String, protocol: String },
+    /// Stream cached peer transitions as newline JSON; performs no network probes.
+    PeerEvents {
+        #[arg(long)]
+        watch: bool,
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+        #[arg(long)]
+        instance: Option<String>,
+        #[arg(long, default_value_t = 30_000)]
+        timeout_ms: u64,
+    },
     /// Say what is wrong with this machine, in words a stranger can act on.
     ///
     /// Reports each check as `ok`, `info`, `setup`, `problem`, or `unknown`. A check
@@ -917,6 +930,45 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                Commands::Undial { peer, protocol } => {
+                    send_control(&home, ControlRequest::Undial { peer, protocol }).await?;
+                    println!("undialed");
+                }
+                Commands::PeerEvents {
+                    watch,
+                    mut after,
+                    mut instance,
+                    timeout_ms,
+                } => loop {
+                    let response = send_control(
+                        &home,
+                        ControlRequest::PeerEvents {
+                            instance: instance.clone(),
+                            after,
+                            timeout_ms: if watch { timeout_ms.max(1) } else { 0 },
+                        },
+                    )
+                    .await;
+                    match response {
+                        Ok(ControlResponse::PeerEvents { batch }) => {
+                            after = batch.cursor;
+                            instance = Some(batch.instance.clone());
+                            println!(
+                                "{}",
+                                serde_json::to_string(&ControlResponse::PeerEvents { batch })?
+                            );
+                        }
+                        Err(_) if watch => {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                        Ok(response) => bail!("unexpected daemon response: {response:?}"),
+                    }
+                    if !watch {
+                        break;
+                    }
+                },
                 Commands::Doctor => {
                     let facts = fabric::doctor::gather(&home, |request| {
                         let home = home.clone();
@@ -1036,10 +1088,11 @@ async fn main() -> Result<()> {
                 Commands::Shell { peer } => {
                     let socket = request_shell_socket(&home, &peer).await?;
                     let (home_ref, peer_ref) = (&home, peer.as_str());
-                    let code = fabric::services::shell::client::run_client(&peer, socket, move || {
-                        request_shell_socket(home_ref, peer_ref)
-                    })
-                    .await?;
+                    let code =
+                        fabric::services::shell::client::run_client(&peer, socket, move || {
+                            request_shell_socket(home_ref, peer_ref)
+                        })
+                        .await?;
                     std::process::exit(code);
                 }
                 Commands::Exec { peer, cmd } => {
@@ -1086,14 +1139,8 @@ async fn main() -> Result<()> {
                     expect,
                     restore_now,
                 } => {
-                    update::supervise_restart(
-                        &home,
-                        &rollback,
-                        &generation,
-                        &expect,
-                        restore_now,
-                    )
-                    .await?;
+                    update::supervise_restart(&home, &rollback, &generation, &expect, restore_now)
+                        .await?;
                 }
                 Commands::Update {
                     tag,
@@ -1185,7 +1232,8 @@ async fn main() -> Result<()> {
                             server_session_detached_ttl_secs,
                         ),
                     )
-                    .await {
+                    .await
+                    {
                         fabric_config::log::stderr(&format!("Error: {error:?}"));
                         std::process::exit(1);
                     }
@@ -1451,7 +1499,10 @@ async fn print_git_status(home: &FabricHome, book: &PeerBook) {
     match std::env::current_exe() {
         Ok(binary) => {
             let helper = fabric::services::git::helper_path_for(&binary);
-            match (helper, fabric::services::git::helper_is_installed_for(&binary)) {
+            match (
+                helper,
+                fabric::services::git::helper_is_installed_for(&binary),
+            ) {
                 (Ok(path), Ok(true)) => println!("helper\tok\t{}", path.display()),
                 (Ok(path), Ok(false)) => println!(
                     "helper\tproblem\tmissing or unrelated {}; run fabric git install-helper",
@@ -1611,14 +1662,11 @@ mod connection_telemetry_tests {
             error: Some("timed out".to_string()),
         };
 
-        assert_eq!(
-            format_peer_reachability(&peer),
-            "laptop\tnode-id\taway\troaming peer"
-        );
+        assert_eq!(format_peer_reachability(&peer), "laptop\tnode-id\toffline");
     }
 
     #[test]
-    fn an_old_status_without_roaming_keeps_unreachable_behavior() {
+    fn an_old_status_without_roaming_reports_normal_offline_state() {
         let peer: PeerReachability = serde_json::from_value(serde_json::json!({
             "id": "node-id",
             "name": "server",
@@ -1630,10 +1678,7 @@ mod connection_telemetry_tests {
         }))
         .unwrap();
 
-        assert_eq!(
-            format_peer_reachability(&peer),
-            "server\tnode-id\tunreachable\ttimed out"
-        );
+        assert_eq!(format_peer_reachability(&peer), "server\tnode-id\toffline");
     }
 
     fn current(peers: &[&str]) -> BTreeSet<String> {
@@ -1831,8 +1876,7 @@ mod connection_telemetry_tests {
         assert_eq!(
             lines,
             vec![
-                "session history (lifetime totals)\tsince 1970-01-01T00:00:00Z"
-                    .to_string(),
+                "session history (lifetime totals)\tsince 1970-01-01T00:00:00Z".to_string(),
                 "  no losses recorded".to_string(),
             ]
         );
@@ -2289,11 +2333,8 @@ fn format_peer_reachability(peer: &PeerReachability) -> String {
             peer.id,
             peer.bytes.unwrap_or_default()
         )
-    } else if peer.roaming {
-        format!("{label}\t{}\taway\troaming peer", peer.id)
     } else {
-        let error = peer.error.as_deref().unwrap_or("unreachable");
-        format!("{label}\t{}\tunreachable\t{error}", peer.id)
+        format!("{label}\t{}\toffline", peer.id)
     }
 }
 
@@ -2567,7 +2608,9 @@ async fn run_join(
     };
     if dry_run {
         for host in &targets {
-            println!("would join\t{host}\tallow there={allow_text}\tgrant here={grant_text}\tas={local_name}");
+            println!(
+                "would join\t{host}\tallow there={allow_text}\tgrant here={grant_text}\tas={local_name}"
+            );
         }
         return Ok(0);
     }
@@ -2657,7 +2700,9 @@ async fn join_one(
     );
     SyncBook::load(home)?.validate_against(&book)?;
     book.save(home)?;
-    let local_daemon = send_control(home, ControlRequest::ReloadPeers).await.is_ok();
+    let local_daemon = send_control(home, ControlRequest::ReloadPeers)
+        .await
+        .is_ok();
 
     let mut summary = format!(
         "id={remote_id}\tgrant here={}",

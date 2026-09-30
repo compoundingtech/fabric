@@ -24,11 +24,11 @@
 //! days of log text. Keeping it is what lets a later change compare a live path
 //! against the relay. This module deliberately makes no such decision itself.
 
+use fabric_config::log_eprintln as eprintln;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use fabric_config::log_eprintln as eprintln;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -368,6 +368,23 @@ impl TelemetryStore {
                 .entry(path.unwrap_or(PATH_UNKNOWN).to_string())
                 .or_default() += 1;
         }
+        self.persist_locked(&inner);
+    }
+
+    /// Keep one loss fact for an absent peer without writing on each retry.
+    pub fn record_absence(&self, peer: &str, path: Option<&str>, now: Instant) {
+        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if inner.losses_in_flight.contains_key(peer) {
+            return;
+        }
+        inner.losses_in_flight.insert(peer.to_string(), now);
+        let entry = inner.peers.entry(peer.to_string()).or_default();
+        entry.losses += 1;
+        entry.reconnect_attempts += 1;
+        *entry
+            .losses_by_path
+            .entry(path.unwrap_or(PATH_UNKNOWN).to_string())
+            .or_default() += 1;
         self.persist_locked(&inner);
     }
 
@@ -757,12 +774,7 @@ mod tests {
         let path = dir.path().join("telemetry.json");
         {
             let store = TelemetryStore::load(&path);
-            store.record_probe(
-                "vps",
-                true,
-                Some("direct"),
-                Some(Duration::from_millis(64)),
-            );
+            store.record_probe("vps", true, Some("direct"), Some(Duration::from_millis(64)));
         }
         let reloaded = TelemetryStore::load(&path);
         assert_eq!(
@@ -893,7 +905,11 @@ mod tests {
         let store = TelemetryStore::ephemeral();
         let base = Instant::now();
         store.record_loss("desktop", Some("direct"), 1, base);
-        store.record_resume("desktop", Some("relay"), base + Duration::from_millis(1_500));
+        store.record_resume(
+            "desktop",
+            Some("relay"),
+            base + Duration::from_millis(1_500),
+        );
         store.record_probe(
             "desktop",
             true,

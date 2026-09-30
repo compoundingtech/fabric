@@ -11,7 +11,7 @@ default-members = [".", "crates/fabric-sync"]
 
 [package]
 name = "fabric"
-version = "0.2.20"
+version = "0.2.21"
 edition = "2024"
 description = "Local socket facade for iroh-backed cross-machine transports"
 repository = "https://github.com/compoundingtech/fabric"
@@ -61,5 +61,6 @@ rcgen = { version = "0.14.9", default-features = false, features = ["pem", "ring
 netdev = { path = "vendor/netdev" }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 proptest = "1"
 tempfile = "3"

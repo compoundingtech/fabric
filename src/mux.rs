@@ -73,6 +73,18 @@ fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
 }
 
+#[derive(Debug)]
+pub(crate) struct PeerOffline;
+impl fmt::Display for PeerOffline {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("peer is offline")
+    }
+}
+impl std::error::Error for PeerOffline {}
+pub(crate) fn is_peer_offline(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<PeerOffline>().is_some()
+}
+
 /// One admitted logical stream on the shared peer connection.
 pub struct MuxStream {
     pub connection: Connection,
@@ -175,6 +187,12 @@ fn is_duplicate_connection(error: &anyhow::Error) -> bool {
                     matches!(error, WriteError::ConnectionLost(reason) if is_duplicate_close(reason))
                 })
     })
+}
+
+pub(crate) fn is_temporary_stream_denial(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<StreamDenied>()
+        .is_some_and(|denial| denial.0 == TEMPORARY_TUNNEL_BLOCK)
 }
 
 fn is_connection_lost(error: &anyhow::Error) -> bool {
@@ -349,6 +367,7 @@ pub struct PeerConnections {
     legacy_notices: Mutex<HashSet<(EndpointId, u64)>>,
     legacy_fallbacks: Mutex<HashMap<(EndpointId, u64), LegacyFallback>>,
     opened_tx: mpsc::UnboundedSender<Connection>,
+    pub(crate) presence: Arc<crate::presence::Presence>,
     #[cfg(test)]
     mux_connect_attempts: std::sync::atomic::AtomicUsize,
 }
@@ -362,6 +381,7 @@ impl PeerConnections {
             legacy_notices: Mutex::new(HashSet::new()),
             legacy_fallbacks: Mutex::new(HashMap::new()),
             opened_tx,
+            presence: Arc::new(crate::presence::Presence::default()),
             #[cfg(test)]
             mux_connect_attempts: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -374,6 +394,23 @@ impl PeerConnections {
             .entry(peer)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    pub(crate) async fn connect_peer(
+        &self,
+        endpoint: &Endpoint,
+        generation: u64,
+        peer: &EndpointAddr,
+    ) -> Result<()> {
+        self.get_or_open(
+            endpoint,
+            generation,
+            peer,
+            "presence",
+            StreamActivity::Probe,
+        )
+        .await?;
+        Ok(())
     }
 
     /// Open a mux stream to `peer_addr`'s exposure `protocol`, reusing the peer's
@@ -426,6 +463,13 @@ impl PeerConnections {
                         tokio::time::sleep(DUPLICATE_RETRY_DELAY).await;
                         continue;
                     }
+                    if is_connection_lost(&error)
+                        && !is_peer_offline(&error)
+                        && attempts < OPEN_ATTEMPTS
+                    {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
                     return Err(error);
                 }
             };
@@ -473,10 +517,30 @@ impl PeerConnections {
         peer_addr: &EndpointAddr,
         protocol: &str,
     ) -> Result<MuxStream> {
-        let connection = endpoint
-            .connect(peer_addr.clone(), protocol.as_bytes())
-            .await
-            .with_context(|| format!("connect legacy protocol {protocol}"))?;
+        let connection = match tokio::time::timeout(
+            Duration::from_secs(2),
+            endpoint.connect(peer_addr.clone(), protocol.as_bytes()),
+        )
+        .await
+        {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(error)) => {
+                let error = anyhow::Error::new(error);
+                if is_mux_unsupported(&error) {
+                    return Err(error);
+                }
+                self.presence.away(peer_addr.id);
+                return Err(error.context(PeerOffline));
+            }
+            Err(_) => {
+                self.presence.away(peer_addr.id);
+                return Err(PeerOffline.into());
+            }
+        };
+        self.presence.legacy_online(
+            peer_addr.id,
+            crate::daemon::classify_connection_transport(&connection),
+        );
         let (send, recv) = connection
             .open_bi()
             .await
@@ -641,7 +705,7 @@ impl PeerConnections {
         generation: u64,
         peer_addr: &EndpointAddr,
         protocol: &str,
-        _activity: StreamActivity,
+        activity: StreamActivity,
     ) -> Result<Option<Connection>> {
         {
             let conns = self.conns.lock().await;
@@ -661,6 +725,11 @@ impl PeerConnections {
             }
         }
 
+        if self.presence.offline(peer_addr.id)
+            && (activity == StreamActivity::Application || !self.presence.probe_due(peer_addr.id))
+        {
+            return Err(PeerOffline.into());
+        }
         let peer_gate = self.peer_gate(peer_addr.id).await;
         let _peer_guard = peer_gate.lock().await;
         let mut conns = self.conns.lock().await;
@@ -688,38 +757,64 @@ impl PeerConnections {
             stale.connection.close(0u32.into(), STALE_GENERATION_REASON);
         }
         drop(conns);
+        if self.presence.offline(peer_addr.id)
+            && (activity == StreamActivity::Application || !self.presence.probe_due(peer_addr.id))
+        {
+            return Err(PeerOffline.into());
+        }
         if self.mux_probe_deferred(peer_addr.id, generation).await {
             return Ok(None);
         }
         #[cfg(test)]
         self.mux_connect_attempts
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let connection = match endpoint.connect(peer_addr.clone(), MUX_ALPN).await {
-            Ok(connection) => connection,
-            Err(connect_error) => {
+        let connected = tokio::time::timeout(
+            Duration::from_secs(2),
+            endpoint.connect(peer_addr.clone(), MUX_ALPN),
+        )
+        .await;
+        let connection = match connected {
+            Err(_) => {
+                self.presence.away(peer_addr.id);
+                return Err(PeerOffline.into());
+            }
+            Ok(Ok(connection)) => connection,
+            Ok(Err(connect_error)) => {
                 let error = anyhow::Error::new(connect_error).context("connect mux connection");
                 if is_mux_unsupported(&error) {
                     self.note_legacy_fallback(peer_addr.id, generation, protocol, &error)
                         .await;
                     return Ok(None);
                 }
+                if is_duplicate_connection(&error) {
+                    return Err(error);
+                }
+                self.presence.away(peer_addr.id);
+                return Err(error.context(PeerOffline));
+            }
+        };
+        let remote_generation = match Self::exchange_generations(&connection, generation).await {
+            Ok(remote_generation) => remote_generation,
+            Err(error) => {
+                // The incoming canonical connection can win while the outgoing
+                // generation preface is still in flight. Its rejection closes
+                // the losing stream before the reply is read.
+                let conns = self.conns.lock().await;
+                if let Some(current) = conns.get(&peer_addr.id)
+                    && current.generation == generation
+                    && current.connection.close_reason().is_none()
+                {
+                    return Ok(Some(current.connection.clone()));
+                }
+                connection.close(0u32.into(), DUPLICATE_CONNECTION_REASON);
                 return Err(error);
             }
         };
-        let remote_generation = Self::exchange_generations(&connection, generation).await?;
-        let mut conns = self.conns.lock().await;
-        conns.insert(
-            peer_addr.id,
-            PeerConn {
-                connection: connection.clone(),
-                remote_generation,
-                generation,
-                opened_at: Instant::now(),
-                health: ConnectionHealthState::default(),
-            },
-        );
-        let _ = self.opened_tx.send(connection.clone());
-        Ok(Some(connection))
+        let selected = self.admit(&connection, generation, remote_generation).await;
+        if selected.stable_id() == connection.stable_id() {
+            let _ = self.opened_tx.send(connection);
+        }
+        Ok(Some(selected))
     }
 
     async fn close_and_forget_if(&self, peer: EndpointId, stable_id: usize) {
@@ -743,13 +838,15 @@ impl PeerConnections {
             let failed = connections
                 .remove(&peer)
                 .expect("the matched mux connection disappeared while locked");
+            self.presence.replacing(peer, failed.connection.stable_id());
             failed.connection.close(0u32.into(), reason);
         }
     }
 
     /// Make one peer use a fresh multipath connection on its next stream.
     pub async fn redial(&self, peer: EndpointId, reason: &[u8]) -> bool {
-        self.redial_opened_before(peer, reason, Instant::now()).await
+        self.redial_opened_before(peer, reason, Instant::now())
+            .await
     }
 
     /// Close only a connection that existed before the failed probe started.
@@ -770,6 +867,8 @@ impl PeerConnections {
             .remove(&peer)
             .expect("the matched mux connection disappeared while locked");
         drop(connections);
+        self.presence
+            .replacing(peer, removed.connection.stable_id());
         removed.connection.close(0u32.into(), reason);
         true
     }
@@ -781,43 +880,111 @@ impl PeerConnections {
         generation: u64,
         remote_generation: u64,
     ) {
+        self.admit(connection, generation, remote_generation).await;
+    }
+
+    async fn admit(
+        &self,
+        connection: &Connection,
+        generation: u64,
+        remote_generation: u64,
+    ) -> Connection {
         let peer = connection.remote_id();
-        let peer_gate = self.peer_gate(peer).await;
-        let _peer_guard = peer_gate.lock().await;
+        let preferred = if self.local_id < peer {
+            Side::Client
+        } else {
+            Side::Server
+        };
+        let suspect = {
+            let conns = self.conns.lock().await;
+            conns
+                .get(&peer)
+                .filter(|current| {
+                    current.generation == generation
+                        && current.remote_generation == remote_generation
+                        && current.connection.stable_id() != connection.stable_id()
+                        && current.connection.close_reason().is_none()
+                        && current.opened_at.elapsed() > Duration::from_secs(5)
+                        && !(connection.side() == preferred
+                            && current.connection.side() != preferred)
+                })
+                .map(|current| current.connection.clone())
+        };
+        // A fresh authenticated connection can arrive before the old path's
+        // idle timeout. Keep an answering canonical path; replace a silent one.
+        // Never hold the global peer map while checking a remote path.
+        let silent = if let Some(old) = suspect {
+            let answer = tokio::time::timeout(
+                Duration::from_secs(2),
+                self.open_on(&old, &MuxStreamHeader::new("fabric/echo/0")),
+            )
+            .await;
+            match answer {
+                Ok(Ok(_)) => None,
+                Ok(Err(error)) if is_stream_denied(&error) => None,
+                _ => Some(old.stable_id()),
+            }
+        } else {
+            None
+        };
         let mut conns = self.conns.lock().await;
+        if let Some(current) = conns.get(&peer)
+            && current.connection.stable_id() == connection.stable_id()
+        {
+            return current.connection.clone();
+        }
         let replace = match conns.get(&peer) {
             None => true,
+            Some(current) if current.generation > generation => false,
             Some(current)
-                if current.generation != generation
+                if current.generation < generation
                     || current.connection.close_reason().is_some() =>
             {
                 true
             }
             Some(current) if remote_generation > current.remote_generation => true,
             Some(current) if remote_generation < current.remote_generation => false,
+            Some(current)
+                if silent == Some(current.connection.stable_id())
+                    && connection.close_reason().is_none() =>
+            {
+                true
+            }
             Some(current) => {
-                current.connection.side() == Side::Server
-                    || (self.local_id > peer && current.connection.side() == Side::Client)
+                connection.side() == preferred && current.connection.side() != preferred
             }
         };
-        if replace {
-            if let Some(old) = conns.remove(&peer) {
-                old.connection
-                    .close(0u32.into(), DUPLICATE_CONNECTION_REASON);
-            }
-            conns.insert(
-                peer,
-                PeerConn {
-                    connection: connection.clone(),
-                    remote_generation,
-                    generation,
-                    opened_at: Instant::now(),
-                    health: ConnectionHealthState::default(),
-                },
-            );
-        } else {
+        if !replace {
             connection.close(0u32.into(), DUPLICATE_CONNECTION_REASON);
+            return conns.get(&peer).unwrap().connection.clone();
         }
+        if let Some(old) = conns.remove(&peer) {
+            old.connection
+                .close(0u32.into(), DUPLICATE_CONNECTION_REASON);
+        }
+        conns.insert(
+            peer,
+            PeerConn {
+                connection: connection.clone(),
+                remote_generation,
+                generation,
+                opened_at: Instant::now(),
+                health: ConnectionHealthState::default(),
+            },
+        );
+        self.presence.online(
+            peer,
+            connection.stable_id(),
+            crate::daemon::classify_connection_transport(connection),
+            "connected",
+        );
+        let presence = self.presence.clone();
+        let monitored = connection.clone();
+        tokio::spawn(async move {
+            monitored.closed().await;
+            presence.closed(peer, monitored.stable_id());
+        });
+        connection.clone()
     }
 
     /// Record application bytes or an acknowledgement on one exact connection.
@@ -848,8 +1015,7 @@ impl PeerConnections {
             if connection.connection.stable_id() != stable_id {
                 return false;
             }
-            connection.health.note_attach_failure(phase, duration)
-                >= ATTACH_FAILURES_BEFORE_REPLACE
+            connection.health.note_attach_failure(phase, duration) >= ATTACH_FAILURES_BEFORE_REPLACE
         };
         if replace {
             self.close_and_forget_if_with_reason(peer, stable_id, REPEATED_ATTACH_FAILURE_REASON)
@@ -883,9 +1049,7 @@ impl PeerConnections {
                     CurrentConnectionHealth {
                         connection_id: connection.connection.stable_id() as u64,
                         age_millis: duration_millis(now.duration_since(connection.opened_at)),
-                        consecutive_attach_failures: connection
-                            .health
-                            .consecutive_attach_failures,
+                        consecutive_attach_failures: connection.health.consecutive_attach_failures,
                         last_attach_failure_phase: connection
                             .health
                             .last_attach_failure_phase
@@ -932,7 +1096,10 @@ mod tests {
     fn brief_progress_does_not_clear_consecutive_attach_failures() {
         let start = Instant::now();
         let mut health = ConnectionHealthState::default();
-        assert_eq!(health.note_attach_failure("hello", Duration::from_millis(10)), 1);
+        assert_eq!(
+            health.note_attach_failure("hello", Duration::from_millis(10)),
+            1
+        );
         health.note_application_progress(start);
         health.note_application_progress(
             start + SUSTAINED_PROGRESS_DURATION - Duration::from_millis(1),
@@ -948,7 +1115,10 @@ mod tests {
     fn sustained_progress_clears_consecutive_attach_failures() {
         let start = Instant::now();
         let mut health = ConnectionHealthState::default();
-        assert_eq!(health.note_attach_failure("hello", Duration::from_millis(10)), 1);
+        assert_eq!(
+            health.note_attach_failure("hello", Duration::from_millis(10)),
+            1
+        );
         health.note_application_progress(start);
         for second in 1..=SUSTAINED_PROGRESS_DURATION.as_secs() {
             health.note_application_progress(start + Duration::from_secs(second));
@@ -1128,6 +1298,122 @@ mod tests {
     /// A slow connection to one peer must not delay an existing connection to
     /// another peer. Production showed a 2-second delay every 20 seconds when
     /// the health loop probed an absent peer beside a healthy peer.
+    #[derive(Debug, Clone)]
+    struct SwitchableMuxEcho(Arc<std::sync::atomic::AtomicBool>);
+    impl ProtocolHandler for SwitchableMuxEcho {
+        async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+            PeerConnections::accept_generation(&connection, 0)
+                .await
+                .map_err(|error| AcceptError::from_err(std::io::Error::other(error.to_string())))?;
+            loop {
+                let Ok((mut send, mut recv)) = connection.accept_bi().await else {
+                    return Ok(());
+                };
+                let blocked = self.0.clone();
+                let held = connection.clone();
+                tokio::spawn(async move {
+                    if MuxStreamHeader::read(&mut recv).await.is_err() {
+                        return;
+                    }
+                    if blocked.load(Ordering::SeqCst) {
+                        held.closed().await;
+                        return;
+                    }
+                    let _ = write_ready(&mut send).await;
+                    let _ = tokio::io::copy(&mut recv, &mut send).await;
+                    let _ = send.finish();
+                });
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_returning_peer_replaces_a_silent_canonical_path_before_its_idle_timeout()
+    -> Result<()> {
+        let first = iroh::SecretKey::generate();
+        let second = iroh::SecretKey::generate();
+        let (lower, higher) = if first.public() < second.public() {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let lower_endpoint = Endpoint::builder(presets::N0)
+            .secret_key(lower)
+            .alpns(vec![MUX_ALPN.to_vec()])
+            .bind()
+            .await?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let manager = Arc::new(PeerConnections::new(lower_endpoint.id(), tx));
+        let lower = Router::builder(lower_endpoint)
+            .accept(
+                MUX_ALPN,
+                ManagedMuxEcho {
+                    manager: manager.clone(),
+                    generation: 0,
+                },
+            )
+            .spawn();
+        let blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let higher = Router::builder(
+            Endpoint::builder(presets::N0)
+                .secret_key(higher)
+                .alpns(vec![MUX_ALPN.to_vec()])
+                .bind()
+                .await?,
+        )
+        .accept(MUX_ALPN, SwitchableMuxEcho(blocked.clone()))
+        .spawn();
+        let old = manager
+            .open_mux_stream(
+                lower.endpoint(),
+                0,
+                &higher.endpoint().addr(),
+                "first",
+                StreamActivity::Probe,
+            )
+            .await?;
+        let old_id = old.connection.stable_id();
+        drop(old);
+        // Simulate a selected path that keeps its QUIC handle but stops answering.
+        // Do not close it: that would give the waiting peer an easy close event.
+        blocked.store(true, Ordering::SeqCst);
+        manager
+            .conns
+            .lock()
+            .await
+            .get_mut(&higher.endpoint().id())
+            .unwrap()
+            .opened_at = Instant::now() - Duration::from_secs(6);
+        let returned = higher
+            .endpoint()
+            .connect(lower.endpoint().addr(), MUX_ALPN)
+            .await?;
+        PeerConnections::exchange_generations(&returned, 0).await?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if manager
+                    .connection(higher.endpoint().id())
+                    .await
+                    .is_some_and(|connection| connection.stable_id() != old_id)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("the stale canonical path rejected a reachable returning peer")?;
+        let (mut send, mut recv) = returned.open_bi().await?;
+        MuxStreamHeader::new("returned").write(&mut send).await?;
+        read_admission(&mut recv).await?;
+        send.write_all(b"back").await?;
+        send.finish()?;
+        assert_eq!(recv.read_to_end(16).await?, b"back");
+        lower.shutdown().await?;
+        higher.shutdown().await?;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn one_slow_peer_open_does_not_block_another_peer() -> Result<()> {
         let client = Endpoint::builder(presets::N0).bind().await?;
@@ -1264,8 +1550,7 @@ mod tests {
             .await;
 
         assert_eq!(
-            recovery,
-            false,
+            recovery, false,
             "recovery closed a connection that opened after the failed probe started"
         );
         assert_eq!(
@@ -1328,6 +1613,10 @@ mod tests {
         drop(first);
         let attempts_before = manager.mux_connect_attempts.load(Ordering::SeqCst);
 
+        let absent = manager
+            .open_mux_stream(&client, 0, &offline_addr, "offline", StreamActivity::Probe)
+            .await;
+        assert!(absent.is_err());
         for probe in 0..FAILED_PROBES {
             let offline_manager = manager.clone();
             let offline_client = client.clone();
@@ -1345,15 +1634,6 @@ mod tests {
                 )
                 .await
             });
-
-            let expected_attempts = attempts_before + probe + 1;
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while manager.mux_connect_attempts.load(Ordering::SeqCst) < expected_attempts {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .with_context(|| format!("offline probe {probe} never started"))?;
 
             let mut stream = tokio::time::timeout(
                 HEALTHY_STREAM_BUDGET,
@@ -1381,8 +1661,8 @@ mod tests {
 
         assert_eq!(
             manager.mux_connect_attempts.load(Ordering::SeqCst) - attempts_before,
-            FAILED_PROBES,
-            "a probe must own one connection attempt and no hidden retry task"
+            1,
+            "cached absence must suppress repeated handshakes and hidden retries"
         );
         assert_eq!(
             manager.conns.lock().await.len(),
@@ -1415,10 +1695,7 @@ mod tests {
             .bind()
             .await?;
         let (lower_opened_tx, mut lower_opened_rx) = mpsc::unbounded_channel();
-        let lower_manager = Arc::new(PeerConnections::new(
-            lower_endpoint.id(),
-            lower_opened_tx,
-        ));
+        let lower_manager = Arc::new(PeerConnections::new(lower_endpoint.id(), lower_opened_tx));
         let lower_router = Router::builder(lower_endpoint)
             .accept(
                 MUX_ALPN,
@@ -1440,10 +1717,7 @@ mod tests {
             .bind()
             .await?;
         let (higher_opened_tx, _higher_opened_rx) = mpsc::unbounded_channel();
-        let higher_manager = Arc::new(PeerConnections::new(
-            higher_endpoint.id(),
-            higher_opened_tx,
-        ));
+        let higher_manager = Arc::new(PeerConnections::new(higher_endpoint.id(), higher_opened_tx));
         let higher_router = Router::builder(higher_endpoint)
             .accept(
                 MUX_ALPN,
@@ -1513,10 +1787,7 @@ mod tests {
             .bind()
             .await?;
         let (lower_opened_tx, _lower_opened_rx) = mpsc::unbounded_channel();
-        let lower_manager = Arc::new(PeerConnections::new(
-            lower_endpoint.id(),
-            lower_opened_tx,
-        ));
+        let lower_manager = Arc::new(PeerConnections::new(lower_endpoint.id(), lower_opened_tx));
         let lower_router = Router::builder(lower_endpoint)
             .accept(
                 MUX_ALPN,
@@ -2020,8 +2291,7 @@ mod tests {
                 .await
         );
         assert_eq!(
-            manager.current_health().await[&server_addr.id]
-                .consecutive_attach_failures,
+            manager.current_health().await[&server_addr.id].consecutive_attach_failures,
             2
         );
         assert_eq!(
@@ -2065,6 +2335,59 @@ mod tests {
         );
         assert_eq!(manager.peer_count().await, 1);
 
+        router.shutdown().await?;
+        client.close().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duplicate_incoming_keeps_an_admitted_live_connection() -> Result<()> {
+        let endpoint = Endpoint::builder(presets::N0).bind().await?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let manager = Arc::new(PeerConnections::new(endpoint.id(), tx));
+        let router = Router::builder(endpoint)
+            .accept(
+                MUX_ALPN,
+                ManagedMuxEcho {
+                    manager: manager.clone(),
+                    generation: 1,
+                },
+            )
+            .spawn();
+        router.endpoint().online().await;
+        let client = Endpoint::bind(presets::N0).await?;
+        let first = client.connect(router.endpoint().addr(), MUX_ALPN).await?;
+        PeerConnections::exchange_generations(&first, 1).await?;
+        let stream = manager
+            .open_on(&first, &MuxStreamHeader::new("echo"))
+            .await?;
+        assert_echo(stream, b"first").await?;
+        let canonical = manager
+            .connection(client.id())
+            .await
+            .context("missing incoming")?;
+        // Admission is idempotent, even when the accept path is re-entered.
+        manager.register_incoming(&canonical, 1, 1).await;
+        assert!(
+            canonical.close_reason().is_none(),
+            "re-registering closed its own connection"
+        );
+        for _ in 0..4 {
+            let duplicate = client.connect(router.endpoint().addr(), MUX_ALPN).await?;
+            let _ = PeerConnections::exchange_generations(&duplicate, 1).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                first.close_reason().is_none(),
+                "a duplicate replaced a healthy admitted connection"
+            );
+        }
+        assert_echo(
+            manager
+                .open_on(&first, &MuxStreamHeader::new("echo"))
+                .await?,
+            b"still-here",
+        )
+        .await?;
         router.shutdown().await?;
         client.close().await;
         Ok(())

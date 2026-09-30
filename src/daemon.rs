@@ -39,8 +39,8 @@ use tracing_subscriber::EnvFilter;
 
 use crate::{
     config::{
-        DEFAULT_EXEC_MAX_CHILDREN, FabricConfig, FabricHome, Peer, PeerBook, PersistedExpose,
-        PersistedExposeTarget, load_or_create_identity, validate_protocol,
+        DEFAULT_EXEC_MAX_CHILDREN, FabricConfig, FabricHome, Peer, PeerBook, PersistedDial,
+        PersistedExpose, PersistedExposeTarget, load_or_create_identity, validate_protocol,
         validate_server_session_config, validate_tcp_addr, write_atomic,
     },
     control::{
@@ -93,7 +93,6 @@ const ENDPOINT_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 /// must not make a recycle or daemon shutdown wait forever.
 const ENDPOINT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const ENDPOINT_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(30);
-const ENDPOINT_HEALTH_POLL_FAILURES_BEFORE_RECYCLE: usize = 2;
 const ENDPOINT_DIAGNOSTIC_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
 const ENDPOINT_RECYCLE_MIN_INTERVAL: Duration = Duration::from_secs(60);
 const ENDPOINT_RSS_OBSERVE_POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -189,14 +188,14 @@ struct FailureBackoff {
 #[derive(Debug)]
 struct FailureBackoffState {
     consecutive_failures: usize,
-    not_before: Instant,
+    not_before: tokio::time::Instant,
     last_delay: Duration,
-    last_log: Option<Instant>,
+    last_log: Option<tokio::time::Instant>,
     suppressed: usize,
 }
 
 impl FailureBackoffState {
-    fn new(now: Instant) -> Self {
+    fn new(now: tokio::time::Instant) -> Self {
         Self {
             consecutive_failures: 0,
             not_before: now,
@@ -214,7 +213,7 @@ impl FailureBackoffState {
     /// keeping the streak would charge a stale escalation to their next attempt.
     /// The grace period is derived from the delay this record itself produced, so
     /// there is no separate number to tune.
-    fn is_idle(&self, now: Instant) -> bool {
+    fn is_idle(&self, now: tokio::time::Instant) -> bool {
         now.saturating_duration_since(self.not_before) >= self.last_delay
     }
 }
@@ -232,14 +231,14 @@ impl FailureBackoff {
     /// Drop records that carry no streak and no remaining delay. The live key
     /// space is bounded by trusted peers times ALPNs, both of which come from
     /// config, so this needs no cap of its own.
-    fn prune(states: &mut HashMap<BackoffKey, FailureBackoffState>, now: Instant) {
+    fn prune(states: &mut HashMap<BackoffKey, FailureBackoffState>, now: tokio::time::Instant) {
         states.retain(|_, state| !state.is_idle(now));
     }
 
     async fn wait(&self, key: &BackoffKey, cancel: &CancellationToken) -> bool {
         loop {
             let delay = {
-                let now = Instant::now();
+                let now = tokio::time::Instant::now();
                 let mut states = self.states.lock().await;
                 Self::prune(&mut states, now);
                 states
@@ -258,7 +257,7 @@ impl FailureBackoff {
     }
 
     async fn record_success(&self, key: &BackoffKey) {
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
         let mut states = self.states.lock().await;
         states.remove(key);
         Self::prune(&mut states, now);
@@ -295,7 +294,7 @@ impl FailureBackoff {
         delays_next_attempt: bool,
     ) {
         let (delay, consecutive_failures, suppressed, should_log) = {
-            let now = Instant::now();
+            let now = tokio::time::Instant::now();
             let mut states = self.states.lock().await;
             let state = states
                 .entry(key.clone())
@@ -405,6 +404,7 @@ impl EndpointHooks for AllowListHook {
 
 #[derive(Debug)]
 pub struct DaemonState {
+    config_write: std::sync::Mutex<()>,
     home: FabricHome,
     endpoint_tx: watch::Sender<CurrentEndpoint>,
     endpoint_recycle: Mutex<()>,
@@ -562,6 +562,7 @@ impl Drop for DialListenerLease {
 struct TcpDial {
     addr: String,
     peer_addr: EndpointAddr,
+    cancel: CancellationToken,
 }
 
 #[derive(Debug, Clone)]
@@ -1046,6 +1047,7 @@ impl DaemonState {
         let (opened_mux_tx, opened_mux_rx) = mpsc::unbounded_channel();
 
         Ok(Arc::new(Self {
+            config_write: std::sync::Mutex::new(()),
             home,
             endpoint_tx,
             endpoint_recycle: Mutex::new(()),
@@ -1133,11 +1135,13 @@ impl DaemonState {
     /// A client for the companion's bridge, when one is attached and alive.
     async fn sync_companion_client(&self) -> Option<IpcClient> {
         let presence = self.sync_companion.lock().await.clone()?;
-        if presence.seen.elapsed() > SYNC_COMPANION_PRESENCE_WINDOW || presence.state != "active"
-        {
+        if presence.seen.elapsed() > SYNC_COMPANION_PRESENCE_WINDOW || presence.state != "active" {
             return None;
         }
-        Some(IpcClient::new(presence.socket?, self.sync_ipc_nonce.clone()))
+        Some(IpcClient::new(
+            presence.socket?,
+            self.sync_ipc_nonce.clone(),
+        ))
     }
 
     async fn sync_runtime_status(&self) -> SyncRuntimeStatus {
@@ -1160,9 +1164,10 @@ impl DaemonState {
             return (Vec::new(), self.sync_runtime_status().await);
         };
         match tokio::time::timeout(SYNC_COMPANION_REQUEST_TIMEOUT, client.status()).await {
-            Ok(Ok(status)) if status.state == IpcRuntimeState::Ready => {
-                (status.entries, SyncRuntimeStatus::new("companion", "active"))
-            }
+            Ok(Ok(status)) if status.state == IpcRuntimeState::Ready => (
+                status.entries,
+                SyncRuntimeStatus::new("companion", "active"),
+            ),
             Ok(Ok(status)) => (
                 status.entries,
                 SyncRuntimeStatus::unavailable(match status.state {
@@ -1239,6 +1244,21 @@ impl DaemonState {
         let trusted_ids = peer_book.trusted_ids();
         *self.peer_book.write().await = peer_book;
         *self.allowed.write().await = trusted_ids;
+        self.peer_connections.presence.retry_now();
+        self.announce_to_peers().await;
+        Ok(())
+    }
+
+    fn update_config(&self, update: impl FnOnce(&mut FabricConfig)) -> Result<()> {
+        // A daemon can serve independent control requests on different threads.
+        // Serialize the complete read-modify-write, not only the final rename.
+        let _guard = self.config_write.lock().unwrap();
+        let mut config = FabricConfig::load(&self.home)?;
+        let before = toml::to_string(&config)?;
+        update(&mut config);
+        if toml::to_string(&config)? != before {
+            config.save(&self.home)?;
+        }
         Ok(())
     }
 
@@ -1256,12 +1276,12 @@ impl DaemonState {
         }
 
         if persist {
-            let mut config = FabricConfig::load(&self.home)?;
-            config.upsert_expose(PersistedExpose::socket(
-                protocol.to_string(),
-                socket.clone(),
-            ));
-            config.save(&self.home)?;
+            self.update_config(|config| {
+                config.upsert_expose(PersistedExpose::socket(
+                    protocol.to_string(),
+                    socket.clone(),
+                ));
+            })?;
         }
 
         let mut exposures = self.exposures.write().await;
@@ -1288,9 +1308,9 @@ impl DaemonState {
         validate_tcp_addr(&addr)?;
 
         if persist {
-            let mut config = FabricConfig::load(&self.home)?;
-            config.upsert_expose(PersistedExpose::tcp(protocol.to_string(), addr.clone()));
-            config.save(&self.home)?;
+            self.update_config(|config| {
+                config.upsert_expose(PersistedExpose::tcp(protocol.to_string(), addr.clone()));
+            })?;
         }
 
         let mut exposures = self.exposures.write().await;
@@ -1329,13 +1349,13 @@ impl DaemonState {
         }
 
         if persist {
-            let mut config = FabricConfig::load(&self.home)?;
-            config.upsert_expose(PersistedExpose::exec(
-                protocol.to_string(),
-                argv.clone(),
-                max_children,
-            ));
-            config.save(&self.home)?;
+            self.update_config(|config| {
+                config.upsert_expose(PersistedExpose::exec(
+                    protocol.to_string(),
+                    argv.clone(),
+                    max_children,
+                ));
+            })?;
         }
 
         let mut exposures = self.exposures.write().await;
@@ -1376,9 +1396,9 @@ impl DaemonState {
             bail!("{protocol:?} is reserved for fabric's built-in protocols");
         }
 
-        let mut config = FabricConfig::load(&self.home)?;
-        config.remove_expose(protocol);
-        config.save(&self.home)?;
+        self.update_config(|config| {
+            config.remove_expose(protocol);
+        })?;
 
         let mut exposures = self.exposures.write().await;
         exposures.remove(&alpn);
@@ -1453,7 +1473,15 @@ impl DaemonState {
 
     pub async fn dial(&self, peer: &str, protocol: &str) -> Result<PathBuf> {
         let alpn = validate_protocol(protocol)?;
-        self.dial_alpn(peer, protocol, alpn, true).await
+        let id = self.peer_book.read().await.resolve(peer)?.id.to_string();
+        self.update_config(|config| {
+            config.upsert_dial(PersistedDial {
+                peer: id.clone(),
+                protocol: protocol.into(),
+                tcp: None,
+            });
+        })?;
+        self.dial_alpn(&id, protocol, alpn, true).await
     }
 
     /// A local socket that reaches `peer`'s `name` service with the newest
@@ -1553,11 +1581,20 @@ impl DaemonState {
             .await
             .with_context(|| format!("failed to bind tcp dial listener {bind}"))?;
         let addr = listener.local_addr()?.to_string();
+        let listener_cancel = self.cancel.child_token();
+        self.update_config(|config| {
+            config.upsert_dial(PersistedDial {
+                peer: peer_addr.id.to_string(),
+                protocol: protocol.into(),
+                tcp: Some(addr.clone()),
+            });
+        })?;
         tcp_dials.insert(
             key,
             TcpDial {
                 addr: addr.clone(),
                 peer_addr: peer_addr.clone(),
+                cancel: listener_cancel.clone(),
             },
         );
         drop(tcp_dials);
@@ -1566,9 +1603,9 @@ impl DaemonState {
             listener,
             self.endpoint_rx(),
             self.home.clone(),
-            peer.to_string(),
+            peer_addr.id.to_string(),
             alpn,
-            self.cancel.clone(),
+            listener_cancel,
             self.tunnel_drop_rx(),
             self.dial_failures.clone(),
             self.dial_slots.clone(),
@@ -1578,6 +1615,33 @@ impl DaemonState {
         ));
 
         Ok(addr)
+    }
+
+    pub async fn undial(&self, peer: &str, protocol: &str) -> Result<()> {
+        let id = self.peer_book.read().await.resolve(peer)?.id.to_string();
+        self.update_config(|config| {
+            config.remove_dial(&id, protocol);
+        })?;
+        let removed = self
+            .dial_sockets
+            .lock()
+            .await
+            .remove(&(id.clone(), protocol.into()));
+        if let Some(socket) = removed {
+            socket.stop().await;
+        }
+        self.tcp_dials
+            .lock()
+            .await
+            .retain(|(candidate, name, _), dial| {
+                if candidate == &id && name == protocol {
+                    dial.cancel.cancel();
+                    false
+                } else {
+                    true
+                }
+            });
+        Ok(())
     }
 
     async fn dial_alpn(
@@ -1844,6 +1908,8 @@ impl DaemonState {
         let peer_id = addr.id.to_string();
         let endpoint = self.endpoint_handle();
 
+        // A user explicitly asked for a fresh one-shot measurement.
+        self.peer_connections.presence.retry_peer_now(addr.id);
         let started = Instant::now();
         let attempt = tokio::time::timeout(
             timeout,
@@ -1914,7 +1980,27 @@ impl DaemonState {
             .unwrap_or_else(|| EndpointAddr::new(peer.id));
         let label = peer.name.clone().unwrap_or_else(|| peer.id.to_string());
 
-        match tokio::time::timeout(REACHABILITY_TIMEOUT, self.ping_addr(&label, addr)).await {
+        let started = Instant::now();
+        let result = tokio::time::timeout(REACHABILITY_TIMEOUT, self.ping_addr(&label, addr)).await;
+        let silent = match &result {
+            Err(_) => true,
+            Ok(Err(error)) => !mux::is_stream_denied(error) && !mux::is_peer_offline(error),
+            Ok(Ok(_)) => false,
+        };
+        if silent
+            && !self.peer_connections.presence.offline(peer.id)
+            && !self
+                .peer_connections
+                .recently_active(peer.id, REACHABILITY_TIMEOUT)
+                .await
+            && self
+                .peer_connections
+                .redial_opened_before(peer.id, b"peer stopped answering", started)
+                .await
+        {
+            self.peer_connections.presence.away(peer.id);
+        }
+        match result {
             Ok(Ok(pong)) => PeerReachability {
                 id: peer.id.to_string(),
                 name: peer.name.clone(),
@@ -1949,6 +2035,26 @@ impl DaemonState {
                 )),
             },
         }
+    }
+
+    async fn announce_to_peers(&self) {
+        let peers = self.peer_book.read().await.peers().to_vec();
+        let mut attempts = tokio::task::JoinSet::new();
+        for peer in peers {
+            let endpoint = self.endpoint_handle();
+            let connections = self.peer_connections.clone();
+            attempts.spawn(async move {
+                let addr = peer.addr.unwrap_or_else(|| EndpointAddr::new(peer.id));
+                // The authenticated mux handshake is the announcement. It does
+                // not depend on a grant to any consumer protocol or echo.
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    connections.connect_peer(&endpoint.endpoint, endpoint.generation, &addr),
+                )
+                .await;
+            });
+        }
+        while attempts.join_next().await.is_some() {}
     }
 
     pub fn builtin_echo_hits(&self) -> usize {
@@ -1996,6 +2102,10 @@ impl DaemonState {
         // suspect, `recycle_endpoint_if_generation` when the endpoint is
         // replaced, and the `debug drop-tunnels` control request.
         endpoint.endpoint.network_change().await;
+        if network_usable {
+            self.peer_connections.presence.retry_now();
+            self.announce_to_peers().await;
+        }
         if !network_usable {
             info!(
                 target: VALIDATION_LOG_TARGET,
@@ -2018,15 +2128,13 @@ impl DaemonState {
             // the selected path to any peer, which is what the change may have
             // killed; ask each held connection, and reset only one that fails.
             self.check_held_peer_connections("network change").await;
+            self.peer_connections.presence.retry_now();
+            self.announce_to_peers().await;
             return;
         }
 
-        if let Err(error) = self
-            .recycle_endpoint_if_generation(endpoint.generation, "network health did not recover")
-            .await
-        {
-            eprintln!("fabric: failed to recycle iroh endpoint after network change: {error:#}");
-        }
+        debug!(target: VALIDATION_LOG_TARGET, event = "network_offline",
+            generation = endpoint.generation, "waiting for the changed network to become reachable");
     }
 
     /// Close only the failed peer's cached connection. The next probe opens a new
@@ -2511,6 +2619,19 @@ impl FabricNode {
         let state = DaemonState::new(home, cancel, options, services).await?;
 
         spawn_outgoing_mux_accepts(&state).await?;
+        for dial in FabricConfig::load(&state.home)?.dials() {
+            // A revoked peer's declaration remains inert, never re-grants trust.
+            if state.peer_book.read().await.resolve(&dial.peer).is_err() {
+                continue;
+            }
+            if let Some(bind) = &dial.tcp {
+                state
+                    .dial_tcp(&dial.peer, &dial.protocol, bind.clone())
+                    .await?;
+            } else {
+                state.dial(&dial.peer, &dial.protocol).await?;
+            }
+        }
 
         let task = tokio::spawn(serve(state.clone()));
         Ok(Self { state, task })
@@ -2756,6 +2877,7 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
         result = run_sync_ipc_socket(sync_ipc_listener, state.clone()) => result?,
         result = run_iroh_accept_loop(state.clone()) => result?,
         result = run_network_rehome_loop(state.clone()) => result?,
+        result = run_endpoint_presence_loop(state.clone()) => result?,
         result = run_endpoint_health_poll_loop(state.clone()) => result?,
         result = run_endpoint_rss_observe_loop(state.clone()) => result?,
         result = run_peer_health_loop(state.clone()) => result?,
@@ -2803,6 +2925,43 @@ async fn close_endpoint_bounded(endpoint: &Endpoint, context: &str) {
     }
 }
 
+/// Relay recovery also detects an uplink/captive portal return when the OS
+/// route and interface addresses never changed. Address updates cover NAT
+/// rebinding and newly advertised direct paths.
+async fn run_endpoint_presence_loop(state: Arc<DaemonState>) -> Result<()> {
+    let mut endpoint_rx = state.endpoint_rx();
+    loop {
+        let endpoint = endpoint_rx.borrow().clone();
+        let mut addresses = endpoint.endpoint.watch_addr();
+        let mut relays = endpoint.endpoint.home_relay_status();
+        let mut previous_addr = addresses.get();
+        let mut relay_online = relays.get().iter().any(|status| status.is_connected());
+        loop {
+            let announce = tokio::select! {
+                _ = state.cancel.cancelled() => return Ok(()),
+                changed = endpoint_rx.changed() => { if changed.is_err() { return Ok(()); } break; },
+                changed = addresses.updated() => {
+                    let Ok(addr) = changed else { break; };
+                    let different = addr != previous_addr;
+                    previous_addr = addr;
+                    different
+                },
+                changed = relays.updated() => {
+                    let Ok(statuses) = changed else { break; };
+                    let online = statuses.iter().any(|status| status.is_connected());
+                    let returned = online && !relay_online;
+                    relay_online = online;
+                    returned
+                },
+            };
+            if announce && state.network_usable.load(Ordering::SeqCst) {
+                state.peer_connections.presence.retry_now();
+                state.announce_to_peers().await;
+            }
+        }
+    }
+}
+
 async fn run_network_rehome_loop(state: Arc<DaemonState>) -> Result<()> {
     let monitor = match netwatch::netmon::Monitor::new().await {
         Ok(monitor) => monitor,
@@ -2844,6 +3003,7 @@ async fn run_rehome_updates(
     mut interfaces: impl InterfaceUpdates,
 ) -> Result<()> {
     let mut debouncer = NetworkChangeDebouncer::new(NETWORK_CHANGE_DEBOUNCE);
+    let mut previous_network = None;
 
     loop {
         let due_at = debouncer.due_at();
@@ -2888,6 +3048,8 @@ async fn run_rehome_updates(
                     state.cancel.cancelled().await;
                     break;
                 };
+                if previous_network.as_ref() == Some(&network_state) { continue; }
+                previous_network = Some(network_state.clone());
                 let network_usable = network_state.default_route_interface.is_some()
                     && (network_state.have_v4 || network_state.have_v6);
                 state.network_usable.store(network_usable, Ordering::SeqCst);
@@ -2954,58 +3116,22 @@ async fn run_endpoint_health_poll_loop(state: Arc<DaemonState>) -> Result<()> {
     let mut interval = tokio::time::interval(ENDPOINT_HEALTH_POLL_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     interval.tick().await;
-    let mut consecutive_failures = 0usize;
-
     loop {
         tokio::select! {
             _ = state.cancel.cancelled() => break,
             _ = interval.tick() => {
                 if !state.network_usable.load(Ordering::SeqCst) {
-                    consecutive_failures = 0;
                     continue;
                 }
 
                 let endpoint = state.endpoint_handle();
-                if state
-                    .endpoint_health_recovered(endpoint.clone(), "periodic health poll")
-                    .await
-                {
-                    consecutive_failures = 0;
-                    continue;
-                }
-
-                if state.endpoint_handle().generation != endpoint.generation {
-                    consecutive_failures = 0;
-                    continue;
-                }
-
-                consecutive_failures = consecutive_failures.saturating_add(1);
-                warn!(
-                    target: VALIDATION_LOG_TARGET,
-                    event = "endpoint_health_poll_failed",
-                    generation = endpoint.generation,
-                    consecutive_failures,
-                    recycle_after_failures = ENDPOINT_HEALTH_POLL_FAILURES_BEFORE_RECYCLE,
-                    "endpoint health poll failed"
-                );
-                eprintln!(
-                    "fabric: iroh endpoint generation {} failed health poll ({}/{})",
-                    endpoint.generation,
-                    consecutive_failures,
-                    ENDPOINT_HEALTH_POLL_FAILURES_BEFORE_RECYCLE,
-                );
-
-                if consecutive_failures >= ENDPOINT_HEALTH_POLL_FAILURES_BEFORE_RECYCLE {
-                    if let Err(error) = state
-                        .recycle_endpoint_if_generation(
-                            endpoint.generation,
-                            "periodic health poll did not recover",
-                        )
-                        .await
-                    {
-                        eprintln!("fabric: failed to recycle iroh endpoint after health poll: {error:#}");
-                    }
-                    consecutive_failures = 0;
+                // No relay and no answering peer is an offline uplink, not
+                // evidence that the endpoint is broken. Iroh retries its
+                // paths; the address/relay watcher announces their return.
+                if !state.endpoint_health_recovered(endpoint.clone(), "periodic health poll").await {
+                    debug!(target: VALIDATION_LOG_TARGET,
+                        event = "endpoint_offline", generation = endpoint.generation,
+                        "waiting for an uplink or peer to return");
                 }
             }
         }
@@ -3022,6 +3148,7 @@ async fn run_endpoint_health_poll_loop(state: Arc<DaemonState>) -> Result<()> {
 ///
 /// `FABRIC_PEER_HEALTH_SECS` overrides the probe interval; `0` disables the loop.
 async fn run_peer_health_loop(state: Arc<DaemonState>) -> Result<()> {
+    state.announce_to_peers().await;
     let probe_interval = match std::env::var("FABRIC_PEER_HEALTH_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -3085,6 +3212,7 @@ async fn run_peer_health_loop_with(
                 let mut round = Vec::with_capacity(peers.len());
                 for peer in peers {
                     let peer_id = peer.id;
+                    if !state.peer_connections.presence.probe_due(peer_id) { continue; }
                     let label = peer.name.clone().unwrap_or_else(|| peer_id.to_string());
                     if state
                         .peer_connections
@@ -3094,15 +3222,15 @@ async fn run_peer_health_loop_with(
                         match peer_probe_log_action(
                             &mut roaming_away,
                             peer_id,
-                            peer.roaming,
+                            true,
                             true,
                         ) {
                             PeerProbeLogAction::RoamingReturned => info!(
                                 target: VALIDATION_LOG_TARGET,
-                                event = "peer_roaming_returned",
+                                event = "peer_online",
                                 peer = %label,
                                 recent_application_traffic = true,
-                                "roaming peer returned"
+                                "peer returned"
                             ),
                             _ => info!(
                                 target: VALIDATION_LOG_TARGET,
@@ -3121,7 +3249,7 @@ async fn run_peer_health_loop_with(
                     match peer_probe_log_action(
                         &mut roaming_away,
                         peer_id,
-                        peer.roaming,
+                        true,
                         health.reachable,
                     ) {
                         PeerProbeLogAction::Probe => info!(
@@ -3135,17 +3263,17 @@ async fn run_peer_health_loop_with(
                         ),
                         PeerProbeLogAction::RoamingAway => info!(
                             target: VALIDATION_LOG_TARGET,
-                            event = "peer_roaming_away",
+                            event = "peer_offline",
                             peer = %label,
-                            "roaming peer is away"
+                            "peer is offline"
                         ),
                         PeerProbeLogAction::RoamingReturned => info!(
                             target: VALIDATION_LOG_TARGET,
-                            event = "peer_roaming_returned",
+                            event = "peer_online",
                             peer = %label,
                             rtt_us = health.round_trip_micros.unwrap_or(0),
                             transport = health.transport.as_deref().unwrap_or("none"),
-                            "roaming peer returned"
+                            "peer returned"
                         ),
                         PeerProbeLogAction::None => {}
                     }
@@ -3153,7 +3281,7 @@ async fn run_peer_health_loop_with(
                     // round trip time and a path and discarded both, so the only
                     // way to compare direct against relay was to parse days of
                     // log text.
-                    if health.reachable || !peer.roaming {
+                    if health.reachable {
                         state.telemetry.record_probe(
                             &label,
                             health.reachable,
@@ -3214,9 +3342,9 @@ async fn run_peer_health_loop_with(
                         probe_started,
                     ));
                 }
-                for (peer_id, label, reachable, roaming, probe_started) in round {
+                for (peer_id, label, reachable, _roaming, probe_started) in round {
                     if let PeerHealthAction::Recover { attempt } =
-                        tracker.on_probe(peer_id, reachable, roaming, Instant::now())
+                        tracker.on_probe(peer_id, reachable, true, Instant::now())
                     {
                         state
                             .recover_unreachable_peer(peer_id, &label, attempt, probe_started)
@@ -3569,6 +3697,29 @@ async fn process_control_request(
     let response = match request {
         ControlRequest::Status => state.status_response().await?,
         ControlRequest::ReachabilityStatus => state.reachability_status_response().await?,
+        ControlRequest::PeerEvents {
+            instance,
+            after,
+            timeout_ms,
+        } => {
+            let presence = &state.peer_connections.presence;
+            let mut changes = presence.subscribe();
+            let batch = presence.batch(instance.as_deref(), after);
+            if !batch.reset && batch.events.is_empty() && timeout_ms > 0 {
+                tokio::select! {
+                    _ = changes.changed() => {},
+                    _ = tokio::time::sleep(Duration::from_millis(timeout_ms.min(60_000))) => {},
+                    _ = state.cancel.cancelled() => {},
+                }
+            }
+            ControlResponse::PeerEvents {
+                batch: presence.batch(instance.as_deref(), after),
+            }
+        }
+        ControlRequest::Undial { peer, protocol } => {
+            state.undial(&peer, &protocol).await?;
+            ControlResponse::Ok
+        }
         ControlRequest::ReloadPeers => {
             state.reload_peers().await?;
             ControlResponse::Ok
@@ -3757,8 +3908,7 @@ async fn process_control_request(
                     crate::version_string()
                 );
             }
-            if sync_ipc_magic != sync::ipc::IPC_MAGIC
-                || sync_ipc_version != sync::ipc::IPC_VERSION
+            if sync_ipc_magic != sync::ipc::IPC_MAGIC || sync_ipc_version != sync::ipc::IPC_VERSION
             {
                 state
                     .record_sync_companion_state("incompatible", companion_socket)
@@ -4448,9 +4598,11 @@ async fn resolve_sync_peers(state: &DaemonState, peers: &SyncPeers) -> ResolvedP
         }
         SyncPeers::List(selectors) => {
             for selector in selectors {
-                match book.peers().iter().find(|p| {
-                    p.id.to_string() == *selector || p.name.as_deref() == Some(selector)
-                }) {
+                match book
+                    .peers()
+                    .iter()
+                    .find(|p| p.id.to_string() == *selector || p.name.as_deref() == Some(selector))
+                {
                     Some(peer) => resolved.peers.push(peer_ref(peer)),
                     None => resolved.unresolved.push(selector.clone()),
                 }
@@ -4670,7 +4822,7 @@ fn log_sync_connection_paths(connection: &Connection) {
     }
 }
 
-fn classify_connection_transport(connection: &Connection) -> Option<String> {
+pub(crate) fn classify_connection_transport(connection: &Connection) -> Option<String> {
     let paths = connection.paths();
     let mut selected_ip = false;
     let mut selected_relay = false;
@@ -4742,16 +4894,9 @@ async fn run_dial_socket(
                 let Ok((local, _)) = accepted else {
                     break;
                 };
-                let permit = tokio::select! {
-                    biased;
-                    _ = listener_cancel.cancelled() => break,
-                    _ = daemon_cancel.cancelled() => break,
-                    permit = dial_slots.clone().acquire_owned() => {
-                        let Ok(permit) = permit else {
-                            break;
-                        };
-                        permit
-                    }
+                let Ok(permit) = dial_slots.clone().try_acquire_owned() else {
+                    drop(local);
+                    continue;
                 };
                 let endpoint_rx = endpoint_rx.clone();
                 let home = home.clone();
@@ -4770,9 +4915,6 @@ async fn run_dial_socket(
                 ));
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if !dial_failures.wait(&backoff_key, &cancel).await {
-                        return;
-                    }
                     match
                         tunnel::run_client_connection(
                             local,
@@ -4788,9 +4930,10 @@ async fn run_dial_socket(
                             .await
                     {
                         Ok(()) => dial_failures.record_success(&backoff_key).await,
+                        Err(error) if mux::is_peer_offline(&error) => {}
                         Err(error) => {
                             dial_failures
-                                .record_failure(&backoff_key, "dial socket connection failed", &error)
+                                .record_failure_for_diagnostics(&backoff_key, "dial socket connection failed", &error)
                                 .await;
                         }
                     }
@@ -4829,16 +4972,9 @@ async fn run_resumable_dial_socket(
                 let Ok((local, _)) = accepted else {
                     break;
                 };
-                let permit = tokio::select! {
-                    biased;
-                    _ = listener_cancel.cancelled() => break,
-                    _ = daemon_cancel.cancelled() => break,
-                    permit = dial_slots.clone().acquire_owned() => {
-                        let Ok(permit) = permit else {
-                            break;
-                        };
-                        permit
-                    }
+                let Ok(permit) = dial_slots.clone().try_acquire_owned() else {
+                    drop(local);
+                    continue;
                 };
                 let endpoint_rx = endpoint_rx.clone();
                 let home = home.clone();
@@ -4854,9 +4990,6 @@ async fn run_resumable_dial_socket(
                 let recorder = recorder.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if !dial_failures.wait(&backoff_key, &cancel).await {
-                        return;
-                    }
                     let failure = format!("{} dial socket connection failed", service.name());
                     match handle_resumable_dial_socket_connection(
                         local,
@@ -4875,9 +5008,10 @@ async fn run_resumable_dial_socket(
                     .await
                     {
                         Ok(()) => dial_failures.record_success(&backoff_key).await,
+                        Err(error) if mux::is_peer_offline(&error) => {}
                         Err(error) => {
                             dial_failures
-                                .record_failure(&backoff_key, &failure, &error)
+                                .record_failure_for_diagnostics(&backoff_key, &failure, &error)
                                 .await;
                         }
                     }
@@ -4931,7 +5065,7 @@ async fn handle_resumable_dial_socket_connection(
                 endpoint.generation,
                 &current_peer_addr,
                 protocol.name(),
-                mux::StreamActivity::Application,
+                if attempt == 0 { mux::StreamActivity::Application } else { mux::StreamActivity::Probe },
             ) => connected,
         };
         match connected {
@@ -5154,6 +5288,17 @@ impl ConnectionRecorder {
     }
 
     fn record(&self, peer: &str, event: &tunnel::ClientConnectionEvent) {
+        if let tunnel::ClientConnectionEvent::Reconnecting { error, .. } = event
+            && error.contains("peer is offline")
+        {
+            self.telemetry
+                .record_absence(peer, self.path_for(peer).as_deref(), Instant::now());
+            return;
+        }
+        if matches!(event, tunnel::ClientConnectionEvent::Failed { error } if error.contains("peer is offline"))
+        {
+            return;
+        }
         let path = self.path_for(peer);
         match event {
             tunnel::ClientConnectionEvent::Reconnecting { attempt, .. } => {
@@ -5187,6 +5332,7 @@ fn generic_dial_notices(
 ) -> tunnel::ClientConnectionNotices {
     tunnel::ClientConnectionNotices::new(move |event| {
         recorder.record(&peer, event);
+        if matches!(event, tunnel::ClientConnectionEvent::Failed { error } | tunnel::ClientConnectionEvent::Reconnecting { error, .. } if error.contains("peer is offline")) { return None; }
         match event {
             tunnel::ClientConnectionEvent::Reconnecting {
                 attempt,
@@ -5246,6 +5392,7 @@ fn service_client_notices(
     let resume_failed_event = format!("{name}_session_resume_failed");
     tunnel::ClientConnectionNotices::new(move |event| {
         recorder.record(&peer, event);
+        if matches!(event, tunnel::ClientConnectionEvent::Failed { error } | tunnel::ClientConnectionEvent::Reconnecting { error, .. } if error.contains("peer is offline")) { return None; }
         match event {
             tunnel::ClientConnectionEvent::Reconnecting {
                 attempt,
@@ -5327,14 +5474,9 @@ async fn run_dial_tcp_listener(
                 let Ok((local, _)) = accepted else {
                     break;
                 };
-                let permit = tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    permit = dial_slots.clone().acquire_owned() => {
-                        let Ok(permit) = permit else {
-                            break;
-                        };
-                        permit
-                    }
+                let Ok(permit) = dial_slots.clone().try_acquire_owned() else {
+                    drop(local);
+                    continue;
                 };
                 let endpoint_rx = endpoint_rx.clone();
                 let home = home.clone();
@@ -5353,9 +5495,6 @@ async fn run_dial_tcp_listener(
                 ));
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if !dial_failures.wait(&backoff_key, &cancel).await {
-                        return;
-                    }
                     match
                         tunnel::run_client_tcp_connection(
                             local,
@@ -5371,9 +5510,10 @@ async fn run_dial_tcp_listener(
                             .await
                     {
                         Ok(()) => dial_failures.record_success(&backoff_key).await,
+                        Err(error) if mux::is_peer_offline(&error) => {}
                         Err(error) => {
                             dial_failures
-                                .record_failure(&backoff_key, "dial tcp connection failed", &error)
+                                .record_failure_for_diagnostics(&backoff_key, "dial tcp connection failed", &error)
                                 .await;
                         }
                     }
@@ -5407,31 +5547,20 @@ async fn run_raw_dial_socket(
                 let Ok((local, _)) = accepted else {
                     break;
                 };
-                let permit = tokio::select! {
-                    biased;
-                    _ = listener_cancel.cancelled() => break,
-                    _ = daemon_cancel.cancelled() => break,
-                    permit = dial_slots.clone().acquire_owned() => {
-                        let Ok(permit) = permit else {
-                            break;
-                        };
-                        permit
-                    }
+                let Ok(permit) = dial_slots.clone().try_acquire_owned() else {
+                    drop(local);
+                    continue;
                 };
                 let endpoint = endpoint_rx.borrow().clone();
                 let peer = peer.clone();
                 let peer_addr = peer_addr.clone();
                 let alpn = alpn.clone();
                 let service = service.clone();
-                let cancel = daemon_cancel.clone();
                 let dial_failures = dial_failures.clone();
                 let backoff_key = backoff_key.clone();
                 let peer_connections = peer_connections.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if !dial_failures.wait(&backoff_key, &cancel).await {
-                        return;
-                    }
                     match handle_raw_dial_socket_connection(
                         local,
                         endpoint,
@@ -5444,9 +5573,10 @@ async fn run_raw_dial_socket(
                     .await
                     {
                         Ok(()) => dial_failures.record_success(&backoff_key).await,
+                        Err(error) if mux::is_peer_offline(&error) => {}
                         Err(error) => {
                             dial_failures
-                                .record_failure(&backoff_key, "dial socket connection failed", &error)
+                                .record_failure_for_diagnostics(&backoff_key, "dial socket connection failed", &error)
                                 .await;
                         }
                     }
@@ -5548,8 +5678,8 @@ async fn pipe_unix_iroh(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync::config::{SyncEntry, SyncPolicy};
     use crate::services::{exec, shell};
+    use crate::sync::config::{SyncEntry, SyncPolicy};
     // The glob import above also brings the timestamped service-log macro,
     // which is ambiguous with the prelude's. Test diagnostics go to the test
     // harness, which captures only the standard macro.
@@ -5589,10 +5719,19 @@ mod tests {
         let mut reply = [0u8; 1];
         let read = tokio::time::timeout(Duration::from_secs(3), cli.read(&mut reply)).await;
         let bridge_result = tokio::time::timeout(Duration::from_secs(3), bridge).await;
-        assert!(read.is_ok(), "the CLI waited forever after the connection was lost");
+        assert!(
+            read.is_ok(),
+            "the CLI waited forever after the connection was lost"
+        );
         assert_eq!(read.unwrap()?, 0, "the bridge did not close its reply half");
-        assert!(bridge_result.is_ok(), "the bridge waited for the CLI to close first");
-        assert!(bridge_result.unwrap()?.is_err(), "lost reply must be reported");
+        assert!(
+            bridge_result.is_ok(),
+            "the bridge waited for the CLI to close first"
+        );
+        assert!(
+            bridge_result.unwrap()?.is_err(),
+            "lost reply must be reported"
+        );
         server.await?;
         client_endpoint.close().await;
         server_endpoint.close().await;
@@ -5624,11 +5763,8 @@ mod tests {
     async fn daemon_reports_the_frozen_sync_ipc_contract_and_the_companion_owner() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let node = FabricNode::start(FabricHome::new(dir.path())).await?;
-        let response = process_control_request(
-            ControlRequest::SyncIpcCompatibility,
-            node.state(),
-        )
-        .await?;
+        let response =
+            process_control_request(ControlRequest::SyncIpcCompatibility, node.state()).await?;
         match response {
             ControlResponse::SyncIpcCompatibility {
                 version,
@@ -5652,7 +5788,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let node = FabricNode::start(FabricHome::new(dir.path())).await?;
 
-        let runtime = process_control_request(ControlRequest::SyncRuntimeStatus, node.state()).await?;
+        let runtime =
+            process_control_request(ControlRequest::SyncRuntimeStatus, node.state()).await?;
         assert!(matches!(
             runtime,
             ControlResponse::SyncRuntimeStatus {
@@ -5713,7 +5850,10 @@ mod tests {
             } => {
                 assert_eq!(owner, "companion");
                 assert_eq!(nonce.as_deref(), Some(node.state().sync_ipc_nonce.as_str()));
-                assert_eq!(daemon_socket, Some(node.state().home.sync_ipc_socket_path()));
+                assert_eq!(
+                    daemon_socket,
+                    Some(node.state().home.sync_ipc_socket_path())
+                );
                 assert_eq!(node_id, Some(node.id().to_string()));
             }
             other => panic!("wrong hello response: {other:?}"),
@@ -5944,8 +6084,14 @@ mod tests {
             PeerHealthTracker::new(3, Duration::from_secs(30), Duration::from_secs(600));
 
         // Below threshold: no recovery yet.
-        assert_eq!(tracker.on_probe(peer, false, false, t0), PeerHealthAction::None);
-        assert_eq!(tracker.on_probe(peer, false, false, t0), PeerHealthAction::None);
+        assert_eq!(
+            tracker.on_probe(peer, false, false, t0),
+            PeerHealthAction::None
+        );
+        assert_eq!(
+            tracker.on_probe(peer, false, false, t0),
+            PeerHealthAction::None
+        );
         // Threshold (3 consecutive failures) reached: fire attempt 1.
         assert_eq!(
             tracker.on_probe(peer, false, false, t0),
@@ -5995,7 +6141,10 @@ mod tests {
         let mut tracker =
             PeerHealthTracker::new(2, Duration::from_secs(30), Duration::from_secs(600));
 
-        assert_eq!(tracker.on_probe(a, false, false, t0), PeerHealthAction::None);
+        assert_eq!(
+            tracker.on_probe(a, false, false, t0),
+            PeerHealthAction::None
+        );
         assert_eq!(tracker.on_probe(b, true, false, t0), PeerHealthAction::None);
         // A reaches its threshold and recovers; B, interleaved, is unaffected.
         assert_eq!(
@@ -6003,7 +6152,10 @@ mod tests {
             PeerHealthAction::Recover { attempt: 1 }
         );
         assert_eq!(tracker.on_probe(b, true, false, t0), PeerHealthAction::None);
-        assert_eq!(tracker.on_probe(b, false, false, t0), PeerHealthAction::None);
+        assert_eq!(
+            tracker.on_probe(b, false, false, t0),
+            PeerHealthAction::None
+        );
         assert_eq!(
             tracker.on_probe(b, false, false, t0),
             PeerHealthAction::Recover { attempt: 1 }
@@ -6405,8 +6557,7 @@ mod tests {
             PeerHealthAction::None
         );
         for expected_attempt in 1..OLD_RECYCLE_ATTEMPT {
-            let PeerHealthAction::Recover { attempt } =
-                tracker.on_probe(laptop, false, false, now)
+            let PeerHealthAction::Recover { attempt } = tracker.on_probe(laptop, false, false, now)
             else {
                 panic!("laptop did not request recovery attempt {expected_attempt}");
             };
@@ -6421,8 +6572,7 @@ mod tests {
             PeerHealthAction::None,
             "one missed vps probe must stay below its own threshold"
         );
-        let PeerHealthAction::Recover { attempt } =
-            tracker.on_probe(laptop, false, false, now)
+        let PeerHealthAction::Recover { attempt } = tracker.on_probe(laptop, false, false, now)
         else {
             panic!("laptop did not retain its independent failure history");
         };
@@ -6710,7 +6860,7 @@ mod tests {
         init_daemon_tracing(&home).unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn failure_backoff_parks_after_failure_instead_of_tight_looping() {
         let backoff = FailureBackoff::new(
             Duration::from_millis(25),
@@ -6734,7 +6884,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn failure_backoff_resets_after_success() {
         let backoff = FailureBackoff::new(
             Duration::from_millis(25),
@@ -6753,7 +6903,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn failure_backoff_can_be_cancelled_while_parked() {
         let backoff = FailureBackoff::new(
             Duration::from_secs(60),
@@ -8799,6 +8949,186 @@ mod tests {
 
         client.shutdown().await?;
         server.shutdown().await?;
+        Ok(())
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interface_address_and_wake_changes_preserve_live_sessions_and_declarations()
+    -> Result<()> {
+        let a_dir = tempfile::tempdir()?;
+        let b_dir = tempfile::tempdir()?;
+        let a_home = FabricHome::new(a_dir.path());
+        let b_home = FabricHome::new(b_dir.path());
+        let a = FabricNode::start(a_home.clone()).await?;
+        let b = FabricNode::start(b_home.clone()).await?;
+        trust_test_peer(&a_home, &a, b.id(), "client", b.addr()).await?;
+        trust_test_peer(&b_home, &b, a.id(), "server", a.addr()).await?;
+        a.expose_exec("audit/echo", vec!["/bin/cat".into()]).await?;
+        let addr = b
+            .dial_tcp("server", "audit/echo", "127.0.0.1:0".into())
+            .await?;
+        let socket = b.dial("server", "audit/echo").await?;
+        let mut live = tokio::net::TcpStream::connect(&addr).await?;
+        live.write_all(b"a").await?;
+        let mut byte = [0u8; 1];
+        tokio::time::timeout(Duration::from_secs(3), live.read_exact(&mut byte)).await??;
+        let state = b.state();
+        let held = held_connection_id(&state, a.id()).await;
+        let generation = state.endpoint_handle().generation;
+        let declarations = FabricConfig::load(&b_home)?.dials().to_vec();
+        let (updates_tx, updates_rx) = mpsc::unbounded_channel();
+        let monitor = tokio::spawn(run_rehome_updates(
+            state.clone(),
+            ScriptedUpdates(updates_rx),
+        ));
+        let mut previous = usable_network("wifi-a", true);
+        previous.local_addresses.regular = vec!["192.0.2.1".parse()?];
+        for (case, route, ip, usable, wake) in [
+            ("switch_wifi", "wifi-a", "192.0.2.2", true, false),
+            ("wifi_to_ethernet", "ethernet-a", "192.0.2.3", true, false),
+            ("vpn_up", "vpn-a", "198.51.100.1", true, false),
+            ("vpn_down", "ethernet-a", "192.0.2.3", true, false),
+            ("rotate_ipv6", "ethernet-a", "2001:db8::2", true, false),
+            ("nat_rebinding", "ethernet-a", "192.0.2.4", true, false),
+            ("captive_portal", "ethernet-a", "192.0.2.4", false, false),
+            ("portal_cleared", "ethernet-a", "192.0.2.4", true, false),
+            ("sleep", "ethernet-a", "192.0.2.4", false, false),
+            ("wake", "ethernet-a", "192.0.2.4", true, true),
+            (
+                "server_uplink_lost",
+                "ethernet-a",
+                "192.0.2.4",
+                false,
+                false,
+            ),
+            (
+                "server_uplink_returned",
+                "ethernet-a",
+                "192.0.2.4",
+                true,
+                false,
+            ),
+        ] {
+            previous.default_route_interface = usable.then(|| route.into());
+            previous.local_addresses.regular = vec![ip.parse()?];
+            previous.last_unsuspend = wake.then(tokio::time::Instant::now);
+            updates_tx.send(previous.clone())?;
+            tokio::time::sleep(NETWORK_CHANGE_DEBOUNCE + Duration::from_millis(100)).await;
+            tokio::time::timeout(Duration::from_secs(3), async {
+                live.write_all(b"b").await?;
+                live.read_exact(&mut byte).await?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .with_context(|| format!("{case} lost a live session"))??;
+            assert_eq!(byte, *b"b", "{case}");
+            assert_eq!(
+                held_connection_id(&state, a.id()).await,
+                held,
+                "{case} replaced a usable connection"
+            );
+            assert_eq!(
+                state.endpoint_handle().generation,
+                generation,
+                "{case} rebuilt the endpoint"
+            );
+            assert_eq!(
+                FabricConfig::load(&b_home)?.dials(),
+                declarations,
+                "{case} lost a declaration"
+            );
+            assert!(socket.exists(), "{case} lost the Unix listener");
+        }
+        drop(live);
+        drop(updates_tx);
+        b.shutdown().await?;
+        monitor.await??;
+        a.shutdown().await?;
+        Ok(())
+    }
+
+    /// Virtual elapsed time with real isolated endpoints and local listeners.
+    /// The returning daemon binds a new UDP address with the same identity;
+    /// the waiting daemon is never reconfigured or restarted.
+    #[tokio::test]
+    async fn a_peer_returns_after_minutes_and_hours_without_errors_or_a_helper() -> Result<()> {
+        let a_dir = tempfile::tempdir()?;
+        let b_dir = tempfile::tempdir()?;
+        let a_home = FabricHome::new(a_dir.path());
+        let b_home = FabricHome::new(b_dir.path());
+        let mut a = FabricNode::start(a_home.clone()).await?;
+        let b = FabricNode::start(b_home.clone()).await?;
+        trust_test_peer(&a_home, &a, b.id(), "client", b.addr()).await?;
+        trust_test_peer(&b_home, &b, a.id(), "server", a.addr()).await?;
+        a.expose_exec("audit/echo", vec!["/bin/cat".into()]).await?;
+        let addr = b
+            .dial_tcp("server", "audit/echo", "127.0.0.1:0".into())
+            .await?;
+        for outage in [
+            Duration::from_secs(5 * 60),
+            Duration::from_secs(4 * 60 * 60),
+        ] {
+            let mut online = tokio::net::TcpStream::connect(&addr).await?;
+            online.write_all(b"x").await?;
+            let mut byte = [0u8; 1];
+            tokio::time::timeout(Duration::from_secs(3), online.read_exact(&mut byte)).await??;
+            drop(online);
+            let peer = a.id();
+            a.shutdown().await?;
+            let state = b.state();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !state.peer_connections.presence.offline(peer) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            let failures_before = state
+                .telemetry
+                .peer("server")
+                .map_or(0, |stats| stats.resume_failures);
+            tokio::time::pause();
+            tokio::time::advance(outage).await;
+            for _ in 0..8 {
+                let mut offline = tokio::net::TcpStream::connect(&addr).await?;
+                let result =
+                    tokio::time::timeout(Duration::from_millis(200), offline.read(&mut byte)).await;
+                assert!(
+                    matches!(result, Ok(Ok(0)) | Ok(Err(_))),
+                    "cached offline request hung after {outage:?}"
+                );
+            }
+            tokio::time::resume();
+            assert_eq!(
+                state
+                    .telemetry
+                    .peer("server")
+                    .map_or(0, |stats| stats.resume_failures),
+                failures_before,
+                "absence was counted as a failure"
+            );
+            let returned = Instant::now();
+            a = FabricNode::start(a_home.clone()).await?;
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if !state.peer_connections.presence.offline(peer) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                let mut live = tokio::net::TcpStream::connect(&addr).await?;
+                live.write_all(b"y").await?;
+                live.read_exact(&mut byte).await?;
+                assert_eq!(byte, *b"y");
+                Ok::<_, anyhow::Error>(())
+            })
+            .await??;
+            assert!(returned.elapsed() < Duration::from_secs(5));
+            println!(
+                "outage={outage:?} virtual; real return tunnel={:?}",
+                returned.elapsed()
+            );
+        }
+        b.shutdown().await?;
+        a.shutdown().await?;
         Ok(())
     }
 }
