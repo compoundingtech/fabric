@@ -188,14 +188,14 @@ struct FailureBackoff {
 #[derive(Debug)]
 struct FailureBackoffState {
     consecutive_failures: usize,
-    not_before: Instant,
+    not_before: tokio::time::Instant,
     last_delay: Duration,
-    last_log: Option<Instant>,
+    last_log: Option<tokio::time::Instant>,
     suppressed: usize,
 }
 
 impl FailureBackoffState {
-    fn new(now: Instant) -> Self {
+    fn new(now: tokio::time::Instant) -> Self {
         Self {
             consecutive_failures: 0,
             not_before: now,
@@ -213,7 +213,7 @@ impl FailureBackoffState {
     /// keeping the streak would charge a stale escalation to their next attempt.
     /// The grace period is derived from the delay this record itself produced, so
     /// there is no separate number to tune.
-    fn is_idle(&self, now: Instant) -> bool {
+    fn is_idle(&self, now: tokio::time::Instant) -> bool {
         now.saturating_duration_since(self.not_before) >= self.last_delay
     }
 }
@@ -231,14 +231,14 @@ impl FailureBackoff {
     /// Drop records that carry no streak and no remaining delay. The live key
     /// space is bounded by trusted peers times ALPNs, both of which come from
     /// config, so this needs no cap of its own.
-    fn prune(states: &mut HashMap<BackoffKey, FailureBackoffState>, now: Instant) {
+    fn prune(states: &mut HashMap<BackoffKey, FailureBackoffState>, now: tokio::time::Instant) {
         states.retain(|_, state| !state.is_idle(now));
     }
 
     async fn wait(&self, key: &BackoffKey, cancel: &CancellationToken) -> bool {
         loop {
             let delay = {
-                let now = Instant::now();
+                let now = tokio::time::Instant::now();
                 let mut states = self.states.lock().await;
                 Self::prune(&mut states, now);
                 states
@@ -257,7 +257,7 @@ impl FailureBackoff {
     }
 
     async fn record_success(&self, key: &BackoffKey) {
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
         let mut states = self.states.lock().await;
         states.remove(key);
         Self::prune(&mut states, now);
@@ -294,7 +294,7 @@ impl FailureBackoff {
         delays_next_attempt: bool,
     ) {
         let (delay, consecutive_failures, suppressed, should_log) = {
-            let now = Instant::now();
+            let now = tokio::time::Instant::now();
             let mut states = self.states.lock().await;
             let state = states
                 .entry(key.clone())
@@ -6860,7 +6860,7 @@ mod tests {
         init_daemon_tracing(&home).unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn failure_backoff_parks_after_failure_instead_of_tight_looping() {
         let backoff = FailureBackoff::new(
             Duration::from_millis(25),
@@ -6884,7 +6884,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn failure_backoff_resets_after_success() {
         let backoff = FailureBackoff::new(
             Duration::from_millis(25),
@@ -6903,7 +6903,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn failure_backoff_can_be_cancelled_while_parked() {
         let backoff = FailureBackoff::new(
             Duration::from_secs(60),
