@@ -490,6 +490,12 @@ That compatibility asset requires `fabric update --url ... --sha256 ...`.
 macOS, launchd owns a transient one-shot job across terminal loss and system
 sleep. The job removes itself after a successful restart or a rollback.
 
+An update that `fabric exec` or `fabric shell` started on a Mac runs inside the
+daemon it restarts, so it hands the restart to a process in a session of its
+own (log: `logs/update-restart.log` in the fabric home) and returns; the
+verifier above still confirms the new version or rolls back. A release whose
+bytes equal the installed pair installs nothing and restarts nothing.
+
 ```sh
 set -eu
 

@@ -1550,6 +1550,10 @@ pub async fn run(home: &crate::config::FabricHome, options: UpdateOptions) -> Re
     println!("checksum\tok");
 
     let binaries = extract_release_binaries(&archive)?;
+    if release_matches_installed(&binaries, &installed_path, &companion_path) {
+        println!("up to date: the release holds exactly the installed bytes");
+        return Ok(0);
+    }
     let stamp = timestamp();
     let staged = stage_binary(&installed_path, &binaries.fabric, &stamp)?;
     let staged_companion = match binaries.fabric_sync.as_deref() {
@@ -1697,6 +1701,97 @@ pub async fn run(home: &crate::config::FabricHome, options: UpdateOptions) -> Re
         staged_companion.is_some(),
     )?;
     Ok(0)
+}
+
+/// Whether the release holds exactly the bytes already installed.
+///
+/// Installing them would change nothing but restart the daemon, and the macOS
+/// supervisor notices that a replacement started only when the installed
+/// binary differs from its rollback copy. With identical bytes it took an
+/// updater that died during the restart for one that never began, and left
+/// the daemon stopped.
+fn release_matches_installed(
+    binaries: &ReleaseBinaries,
+    installed: &Path,
+    companion: &Path,
+) -> bool {
+    let holds = |path: &Path, bytes: &[u8]| {
+        std::fs::read(path).is_ok_and(|current| current.as_slice() == bytes)
+    };
+    holds(installed, &binaries.fabric)
+        && match &binaries.fabric_sync {
+            Some(bytes) => holds(companion, bytes),
+            None => !companion.exists(),
+        }
+}
+
+/// Whether the service restart must run outside this process.
+///
+/// A command that `fabric exec` or `fabric shell` started is the daemon's own
+/// descendant. On macOS the restart stops the daemon, which ends the commands
+/// and shells it started, and launchd ends what is left of its process group.
+/// An updater that restarted the service itself was killed part way, after the
+/// old daemon stopped and before the new one started. On Linux the restart is
+/// already handed to systemd as a transient unit.
+fn restart_must_detach(is_macos: bool, env: impl Fn(&str) -> Option<String>) -> bool {
+    is_macos
+        && ["FABRIC_EXEC", "FABRIC_SHELL"]
+            .iter()
+            .any(|key| env(key).as_deref() == Some("1"))
+}
+
+/// The restart a detached process performs: the managed binary's own service
+/// install, which every release has, so a rollback to an older build restarts
+/// the same way.
+fn detached_restart_argv(home: &Path) -> Vec<String> {
+    vec![
+        "--home".into(),
+        home.display().to_string(),
+        "service".into(),
+        "install".into(),
+    ]
+}
+
+/// Start the restart in a session of its own, so nothing that stops the daemon
+/// can stop it. Returns its pid and the log it writes to.
+#[cfg(unix)]
+fn spawn_detached_restart(
+    home: &crate::config::FabricHome,
+    managed: &Path,
+) -> Result<(u32, PathBuf)> {
+    use std::os::unix::process::CommandExt;
+    let log = home.root().join("logs").join("update-restart.log");
+    if let Some(parent) = log.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .with_context(|| format!("failed to open {}", log.display()))?;
+    let err = out.try_clone()?;
+    let mut command = std::process::Command::new(managed);
+    command
+        .args(detached_restart_argv(home.root()))
+        .stdin(std::process::Stdio::null())
+        .stdout(out)
+        .stderr(err);
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().with_context(|| {
+        format!(
+            "failed to start {} to restart the service",
+            managed.display()
+        )
+    })?;
+    Ok((child.id(), log))
 }
 
 /// Work out where the bytes come from, what hash they must have, and what
@@ -1895,13 +1990,23 @@ fn finish(
         macos_signing_identity: None,
     };
     let supervised = rollback.exists();
-    crate::service::install_at_for_update(
-        home,
-        &managed,
-        install_options,
-        companion_exists,
-        supervised,
-    )?;
+    if restart_must_detach(cfg!(target_os = "macos"), |key| std::env::var(key).ok()) {
+        let _ = (install_options, companion_exists);
+        let (pid, log) = spawn_detached_restart(home, &managed)?;
+        println!(
+            "restart\thanded to process {pid}, which outlives this one because this update runs \
+             inside fabric; log {}",
+            log.display()
+        );
+    } else {
+        crate::service::install_at_for_update(
+            home,
+            &managed,
+            install_options,
+            companion_exists,
+            supervised,
+        )?;
+    }
     schedule_supervisor(home, rollback, generation, expect)?;
     if supervised {
         let previous = binary_version(rollback).unwrap_or_else(|_| "the previous version".into());
@@ -1917,6 +2022,141 @@ fn finish(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An install that would change no bytes must not restart anything: the
+    /// macOS supervisor cannot tell it from an install that never began.
+    #[test]
+    fn a_release_identical_to_the_installed_pair_installs_nothing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let fabric = dir.path().join("fabric");
+        let companion = dir.path().join("fabric-sync");
+        std::fs::write(&fabric, b"fabric 1")?;
+        std::fs::write(&companion, b"sync 1")?;
+        let release = |fabric: &[u8], sync: Option<&[u8]>| ReleaseBinaries {
+            fabric: fabric.to_vec(),
+            fabric_sync: sync.map(<[u8]>::to_vec),
+        };
+
+        assert!(release_matches_installed(
+            &release(b"fabric 1", Some(b"sync 1")),
+            &fabric,
+            &companion
+        ));
+        assert!(!release_matches_installed(
+            &release(b"fabric 2", Some(b"sync 1")),
+            &fabric,
+            &companion
+        ));
+        assert!(!release_matches_installed(
+            &release(b"fabric 1", Some(b"sync 2")),
+            &fabric,
+            &companion
+        ));
+        // A fabric-only release removes the installed companion: a change.
+        assert!(!release_matches_installed(
+            &release(b"fabric 1", None),
+            &fabric,
+            &companion
+        ));
+        std::fs::remove_file(&companion)?;
+        assert!(release_matches_installed(
+            &release(b"fabric 1", None),
+            &fabric,
+            &companion
+        ));
+        assert!(!release_matches_installed(
+            &release(b"fabric 1", Some(b"sync 1")),
+            &fabric,
+            &companion
+        ));
+        std::fs::remove_file(&fabric)?;
+        assert!(!release_matches_installed(
+            &release(b"fabric 1", None),
+            &fabric,
+            &companion
+        ));
+        Ok(())
+    }
+
+    /// Only an updater that the daemon itself started, on macOS, hands its
+    /// restart away. Run from a terminal it still restarts in place and
+    /// reports a failure directly.
+    #[test]
+    fn only_an_update_running_inside_fabric_on_macos_detaches_its_restart() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        assert!(restart_must_detach(true, env(&[("FABRIC_EXEC", "1")])));
+        assert!(restart_must_detach(true, env(&[("FABRIC_SHELL", "1")])));
+        assert!(!restart_must_detach(true, env(&[])));
+        assert!(!restart_must_detach(true, env(&[("FABRIC_EXEC", "0")])));
+        assert!(!restart_must_detach(false, env(&[("FABRIC_EXEC", "1")])));
+        assert!(!restart_must_detach(false, env(&[("FABRIC_SHELL", "1")])));
+    }
+
+    /// The restart process leads a process group of its own (setsid makes it
+    /// a session and group leader), so neither the daemon's shutdown nor
+    /// launchd's cleanup of the daemon's process group reaches it.
+    #[cfg(unix)]
+    #[test]
+    fn the_detached_restart_leads_its_own_process_group() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        let home = crate::config::FabricHome::new(dir.path().join("home"));
+        // Stands in for the managed binary: records its process group and the
+        // arguments it was given.
+        let managed = dir.path().join("fabric");
+        let marker = dir.path().join("restart.txt");
+        std::fs::write(
+            &managed,
+            format!(
+                "#!/bin/sh\nprintf '%s %s\\n' \"$(ps -o pgid= -p $$ | tr -d ' ')\" \"$*\" > '{}'\n",
+                marker.display()
+            ),
+        )?;
+        std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o755))?;
+
+        let (pid, log) = spawn_detached_restart(&home, &managed)?;
+        assert!(log.starts_with(home.root()), "{}", log.display());
+        let started = std::time::Instant::now();
+        while std::fs::read_to_string(&marker).map_or(true, |seen| seen.is_empty()) {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the detached restart never ran"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let seen = std::fs::read_to_string(&marker)?;
+        let group: i32 = seen.split_whitespace().next().unwrap_or_default().parse()?;
+        assert_eq!(group, pid as i32, "the restart does not lead its own group");
+        assert_ne!(
+            group,
+            unsafe { libc::getpgrp() },
+            "the restart shares this process's group"
+        );
+        assert!(seen.contains("service install"), "{seen}");
+        Ok(())
+    }
+
+    /// The detached restart is a plain service install, which every release
+    /// has, so a rollback to an older build restarts the same way.
+    #[test]
+    fn the_detached_restart_is_the_managed_binarys_own_service_install() {
+        assert_eq!(
+            detached_restart_argv(Path::new("/Users/alex/.local/share/fabric")),
+            [
+                "--home",
+                "/Users/alex/.local/share/fabric",
+                "service",
+                "install"
+            ]
+        );
+    }
 
     #[test]
     fn pending_verification_names_the_command_bound_and_outcomes() {
