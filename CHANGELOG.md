@@ -4,6 +4,13 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+## [0.2.25] - 2026-10-01
+
+### Changed
+
+- No functional change. Released to check, on a Mac running the signed app,
+  that an update keeps the privacy permissions macOS granted before it.
+
 ## [0.2.24] - 2026-10-01
 
 ### Added
