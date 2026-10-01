@@ -1758,7 +1758,7 @@ async fn ctrl_c_ends_a_shell_waiting_for_an_away_peer() -> Result<()> {
 /// laptop.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_shell_starts_soon_after_an_away_peer_returns() -> Result<()> {
+async fn a_shell_starts_once_an_away_peer_returns() -> Result<()> {
     let (_server_dir, _client_dir, server_home, client_home, server, client) =
         pty_shell_pair().await?;
     let client_id = client.id();
