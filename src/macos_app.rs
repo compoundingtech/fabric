@@ -120,6 +120,21 @@ pub fn payload_digest(fabric: &Path, companion: Option<&Path>) -> Result<String>
         .collect())
 }
 
+/// What the macOS service runs, as `fabric doctor` reports it. Only asked when
+/// a signing identity is configured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppState {
+    /// The service runs the app, and the app is the installed build signed with
+    /// the configured identity.
+    Current { identity: String },
+    /// An identity is configured, but the service runs the installed binary
+    /// directly, so macOS asks again after each update.
+    PlainBinary,
+    /// The service runs an app that is not the installed build signed with the
+    /// configured identity.
+    Stale,
+}
+
 /// `CFBundleShortVersionString` takes numbers and dots only.
 fn bundle_version(version: &str) -> &str {
     version.split(['+', '-', ' ']).next().unwrap_or(version)
@@ -184,7 +199,7 @@ fn xml_escape(value: &str) -> String {
 }
 
 #[cfg(target_os = "macos")]
-pub use platform::{payload_for_app_executable, prepare, remove};
+pub use platform::{payload_for_app_executable, prepare, remove, state};
 
 #[cfg(target_os = "macos")]
 mod platform {
@@ -197,8 +212,8 @@ mod platform {
     use anyhow::{Context, Result, bail};
 
     use super::{
-        BUNDLE_ID, DIGEST_KEY, IDENTITY_KEY, PAYLOAD_KEY, SYNC_IDENTIFIER, executable_dir,
-        is_app_executable, payload_digest, render_info_plist,
+        AppState, BUNDLE_ID, DIGEST_KEY, IDENTITY_KEY, PAYLOAD_KEY, SYNC_IDENTIFIER,
+        executable_dir, is_app_executable, payload_digest, render_info_plist,
     };
 
     const CODESIGN: &str = "/usr/bin/codesign";
@@ -271,6 +286,34 @@ mod platform {
         match std::fs::remove_dir_all(bundle) {
             Ok(()) => println!("app\t{} removed", bundle.display()),
             Err(error) => eprintln!("WARNING: could not remove {}: {error}", bundle.display()),
+        }
+    }
+
+    /// Whether the service at `launch_agent` runs `bundle`, and whether that
+    /// app is `payload` signed with `identity`.
+    pub fn state(bundle: &Path, launch_agent: &Path, payload: &Path, identity: &str) -> AppState {
+        let program = Command::new("/usr/bin/plutil")
+            .args(["-extract", "Program", "raw", "-o", "-"])
+            .arg(launch_agent)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()));
+        let Some(program) = program else {
+            return AppState::PlainBinary;
+        };
+        if program != executable_dir(bundle).join("fabric") {
+            return AppState::Stale;
+        }
+        let companion = payload.with_file_name("fabric-sync");
+        let companion = companion.is_file().then_some(companion.as_path());
+        match payload_digest(payload, companion) {
+            Ok(digest) if bundle_is_current(bundle, payload, &digest, identity) => {
+                AppState::Current {
+                    identity: identity.to_string(),
+                }
+            }
+            _ => AppState::Stale,
         }
     }
 
@@ -896,6 +939,53 @@ mod platform {
                 .filter(|name| name != "Fabric.app")
                 .collect();
             assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+        }
+
+        /// Doctor's reading follows what launchd runs, not what is on disk.
+        #[test]
+        fn the_state_follows_the_launch_agent_and_the_installed_build() {
+            let identity = scratch_identity();
+            let installed = tempfile::tempdir().unwrap();
+            let apps = tempfile::tempdir().unwrap();
+            let bundle = apps.path().join("Fabric.app");
+            let payload = write_payload(installed.path(), "0.0.8");
+            sign(&bundle, &payload, &identity, &identity.sha1).unwrap();
+
+            let agent = apps.path().join("agent.plist");
+            let write_agent = |program: Option<&Path>| {
+                let program = program
+                    .map(|program| {
+                        format!("<key>Program</key><string>{}</string>", program.display())
+                    })
+                    .unwrap_or_default();
+                std::fs::write(
+                    &agent,
+                    format!(
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\
+                         <dict><key>Label</key><string>test</string>{program}</dict></plist>\n"
+                    ),
+                )
+                .unwrap();
+            };
+
+            write_agent(None);
+            assert_eq!(
+                state(&bundle, &agent, &payload, &identity.sha1),
+                AppState::PlainBinary
+            );
+            write_agent(Some(&executable_dir(&bundle).join("fabric")));
+            assert_eq!(
+                state(&bundle, &agent, &payload, &identity.sha1),
+                AppState::Current {
+                    identity: identity.sha1.clone()
+                }
+            );
+            // A newer installed build that the app does not mirror yet.
+            write_payload(installed.path(), "0.0.9");
+            assert_eq!(
+                state(&bundle, &agent, &payload, &identity.sha1),
+                AppState::Stale
+            );
         }
 
         /// A person's own app at that path is never replaced or removed.
