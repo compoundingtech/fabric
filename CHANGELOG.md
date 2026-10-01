@@ -4,6 +4,20 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+## [0.2.30] - 2026-10-01
+
+### Fixed
+
+- Ctrl-C ends `fabric shell` while it waits: for a connection, a protocol
+  probe, or a reconnect. The terminal is raw, so the key reached a daemon that
+  was not reading, and a person waiting on an away peer could not get out. The
+  terminal is put back on the way out, and the exit status is 130.
+- A peer that is away is waited for, not reported as offline. The shell says
+  `waiting for a connection to the peer (Ns so far); trying again in Xs;
+  Ctrl-C stops`, and a first session gives up after two minutes with a
+  sentence instead of holding the terminal (`FABRIC_SHELL_CONNECT_DEADLINE_SECS`
+  overrides the bound). Each attempt to open the session is bounded at 10 s.
+
 ## [0.2.29] - 2026-10-01
 
 ### Fixed
