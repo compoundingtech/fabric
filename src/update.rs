@@ -1752,12 +1752,29 @@ fn detached_restart_argv(home: &Path) -> Vec<String> {
     ]
 }
 
+/// Waits for the updater to exit, then becomes the restart. Restarting at
+/// once raced the updater: the daemon could stop before the updater's exit
+/// status reached the `fabric exec` caller, which then saw a closed stream and
+/// no status from an update that had worked. The wait has a bound, so an
+/// updater that does not exit cannot hold the restart back.
+const RESTART_AFTER_UPDATER: &str = r#"updater=$1
+shift
+waited=0
+while kill -0 "$updater" 2>/dev/null && [ "$waited" -lt 150 ]; do
+    /bin/sleep 0.2
+    waited=$((waited + 1))
+done
+exec "$@"
+"#;
+
 /// Start the restart in a session of its own, so nothing that stops the daemon
-/// can stop it. Returns its pid and the log it writes to.
+/// can stop it, once process `updater` has exited. Returns its pid and the log
+/// it writes to.
 #[cfg(unix)]
 fn spawn_detached_restart(
     home: &crate::config::FabricHome,
     managed: &Path,
+    updater: u32,
 ) -> Result<(u32, PathBuf)> {
     use std::os::unix::process::CommandExt;
     let log = home.root().join("logs").join("update-restart.log");
@@ -1771,8 +1788,11 @@ fn spawn_detached_restart(
         .open(&log)
         .with_context(|| format!("failed to open {}", log.display()))?;
     let err = out.try_clone()?;
-    let mut command = std::process::Command::new(managed);
+    let mut command = std::process::Command::new("/bin/sh");
     command
+        .args(["-c", RESTART_AFTER_UPDATER, "fabric-update-restart"])
+        .arg(updater.to_string())
+        .arg(managed)
         .args(detached_restart_argv(home.root()))
         .stdin(std::process::Stdio::null())
         .stdout(out)
@@ -1992,7 +2012,7 @@ fn finish(
     let supervised = rollback.exists();
     if restart_must_detach(cfg!(target_os = "macos"), |key| std::env::var(key).ok()) {
         let _ = (install_options, companion_exists);
-        let (pid, log) = spawn_detached_restart(home, &managed)?;
+        let (pid, log) = spawn_detached_restart(home, &managed, std::process::id())?;
         println!(
             "restart\thanded to process {pid}, which outlives this one because this update runs \
              inside fabric; log {}",
@@ -2121,7 +2141,11 @@ mod tests {
         )?;
         std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o755))?;
 
-        let (pid, log) = spawn_detached_restart(&home, &managed)?;
+        // An updater that has already exited: the restart runs at once.
+        let mut finished = std::process::Command::new("/usr/bin/true").spawn()?;
+        let finished_pid = finished.id();
+        finished.wait()?;
+        let (pid, log) = spawn_detached_restart(&home, &managed, finished_pid)?;
         assert!(log.starts_with(home.root()), "{}", log.display());
         let started = std::time::Instant::now();
         while std::fs::read_to_string(&marker).map_or(true, |seen| seen.is_empty()) {
@@ -2140,6 +2164,41 @@ mod tests {
             "the restart shares this process's group"
         );
         assert!(seen.contains("service install"), "{seen}");
+        Ok(())
+    }
+
+    /// The restart does not begin while the updater is still running, so the
+    /// updater's exit status reaches its caller before the daemon stops.
+    #[cfg(unix)]
+    #[test]
+    fn the_detached_restart_waits_for_the_updater_to_exit() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        let home = crate::config::FabricHome::new(dir.path().join("home"));
+        let managed = dir.path().join("fabric");
+        let marker = dir.path().join("restarted");
+        std::fs::write(
+            &managed,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )?;
+        std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o755))?;
+
+        let mut updater = std::process::Command::new("/bin/sleep").arg("1").spawn()?;
+        spawn_detached_restart(&home, &managed, updater.id())?;
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        assert!(
+            !marker.exists(),
+            "the restart began while the updater was still running"
+        );
+        updater.wait()?;
+        let started = std::time::Instant::now();
+        while !marker.exists() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the restart did not begin after the updater exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
         Ok(())
     }
 
