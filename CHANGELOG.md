@@ -4,6 +4,22 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+## [0.2.27] - 2026-10-01
+
+### Fixed
+
+- An update that `fabric exec` or `fabric shell` started on a Mac now
+  completes. The restart stopped the daemon that the updater ran under, which
+  killed the updater before it started the new daemon, and the verifier then
+  rolled the update back. The restart now runs as the managed binary's own
+  `service install` in a session of its own, with its output in
+  `logs/update-restart.log`, and the verifier confirms the new version or rolls
+  back as before.
+- A release whose bytes equal the installed pair installs and restarts nothing.
+  Run through `fabric exec` on a Mac, such an update used to leave the daemon
+  stopped, because the verifier could not tell it from an update that never
+  began.
+
 ## [0.2.26] - 2026-10-01
 
 ### Changed
