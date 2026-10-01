@@ -4,6 +4,15 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+## [0.2.29] - 2026-10-01
+
+### Fixed
+
+- An update run through `fabric exec` on a Mac returns its exit status. The
+  restart it hands to a detached process now waits for the updater to exit (at
+  most 30 seconds) before it stops the daemon, so the caller no longer sees the
+  exec stream close without a status after an update that worked.
+
 ## [0.2.28] - 2026-10-01
 
 ### Changed
