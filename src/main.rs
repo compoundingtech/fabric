@@ -459,6 +459,19 @@ enum ServiceCommands {
         /// Remove a previously persisted memory ceiling.
         #[arg(long)]
         no_memory_max_mb: bool,
+        /// macOS: the SHA-1 of a code-signing certificate, as `security
+        /// find-identity -v -p codesigning` prints it. The service then runs a
+        /// copy of fabric in ~/Applications/Fabric.app signed with it, so macOS
+        /// keeps its privacy permissions across updates. Remembered.
+        #[arg(
+            long,
+            value_name = "SHA1",
+            conflicts_with = "no_macos_signing_identity"
+        )]
+        macos_signing_identity: Option<String>,
+        /// Stop signing, and run the installed binary directly again.
+        #[arg(long)]
+        no_macos_signing_identity: bool,
     },
     /// Show native service-manager status.
     Status,
@@ -1116,13 +1129,19 @@ async fn main() -> Result<()> {
                         no_allow_exec,
                         memory_max_mb,
                         no_memory_max_mb,
+                        macos_signing_identity,
+                        no_macos_signing_identity,
                     } => {
                         service::install(
                             &home,
                             ServiceInstallOptions {
                                 allow_shell: allow_override(allow_shell, no_allow_shell),
                                 allow_exec: allow_override(allow_exec, no_allow_exec),
-                                memory_max_mb: memory_override(memory_max_mb, no_memory_max_mb),
+                                memory_max_mb: optional_override(memory_max_mb, no_memory_max_mb),
+                                macos_signing_identity: optional_override(
+                                    macos_signing_identity,
+                                    no_macos_signing_identity,
+                                ),
                             },
                         )?;
                     }
@@ -2350,8 +2369,8 @@ fn joined_or_dash(values: &[String]) -> String {
 /// enable, `Some(false)` to explicitly disable, `None` to leave the persisted
 /// value untouched. Shared by the shell and exec allow flags.
 /// The same tri-state as `allow_override`, for a value that is itself optional.
-/// Nothing said keeps the persisted ceiling; `--no-memory-max-mb` clears it.
-fn memory_override(value: Option<u64>, clear: bool) -> Option<Option<u64>> {
+/// Nothing said keeps the persisted value; the `--no-` flag clears it.
+fn optional_override<T>(value: Option<T>, clear: bool) -> Option<Option<T>> {
     if clear {
         return Some(None);
     }

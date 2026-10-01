@@ -357,6 +357,27 @@ because a healthy working set has not been measured, and a ceiling nobody chose
 kills the daemon at a number nobody chose. (This README used to say the default
 was 1 GiB. It was not.)
 
+On macOS, every command that `fabric exec` runs counts as the daemon's for
+privacy permissions (Desktop, Documents, Downloads, Photos, local network).
+macOS remembers each permission against the program's code signature, and a
+release binary is ad hoc signed, so every update is a new program and the
+prompts return. Give the service a code-signing identity to stop that:
+
+```sh
+security find-identity -v -p codesigning            # pick one, copy its SHA-1
+fabric service install --macos-signing-identity <SHA1>
+```
+
+The service then runs a copy of the installed pair inside
+`~/Applications/Fabric.app`, signed with that identity under one identifier, and
+macOS keeps the permissions across updates. The identity is remembered, so
+`fabric update` re-signs each new build the same way; an install that changes
+no bytes leaves the app untouched. The installed binaries stay where they were
+and the updater still replaces and rolls back those. If signing fails, the
+service runs the installed binary directly and says so.
+`--no-macos-signing-identity` goes back to that and removes the app.
+The first start of the signed app asks for each permission one last time.
+
 If you set a ceiling, leave headroom above the measured healthy working set.
 Fabric never recycles an endpoint because of RSS. On glibc Linux, each new
 128 MiB RSS growth step asks the allocator to return pages it already considers
@@ -1010,7 +1031,7 @@ tight. Remove `shell` from that peer's array and reload the file to turn shell
 off.
 
 ```sh
-fabric service install [--memory-max-mb N]
+fabric service install [--memory-max-mb N] [--macos-signing-identity SHA1]
 fabric service status
 fabric service uninstall
 ```
@@ -1027,8 +1048,8 @@ everything else.
 `status` reports `fabric.service` and `fabric-sync.service` on Linux. It reports
 `com.compoundingtech.fabric` and `com.compoundingtech.fabric-sync` on macOS.
 `uninstall` stops the companion first, then the daemon. It removes only the
-systemd or launchd artifacts. It leaves the fabric home, identity, peers, logs,
-and config in place.
+systemd or launchd artifacts, and on macOS the signed `Fabric.app` it built. It
+leaves the fabric home, identity, peers, logs, and config in place.
 
 No memory ceiling is set unless `--memory-max-mb` is passed, and
 `--no-memory-max-mb` removes one that was. The shell and exec flags remain

@@ -1253,6 +1253,11 @@ pub struct FabricConfig {
     /// drops an unpersisted ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     memory_max_mb: Option<u64>,
+    /// The certificate hash the macOS service's app is signed with. Kept here
+    /// for the same reason as the ceiling above: an update re-renders the
+    /// service without naming it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    macos_signing_identity: Option<String>,
     #[serde(default)]
     server_sessions: ServerSessionConfig,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1338,6 +1343,14 @@ impl FabricConfig {
     /// `None` clears the ceiling, which is what `--no-memory-max-mb` asks for.
     pub fn set_memory_max_mb(&mut self, memory_max_mb: Option<u64>) {
         self.memory_max_mb = memory_max_mb;
+    }
+
+    pub fn macos_signing_identity(&self) -> Option<&str> {
+        self.macos_signing_identity.as_deref()
+    }
+
+    pub fn set_macos_signing_identity(&mut self, identity: Option<String>) {
+        self.macos_signing_identity = identity;
     }
 
     pub fn dials(&self) -> &[PersistedDial] {

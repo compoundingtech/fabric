@@ -1892,6 +1892,7 @@ fn finish(
         allow_shell: None,
         allow_exec: None,
         memory_max_mb: None,
+        macos_signing_identity: None,
     };
     let supervised = rollback.exists();
     crate::service::install_at_for_update(
