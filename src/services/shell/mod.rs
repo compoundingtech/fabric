@@ -3,7 +3,12 @@
 
 use std::{
     io::{Read, Write},
-    sync::mpsc as std_mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc as std_mpsc,
+    },
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -163,6 +168,45 @@ impl Service for Shell {
     }
 }
 
+/// How long a hung-up shell gets to exit on its own before it is killed.
+const SHELL_HANGUP_GRACE: Duration = Duration::from_secs(2);
+
+/// Hangs the shell up however its session ends.
+///
+/// The cleanup at the end of a session runs only when the session future runs
+/// to completion. A daemon that shuts down drops the future instead, and a
+/// shell left running keeps the session's blocking PTY reader and child wait
+/// alive. A tokio runtime does not finish dropping until every blocking task
+/// has returned, so the daemon could not exit. A hang-up is what a shell
+/// expects when its terminal goes away: SIGHUP, then SIGKILL if it is still
+/// there after a grace period.
+///
+/// Nothing is sent once the child has been reaped, so a reused pid is never
+/// signalled.
+struct HangUpOnDrop {
+    pid: Option<libc::pid_t>,
+    reaped: Arc<AtomicBool>,
+}
+
+impl Drop for HangUpOnDrop {
+    fn drop(&mut self) {
+        let Some(pid) = self.pid.take() else {
+            return;
+        };
+        if self.reaped.load(Ordering::SeqCst) {
+            return;
+        }
+        unsafe { libc::kill(pid, libc::SIGHUP) };
+        let reaped = self.reaped.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(SHELL_HANGUP_GRACE);
+            if !reaped.load(Ordering::SeqCst) {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        });
+    }
+}
+
 pub async fn serve_shell_session<R, W>(recv: &mut R, send: &mut W, peer: &str) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -191,7 +235,11 @@ where
     command.env("FABRIC_SHELL", "1");
     command.env("FABRIC_PEER", peer);
     let mut child = pair.slave.spawn_command(command)?;
-    let mut child_killer = child.clone_killer();
+    let reaped = Arc::new(AtomicBool::new(false));
+    let hang_up = HangUpOnDrop {
+        pid: child.process_id().map(|pid| pid as libc::pid_t),
+        reaped: reaped.clone(),
+    };
     let mut reader = pair.master.try_clone_reader()?;
     let mut writer = pair.master.take_writer()?;
     let master = pair.master;
@@ -226,7 +274,11 @@ where
         }
     });
 
-    let mut wait_task = tokio::task::spawn_blocking(move || child.wait());
+    let mut wait_task = tokio::task::spawn_blocking(move || {
+        let status = child.wait();
+        reaped.store(true, Ordering::SeqCst);
+        status
+    });
     let mut stdin_done = false;
     let mut output_done = false;
     let mut exit_code = None;
@@ -285,7 +337,7 @@ where
     // A framing or output error owns the same cleanup as cancellation. Leaving
     // early via `?` otherwise detaches the blocking PTY reader and child wait.
     if exit_code.is_none() {
-        let _ = tokio::task::spawn_blocking(move || child_killer.kill()).await;
+        drop(hang_up);
         let _ = input_tx.send(None);
         let _ = wait_task.await;
     }
@@ -464,6 +516,70 @@ mod tests {
             // reap its leaked child rather than hanging the test runtime.
             unsafe { libc::kill(self.0, libc::SIGKILL) };
         }
+    }
+
+    /// A session dropped before its cleanup runs, as every session is when the
+    /// daemon's runtime shuts down, still hangs its shell up. A shell left
+    /// running keeps the blocking PTY reader and child wait alive, and a tokio
+    /// runtime does not finish dropping until those return.
+    ///
+    /// The shell here has become a program that reads nothing, as an editor or
+    /// a build would be: the end-of-file a dropped PTY writer sends ends a
+    /// shell idle at its prompt, but not this.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dropped_shell_session_hangs_up_its_pty_child() -> anyhow::Result<()> {
+        let (server, client) = tokio::io::duplex(8192);
+        let (mut recv, mut send) = tokio::io::split(server);
+        let task =
+            tokio::spawn(
+                async move { super::serve_shell_session(&mut recv, &mut send, "peer").await },
+            );
+        let (mut read, mut write) = tokio::io::split(client);
+        super::write_client_stdin(
+            &mut write,
+            b"printf 'SHELLPID-%s-END\\n' $$; exec sleep 60\n",
+        )
+        .await?;
+        let pid = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut seen = Vec::new();
+            loop {
+                if let Some(ServerFrame::Output(bytes)) = read_server_frame(&mut read).await? {
+                    seen.extend(bytes);
+                    for candidate in String::from_utf8_lossy(&seen).split("SHELLPID-") {
+                        if let Some((digits, _)) = candidate.split_once("-END")
+                            && let Ok(pid) = digits.parse::<libc::pid_t>()
+                        {
+                            return Ok::<_, anyhow::Error>(pid);
+                        }
+                    }
+                }
+            }
+        })
+        .await??;
+        let cleanup = KillOnDrop(pid);
+
+        // The client end stays open, so only the drop can end the shell.
+        task.abort();
+        let _ = task.await;
+        let started = std::time::Instant::now();
+        let mut alive = true;
+        while started.elapsed() < Duration::from_secs(10) {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if alive {
+            drop(cleanup);
+        } else {
+            // The service reaped the PID. Never signal a reused PID.
+            std::mem::forget(cleanup);
+        }
+        assert!(!alive, "a dropped shell session left its PTY child alive");
+        drop((read, write));
+        Ok(())
     }
 
     #[cfg(unix)]
