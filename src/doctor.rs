@@ -176,6 +176,9 @@ pub struct Facts {
     /// `None` means the path could not be established.
     pub sync_companion_binary: Option<bool>,
     pub sync_runtime: crate::control::SyncRuntimeStatus,
+    /// What the macOS service runs. `None` unless this is the managed home on
+    /// macOS with a signing identity configured.
+    pub macos_app: Option<crate::macos_app::AppState>,
     pub own_version: String,
     pub peers: Vec<PeerFact>,
     pub syncs: Vec<SyncFact>,
@@ -361,6 +364,33 @@ pub fn diagnose(facts: &Facts) -> Vec<Finding> {
                     "could not tell whether the sync companion is enabled",
                 ),
             }
+        });
+    }
+
+    if let Some(state) = &facts.macos_app {
+        use crate::macos_app::AppState;
+        out.push(match state {
+            AppState::Current { identity } => Finding::new(
+                "macos app",
+                Verdict::Ok,
+                format!(
+                    "the service runs the installed build signed by {identity}, so macOS keeps \
+                     its privacy permissions across updates"
+                ),
+            ),
+            AppState::PlainBinary => Finding::new(
+                "macos app",
+                Verdict::Problem,
+                "a signing identity is configured, but the service runs the installed binary \
+                 directly, so macOS asks again for its privacy permissions after each update",
+            )
+            .with_action("fabric service install"),
+            AppState::Stale => Finding::new(
+                "macos app",
+                Verdict::Problem,
+                "the service runs a signed app that is not the installed build",
+            )
+            .with_action("fabric service install"),
         });
     }
 
@@ -875,6 +905,7 @@ mod tests {
                 owner: "embedded".to_string(),
                 companion: "standby".to_string(),
             },
+            macos_app: None,
             own_version: "0.2.0+abc".to_string(),
             peers: vec![PeerFact {
                 label: "vps".to_string(),
@@ -905,6 +936,39 @@ mod tests {
 
     fn find<'a>(findings: &'a [Finding], check: &str) -> Vec<&'a Finding> {
         findings.iter().filter(|f| f.check == check).collect()
+    }
+
+    /// The prompts come back silently if the service falls back to the plain
+    /// binary, so doctor is where that has to show.
+    #[test]
+    fn a_service_off_its_signed_app_is_a_problem_with_a_repair() {
+        use crate::macos_app::AppState;
+
+        let unsigned = diagnose(&configured());
+        assert!(find(&unsigned, "macos app").is_empty());
+
+        let mut facts = configured();
+        facts.macos_app = Some(AppState::Current {
+            identity: "0123456789ABCDEF0123456789ABCDEF01234567".to_string(),
+        });
+        let findings = diagnose(&facts);
+        let app = find(&findings, "macos app");
+        assert_eq!(app.len(), 1);
+        assert_eq!(app[0].verdict, Verdict::Ok);
+        assert!(
+            app[0]
+                .detail
+                .contains("0123456789ABCDEF0123456789ABCDEF01234567")
+        );
+
+        for state in [AppState::PlainBinary, AppState::Stale] {
+            facts.macos_app = Some(state.clone());
+            let findings = diagnose(&facts);
+            let app = find(&findings, "macos app");
+            assert_eq!(app.len(), 1, "{state:?}");
+            assert_eq!(app[0].verdict, Verdict::Problem, "{state:?}");
+            assert_eq!(app[0].action.as_deref(), Some("fabric service install"));
+        }
     }
 
     #[test]
@@ -1037,6 +1101,7 @@ mod tests {
                 owner: "unavailable".to_string(),
                 companion: "unknown".to_string(),
             },
+            macos_app: None,
             own_version: "0.2.0+abc".to_string(),
             peers: Vec::new(),
             syncs: Vec::new(),
@@ -1090,6 +1155,7 @@ mod tests {
                 companion: "unknown".to_string(),
             },
             daemon_running: false,
+            macos_app: None,
             own_version: "0.2.0+abc".to_string(),
             peers: Vec::new(),
             syncs: Vec::new(),
@@ -1802,6 +1868,11 @@ where
         })
         .collect::<Vec<_>>();
 
+    #[cfg(target_os = "macos")]
+    let macos_app = manages_service.then(|| gather_macos_app(home)).flatten();
+    #[cfg(not(target_os = "macos"))]
+    let macos_app = None;
+
     Facts {
         has_identity,
         manages_service,
@@ -1810,11 +1881,26 @@ where
         sync_service,
         sync_companion_binary,
         sync_runtime,
+        macos_app,
         own_version,
         peers,
         ca: gather_ca(home, &syncs),
         syncs,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn gather_macos_app(home: &FabricHome) -> Option<crate::macos_app::AppState> {
+    let config = crate::config::FabricConfig::load(home).ok()?;
+    let identity = config.macos_signing_identity()?;
+    let payload = crate::update::managed_binary_path().ok()?;
+    let home_dir = std::env::var_os("HOME").map(PathBuf::from)?;
+    Some(crate::macos_app::state(
+        &crate::macos_app::bundle_path(&home_dir),
+        &crate::service::launch_agent_path().ok()?,
+        &payload,
+        identity,
+    ))
 }
 
 /// Ask a peer which build it runs, over the path a person would use.
