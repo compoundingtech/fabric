@@ -466,6 +466,70 @@ mod tests {
         }
     }
 
+    /// A session dropped before its cleanup runs, as every session is when the
+    /// daemon's runtime shuts down, still hangs its shell up. A shell left
+    /// running keeps the blocking PTY reader and child wait alive, and a tokio
+    /// runtime does not finish dropping until those return.
+    ///
+    /// The shell here has become a program that reads nothing, as an editor or
+    /// a build would be: the end-of-file a dropped PTY writer sends ends a
+    /// shell idle at its prompt, but not this.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dropped_shell_session_hangs_up_its_pty_child() -> anyhow::Result<()> {
+        let (server, client) = tokio::io::duplex(8192);
+        let (mut recv, mut send) = tokio::io::split(server);
+        let task =
+            tokio::spawn(
+                async move { super::serve_shell_session(&mut recv, &mut send, "peer").await },
+            );
+        let (mut read, mut write) = tokio::io::split(client);
+        super::write_client_stdin(
+            &mut write,
+            b"printf 'SHELLPID-%s-END\\n' $$; exec sleep 60\n",
+        )
+        .await?;
+        let pid = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut seen = Vec::new();
+            loop {
+                if let Some(ServerFrame::Output(bytes)) = read_server_frame(&mut read).await? {
+                    seen.extend(bytes);
+                    for candidate in String::from_utf8_lossy(&seen).split("SHELLPID-") {
+                        if let Some((digits, _)) = candidate.split_once("-END")
+                            && let Ok(pid) = digits.parse::<libc::pid_t>()
+                        {
+                            return Ok::<_, anyhow::Error>(pid);
+                        }
+                    }
+                }
+            }
+        })
+        .await??;
+        let cleanup = KillOnDrop(pid);
+
+        // The client end stays open, so only the drop can end the shell.
+        task.abort();
+        let _ = task.await;
+        let started = std::time::Instant::now();
+        let mut alive = true;
+        while started.elapsed() < Duration::from_secs(10) {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if alive {
+            drop(cleanup);
+        } else {
+            // The service reaped the PID. Never signal a reused PID.
+            std::mem::forget(cleanup);
+        }
+        assert!(!alive, "a dropped shell session left its PTY child alive");
+        drop((read, write));
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_shell_stream_error_terminates_and_reaps_its_pty_child() -> anyhow::Result<()> {
