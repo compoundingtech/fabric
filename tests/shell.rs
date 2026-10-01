@@ -218,8 +218,9 @@ async fn unavailable_old_peer_later_falls_back_to_raw_shell_zero() -> Result<()>
     // Do not start the old endpoint until the client has observed a real
     // transient pre-attach failure. The command is already buffered on the
     // local socket, proving protocol selection has not consumed or reframed it.
-    let mut stderr_output =
-        read_until_marker(&mut stderr, b"probing remote shell protocol again").await?;
+    // Either wait notice: "probing ... again in" or, for a peer that is away,
+    // "waiting for a connection ...; trying again in".
+    let mut stderr_output = read_until_marker(&mut stderr, b"again in").await?;
 
     let legacy_endpoint = Endpoint::builder(presets::N0)
         .secret_key(legacy_secret)
@@ -1653,6 +1654,156 @@ async fn shell_exit_puts_the_terminal_back_after_a_program_inside_it_died_unclea
     );
     assert_terminal_put_back(&seen, after_marker, "exit after the inner program died");
 
+    client.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// While the peer is away, the shell says it is waiting for a connection. A
+/// roaming peer is not an error, and "peer is offline" read as one while the
+/// connection was being re-established.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shell_waiting_for_an_away_peer_says_what_it_waits_for() -> Result<()> {
+    let (_server_dir, _client_dir, _server_home, client_home, server, client) =
+        pty_shell_pair().await?;
+    server.shutdown().await?;
+    let mut shell = PtyShell::spawn(&client_home, "server")?;
+    let first = shell.wait_for(b"again in", 0).await?;
+    shell.wait_for(b"again in", first).await?;
+    let seen = String::from_utf8_lossy(&shell.seen()).into_owned();
+    assert!(seen.contains("waiting for a connection"), "{seen}");
+    assert!(!seen.contains("offline"), "{seen}");
+    let pid = shell.pid()?;
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    let _ = wait_for_pty_child(shell.child.as_mut()).await;
+    client.shutdown().await?;
+    Ok(())
+}
+
+/// The first session's wait for an away peer has a bound, and ends with a
+/// sentence instead of holding the terminal.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shell_gives_up_on_an_away_peer_after_its_bound() -> Result<()> {
+    let (_server_dir, _client_dir, _server_home, client_home, server, client) =
+        pty_shell_pair().await?;
+    server.shutdown().await?;
+    let pair = native_pty_system().openpty(PtySize::default())?;
+    let mut command = CommandBuilder::new(fabric_bin());
+    command.env("FABRIC_SHELL_CONNECT_DEADLINE_SECS", "3");
+    command.args(["--home"]);
+    command.arg(client_home.root());
+    command.args(["shell", "server"]);
+    let mut child = pair.slave.spawn_command(command)?;
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader()?;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        while let Ok(count) = reader.read(&mut chunk) {
+            if count == 0 {
+                break;
+            }
+            sink.lock().unwrap().extend_from_slice(&chunk[..count]);
+        }
+    });
+    let status = wait_for_pty_child(child.as_mut()).await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let seen = String::from_utf8_lossy(&seen.lock().unwrap()).into_owned();
+    assert_eq!(status.exit_code(), 1, "{seen}");
+    assert!(
+        seen.contains("no connection to \"server\" within 3s"),
+        "{seen}"
+    );
+    drop(pair.master);
+    client.shutdown().await?;
+    Ok(())
+}
+
+/// Ctrl-C ends `fabric shell` while it waits for a peer that is away. The
+/// terminal is raw, so the key is a byte rather than a signal, and nothing on
+/// the far side reads it during the wait: it used to be forwarded into nothing,
+/// and the person could not get out.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ctrl_c_ends_a_shell_waiting_for_an_away_peer() -> Result<()> {
+    let (_server_dir, _client_dir, _server_home, client_home, server, client) =
+        pty_shell_pair().await?;
+    server.shutdown().await?;
+
+    let mut shell = PtyShell::spawn(&client_home, "server")?;
+    let before = shell.before.clone();
+    // Both the old and the new wait notices end in "again in"; this waits for
+    // the daemon to report a wait, whatever it calls it.
+    shell.wait_for(b"again in", 0).await?;
+    shell.writer.write_all(&[0x03])?;
+    shell.writer.flush()?;
+
+    let (status, after, seen) = shell.wait().await?;
+    assert_eq!(
+        status.exit_code(),
+        130,
+        "Ctrl-C did not end the wait; seen={}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert_eq!(after, before, "the terminal was not put back exactly");
+    client.shutdown().await?;
+    Ok(())
+}
+
+/// A shell waiting for an away peer starts once the peer is reachable again,
+/// even when the peer cannot dial back, as a server cannot reach a roaming
+/// laptop.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shell_starts_soon_after_an_away_peer_returns() -> Result<()> {
+    let (_server_dir, _client_dir, server_home, client_home, server, client) =
+        pty_shell_pair().await?;
+    let client_id = client.id();
+    server.shutdown().await?;
+    // The returning server will not know the client's address, so only the
+    // client's own attempts can bring the connection back.
+    let mut peers = PeerBook::load(&server_home)?;
+    peers.add_with_allow(
+        client_id,
+        Some("client".to_string()),
+        None,
+        Some(vec!["shell".to_string()]),
+    );
+    peers.save(&server_home)?;
+
+    let mut shell = PtyShell::spawn(&client_home, "server")?;
+    shell.wait_for(b"again in", 0).await?;
+    tokio::time::sleep(Duration::from_secs(15)).await;
+
+    let server = start_shell_server(server_home.clone()).await?;
+    let returned = Instant::now();
+    trust_peer(
+        &client_home,
+        &client,
+        server.id(),
+        Some("server"),
+        Some(server.addr()),
+    )
+    .await?;
+    // The echo of the typed line holds the format, never the expanded word.
+    shell.writer.write_all(b"printf 'BACK-%s-END\\n' HERE\n")?;
+    shell.writer.flush()?;
+    while find_from(&shell.seen(), b"BACK-HERE-END", 0).is_none() {
+        assert!(
+            returned.elapsed() < Duration::from_secs(30),
+            "the shell did not start within 30 s of the peer returning; seen={}",
+            String::from_utf8_lossy(&shell.seen())
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    shell.writer.write_all(b"exit 0\n")?;
+    shell.writer.flush()?;
+    let (status, _, _) = shell.wait().await?;
+    assert!(status.success(), "{status:?}");
     client.shutdown().await?;
     server.shutdown().await?;
     Ok(())

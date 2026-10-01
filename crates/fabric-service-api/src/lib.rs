@@ -134,6 +134,13 @@ pub enum Notice<'a> {
     Unavailable { error: &'a str },
     /// The peer does not speak the newest protocol; the older one is used.
     FallingBack,
+    /// The peer is away, so the daemon is waiting for a connection to it:
+    /// `waited` so far, the next attempt after `delay`. A roaming peer is not
+    /// an error, and this is not reported as one.
+    Connecting {
+        waited: std::time::Duration,
+        delay: std::time::Duration,
+    },
     /// No resumable session could be started yet; trying again after `delay`.
     Probing {
         error: &'a str,

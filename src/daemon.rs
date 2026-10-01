@@ -5056,6 +5056,7 @@ async fn handle_resumable_dial_socket_connection(
         .iter()
         .find(|candidate| !candidate.resumable);
     let mut attempt = 0usize;
+    let mut waiting_since: Option<Instant> = None;
     loop {
         let current_peer_addr = PeerBook::load(&home)
             .and_then(|book| book.resolve(&peer))
@@ -5074,13 +5075,19 @@ async fn handle_resumable_dial_socket_connection(
                 }
                 continue;
             }
-            connected = peer_connections.open_stream(
+            // Bounded: an open made while the peer's connection is being
+            // re-established has been seen to never return, which held the
+            // shell silent until the person gave up. Dropping it lets the next
+            // attempt find the connection that formed meanwhile.
+            connected = tokio::time::timeout(SERVICE_OPEN_ATTEMPT_BOUND, peer_connections.open_stream(
                 &endpoint.endpoint,
                 endpoint.generation,
                 &current_peer_addr,
                 protocol.name(),
                 if attempt == 0 { mux::StreamActivity::Application } else { mux::StreamActivity::Probe },
-            ) => connected,
+            )) => connected.unwrap_or_else(|_| Err(anyhow::anyhow!(
+                "opening a stream to the peer did not finish within {SERVICE_OPEN_ATTEMPT_BOUND:?}"
+            ))),
         };
         match connected {
             Ok(connection) => {
@@ -5143,6 +5150,24 @@ async fn handle_resumable_dial_socket_connection(
                 }
                 attempt = attempt.saturating_add(1);
                 let delay = protocol_probe_delay(attempt);
+                if mux::is_peer_offline(&error)
+                    || peer_connections.presence.offline(current_peer_addr.id)
+                {
+                    let since = *waiting_since.get_or_insert_with(Instant::now);
+                    write_service_notice(
+                        &mut local,
+                        service.as_ref(),
+                        Notice::Connecting {
+                            waited: since.elapsed(),
+                            delay,
+                        },
+                    )
+                    .await?;
+                    if !wait_for_protocol_retry(delay, &cancel, &mut endpoint_rx).await {
+                        return Ok(());
+                    }
+                    continue;
+                }
                 let error = format!("{error:#}");
                 write_service_notice(
                     &mut local,
@@ -5243,6 +5268,10 @@ async fn write_service_notice(
     }
     Ok(())
 }
+
+/// How long one attempt to open a service stream may take before it is
+/// dropped and retried.
+const SERVICE_OPEN_ATTEMPT_BOUND: Duration = Duration::from_secs(10);
 
 fn protocol_probe_delay(attempt: usize) -> Duration {
     const STEPS_MS: &[u64] = &[100, 250, 500, 1_000, 2_000, 5_000, 10_000, 15_000];

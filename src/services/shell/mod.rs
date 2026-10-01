@@ -93,6 +93,11 @@ const PROTOCOLS: &[Protocol] = &[
     },
 ];
 
+/// The status that ends a wait inside a live session. The client stops treating
+/// Ctrl-C as "stop waiting" when it sees this, so the key reaches the remote
+/// program again.
+pub(crate) const RESUMED_STATUS: &str = "connection restored; remote shell session resumed";
+
 /// The shell service, as the base network sees it.
 #[derive(Debug, Default)]
 pub struct Shell;
@@ -135,6 +140,12 @@ impl Service for Shell {
             Notice::FallingBack => {
                 encode_server_status("peer does not support resumable shell; using legacy shell/0")
             }
+            Notice::Connecting { waited, delay } => encode_server_status(&format!(
+                "waiting for a connection to the peer ({}s so far); trying again in {:.1}s; \
+                 Ctrl-C stops",
+                waited.as_secs(),
+                delay.as_secs_f32()
+            )),
             Notice::Probing { error, delay } => encode_server_status(&format!(
                 "connection unavailable ({error}); probing remote shell protocol again in {:.1}s",
                 delay.as_secs_f32()
@@ -151,9 +162,7 @@ impl Service for Shell {
                 "connection lost ({error}); reconnecting attempt {attempt} in {:.1}s",
                 delay.as_secs_f32()
             )),
-            Notice::Resumed => {
-                encode_server_status("connection restored; remote shell session resumed")
-            }
+            Notice::Resumed => encode_server_status(RESUMED_STATUS),
             Notice::ResumeFailed { error } => {
                 encode_server_error(&format!("remote shell could not resume: {error}"))
             }
@@ -772,6 +781,28 @@ mod tests {
             [ServerFrame::Status(message)] => message.clone(),
             other => panic!("expected one status frame, got {other:?}"),
         }
+    }
+
+    /// A peer that is away is waited for, not reported as an error, and the
+    /// wait says how to stop it.
+    #[tokio::test]
+    async fn waiting_for_an_away_peer_reads_as_a_wait() {
+        let message = only_status(Notice::Connecting {
+            waited: Duration::from_secs(12),
+            delay: Duration::from_secs(5),
+        })
+        .await;
+        assert_eq!(
+            message,
+            "waiting for a connection to the peer (12s so far); trying again in 5.0s; Ctrl-C stops"
+        );
+        assert!(!message.contains("offline") && !message.contains("unavailable"));
+    }
+
+    /// The client recognises the end of a wait by this exact status.
+    #[tokio::test]
+    async fn a_resumed_session_reports_the_status_the_client_waits_for() {
+        assert_eq!(only_status(Notice::Resumed).await, super::RESUMED_STATUS);
     }
 
     #[tokio::test]

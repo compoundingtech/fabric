@@ -31,6 +31,19 @@ use super::{
 const SHELL_REPLACEMENT_DEADLINE: Duration = Duration::from_secs(5 * 60);
 /// How often to ask the local daemon again while it is itself unavailable.
 const SHELL_REPLACEMENT_LOCAL_RETRY: Duration = Duration::from_secs(1);
+/// How long a first session waits for a connection to a peer that is away.
+/// A roaming peer usually returns within a minute; one that does not gets a
+/// clear end instead of a terminal held forever.
+/// `FABRIC_SHELL_CONNECT_DEADLINE_SECS` overrides it.
+const SHELL_CONNECT_DEADLINE: Duration = Duration::from_secs(2 * 60);
+
+fn shell_connect_deadline() -> Duration {
+    std::env::var("FABRIC_SHELL_CONNECT_DEADLINE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(SHELL_CONNECT_DEADLINE)
+}
 
 /// The stdin pump's view of the session it feeds.
 ///
@@ -52,6 +65,10 @@ struct ShellInput {
     eof: AtomicBool,
     /// Ctrl-C typed while not forwarding: the person wants out of the wait.
     interrupted: AtomicBool,
+    /// The daemon reported a wait in progress (a status frame) and the session
+    /// has not answered since. Bytes still go through, but Ctrl-C means "stop
+    /// waiting": nothing on the far side is reading it.
+    waiting: AtomicBool,
     interrupt: tokio::sync::Notify,
 }
 
@@ -63,8 +80,17 @@ impl ShellInput {
             discarded: AtomicUsize::new(0),
             eof: AtomicBool::new(false),
             interrupted: AtomicBool::new(false),
+            waiting: AtomicBool::new(false),
             interrupt: tokio::sync::Notify::new(),
         }
+    }
+
+    fn set_waiting(&self, waiting: bool) {
+        self.waiting.store(waiting, Ordering::SeqCst);
+    }
+
+    fn is_waiting(&self) -> bool {
+        self.waiting.load(Ordering::SeqCst)
     }
 
     /// Connect to a session socket, tell the remote PTY the window size, and
@@ -124,6 +150,11 @@ impl ShellInput {
                     let _ = super::write_client_eof(write).await;
                 }
                 return Ok(());
+            }
+            if self.is_forwarding() && self.is_waiting() && buf[..read].contains(&0x03) {
+                self.interrupted.store(true, Ordering::SeqCst);
+                self.interrupt.notify_one();
+                continue;
             }
             if self.is_forwarding() {
                 if let Some(write) = self.write.lock().await.as_mut() {
@@ -247,10 +278,16 @@ enum ShellSessionEnd {
     Lost {
         answered: bool,
     },
-    /// Ctrl-C typed while waiting for a replacement shell to answer.
-    Interrupted,
+    /// Ctrl-C typed while waiting: for a replacement shell to answer, or for
+    /// the daemon to reach the peer.
+    Interrupted {
+        replacement: bool,
+    },
     /// The replacement shell did not answer within the deadline.
     DeadlinePassed,
+    /// The first session waited for a connection to the peer for
+    /// `SHELL_CONNECT_DEADLINE` without one.
+    ConnectTimedOut,
 }
 
 enum ReplacementOutcome {
@@ -300,13 +337,23 @@ where
             .await?;
             match end {
                 ShellSessionEnd::Exited(code) => break Ok(code),
-                ShellSessionEnd::Interrupted => {
+                ShellSessionEnd::Interrupted { replacement } => {
+                    let message = if replacement {
+                        format!("fabric: interrupted while waiting for a new remote shell to {peer:?}")
+                    } else {
+                        format!("fabric: stopped waiting for {peer:?}")
+                    };
+                    notices.line(&message).await?;
+                    break Ok(130);
+                }
+                ShellSessionEnd::ConnectTimedOut => {
                     notices
                         .line(&format!(
-                            "fabric: interrupted while waiting for a new remote shell to {peer:?}"
+                            "fabric: no connection to {peer:?} within {}s; it may be away. Try again later",
+                            shell_connect_deadline().as_secs()
                         ))
                         .await?;
-                    break Ok(130);
+                    break Ok(1);
                 }
                 ShellSessionEnd::DeadlinePassed => {
                     notices
@@ -393,6 +440,9 @@ async fn run_shell_session(
     mut answer_deadline: Option<tokio::time::Instant>,
 ) -> Result<ShellSessionEnd> {
     let mut answered = false;
+    // Set when a first session starts waiting for the peer; a replacement has
+    // its own deadline in `answer_deadline`.
+    let mut connect_deadline: Option<tokio::time::Instant> = None;
     let incoming = super::next_server_frame(read);
     tokio::pin!(incoming);
     loop {
@@ -405,8 +455,10 @@ async fn run_shell_session(
                 };
                 match frame {
                     ServerFrame::Output(bytes) => {
+                        input.set_waiting(false);
                         if !answered {
                             answered = true;
+                            connect_deadline = None;
                             if answer_deadline.take().is_some() {
                                 let discarded = input.resume_forwarding();
                                 let mut ready =
@@ -430,6 +482,11 @@ async fn run_shell_session(
                         notices.line(&format!("fabric: peer {peer:?} {message}")).await?;
                     }
                     ServerFrame::Status(message) => {
+                        input.set_waiting(message != super::RESUMED_STATUS);
+                        if !answered && answer_deadline.is_none() && connect_deadline.is_none() {
+                            connect_deadline =
+                                Some(tokio::time::Instant::now() + shell_connect_deadline());
+                        }
                         notices.status(&message).await?;
                     }
                     ServerFrame::Exit(code) => {
@@ -454,11 +511,18 @@ async fn run_shell_session(
                     }
                 }
             }
-            _ = input.interrupt.notified(), if !input.is_forwarding() => {
+            _ = input.interrupt.notified(), if !input.is_forwarding() || input.is_waiting() => {
                 if input.take_interrupt() {
                     notices.end_status().await?;
-                    return Ok(ShellSessionEnd::Interrupted);
+                    return Ok(ShellSessionEnd::Interrupted {
+                        replacement: !input.is_forwarding(),
+                    });
                 }
+            }
+            _ = tokio::time::sleep_until(connect_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                if connect_deadline.is_some() => {
+                notices.end_status().await?;
+                return Ok(ShellSessionEnd::ConnectTimedOut);
             }
             _ = tokio::time::sleep_until(answer_deadline.unwrap_or_else(tokio::time::Instant::now)),
                 if answer_deadline.is_some() => {
