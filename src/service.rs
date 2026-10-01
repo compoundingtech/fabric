@@ -30,7 +30,7 @@ const CONTROL_READY_POLL: Duration = Duration::from_millis(100);
 /// Bootstrap attempts before giving up — a re-install must be safe to re-run.
 const LAUNCHD_BOOTSTRAP_MAX_ATTEMPTS: usize = 5;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ServiceInstallOptions {
     pub allow_shell: Option<bool>,
     pub allow_exec: Option<bool>,
@@ -38,6 +38,9 @@ pub struct ServiceInstallOptions {
     /// optional. `None` means the caller never mentioned it, so keep whatever is
     /// persisted. `Some(None)` clears it. `Some(Some(mb))` sets it.
     pub memory_max_mb: Option<Option<u64>>,
+    /// The certificate hash the macOS service's app is signed with, in the same
+    /// tri-state, so an update that names nothing keeps it. See `macos_app`.
+    pub macos_signing_identity: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +48,9 @@ pub struct ServiceSpec {
     exe: PathBuf,
     home: PathBuf,
     memory_max_mb: Option<u64>,
+    /// The signed app's executable directory, when launchd runs the app's copy
+    /// of `exe` instead of `exe` itself. argv[0] still names `exe`.
+    app_dir: Option<PathBuf>,
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -96,7 +102,23 @@ impl ServiceSpec {
             exe: exe.into(),
             home: home.into(),
             memory_max_mb,
+            app_dir: None,
         })
+    }
+
+    /// Run the signed copies in `app_dir` while argv[0] keeps naming the
+    /// installed binaries, so every reader of the definition finds those.
+    pub fn running_app(mut self, app_dir: Option<PathBuf>) -> Self {
+        self.app_dir = app_dir;
+        self
+    }
+
+    fn program(&self) -> Option<PathBuf> {
+        self.app_dir.as_ref().map(|dir| dir.join("fabric"))
+    }
+
+    fn sync_program(&self) -> Option<PathBuf> {
+        self.app_dir.as_ref().map(|dir| dir.join("fabric-sync"))
     }
 
     fn current(
@@ -138,6 +160,12 @@ impl ServiceSpec {
 
 pub fn install(home: &FabricHome, options: ServiceInstallOptions) -> Result<()> {
     let exe = env::current_exe().context("failed to resolve current fabric executable")?;
+    // Run from inside the app, install the binary that the app mirrors.
+    #[cfg(target_os = "macos")]
+    let exe = match crate::macos_app::payload_for_app_executable(&exe) {
+        Some(payload) => payload?,
+        None => exe,
+    };
     install_at(home, &exe, options)
 }
 
@@ -228,6 +256,8 @@ fn install_at_with_verification(
     // options. They are parse-only compatibility values and never set policy.
     let _ = (options.allow_shell, options.allow_exec);
     let memory_max_mb = resolve_memory_max_mb(home, options.memory_max_mb)?;
+    let macos_signing_identity =
+        resolve_macos_signing_identity(home, options.macos_signing_identity)?;
     let spec = ServiceSpec::new(exe, home.root(), false, false, memory_max_mb)?;
     if companion_exists {
         require_sync_companion(&spec)?;
@@ -235,10 +265,19 @@ fn install_at_with_verification(
     match ServiceManager::current()? {
         #[cfg(target_os = "linux")]
         ServiceManager::SystemdUser => {
+            let _ = macos_signing_identity;
             install_systemd_user(&spec, companion_exists)?;
         }
         #[cfg(target_os = "macos")]
         ServiceManager::LaunchdUser => {
+            // Before the app is built, so a refusal here still changes nothing.
+            let domain = launchd_domain();
+            if !launchd_domain_available(&domain) {
+                bail!("{}", launchd_domain_unavailable_message(&domain));
+            }
+            let app_dir =
+                prepare_macos_app(&spec, companion_exists, macos_signing_identity.as_deref())?;
+            let spec = spec.running_app(app_dir);
             if !companion_exists {
                 remove_launchd_sync_for_rollback()?;
             }
@@ -322,6 +361,11 @@ pub(crate) fn restore_after_update_rollback(
         ServiceManager::SystemdUser => restore_systemd_after_update_rollback(&spec, companion_exists),
         #[cfg(target_os = "macos")]
         ServiceManager::LaunchdUser => {
+            // The known-good binary is back in place, so the app mirrors it
+            // again. Its signature still satisfies every grant macOS holds.
+            let identity = resolve_macos_signing_identity(home, None)?;
+            let app_dir = prepare_macos_app(&spec, companion_exists, identity.as_deref())?;
+            let spec = spec.running_app(app_dir);
             install_launchd_user(home, &spec)?;
             if companion_exists {
                 install_launchd_sync_user(home, &spec)?;
@@ -329,6 +373,23 @@ pub(crate) fn restore_after_update_rollback(
             Ok(())
         }
     }
+}
+
+/// Build or refresh the signed app for `spec`'s binaries. `None` means the
+/// service runs the installed binaries directly.
+#[cfg(target_os = "macos")]
+fn prepare_macos_app(
+    spec: &ServiceSpec,
+    companion_exists: bool,
+    identity: Option<&str>,
+) -> Result<Option<PathBuf>> {
+    let bundle = crate::macos_app::bundle_path(&home_dir()?);
+    Ok(crate::macos_app::prepare(
+        &bundle,
+        &spec.exe,
+        companion_exists,
+        identity,
+    ))
 }
 
 fn require_sync_companion(spec: &ServiceSpec) -> Result<PathBuf> {
@@ -439,6 +500,27 @@ fn systemd_restart_argv(companion_exists: bool) -> (&'static str, Vec<String>) {
         args.push(SYNC_SERVICE_NAME.into());
     }
     ("systemd-run", args)
+}
+
+/// Resolve the macOS signing identity in the memory ceiling's tri-state.
+///
+/// Persisted rather than read from the launch definition, because `fabric
+/// update` names nothing: every later build must be signed the way the first
+/// one was, or the grants macOS holds stop matching.
+fn resolve_macos_signing_identity(
+    home: &FabricHome,
+    requested: Option<Option<String>>,
+) -> Result<Option<String>> {
+    let mut config = FabricConfig::load(home)?;
+    if let Some(identity) = requested {
+        let identity = identity
+            .map(|raw| crate::macos_app::normalise_signing_identity(&raw))
+            .transpose()?;
+        config.set_macos_signing_identity(identity.clone());
+        config.save(home)?;
+        return Ok(identity);
+    }
+    Ok(config.macos_signing_identity().map(str::to_string))
 }
 
 /// Resolve the memory ceiling, in the same shape as the two allow flags above.
@@ -1176,6 +1258,7 @@ fn uninstall_launchd_user() -> Result<()> {
         fs::remove_file(&plist_path)
             .with_context(|| format!("failed to remove {}", plist_path.display()))?;
     }
+    crate::macos_app::remove(&crate::macos_app::bundle_path(&home_dir()?));
     Ok(())
 }
 
@@ -1299,6 +1382,7 @@ pub fn render_launch_agent_plist(home: &FabricHome, spec: &ServiceSpec) -> Resul
     render_launch_agent_plist_for(
         home,
         LAUNCHD_LABEL,
+        spec.program(),
         spec.program_arguments(),
         "service",
         spec.memory_max_mb,
@@ -1312,6 +1396,7 @@ pub fn render_launch_sync_agent_plist(
     render_launch_agent_plist_for(
         home,
         LAUNCHD_SYNC_LABEL,
+        spec.sync_program(),
         spec.sync_program_arguments()?,
         "sync-service",
         None,
@@ -1321,6 +1406,7 @@ pub fn render_launch_sync_agent_plist(
 fn render_launch_agent_plist_for(
     home: &FabricHome,
     label: &str,
+    program: Option<PathBuf>,
     program_arguments: Vec<String>,
     log_name: &str,
     memory_max_mb: Option<u64>,
@@ -1383,6 +1469,24 @@ fn render_launch_agent_plist_for(
         .map(|arg| format!("        <string>{}</string>", xml_escape(arg)))
         .collect::<Vec<_>>()
         .join("\n");
+    // `Program` is what launchd executes and what macOS privacy controls see;
+    // argv[0] stays the installed binary, which the updater and older rollback
+    // binaries read back from this file. Naming the app lets local network
+    // privacy and System Settings attribute the agent to it.
+    let program = program
+        .map(|program| {
+            format!(
+                "    <key>Program</key>\n\
+    <string>{}</string>\n\
+    <key>AssociatedBundleIdentifiers</key>\n\
+    <array>\n\
+        <string>{}</string>\n\
+    </array>\n",
+                xml_escape(&program.display().to_string()),
+                xml_escape(crate::macos_app::BUNDLE_ID),
+            )
+        })
+        .unwrap_or_default();
     Ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
@@ -1390,6 +1494,7 @@ fn render_launch_agent_plist_for(
 <dict>\n\
     <key>Label</key>\n\
     <string>{}</string>\n\
+{program}\
     <key>ProgramArguments</key>\n\
     <array>\n\
 {}\n\
@@ -1692,6 +1797,79 @@ mod tests {
             !single_args.iter().any(|arg| arg == SYNC_SERVICE_NAME),
             "a fabric-only release must not restart the absent companion: {single_args:?}"
         );
+    }
+
+    #[test]
+    fn a_service_that_runs_the_app_still_names_the_installed_binaries() -> Result<()> {
+        let home = FabricHome::new("/Users/alex/.local/share/fabric");
+        let app = PathBuf::from("/Users/alex/Applications/Fabric.app/Contents/MacOS");
+        let spec = ServiceSpec::new(
+            "/Users/alex/.local/bin/fabric",
+            home.root(),
+            false,
+            false,
+            None,
+        )?
+        .running_app(Some(app));
+        let plists = [
+            (
+                render_launch_agent_plist(&home, &spec)?,
+                "/Users/alex/Applications/Fabric.app/Contents/MacOS/fabric",
+                "/Users/alex/.local/bin/fabric",
+            ),
+            (
+                render_launch_sync_agent_plist(&home, &spec)?,
+                "/Users/alex/Applications/Fabric.app/Contents/MacOS/fabric-sync",
+                "/Users/alex/.local/bin/fabric-sync",
+            ),
+        ];
+        for (plist, program, argv0) in plists {
+            // The app's copy is what launchd executes and what macOS privacy
+            // controls see.
+            assert!(
+                plist.contains(&format!("<key>Program</key>\n<string>{program}</string>")),
+                "{plist}"
+            );
+            assert!(plist.contains(
+                "<key>AssociatedBundleIdentifiers</key>\n<array>\n<string>com.compoundingtech.fabric</string>"
+            ));
+            // argv[0] is what the updater, and any older rollback binary,
+            // reads back as the binary it manages.
+            assert!(
+                plist.contains(&format!(
+                    "<key>ProgramArguments</key>\n<array>\n        <string>{argv0}</string>"
+                )),
+                "{plist}"
+            );
+            #[cfg(target_os = "macos")]
+            {
+                let dir = tempfile::tempdir()?;
+                let path = dir.path().join("agent.plist");
+                std::fs::write(&path, &plist)?;
+                let read = |key: &str| -> Result<String> {
+                    let output = std::process::Command::new("plutil")
+                        .args(["-extract", key, "raw", "-o", "-"])
+                        .arg(&path)
+                        .output()?;
+                    assert!(output.status.success(), "plutil cannot read {key}");
+                    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+                };
+                assert_eq!(read("ProgramArguments.0")?, argv0);
+                assert_eq!(read("Program")?, program);
+            }
+        }
+
+        let plain = ServiceSpec::new(
+            "/Users/alex/.local/bin/fabric",
+            home.root(),
+            false,
+            false,
+            None,
+        )?;
+        let plist = render_launch_agent_plist(&home, &plain)?;
+        assert!(!plist.contains("<key>Program</key>"));
+        assert!(!plist.contains("AssociatedBundleIdentifiers"));
+        Ok(())
     }
 
     #[test]
@@ -2090,14 +2268,29 @@ mod plist_validity {
     #[test]
     fn rendered_plists_are_valid_property_lists() -> Result<()> {
         let home = FabricHome::new(std::path::Path::new("/home/alex/.local/share/fabric"));
-        for memory in [None, Some(512u64)] {
-            let spec = ServiceSpec::new("/usr/local/bin/fabric", home.root(), true, true, memory)?;
+        let app = Some(PathBuf::from(
+            "/Users/alex/Applications/Fabric.app/Contents/MacOS",
+        ));
+        for (memory, app) in [(None, None), (Some(512u64), None), (None, app)] {
+            let spec = ServiceSpec::new("/usr/local/bin/fabric", home.root(), true, true, memory)?
+                .running_app(app.clone());
+            let info = crate::macos_app::render_info_plist(
+                "0.2.24+abc1234",
+                std::path::Path::new("/usr/local/bin/fabric"),
+                "deadbeef & <more>",
+                "0123456789ABCDEF0123456789ABCDEF01234567",
+            );
             for (name, plist) in [
                 ("fabric", render_launch_agent_plist(&home, &spec)?),
                 ("fabric-sync", render_launch_sync_agent_plist(&home, &spec)?),
+                ("app-info", info),
             ] {
-                let path = std::env::temp_dir()
-                    .join(format!("{name}-plist-{:?}.plist", memory));
+                let path = std::env::temp_dir().join(format!(
+                    "{name}-plist-{:?}-{}-{}.plist",
+                    memory,
+                    app.is_some(),
+                    std::process::id()
+                ));
                 std::fs::write(&path, &plist)?;
                 let out = std::process::Command::new("plutil")
                     .arg("-lint")

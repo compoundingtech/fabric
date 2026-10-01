@@ -193,10 +193,15 @@ where
 /// PATH at all.
 pub fn exec_path_env() -> String {
     let inherited = std::env::var("PATH").unwrap_or_default();
-    let Some(dir) = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
-    else {
+    let Some(dir) = std::env::current_exe().ok().and_then(|exe| {
+        fabric_dir(
+            &exe,
+            std::env::args_os()
+                .next()
+                .map(std::path::PathBuf::from)
+                .as_deref(),
+        )
+    }) else {
         return inherited;
     };
     let dir = dir.display().to_string();
@@ -207,6 +212,33 @@ pub fn exec_path_env() -> String {
         return inherited;
     }
     format!("{dir}:{inherited}")
+}
+
+/// The directory of the fabric that a spawned command should find first.
+///
+/// A macOS service can run a signed copy inside an app bundle. That directory
+/// holds no `git-remote-fabric`. launchd's argv[0] names the installed binary
+/// the app mirrors, so its directory is used instead.
+fn fabric_dir(
+    exe: &std::path::Path,
+    argv0: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    let in_app = exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)
+        .is_some_and(|bundle| {
+            bundle
+                .extension()
+                .is_some_and(|extension| extension == "app")
+        });
+    if in_app
+        && let Some(argv0) = argv0
+        && argv0.is_absolute()
+    {
+        return argv0.parent().map(std::path::Path::to_path_buf);
+    }
+    exe.parent().map(std::path::Path::to_path_buf)
 }
 
 pub async fn serve_exec_session<R, W>(recv: &mut R, send: &mut W, peer: &str) -> Result<()>
@@ -778,6 +810,29 @@ mod path_tests {
         assert!(
             path.split(':').any(|entry| entry == dir),
             "the running fabric's directory is not on the spawned PATH:\n{path}"
+        );
+    }
+
+    /// A daemon running the signed copy inside the macOS app hands its
+    /// commands the installed directory, where `git-remote-fabric` lives.
+    #[test]
+    fn a_daemon_inside_the_app_hands_out_the_installed_directory() {
+        use std::path::{Path, PathBuf};
+        let app = Path::new("/Users/alex/Applications/Fabric.app/Contents/MacOS/fabric");
+        let installed = Path::new("/Users/alex/.local/bin/fabric");
+        assert_eq!(
+            fabric_dir(app, Some(installed)),
+            Some(PathBuf::from("/Users/alex/.local/bin"))
+        );
+        assert_eq!(
+            fabric_dir(app, Some(Path::new("fabric"))),
+            Some(PathBuf::from(
+                "/Users/alex/Applications/Fabric.app/Contents/MacOS"
+            ))
+        );
+        assert_eq!(
+            fabric_dir(installed, Some(Path::new("/opt/elsewhere/fabric"))),
+            Some(PathBuf::from("/Users/alex/.local/bin"))
         );
     }
 

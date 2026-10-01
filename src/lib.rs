@@ -11,6 +11,7 @@ pub mod control;
 pub mod daemon;
 pub mod doctor;
 pub mod join;
+pub mod macos_app;
 pub mod mux;
 pub mod pathwatch;
 pub mod service;
