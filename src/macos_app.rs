@@ -533,12 +533,55 @@ mod platform {
         use super::*;
 
         /// A throwaway self-signed code-signing identity in its own keychain.
-        /// The test needs no certificate from anyone, and it never joins the
-        /// keychain search list a person uses: codesign is pointed at it.
+        /// The test needs no certificate from anyone.
+        ///
+        /// Older macOS (the CI runner's) finds a signing key only in a keychain
+        /// on the user's search list, even with `codesign --keychain`, so the
+        /// scratch keychain joins the list while the identity lives. One test
+        /// at a time, and the exact previous list is put back on drop, a
+        /// failing test included. Fields drop in order: list, then keychain.
         struct ScratchIdentity {
+            _search_list: SearchList,
             _dir: tempfile::TempDir,
             keychain: PathBuf,
             sha1: String,
+            _serial: std::sync::MutexGuard<'static, ()>,
+        }
+
+        static SIGNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        struct SearchList {
+            before: Vec<String>,
+        }
+
+        impl SearchList {
+            fn read() -> Vec<String> {
+                run("/usr/bin/security", &["list-keychains", "-d", "user"])
+                    .lines()
+                    .map(|line| line.trim().trim_matches('"').to_string())
+                    .filter(|line| !line.is_empty())
+                    .collect()
+            }
+
+            fn set(keychains: &[String]) {
+                let mut args = vec!["list-keychains", "-d", "user", "-s"];
+                args.extend(keychains.iter().map(String::as_str));
+                let _ = Command::new("/usr/bin/security").args(&args).status();
+            }
+
+            fn join(keychain: &Path) -> Self {
+                let before = Self::read();
+                let mut during = before.clone();
+                during.push(keychain.display().to_string());
+                Self::set(&during);
+                Self { before }
+            }
+        }
+
+        impl Drop for SearchList {
+            fn drop(&mut self) {
+                Self::set(&self.before);
+            }
         }
 
         fn run(program: &str, args: &[&str]) -> String {
@@ -552,6 +595,9 @@ mod platform {
         }
 
         fn scratch_identity() -> ScratchIdentity {
+            let serial = SIGNING
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let dir = tempfile::tempdir().unwrap();
             let path = |name: &str| dir.path().join(name).display().to_string();
             std::fs::write(
@@ -651,9 +697,11 @@ mod platform {
                 .unwrap()
                 .replace(':', "");
             ScratchIdentity {
+                _search_list: SearchList::join(&keychain),
                 _dir: dir,
                 keychain,
                 sha1: crate::macos_app::normalise_signing_identity(&sha1).unwrap(),
+                _serial: serial,
             }
         }
 
