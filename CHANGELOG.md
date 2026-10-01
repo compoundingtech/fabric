@@ -4,6 +4,37 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+## [0.2.24] - 2026-10-01
+
+### Added
+
+- `fabric service install --macos-signing-identity <SHA1>` runs the macOS
+  service from `~/Applications/Fabric.app`, a copy of the installed pair signed
+  with that certificate under fixed identifiers. macOS keeps a privacy
+  permission (Desktop, Documents, Downloads, Photos, local network) against the
+  code signature of the program responsible for an access, and every command
+  `fabric exec` runs counts as the daemon's. An ad hoc signed release binary is
+  a new program after every update, so those commands asked again each time.
+  The identity is remembered, and every update re-signs the new build the same
+  way. An install that changes no bytes leaves the app untouched. If signing
+  fails, the service runs the installed binary directly and warns.
+  `--no-macos-signing-identity` and `fabric service uninstall` remove the app.
+  The launch definitions still name the installed binary as argv[0], so the
+  updater and its rollback are unchanged.
+- With a signing identity configured, `fabric doctor` reports whether the macOS
+  service runs the installed build signed with it, and names
+  `fabric service install` as the repair when it does not.
+
+### Fixed
+
+- A remote shell is hung up however its session ends. A daemon that shut down
+  with a shell open whose program does not end on end-of-file (an editor, a
+  build, a raw-mode program) left that shell running, and the session's blocking
+  terminal reader and child wait kept the daemon's process from exiting until
+  the service manager killed it. The shell now gets SIGHUP, then SIGKILL two
+  seconds later if it is still there. A session that ends on an error or a
+  cancellation no longer waits without a bound for a shell that ignores SIGHUP.
+
 ## [0.2.23] - 2026-09-30
 
 ### Fixed
