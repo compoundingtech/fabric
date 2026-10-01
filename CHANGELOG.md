@@ -4,6 +4,13 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+## [0.2.28] - 2026-10-01
+
+### Changed
+
+- No functional change. Released to check that an update run through
+  `fabric exec` on a Mac now completes.
+
 ## [0.2.27] - 2026-10-01
 
 ### Fixed
