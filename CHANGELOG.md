@@ -6,6 +6,19 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ## [Unreleased]
 
+### Fixed
+
+- A peer whose access is removed now loses what it already had open. Before
+  this, `fabric reload-peers` (and `fabric remove`, which reloads) checked the
+  new grants only for new connections, so a session admitted earlier outlived
+  the grant that let it in. A reload that succeeds now ends every session,
+  stream and direct connection the new peer book no longer allows, attached or
+  detached. The peer's other services carry on, and so do this machine's own
+  sessions to other peers. A reload that fails ends nothing: a file that does
+  not parse still closes the daemon to new connections, but one bad edit can
+  no longer cut a live session. A Git request already running finishes; the
+  next is checked against the new grants.
+
 ### Compatibility
 
 - The bytes a client outside fabric uses to reach a service exposed with

@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 use fabric_service_api::{PeerStream, Service};
 
 use crate::{
+    admission::{Admission, Grant},
     config::{FabricHome, PeerBook},
     daemon::CurrentEndpoint,
     mux::{MuxStream, PeerConnections, StreamActivity},
@@ -325,6 +326,9 @@ struct TunnelState {
 pub struct TunnelSession {
     id: TunnelSessionId,
     peer_id: EndpointId,
+    /// What admitted a session this daemon serves. Set once, at creation; a
+    /// session held out to a peer has none.
+    grant: std::sync::OnceLock<Grant>,
     local_write: Mutex<Option<LocalWrite>>,
     cleanup: Mutex<Option<SessionCleanup>>,
     state: Mutex<TunnelState>,
@@ -419,6 +423,7 @@ impl TunnelSession {
         let session = Arc::new(Self {
             id,
             peer_id,
+            grant: std::sync::OnceLock::new(),
             local_write: Mutex::new(Some(write)),
             cleanup: Mutex::new(cleanup),
             state: Mutex::new(TunnelState {
@@ -1646,6 +1651,7 @@ impl ServerSessionStore {
         peer_id: EndpointId,
         target: ServerTarget,
         resume: bool,
+        grant: Grant,
     ) -> Result<(Arc<TunnelSession>, bool)> {
         self.reap_expired(self.detached_ttl).await;
         if let Some(session) = self.get(session_id).await {
@@ -1659,6 +1665,7 @@ impl ServerSessionStore {
         self.ensure_room_for(peer_id).await?;
 
         let (session, local_read) = create_server_session(session_id, peer_id, target).await?;
+        let _ = session.grant.set(grant);
         session.state.lock().await.drain_server_output = true;
         match self.insert_created(session.clone()).await {
             Ok(None) => {
@@ -1763,6 +1770,24 @@ impl ServerSessionStore {
             }
         }
         oldest.map(|(session_id, _, session)| (session_id, session))
+    }
+
+    /// Close every session whose grant `permitted` no longer gives, attached or
+    /// detached. A detached one could not be resumed anyway, since admission
+    /// would refuse the resume; closing it releases the service connection it
+    /// still holds. Returns how many.
+    pub async fn revoke(&self, permitted: impl Fn(&EndpointId, &Grant) -> bool) -> usize {
+        let current: Vec<Arc<TunnelSession>> = self.inner.lock().await.values().cloned().collect();
+        let mut revoked = 0;
+        for session in current {
+            if let Some(grant) = session.grant.get()
+                && !permitted(&session.peer_id, grant)
+            {
+                self.remove_session(&session).await;
+                revoked += 1;
+            }
+        }
+        revoked
     }
 
     pub async fn reap_expired(&self, ttl: Duration) -> usize {
@@ -1876,7 +1901,7 @@ pub async fn serve_connection(
     connection: Connection,
     mut send: SendStream,
     mut recv: RecvStream,
-    peer_id: EndpointId,
+    admission: Admission,
     target: ServerTarget,
     connections: Option<Arc<PeerConnections>>,
     sessions: ServerSessionStore,
@@ -1894,8 +1919,15 @@ pub async fn serve_connection(
         bail!("tunnel client did not send hello");
     };
 
+    let peer_id = admission.peer();
     let (session, is_new_session) = match sessions
-        .get_or_create(session_id, peer_id, target, resume)
+        .get_or_create(
+            session_id,
+            peer_id,
+            target,
+            resume,
+            admission.grant().clone(),
+        )
         .await
     {
         Ok(admission) => admission,
@@ -1932,10 +1964,21 @@ pub async fn serve_connection(
     }
 
     let attach_started = Instant::now();
-    let result = session
+    let attach = session
         .clone()
-        .run_attach(send, recv, recv_next, health.clone())
-        .await;
+        .run_attach(send, recv, recv_next, health.clone());
+    tokio::pin!(attach);
+    let revoked = admission.revoked();
+    let result = tokio::select! {
+        result = &mut attach => result,
+        _ = revoked.cancelled() => {
+            // A reload took away the grant that admitted this session. Closing
+            // it ends the attach, whose writer stops once the session is done.
+            // The store's own sweep may get there first; either is enough.
+            sessions.remove_session(&session).await;
+            attach.await
+        }
+    };
     if attach_end_counts_against_connection(&result, true)
         && let Some(health) = health
     {
@@ -2481,6 +2524,7 @@ mod tests {
                 peer,
                 ServerTarget::UnixSocket(PathBuf::from("/missing")),
                 true,
+                Grant::Trust,
             )
             .await
             .unwrap_err();
@@ -2848,6 +2892,7 @@ mod tests {
                 peer_id(),
                 ServerTarget::UnixSocket(path),
                 false,
+                Grant::Trust,
             )
             .await
             .unwrap();

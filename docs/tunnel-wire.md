@@ -104,5 +104,9 @@ replayed as a new session.
 
 ## Trust after admission
 
-`fabric reload-peers` takes effect for new connections and resumes. It does
-not close a session that is already attached.
+A `fabric reload-peers` that succeeds ends every session the new peer book no
+longer allows, attached or detached. A direct connection whose grant was
+removed is closed with code 403 and the same reason a new connection would
+get (`not permitted for service`, or `node is not in fabric allow-list` for a
+peer that was removed), so a client can treat it as a refusal. A reload that
+fails ends nothing.
