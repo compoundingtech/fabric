@@ -1001,6 +1001,10 @@ fabric's config and returns when the daemon restarts, as does the dial listener
 on machine A. Run `fabric unexpose demo-http` on machine B and
 `fabric undial machine-b demo-http` on machine A when they are no longer wanted.
 
+A client that is not fabric can reach an exposed service with only an iroh
+endpoint. [docs/tunnel-wire.md](docs/tunnel-wire.md) describes the bytes it
+speaks, which fabric keeps stable.
+
 **8080 and 9080 above are examples, not recommendations.** Pick a port you have
 checked, and remember that **availability is not permission**: a port being free
 right now does not make it yours to take. On a machine you share, `lsof -i :<port>`

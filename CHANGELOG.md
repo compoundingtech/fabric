@@ -4,6 +4,17 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+## [Unreleased]
+
+### Compatibility
+
+- The bytes a client outside fabric uses to reach a service exposed with
+  `fabric expose` are now a compatibility surface: the exposure's name as the
+  ALPN, one stream per connection, and the tunnel's Hello, Data, Ack, Close and
+  Error frames. They are described in `docs/tunnel-wire.md`, and a test that
+  speaks them from hand-written bytes fails if they change. The wire itself is
+  unchanged from 0.2.30.
+
 ## [0.2.30] - 2026-10-01
 
 ### Fixed

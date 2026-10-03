@@ -8583,6 +8583,175 @@ mod tests {
         Ok(())
     }
 
+    /// The direct exposure wire, frozen byte for byte.
+    ///
+    /// A client outside fabric can reach an exposed service with nothing but an
+    /// iroh endpoint: connect with the exposure's name as the ALPN, open one
+    /// stream, and speak the tunnel frames. That makes these bytes a
+    /// compatibility surface (docs/tunnel-wire.md), and this test is such a
+    /// client. Every byte it sends or expects is written out here rather than
+    /// produced by the tunnel codec, so a change that moves the encoder and the
+    /// decoder together, and keeps fabric talking to itself, still fails here.
+    #[tokio::test]
+    async fn the_direct_exposure_wire_is_frozen() -> Result<()> {
+        const PROTOCOL: &str = "test/wire/1";
+        const SESSION: [u8; 16] = [0xa5; 16];
+
+        let server_dir = tempfile::tempdir()?;
+        let server_home = FabricHome::new(server_dir.path());
+        let server = FabricNode::start(server_home.clone()).await?;
+
+        // The service answers only after its request ends: it reads to EOF,
+        // writes back what it read, and closes. So its reply can arrive only if
+        // the client's Close was delivered to it as a half-close.
+        let echo_socket = server_dir.path().join("echo.sock");
+        let echo_listener = UnixListener::bind(&echo_socket)?;
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = echo_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    if stream.read_to_end(&mut request).await.is_ok() {
+                        let _ = stream.write_all(&request).await;
+                    }
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        server.expose(PROTOCOL, echo_socket).await?;
+
+        let client = Endpoint::bind(iroh::endpoint::presets::N0).await?;
+        trust_test_peer_allowing(
+            &server_home,
+            &server,
+            client.id(),
+            "wire-client",
+            client.addr(),
+            &[PROTOCOL],
+        )
+        .await?;
+
+        let connection = client.connect(server.addr(), PROTOCOL.as_bytes()).await?;
+        let (mut send, mut recv) = connection.open_bi().await?;
+
+        // Hello: kind 1, length 25, the session id, recv_next 0, resume 0.
+        let mut hello = vec![0x01, 0x00, 0x00, 0x00, 0x19];
+        hello.extend_from_slice(&SESSION);
+        hello.extend_from_slice(&[0; 8]);
+        hello.push(0x00);
+        send.write_all(&hello).await?;
+
+        // The server answers with the same Hello and then, before any data, a
+        // cumulative Ack of nothing.
+        let mut expected = hello.clone();
+        expected.extend_from_slice(&[0x03, 0x00, 0x00, 0x00, 0x08]);
+        expected.extend_from_slice(&[0; 8]);
+        let mut opening = vec![0; expected.len()];
+        tokio::time::timeout(Duration::from_secs(10), recv.read_exact(&mut opening))
+            .await
+            .context("the server did not answer the Hello within 10s")??;
+        assert_eq!(opening, expected, "the server's Hello, then Ack 0");
+
+        // The request "ping" as Data at offset 0, then Close at offset 4.
+        send.write_all(&[
+            0x02, 0x00, 0x00, 0x00, 0x0c, 0, 0, 0, 0, 0, 0, 0, 0, b'p', b'i', b'n', b'g',
+        ])
+        .await?;
+        send.write_all(&[0x04, 0x00, 0x00, 0x00, 0x08, 0, 0, 0, 0, 0, 0, 0, 4])
+            .await?;
+
+        // Read up to the server's Close. Its Data must run contiguously from
+        // offset 0, and its Acks must come to cover the four bytes sent.
+        let mut reply = Vec::new();
+        let mut acked = 0u64;
+        let server_close = loop {
+            let (kind, payload) = read_wire_frame(&mut recv).await?;
+            match kind {
+                0x02 => {
+                    let offset = u64::from_be_bytes(payload[..8].try_into()?);
+                    assert_eq!(
+                        offset,
+                        reply.len() as u64,
+                        "the server's Data is contiguous"
+                    );
+                    reply.extend_from_slice(&payload[8..]);
+                }
+                0x03 => {
+                    acked = acked.max(u64::from_be_bytes(payload[..].try_into()?));
+                }
+                0x04 => break u64::from_be_bytes(payload[..].try_into()?),
+                other => panic!("unexpected frame kind {other} before the server's Close"),
+            }
+        };
+        assert_eq!(reply, b"ping");
+        assert_eq!(server_close, 4, "the server's Close names its final offset");
+        assert_eq!(acked, 4, "the server acknowledged the whole request");
+
+        // Acknowledge the reply. Both directions are now closed and fully
+        // acknowledged, so the server drops the session and the connection. The
+        // client may see the stream end or the connection close; both mean the
+        // same here, and no bytes follow the Close either way.
+        send.write_all(&[0x03, 0x00, 0x00, 0x00, 0x08, 0, 0, 0, 0, 0, 0, 0, 4])
+            .await?;
+        assert_nothing_follows(&mut recv, "Close").await?;
+        let server_state = server.state();
+        let drained = tokio::time::timeout(Duration::from_secs(10), async {
+            while server_state.tunnel_sessions.stats().await.total_sessions > 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "the server kept a session that both sides closed and acknowledged"
+        );
+
+        // A resume of a session the server does not hold is answered with an
+        // Error frame, kind 5, and then the end of the stream. Its text is a
+        // diagnostic, not part of the contract.
+        let connection = client.connect(server.addr(), PROTOCOL.as_bytes()).await?;
+        let (mut send, mut recv) = connection.open_bi().await?;
+        let mut resume = vec![0x01, 0x00, 0x00, 0x00, 0x19];
+        resume.extend_from_slice(&[0x5a; 16]);
+        resume.extend_from_slice(&[0; 8]);
+        resume.push(0x01);
+        send.write_all(&resume).await?;
+        let (kind, message) = read_wire_frame(&mut recv).await?;
+        assert_eq!(kind, 0x05, "a refused Hello is answered with Error");
+        assert!(String::from_utf8(message).is_ok_and(|message| !message.is_empty()));
+        assert_nothing_follows(&mut recv, "Error").await?;
+
+        client.close().await;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// After a session's last frame the stream ends, or the server closes the
+    /// connection under it. Either is the end; a further byte is not.
+    async fn assert_nothing_follows(recv: &mut RecvStream, last: &str) -> Result<()> {
+        let rest = tokio::time::timeout(Duration::from_secs(10), recv.read_to_end(1024))
+            .await
+            .with_context(|| format!("the stream was still open 10s after the server's {last}"))?;
+        if let Ok(rest) = rest {
+            assert!(rest.is_empty(), "bytes after the server's {last}: {rest:?}");
+        }
+        Ok(())
+    }
+
+    /// One tunnel frame, read the way a client outside fabric would: a kind
+    /// byte, a big-endian u32 length, then exactly that many payload bytes.
+    async fn read_wire_frame(recv: &mut RecvStream) -> Result<(u8, Vec<u8>)> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut header = [0u8; 5];
+            recv.read_exact(&mut header).await?;
+            let len = u32::from_be_bytes(header[1..].try_into()?) as usize;
+            let mut payload = vec![0; len];
+            recv.read_exact(&mut payload).await?;
+            Ok((header[0], payload))
+        })
+        .await
+        .context("no tunnel frame within 10s")?
+    }
+
     #[test]
     fn explicit_acl_names_match_every_builtin_gate_name() {
         let dir = tempfile::tempdir().unwrap();
