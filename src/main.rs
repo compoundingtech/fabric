@@ -1922,6 +1922,38 @@ mod connection_telemetry_tests {
         );
     }
 
+    /// Telemetry is filed under whatever named the peer when it was recorded:
+    /// its name, or its NodeID when a caller dialled by id. A trusted peer is
+    /// current under either, and only a peer gone from the book is marked.
+    #[test]
+    fn a_trusted_peer_is_current_under_its_node_id_as_well_as_its_name() {
+        let peers: Vec<PeerReachability> = serde_json::from_value(serde_json::json!([
+            {"id": "vps-node-id", "name": "vps", "reachable": true, "bytes": 32,
+             "round_trip_micros": 1000, "transport": "direct", "error": null},
+            {"id": "laptop-node-id", "name": null, "reachable": false, "bytes": null,
+             "round_trip_micros": null, "transport": null, "error": "timed out"}
+        ]))
+        .unwrap();
+        let current = current_peer_keys(&peers);
+        let telemetry = BTreeMap::from([
+            ("vps".to_string(), peer_with_losses()),
+            ("vps-node-id".to_string(), peer_with_losses()),
+            ("laptop-node-id".to_string(), peer_with_losses()),
+            ("gone-node-id".to_string(), peer_with_losses()),
+        ]);
+
+        let marked: Vec<String> = connection_telemetry_lines(&telemetry, &test_window(), &current)
+            .into_iter()
+            .filter(|line| line.contains("[not in peers.toml]"))
+            .collect();
+        assert_eq!(
+            marked.len(),
+            1,
+            "only the removed peer is marked: {marked:?}"
+        );
+        assert!(marked[0].contains("gone-node-id"), "{marked:?}");
+    }
+
     #[test]
     fn a_removed_peer_is_marked_in_every_durable_telemetry_block() {
         let mut peer = peer_with_losses();
@@ -2060,10 +2092,7 @@ fn print_status(
     );
     print_peer_reachability(peers);
     print_current_connection_health(current_connection_health);
-    let current_peers = peers
-        .iter()
-        .map(|peer| peer.name.clone().unwrap_or_else(|| peer.id.clone()))
-        .collect::<BTreeSet<_>>();
+    let current_peers = current_peer_keys(peers);
     print_connection_telemetry(
         connection_telemetry,
         connection_telemetry_window,
@@ -2284,6 +2313,15 @@ fn telemetry_window_line(window: &TelemetryWindow) -> String {
                 .to_string()
         }
     }
+}
+
+/// Every key a current peer's telemetry may be filed under: its name, and its
+/// NodeID, which is the key when a caller dialled the peer by id.
+fn current_peer_keys(peers: &[PeerReachability]) -> BTreeSet<String> {
+    peers
+        .iter()
+        .flat_map(|peer| std::iter::once(peer.id.clone()).chain(peer.name.clone()))
+        .collect()
 }
 
 fn telemetry_peer_label(peer: &str, current_peers: &BTreeSet<String>) -> String {

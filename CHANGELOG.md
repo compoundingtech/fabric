@@ -4,6 +4,15 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+## [Unreleased]
+
+### Fixed
+
+- `fabric status` no longer marks a trusted peer `[not in peers.toml]` in its
+  session history and path latency blocks. Those totals are filed under
+  whatever named the peer when they were recorded, which is its NodeID when a
+  caller dialled it by id, and status matched them against peer names only.
+
 ## [0.2.31] - 2026-10-04
 
 ### Fixed
