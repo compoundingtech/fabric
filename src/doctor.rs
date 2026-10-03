@@ -483,17 +483,7 @@ pub fn diagnose(facts: &Facts) -> Vec<Finding> {
 
 fn peer_finding(peer: &PeerFact) -> Finding {
     let label = &peer.label;
-    if peer.has_grants == Some(false) {
-        return Finding::new(
-            "peer",
-            Verdict::Problem,
-            format!("{label} has no grants on this machine, so it cannot reach any service"),
-        )
-        .with_action(format!(
-            "edit peers.toml and add the required services to {label}'s allow list"
-        ));
-    }
-    match peer.reachable {
+    let finding = match peer.reachable {
         Some(true) => Finding::new("peer", Verdict::Ok, format!("{label} is reachable")),
         Some(false) => Finding::new(
             "peer",
@@ -505,6 +495,23 @@ fn peer_finding(peer: &PeerFact) -> Finding {
             Verdict::Unknown,
             format!("could not test whether {label} is reachable"),
         ),
+    };
+    if peer.has_grants != Some(false) {
+        return finding;
+    }
+    // An empty allow list is a choice, not a fault: this machine knows the
+    // peer and grants it nothing, which is what `fabric add` without --allow
+    // writes. Worth saying, never worth an exit code.
+    Finding {
+        verdict: match finding.verdict {
+            Verdict::Ok => Verdict::Informational,
+            verdict => verdict,
+        },
+        detail: format!(
+            "{}; it has no grants on this machine, so it can reach no service here",
+            finding.detail
+        ),
+        ..finding
     }
 }
 
@@ -1062,32 +1069,44 @@ mod tests {
         }
     }
 
+    /// A peer with an empty allow list is a valid choice: this machine knows
+    /// its identity and grants it nothing, which is what `fabric add` without
+    /// `--allow` and the default side of `fabric join` write. Doctor says so
+    /// and asks for nothing, and still reports whether the peer is reachable.
     #[test]
-    fn a_peer_with_no_grants_is_an_actionable_problem() {
-        let mut facts = configured();
-        facts.peers[0].has_grants = Some(false);
+    fn a_peer_with_no_grants_is_information_not_a_problem() {
+        for (reachable, verdict, said) in [
+            (Some(true), Verdict::Informational, "is reachable"),
+            (Some(false), Verdict::Informational, "is offline"),
+            (None, Verdict::Unknown, "could not test"),
+        ] {
+            let mut facts = configured();
+            facts.peers[0].has_grants = Some(false);
+            facts.peers[0].reachable = reachable;
 
-        let findings = diagnose(&facts);
-        let peer = find(&findings, "peer")[0];
+            let findings = diagnose(&facts);
+            let peer = find(&findings, "peer")[0];
 
-        assert_eq!(peer.verdict, Verdict::Problem);
-        assert!(
-            peer.detail.contains("no grants"),
-            "wrong detail: {}",
-            peer.detail
-        );
-        assert!(
-            peer.action
-                .as_deref()
-                .is_some_and(|action| action.contains("peers.toml")),
-            "the finding did not say where to add a grant: {:?}",
-            peer.action
-        );
+            assert_eq!(
+                peer.verdict, verdict,
+                "reachable {reachable:?}: {}",
+                peer.detail
+            );
+            assert!(
+                peer.detail.contains(said) && peer.detail.contains("no grants"),
+                "reachable {reachable:?}: wrong detail: {}",
+                peer.detail
+            );
+            assert!(
+                peer.action.is_none(),
+                "an empty allow list asked for action"
+            );
+            if reachable.is_some() {
+                assert_eq!(exit_code(&[peer.clone()]), 0);
+            }
+        }
     }
 
-    /// The first run. Nothing is wrong, and the words have to say so, or a
-    /// person learns to ignore the tool at the only moment it had their
-    /// attention.
     #[test]
     fn a_brand_new_machine_reads_as_setup_not_as_broken() {
         let facts = Facts {
