@@ -12,6 +12,12 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   session history and path latency blocks. Those totals are filed under
   whatever named the peer when they were recorded, which is its NodeID when a
   caller dialled it by id, and status matched them against peer names only.
+- `fabric doctor` no longer reports a peer with an empty allow list as a
+  problem. Granting a known peer nothing is a valid choice, and it is what
+  `fabric add` without `--allow` and the default side of `fabric join` write,
+  so doctor exited 1 on a correct configuration. It now says so as
+  information, and also reports that peer's reachability, which the old
+  finding hid.
 
 ## [0.2.31] - 2026-10-04
 
