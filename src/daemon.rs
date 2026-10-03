@@ -38,6 +38,7 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::{
+    admission::{Admission, Admissions, Grant},
     config::{
         DEFAULT_EXEC_MAX_CHILDREN, FabricConfig, FabricHome, Peer, PeerBook, PersistedDial,
         PersistedExpose, PersistedExposeTarget, load_or_create_identity, validate_protocol,
@@ -416,6 +417,9 @@ pub struct DaemonState {
     active_dial_listeners: Arc<AtomicUsize>,
     tcp_dials: Mutex<HashMap<(String, String, String), TcpDial>>,
     tunnel_sessions: tunnel::ServerSessionStore,
+    /// What each live inbound connection or stream was admitted to, so a
+    /// reload that takes the access away can end it.
+    admissions: Arc<Admissions>,
     /// Attached OUTBOUND sessions. `tunnel_sessions` only knows what we serve.
     client_attaches: Arc<tunnel::ClientAttachGauge>,
     tunnel_drop_tx: watch::Sender<u64>,
@@ -1059,6 +1063,7 @@ impl DaemonState {
             active_dial_listeners: Arc::new(AtomicUsize::new(0)),
             tcp_dials: Mutex::new(HashMap::new()),
             tunnel_sessions,
+            admissions: Arc::new(Admissions::default()),
             client_attaches: tunnel::ClientAttachGauge::new(),
             tunnel_drop_tx,
             tunnel_blocked: AtomicBool::new(false),
@@ -1242,11 +1247,38 @@ impl DaemonState {
         };
         SyncBook::load(&self.home)?.validate_against(&peer_book)?;
         let trusted_ids = peer_book.trusted_ids();
+        let installed = peer_book.clone();
         *self.peer_book.write().await = peer_book;
         *self.allowed.write().await = trusted_ids;
+        // Only here, after a book was accepted and installed. A reload that
+        // failed above ended nothing: a load failure closes the book to new
+        // connections, a rejected book leaves the old one in force, and neither
+        // touches live work.
+        self.revoke_withdrawn(&installed).await;
         self.peer_connections.presence.retry_now();
         self.announce_to_peers().await;
         Ok(())
+    }
+
+    /// End what `book` no longer allows: live direct connections and streams,
+    /// and server tunnel sessions whether attached or detached. A peer that is
+    /// still trusted keeps its connection; only the services it lost end.
+    /// Sessions this machine opened to other peers are theirs to govern.
+    async fn revoke_withdrawn(&self, book: &PeerBook) {
+        let admissions = self.admissions.revoke(book);
+        let sessions = self
+            .tunnel_sessions
+            .revoke(|peer, grant| grant.permitted(book, peer))
+            .await;
+        if admissions > 0 || sessions > 0 {
+            info!(
+                target: VALIDATION_LOG_TARGET,
+                event = "access_revoked",
+                admissions,
+                sessions,
+                "a peer reload took access away and ended what it no longer allows"
+            );
+        }
     }
 
     fn update_config(&self, update: impl FnOnce(&mut FabricConfig)) -> Result<()> {
@@ -4125,6 +4157,58 @@ fn service_name_for_alpn(services: &Services, alpn: &[u8]) -> String {
     String::from_utf8_lossy(alpn).to_string()
 }
 
+/// The grant an admission on this ALPN depends on. A service that checks a
+/// narrower grant itself (Git) depends here on trust alone; its own check runs
+/// on every request.
+fn grant_for_alpn(services: &Services, alpn: &[u8]) -> Grant {
+    match services.find(alpn) {
+        Some((service, _)) if service.access() == Access::Grants => Grant::Trust,
+        _ => Grant::Service(service_name_for_alpn(services, alpn)),
+    }
+}
+
+/// Close a direct connection once its admission is revoked. A direct
+/// connection carries exactly one admission, so this ends that and nothing
+/// else. The reason is the sentence a fresh connection would be refused with,
+/// so a client reads it as a refusal rather than a network fault.
+fn close_when_revoked(connection: &Connection, admission: &Admission) {
+    let reason = match admission.grant() {
+        Grant::Trust => "node is not in fabric allow-list (access revoked)".to_string(),
+        Grant::Service(service) => {
+            format!("peer not permitted for service {service:?} (access revoked)")
+        }
+    };
+    let revoked = admission.revoked();
+    let weak = connection.weak_handle();
+    let closed = weak.closed();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = closed => {}
+            _ = revoked.cancelled() => {
+                if let Some(connection) = weak.upgrade() {
+                    connection.close(VarInt::from_u32(403), reason.as_bytes());
+                }
+            }
+        }
+    });
+}
+
+/// Run one-shot work until it ends or its admission is revoked. Dropping the
+/// work drops its streams and every child it spawned with `kill_on_drop`.
+async fn until_revoked(
+    admission: &Admission,
+    work: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    let revoked = admission.revoked();
+    tokio::select! {
+        result = work => result,
+        _ = revoked.cancelled() => {
+            debug!(peer = %admission.peer(), "ended one-shot work whose access a reload took away");
+            Ok(())
+        }
+    }
+}
+
 /// Refuse a connection from a peer that is trusted but not permitted here.
 ///
 /// Closed with the reason attached, so the dialling side can print WHY rather
@@ -4175,6 +4259,13 @@ async fn process_incoming_iroh(
         return Ok(());
     }
 
+    // Recorded before the grant is checked; see `Admissions::admit`.
+    let admission = state.admissions.admit(
+        connection.remote_id(),
+        grant_for_alpn(&state.services, &alpn),
+    );
+    close_when_revoked(&connection, &admission);
+
     let service = state
         .services
         .find(&alpn)
@@ -4203,7 +4294,7 @@ async fn process_incoming_iroh(
     }
     if let Some((service, protocol)) = service {
         log_connection_paths(protocol.accept_event, &connection);
-        handle_service_connection(connection, service, protocol, state).await?;
+        handle_service_connection(connection, service, protocol, state, admission).await?;
         return Ok(());
     }
     if alpn == SYNC_ALPN {
@@ -4220,13 +4311,12 @@ async fn process_incoming_iroh(
         connection.close(0u32.into(), b"fabric tunnel blocked");
         return Ok(());
     }
-    let peer_id = connection.remote_id();
     let (send, recv) = connection.accept_bi().await?;
     tunnel::serve_connection(
         connection,
         send,
         recv,
-        peer_id,
+        admission,
         exposure.to_server_target(),
         None,
         state.tunnel_sessions.clone(),
@@ -4242,6 +4332,7 @@ async fn handle_service_connection(
     service: Arc<dyn Service>,
     protocol: &'static services::Protocol,
     state: Arc<DaemonState>,
+    admission: Admission,
 ) -> Result<()> {
     let peer = connection.remote_id();
     let (send, recv) = connection.accept_bi().await?;
@@ -4250,7 +4341,7 @@ async fn handle_service_connection(
             connection,
             send,
             recv,
-            peer,
+            admission,
             tunnel::ServerTarget::Service(tunnel::ServiceTarget(service)),
             None,
             state.tunnel_sessions.clone(),
@@ -4259,7 +4350,7 @@ async fn handle_service_connection(
         .await;
     }
     let stream = state.service_stream(&service, peer, send, recv).await;
-    service.serve(stream).await?;
+    until_revoked(&admission, service.serve(stream)).await?;
     connection.closed().await;
     Ok(())
 }
@@ -4352,6 +4443,13 @@ async fn handle_mux_stream(
         .services
         .find(alpn)
         .map(|(service, protocol)| (service.clone(), protocol));
+    // Recorded before the grant is checked; see `Admissions::admit`. One
+    // stream is one admission: revoking it ends this stream, not the shared
+    // connection the peer's other streams ride on.
+    let admission = state.admissions.admit(
+        connection.remote_id(),
+        grant_for_alpn(&state.services, alpn),
+    );
     if !matches!(&service, Some((service, _)) if service.access() == Access::Grants) {
         let name = service_name_for_alpn(&state.services, alpn);
         if let Err(denied) = state.may(&connection.remote_id(), &name).await {
@@ -4368,8 +4466,12 @@ async fn handle_mux_stream(
 
     if alpn == BUILTIN_ECHO_ALPN {
         state.builtin_echo_hits.fetch_add(1, Ordering::SeqCst);
-        tokio::io::copy(&mut recv, &mut send).await?;
-        send.finish()?;
+        until_revoked(&admission, async {
+            tokio::io::copy(&mut recv, &mut send).await?;
+            send.finish()?;
+            Ok(())
+        })
+        .await?;
     } else if let Some((service, protocol)) = service {
         let peer = connection.remote_id();
         if protocol.resumable {
@@ -4377,7 +4479,7 @@ async fn handle_mux_stream(
                 connection,
                 send,
                 recv,
-                peer,
+                admission,
                 tunnel::ServerTarget::Service(tunnel::ServiceTarget(service)),
                 Some(state.peer_connections.clone()),
                 state.tunnel_sessions.clone(),
@@ -4386,17 +4488,17 @@ async fn handle_mux_stream(
             .await?;
         } else {
             let stream = state.service_stream(&service, peer, send, recv).await;
-            service.serve(stream).await?;
+            until_revoked(&admission, service.serve(stream)).await?;
         }
     } else if alpn == SYNC_ALPN {
-        handle_sync_stream(connection.remote_id(), send, recv, state).await?;
-    } else if let Some(exposure) = exposure {
         let peer = connection.remote_id();
+        until_revoked(&admission, handle_sync_stream(peer, send, recv, state)).await?;
+    } else if let Some(exposure) = exposure {
         tunnel::serve_connection(
             connection,
             send,
             recv,
-            peer,
+            admission,
             exposure.to_server_target(),
             Some(state.peer_connections.clone()),
             state.tunnel_sessions.clone(),
@@ -8750,6 +8852,253 @@ mod tests {
         })
         .await
         .context("no tunnel frame within 10s")?
+    }
+
+    /// A reload that takes access away ends what the peer already has open, and
+    /// only that. Admission checks a grant when a session starts; without this
+    /// a session admitted before the reload outlives the grant that let it in.
+    ///
+    /// Three sessions cover both ways in: a trusted client keeps one exposure
+    /// and loses another over the shared connection, and a client outside
+    /// fabric, which stops being trusted at all, holds one on its own direct
+    /// connection.
+    #[tokio::test]
+    async fn a_successful_reload_ends_the_sessions_it_no_longer_allows() -> Result<()> {
+        const KEPT: &str = "test/revoke/kept";
+        const CUT: &str = "test/revoke/cut";
+        let server_dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let server_home = FabricHome::new(server_dir.path());
+        let client_home = FabricHome::new(client_dir.path());
+        let server = FabricNode::start(server_home.clone()).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        let outsider = Endpoint::bind(iroh::endpoint::presets::N0).await?;
+        trust_test_peer_allowing(
+            &server_home,
+            &server,
+            client.id(),
+            "client",
+            client.addr(),
+            &[KEPT, CUT],
+        )
+        .await?;
+        trust_test_peer_allowing(
+            &server_home,
+            &server,
+            outsider.id(),
+            "outsider",
+            outsider.addr(),
+            &[CUT],
+        )
+        .await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+        for (protocol, file) in [(KEPT, "kept.sock"), (CUT, "cut.sock")] {
+            let socket = server_dir.path().join(file);
+            spawn_echo_socket(&socket)?;
+            server.expose(protocol, socket).await?;
+        }
+
+        let client_state = client.state();
+        let kept_socket = client_state
+            .dial_alpn("server", KEPT, KEPT.as_bytes().to_vec(), false)
+            .await?;
+        let cut_socket = client_state
+            .dial_alpn("server", CUT, CUT.as_bytes().to_vec(), false)
+            .await?;
+        let mut kept = UnixStream::connect(&kept_socket).await?;
+        let mut cut = UnixStream::connect(&cut_socket).await?;
+        round_trip(&mut kept, b"one").await?;
+        round_trip(&mut cut, b"one").await?;
+        let (_outsider_connection, _outsider_send, mut outsider_recv) =
+            open_direct_session(&outsider, &server, CUT).await?;
+        let server_state = server.state();
+        assert!(
+            wait_for_sessions(&server_state, 3).await,
+            "the server never held all three sessions, so it cannot show which it ends"
+        );
+
+        let mut peers = PeerBook::load(&server_home)?;
+        peers.add_with_allow(
+            client.id(),
+            Some("client".into()),
+            Some(client.addr()),
+            Some(vec![KEPT.into()]),
+        );
+        assert!(peers.remove("outsider"));
+        peers.save(&server_home)?;
+        server_state.reload_peers().await?;
+
+        assert!(
+            closes_within(&mut cut, Duration::from_secs(20)).await,
+            "the client's session to a service it lost stayed open"
+        );
+        assert!(
+            direct_session_ends(&mut outsider_recv).await,
+            "the session of a peer no longer trusted stayed open"
+        );
+        assert!(
+            wait_for_sessions(&server_state, 1).await,
+            "the server still holds a session the new peer book does not allow"
+        );
+        round_trip(&mut kept, b"two").await?;
+
+        outsider.close().await;
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// A reload that fails ends nothing, in either way a reload can fail. A
+    /// failed load closes the book to new connections, which is right for new
+    /// connections and would be wrong for live ones: one bad edit to the peer
+    /// file must not cut every session on the machine.
+    #[tokio::test]
+    async fn a_failed_reload_never_ends_a_live_session() -> Result<()> {
+        const KEPT: &str = "test/revoke/kept";
+        let server_dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let server_home = FabricHome::new(server_dir.path());
+        let client_home = FabricHome::new(client_dir.path());
+        let server = FabricNode::start(server_home.clone()).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer_allowing(
+            &server_home,
+            &server,
+            client.id(),
+            "client",
+            client.addr(),
+            &[KEPT],
+        )
+        .await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+        let socket = server_dir.path().join("kept.sock");
+        spawn_echo_socket(&socket)?;
+        server.expose(KEPT, socket).await?;
+
+        let client_state = client.state();
+        let kept_socket = client_state
+            .dial_alpn("server", KEPT, KEPT.as_bytes().to_vec(), false)
+            .await?;
+        let mut kept = UnixStream::connect(&kept_socket).await?;
+        round_trip(&mut kept, b"one").await?;
+        let server_state = server.state();
+        let valid = fs::read(server_home.peers_path())?;
+
+        // The sync book rejects a new peer book that drops the client. The
+        // reload fails, and the book it rejected must not decide anything.
+        write_test_sync(&server_home, server_dir.path().join("catalog"), "client")?;
+        PeerBook::default().save(&server_home)?;
+        assert!(server_state.reload_peers().await.is_err());
+        fs::remove_file(server_home.syncs_path())?;
+        round_trip(&mut kept, b"two").await?;
+
+        // The peer file does not parse. New connections are refused, and the
+        // live session carries on.
+        fs::write(server_home.peers_path(), "[[peers]\nnot toml")?;
+        assert!(server_state.reload_peers().await.is_err());
+        assert!(
+            server_state.may(&client.id(), KEPT).await.is_err(),
+            "a failed load left a grant open to new connections"
+        );
+        round_trip(&mut kept, b"three").await?;
+
+        // A reload that succeeds and still allows the session leaves it alone.
+        fs::write(server_home.peers_path(), &valid)?;
+        server_state.reload_peers().await?;
+        round_trip(&mut kept, b"four").await?;
+        assert!(wait_for_sessions(&server_state, 1).await);
+
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// A Unix service that echoes each read straight back, so a session through
+    /// it stays attached for as long as the test keeps it open.
+    fn spawn_echo_socket(path: &std::path::Path) -> Result<()> {
+        let listener = UnixListener::bind(path)?;
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    while let Ok(read) = stream.read(&mut buf).await {
+                        if read == 0 || stream.write_all(&buf[..read]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        Ok(())
+    }
+
+    async fn round_trip(stream: &mut UnixStream, bytes: &[u8]) -> Result<()> {
+        stream.write_all(bytes).await?;
+        let mut echoed = vec![0; bytes.len()];
+        tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut echoed))
+            .await
+            .context("no echo within 10s")??;
+        assert_eq!(echoed, bytes);
+        Ok(())
+    }
+
+    /// Does the local end see the session end (EOF or an error) in time?
+    async fn closes_within(stream: &mut UnixStream, within: Duration) -> bool {
+        let mut buf = [0u8; 64];
+        matches!(
+            tokio::time::timeout(within, stream.read(&mut buf)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        )
+    }
+
+    async fn wait_for_sessions(state: &DaemonState, want: usize) -> bool {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while state.tunnel_sessions.stats().await.total_sessions != want {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// A client outside fabric with one live session to `protocol`, proven by
+    /// an echo of `one`. The wire is the one docs/tunnel-wire.md describes.
+    async fn open_direct_session(
+        client: &Endpoint,
+        server: &FabricNode,
+        protocol: &str,
+    ) -> Result<(Connection, SendStream, RecvStream)> {
+        let connection = client.connect(server.addr(), protocol.as_bytes()).await?;
+        let (mut send, mut recv) = connection.open_bi().await?;
+        let mut hello = vec![0x01, 0x00, 0x00, 0x00, 0x19];
+        hello.extend_from_slice(&rand::random::<[u8; 16]>());
+        hello.extend_from_slice(&[0; 9]);
+        send.write_all(&hello).await?;
+        let (kind, _) = read_wire_frame(&mut recv).await?;
+        assert_eq!(kind, 0x01, "the server answers a Hello with a Hello");
+        send.write_all(&[
+            0x02, 0x00, 0x00, 0x00, 0x0b, 0, 0, 0, 0, 0, 0, 0, 0, b'o', b'n', b'e',
+        ])
+        .await?;
+        let mut echoed = Vec::new();
+        while echoed.len() < 3 {
+            let (kind, payload) = read_wire_frame(&mut recv).await?;
+            if kind == 0x02 {
+                echoed.extend_from_slice(&payload[8..]);
+            }
+        }
+        assert_eq!(echoed, b"one");
+        Ok((connection, send, recv))
+    }
+
+    /// Does a direct session's stream end, or its connection close, in time?
+    async fn direct_session_ends(recv: &mut RecvStream) -> bool {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut buf = [0u8; 256];
+            while let Ok(Some(_)) = recv.read(&mut buf).await {}
+        })
+        .await
+        .is_ok()
     }
 
     #[test]

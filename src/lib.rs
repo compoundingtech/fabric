@@ -5,6 +5,7 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 
+mod admission;
 pub mod ca;
 pub mod config;
 pub mod control;

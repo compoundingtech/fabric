@@ -854,8 +854,17 @@ fabric reload-peers
 ```
 
 Validate `peers.toml` and apply it to the running daemon without restarting.
-The daemon keeps its previously loaded allow-list if parsing or validation
-fails.
+
+A reload that succeeds also ends what the new file no longer allows. A peer
+that lost a service loses its open sessions for that service, attached or
+detached, and a peer that is no longer listed loses every session it had open
+here. Its other services, and the sessions this machine opened to other
+peers, carry on. A Git request that is already running finishes; the next one
+is checked against the new grants.
+
+A reload that fails ends nothing. If the file cannot be read or parsed, the
+daemon refuses every new connection until a reload succeeds. If it parses but
+fails validation, the previously loaded allow-list stays in force.
 
 ```sh
 fabric status
@@ -878,7 +887,8 @@ An omitted `--allow` grants no service.
 fabric remove <nodeid-or-name>
 ```
 
-Remove a trusted peer.
+Remove a trusted peer. A running daemon applies it at once and ends the
+sessions that peer had open here.
 
 ```sh
 fabric up [--foreground]
