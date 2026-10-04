@@ -238,10 +238,13 @@ The binary is `target/debug/fabric` during development.
 Cargo never deletes old build output, so a target directory grows with every
 toolchain update, dependency bump and profile. `bin/fabric-sweep-target
 TARGET_DIR` removes what no build used within `--days` (default 14) of the
-newest build in that directory, judged by the fingerprints cargo reads on every
-build, and keeps the rest, so the next build is not from scratch. `--dry-run`
-reports first; `--self-test` checks the tool against throwaway directories.
-Run it on a schedule (it is cheap: stat calls only).
+newest build in that directory and keeps the rest, so the next build is not
+from scratch. It judges use by the fingerprints cargo reads on every build,
+re-arming their access times on each sweep, and keeps each unit's last use in
+`.fabric-sweep.json`; a first sweep only records. To shrink a cache to exactly
+what the current builds use: `--arm`, run those builds, then `--since-arm`.
+`--dry-run` reports first, and `--self-test` checks the tool against throwaway
+directories. It is cheap enough to run daily.
 
 ## Install
 

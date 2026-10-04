@@ -10,11 +10,15 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 - `bin/fabric-sweep-target` removes the build output in a cargo target
   directory that no recent build used and keeps the rest, so a cache stays
-  small without a rebuild from scratch. A unit counts as used when cargo read
-  its fingerprint, which every build does for every unit in its graph, fresh
-  or not, within `--days` of the newest build in that directory; an idle cache
-  therefore keeps what its last builds used. A profile directory a running
-  build holds locked is skipped. `--dry-run` and `--self-test` are built in.
+  small without a rebuild from scratch. Cargo reads every unit's fingerprint
+  on every build, fresh or not, but APFS (and Linux relatime within a day)
+  moves a file's access time only while it is older than its modification
+  time, so each sweep re-arms the fingerprints and keeps each unit's last use
+  in `.fabric-sweep.json`. A unit unused for `--days` before the newest use in
+  its directory goes, so an idle cache keeps what its last builds used.
+  `--arm` then `--since-arm` around a set of builds shrinks a cache to exactly
+  what they read. A profile a running build holds locked is skipped.
+  `--dry-run` and `--self-test` are built in.
 
 ## [0.2.32] - 2026-10-04
 
