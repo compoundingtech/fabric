@@ -4,6 +4,18 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+## [Unreleased]
+
+### Added
+
+- `bin/fabric-sweep-target` removes the build output in a cargo target
+  directory that no recent build used and keeps the rest, so a cache stays
+  small without a rebuild from scratch. A unit counts as used when cargo read
+  its fingerprint, which every build does for every unit in its graph, fresh
+  or not, within `--days` of the newest build in that directory; an idle cache
+  therefore keeps what its last builds used. A profile directory a running
+  build holds locked is skipped. `--dry-run` and `--self-test` are built in.
+
 ## [0.2.32] - 2026-10-04
 
 ### Fixed

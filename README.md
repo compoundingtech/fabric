@@ -235,6 +235,14 @@ cargo test
 
 The binary is `target/debug/fabric` during development.
 
+Cargo never deletes old build output, so a target directory grows with every
+toolchain update, dependency bump and profile. `bin/fabric-sweep-target
+TARGET_DIR` removes what no build used within `--days` (default 14) of the
+newest build in that directory, judged by the fingerprints cargo reads on every
+build, and keeps the rest, so the next build is not from scratch. `--dry-run`
+reports first; `--self-test` checks the tool against throwaway directories.
+Run it on a schedule (it is cheap: stat calls only).
+
 ## Install
 
 Fast path for macOS and Linux:
