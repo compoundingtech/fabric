@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""Remove what no recent build used from a cargo target directory, and keep
+everything a recent build did, so the next build is never from scratch.
+
+Cargo deletes nothing. Every toolchain update, dependency bump, profile and
+feature set leaves a complete set of artifacts behind that nothing reads again.
+
+Cargo reads the fingerprint of every unit in a build's graph on every build,
+fresh or not. A read moves a file's access time only while that time is older
+than the file's modification time: APFS behaves this way, and Linux relatime
+does too until a day has passed. So the access time alone says when a file was
+first read after it was written, not when it was last read. Each sweep
+therefore arms the fingerprints: it sets their access time just below their
+modification time, so the next read moves it again. The next sweep sees which
+units a build read since, and keeps each unit's last use in a small state file
+(.fabric-sweep.json) in the profile directory.
+
+A unit is stale when its last use is more than --days older than the newest
+use in the same profile directory, not older than now: a cache nobody has built
+in for a month keeps what its last builds used instead of emptying itself. A
+first sweep has no history, so it records and arms and removes nothing.
+
+Per profile directory (debug, release, <triple>/debug, ...) a sweep removes:
+  .fingerprint/<unit>-<hash>    a stale unit
+  deps/, build/, examples/      a stale unit's artifacts, and artifacts with no
+                                fingerprint at all written before the window
+  incremental/<crate>-<id>      a session store not written within the window
+
+To sweep down to exactly what the current builds use: run with --arm, run
+those builds (they are no-ops when fresh), then sweep with --since-arm, which
+removes every unit the builds did not read.
+
+A profile directory that a running cargo holds locked is skipped, not swept.
+--self-test checks all of this against throwaway directories, with reads that
+follow the access time rule above.
+
+Exit codes:
+  0  swept, armed, or with --dry-run reported what a sweep would remove
+  1  a path was not a cargo target directory, or could not be swept, or the
+     self test failed
+"""
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+import time
+
+HASH = re.compile(r"-([0-9a-f]{16})(?=\.|$)")
+LOCKS = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
+ARTIFACT_DIRS = ("deps", "build", "examples")
+STATE = ".fabric-sweep.json"
+DAY = 86400
+
+
+def fingerprint_files(unit_dir):
+    with os.scandir(unit_dir) as entries:
+        return [e.path for e in entries if e.is_file(follow_symlinks=False)]
+
+
+def touched(files):
+    """The latest read or write the files show. Never a directory's access
+    time: listing a directory moves that, and this program lists them."""
+    latest = 0.0
+    for path in files:
+        st = os.lstat(path)
+        latest = max(latest, st.st_atime, st.st_mtime)
+    return latest
+
+
+def arm(files):
+    """Put each file's access time just below its modification time, so the
+    next read moves it."""
+    for path in files:
+        st = os.lstat(path)
+        os.utime(path, ns=(st.st_mtime_ns - 1_000_000_000, st.st_mtime_ns))
+
+
+def size_of(path):
+    """Bytes on disk under path, counting each inode once."""
+    total, seen = 0, set()
+    for root, dirs, files in os.walk(path):
+        for name in dirs + files:
+            try:
+                st = os.lstat(os.path.join(root, name))
+            except OSError:
+                continue
+            if (st.st_dev, st.st_ino) in seen:
+                continue
+            seen.add((st.st_dev, st.st_ino))
+            total += st.st_blocks * 512
+    return total
+
+
+def remove(path, dry_run):
+    size = size_of(path) if os.path.isdir(path) else os.lstat(path).st_blocks * 512
+    if not dry_run:
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+    return size
+
+
+def lock(profile):
+    """Hold every lock cargo takes on this profile directory, or None if a
+    build holds one."""
+    held = []
+    for name in LOCKS:
+        path = os.path.join(profile, name)
+        if not os.path.exists(path):
+            continue
+        handle = open(path, "r")
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            for other in held:
+                other.close()
+            return None
+        held.append(handle)
+    return held
+
+
+def load_state(profile):
+    try:
+        with open(os.path.join(profile, STATE)) as handle:
+            state = json.load(handle)
+        return float(state["armed"]), {k: float(v) for k, v in state["used"].items()}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, {}
+
+
+def save_state(profile, armed, used):
+    path = os.path.join(profile, STATE)
+    with open(path + ".tmp", "w") as handle:
+        json.dump({"armed": armed, "used": used}, handle)
+    os.replace(path + ".tmp", path)
+
+
+def scan(profile):
+    units = {}
+    with os.scandir(os.path.join(profile, ".fingerprint")) as entries:
+        for entry in entries:
+            match = HASH.search(entry.name)
+            if match and entry.is_dir(follow_symlinks=False):
+                units[entry.path] = (match.group(1), fingerprint_files(entry.path))
+    return units
+
+
+def arm_profile(profile, now):
+    units = scan(profile)
+    for _, files in units.values():
+        arm(files)
+    armed, used = load_state(profile)
+    save_state(profile, now, used)
+    return len(units)
+
+
+def sweep_profile(profile, days, dry_run, since_arm=False, now=None):
+    now = time.time() if now is None else now
+    armed, history = load_state(profile)
+    units = scan(profile)
+    if armed is None:
+        if since_arm:
+            raise ValueError("--since-arm needs a profile armed with --arm first")
+        if not dry_run:
+            for _, files in units.values():
+                arm(files)
+            save_state(profile, now, {h: now for h, _ in units.values()})
+        return {"units kept": len(units), "units removed": 0, "first sweep": 1}
+
+    last_use = {}
+    for unit_hash, files in units.values():
+        seen = touched(files)
+        if seen >= armed:
+            use = seen
+        else:
+            use = history.get(unit_hash, armed)
+        last_use[unit_hash] = max(last_use.get(unit_hash, 0.0), use)
+    if not last_use:
+        return {}
+    if since_arm:
+        cutoff = armed
+        live = {h for h, files in units.values() if touched(files) >= armed}
+    else:
+        cutoff = max(last_use.values()) - days * DAY
+        live = {h for h, use in last_use.items() if use >= cutoff}
+    stale = set(last_use) - live
+    # Session stores are written only when a crate compiles, which a no-op
+    # build does not do, so they always age by time.
+    incremental_cutoff = max(last_use.values()) - days * DAY
+
+    freed = {}
+
+    def count(kind, path):
+        freed[kind] = freed.get(kind, 0) + remove(path, dry_run)
+
+    for path, (unit_hash, _) in units.items():
+        if unit_hash in stale:
+            count(".fingerprint", path)
+    for kind in ARTIFACT_DIRS:
+        directory = os.path.join(profile, kind)
+        if not os.path.isdir(directory):
+            continue
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                match = HASH.search(entry.name)
+                if not match or match.group(1) in live:
+                    continue
+                orphan = match.group(1) not in stale
+                if orphan and os.lstat(entry.path).st_mtime >= cutoff:
+                    continue
+                count(kind, entry.path)
+    incremental = os.path.join(profile, "incremental")
+    if os.path.isdir(incremental):
+        with os.scandir(incremental) as entries:
+            for entry in entries:
+                if entry.is_dir(follow_symlinks=False) and os.lstat(entry.path).st_mtime < incremental_cutoff:
+                    count("incremental", entry.path)
+    if not dry_run:
+        for unit_hash, files in units.values():
+            if unit_hash in live:
+                arm(files)
+        save_state(profile, now, {h: last_use[h] for h in live})
+    freed["units kept"] = len(live)
+    freed["units removed"] = len(stale)
+    return freed
+
+
+def profiles(target):
+    """Every directory under target that holds a .fingerprint directory."""
+    found = []
+    for root, dirs, _ in os.walk(target):
+        if ".fingerprint" in dirs:
+            found.append(root)
+            dirs[:] = []
+        elif root[len(target):].count(os.sep) >= 3:
+            dirs[:] = []
+    return sorted(found)
+
+
+def gigabytes(n):
+    return f"{n / 1024**3:.1f} GB"
+
+
+def self_test():
+    """Daily builds and sweeps over simulated weeks, with reads that obey the
+    access time rule: a read moves the time only while it is older than the
+    modification time."""
+    start = time.time() - 200 * DAY
+    hashes = {"serde": "1" * 16, "tokio": "2" * 16, "iroh": "3" * 16, "fabric": "7" * 16}
+    failures = []
+
+    def check(label, condition):
+        print(f"{'ok  ' if condition else 'FAIL'}  {label}")
+        if not condition:
+            failures.append(label)
+
+    def put(path, when):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(b"x" * 4096)
+        os.utime(path, (when, when))
+
+    def read(profile, name, when):
+        unit = os.path.join(profile, ".fingerprint", f"{name}-{hashes[name]}")
+        if not os.path.isdir(unit):
+            return
+        for path in fingerprint_files(unit):
+            st = os.lstat(path)
+            if st.st_atime < st.st_mtime:
+                os.utime(path, (when, st.st_mtime))
+
+    def cache(root):
+        profile = os.path.join(root, "debug")
+        built = start - 40 * DAY
+        for name, unit_hash in hashes.items():
+            put(os.path.join(profile, ".fingerprint", f"{name}-{unit_hash}", "lib"), built)
+            put(os.path.join(profile, "deps", f"lib{name}-{unit_hash}.rlib"), built)
+        put(os.path.join(profile, "build", f"iroh-{hashes['iroh']}", "out"), built)
+        put(os.path.join(profile, "deps", "libold-" + "5" * 16 + ".rlib"), built)
+        put(os.path.join(profile, "deps", "README"), built)
+        put(os.path.join(profile, ".cargo-lock"), built)
+        return profile
+
+    def present(profile, name):
+        return os.path.exists(os.path.join(profile, "deps", f"lib{name}-{hashes[name]}.rlib"))
+
+    with tempfile.TemporaryDirectory() as root:
+        profile = cache(root)
+        sweep_profile(profile, 14, False, now=start)
+        check("a first sweep removes nothing", all(present(profile, n) for n in hashes))
+        # Every daily build reads serde and fabric, tokio until day 10, iroh
+        # never. fabric is rebuilt on day 25, so it carries the newest use,
+        # and a unit whose reads did not register would fall behind it.
+        for day in range(1, 31):
+            now = start + day * DAY
+            if day == 25:
+                put(os.path.join(profile, ".fingerprint", f"fabric-{hashes['fabric']}", "lib"), now - 7200)
+            for name in ("serde", "fabric"):
+                read(profile, name, now - 3600)
+            if day <= 10:
+                read(profile, "tokio", now - 3600)
+            sweep_profile(profile, 14, False, now=now)
+            if day == 14:
+                check("a unit unread for 14 days is kept on day 14", present(profile, "iroh"))
+        check("a unit built 40 days ago and read daily stays beside one rebuilt on day 25",
+              present(profile, "serde") and present(profile, "fabric"))
+        check("a unit unread for 20 days goes", not present(profile, "tokio"))
+        check("a unit never read goes, with its build output",
+              not present(profile, "iroh")
+              and not os.path.exists(os.path.join(profile, "build", f"iroh-{hashes['iroh']}")))
+        check("an orphan older than the window goes",
+              not os.path.exists(os.path.join(profile, "deps", "libold-" + "5" * 16 + ".rlib")))
+        check("a file without a unit hash stays", os.path.exists(os.path.join(profile, "deps", "README")))
+        for day in range(31, 131):
+            sweep_profile(profile, 14, False, now=start + day * DAY)
+        check("a cache idle for 100 days keeps what its last builds used", present(profile, "serde"))
+
+    with tempfile.TemporaryDirectory() as root:
+        profile = cache(root)
+        sweep_profile(profile, 14, False, now=start)
+        arm_profile(profile, start + DAY)
+        read(profile, "serde", start + DAY + 60)
+        sweep_profile(profile, 14, False, since_arm=True, now=start + DAY + 120)
+        check("--since-arm keeps exactly what the builds read",
+              present(profile, "serde") and not any(present(profile, n) for n in ("tokio", "iroh", "fabric")))
+
+    with tempfile.TemporaryDirectory() as root:
+        profile = cache(root)
+        arm_profile(profile, start)
+        read(profile, "tokio", start + 60)
+        sweep_profile(profile, 14, False, since_arm=True, now=start + 120)
+        check("--since-arm on a cache never swept before keeps only what was read",
+              present(profile, "tokio") and not any(present(profile, n) for n in ("serde", "iroh", "fabric")))
+
+    with tempfile.TemporaryDirectory() as root:
+        profile = cache(root)
+        sweep_profile(profile, 14, False, now=start)
+        before = {p: os.lstat(p).st_atime_ns for p in fingerprint_files(
+            os.path.join(profile, ".fingerprint", f"iroh-{hashes['iroh']}"))}
+        sweep_profile(profile, 0, True, now=start + 30 * DAY)
+        after = {p: os.lstat(p).st_atime_ns for p in before}
+        check("a dry run changes nothing, not even an access time",
+              present(profile, "iroh") and before == after)
+        with open(os.path.join(profile, ".cargo-lock")) as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            check("a profile a build holds locked is not touched", lock(profile) is None)
+    return 1 if failures else 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__.split("\n\n")[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("targets", nargs="*", metavar="TARGET_DIR")
+    parser.add_argument(
+        "--days",
+        type=float,
+        default=14,
+        help="keep what any build used within this many days of the newest "
+        "use in the same profile (default 14)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would be removed and change nothing",
+    )
+    parser.add_argument(
+        "--arm",
+        action="store_true",
+        help="only arm the fingerprints, so a following --since-arm sweep "
+        "keeps exactly what the builds run in between read",
+    )
+    parser.add_argument(
+        "--since-arm",
+        action="store_true",
+        help="remove every unit no build read since the last --arm",
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="check the sweep against throwaway target directories and exit",
+    )
+    args = parser.parse_args()
+    if args.self_test:
+        return self_test()
+    if not args.targets:
+        parser.error("name at least one TARGET_DIR")
+    status = 0
+    for target in args.targets:
+        target = os.path.abspath(os.path.expanduser(target))
+        found = profiles(target) if os.path.isdir(target) else []
+        if not found:
+            print(f"{target}\tnot a cargo target directory", file=sys.stderr)
+            status = 1
+            continue
+        before = 0 if args.arm else size_of(target)
+        would_free = 0
+        for profile in found:
+            held = lock(profile)
+            if held is None:
+                print(f"{profile}\tskipped: a build holds its lock")
+                continue
+            try:
+                if args.arm:
+                    print(f"{profile}\tarmed {arm_profile(profile, time.time())} units")
+                    continue
+                freed = sweep_profile(profile, args.days, args.dry_run, args.since_arm)
+            except (OSError, ValueError) as error:
+                print(f"{profile}\tcould not sweep: {error}", file=sys.stderr)
+                status = 1
+                continue
+            finally:
+                for handle in held:
+                    handle.close()
+            kept = freed.pop("units kept", 0)
+            gone = freed.pop("units removed", 0)
+            if freed.pop("first sweep", 0):
+                print(f"{profile}\tfirst sweep: recorded and armed {kept} units, removed nothing")
+                continue
+            would_free += sum(freed.values())
+            detail = ", ".join(f"{kind} {gigabytes(n)}" for kind, n in sorted(freed.items()))
+            print(f"{profile}\tunits kept {kept}, removed {gone}; {detail or 'nothing to remove'}")
+        if args.arm:
+            continue
+        if args.dry_run:
+            print(f"{target}\t{gigabytes(before)}, a sweep would free about {gigabytes(would_free)}")
+        else:
+            after = size_of(target)
+            print(
+                f"{target}\tbefore {gigabytes(before)}, after {gigabytes(after)}, "
+                f"freed {gigabytes(before - after)}"
+            )
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())
