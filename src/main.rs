@@ -100,6 +100,15 @@ enum Commands {
         /// `fabric expose` and never crosses the wire.
         #[arg(long = "allow", value_delimiter = ',')]
         allow: Option<Vec<String>>,
+        /// This machine may dial the peer; the peer may never use anything
+        /// here. For a host that runs code you do not trust, such as a CI
+        /// runner.
+        ///
+        /// Whatever `allow` says, it grants such a peer nothing, and it is not
+        /// let in as an inbound connection at all. A later `fabric add` or
+        /// `fabric join` cannot lift it; remove the peer to undo it.
+        #[arg(long = "dial-only", conflicts_with = "allow")]
+        dial_only: bool,
     },
     /// Pair with a machine you can already ssh to: one command, both directions.
     ///
@@ -615,7 +624,9 @@ async fn main() -> Result<()> {
                     let book = PeerBook::load(&home)?;
                     for peer in book.peers() {
                         let name = peer.name.clone().unwrap_or_default();
-                        let policy = if peer.allow.is_empty() {
+                        let policy = if peer.dial_only {
+                            "dial-only".to_string()
+                        } else if peer.allow.is_empty() {
                             "no services".to_string()
                         } else {
                             peer.allow.join(",")
@@ -708,12 +719,23 @@ async fn main() -> Result<()> {
                     name,
                     addr_json,
                     allow,
+                    dial_only,
                 } => {
                     let id = parse_node_id(&nodeid)?;
                     let addr = parse_addr_json(addr_json.as_deref(), id)?;
                     let mut book = PeerBook::load(&home)?;
+                    if let Some(allow) = &allow {
+                        book.refuse_grants_for_dial_only(&id.to_string(), allow)?;
+                        if let Some(name) = &name {
+                            book.refuse_grants_for_dial_only(name, allow)?;
+                        }
+                    }
                     warn_if_permissions_would_stop_a_sync(&home, &allow)?;
-                    book.add_with_allow(id, name, addr, allow);
+                    if dial_only {
+                        book.add_dial_only(id, name, addr);
+                    } else {
+                        book.add_with_allow(id, name, addr, allow);
+                    }
                     SyncBook::load(&home)?.validate_against(&book)?;
                     book.save(&home)?;
                     let _ = send_control(&home, ControlRequest::ReloadPeers).await;
@@ -2748,6 +2770,9 @@ async fn join_one(
         .map(<[String]>::to_vec)
         .or_else(|| previous.clone())
         .unwrap_or_default();
+    if let Some(grant) = grant {
+        book.refuse_grants_for_dial_only(&remote_id.to_string(), grant)?;
+    }
     warn_if_permissions_would_stop_a_sync(home, &Some(effective_grant.clone()))?;
     book.add_with_allow(
         remote_id,

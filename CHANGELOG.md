@@ -6,6 +6,27 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ## [Unreleased]
 
+### Security
+
+- A peer can be marked **dial-only**: this machine may dial it, and it may
+  never use anything here. For a host that runs code you do not trust, such as
+  a CI runner. Set it with `fabric add <nodeid> <name> --dial-only`, or
+  `dial_only = true` in `peers.toml`. Until now the only thing keeping such a
+  host out was an empty `allow` list on each machine, which one `fabric add
+  --allow`, a `fabric join` or a hand edit could undo without anything saying
+  so. The flag is enforced where grants are decided, so it wins over whatever
+  `allow` says; a re-add, a join or `fabric git grant` cannot lift it and is
+  refused with a sentence that says why; undoing it means `fabric remove`. A
+  dial-only peer is also not let in as an inbound connection, and a connection
+  this machine dialled to it is not read for streams it opens back. That closes
+  a second path the grants never covered: any peer let in at the transport can
+  open mux streams that never send a header, and 32 of them held every stream
+  slot on the daemon for ten seconds at a time, whatever the peer was granted.
+  `fabric peers` prints `dial-only`; `fabric doctor` reports a dial-only peer as
+  information and a dial-only peer whose file still lists grants as a problem.
+  A saved file always carries `allow = []` beside the flag, so a rolled-back
+  build that has never heard of it grants the peer nothing either.
+
 ### Added
 
 - `bin/fabric-sweep-target` removes the build output in a cargo target

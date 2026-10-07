@@ -135,6 +135,18 @@ pub struct Peer {
     /// Its absence is normal and must not drive failure recovery.
     #[serde(default, skip_serializing_if = "is_false")]
     pub roaming: bool,
+    /// This machine may dial the peer, and the peer may never use anything
+    /// here: no service, no exposure, no sync, no file transfer, and it is not
+    /// let in as an inbound connection at all.
+    ///
+    /// For a host that runs code this machine does not trust, such as a CI
+    /// runner. Fabric enforces it where grants are decided, so it holds
+    /// whatever `allow` says, and whatever a later `fabric add`, `fabric join`
+    /// or hand edit writes there. A saved file always carries `allow = []` for
+    /// such a peer, so a rolled-back build that has never heard of this field
+    /// grants it nothing either.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dial_only: bool,
     /// Which services this peer may reach, by the NAME a person types:
     /// `shell`, `exec`, `sync`, `echo`, or any exposed protocol such as `web`.
     ///
@@ -424,6 +436,19 @@ impl PeerBook {
 
     pub fn save(&self, home: &FabricHome) -> Result<()> {
         self.validate()?;
+        // A dial-only peer is always written with an empty allow list, so a
+        // build that does not know the flag grants it nothing either.
+        if self
+            .peers
+            .iter()
+            .any(|peer| peer.dial_only && !peer.allow.is_empty())
+        {
+            let mut clean = self.clone();
+            for peer in clean.peers.iter_mut().filter(|peer| peer.dial_only) {
+                peer.allow.clear();
+            }
+            return clean.save(home);
+        }
         self.write_peer_file(home)?;
         home.remove_legacy_peer_config()?;
         Self::remove_embedded_config_peers(home)?;
@@ -449,6 +474,12 @@ impl PeerBook {
 #        that depends on a name.
 # roaming  whether this peer is expected to disconnect and return. Defaults
 #        to false. An absent roaming peer is away, not failed.
+# dial_only  this machine may dial the peer, and the peer may never use
+#        anything here: no service, no sync, no files, and no inbound
+#        connection at all. For a host that runs code you do not trust, such
+#        as a CI runner. Whatever allow says, it grants such a peer nothing,
+#        and fabric keeps allow = [] beside it. Set it with `fabric add --dial-only`;
+#        undo it by removing the peer.
 # allow  which services this peer may reach, by the name a person types:
 #        shell, exec, sync, echo, or any protocol you expose such as web.
 #        Git grants are git/<remote>/read and git/<remote>/write.
@@ -607,7 +638,11 @@ impl PeerBook {
     ) -> Result<bool> {
         self.require_git_remote(remote)?;
         let permission = access.permission(remote);
+        let peer_name = peer;
         let peer = self.peer_mut(peer)?;
+        if peer.dial_only {
+            bail!("{peer_name} is dial-only: it may never use a service here, Git included");
+        }
         if peer.allow.contains(&permission) {
             return Ok(false);
         }
@@ -655,6 +690,12 @@ impl PeerBook {
         let Some(peer) = self.peers.iter().find(|peer| peer.id == *id) else {
             return Err(Denied::NotTrusted);
         };
+        // Before the allow list is read, so nothing written there matters.
+        if peer.dial_only {
+            return Err(Denied::NotPermitted {
+                service: service.to_string(),
+            });
+        }
         match &peer.allow {
             allowed if allowed.is_empty() => Err(Denied::NoGrants {
                 service: service.to_string(),
@@ -666,8 +707,67 @@ impl PeerBook {
         }
     }
 
+    /// The peers let in as inbound connections: every peer but a dial-only one,
+    /// which this machine dials and which never gets to dial it.
     pub fn trusted_ids(&self) -> HashSet<EndpointId> {
-        self.peers.iter().map(|peer| peer.id).collect()
+        self.peers
+            .iter()
+            .filter(|peer| !peer.dial_only)
+            .map(|peer| peer.id)
+            .collect()
+    }
+
+    /// Is `id` a peer that may connect to this machine at all?
+    pub fn accepts_inbound(&self, id: &EndpointId) -> bool {
+        self.peers
+            .iter()
+            .any(|peer| peer.id == *id && !peer.dial_only)
+    }
+
+    /// Is `id` a peer this machine dials and never lets in?
+    pub fn is_dial_only(&self, id: &EndpointId) -> bool {
+        self.peers
+            .iter()
+            .any(|peer| peer.id == *id && peer.dial_only)
+    }
+
+    /// Does this peer list grants that a dial-only flag overrides? A file in
+    /// that state is safe and contradicts itself; `fabric doctor` says so.
+    pub fn ignored_grants(&self, id: &EndpointId) -> bool {
+        self.peers
+            .iter()
+            .any(|peer| peer.id == *id && peer.dial_only && !peer.allow.is_empty())
+    }
+
+    /// Refuse to put grants on a peer that is dial-only. `peer` is a name or a
+    /// NodeID; an unknown one is fine, since it will be added without the flag.
+    pub fn refuse_grants_for_dial_only(&self, peer: &str, allow: &[String]) -> Result<()> {
+        let id = EndpointId::from_str(peer).ok();
+        let existing = self
+            .peers
+            .iter()
+            .find(|entry| id == Some(entry.id) || entry.name.as_deref() == Some(peer));
+        if allow.is_empty() || !existing.is_some_and(|entry| entry.dial_only) {
+            return Ok(());
+        }
+        bail!(
+            "{peer} is dial-only: it may never use a service here, so it cannot be granted {}. \
+             Run `fabric remove {peer}` first if it is no longer a host this machine must not trust",
+            allow.join(",")
+        )
+    }
+
+    /// Trust `id` for dialling only. Anything it was granted is dropped.
+    pub fn add_dial_only(
+        &mut self,
+        id: EndpointId,
+        name: Option<String>,
+        addr: Option<EndpointAddr>,
+    ) {
+        self.add_with_allow(id, name, addr, Some(Vec::new()));
+        if let Some(peer) = self.peers.iter_mut().find(|peer| peer.id == id) {
+            peer.dial_only = true;
+        }
     }
 
     pub fn add(&mut self, id: EndpointId, name: Option<String>, addr: Option<EndpointAddr>) {
@@ -691,6 +791,12 @@ impl PeerBook {
             .iter()
             .find(|peer| peer.id == id)
             .is_some_and(|peer| peer.roaming);
+        // A re-add never clears it: undoing dial-only means removing the peer.
+        let dial_only = self
+            .peers
+            .iter()
+            .find(|peer| peer.id == id)
+            .is_some_and(|peer| peer.dial_only);
         let allow = allow
             .or_else(|| {
                 self.peers
@@ -709,7 +815,8 @@ impl PeerBook {
             name,
             addr,
             roaming,
-            allow,
+            dial_only,
+            allow: if dial_only { Vec::new() } else { allow },
         });
         self.peers
             .sort_by_key(|peer| (peer.name.clone().unwrap_or_default(), peer.id.to_string()));
@@ -881,6 +988,9 @@ fn upsert_peer_tables(
         }
         if old_peer.roaming != new_peer.roaming {
             upsert_table_field(table, desired_table, "roaming")?;
+        }
+        if old_peer.dial_only != new_peer.dial_only {
+            upsert_table_field(table, desired_table, "dial_only")?;
         }
         if old_peer.allow != new_peer.allow {
             upsert_string_array_field(table, desired_table, "allow")?;
@@ -2333,5 +2443,178 @@ mod tests {
             format!("{error:#}").contains("detached_ttl_secs must be greater than zero"),
             "unexpected error: {error:#}"
         );
+    }
+
+    const DIAL_ONLY_SERVICES: [&str; 8] = [
+        "shell",
+        "exec",
+        "sync",
+        "echo",
+        "send-file",
+        "web",
+        "git/repo/read",
+        "git/repo/write",
+    ];
+
+    fn book_with(peer: Peer) -> PeerBook {
+        let mut book = PeerBook::default();
+        book.peers.push(peer);
+        book
+    }
+
+    fn peer_with(id: EndpointId, dial_only: bool, allow: Vec<String>) -> Peer {
+        Peer {
+            id,
+            name: Some("host".into()),
+            addr: None,
+            roaming: false,
+            dial_only,
+            allow,
+        }
+    }
+
+    proptest::proptest! {
+        /// Whatever a dial-only peer's allow list says, for every service it
+        /// is denied. The same list does grant a peer that is not dial-only,
+        /// so the property is about the flag and not about an empty list.
+        #[test]
+        fn a_dial_only_peer_is_denied_every_service_whatever_allow_says(
+            mask in proptest::collection::vec(proptest::bool::ANY, DIAL_ONLY_SERVICES.len()),
+        ) {
+            let allow: Vec<String> = DIAL_ONLY_SERVICES
+                .iter()
+                .zip(&mask)
+                .filter(|(_, listed)| **listed)
+                .map(|(service, _)| service.to_string())
+                .collect();
+            let id = an_id(0);
+            let dial_only = book_with(peer_with(id, true, allow.clone()));
+            let ordinary = book_with(peer_with(id, false, allow));
+            for (service, listed) in DIAL_ONLY_SERVICES.iter().zip(&mask) {
+                proptest::prop_assert!(dial_only.may(&id, service).is_err(), "{service} was granted");
+                proptest::prop_assert_eq!(ordinary.may(&id, service).is_ok(), *listed);
+            }
+            proptest::prop_assert!(!dial_only.accepts_inbound(&id));
+            proptest::prop_assert!(!dial_only.trusted_ids().contains(&id));
+            proptest::prop_assert!(ordinary.accepts_inbound(&id));
+            proptest::prop_assert!(ordinary.trusted_ids().contains(&id));
+        }
+    }
+
+    #[test]
+    fn a_refusal_of_a_dial_only_peer_carries_the_wire_phrase() {
+        let id = an_id(0);
+        let book = book_with(peer_with(id, true, vec!["exec".into()]));
+        let denied = book.may(&id, "exec").unwrap_err();
+        assert!(
+            fabric_service_api::is_refusal(&denied.to_string()),
+            "the dialling side would take this for a network fault: {denied}"
+        );
+    }
+
+    #[test]
+    fn re_adding_a_dial_only_peer_keeps_it_dial_only_and_ungranted() {
+        let id = an_id(0);
+        let mut book = PeerBook::default();
+        book.add_with_allow(id, Some("ci".into()), None, Some(vec!["exec".into()]));
+        book.add_dial_only(id, Some("ci".into()), None);
+        assert!(book.is_dial_only(&id));
+        assert!(
+            book.peers()[0].allow.is_empty(),
+            "adding it dial-only kept a grant"
+        );
+
+        // `fabric add` with or without --allow, as `fabric join` does it.
+        book.add_with_allow(id, Some("ci".into()), None, Some(vec!["shell".into()]));
+        book.add_with_allow(id, Some("ci".into()), None, None);
+        assert!(book.is_dial_only(&id), "a re-add lifted dial-only");
+        assert!(
+            book.peers()[0].allow.is_empty(),
+            "a re-add granted a dial-only peer"
+        );
+
+        let grants = vec!["exec".to_string()];
+        assert!(
+            book.refuse_grants_for_dial_only(&id.to_string(), &grants)
+                .is_err()
+        );
+        assert!(book.refuse_grants_for_dial_only("ci", &grants).is_err());
+        assert!(book.refuse_grants_for_dial_only("ci", &[]).is_ok());
+        assert!(
+            book.refuse_grants_for_dial_only("someone-else", &grants)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_dial_only_peer_cannot_be_granted_git_access() {
+        let id = an_id(0);
+        let mut book = PeerBook::default();
+        book.add_dial_only(id, Some("ci".into()), None);
+        book.git_remotes.push(GitRemote {
+            name: "repo".into(),
+            path: PathBuf::from("/srv/repo.git"),
+        });
+        let error = book
+            .grant_git_remote("repo", "ci", GitAccess::Read)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("dial-only"),
+            "unexpected: {error:#}"
+        );
+        assert!(book.peers()[0].allow.is_empty());
+    }
+
+    #[test]
+    fn saving_a_dial_only_peer_always_writes_an_empty_allow_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = FabricHome::new(dir.path());
+        let id = an_id(0);
+        let other = an_id(1);
+        // The worst a hand edit can write: dial-only, and every grant besides.
+        fs::write(
+            home.peers_path(),
+            format!(
+                "format = 2\n\n\
+                 [[peers]]\nid = \"{id}\"\nname = \"ci\"\ndial_only = true\n\
+                 allow = [\"shell\", \"exec\", \"sync\"]\n\n\
+                 [[peers]]\nid = \"{other}\"\nname = \"dev\"\nallow = [\"exec\"]\n"
+            ),
+        )
+        .unwrap();
+
+        let mut book = PeerBook::load(&home).unwrap();
+        assert!(book.is_dial_only(&id));
+        assert!(
+            book.ignored_grants(&id),
+            "the contradiction was not noticed"
+        );
+        assert!(
+            book.may(&id, "exec").is_err(),
+            "a hand-written grant was honoured"
+        );
+        assert!(!book.trusted_ids().contains(&id));
+        assert!(
+            book.may(&other, "exec").is_ok(),
+            "an unrelated peer lost its grant"
+        );
+
+        // Any save, for any reason, repairs the file.
+        book.add_with_allow(other, Some("dev".into()), None, None);
+        book.save(&home).unwrap();
+        let saved = PeerBook::load(&home).unwrap();
+        let ci = saved.peers().iter().find(|peer| peer.id == id).unwrap();
+        assert!(ci.dial_only, "saving dropped dial-only");
+        assert!(
+            ci.allow.is_empty(),
+            "saving kept grants for a dial-only peer"
+        );
+        assert!(!saved.ignored_grants(&id));
+        let raw = fs::read_to_string(home.peers_path()).unwrap();
+        assert!(
+            raw.contains("dial_only = true"),
+            "the file lost the flag: {raw}"
+        );
+        assert!(saved.may(&other, "exec").is_ok());
     }
 }
