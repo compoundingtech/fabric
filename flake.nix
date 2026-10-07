@@ -15,6 +15,9 @@
 
       # Get pkgs for a given system.
       pkgsFor = system: nixpkgs.legacyPackages.${system};
+
+      # The version is the crate's, so it can never go stale here.
+      version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
     in
     {
       packages = forAllSystems (system:
@@ -23,7 +26,7 @@
 
           fabric = pkgs.rustPlatform.buildRustPackage {
             pname = "fabric";
-            version = "0.2.1";
+            inherit version;
 
             src = ./.;
 
@@ -33,8 +36,15 @@
               lockFile = ./Cargo.lock;
             };
 
-            # build.rs stamps FABRIC_BUILD_SHA from git; the nix build has no git,
-            # so it falls back to "unknown" (version reads e.g. `0.2.1+unknown`).
+            # build.rs stamps FABRIC_BUILD_SHA from git, and the sandbox has no
+            # git, so without help the version reads `0.2.33+unknown` and a
+            # machine built from Nix cannot be told from any other build of the
+            # same release. build.rs also takes the commit from GITHUB_SHA, which
+            # is how CI hands it over, so hand it the flake's own revision. It is
+            # absent from a dirty tree, which then still reads `unknown`.
+            env = pkgs.lib.optionalAttrs (self ? rev) {
+              GITHUB_SHA = self.rev;
+            };
 
             # The test suite includes integration tests that dial real iroh over
             # the network, which the sandboxed build cannot reach. The library

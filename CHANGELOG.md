@@ -4,6 +4,19 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+## [Unreleased]
+
+### Fixed
+
+- The Nix package reports its own version and commit. `flake.nix` named the
+  package `0.2.1` whatever the crate said, and the sandbox has no git, so a
+  daemon built from Nix read `0.2.33+unknown` and could not be told from any
+  other build of that release. The flake now takes the version from
+  `Cargo.toml` and hands its own revision to the build, the way CI hands over
+  `GITHUB_SHA`, so a pinned build reads the same `0.2.N+<commit>` as the
+  release binaries and the store path is `fabric-0.2.N`. A build from a dirty
+  tree still reads `unknown`.
+
 ## [0.2.33] - 2026-10-07
 
 ### Security
