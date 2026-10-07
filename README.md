@@ -406,9 +406,9 @@ fabric add <ci-nodeid> ci --dial-only
 `dial-only` means this machine may dial the peer (`fabric exec ci -- ...` works
 if the peer grants it) and the peer may never use anything here. It is not let
 in as an inbound connection, no service, exposure, sync, Git or file transfer
-reaches it, and the connection this machine dialled to it is not read for
-streams it opens back. It overrides `allow`: whatever that list says, even a
-hand edit that lists `shell` and `exec` beside the flag, the peer is granted
+reaches it, and a stream it opens back on the connection this machine
+dialled is answered with an immediate refusal that uses none of the daemon's
+shared slots. It overrides `allow`: whatever that list says, even a hand edit that lists `shell` and `exec` beside the flag, the peer is granted
 nothing, and `fabric doctor` reports the contradiction. `fabric add --allow`,
 `fabric join --grant` and `fabric git grant` for a dial-only peer are refused.
 To undo it, run `fabric remove ci`. An empty `allow` list is not the same
