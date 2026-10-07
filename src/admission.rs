@@ -32,7 +32,7 @@ impl Grant {
     /// Does `book` still give `peer` this grant?
     pub fn permitted(&self, book: &PeerBook, peer: &EndpointId) -> bool {
         match self {
-            Grant::Trust => book.peers().iter().any(|entry| entry.id == *peer),
+            Grant::Trust => book.accepts_inbound(peer),
             Grant::Service(service) => book.may(peer, service).is_ok(),
         }
     }

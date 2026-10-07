@@ -118,6 +118,11 @@ pub struct PeerFact {
     /// Whether this peer has at least one incoming service grant here.
     /// `None` means the peer configuration could not be read.
     pub has_grants: Option<bool>,
+    /// This machine may dial the peer and the peer may never use anything here.
+    pub dial_only: bool,
+    /// The peer is dial-only and peers.toml still lists grants for it. They are
+    /// ignored; the file contradicts itself.
+    pub ignored_grants: bool,
     /// `None` when the check could not run at all.
     pub reachable: Option<bool>,
     /// What the peer reports as its version, if it could be asked.
@@ -496,6 +501,32 @@ fn peer_finding(peer: &PeerFact) -> Finding {
             format!("could not test whether {label} is reachable"),
         ),
     };
+    if peer.dial_only {
+        if peer.ignored_grants {
+            return Finding::new(
+                "peer",
+                Verdict::Problem,
+                format!(
+                    "{label} is dial-only but peers.toml still lists grants for it; fabric \
+                     ignores them and grants it nothing"
+                ),
+            )
+            .with_action(format!(
+                "delete the allow entries for {label} from peers.toml; the next save would remove them anyway"
+            ));
+        }
+        return Finding {
+            verdict: match finding.verdict {
+                Verdict::Ok => Verdict::Informational,
+                verdict => verdict,
+            },
+            detail: format!(
+                "{}; it is dial-only, so this machine may dial it and it can use nothing here",
+                finding.detail
+            ),
+            ..finding
+        };
+    }
     if peer.has_grants != Some(false) {
         return finding;
     }
@@ -919,6 +950,8 @@ mod tests {
                 roaming: false,
                 has_address: true,
                 has_grants: Some(true),
+                dial_only: false,
+                ignored_grants: false,
                 reachable: Some(true),
                 version: Some("0.2.0+abc".to_string()),
                 version_error: None,
@@ -1066,6 +1099,50 @@ mod tests {
         {
             assert_eq!(finding.verdict, Verdict::Unknown);
             assert!(finding.action.is_none(), "unknown state offered an action");
+        }
+    }
+
+    /// A dial-only peer is information, and doctor still says whether it is
+    /// reachable. One whose file also lists grants contradicts itself, and the
+    /// grants are ignored; that is worth a problem, because someone meant to
+    /// grant something and it is not happening.
+    #[test]
+    fn a_dial_only_peer_is_information_unless_the_file_lists_grants_for_it() {
+        for (reachable, ignored, verdict) in [
+            (Some(true), false, Verdict::Informational),
+            (Some(false), false, Verdict::Informational),
+            (None, false, Verdict::Unknown),
+            (Some(true), true, Verdict::Problem),
+            (Some(false), true, Verdict::Problem),
+        ] {
+            let mut facts = configured();
+            facts.peers[0].dial_only = true;
+            facts.peers[0].ignored_grants = ignored;
+            facts.peers[0].has_grants = Some(ignored);
+            facts.peers[0].reachable = reachable;
+
+            let findings = diagnose(&facts);
+            let peer = find(&findings, "peer")[0];
+
+            assert_eq!(
+                peer.verdict, verdict,
+                "{reachable:?}/{ignored}: {}",
+                peer.detail
+            );
+            if ignored {
+                assert!(peer.detail.contains("dial-only") && peer.detail.contains("ignores"));
+                assert!(
+                    peer.action
+                        .as_deref()
+                        .is_some_and(|a| a.contains("peers.toml"))
+                );
+            } else {
+                assert!(peer.detail.contains("dial-only"), "{}", peer.detail);
+                assert!(
+                    peer.action.is_none(),
+                    "an intended setting asked for action"
+                );
+            }
         }
     }
 
@@ -1710,6 +1787,8 @@ mod tests {
             roaming: false,
             has_address: true,
             has_grants: Some(true),
+            dial_only: false,
+            ignored_grants: false,
             reachable: Some(true),
             version: None,
             version_error: Some(PeerVersionError::PolicyRefusal(
@@ -1838,6 +1917,16 @@ where
                         .iter()
                         .find(|configured| configured.id.to_string() == peer.id)
                         .map(|configured| !configured.allow.is_empty())
+                }),
+                dial_only: peer_book.as_ref().is_some_and(|book| {
+                    book.peers().iter().any(|configured| {
+                        configured.id.to_string() == peer.id && configured.dial_only
+                    })
+                }),
+                ignored_grants: peer_book.as_ref().is_some_and(|book| {
+                    book.peers().iter().any(|configured| {
+                        configured.id.to_string() == peer.id && book.ignored_grants(&configured.id)
+                    })
                 }),
                 reachable: Some(peer.reachable),
                 label,

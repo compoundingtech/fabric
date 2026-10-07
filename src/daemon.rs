@@ -4369,6 +4369,20 @@ async fn handle_mux_connection(
     state: Arc<DaemonState>,
     register_incoming: bool,
 ) -> Result<()> {
+    if !register_incoming
+        && state
+            .peer_book
+            .read()
+            .await
+            .is_dial_only(&connection.remote_id())
+    {
+        // We dialled a host that may never use anything here. A connection we
+        // opened still lets the far side open streams back, and every one is
+        // refused by `may`; not accepting them at all also keeps a hostile host
+        // from holding this daemon's stream slots with streams that never send
+        // a header. Our own streams on it are unaffected.
+        return Ok(());
+    }
     if register_incoming {
         let generation = state.endpoint_handle().generation;
         let remote_generation =
@@ -9099,6 +9113,242 @@ mod tests {
         })
         .await
         .is_ok()
+    }
+
+    /// A CI host may never run a command on a development host, and a
+    /// development host may run one on a CI host. Enforced by `dial_only` in
+    /// the development host's peers.toml, which this test writes the way a
+    /// careless hand edit would: dial-only AND every grant besides. The flag
+    /// must win.
+    ///
+    /// Two real nodes with exec enabled on both. The positive control runs a
+    /// command in the allowed direction, so a refusal in the other proves the
+    /// flag and not a broken setup. Every attempt from the CI side tries to
+    /// create a file on the development host, and the file must not exist.
+    #[tokio::test]
+    async fn a_ci_host_cannot_exec_on_a_dev_host_but_the_dev_host_can_exec_on_it() -> Result<()> {
+        let dev_dir = tempfile::tempdir()?;
+        let ci_dir = tempfile::tempdir()?;
+        let dev_home = FabricHome::new(dev_dir.path());
+        let ci_home = FabricHome::new(ci_dir.path());
+        let exec_on = || DaemonOptions {
+            allow_exec: true,
+            allow_shell: true,
+            ..DaemonOptions::default()
+        };
+        let dev = FabricNode::start_with_daemon_options(dev_home.clone(), exec_on()).await?;
+        let ci = FabricNode::start_with_daemon_options(ci_home.clone(), exec_on()).await?;
+        let outsider = Endpoint::bind(iroh::endpoint::presets::N0).await?;
+
+        // The CI host grants the development host everything, as a CI host
+        // would for the machines that drive it.
+        trust_test_peer(&ci_home, &ci, dev.id(), "dev", dev.addr()).await?;
+        // The development host trusts both of them for dialling only, with
+        // every grant listed beside the flag.
+        let everything = [
+            "shell",
+            "exec",
+            "sync",
+            "echo",
+            "send-file",
+            "audit/echo",
+            "audit/sink",
+        ];
+        trust_test_peer_allowing(&dev_home, &dev, ci.id(), "ci", ci.addr(), &everything).await?;
+        trust_test_peer_allowing(
+            &dev_home,
+            &dev,
+            outsider.id(),
+            "ci-raw",
+            outsider.addr(),
+            &everything,
+        )
+        .await?;
+        let raw = fs::read_to_string(dev_home.peers_path())?;
+        let flagged = raw.replace("name = \"ci\"\n", "name = \"ci\"\ndial_only = true\n");
+        let flagged = flagged.replace(
+            "name = \"ci-raw\"\n",
+            "name = \"ci-raw\"\ndial_only = true\n",
+        );
+        assert_eq!(
+            flagged.matches("dial_only = true").count(),
+            2,
+            "the edit did not apply: {raw}"
+        );
+        fs::write(dev_home.peers_path(), flagged)?;
+        dev.state().reload_peers().await?;
+        let peers = dev.state().peer_book.read().await.clone();
+        assert!(
+            peers.ignored_grants(&ci.id()) && peers.ignored_grants(&outsider.id()),
+            "the test did not build the contradictory file it means to test"
+        );
+
+        // POSITIVE CONTROL: dev -> ci.
+        let socket = dev
+            .state()
+            .dial_alpn("ci", exec::EXEC_PROTOCOL, exec::EXEC_ALPN.to_vec(), false)
+            .await?;
+        let mut stream = UnixStream::connect(&socket).await?;
+        exec::write_client_argv(
+            &mut stream,
+            &["/bin/sh".into(), "-c".into(), "printf from-dev".into()],
+        )
+        .await?;
+        let (stdout, exit) =
+            tokio::time::timeout(Duration::from_secs(30), collect_exec(&mut stream)).await??;
+        assert_eq!(stdout, b"from-dev");
+        assert_eq!(
+            exit, 0,
+            "the allowed direction does not work, so a refusal proves nothing"
+        );
+
+        // ci -> dev through the CI host's own daemon. The dev host's connection
+        // to it is now open and cached on both sides, which is the reverse
+        // path a hostile host would use.
+        let marker = dev_dir.path().join("ran-from-ci");
+        let socket = ci
+            .state()
+            .dial_alpn("dev", exec::EXEC_PROTOCOL, exec::EXEC_ALPN.to_vec(), false)
+            .await?;
+        let mut stream = UnixStream::connect(&socket).await?;
+        exec::write_client_argv(
+            &mut stream,
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("touch {}", marker.display()),
+            ],
+        )
+        .await?;
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(60), collect_exec(&mut stream)).await;
+        assert!(
+            !matches!(&outcome, Ok(Ok((_, 0)))),
+            "a CI host's exec ran on a development host: {outcome:?}"
+        );
+        assert!(!marker.exists(), "the command ran on the development host");
+
+        // A CI host dialling in by itself, on each ALPN it could use. It is
+        // not let in at all, so none of them gets as far as a stream.
+        for alpn in [exec::EXEC_ALPN, shell::RESUMABLE_SHELL_ALPN, mux::MUX_ALPN] {
+            match outsider.connect(dev.addr(), alpn).await {
+                Err(_) => {}
+                Ok(connection) => {
+                    let closed =
+                        tokio::time::timeout(Duration::from_secs(20), connection.closed()).await;
+                    assert!(
+                        closed.is_ok(),
+                        "a dial-only host kept a connection open on {}",
+                        String::from_utf8_lossy(alpn)
+                    );
+                }
+            }
+        }
+        assert!(!marker.exists());
+
+        // The same list does grant a peer that is not dial-only: the flag, and
+        // not the setup, is what refused the others.
+        let ordinary = Endpoint::bind(iroh::endpoint::presets::N0).await?;
+        trust_test_peer_allowing(
+            &dev_home,
+            &dev,
+            ordinary.id(),
+            "ordinary",
+            ordinary.addr(),
+            &everything,
+        )
+        .await?;
+        let connection = ordinary.connect(dev.addr(), BUILTIN_ECHO_ALPN).await?;
+        let (mut send, mut recv) = connection.open_bi().await?;
+        send.write_all(b"ping").await?;
+        send.finish()?;
+        let echoed = tokio::time::timeout(Duration::from_secs(20), recv.read_to_end(16)).await??;
+        assert_eq!(
+            echoed, b"ping",
+            "an ordinary peer with the same grants was refused"
+        );
+
+        ordinary.close().await;
+        outsider.close().await;
+        ci.shutdown().await?;
+        dev.shutdown().await?;
+        Ok(())
+    }
+
+    /// A host that runs code this machine does not trust must not be able to
+    /// slow this daemon down. Every peer let in at the transport can open mux
+    /// streams that never send a header, and each holds one of the daemon's
+    /// 32 stream slots for ten seconds, whatever its grants say. A dial-only
+    /// host is not let in, and the connection this machine dialled to it is
+    /// not read for streams.
+    #[tokio::test]
+    async fn a_dial_only_host_cannot_hold_this_daemons_stream_slots() -> Result<()> {
+        async fn slots_left_after_a_flood(dial_only: bool) -> Result<usize> {
+            let dev_dir = tempfile::tempdir()?;
+            let ci_dir = tempfile::tempdir()?;
+            let dev_home = FabricHome::new(dev_dir.path());
+            let ci_home = FabricHome::new(ci_dir.path());
+            let dev = FabricNode::start(dev_home.clone()).await?;
+            let ci = FabricNode::start(ci_home.clone()).await?;
+            trust_test_peer(&ci_home, &ci, dev.id(), "dev", dev.addr()).await?;
+            if dial_only {
+                let mut peers = PeerBook::load(&dev_home)?;
+                peers.add_dial_only(ci.id(), Some("ci".into()), Some(ci.addr()));
+                peers.save(&dev_home)?;
+                dev.state().reload_peers().await?;
+            } else {
+                trust_test_peer_allowing(&dev_home, &dev, ci.id(), "ci", ci.addr(), &[]).await?;
+            }
+
+            // The development host opens the connection, as it does to a CI host.
+            let echo = std::str::from_utf8(BUILTIN_ECHO_ALPN)?;
+            let mut stream = dev
+                .state()
+                .open_peer_stream(&ci.addr(), echo, mux::StreamActivity::Application)
+                .await?;
+            stream.send.write_all(b"ping").await?;
+            stream.send.finish()?;
+            let echoed = tokio::time::timeout(Duration::from_secs(20), stream.recv.read_to_end(16))
+                .await??;
+            assert_eq!(echoed, b"ping", "the allowed direction does not work");
+
+            // The CI host floods that connection with streams that never speak.
+            let connection = tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    if let Some(connection) = ci.state().peer_connections.connection(dev.id()).await
+                    {
+                        return connection;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await?;
+            let mut held = Vec::new();
+            for _ in 0..(MAX_INCOMING_HANDLERS + 16) {
+                held.push(connection.open_bi().await?);
+            }
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let left = dev.state().mux_stream_slots.available_permits();
+            drop(held);
+            ci.shutdown().await?;
+            dev.shutdown().await?;
+            Ok(left)
+        }
+
+        let control = slots_left_after_a_flood(false).await?;
+        assert!(
+            control < MAX_INCOMING_HANDLERS,
+            "the flood held no slots from an ordinary trusted peer ({control} of \
+             {MAX_INCOMING_HANDLERS} left), so it shows nothing about a dial-only one"
+        );
+        let dial_only = slots_left_after_a_flood(true).await?;
+        assert_eq!(
+            dial_only,
+            MAX_INCOMING_HANDLERS,
+            "a dial-only host held {} of this daemon's stream slots",
+            MAX_INCOMING_HANDLERS - dial_only
+        );
+        Ok(())
     }
 
     #[test]

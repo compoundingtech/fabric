@@ -394,6 +394,32 @@ Fabric never recycles an endpoint because of RSS. On glibc Linux, each new
 128 MiB RSS growth step asks the allocator to return pages it already considers
 free. This request cannot free live allocations or enforce a memory limit.
 
+### A host that runs code you do not trust
+
+A CI runner executes code from pull requests, so treat it as hostile. Give it
+no way to reach the machines you work on:
+
+```sh
+fabric add <ci-nodeid> ci --dial-only
+```
+
+`dial-only` means this machine may dial the peer (`fabric exec ci -- ...` works
+if the peer grants it) and the peer may never use anything here. It is not let
+in as an inbound connection, no service, exposure, sync, Git or file transfer
+reaches it, and the connection this machine dialled to it is not read for
+streams it opens back. It overrides `allow`: whatever that list says, even a
+hand edit that lists `shell` and `exec` beside the flag, the peer is granted
+nothing, and `fabric doctor` reports the contradiction. `fabric add --allow`,
+`fabric join --grant` and `fabric git grant` for a dial-only peer are refused.
+To undo it, run `fabric remove ci`. An empty `allow` list is not the same
+thing: nothing stops a later edit from filling it, and the host is still let in
+as a connection.
+
+The other direction is the CI host's own `peers.toml`: list each machine that
+drives it with the services it should accept, and nothing else. A machine that
+never needs to dial the CI host should not list it at all, which is stricter
+still: the host is then refused at the handshake like any stranger.
+
 ### Enabling remote shell and exec
 
 Both remote shell (`fabric shell <peer>`) and non-interactive remote exec
