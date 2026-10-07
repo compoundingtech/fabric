@@ -4369,19 +4369,8 @@ async fn handle_mux_connection(
     state: Arc<DaemonState>,
     register_incoming: bool,
 ) -> Result<()> {
-    if !register_incoming
-        && state
-            .peer_book
-            .read()
-            .await
-            .is_dial_only(&connection.remote_id())
-    {
-        // We dialled a host that may never use anything here. A connection we
-        // opened still lets the far side open streams back, and every one is
-        // refused by `may`; not accepting them at all also keeps a hostile host
-        // from holding this daemon's stream slots with streams that never send
-        // a header. Our own streams on it are unaffected.
-        return Ok(());
+    if !register_incoming {
+        refuse_streams_while_dial_only(&connection, &state).await;
     }
     if register_incoming {
         let generation = state.endpoint_handle().generation;
@@ -4417,6 +4406,55 @@ async fn handle_mux_connection(
                 debug!(%error, "mux stream failed");
             }
         });
+    }
+}
+
+/// We dialled a host that may never use anything here. A connection we opened
+/// still lets the far side open streams back, and this answers every one with
+/// a refusal, from this connection's own loop and holding none of the daemon's
+/// shared stream slots, so a hostile host can neither use anything nor starve
+/// the other peers. Our own streams on the connection are unaffected.
+///
+/// The answer matters as much as the refusal. A host that gets no answer to a
+/// stream concludes the connection is dead, closes it and dials again, every
+/// few seconds for as long as it runs, and each replacement leaves a window in
+/// which this machine refuses its own requests to that host as offline. A
+/// refusal is an answer: that host keeps the connection.
+///
+/// Returns when the connection ends, the daemon stops, or the peer is no longer
+/// dial-only, after which the connection is served like any other.
+async fn refuse_streams_while_dial_only(connection: &Connection, state: &Arc<DaemonState>) {
+    let peer = connection.remote_id();
+    while state.peer_book.read().await.is_dial_only(&peer) {
+        let accepted = tokio::select! {
+            _ = state.cancel.cancelled() => return,
+            _ = connection.closed() => return,
+            accepted = connection.accept_bi() => accepted,
+        };
+        let Ok((mut send, mut recv)) = accepted else {
+            return;
+        };
+        // Read the request so the dialler's write completes and it goes on to
+        // read the answer. A stream that never speaks costs this loop a couple
+        // of seconds and nobody else anything.
+        let Ok(Ok(header)) = tokio::time::timeout(
+            Duration::from_secs(2),
+            mux::MuxStreamHeader::read(&mut recv),
+        )
+        .await
+        else {
+            continue;
+        };
+        let reason = match state.may(&peer, &header.protocol).await {
+            Err(denied) => denied.to_string(),
+            // Cleared between the check above and here; refuse this one anyway.
+            Ok(()) => format!("peer not permitted for service {:?}", header.protocol),
+        };
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            mux::write_denied(&mut send, &reason),
+        )
+        .await;
     }
 }
 
@@ -9279,8 +9317,8 @@ mod tests {
     /// slow this daemon down. Every peer let in at the transport can open mux
     /// streams that never send a header, and each holds one of the daemon's
     /// 32 stream slots for ten seconds, whatever its grants say. A dial-only
-    /// host is not let in, and the connection this machine dialled to it is
-    /// not read for streams.
+    /// host is not let in, and the streams it opens on the connection this
+    /// machine dialled are refused from that connection's own loop.
     #[tokio::test]
     async fn a_dial_only_host_cannot_hold_this_daemons_stream_slots() -> Result<()> {
         async fn slots_left_after_a_flood(dial_only: bool) -> Result<usize> {
@@ -9348,6 +9386,85 @@ mod tests {
             "a dial-only host held {} of this daemon's stream slots",
             MAX_INCOMING_HANDLERS - dial_only
         );
+        Ok(())
+    }
+
+    /// A host this machine dialled and marked dial-only keeps getting answers.
+    /// Its health probe opens streams on the connection this machine made, and a
+    /// host that is never answered decides the connection is dead, closes it and
+    /// dials again, over and over, while this side refuses its own requests to
+    /// that host as offline for a moment after each one. The refusal is the
+    /// answer, and it must arrive promptly and leave the connection alone.
+    #[tokio::test]
+    async fn a_dial_only_host_is_refused_promptly_and_keeps_its_connection() -> Result<()> {
+        let dev_dir = tempfile::tempdir()?;
+        let ci_dir = tempfile::tempdir()?;
+        let dev_home = FabricHome::new(dev_dir.path());
+        let ci_home = FabricHome::new(ci_dir.path());
+        let dev = FabricNode::start(dev_home.clone()).await?;
+        let ci = FabricNode::start(ci_home.clone()).await?;
+        trust_test_peer(&ci_home, &ci, dev.id(), "dev", dev.addr()).await?;
+        let mut peers = PeerBook::load(&dev_home)?;
+        peers.add_dial_only(ci.id(), Some("ci".into()), Some(ci.addr()));
+        peers.save(&dev_home)?;
+        dev.state().reload_peers().await?;
+
+        // The development host dials, and the connection is established.
+        let echo = std::str::from_utf8(BUILTIN_ECHO_ALPN)?;
+        let mut stream = dev
+            .state()
+            .open_peer_stream(&ci.addr(), echo, mux::StreamActivity::Application)
+            .await?;
+        stream.send.write_all(b"ping").await?;
+        stream.send.finish()?;
+        let echoed =
+            tokio::time::timeout(Duration::from_secs(20), stream.recv.read_to_end(16)).await??;
+        assert_eq!(echoed, b"ping", "the allowed direction does not work");
+        let connection = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Some(connection) = ci.state().peer_connections.connection(dev.id()).await {
+                    return connection;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await?;
+        let before = connection.stable_id();
+
+        // The CI host probes it five times. Three unanswered attempts are
+        // enough for a host to replace the connection.
+        for attempt in 1..=5 {
+            let started = Instant::now();
+            let error = ci
+                .state()
+                .open_peer_stream(&dev.addr(), echo, mux::StreamActivity::Probe)
+                .await
+                .err()
+                .with_context(|| format!("attempt {attempt}: a dial-only host was served"))?;
+            assert!(
+                mux::is_stream_denied(&error),
+                "attempt {attempt}: not a refusal, so the CI host would count it as a dead \
+                 connection: {error:#}"
+            );
+            assert!(
+                format!("{error:#}").contains("not permitted for service"),
+                "attempt {attempt}: {error:#}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "attempt {attempt}: the refusal took {:?}",
+                started.elapsed()
+            );
+        }
+        let after = ci.state().peer_connections.connection(dev.id()).await;
+        assert_eq!(
+            after.map(|connection| connection.stable_id()),
+            Some(before),
+            "the CI host replaced its connection"
+        );
+
+        ci.shutdown().await?;
+        dev.shutdown().await?;
         Ok(())
     }
 

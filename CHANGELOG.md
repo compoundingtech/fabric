@@ -4,6 +4,22 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+## [Unreleased]
+
+### Fixed
+
+- A dial-only peer no longer makes its own connection to this machine churn.
+  0.2.33 stopped reading the streams a dial-only peer opens on the connection
+  this machine dialled to it, so that it could not hold the daemon's stream
+  slots. The peer's health probe then went unanswered, and a peer that gets no
+  answer decides the connection is dead, closes it and dials again every 40
+  seconds or so, each time leaving a window in which this machine refused its
+  own requests to that peer as offline. Such a stream is now read and refused
+  at once with the usual "not permitted" answer, from that connection's own
+  loop and holding none of the shared slots, so the peer keeps its connection
+  and still cannot use anything. In a two-node test the peer saw 9 different
+  connections in a minute before and 1 after.
+
 ## [0.2.34] - 2026-10-07
 
 ### Fixed
