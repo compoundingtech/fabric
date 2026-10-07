@@ -4,6 +4,19 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+## [Unreleased]
+
+### Added
+
+- The validation log records every closed peer connection: `peer_connection_closed`
+  with the peer, whether this side dialled, how long the connection lived and
+  the reason (`closed by peer: <code>` with any text the peer sent, a timeout, a
+  reset, or this side closing it). Every "peer is offline" that follows a lost
+  connection starts with one, and until now nothing recorded it, so a run of
+  them could not be told apart: a peer that went away, a transport that timed
+  out, or a connection fabric replaced on purpose. Closures are rare, so it
+  costs nothing while idle.
+
 ## [0.2.35] - 2026-10-07
 
 ### Fixed

@@ -131,6 +131,9 @@ jobs:
       - name: Adversarial folder sync matrix
         run: timeout 10m cargo test --locked -p fabric-sync --test folder_sync -- --test-threads=1
 
+      - name: Connection close log contract
+        run: timeout 5m cargo test --locked -p fabric --test connection_close_log -- --test-threads=1
+
       - name: Update command contract
         run: timeout 5m cargo test --locked -p fabric --test update -- --test-threads=1
 
