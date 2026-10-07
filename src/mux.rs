@@ -980,8 +980,23 @@ impl PeerConnections {
         );
         let presence = self.presence.clone();
         let monitored = connection.clone();
+        let opened = Instant::now();
         tokio::spawn(async move {
-            monitored.closed().await;
+            let reason = monitored.closed().await;
+            // A closed connection is the start of every "peer is offline" that
+            // follows it, and without the reason there is nothing to tell a peer
+            // that went away from a transport that timed out from a connection we
+            // replaced on purpose. Closures are rare, so this costs nothing idle.
+            tracing::info!(
+                target: VALIDATION_LOG_TARGET,
+                event = "peer_connection_closed",
+                peer = %peer,
+                connection = monitored.stable_id(),
+                we_dialled = monitored.side() == iroh::endpoint::Side::Client,
+                age_ms = duration_millis(opened.elapsed()),
+                reason = %reason,
+                "a connection to a peer closed"
+            );
             presence.closed(peer, monitored.stable_id());
         });
         connection.clone()
