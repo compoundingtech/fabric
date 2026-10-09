@@ -208,6 +208,11 @@ pub fn sample_threads() -> Vec<ThreadSample> {
                 .unwrap_or_default()
         };
         let stat = read("stat");
+        // A thread that exited between the listing and this read has nothing to
+        // report, and is not a thread whose state could not be parsed.
+        if stat.is_empty() {
+            continue;
+        }
         // The state follows the closing parenthesis of the command name, which
         // can itself contain parentheses and spaces.
         let state = stat
@@ -358,15 +363,21 @@ pub fn summarize_children(own_name: &str, children: &[(u32, char, String)]) -> S
 /// whole process from ending, so the service manager never sees it exit and never
 /// starts another. Killing them closes the pipes. Returns how many.
 pub fn kill_children() -> usize {
-    let children = children_of(std::process::id(), &all_processes());
+    kill_processes(&children_of(std::process::id(), &all_processes()))
+}
+
+/// Kill exactly the processes given. Separate from finding them, so a test can
+/// kill its own child and not every child of the test binary, which includes
+/// those of the tests running beside it.
+pub fn kill_processes(processes: &[(u32, char, String)]) -> usize {
     #[cfg(unix)]
-    for (pid, _, _) in &children {
+    for (pid, _, _) in processes {
         // SAFETY: signalling a process by number; the worst outcome is ESRCH.
         unsafe {
             libc::kill(*pid as libc::pid_t, libc::SIGKILL);
         }
     }
-    children.len()
+    processes.len()
 }
 
 #[cfg(target_os = "linux")]
@@ -837,8 +848,14 @@ mod tests {
             .stdin(Stdio::piped())
             .spawn()
             .expect("sleep is available");
-        let killed = kill_children();
-        assert!(killed >= 1, "the child was not found among {killed}");
+        // Find the daemon's children the way the abort does, but kill only this
+        // test's: other tests in this binary have children of their own.
+        let mine = children_of(std::process::id(), &all_processes())
+            .into_iter()
+            .filter(|(pid, _, _)| *pid == child.id())
+            .collect::<Vec<_>>();
+        assert_eq!(mine.len(), 1, "the child was not found among the children");
+        assert_eq!(kill_processes(&mine), 1);
         let status = child.wait().expect("the child can be waited for");
         assert!(!status.success(), "the child survived: {status:?}");
     }
