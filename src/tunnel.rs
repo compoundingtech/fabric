@@ -559,8 +559,19 @@ impl TunnelSession {
     pub async fn run_local_reader(self: Arc<Self>, mut read: LocalRead) -> Result<()> {
         let mut buf = [0; LOCAL_READ_BUF];
         loop {
-            self.wait_for_buffer_space().await;
-            let read = match read.read(&mut buf).await {
+            // A closed session closes its socket. Closing shuts down only the
+            // half this session writes; the half read here is this task's, and a
+            // reader that outlives its session holds the fd open for ever, with
+            // our FIN already sent and the peer's replies piling up unread.
+            tokio::select! {
+                _ = self.done.cancelled() => return Ok(()),
+                _ = self.wait_for_buffer_space() => {}
+            }
+            let read = tokio::select! {
+                _ = self.done.cancelled() => return Ok(()),
+                read = read.read(&mut buf) => read,
+            };
+            let read = match read {
                 Ok(read) => read,
                 Err(error) => {
                     // An abrupt local close ends local input just as surely as a
@@ -2385,6 +2396,124 @@ mod tests {
             Some(SessionCleanup { kill }),
         );
         session
+    }
+
+    /// How a target that keeps talking to a closed session ends.
+    #[derive(Debug, PartialEq, Eq)]
+    enum TargetEnd {
+        /// Fabric closed its end: a write eventually fails.
+        FabricClosed,
+        /// Fabric kept its end open and unread: writes fill the buffers and stall.
+        FabricKeptItOpen,
+    }
+
+    /// A target that accepts one connection and writes to it without reading,
+    /// as a peer that is still sending to a session which has been closed does.
+    async fn talkative_target() -> (String, tokio::task::JoinHandle<TargetEnd>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let chunk = [7u8; 64 * 1024];
+            loop {
+                match tokio::time::timeout(Duration::from_secs(6), socket.write_all(&chunk)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => return TargetEnd::FabricClosed,
+                    Err(_) => return TargetEnd::FabricKeptItOpen,
+                }
+            }
+        });
+        (addr, task)
+    }
+
+    /// Closing a server session must close its socket to the target, not only
+    /// the half it writes. The task that reads the target holds the other half;
+    /// left running it keeps the fd open for ever, with our FIN already sent, so
+    /// the target's replies pile up unread in a socket nobody will ever read.
+    /// Hundreds of these exhausted the network buffers of the hosts that ran them.
+    #[tokio::test]
+    async fn closing_a_server_session_closes_its_socket_to_the_target() {
+        let (addr, target) = talkative_target().await;
+        let store = store(8, 8);
+        let (session, _) = store
+            .get_or_create(
+                session_id(40),
+                peer_id(),
+                ServerTarget::Tcp { addr },
+                false,
+                Grant::Trust,
+            )
+            .await
+            .unwrap();
+        // Let the target's output fill the session's buffer, which stops its reader.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // What eviction, expiry and a revoking reload all do.
+        store.remove_session(&session).await;
+
+        assert_eq!(
+            target.await.unwrap(),
+            TargetEnd::FabricClosed,
+            "the session was closed and the target could still write into an open socket"
+        );
+    }
+
+    /// The same, counted the way the leak was found: sockets left in FIN_WAIT_2
+    /// to the target after many sessions have come and gone.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn many_closed_sessions_leave_no_fin_wait_2_sockets() {
+        const FIN_WAIT2: &str = "05";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let addr = format!("127.0.0.1:{port}");
+        // Accepts every connection and writes to it for as long as it stays open.
+        let target = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                let (_, mut write) = socket.into_split();
+                held.push(tokio::spawn(async move {
+                    let chunk = [7u8; 16 * 1024];
+                    while write.write_all(&chunk).await.is_ok() {}
+                }));
+            }
+        });
+
+        let store = store(64, 64);
+        for number in 0..20u8 {
+            let (session, _) = store
+                .get_or_create(
+                    session_id(60 + number),
+                    peer_id(),
+                    ServerTarget::Tcp { addr: addr.clone() },
+                    false,
+                    Grant::Trust,
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            store.remove_session(&session).await;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Sockets whose remote port is the target's, in FIN_WAIT_2, from the table.
+        let table = std::fs::read_to_string("/proc/net/tcp").unwrap();
+        let hex_port = format!("{port:04X}");
+        let stuck = table
+            .lines()
+            .skip(1)
+            .filter(|line| {
+                let columns: Vec<&str> = line.split_whitespace().collect();
+                columns.len() > 3
+                    && columns[2].ends_with(&format!(":{hex_port}"))
+                    && columns[3] == FIN_WAIT2
+            })
+            .count();
+        target.abort();
+        assert_eq!(
+            stuck, 0,
+            "{stuck} sockets to the target were left in FIN_WAIT_2"
+        );
     }
 
     async fn mark_detached(session: &TunnelSession) {

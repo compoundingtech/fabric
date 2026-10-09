@@ -4,6 +4,22 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+## [Unreleased]
+
+### Fixed
+
+- A closed tunnel session now closes its socket to the target. Closing shut down
+  only the half the session writes; the task that reads the target kept the
+  other half, so the fd stayed open for ever with the FIN already sent: a
+  socket in FIN_WAIT_2 whose peer kept talking into a buffer nobody would read.
+  A daemon gained hundreds of them (555 holding 202 MiB after a day and a half
+  on one host, about 320 on each of two Macs), and on a Mac they drain the
+  machine's shared network buffers until every socket on it, including other
+  programs' replication, fails with "No buffer space available". The count
+  grew with uptime, every time a session ended without its target closing first
+  (eviction, expiry of a detached session, a revoking reload). The reader now
+  stops when its session closes.
+
 ## [0.2.36] - 2026-10-09
 
 ### Added
