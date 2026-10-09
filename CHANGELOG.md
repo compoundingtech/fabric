@@ -20,6 +20,26 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   (eviction, expiry of a detached session, a revoking reload). The reader now
   stops when its session closes.
 
+### Added
+
+- A frozen daemon ends itself instead of staying frozen. If the async runtime
+  stops running, a watcher thread that no runtime stall can stop logs
+  `runtime_stalled` after 60 s, with where each thread waits, the kernel's CPU,
+  I/O and memory pressure, whether the daemon's cgroup is throttled, the
+  processes on the machine stuck in uninterruptible waits, and the daemon's own
+  children. After 180 s it kills those children and ends the process with
+  status 70, so the service manager starts a fresh daemon that dials its peers.
+  Two hosts' daemons stopped in one morning: one for 226 s and then recovered,
+  one for good, and a daemon that is alive and serves nothing used to stay that
+  way until someone logged in. The children are killed first because a thread
+  blocked on a pipe a child holds open keeps the process from ending, so
+  systemd never sees it exit and never restarts it (a unit with
+  `KillMode=process` leaves children alive on purpose); that is how the second
+  one stayed down. A gap in which the watcher was paused too (a laptop asleep, a
+  stopped process) is not counted. `FABRIC_STALL_REPORT_SECS` and
+  `FABRIC_STALL_ABORT_SECS` change the limits, and `0` disables the abort. The
+  cost is two wakeups every 10 s.
+
 ## [0.2.36] - 2026-10-09
 
 ### Added

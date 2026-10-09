@@ -2798,6 +2798,9 @@ pub async fn run_daemon(home: FabricHome, allow_shell: bool) -> Result<()> {
 pub async fn run_daemon_with_options(home: FabricHome, options: DaemonOptions) -> Result<()> {
     let _lease = DaemonLease::acquire(&home)?;
     init_daemon_tracing(&home)?;
+    // For the life of the daemon: if its runtime ever stops running, say why and
+    // end the process so the service manager starts a fresh one.
+    let _stall = crate::stall::Watchdog::start(crate::stall::StallConfig::from_env());
     FabricNode::start_with_daemon_options(home, options)
         .await?
         .wait()
