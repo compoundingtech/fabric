@@ -17,6 +17,7 @@ pub mod mux;
 pub mod pathwatch;
 pub mod service;
 pub mod services;
+pub mod stall;
 /// What the daemon shares with the sync companion, re-exported where it used
 /// to live so every `fabric::sync` path still resolves.
 pub use fabric_config::sync;

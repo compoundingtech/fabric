@@ -79,6 +79,33 @@ Fabric bounds a new request while the peer is down and accepts another request
 after the peer returns. Whether a particular client retries remains that
 client's behavior.
 
+## A daemon that is alive and does nothing
+
+A dead daemon is restarted by its service manager. A daemon whose async runtime
+has stopped running is not dead: its connections time out, every peer sees it
+offline, and the service manager sees a running process, so nothing replaces it.
+It was seen on two hosts in one morning, once recovering by itself after about
+226 seconds and once not at all.
+
+The daemon therefore watches itself from a plain OS thread that no runtime stall
+can stop. A task on the runtime writes a heartbeat every 10 s. When the heartbeat
+is 60 s old the thread logs `runtime_stalled` once, with where each thread is
+waiting, the kernel's CPU, I/O and memory pressure, whether the daemon's cgroup is
+being throttled, and every process on the machine stuck in an uninterruptible
+wait (several unrelated processes stuck in the same place name a cause outside
+fabric). When it is 180 s old the thread ends the process with status 70, so the
+service manager starts a fresh one, which dials its peers on its own. If the
+runtime runs again before that, `runtime_recovered` records how long it was out.
+
+The thread judges only time during which it was itself running. A laptop that
+slept, a virtual machine that was frozen or a process that was stopped paused the
+thread too, so it has no evidence and starts counting again instead of ending a
+daemon that is waking up.
+
+`FABRIC_STALL_REPORT_SECS` and `FABRIC_STALL_ABORT_SECS` change the two limits;
+an abort of `0` reports and never ends the process. The cost is two wakeups every
+10 s, one on the runtime and one on the thread.
+
 ## Known rough edges
 
 Retry delays now grow to about an hour with jitter during an extended absence,
