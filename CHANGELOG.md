@@ -322,7 +322,7 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   network-change contracts, including virtual five-minute/four-hour outages
   with real endpoints returning at a changed UDP address.
 
-## [0.2.38] - 2026-10-10
+## [Unreleased]
 
 ### Removed
 
