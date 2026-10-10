@@ -228,6 +228,124 @@ pub fn sample_threads() -> Vec<ThreadSample> {
     samples
 }
 
+/// The system call a thread is inside, as `/proc/<pid>/task/<tid>/syscall`
+/// prints it: the call's number and its first argument (a file descriptor for
+/// `read`). `None` while the thread is running or the file is not readable.
+pub fn parse_syscall(text: &str) -> Option<(i64, u64)> {
+    let mut fields = text.split_whitespace();
+    let number: i64 = fields.next()?.parse().ok()?;
+    if number < 0 {
+        return None;
+    }
+    let first = fields.next()?;
+    let first = u64::from_str_radix(first.strip_prefix("0x")?, 16).ok()?;
+    Some((number, first))
+}
+
+/// What a thread stuck outside the runtime is waiting for: the system call, the
+/// descriptor it was given and what that descriptor is, and for a pipe or socket
+/// every process that holds an end. A thread parked in a pipe read is waiting
+/// for whoever holds the other end to write or close it, and this names them.
+#[cfg(target_os = "linux")]
+pub fn describe_thread_wait(task: &std::path::Path) -> Option<String> {
+    let (number, first) = parse_syscall(&std::fs::read_to_string(task.join("syscall")).ok()?)?;
+    let mut line = format!("syscall={number}");
+    // Only a plausible descriptor; for other calls the first argument is an address.
+    if first >= 65536 {
+        return Some(line);
+    }
+    let Ok(target) = std::fs::read_link(format!("/proc/self/fd/{first}")) else {
+        return Some(line);
+    };
+    let target = target.to_string_lossy().into_owned();
+    line.push_str(&format!(" fd={first} {target}"));
+    if target.starts_with("pipe:") || target.starts_with("socket:") {
+        let holders = holders_of(&target);
+        let shown = holders
+            .iter()
+            .take(8)
+            .map(|(pid, state, name, fds)| format!("{pid}:{state}/{name} fds={fds}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        line.push_str(&format!(" held-by=[{shown}]"));
+    }
+    Some(line)
+}
+
+/// Every process with a descriptor that is `target` (for example `pipe:[123]`),
+/// with its state, name and how many such descriptors it holds.
+#[cfg(target_os = "linux")]
+fn holders_of(target: &str) -> Vec<(u32, char, String, usize)> {
+    let mut holders = Vec::new();
+    let Ok(processes) = std::fs::read_dir("/proc") else {
+        return holders;
+    };
+    for process in processes.flatten() {
+        let Some(pid) = process
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(process.path().join("fd")) else {
+            continue;
+        };
+        let count = fds
+            .flatten()
+            .filter(|fd| {
+                std::fs::read_link(fd.path()).is_ok_and(|link| link.to_string_lossy() == target)
+            })
+            .count();
+        if count == 0 {
+            continue;
+        }
+        let stat = std::fs::read_to_string(process.path().join("stat")).unwrap_or_default();
+        let (state, name) =
+            parse_stat(&stat).map_or(('?', String::new()), |(_, state, name)| (state, name));
+        holders.push((pid, state, name, count));
+    }
+    holders
+}
+
+/// For each of this process's threads that is neither idle nor parked, what it
+/// is waiting for (see [`describe_thread_wait`]).
+#[cfg(target_os = "linux")]
+pub fn stuck_thread_waits() -> String {
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return "stuck-threads=unreadable".to_string();
+    };
+    let mut waits = Vec::new();
+    // The thread writing this report is always running; it is not a finding.
+    let own = unsafe { libc::syscall(libc::SYS_gettid) }.to_string();
+    for task in tasks.flatten() {
+        if task.file_name().to_string_lossy() == own {
+            continue;
+        }
+        let path = task.path();
+        let stat = std::fs::read_to_string(path.join("stat")).unwrap_or_default();
+        let Some(state) = stat
+            .rsplit_once(") ")
+            .and_then(|(_, rest)| rest.chars().next())
+        else {
+            continue;
+        };
+        if matches!(state, 'S' | 'I') {
+            continue;
+        }
+        let name = std::fs::read_to_string(path.join("comm")).unwrap_or_default();
+        let wait = describe_thread_wait(&path).unwrap_or_else(|| "running".to_string());
+        waits.push(format!("{}:{state} {wait}", name.trim()));
+    }
+    waits.truncate(8);
+    format!("stuck-threads=[{}]", waits.join("; "))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn stuck_thread_waits() -> String {
+    String::new()
+}
+
 /// The kernel's own account of stall, from `/proc/pressure/{cpu,io,memory}`:
 /// the share of the last 10 s and 60 s that some task, and for io and memory all
 /// tasks, could not run for want of that resource.
@@ -430,8 +548,9 @@ fn machine_view() -> String {
         .unwrap_or_default();
     let children = summarize_children(&own_name, &children_of(me, &all_processes()));
     format!(
-        "pressure(10s/60s): {pressure} | own-cgroup: {throttling} | {} | {children}",
-        summarize_blocked(&stats)
+        "pressure(10s/60s): {pressure} | own-cgroup: {throttling} | {} | {children} | {}",
+        summarize_blocked(&stats),
+        stuck_thread_waits()
     )
 }
 
@@ -912,6 +1031,58 @@ mod tests {
         assert!(view.contains("pressure(10s/60s):"), "{view}");
         assert!(view.contains("own-cgroup:"), "{view}");
         assert!(view.contains("blocked_processes="), "{view}");
+    }
+
+    #[test]
+    fn a_syscall_line_is_parsed_and_a_running_thread_has_none() {
+        assert_eq!(
+            parse_syscall("0 0x17 0x7f00 0x2000 0x0 0x0 0x0 0x7ffd 0x7f12"),
+            Some((0, 0x17))
+        );
+        assert_eq!(parse_syscall("running"), None);
+        assert_eq!(parse_syscall("-1 0x7ffd 0x7f12"), None);
+        assert_eq!(parse_syscall(""), None);
+    }
+
+    /// The point of the report: a thread parked reading a pipe is named together
+    /// with the process that holds the other end, which is how the next freeze
+    /// shows whose write it was waiting for.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_thread_reading_a_pipe_is_described_with_the_holders_of_the_pipe() {
+        use std::io::Read;
+        use std::sync::mpsc;
+        let (mut reader, writer) = std::io::pipe().expect("pipe");
+        let (tid_tx, tid_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            // The kernel thread id, which is the name of this thread's /proc/self/task entry.
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+            tid_tx.send(tid).expect("send tid");
+            let mut byte = [0u8; 1];
+            let _ = reader.read(&mut byte);
+        });
+        let tid = tid_rx.recv().expect("tid");
+        let task = std::path::PathBuf::from(format!("/proc/self/task/{tid}"));
+        let mut description = None;
+        for _ in 0..200 {
+            description = describe_thread_wait(&task).filter(|text| text.contains("pipe:"));
+            if description.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let description = description.expect("the thread never showed a pipe read");
+        let me = std::process::id();
+        assert!(description.contains("held-by=["), "{description}");
+        assert!(description.contains(&format!("{me}:")), "{description}");
+        drop(writer);
+        thread.join().expect("reader ends when the pipe closes");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_stuck_thread_report_is_part_of_the_machine_view() {
+        assert!(machine_view().contains("stuck-threads=["));
     }
 
     #[cfg(target_os = "linux")]

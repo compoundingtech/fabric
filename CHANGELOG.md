@@ -4,6 +4,28 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+## [Unreleased]
+
+### Fixed
+
+- Starting a command no longer takes one of the daemon's runtime workers for as
+  long as the operating system takes to start it. `Command::spawn` waits on a
+  pipe until the child has executed; called inline in the exec, Git and
+  exposed-exec services it parked a worker in that wait. Two stalls in a day
+  had one worker in an uninterruptible pipe read and the daemon's only child
+  a command it had just started, which stopped the whole runtime until the
+  stall watchdog ended the process. The spawn now runs on the blocking pool with
+  a 20 s limit: a spawn that does not finish fails that one request, and a child
+  that appears after the limit is killed.
+
+### Added
+
+- The stall report names what each stuck thread is waiting for: the system call,
+  the descriptor it was given, what that descriptor is, and for a pipe or socket
+  every process that holds an end (`stuck-threads=[... fd=23 pipe:[N]
+  held-by=[PID:S/name ...]]`), so the next freeze shows whose write it was
+  waiting for.
+
 ## [0.2.37] - 2026-10-09
 
 ### Fixed

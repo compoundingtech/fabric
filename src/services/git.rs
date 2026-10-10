@@ -469,7 +469,7 @@ where
     if let Some(protocol) = request.git_protocol {
         command.env("GIT_PROTOCOL", protocol);
     }
-    let mut child = match command.spawn() {
+    let mut child = match fabric_service_api::child_spawn::spawn(command).await {
         Ok(child) => child,
         Err(error) => {
             write_json(

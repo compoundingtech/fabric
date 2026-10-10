@@ -16,6 +16,8 @@
 //! A service that logs through `tracing` uses a target under `fabric::`, the
 //! prefix the daemon's log filter admits.
 
+pub mod child_spawn;
+
 use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc};
 
 use tokio::io::{AsyncRead, AsyncWrite};
