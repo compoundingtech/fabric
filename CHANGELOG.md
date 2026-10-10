@@ -4,7 +4,7 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
-## [Unreleased]
+## [0.2.38] - 2026-10-10
 
 ### Fixed
 
