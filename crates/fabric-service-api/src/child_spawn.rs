@@ -21,9 +21,9 @@ use tokio::process::{Child, Command};
 
 /// Longer than any healthy spawn, short enough that a request learns of the
 /// failure before its caller gives up.
-pub(crate) const SPAWN_LIMIT: Duration = Duration::from_secs(20);
+pub const SPAWN_LIMIT: Duration = Duration::from_secs(20);
 
-pub(crate) async fn spawn(command: Command) -> io::Result<Child> {
+pub async fn spawn(command: Command) -> io::Result<Child> {
     spawn_within(command, SPAWN_LIMIT).await
 }
 

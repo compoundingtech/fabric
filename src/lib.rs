@@ -6,7 +6,6 @@ use iroh::{
 };
 
 mod admission;
-mod child_spawn;
 pub mod ca;
 pub mod config;
 pub mod control;
