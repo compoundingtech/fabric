@@ -4,7 +4,7 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
-## [Unreleased]
+## [0.2.38] - 2026-10-10
 
 ### Fixed
 
@@ -322,7 +322,7 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   network-change contracts, including virtual five-minute/four-hour outages
   with real endpoints returning at a changed UDP address.
 
-## [Unreleased]
+## [0.2.38] - 2026-10-10
 
 ### Removed
 
