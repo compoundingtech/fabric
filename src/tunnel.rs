@@ -2149,8 +2149,8 @@ async fn spawn_exec_session(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = command
-        .spawn()
+    let mut child = crate::child_spawn::spawn(command)
+        .await
         .with_context(|| format!("failed to spawn exposed exec {program:?}"))?;
     let stdin = child
         .stdin
