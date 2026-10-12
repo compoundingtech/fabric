@@ -2149,7 +2149,8 @@ async fn spawn_exec_session(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = fabric_service_api::child_spawn::spawn(command)
+    let spawn_label = format!("exposed-exec {label} for {peer_id}");
+    let mut child = fabric_service_api::child_spawn::spawn(&spawn_label, command)
         .await
         .with_context(|| format!("failed to spawn exposed exec {program:?}"))?;
     let stdin = child

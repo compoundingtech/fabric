@@ -548,9 +548,10 @@ fn machine_view() -> String {
         .unwrap_or_default();
     let children = summarize_children(&own_name, &children_of(me, &all_processes()));
     format!(
-        "pressure(10s/60s): {pressure} | own-cgroup: {throttling} | {} | {children} | {}",
+        "pressure(10s/60s): {pressure} | own-cgroup: {throttling} | {} | {children} | {} | {}",
         summarize_blocked(&stats),
-        stuck_thread_waits()
+        stuck_thread_waits(),
+        fabric_service_api::child_spawn::in_flight()
     )
 }
 

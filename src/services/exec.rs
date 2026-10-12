@@ -284,7 +284,7 @@ where
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    let mut child = match fabric_service_api::child_spawn::spawn(command).await {
+    let mut child = match fabric_service_api::child_spawn::spawn(&format!("exec {:?} for {peer}", argv[0]), command).await {
         Ok(child) => child,
         Err(error) => {
             write_server_frame(
