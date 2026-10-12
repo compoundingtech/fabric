@@ -9,6 +9,7 @@ repository = "https://github.com/compoundingtech/fabric"
 anyhow = "1"
 tokio = { version = "1", features = ["io-util", "process", "rt", "time"] }
 tokio-util = "0.7"
+tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "time"] }

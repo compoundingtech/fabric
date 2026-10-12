@@ -15,25 +15,102 @@
 //! request; it no longer fails the daemon. If it finishes after the limit, the
 //! child it produced is killed instead of left behind.
 
-use std::{io, time::Duration};
+use std::{
+    collections::BTreeMap,
+    io,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use tokio::process::{Child, Command};
+
+/// Spawns that have started and not yet come back, by sequence number: what each
+/// was for and when it began. A stall report reads this to say which request a
+/// stuck spawn belongs to, which the child's own name cannot.
+static IN_FLIGHT: Mutex<BTreeMap<u64, (String, Instant)>> = Mutex::new(BTreeMap::new());
+static NEXT: AtomicU64 = AtomicU64::new(0);
+
+/// A spawn that took longer than this is worth a log line even when it worked.
+const SLOW_SPAWN: Duration = Duration::from_secs(1);
+
+/// One line naming every spawn still in progress and how long it has been going,
+/// oldest first.
+pub fn in_flight() -> String {
+    let now = Instant::now();
+    let Ok(spawns) = IN_FLIGHT.lock() else {
+        return "spawns-in-flight=unreadable".to_string();
+    };
+    let mut shown: Vec<(Duration, &str)> = spawns
+        .values()
+        .map(|(label, since)| (now.duration_since(*since), label.as_str()))
+        .collect();
+    shown.sort_by(|a, b| b.0.cmp(&a.0));
+    let list = shown
+        .iter()
+        .take(8)
+        .map(|(age, label)| format!("{label} {}s", age.as_secs()))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("spawns-in-flight={} [{list}]", shown.len())
+}
+
+struct InFlight(u64);
+
+impl InFlight {
+    fn begin(label: &str) -> Self {
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut spawns) = IN_FLIGHT.lock() {
+            spawns.insert(id, (label.to_string(), Instant::now()));
+        }
+        Self(id)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Ok(mut spawns) = IN_FLIGHT.lock() {
+            spawns.remove(&self.0);
+        }
+    }
+}
 
 /// Longer than any healthy spawn, short enough that a request learns of the
 /// failure before its caller gives up.
 pub const SPAWN_LIMIT: Duration = Duration::from_secs(20);
 
-pub async fn spawn(command: Command) -> io::Result<Child> {
-    spawn_within(command, SPAWN_LIMIT).await
+/// `label` says what the spawn is for (service, program, who asked); it appears
+/// in [`in_flight`] while the spawn runs and in the log if it was slow.
+pub async fn spawn(label: &str, command: Command) -> io::Result<Child> {
+    spawn_within(label, command, SPAWN_LIMIT).await
 }
 
-async fn spawn_within(mut command: Command, limit: Duration) -> io::Result<Child> {
+async fn spawn_within(label: &str, mut command: Command, limit: Duration) -> io::Result<Child> {
+    let began = Instant::now();
+    let in_flight = InFlight::begin(label);
     let mut start = tokio::task::spawn_blocking(move || command.spawn());
-    match tokio::time::timeout(limit, &mut start).await {
+    let result = tokio::time::timeout(limit, &mut start).await;
+    let took = began.elapsed();
+    if took >= SLOW_SPAWN {
+        tracing::warn!(
+            target: "fabric::validation",
+            event = "slow_child_spawn",
+            label = %label,
+            took_ms = took.as_millis() as u64,
+            finished = result.is_ok(),
+            "starting a child process took a long time"
+        );
+    }
+    match result {
         Ok(Ok(result)) => result,
         Ok(Err(join)) => Err(io::Error::other(format!("spawn task failed: {join}"))),
         Err(_) => {
+            // The blocking call is still running: keep it in the in-flight list
+            // until it ends, and kill whatever it eventually produces.
             tokio::spawn(async move {
+                let _in_flight = in_flight;
                 if let Ok(Ok(mut late)) = start.await {
                     let _ = late.start_kill();
                     let _ = late.wait().await;
@@ -56,7 +133,7 @@ mod tests {
     async fn a_process_is_started_and_its_output_read() {
         let mut command = Command::new("echo");
         command.arg("hello").stdout(std::process::Stdio::piped());
-        let mut child = spawn(command).await.expect("spawn echo");
+        let mut child = spawn("test echo", command).await.expect("spawn echo");
         let mut out = String::new();
         child
             .stdout
@@ -71,9 +148,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_program_that_does_not_exist_is_an_error_not_a_hang() {
-        let error = spawn(Command::new("/nonexistent/fabric-test-program"))
-            .await
-            .expect_err("no such program");
+        let error = spawn(
+            "test missing",
+            Command::new("/nonexistent/fabric-test-program"),
+        )
+        .await
+        .expect_err("no such program");
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 
@@ -84,7 +164,7 @@ mod tests {
     async fn waiting_for_a_spawn_does_not_hold_the_runtime() {
         let mut command = Command::new("sleep");
         command.arg("5").kill_on_drop(true);
-        let pending = tokio::spawn(spawn(command));
+        let pending = tokio::spawn(async move { spawn("test sleep", command).await });
         let ticked = tokio::time::timeout(Duration::from_secs(2), async {
             for _ in 0..3 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -110,11 +190,32 @@ mod tests {
                 Ok(())
             });
         }
-        let error = spawn_within(command, Duration::from_millis(50))
+        let error = spawn_within("test slow", command, Duration::from_millis(50))
             .await
             .expect_err("the spawn takes longer than the limit");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         // Give the late child time to appear and be killed; nothing may panic.
         tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(!in_flight().contains("test slow"), "{}", in_flight());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_spawn_in_progress_is_named_until_it_ends() {
+        let mut command = Command::new("true");
+        unsafe {
+            command.pre_exec(|| {
+                std::thread::sleep(Duration::from_millis(500));
+                Ok(())
+            });
+        }
+        let pending =
+            tokio::spawn(async move { spawn("test named spawn for peer-x", command).await });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let during = in_flight();
+        assert!(during.contains("test named spawn for peer-x"), "{during}");
+        let mut child = pending.await.expect("join").expect("spawn");
+        child.wait().await.expect("wait");
+        assert!(!in_flight().contains("test named spawn"), "{}", in_flight());
     }
 }

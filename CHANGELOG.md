@@ -4,6 +4,18 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+## [Unreleased]
+
+### Added
+
+- A stall report names the request behind a stuck spawn. Every child the daemon
+  starts is labelled with its service, program and the requesting peer; the
+  report lists the spawns still in progress with their age (`spawns-in-flight=N
+  [label Ns; ...]`), and a spawn that takes a second or more is logged as
+  `slow_child_spawn` even when it succeeds. The previous report showed a thread
+  waiting on the pipe a spawn uses to learn whether the new program ran, held by
+  a child named like the program, but not which request that was.
+
 ## [0.2.38] - 2026-10-10
 
 ### Fixed
