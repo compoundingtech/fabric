@@ -307,7 +307,7 @@ mod tests {
 
     /// The rows of the code table in docs/errors.md: code to (class, exit).
     fn documented_codes() -> BTreeMap<String, (String, i32)> {
-        let doc = include_str!("../docs/errors.md");
+        let doc = include_str!("../../../docs/errors.md");
         let table = doc
             .split("<!-- codes -->")
             .nth(1)

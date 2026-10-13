@@ -12,7 +12,7 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   each failure, a class that says what to do about it (`refusal`, `fault` or
   `usage`), the exit status for each class, the `--json` error object and the
   `fabric:<code> ` token that close reasons and wire errors will carry ahead of
-  today's text. This adds the `fabric::error` type and the specification;
+  today's text. This adds the `fabric::error` type (in `fabric-config`, so the sync companion shares it) and the specification;
   commands, close reasons and `--json` adopt it in the next changes.
 
 ## [0.2.40] - 2026-10-13

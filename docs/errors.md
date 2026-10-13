@@ -3,7 +3,7 @@
 Every failure fabric reports carries a stable code. A program reads the code;
 the text beside it is for people and may change. Fabric 0.2.41 and later
 carry codes. This page is the contract, and the test
-`error::tests::the_documented_table_is_the_code_list` keeps the table below
+`fabric_config::error::tests::the_documented_table_is_the_code_list` keeps the table below
 identical to the code.
 
 ## Codes
