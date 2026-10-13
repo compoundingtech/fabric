@@ -125,6 +125,13 @@ Deprecated, Fixed or Security.
   installs an older one now needs `--allow-downgrade`.
 
 ### Fixed
+- A network change can no longer stall the recovery that follows it. The rehome
+  loop awaited iroh's network-change notice with no deadline, so a notice that
+  never returned (a wake from sleep is the likely moment) left that loop, and
+  with it the held-connection check and the announcement to peers, stuck for
+  good. The notice now has a ten-second deadline, logs
+  `network_change_notify_timeout` when it is missed, and the loop carries on.
+  (Issue 21.)
 - `fabric exec` no longer loses a refusal to a broken pipe. A peer that refuses
   exec answers and closes the stream without reading the command, so the
   client's write of the command could fail with `Broken pipe` while the refusal

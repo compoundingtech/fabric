@@ -94,6 +94,11 @@ const ENDPOINT_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 /// iroh normally drains an endpoint within three seconds. A transport defect
 /// must not make a recycle or daemon shutdown wait forever.
 const ENDPOINT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the rehome loop waits for iroh to take a network-change notice.
+/// The notice only asks iroh to re-probe its paths. If it does not return, the
+/// loop must still go on to prove the held peer connections and announce, or a
+/// wake from sleep can leave every later network change unhandled.
+const NETWORK_CHANGE_NOTIFY_TIMEOUT: Duration = Duration::from_secs(10);
 const ENDPOINT_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const ENDPOINT_DIAGNOSTIC_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
 const ENDPOINT_RECYCLE_MIN_INTERVAL: Duration = Duration::from_secs(60);
@@ -2255,7 +2260,13 @@ impl DaemonState {
         // explicitly: `recover_unreachable_peer` when the endpoint itself is
         // suspect, `recycle_endpoint_if_generation` when the endpoint is
         // replaced, and the `debug drop-tunnels` control request.
-        endpoint.endpoint.network_change().await;
+        notify_network_change(
+            endpoint.endpoint.network_change(),
+            NETWORK_CHANGE_NOTIFY_TIMEOUT,
+            endpoint.generation,
+            reason,
+        )
+        .await;
         if network_usable {
             self.peer_connections.presence.retry_now();
             self.announce_to_peers().await;
@@ -3090,6 +3101,28 @@ where
     F: std::future::Future<Output = ()>,
 {
     tokio::time::timeout(bound, close).await.is_ok()
+}
+
+/// Hand iroh a network-change notice, and carry on without it if it does not
+/// come back within `bound`.
+async fn notify_network_change<F>(notice: F, bound: Duration, generation: u64, reason: &str)
+where
+    F: std::future::Future<Output = ()>,
+{
+    if !wait_for_close(notice, bound).await {
+        warn!(
+            target: VALIDATION_LOG_TARGET,
+            event = "network_change_notify_timeout",
+            generation,
+            reason,
+            timeout_ms = bound.as_millis() as u64,
+            "iroh did not take the network-change notice in time"
+        );
+        eprintln!(
+            "fabric: iroh took longer than {bound:?} to take a network change ({reason}); \
+             continuing without it"
+        );
+    }
 }
 
 async fn close_endpoint_bounded(endpoint: &Endpoint, context: &str) {
@@ -6284,6 +6317,26 @@ mod tests {
             "the old grant stayed open after the migration write failed"
         );
         node.shutdown().await
+    }
+
+    /// A wake from sleep is when iroh's network-change notice is most likely
+    /// to stall, and it is the notice that starts the recovery that follows. The
+    /// loop that sends it must come back and go on to prove its held peer
+    /// connections, however long iroh takes.
+    #[tokio::test]
+    async fn a_hung_network_change_notice_does_not_stall_the_rehome() {
+        let bound = Duration::from_millis(20);
+        let started = Instant::now();
+        notify_network_change(std::future::pending(), bound, 1, "test: hung notice").await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a hung notice escaped its {bound:?} deadline"
+        );
+
+        // A notice that comes back is not waited on past its return.
+        let started = Instant::now();
+        notify_network_change(std::future::ready(()), Duration::from_secs(30), 1, "test").await;
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]
