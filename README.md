@@ -9,6 +9,38 @@ Consumer tools do not link to iroh, know NodeAddr formats, or open QUIC streams.
 They ask fabric for a local socket connected to a remote service, then speak their
 own protocol over that socket.
 
+## Stability
+
+From 1.0.0, each part of fabric is stable, provisional or internal.
+[docs/stability.md](docs/stability.md) lists exactly what is in each level and
+the rules every 1.x release follows.
+
+- **Stable**, unchanged in meaning until 2.0:
+  - identity and the trust model;
+  - `peers.toml` grants;
+  - `expose` and `dial`;
+  - the direct exposure wire ([docs/tunnel-wire.md](docs/tunnel-wire.md));
+  - `fabric://` Git URLs;
+  - the commands programs drive, with their `--json` output and error codes
+    ([docs/errors.md](docs/errors.md)).
+- **Provisional**, which may change in a minor release with a CHANGELOG note:
+  - file sync;
+  - `fabric-stdio`;
+  - the conveniences around the core: `shell`, `join`, `ca`, `cert`,
+    `service`, and `restart`.
+- **Internal**, which may change in any release:
+  - the daemon-to-daemon framing (`fabric/mux/2`);
+  - the control socket;
+  - `telemetry.json`;
+  - log event names;
+  - human-readable output;
+  - the update machinery;
+  - the Rust crates as libraries.
+
+In a 1.x release, wire and grant semantics do not change; that waits for 2.0.
+New commands, flags and `--json` fields arrive in minor releases. Patch
+releases only fix bugs.
+
 ## Adopt Fabric On Two Machines
 
 Install the same fabric release on both macOS or Linux machines:
@@ -428,6 +460,29 @@ The other direction is the CI host's own `peers.toml`: list each machine that
 drives it with the services it should accept, and nothing else. A machine that
 never needs to dial the CI host should not list it at all, which is stricter
 still: the host is then refused at the handshake like any stranger.
+
+### A peer that only dials in
+
+A phone or a laptop behind a firewall connects to you and is never somewhere
+you can connect to. Without help, fabric probes such a peer every few seconds
+and reports it offline whenever it is not connected:
+
+```sh
+fabric add <phone-nodeid> phone --inbound-only --allow echo,web
+```
+
+`inbound-only` means the peer is served under its `--allow` list when it
+connects, exactly like any other peer, and this machine never dials, probes or
+announces to it. The liveness loop, the network-change checks, the start-up
+announcement and `fabric status` all leave it alone; `status` and `doctor`
+show it as `inbound-only` and connected or not connected, never as offline.
+`fabric ping`, `exec`, `shell`, `dial` and sync for that peer are refused with
+a message that says why, and a sync entry for `peers = "*"` skips it. Its
+build is not checked, because that needs an exec to the peer.
+
+It is the opposite direction from `--dial-only`, and the two cannot be combined
+(`fabric add` refuses the second flag). A later `fabric add` or `fabric join`
+keeps the flag; to undo it, run `fabric remove phone` and add the peer again.
 
 ### Enabling remote shell and exec
 
