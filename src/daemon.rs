@@ -18,6 +18,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, bail};
+use fabric_config::error::{ErrorCode, FabricError};
 use fabric_config::log_eprintln as eprintln;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId,
@@ -2924,9 +2925,7 @@ impl DaemonLease {
 }
 
 pub async fn send_control(home: &FabricHome, request: ControlRequest) -> Result<ControlResponse> {
-    let mut stream = UnixStream::connect(home.control_socket_path())
-        .await
-        .with_context(|| "fabric daemon is not running; run `fabric up` first")?;
+    let mut stream = fabric_config::daemon_control::connect(home).await?;
     let mut raw = serde_json::to_vec(&request)?;
     raw.push(b'\n');
     stream.write_all(&raw).await?;
@@ -2934,8 +2933,8 @@ pub async fn send_control(home: &FabricHome, request: ControlRequest) -> Result<
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await?;
     let response: ControlResponse = serde_json::from_slice(&response)?;
-    if let ControlResponse::Error { message } = response {
-        bail!("{message}");
+    if let ControlResponse::Error { message, fields } = response {
+        return Err(fields.into_error(message));
     }
     Ok(response)
 }
@@ -3760,9 +3759,7 @@ async fn handle_control_stream(stream: UnixStream, state: Arc<DaemonState>) {
     .await
     {
         Ok(response) => response,
-        Err(error) => ControlResponse::Error {
-            message: format!("{error:#}"),
-        },
+        Err(error) => ControlResponse::error(&error),
     };
 
     let mut stream = reader.into_inner();
@@ -3951,16 +3948,17 @@ async fn process_control_request(
             let bytes = match std::fs::metadata(&path) {
                 Ok(meta) => meta.len(),
                 Err(error) => {
-                    return Ok(ControlResponse::Error {
-                        message: format!("could not read {}: {error}", path.display()),
-                    });
+                    return Ok(ControlResponse::error(&anyhow::Error::new(
+                        FabricError::new(
+                            ErrorCode::InvalidArgument,
+                            format!("could not read {}: {error}", path.display()),
+                        ),
+                    )));
                 }
             };
             match services::send_file(&state, &peer, &name, &path).await {
                 Ok(()) => ControlResponse::SentFile { peer, name, bytes },
-                Err(error) => ControlResponse::Error {
-                    message: format!("{error:#}"),
-                },
+                Err(error) => ControlResponse::error(&error),
             }
         }
         ControlRequest::SyncStatus => {

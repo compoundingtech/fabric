@@ -9,6 +9,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use fabric::{
+    error::{ErrorCode, FabricError},
     config::{
         DEFAULT_EXEC_MAX_CHILDREN, FabricHome, GitAccess, PeerBook, generate_identity_file,
         load_or_create_identity, parse_addr_json, parse_node_id,
@@ -35,6 +36,11 @@ struct Cli {
 
     #[arg(long, global = true)]
     home: Option<PathBuf>,
+
+    /// Print results as JSON on stdout. A failure prints one error object,
+    /// as docs/errors.md describes, and exits with its code's status.
+    #[arg(long, global = true)]
+    json: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -288,9 +294,6 @@ enum Commands {
         /// Caller deadline in seconds.
         #[arg(long, default_value = "3")]
         timeout: f64,
-        /// Emit one JSON object instead of a human line.
-        #[arg(long)]
-        json: bool,
     },
     /// Open an interactive remote shell on a trusted peer.
     Shell { peer: String },
@@ -525,30 +528,44 @@ enum DebugCommands {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     if fabric::services::git::invoked_as_remote_helper() {
-        let code = fabric::services::git::run_remote_helper(|| {
-            let home = FabricHome::resolve(None)?;
-            Ok(move |peer: String| async move {
-                let response = send_control(&home, ControlRequest::Git { peer })
-                    .await
-                    .with_context(|| "the running Fabric daemon could not open a Git transport")?;
-                let socket = match response {
-                    ControlResponse::Git { socket } => socket,
-                    other => {
-                        bail!("the running Fabric daemon returned an unexpected reply: {other:?}")
-                    }
-                };
-                tokio::net::UnixStream::connect(&socket)
-                    .await
-                    .with_context(|| format!("failed to connect to Fabric at {}", socket.display()))
-            })
-        })
-        .await?;
+        let code = run_git_remote_helper()
+            .await
+            .unwrap_or_else(|error| fabric::error::report(&error, false));
         std::process::exit(code);
     }
-
     let cli = Cli::parse();
+    let json = cli.json;
+    if let Err(error) = run(cli).await {
+        std::process::exit(fabric::error::report(&error, json));
+    }
+}
+
+/// fabric runs as `git-remote-fabric` when Git invokes it for a fabric:// URL.
+async fn run_git_remote_helper() -> Result<i32> {
+    fabric::services::git::run_remote_helper(|| {
+        let home = FabricHome::resolve(None)?;
+        Ok(move |peer: String| async move {
+            let response = send_control(&home, ControlRequest::Git { peer })
+                .await
+                .with_context(|| "the running Fabric daemon could not open a Git transport")?;
+            let socket = match response {
+                ControlResponse::Git { socket } => socket,
+                other => {
+                    bail!("the running Fabric daemon returned an unexpected reply: {other:?}")
+                }
+            };
+            tokio::net::UnixStream::connect(&socket)
+                .await
+                .with_context(|| format!("failed to connect to Fabric at {}", socket.display()))
+        })
+    })
+    .await
+}
+
+async fn run(cli: Cli) -> Result<()> {
+    let json = cli.json;
     if cli.version {
         println!("{}", fabric::version_string());
         return Ok(());
@@ -1062,15 +1079,26 @@ async fn main() -> Result<()> {
                     peer,
                     protocol,
                     timeout,
-                    json,
                 } => {
                     if !(timeout.is_finite() && timeout > 0.0) {
-                        eprintln!("fabric: --timeout must be a positive number of seconds");
-                        std::process::exit(PROBE_EXIT_UNANSWERABLE);
+                        probe_unanswerable(
+                            FabricError::new(
+                                ErrorCode::InvalidArgument,
+                                "--timeout must be a positive number of seconds",
+                            )
+                            .into(),
+                            json,
+                        );
                     }
                     if protocol.is_empty() {
-                        eprintln!("fabric: PROTOCOL must be a non-empty ALPN string");
-                        std::process::exit(PROBE_EXIT_UNANSWERABLE);
+                        probe_unanswerable(
+                            FabricError::new(
+                                ErrorCode::InvalidArgument,
+                                "PROTOCOL must be a non-empty ALPN string",
+                            )
+                            .into(),
+                            json,
+                        );
                     }
                     let timeout_ms = ((timeout * 1000.0).round() as u64).max(1);
                     // Exit 1 means "the peer does not serve this protocol". A local
@@ -1089,8 +1117,10 @@ async fn main() -> Result<()> {
                     {
                         Ok(response) => response,
                         Err(error) => {
-                            eprintln!("fabric: probe could not be answered: {error:#}");
-                            std::process::exit(PROBE_EXIT_UNANSWERABLE);
+                            probe_unanswerable(
+                                error.context("probe could not be answered"),
+                                json,
+                            );
                         }
                     };
                     match response {
@@ -1104,6 +1134,7 @@ async fn main() -> Result<()> {
                             error,
                         } => {
                             if json {
+                                let code = probe_outcome_code(&outcome, error.as_deref());
                                 println!(
                                     "{}",
                                     serde_json::json!({
@@ -1114,6 +1145,8 @@ async fn main() -> Result<()> {
                                         "round_trip_micros": round_trip_micros,
                                         "transport": transport,
                                         "error": error,
+                                        "code": code.map(ErrorCode::as_str),
+                                        "class": code.map(|code| code.class().as_str()),
                                     })
                                 );
                             } else {
@@ -1137,8 +1170,10 @@ async fn main() -> Result<()> {
                             });
                         }
                         response => {
-                            eprintln!("fabric: unexpected daemon response: {response:?}");
-                            std::process::exit(PROBE_EXIT_UNANSWERABLE);
+                            probe_unanswerable(
+                                anyhow::anyhow!("unexpected daemon response: {response:?}"),
+                                json,
+                            );
                         }
                     }
                 }
@@ -1326,11 +1361,15 @@ fn expose_request(
     let persist = !ephemeral;
     if exec {
         if command.is_empty() {
-            bail!("--exec requires a command: fabric expose {protocol} --exec -- <cmd> [args...]");
+            return Err(invalid_argument(format!(
+                "--exec requires a command: fabric expose {protocol} --exec -- <cmd> [args...]"
+            )));
         }
         let max_children = max_children.unwrap_or(DEFAULT_EXEC_MAX_CHILDREN);
         if max_children == 0 {
-            bail!("--max-children must be greater than zero");
+            return Err(invalid_argument(
+                "--max-children must be greater than zero".into(),
+            ));
         }
         return Ok(ControlRequest::ExposeExec {
             protocol,
@@ -1341,11 +1380,11 @@ fn expose_request(
     }
 
     if max_children.is_some() {
-        bail!("--max-children requires --exec");
+        return Err(invalid_argument("--max-children requires --exec".into()));
     }
 
     if !command.is_empty() {
-        bail!("command arguments require --exec");
+        return Err(invalid_argument("command arguments require --exec".into()));
     }
 
     if let Some(addr) = tcp {
@@ -1357,7 +1396,10 @@ fn expose_request(
     }
 
     let Some(socket) = socket else {
-        bail!("expose requires --socket <path>, --tcp <host:port>, or --exec -- <cmd> [args...]");
+        return Err(invalid_argument(
+            "expose requires --socket <path>, --tcp <host:port>, or --exec -- <cmd> [args...]"
+                .into(),
+        ));
     };
     Ok(ControlRequest::Expose {
         protocol,
@@ -1433,6 +1475,72 @@ fn hand_sync_command_to_companion() -> Result<()> {
         ProcessCommand::new(&companion).args(std::env::args_os().skip(1)),
     );
     Err(error).with_context(|| format!("failed to run {}", companion.display()))
+}
+
+#[cfg(test)]
+mod json_flag_tests {
+    use super::*;
+
+    #[test]
+    fn the_command_line_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn json_is_accepted_before_or_after_any_command() {
+        for args in [
+            &["fabric", "--json", "peers"][..],
+            &["fabric", "peers", "--json"],
+            &["fabric", "probe", "box", "web", "--json"],
+            &["fabric", "dial", "box", "web", "--json"],
+            &["fabric", "exec", "--json", "box", "--", "ls"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap_or_else(|error| panic!("{args:?}: {error}"));
+            assert!(cli.json, "{args:?}");
+        }
+        let cli = Cli::try_parse_from(["fabric", "peers"]).unwrap();
+        assert!(!cli.json);
+    }
+
+    #[test]
+    fn json_after_an_exec_command_belongs_to_the_command() {
+        let cli = Cli::try_parse_from(["fabric", "exec", "box", "--", "tool", "--json"]).unwrap();
+        assert!(!cli.json);
+        let Some(Commands::Exec { cmd, .. }) = cli.command else {
+            panic!("not exec");
+        };
+        assert_eq!(cmd, ["tool", "--json"]);
+    }
+
+    #[test]
+    fn sync_keeps_its_own_json() {
+        let cli = Cli::try_parse_from(["fabric", "sync", "ls", "--json"]).unwrap();
+        let Some(Commands::Sync {
+            command: SyncCommands::Ls { json },
+        }) = cli.command
+        else {
+            panic!("not sync ls");
+        };
+        assert!(json);
+    }
+
+    #[test]
+    fn probe_answers_name_their_code() {
+        assert_eq!(probe_outcome_code("supported", None), None);
+        assert_eq!(
+            probe_outcome_code("unsupported", Some("peer not permitted for service \"web\"")),
+            Some(ErrorCode::PeerNotPermittedForService)
+        );
+        assert_eq!(
+            probe_outcome_code("unsupported", Some("alpn negotiation failed")),
+            Some(ErrorCode::ServiceNotExposed)
+        );
+        assert_eq!(
+            probe_outcome_code("unreachable", Some("no path")),
+            Some(ErrorCode::Unreachable)
+        );
+        assert_eq!(probe_outcome_code("timeout", None), Some(ErrorCode::Timeout));
+    }
 }
 
 #[cfg(test)]
@@ -2485,6 +2593,33 @@ const PROBE_EXIT_UNSUPPORTED: i32 = 1;
 const PROBE_EXIT_UNREACHABLE: i32 = 2;
 const PROBE_EXIT_TIMEOUT: i32 = 3;
 const PROBE_EXIT_UNANSWERABLE: i32 = 64;
+
+/// `probe` keeps its own exit contract: a question it cannot answer exits 64,
+/// whatever the failure's code. The code is still printed, and with `--json`
+/// the error object docs/errors.md describes.
+fn probe_unanswerable(error: anyhow::Error, json: bool) -> ! {
+    fabric::error::report(&error, json);
+    std::process::exit(PROBE_EXIT_UNANSWERABLE);
+}
+
+/// Arguments fabric itself rejects (clap rejects the rest before this runs).
+fn invalid_argument(message: String) -> anyhow::Error {
+    FabricError::new(ErrorCode::InvalidArgument, message).into()
+}
+
+/// The error code behind a probe answer other than `supported`. A refusal
+/// carries its code in the error text (or the text older peers send); a
+/// protocol nobody refused is one the peer does not expose.
+fn probe_outcome_code(outcome: &str, error: Option<&str>) -> Option<ErrorCode> {
+    let carried = error.and_then(fabric::error::code_in_text);
+    match outcome {
+        "supported" => None,
+        "unsupported" => Some(carried.unwrap_or(ErrorCode::ServiceNotExposed)),
+        "unreachable" => Some(carried.unwrap_or(ErrorCode::Unreachable)),
+        "timeout" => Some(ErrorCode::Timeout),
+        _ => Some(carried.unwrap_or(ErrorCode::Internal)),
+    }
+}
 
 /// One human line per probe outcome. Machine callers use --json or the exit code.
 fn print_probe_line(

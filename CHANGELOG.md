@@ -12,8 +12,23 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   each failure, a class that says what to do about it (`refusal`, `fault` or
   `usage`), the exit status for each class, the `--json` error object and the
   `fabric:<code> ` token that close reasons and wire errors will carry ahead of
-  today's text. This adds the `fabric::error` type (in `fabric-config`, so the sync companion shares it) and the specification;
-  commands, close reasons and `--json` adopt it in the next changes.
+  today's text. This adds the `fabric::error` type (in `fabric-config`, so the
+  sync companion shares it) and the specification; commands, close reasons and
+  `--json` adopt it in the next changes.
+- `--json` is accepted by every command, before or after it. A failing
+  command now ends with `Error: fabric:<code> <text>` on stderr (the text is
+  unchanged) and exits 77 for a refusal, 69 for a fault, 2 for an argument
+  fabric rejects and 1 for anything without a code yet; with `--json` it also
+  prints the error object on stdout. The daemon's control replies carry the
+  code, so a command reports the code the daemon chose. Codes so far:
+  `daemon_not_running`, `unknown_peer`, and `invalid_argument` for a bad node
+  id, an ambiguous peer name and `expose` arguments. `probe` keeps its exit
+  statuses; its `--json` answer gains a `code` field.
+
+### Changed
+
+- A failure's stderr line is now one line, `Error: fabric:<code> <text>`,
+  where it used to list each cause on its own `Caused by:` line.
 
 - `fabric add --inbound-only` (`inbound_only = true` in `peers.toml`) for a peer
   that only ever connects here, such as a phone. It is served under its grants

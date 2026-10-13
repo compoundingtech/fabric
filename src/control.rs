@@ -8,6 +8,7 @@ pub use fabric_config::sync::status::{
 };
 
 use crate::{
+    error::ErrorFields,
     mux::CurrentConnectionHealth,
     telemetry::{PeerTelemetry, TelemetryWindow},
 };
@@ -260,7 +261,20 @@ pub enum ControlResponse {
     },
     Error {
         message: String,
+        /// The failure's code (docs/errors.md), absent from daemons before codes.
+        #[serde(flatten)]
+        fields: ErrorFields,
     },
+}
+
+impl ControlResponse {
+    /// The reply for a request that failed, carrying the failure's code.
+    pub fn error(error: &anyhow::Error) -> Self {
+        Self::Error {
+            message: format!("{error:#}"),
+            fields: ErrorFields::of(error),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -356,12 +370,14 @@ mod tests {
         }
         let error = ControlResponse::Error {
             message: "fabric-sync 0.2.15 cannot attach to 0.2.16".into(),
+            fields: Default::default(),
         };
         assert_eq!(
             serde_json::from_value::<CompanionResponse>(serde_json::to_value(&error).unwrap())
                 .unwrap(),
             CompanionResponse::Error {
-                message: "fabric-sync 0.2.15 cannot attach to 0.2.16".into()
+                message: "fabric-sync 0.2.15 cannot attach to 0.2.16".into(),
+                fields: Default::default(),
             }
         );
         assert_eq!(

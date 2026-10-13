@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -18,6 +18,7 @@ use tokio::{
 
 use crate::{
     FabricHome,
+    error::{ErrorCode, ErrorFields, FabricError},
     sync::status::{SyncEntryStatus, SyncPublishFile, SyncPublishedFile, SyncRuntimeStatus},
 };
 
@@ -78,17 +79,30 @@ pub enum Response {
     },
     Error {
         message: String,
+        #[serde(flatten)]
+        fields: ErrorFields,
     },
     /// Any other reply the daemon's protocol has.
     #[serde(other)]
     Other,
 }
 
+/// Connect to the daemon's control socket, or fail with `daemon_not_running`.
+pub async fn connect(home: &FabricHome) -> Result<UnixStream> {
+    UnixStream::connect(home.control_socket_path())
+        .await
+        .map_err(|error| {
+            FabricError::new(
+                ErrorCode::DaemonNotRunning,
+                format!("fabric daemon is not running; run `fabric up` first: {error}"),
+            )
+            .into()
+        })
+}
+
 /// Send one request on the daemon's control socket and read its reply.
 pub async fn send(home: &FabricHome, request: Request) -> Result<Response> {
-    let mut stream = UnixStream::connect(home.control_socket_path())
-        .await
-        .with_context(|| "fabric daemon is not running; run `fabric up` first")?;
+    let mut stream = connect(home).await?;
     let mut raw = serde_json::to_vec(&request)?;
     raw.push(b'\n');
     stream.write_all(&raw).await?;
@@ -96,8 +110,8 @@ pub async fn send(home: &FabricHome, request: Request) -> Result<Response> {
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await?;
     let response: Response = serde_json::from_slice(&response)?;
-    if let Response::Error { message } = response {
-        bail!("{message}");
+    if let Response::Error { message, fields } = response {
+        return Err(fields.into_error(message));
     }
     Ok(response)
 }
