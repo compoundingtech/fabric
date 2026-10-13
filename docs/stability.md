@@ -18,7 +18,7 @@ Anything this page does not name is internal.
 | --- | --- |
 | Identity | A NodeID is the public half of the machine's ed25519 key. The `identity.toml` format. `fabric key gen` and `fabric id`. |
 | Trust and grants | `peers.toml`: each peer's `id`, `name`, `allow`, `dial_only` and `inbound_only`. A grant is the full service name, matched exactly, and an unlisted service is refused. An untrusted NodeID is refused. An inbound-only peer is never dialled or probed by this machine. `fabric reload-peers` ends every session the new file no longer allows. `fabric add` (with `--allow`, `--dial-only` and `--inbound-only`), `fabric remove`, `fabric peers`. |
-| Exposures and dials | `fabric expose` (a Unix socket, a TCP address or `--exec` command), `fabric unexpose`, `fabric dial` (a Unix socket, or `--tcp`), `fabric undial`. A service name is its ALPN. Persisted exposures and dials come back after a restart. |
+| Exposures and dials | `fabric expose` (a Unix socket, a TCP address or `--exec` command), `fabric unexpose`, `fabric dial` (a Unix socket, or `--tcp`), `fabric undial`. A service name is its ALPN. Persisted exposures and dials come back after a restart. (`--peer-header` is provisional; see below.) |
 | The direct exposure wire | Everything in [docs/tunnel-wire.md](tunnel-wire.md): admission, the frame layout, Hello, Data, Ack, Close and Error, resume, the limits and their defaults, and the 403 refusals with their reasons. |
 | Git over fabric | `fabric://<peer>/<remote>` URLs, the grants `git/<remote>/read` and `git/<remote>/write`, and `fabric git share`, `unshare`, `grant` and `revoke`. |
 | Error codes | Everything in [docs/errors.md](errors.md): the codes, their classes, exit statuses, the `--json` error object and the `fabric:<code> ` token on the wire. |
@@ -31,6 +31,7 @@ Anything this page does not name is internal.
 | --- | --- |
 | File sync (`fabric sync`, `syncs.toml`, the `fabric-sync` companion, `fabric/sync/1`) | Still settling: open performance and catalog-removal work. It will get its own 1.0. |
 | `fabric-stdio` | The way to write an exec service. New, and its API may still change. |
+| `fabric expose --socket --peer-header` | The line it writes before a stream's first byte (`{"peer","name"}`), and the `peer_header` setting that persists it. New, and no consumer has exercised it yet. |
 | `fabric shell` | Interactive use is supported. The resumption window and status lines may change. |
 | `fabric join`, `fabric ca`, `fabric cert`, `fabric service`, `fabric restart` | Supported conveniences whose flags and output may still change. |
 | `fabric doctor` and `fabric status` exit statuses | Their meanings may still be refined. |
