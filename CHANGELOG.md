@@ -6,24 +6,6 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ## [0.2.40] - 2026-10-13
 
-### Added
-
-- The stall report describes each child the daemon has: the command line it
-  carries, the wait channel and system call it is in (`child-details=[PID:S
-  cmdline="..." wchan=... syscall=...]`), and the wait channel of every process
-  that holds an end of the pipe a stuck thread is reading. A forked child that
-  has not yet executed still carries the daemon's own command line, one that has
-  executed carries the command it was started for, so the next stall says
-  whether a spawn was waiting on a slow exec or something else was reading that
-  pipe.
-
-### Tests
-
-- A regression test starts six children that write nothing and never exit,
-  reads their stdout and stderr, and requires the runtime to keep running.
-
-## [Unreleased]
-
 ### Fixed
 
 - An idle terminal attach no longer stops the daemon. A pipe read or write
@@ -48,6 +30,20 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   pid, exit status) and `child_pipe_closed` for every pipe (which pipe, how it
   ended, bytes moved, how long it was open, its longest silence), plus
   `child_pipe_long_wait` for a read that waited more than 30 s.
+
+- The stall report describes each child the daemon has: the command line it
+  carries, the wait channel and system call it is in (`child-details=[PID:S
+  cmdline="..." wchan=... syscall=...]`), and the wait channel of every process
+  that holds an end of the pipe a stuck thread is reading. A forked child that
+  has not yet executed still carries the daemon's own command line, one that has
+  executed carries the command it was started for, so the next stall says
+  whether a spawn was waiting on a slow exec or something else was reading that
+  pipe.
+
+### Tests
+
+- A regression test starts six children that write nothing and never exit,
+  reads their stdout and stderr, and requires the runtime to keep running.
 
 ## [0.2.39] - 2026-10-12
 
