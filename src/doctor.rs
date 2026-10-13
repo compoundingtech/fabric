@@ -129,6 +129,9 @@ pub struct PeerFact {
     pub ignored_grants: bool,
     /// `None` when the check could not run at all.
     pub reachable: Option<bool>,
+    /// The peer is up and trusts this machine but has not granted it `echo`, so
+    /// the ping that measures reachability was refused.
+    pub echo_denied: bool,
     /// What the peer reports as its version, if it could be asked.
     pub version: Option<String>,
     /// Why it could not be asked. A count of peers you could not reach is not
@@ -508,6 +511,14 @@ fn peer_finding(peer: &PeerFact) -> Finding {
         );
     }
     let finding = match peer.reachable {
+        Some(true) if peer.echo_denied => Finding::new(
+            "peer",
+            Verdict::Informational,
+            format!(
+                "{label} is up, but has not granted this machine echo, so fabric ping and \
+                 fabric status cannot measure it"
+            ),
+        ),
         Some(true) => Finding::new("peer", Verdict::Ok, format!("{label} is reachable")),
         Some(false) => Finding::new(
             "peer",
@@ -998,6 +1009,7 @@ mod tests {
                 inbound_only: false,
                 ignored_grants: false,
                 reachable: Some(true),
+                echo_denied: false,
                 version: Some("0.2.0+abc".to_string()),
                 version_error: None,
             }],
@@ -1822,6 +1834,22 @@ mod tests {
     /// "could not ask 1 peer" is a count. A count is not something a stranger
     /// can act on, and this check exists to be acted on.
     #[test]
+    fn a_peer_that_has_not_granted_echo_is_up_and_needs_no_action() {
+        let mut facts = configured();
+        facts.peers[0].echo_denied = true;
+
+        let findings = diagnose(&facts);
+        let peer = find(&findings, "peer");
+        assert_eq!(peer.len(), 1);
+        assert_eq!(peer[0].verdict, Verdict::Informational);
+        assert!(peer[0].detail.contains("vps is up"), "{}", peer[0].detail);
+        assert!(peer[0].detail.contains("has not granted this machine echo"));
+        assert!(!peer[0].detail.contains("offline"), "{}", peer[0].detail);
+        assert!(peer[0].action.is_none());
+        assert_eq!(exit_code(&findings), 0, "{findings:?}");
+    }
+
+    #[test]
     fn an_exec_policy_refusal_is_informational_and_does_not_count() {
         let mut facts = configured();
         facts.peers[0].version = None;
@@ -1913,6 +1941,7 @@ mod tests {
             inbound_only: false,
             ignored_grants: false,
             reachable: Some(true),
+            echo_denied: false,
             version: None,
             version_error: Some(PeerVersionError::PolicyRefusal(
                 "remote exec is disabled".to_string(),
@@ -2054,6 +2083,7 @@ where
                     })
                 }),
                 reachable: Some(peer.reachable),
+                echo_denied: peer.echo_denied,
                 label,
             }
         })

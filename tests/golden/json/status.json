@@ -9,6 +9,7 @@
   "node_id": "<CLIENT_ID>",
   "peers": [
     {
+      "echo_denied": false,
       "error": null,
       "id": "<SERVER_ID>",
       "inbound_only": false,

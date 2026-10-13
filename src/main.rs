@@ -1931,6 +1931,7 @@ mod connection_telemetry_tests {
             name: Some("laptop".to_string()),
             roaming: true,
             inbound_only: false,
+            echo_denied: false,
             reachable: false,
             bytes: None,
             round_trip_micros: None,
@@ -2375,6 +2376,7 @@ fn status_json(
                 "name": peer.name,
                 "reachable": peer.reachable,
                 "inbound_only": peer.inbound_only,
+                "echo_denied": peer.echo_denied,
                 "roaming": peer.roaming,
                 "round_trip_micros": peer.round_trip_micros,
                 "transport": peer.transport,
@@ -2726,6 +2728,8 @@ fn format_peer_reachability(peer: &PeerReachability) -> String {
             "not connected"
         };
         format!("{label}\t{}\tinbound-only\t{state}", peer.id)
+    } else if peer.echo_denied {
+        format!("{label}\t{}\treachable\techo not granted", peer.id)
     } else if peer.reachable {
         let millis = peer.round_trip_micros.unwrap_or_default() as f64 / 1000.0;
         let transport = peer.transport.as_deref().unwrap_or("unknown");

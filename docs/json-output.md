@@ -20,7 +20,7 @@ a new key may be added, so read objects by key and ignore keys you do not know.
 | `addr` | the daemon's `EndpointAddr` object (`{"id": ..., "addrs": [...]}`), with or without `--json`; it was JSON before the flag existed |
 | `peers` | `{"peers": [{"node", "name" (or null), "allow": [...], "dial_only", "inbound_only", "roaming"}]}` |
 | `probe PEER PROTOCOL` | `{"peer", "peer_id", "protocol", "outcome", "round_trip_micros", "transport", "error", "code", "class"}`; `outcome` is `supported`, `unsupported`, `unreachable` or `timeout`, and the exit status is unchanged |
-| `status` | `{"version", "node_id", "endpoint_addr", "exposed_protocols", "dial_sockets", "dial_handlers": {"active", "max"}, "sync_runtime": {"owner", "companion"}, "peers": [{"id", "name", "reachable", "inbound_only", "roaming", "round_trip_micros", "transport", "error"}]}`; connection telemetry is not part of it |
+| `status` | `{"version", "node_id", "endpoint_addr", "exposed_protocols", "dial_sockets", "dial_handlers": {"active", "max"}, "sync_runtime": {"owner", "companion"}, "peers": [{"id", "name", "reachable", "echo_denied", "inbound_only", "roaming", "round_trip_micros", "transport", "error"}]}`; connection telemetry is not part of it. A peer that trusts this machine but has not granted it `echo` is `reachable: true` with `echo_denied: true`, `error: null` and no round trip or transport |
 | `dial PEER PROTOCOL` | `{"socket": "<path>"}` |
 | `dial PEER PROTOCOL --tcp ADDR` | `{"address": "<host:port>"}` |
 | `expose`, `unexpose` | `{"ok": true, "protocol": "<name>"}` |

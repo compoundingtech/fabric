@@ -72,6 +72,34 @@ Deprecated, Fixed or Security.
   says why. `fabric status` and `fabric doctor` show it as `inbound-only`,
   connected or not connected, and doctor does not ask for its build. The flag
   is the opposite direction from `--dial-only` and cannot be combined with it.
+### Fixed
+
+- A peer that has not granted this machine `echo` is no longer reported offline.
+  `fabric status` and the liveness probe measure a peer with an echo ping, and a
+  peer that trusts this machine but grants nothing refuses it; that refusal was
+  read as "unreachable", so `status` listed a live peer as `offline` with
+  "not permitted for service echo" as the reason, and the health loop counted
+  failed probes against it. It is now `reachable` with `echo not granted`
+  (`fabric status`), `reachable: true` plus `echo_denied: true` and `error: null`
+  (`status --json`, and the daemon's `ReachabilityStatus` reply, an additive
+  field), an `info` line in `fabric doctor`, and `fabric ping` says the peer is
+  up but has not granted `echo` (same exit status 77 and code as before). A peer
+  with no echo grant has no round trip to report, so it adds nothing to the path
+  telemetry. `fabric join` still grants `shell,exec` by default; add `echo` for
+  `fabric ping` to work.
+
+- `fabric exec` no longer loses a refusal to a broken pipe. A peer that refuses
+  exec answers and closes the stream without reading the command, so the
+  client's write of the command could fail with `Broken pipe` while the refusal
+  was already waiting to be read. The client reported that write error, exited 1
+  and, under `fabric doctor`, turned a peer that refuses exec by design into an
+  `unknown` build finding that fails the run. The client now reads the answer
+  first and keeps the write error only when nothing answers. An end-to-end test
+  runs `fabric doctor` against a peer that does not grant exec and requires an
+  informational `versions` line; it failed about one run in twenty-five before.
+
+### Changed
+
 - `fabric update --url` no longer installs whatever matches the hash. The
   updater runs the staged binary and compares its version with the installed
   one before anything installed changes, as the release-tag path already did:

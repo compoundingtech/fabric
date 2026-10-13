@@ -280,6 +280,79 @@ async fn every_json_command_prints_one_stable_object() -> Result<()> {
     Ok(())
 }
 
+/// A peer that trusts this machine but has not granted `echo` is up. `status`
+/// used to call it offline with a refusal as the reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_says_a_peer_that_has_not_granted_echo_is_up() -> Result<()> {
+    let server_dir = TempDir::new()?;
+    let client_dir = TempDir::new()?;
+    let server_home = FabricHome::new(server_dir.path());
+    let client_home = FabricHome::new(client_dir.path());
+    let server = FabricNode::start(server_home.clone()).await?;
+    let client = FabricNode::start(client_home.clone()).await?;
+
+    // The server trusts the client and grants it nothing.
+    let mut server_book = PeerBook::load(&server_home)?;
+    server_book.add_with_allow(
+        client.id(),
+        Some("client".into()),
+        Some(client.addr()),
+        None,
+    );
+    server_book.save(&server_home)?;
+    server.state().reload_peers().await?;
+    let mut client_book = PeerBook::load(&client_home)?;
+    client_book.add_with_allow(
+        server.id(),
+        Some("server".into()),
+        Some(server.addr()),
+        Some(vec!["echo".into()]),
+    );
+    client_book.save(&client_home)?;
+    client.state().reload_peers().await?;
+
+    let normaliser = Normaliser {
+        replacements: vec![
+            (client_dir.path().display().to_string(), "<CLIENT_HOME>"),
+            (server_dir.path().display().to_string(), "<SERVER_HOME>"),
+            (client.id().to_string(), "<CLIENT_ID>"),
+            (server.id().to_string(), "<SERVER_ID>"),
+            (fabric::version_string(), "<VERSION>"),
+        ],
+    };
+
+    let status = fabric(&client_home, &["status", "--json"]).await?;
+    let mut value: Value = serde_json::from_str(ok(&status)?.trim())?;
+    assert_eq!(value["peers"][0]["reachable"], true, "{value}");
+    assert_eq!(value["peers"][0]["echo_denied"], true, "{value}");
+    assert_eq!(value["peers"][0]["error"], Value::Null, "{value}");
+    value["endpoint_addr"] = "<ENDPOINT_ADDR>".into();
+    normaliser.check("status_echo_denied", &serde_json::to_string(&value)?)?;
+
+    // The human form says the same, and never "offline".
+    let text = fabric(&client_home, &["status"]).await?;
+    let line = ok(&text)?
+        .lines()
+        .find(|line| line.starts_with("  server\t"))
+        .context("status listed no server line")?
+        .to_string();
+    assert!(line.ends_with("\treachable\techo not granted"), "{line:?}");
+
+    // And ping names the real reason, with the refusal's exit status.
+    let ping = fabric(&client_home, &["ping", "server"]).await?;
+    assert_eq!(ping.code, Some(77), "{}", ping.stderr);
+    assert!(
+        ping.stderr
+            .contains("is up but has not granted this machine echo"),
+        "{}",
+        ping.stderr
+    );
+
+    client.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failing_json_command_prints_only_an_error_object() -> Result<()> {
     let dir = TempDir::new()?;
