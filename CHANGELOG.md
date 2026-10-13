@@ -44,6 +44,16 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 - A failure's stderr line is now one line, `Error: fabric:<code> <text>`,
   where it used to list each cause on its own `Caused by:` line.
 
+- `fabric add --inbound-only` (`inbound_only = true` in `peers.toml`) for a peer
+  that only ever connects here, such as a phone. It is served under its grants
+  when it connects. This machine never dials, probes or announces to it: the
+  liveness loop, the start-up announcement, the network-change checks and
+  `fabric status` leave it alone, so it is never reported offline, and `fabric
+  ping`, `exec`, `shell`, `dial` and sync for it are refused with a message that
+  says why. `fabric status` and `fabric doctor` show it as `inbound-only`,
+  connected or not connected, and doctor does not ask for its build. The flag
+  is the opposite direction from `--dial-only` and cannot be combined with it.
+
 ### Fixed
 
 - `fabric exec` no longer loses a refusal to a broken pipe. A peer that refuses
