@@ -1,0 +1,16 @@
+{
+  "peers": [
+    {
+      "allow": [
+        "echo",
+        "web",
+        "send-file"
+      ],
+      "dial_only": false,
+      "inbound_only": false,
+      "name": "server",
+      "node": "<SERVER_ID>",
+      "roaming": false
+    }
+  ]
+}
