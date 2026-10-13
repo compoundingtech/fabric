@@ -113,16 +113,22 @@ fn a_clap_usage_error_prints_no_json() -> Result<()> {
 async fn the_daemons_code_and_peer_reach_the_command() -> Result<()> {
     let home = TempDir::new()?;
     let node = FabricNode::start(FabricHome::new(home.path())).await?;
-    let path = home.path().to_path_buf();
-    let output = tokio::task::spawn_blocking(move || {
-        Command::new(env!("CARGO_BIN_EXE_fabric"))
-            .arg("--home")
-            .arg(path)
-            .args(["--json", "dial", "ghost", "web"])
-            .output()
-    })
-    .await??;
+    let run = |args: &'static [&'static str]| {
+        let path = home.path().to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            Command::new(env!("CARGO_BIN_EXE_fabric"))
+                .arg("--home")
+                .arg(path)
+                .args(args)
+                .output()
+        })
+    };
+    let output = run(&["--json", "dial", "ghost", "web"]).await??;
+    // The daemon checks the protocol before it looks the peer up.
+    let reserved = run(&["--json", "dial", "ghost", "git/notes"]).await??;
     node.shutdown().await?;
+    assert_eq!(reserved.status.code(), Some(2));
+    assert_eq!(error_object(&reserved)?["code"], "invalid_argument");
     assert_eq!(output.status.code(), Some(69));
     let error = error_object(&output)?;
     assert_eq!(error["code"], "unknown_peer");

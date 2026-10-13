@@ -33,7 +33,9 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   `session_expired`, `service_unavailable` and `spawn_failed`. A command
   reports the code the other machine sent, `fabric exec` included, and reads
   the refusal texts of daemons older than codes as the matching refusal. A
-  failed or skipped connection to a peer is `unreachable` or `peer_offline`.
+  failed or skipped connection to a peer is `unreachable` or `peer_offline`,
+  and a protocol, TCP address or address hint fabric rejects is
+  `invalid_argument`.
 
 ### Changed
 

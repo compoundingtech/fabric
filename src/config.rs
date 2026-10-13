@@ -1635,13 +1635,15 @@ pub fn validate_server_session_config(
 
 pub fn validate_tcp_addr(addr: &str) -> Result<()> {
     if addr.trim().is_empty() {
-        bail!("tcp address cannot be empty");
+        return Err(invalid_argument("tcp address cannot be empty".into()));
     }
     if addr.bytes().any(|byte| byte == 0 || byte == b'\n') {
-        bail!("tcp address cannot contain NUL or newline bytes");
+        return Err(invalid_argument(
+            "tcp address cannot contain NUL or newline bytes".into(),
+        ));
     }
     if !addr.contains(':') {
-        bail!("tcp address must be HOST:PORT");
+        return Err(invalid_argument("tcp address must be HOST:PORT".into()));
     }
     Ok(())
 }
@@ -1660,32 +1662,41 @@ pub fn parse_addr_json(addr: Option<&str>, expected: EndpointId) -> Result<Optio
     let Some(addr) = addr else {
         return Ok(None);
     };
-    let parsed: EndpointAddr =
-        serde_json::from_str(addr).context("address hints must be EndpointAddr JSON")?;
+    let parsed: EndpointAddr = serde_json::from_str(addr).map_err(|error| {
+        invalid_argument(format!("address hints must be EndpointAddr JSON: {error}"))
+    })?;
     if parsed.id != expected {
-        bail!(
+        return Err(invalid_argument(format!(
             "address hint id {} does not match node id {}",
-            parsed.id,
-            expected
-        );
+            parsed.id, expected
+        )));
     }
     Ok(Some(parsed))
 }
 
 pub fn validate_protocol(protocol: &str) -> Result<Vec<u8>> {
     if protocol.is_empty() {
-        bail!("protocol cannot be empty");
+        return Err(invalid_argument("protocol cannot be empty".into()));
     }
     if protocol.len() > 255 {
         bail!("protocol ALPN is too long; keep it at 255 bytes or less");
     }
     if protocol.bytes().any(|byte| byte == 0 || byte == b'\n') {
-        bail!("protocol cannot contain NUL or newline bytes");
+        return Err(invalid_argument(
+            "protocol cannot contain NUL or newline bytes".into(),
+        ));
     }
     if protocol.starts_with("git/") {
-        bail!("the git/ protocol namespace is reserved for Fabric Git remotes");
+        return Err(invalid_argument(
+            "the git/ protocol namespace is reserved for Fabric Git remotes".into(),
+        ));
     }
     Ok(protocol.as_bytes().to_vec())
+}
+
+/// An argument fabric rejects: `invalid_argument` (docs/errors.md).
+fn invalid_argument(message: String) -> anyhow::Error {
+    FabricError::new(ErrorCode::InvalidArgument, message).into()
 }
 
 #[cfg(test)]
