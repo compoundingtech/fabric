@@ -58,9 +58,15 @@ in their output instead:
 - `fabric exec` exits with the remote command's status, so a status alone
   cannot tell a fabric failure from the command's own. Read the stderr line.
 - `fabric probe` exits 0 supported, 1 unsupported, 2 unreachable, 3 timeout,
-  and 64 when it cannot answer.
+  and 64 when it cannot answer. When it cannot answer, `--json` prints the
+  error object. An answer is not a failure: `probe --json` prints its answer
+  object, in which `error` is a string or `null`, and `code` names the code
+  behind any answer other than `supported` (`null` for `supported`).
 - `fabric doctor` exits 0 to 3 as its help describes.
 - `fabric update --check` exits 0 current, 1 available, 2 error.
+- `fabric sync` subcommands other than `add`, `rm` and `reload` are run by the
+  sync companion, which is provisional and does not report codes yet. Their
+  own `--json` goes after the subcommand: `fabric sync ls --json`.
 
 The last line fabric writes to stderr for a failure is:
 
@@ -94,8 +100,9 @@ prints nothing on stdout.
 A build older than 0.2.41 does not know `--json` on most commands, and answers
 the same way: exit 2, usage text on stderr, nothing on stdout. A reader can
 treat "no JSON object on stdout" as an older build and fall back to its text.
-`fabric probe --json` and `fabric sync ls --json` existed before codes; on
-those, look for the `error` key, or compare `fabric --version`.
+`fabric probe --json` and `fabric sync ls --json` existed before codes. On
+`probe`, an error object is one whose `error` is an object (a probe answer's
+`error` is a string or `null`); or compare `fabric --version`.
 
 ## On the wire
 

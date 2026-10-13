@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use fabric_config::error::{ErrorCode, FabricError};
 use fabric_config::log_eprintln as eprintln;
 use iroh::{EndpointAddr, EndpointId, SecretKey};
 use serde::{Deserialize, Serialize};
@@ -677,7 +678,14 @@ impl PeerBook {
         self.peers
             .iter_mut()
             .find(|entry| id == Some(entry.id) || entry.name.as_deref() == Some(peer))
-            .with_context(|| format!("unknown peer {peer:?}; add it before granting Git access"))
+            .ok_or_else(|| {
+                FabricError::new(
+                    ErrorCode::UnknownPeer,
+                    format!("unknown peer {peer:?}; add it before granting Git access"),
+                )
+                .peer(peer)
+                .into()
+            })
     }
 
     /// May `id` reach `service`? The ONLY place this question is answered.
@@ -848,10 +856,20 @@ impl PeerBook {
                 .addr
                 .clone()
                 .unwrap_or_else(|| EndpointAddr::new(entry.id))),
-            [] => bail!(
-                "unknown peer {peer:?}; add it to peers.toml or use `fabric add <nodeid> [name]`"
-            ),
-            _ => bail!("ambiguous peer name {peer:?}"),
+            [] => Err(FabricError::new(
+                ErrorCode::UnknownPeer,
+                format!(
+                    "unknown peer {peer:?}; add it to peers.toml or use `fabric add <nodeid> [name]`"
+                ),
+            )
+            .peer(peer)
+            .into()),
+            _ => Err(FabricError::new(
+                ErrorCode::InvalidArgument,
+                format!("ambiguous peer name {peer:?}; name it by its node id"),
+            )
+            .peer(peer)
+            .into()),
         }
     }
 
@@ -1612,7 +1630,13 @@ pub fn validate_tcp_addr(addr: &str) -> Result<()> {
 }
 
 pub fn parse_node_id(node_id: &str) -> Result<EndpointId> {
-    EndpointId::from_str(node_id).with_context(|| format!("invalid node id {node_id:?}"))
+    EndpointId::from_str(node_id).map_err(|error| {
+        FabricError::new(
+            ErrorCode::InvalidArgument,
+            format!("invalid node id {node_id:?}: {error}"),
+        )
+        .into()
+    })
 }
 
 pub fn parse_addr_json(addr: Option<&str>, expected: EndpointId) -> Result<Option<EndpointAddr>> {
