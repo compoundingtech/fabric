@@ -60,6 +60,11 @@ Deprecated, Fixed or Security.
   `tests/golden/json/`, so changing one fails a test.
 
 ### Changed
+- README, sync and architecture: the workspace is five crates, not two; the sync
+  bridge is how the companion runs in production, not a bridge "no production
+  request selects"; the exec and shell sections no longer carry before-and-after
+  measurements and notes about what an earlier README claimed, which belong in
+  this file. The behaviour they described is unchanged.
 - README, peer config: the declarative section said that reloading does not close
   active tunnels or shells, which contradicts the Commands section and the code
   (a reload ends the sessions the new file no longer allows); it now says what
