@@ -60,6 +60,12 @@ Deprecated, Fixed or Security.
   `tests/golden/json/`, so changing one fails a test.
 
 ### Changed
+- README, Commands: `probe`, `send-file`, `doctor`, `update`, `exec`, `ca` and
+  `cert` were not documented; they are now, with the exit statuses and the inbox
+  path checked against the binary. `fabric ping` and `fabric status` say they need
+  an `echo` grant, `--json` is described once for every command, and the claim
+  that `config.toml` stores shell policy (false since format 2, where each
+  peer's `allow` list holds it) is gone.
 - README, install and join steps: the quick start now grants `echo` on both
   sides, because `fabric ping` and the reachability check in `fabric status` use
   it and a peer without that grant is refused and listed as offline; the join

@@ -933,7 +933,15 @@ Print this node's stable NodeID, generating and persisting it on first use.
 fabric peers
 ```
 
-Read and list the entries in the authoritative `peers.toml`.
+Read and list the entries in the authoritative `peers.toml`, one per line:
+NodeID, name, and the services granted (`no services`, or `dial-only` for a peer
+marked that way). With `--json`, one object, `{"peers": [...]}`.
+
+Every command accepts `--json`. Where it has a result to print, it prints one
+JSON object on stdout and nothing else; on a failure it prints one error object
+and exits with the code's status. [docs/json-output.md](docs/json-output.md)
+lists the commands and their exact shapes, and [docs/errors.md](docs/errors.md)
+the error codes. A command not listed there prints what it always did.
 
 ```sh
 fabric git install-helper
@@ -986,8 +994,13 @@ fabric status
 ```
 
 Show the running daemon's local state and check every trusted peer. An absent
-peer is offline regardless of its machine kind. Reachable peers include latency and the `direct`, `relay`, or `mixed`
-transport path when iroh supplies it. Status also prints the daemon build.
+peer is offline regardless of its machine kind. Reachable peers include latency
+and the `direct`, `relay`, or `mixed` transport path when iroh supplies it.
+Status also prints the daemon build.
+
+The check is an echo ping, so a peer that has not granted this machine `echo` is
+refused and listed as offline even though it is up; `fabric ping` on it says
+`not permitted for service "echo"`.
 
 ```sh
 fabric add <nodeid> [name] [--addr-json JSON] [--allow service,...]
@@ -996,7 +1009,8 @@ fabric add <nodeid> [name] [--addr-json JSON] [--allow service,...]
 Trust a peer NodeID and optionally assign a human name. `--addr-json` is an
 optional local/direct address hint for deterministic same-machine testing; normal
 key-only dialing relies on iroh address lookup.
-An omitted `--allow` grants no service.
+An omitted `--allow` grants no service. A peer that grants nothing cannot be
+pinged and shows as offline in `fabric status`; grant it `echo` for that.
 
 ```sh
 fabric remove <nodeid-or-name>
@@ -1065,9 +1079,9 @@ default to at most 32 active children per exposure; use `--max-children` to set
 a different per-exposure cap.
 
 Exposes are persisted by default to `<home>/config.toml` and are restored when
-the daemon starts. That same file also stores shell policy; `fabric add` writes
-the separate authoritative `peers.toml`. Use `--ephemeral` for short-lived test
-exposes that should not survive a daemon restart.
+the daemon starts. `fabric add` writes the separate authoritative `peers.toml`,
+which holds every peer's grants. Use `--ephemeral` for short-lived test exposes
+that should not survive a daemon restart.
 
 Only permitted remote NodeIDs are accepted before the local socket is opened or
 the local TCP connection or exec command starts. If no trusted peer can reach a
@@ -1106,6 +1120,69 @@ when `reset` is true, replace the consumer's cached presence with the snapshot.
 `cause` describes observed `connected`, `connection_closed` or `unreachable`
 facts; it does not guess why a remote machine returned. `path` is the observed
 `direct`, `relay`, or `mixed` path when available. `fabric addr` is unchanged.
+
+```sh
+fabric exec <peer> -- <cmd> [args...]
+```
+
+Run a command on a trusted peer without a terminal: its stdout and stderr come
+back on this side's stdout and stderr, and `fabric exec` exits with the remote
+command's exit status. The peer must grant this machine `exec`; a refusal exits
+126 with a message that names the peer and the service. See
+[Enabling remote shell and exec](#enabling-remote-shell-and-exec).
+
+```sh
+fabric probe <peer> <protocol> [--timeout SECONDS]
+```
+
+Ask, with one connect and no state, whether a peer serves one protocol right
+now. The exit status is the answer: 0 supported, 1 unsupported, 2 unreachable, 3
+timed out. A local failure (no daemon, an unknown peer) is not one of those
+answers: it exits 64 with an error, so a broken question is never read as "the
+peer does not serve it". With `--json` it prints
+`{"peer", "peer_id", "protocol", "outcome", "round_trip_micros", "transport",
+"error", "code", "class"}`.
+
+```sh
+fabric send-file <peer> <path> [--as <name>]
+```
+
+Send one file to a peer. It lands in `<home>/inbox/<your NodeID>/<name>` on the
+receiving machine, and the sender cannot choose a different place: `--as` takes a
+relative name only. One shot, one direction, nothing is ever deleted, files up to
+2 GiB. The peer must grant this machine `send-file`.
+
+```sh
+fabric doctor
+```
+
+Say what is wrong with this machine, in words a stranger can act on. Each check
+reads `ok`, `info`, `setup`, `problem` or `unknown`; an `unknown` means a check
+could not answer, and counts as needing attention. The exit status is the answer:
+0 nothing needs attention, 1 a problem or a setup step, 2 a usage error, 3
+unknown. It changes nothing. A peer that refuses `exec` by policy shows its build
+as `info`, not `unknown`, and does not change the exit status.
+
+```sh
+fabric update [--check | --dry-run | --rollback] [--tag TAG | --url URL --sha256 HASH]
+```
+
+Replace this machine's fabric with a verified build and restart it. It refuses a
+build that is not newer unless `--allow-downgrade` is given, and for `--url` it
+runs the downloaded binary to find out; `--expect-version` makes it require one
+exact version. `--check` changes nothing and exits 0 up to date, 1 update
+available, 2 error. See [Upgrading Fabric Safely](#upgrading-fabric-safely).
+
+```sh
+fabric ca init | install | uninstall | status
+fabric cert <name>
+```
+
+A local certificate authority for names ending in `.fabric` and for `localhost`,
+for a listener a browser or phone has to trust over https. `ca init` creates the
+authority and trusts nothing; `ca install` makes this machine trust what it signs
+(it asks first, `--yes` skips the prompt) and `ca uninstall` reverses that.
+`cert <name>` writes a certificate and key for one name.
 
 ### Expose And Dial A Service
 
@@ -1147,7 +1224,8 @@ Connectivity and trust test. `fabric ping` dials the peer's built-in
 ACL-gated echo protocol, sends a random nonce, verifies the same bytes come
 back, and prints the round-trip latency. When available, it also reports whether
 iroh used a direct, relay, or mixed path. Use this first when bringing up a new
-machine.
+machine. The peer must have granted this machine `echo` in its `allow` list;
+without it the ping fails with `not permitted for service "echo"` (exit 77).
 
 ```sh
 fabric shell <peer>
@@ -1913,8 +1991,8 @@ client machine                                      server machine
 ```
 
 The daemon owns one persisted iroh endpoint per fabric home. `<home>/config.toml`
-stores shell policy and persisted exposes; `peers.toml` stores the peer
-allow-list. `fabric expose` registers an ALPN and a local Unix socket, TCP, or
+stores persisted exposes and dials; `peers.toml` stores the peer allow-list and
+each peer's grants. `fabric expose` registers an ALPN and a local Unix socket, TCP, or
 exec target in the running daemon and, by default, writes it to `config.toml`.
 On startup, the daemon restores those exposes before binding its accepted ALPN
 list. Incoming iroh connections pass through an
