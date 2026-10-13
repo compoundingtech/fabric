@@ -1,0 +1,307 @@
+//! Golden tests for `--json`: the exact shape of what each command prints.
+//!
+//! These objects are what other programs parse, so a key that moves or a type
+//! that changes must fail here, in the pull request that changes it. Values
+//! that differ from run to run (node ids, paths, ports, timings) are replaced
+//! with a placeholder before the comparison; keys and types are never
+//! normalised. To accept an intended change, run with `UPDATE_GOLDEN=1` and
+//! review the diff in `tests/golden/json/`.
+
+use std::{fs, path::PathBuf, process::Command, time::Duration};
+
+use anyhow::{Context, Result, bail};
+use fabric::{
+    config::{FabricHome, PeerBook},
+    daemon::FabricNode,
+};
+use serde_json::Value;
+use tempfile::TempDir;
+
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn fabric_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_fabric")
+}
+
+fn golden_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/json")
+}
+
+/// A command's raw result.
+struct Ran {
+    stdout: String,
+    stderr: String,
+    code: Option<i32>,
+}
+
+async fn fabric(home: &FabricHome, args: &[&str]) -> Result<Ran> {
+    let output = tokio::time::timeout(
+        COMMAND_TIMEOUT,
+        tokio::process::Command::new(fabric_bin())
+            .arg("--home")
+            .arg(home.root())
+            .args(args)
+            .output(),
+    )
+    .await
+    .with_context(|| format!("fabric {args:?} timed out"))??;
+    Ok(Ran {
+        stdout: String::from_utf8(output.stdout)?,
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        code: output.status.code(),
+    })
+}
+
+/// What differs from run to run, by name.
+struct Normaliser {
+    replacements: Vec<(String, &'static str)>,
+}
+
+impl Normaliser {
+    fn walk(&self, key: Option<&str>, value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                for (key, value) in map.iter_mut() {
+                    self.walk(Some(key), value);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    self.walk(key, item);
+                }
+            }
+            Value::String(text) => {
+                match key {
+                    // The only keys whose strings are not ours to compare.
+                    Some("transport") => *text = "<TRANSPORT>".into(),
+                    Some("address") => *text = "<HOST:PORT>".into(),
+                    // A dial socket is named after a hash of the peer and
+                    // protocol; the directory it lives in is what is pinned.
+                    Some("socket") => {
+                        let dir = text.rsplit_once('/').map_or("", |(dir, _)| dir).to_string();
+                        *text = format!("{dir}/<NAME>.sock");
+                        for (from, to) in &self.replacements {
+                            *text = text.replace(from.as_str(), to);
+                        }
+                    }
+                    // Which sync runtime a node has depends on how it was started.
+                    Some("owner" | "companion") => *text = "<SYNC>".into(),
+                    _ => {
+                        for (from, to) in &self.replacements {
+                            *text = text.replace(from.as_str(), to);
+                        }
+                    }
+                }
+            }
+            Value::Number(_) => {
+                if matches!(key, Some("round_trip_micros")) {
+                    *value = Value::String("<MICROS>".into());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Parse exactly one JSON object from `stdout`, normalise it, and render
+    /// it the way the golden file is written.
+    fn render(&self, stdout: &str) -> Result<String> {
+        let mut lines = stdout.lines();
+        let line = lines.next().context("a --json command printed nothing")?;
+        if lines.next().is_some() {
+            bail!("a --json command printed more than one line: {stdout:?}");
+        }
+        let mut value: Value =
+            serde_json::from_str(line).with_context(|| format!("not JSON: {line:?}"))?;
+        if !value.is_object() {
+            bail!("not a JSON object: {line}");
+        }
+        self.walk(None, &mut value);
+        Ok(serde_json::to_string_pretty(&value)? + "\n")
+    }
+
+    fn check(&self, name: &str, stdout: &str) -> Result<()> {
+        let rendered = self.render(stdout)?;
+        let path = golden_dir().join(format!("{name}.json"));
+        if std::env::var_os("UPDATE_GOLDEN").is_some() {
+            fs::create_dir_all(golden_dir())?;
+            fs::write(&path, &rendered)?;
+            return Ok(());
+        }
+        let expected = fs::read_to_string(&path).with_context(|| {
+            format!(
+                "no golden file {}; run with UPDATE_GOLDEN=1 to write it",
+                path.display()
+            )
+        })?;
+        assert_eq!(
+            rendered, expected,
+            "{name}: the --json shape changed. If that is intended, run with UPDATE_GOLDEN=1"
+        );
+        Ok(())
+    }
+}
+
+fn ok(ran: &Ran) -> Result<&str> {
+    if ran.code != Some(0) {
+        bail!(
+            "exit {:?}\nstdout: {}\nstderr: {}",
+            ran.code,
+            ran.stdout,
+            ran.stderr
+        );
+    }
+    Ok(&ran.stdout)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_json_command_prints_one_stable_object() -> Result<()> {
+    let server_dir = TempDir::new()?;
+    let client_dir = TempDir::new()?;
+    let drop_dir = TempDir::new()?;
+    let server_home = FabricHome::new(server_dir.path());
+    let client_home = FabricHome::new(client_dir.path());
+    let server = FabricNode::start(server_home.clone()).await?;
+    let client = FabricNode::start(client_home.clone()).await?;
+
+    let mut server_book = PeerBook::load(&server_home)?;
+    server_book.add_with_allow(
+        client.id(),
+        Some("client".into()),
+        Some(client.addr()),
+        Some(vec!["echo".into(), "send-file".into()]),
+    );
+    server_book.save(&server_home)?;
+    server.state().reload_peers().await?;
+
+    let mut client_book = PeerBook::load(&client_home)?;
+    client_book.add_with_allow(
+        server.id(),
+        Some("server".into()),
+        Some(server.addr()),
+        Some(vec!["echo".into(), "web".into(), "send-file".into()]),
+    );
+    client_book.save(&client_home)?;
+    client.state().reload_peers().await?;
+
+    let normaliser = Normaliser {
+        replacements: vec![
+            (client_dir.path().display().to_string(), "<CLIENT_HOME>"),
+            (server_dir.path().display().to_string(), "<SERVER_HOME>"),
+            (drop_dir.path().display().to_string(), "<DROP>"),
+            (client.id().to_string(), "<CLIENT_ID>"),
+            (server.id().to_string(), "<SERVER_ID>"),
+            (fabric::version_string(), "<VERSION>"),
+        ],
+    };
+
+    // id
+    let id = fabric(&client_home, &["id", "--json"]).await?;
+    normaliser.check("id", ok(&id)?)?;
+    let plain = fabric(&client_home, &["id"]).await?;
+    assert_eq!(
+        ok(&plain)?.trim(),
+        client.id().to_string(),
+        "the human form of `id` changed"
+    );
+
+    // addr: JSON with or without the flag, and the same object
+    let addr = fabric(&client_home, &["addr"]).await?;
+    let addr_json = fabric(&client_home, &["addr", "--json"]).await?;
+    assert_eq!(ok(&addr)?, ok(&addr_json)?);
+    let parsed: Value = serde_json::from_str(ok(&addr_json)?.trim())?;
+    assert_eq!(parsed["id"], client.id().to_string());
+
+    // peers
+    let peers = fabric(&client_home, &["peers", "--json"]).await?;
+    normaliser.check("peers", ok(&peers)?)?;
+
+    // probe: a service the peer serves
+    let probe = fabric(
+        &client_home,
+        &["probe", "server", "fabric/echo/0", "--json"],
+    )
+    .await?;
+    let probe_value: Value = serde_json::from_str(probe.stdout.trim())
+        .with_context(|| format!("probe printed {:?}", probe.stdout))?;
+    assert_eq!(probe_value["outcome"], "supported", "{probe_value}");
+    assert_eq!(probe.code, Some(0));
+    normaliser.check("probe", &probe.stdout)?;
+
+    // status
+    let status = fabric(&client_home, &["status", "--json"]).await?;
+    let mut status_value: Value = serde_json::from_str(ok(&status)?.trim())?;
+    assert_eq!(status_value["peers"][0]["reachable"], true);
+    status_value["endpoint_addr"] = "<ENDPOINT_ADDR>".into();
+    normaliser.check("status", &serde_json::to_string(&status_value)?)?;
+
+    // expose / dial / unexpose
+    let socket = drop_dir.path().join("web.sock");
+    let expose = fabric(
+        &client_home,
+        &[
+            "expose",
+            "web",
+            "--socket",
+            socket.to_str().unwrap(),
+            "--json",
+        ],
+    )
+    .await?;
+    normaliser.check("expose", ok(&expose)?)?;
+
+    let dial = fabric(&client_home, &["dial", "server", "web", "--json"]).await?;
+    normaliser.check("dial_socket", ok(&dial)?)?;
+    let dial_tcp = fabric(
+        &client_home,
+        &["dial", "server", "web", "--tcp", "127.0.0.1:0", "--json"],
+    )
+    .await?;
+    normaliser.check("dial_tcp", ok(&dial_tcp)?)?;
+
+    let unexpose = fabric(&client_home, &["unexpose", "web", "--json"]).await?;
+    normaliser.check("unexpose", ok(&unexpose)?)?;
+
+    // send-file
+    let file = drop_dir.path().join("note.txt");
+    fs::write(&file, b"hello")?;
+    let sent = fabric(
+        &client_home,
+        &["send-file", "server", file.to_str().unwrap(), "--json"],
+    )
+    .await?;
+    normaliser.check("send_file", ok(&sent)?)?;
+
+    // reload-peers
+    let reload = fabric(&client_home, &["reload-peers", "--json"]).await?;
+    normaliser.check("reload_peers", ok(&reload)?)?;
+
+    client.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_json_command_prints_only_an_error_object() -> Result<()> {
+    let dir = TempDir::new()?;
+    let home = FabricHome::new(dir.path());
+    let node = FabricNode::start(home.clone()).await?;
+
+    for args in [
+        &["dial", "nobody", "web", "--json"][..],
+        &["expose", "web", "--json"],
+    ] {
+        let ran = fabric(&home, args).await?;
+        assert_ne!(ran.code, Some(0), "{args:?} succeeded");
+        let line = ran.stdout.trim();
+        let value: Value = serde_json::from_str(line)
+            .with_context(|| format!("{args:?}: stdout was not one JSON object: {line:?}"))?;
+        assert!(
+            value["error"]["code"].is_string() && value["error"]["message"].is_string(),
+            "{args:?}: {value}"
+        );
+        assert_eq!(ran.stdout.lines().count(), 1, "{args:?}: {}", ran.stdout);
+    }
+
+    node.shutdown().await?;
+    Ok(())
+}

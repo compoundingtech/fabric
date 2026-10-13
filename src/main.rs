@@ -37,8 +37,10 @@ struct Cli {
     #[arg(long, global = true)]
     home: Option<PathBuf>,
 
-    /// Print results as JSON on stdout. A failure prints one error object,
-    /// as docs/errors.md describes, and exits with its code's status.
+    /// Print one JSON object on stdout, for the commands that have a result
+    /// (docs/json-output.md lists them; the others print as usual). A failure
+    /// of any command prints one error object, as docs/errors.md describes,
+    /// and exits with its code's status.
     #[arg(long, global = true)]
     json: bool,
 
@@ -115,6 +117,15 @@ enum Commands {
         /// `fabric join` cannot lift it; remove the peer to undo it.
         #[arg(long = "dial-only", conflicts_with = "allow")]
         dial_only: bool,
+        /// The peer only ever connects to this machine, such as a phone. It is
+        /// served under its `--allow` list when it connects; this machine never
+        /// dials, probes or announces to it, so it is never reported offline.
+        ///
+        /// The opposite direction from `--dial-only`, and the two cannot be
+        /// combined. A later `fabric add` keeps the flag; remove the peer to
+        /// undo it.
+        #[arg(long = "inbound-only", conflicts_with = "dial_only")]
+        inbound_only: bool,
     },
     /// Pair with a machine you can already ssh to: one command, both directions.
     ///
@@ -594,8 +605,13 @@ async fn run(cli: Cli) -> Result<()> {
                 Commands::Key { .. } => unreachable!("key commands are handled before home setup"),
                 Commands::Id => {
                     let key = load_or_create_identity(&home)?;
-                    println!("{}", key.public());
+                    if json {
+                        print_json(&id_json(&key.public().to_string()))?;
+                    } else {
+                        println!("{}", key.public());
+                    }
                 }
+                // `addr` is JSON already: the same object with or without --json.
                 Commands::Addr => match send_control(&home, ControlRequest::Status).await? {
                     ControlResponse::Status { endpoint_addr, .. } => {
                         println!("{}", serde_json::to_string(&endpoint_addr)?);
@@ -631,6 +647,19 @@ async fn run(cli: Cli) -> Result<()> {
                                     companion: "unknown".to_string(),
                                 },
                             };
+                            if json {
+                                print_json(&status_json(
+                                    &version,
+                                    &node_id,
+                                    &endpoint_addr,
+                                    &exposed_protocols,
+                                    &dial_sockets,
+                                    &peers,
+                                    (active_dial_handlers, max_dial_handlers),
+                                    &sync_runtime,
+                                ))?;
+                                return Ok(());
+                            }
                             print_status(
                                 &version,
                                 &node_id,
@@ -652,10 +681,18 @@ async fn run(cli: Cli) -> Result<()> {
                 }
                 Commands::Peers => {
                     let book = PeerBook::load(&home)?;
+                    if json {
+                        print_json(&peers_json(book.peers()))?;
+                        return Ok(());
+                    }
                     for peer in book.peers() {
                         let name = peer.name.clone().unwrap_or_default();
                         let policy = if peer.dial_only {
                             "dial-only".to_string()
+                        } else if peer.inbound_only && peer.allow.is_empty() {
+                            "inbound-only, no services".to_string()
+                        } else if peer.inbound_only {
+                            format!("inbound-only,{}", peer.allow.join(","))
                         } else if peer.allow.is_empty() {
                             "no services".to_string()
                         } else {
@@ -742,7 +779,11 @@ async fn run(cli: Cli) -> Result<()> {
                 },
                 Commands::ReloadPeers => {
                     send_control(&home, ControlRequest::ReloadPeers).await?;
-                    println!("reloaded");
+                    if json {
+                        print_json(&ok_json([]))?;
+                    } else {
+                        println!("reloaded");
+                    }
                 }
                 Commands::Add {
                     nodeid,
@@ -750,6 +791,7 @@ async fn run(cli: Cli) -> Result<()> {
                     addr_json,
                     allow,
                     dial_only,
+                    inbound_only,
                 } => {
                     let id = parse_node_id(&nodeid)?;
                     let addr = parse_addr_json(addr_json.as_deref(), id)?;
@@ -760,9 +802,17 @@ async fn run(cli: Cli) -> Result<()> {
                             book.refuse_grants_for_dial_only(name, allow)?;
                         }
                     }
+                    if dial_only || inbound_only {
+                        book.refuse_opposite_direction(&id.to_string(), inbound_only)?;
+                        if let Some(name) = &name {
+                            book.refuse_opposite_direction(name, inbound_only)?;
+                        }
+                    }
                     warn_if_permissions_would_stop_a_sync(&home, &allow)?;
                     if dial_only {
                         book.add_dial_only(id, name, addr);
+                    } else if inbound_only {
+                        book.add_inbound_only(id, name, addr, allow);
                     } else {
                         book.add_with_allow(id, name, addr, allow);
                     }
@@ -794,6 +844,13 @@ async fn run(cli: Cli) -> Result<()> {
                     };
                     match send_control(&home, ControlRequest::SendFile { peer, path, name }).await?
                     {
+                        ControlResponse::SentFile { peer, name, bytes } if json => {
+                            print_json(&ok_json([
+                                ("peer", peer.into()),
+                                ("name", name.into()),
+                                ("bytes", bytes.into()),
+                            ]))?;
+                        }
                         ControlResponse::SentFile { peer, name, bytes } => {
                             println!("sent\t{bytes} bytes");
                             println!("to\t{peer}");
@@ -965,11 +1022,25 @@ async fn run(cli: Cli) -> Result<()> {
                             "fabric: exposure succeeded, but its peer permissions could not be checked: {error:#}"
                         );
                     }
-                    println!("exposed");
+                    if json {
+                        print_json(&ok_json([("protocol", exposed_protocol.into())]))?;
+                    } else {
+                        println!("exposed");
+                    }
                 }
                 Commands::Unexpose { protocol } => {
-                    send_control(&home, ControlRequest::Unexpose { protocol }).await?;
-                    println!("unexposed");
+                    send_control(
+                        &home,
+                        ControlRequest::Unexpose {
+                            protocol: protocol.clone(),
+                        },
+                    )
+                    .await?;
+                    if json {
+                        print_json(&ok_json([("protocol", protocol.into())]))?;
+                    } else {
+                        println!("unexposed");
+                    }
                 }
                 Commands::Dial {
                     peer,
@@ -987,11 +1058,17 @@ async fn run(cli: Cli) -> Result<()> {
                         )
                         .await?
                         {
+                            ControlResponse::DialTcp { addr } if json => {
+                                print_json(&serde_json::json!({ "address": addr.to_string() }))?;
+                            }
                             ControlResponse::DialTcp { addr } => println!("{addr}"),
                             response => bail!("unexpected daemon response: {response:?}"),
                         }
                     } else {
                         match send_control(&home, ControlRequest::Dial { peer, protocol }).await? {
+                            ControlResponse::Dial { socket } if json => {
+                                print_json(&serde_json::json!({ "socket": socket }))?;
+                            }
                             ControlResponse::Dial { socket } => println!("{}", socket.display()),
                             response => bail!("unexpected daemon response: {response:?}"),
                         }
@@ -1499,6 +1576,36 @@ mod json_flag_tests {
         assert!(!cli.json);
     }
 
+    /// `peers --json` carries how each peer is treated, so a program can tell a
+    /// phone that only dials in from a server, and a CI host this machine only
+    /// dials, without reading `peers.toml`.
+    #[test]
+    fn peers_json_says_how_each_peer_is_treated() {
+        let mut book = fabric::config::PeerBook::default();
+        let id = |byte: u8| iroh::SecretKey::from_bytes(&[byte; 32]).public();
+        book.add_inbound_only(id(1), Some("phone".into()), None, Some(vec!["echo".into()]));
+        book.add_dial_only(id(2), Some("ci".into()), None);
+        book.add(id(3), Some("server".into()), None);
+
+        let json = peers_json(book.peers());
+        let by_name = |name: &str| {
+            json["peers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|peer| peer["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_name("phone")["inbound_only"], true);
+        assert_eq!(by_name("phone")["dial_only"], false);
+        assert_eq!(by_name("phone")["allow"], serde_json::json!(["echo"]));
+        assert_eq!(by_name("ci")["dial_only"], true);
+        assert_eq!(by_name("ci")["inbound_only"], false);
+        assert_eq!(by_name("server")["inbound_only"], false);
+        assert_eq!(by_name("server")["dial_only"], false);
+    }
+
     #[test]
     fn json_after_an_exec_command_belongs_to_the_command() {
         let cli = Cli::try_parse_from(["fabric", "exec", "box", "--", "tool", "--json"]).unwrap();
@@ -1823,6 +1930,7 @@ mod connection_telemetry_tests {
             id: "node-id".to_string(),
             name: Some("laptop".to_string()),
             roaming: true,
+            inbound_only: false,
             reachable: false,
             bytes: None,
             round_trip_micros: None,
@@ -2206,6 +2314,86 @@ fn parse_include(value: Option<&str>) -> Option<Vec<String>> {
     if globs.is_empty() { None } else { Some(globs) }
 }
 
+/// One JSON object on stdout, and nothing else.
+fn print_json(value: &serde_json::Value) -> Result<()> {
+    println!("{}", serde_json::to_string(value)?);
+    Ok(())
+}
+
+/// `{"ok":true, ...fields}`: the success shape of a command that has nothing
+/// to return but its own outcome.
+fn ok_json<const N: usize>(fields: [(&str, serde_json::Value); N]) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    object.insert("ok".to_string(), true.into());
+    for (key, value) in fields {
+        object.insert(key.to_string(), value);
+    }
+    serde_json::Value::Object(object)
+}
+
+fn id_json(id: &str) -> serde_json::Value {
+    serde_json::json!({ "id": id })
+}
+
+/// `fabric peers --json`. `node` is the NodeID and `allow` the services granted
+/// to the peer; the flags say how the peer is treated and are always present.
+fn peers_json(peers: &[fabric::config::Peer]) -> serde_json::Value {
+    let peers: Vec<_> = peers
+        .iter()
+        .map(|peer| {
+            serde_json::json!({
+                "node": peer.id.to_string(),
+                "name": peer.name,
+                "allow": peer.allow,
+                "dial_only": peer.dial_only,
+                "inbound_only": peer.inbound_only,
+                "roaming": peer.roaming,
+            })
+        })
+        .collect();
+    serde_json::json!({ "peers": peers })
+}
+
+/// `fabric status --json`. Connection telemetry is left out on purpose: it is
+/// not part of the stable surface, and `telemetry.json` carries it.
+#[allow(clippy::too_many_arguments)]
+fn status_json(
+    version: &str,
+    node_id: &str,
+    endpoint_addr: &serde_json::Value,
+    exposed_protocols: &[String],
+    dial_sockets: &[PathBuf],
+    peers: &[PeerReachability],
+    dial_handlers: (usize, usize),
+    sync_runtime: &SyncRuntimeStatus,
+) -> serde_json::Value {
+    let peers: Vec<_> = peers
+        .iter()
+        .map(|peer| {
+            serde_json::json!({
+                "id": peer.id,
+                "name": peer.name,
+                "reachable": peer.reachable,
+                "inbound_only": peer.inbound_only,
+                "roaming": peer.roaming,
+                "round_trip_micros": peer.round_trip_micros,
+                "transport": peer.transport,
+                "error": peer.error,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "version": version,
+        "node_id": node_id,
+        "endpoint_addr": endpoint_addr,
+        "exposed_protocols": exposed_protocols,
+        "dial_sockets": dial_sockets,
+        "dial_handlers": { "active": dial_handlers.0, "max": dial_handlers.1 },
+        "sync_runtime": { "owner": sync_runtime.owner, "companion": sync_runtime.companion },
+        "peers": peers,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn print_status(
     version: &str,
@@ -2531,7 +2719,14 @@ fn print_peer_reachability(peers: &[PeerReachability]) {
 
 fn format_peer_reachability(peer: &PeerReachability) -> String {
     let label = peer.name.as_deref().unwrap_or(&peer.id);
-    if peer.reachable {
+    if peer.inbound_only {
+        let state = if peer.reachable {
+            "connected"
+        } else {
+            "not connected"
+        };
+        format!("{label}\t{}\tinbound-only\t{state}", peer.id)
+    } else if peer.reachable {
         let millis = peer.round_trip_micros.unwrap_or_default() as f64 / 1000.0;
         let transport = peer.transport.as_deref().unwrap_or("unknown");
         format!(

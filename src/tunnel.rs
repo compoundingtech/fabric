@@ -1287,6 +1287,13 @@ async fn run_client_attach_loop(
                     }
                 }
             }
+            // A session with both sides finished and everything acknowledged has
+            // nothing left to resume, however its last attach came to an end. A
+            // short session often loses a race here: the far side finishes its
+            // stream, and this attach reads the end of it before its own writer
+            // has noticed the session is complete. Retrying would record a loss
+            // and log a reconnect for a session that was already over.
+            Err(_) if session.is_complete().await => return Ok(()),
             Err(error) => {
                 // A temporary admission refusal is a reply from a live peer.
                 // It must not inherit an absent peer's long retry schedule.
