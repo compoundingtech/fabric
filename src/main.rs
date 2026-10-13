@@ -1112,6 +1112,7 @@ async fn run(cli: Cli) -> Result<()> {
                             error,
                         } => {
                             if json {
+                                let code = probe_outcome_code(&outcome, error.as_deref());
                                 println!(
                                     "{}",
                                     serde_json::json!({
@@ -1122,8 +1123,8 @@ async fn run(cli: Cli) -> Result<()> {
                                         "round_trip_micros": round_trip_micros,
                                         "transport": transport,
                                         "error": error,
-                                        "code": probe_outcome_code(&outcome, error.as_deref())
-                                            .map(ErrorCode::as_str),
+                                        "code": code.map(ErrorCode::as_str),
+                                        "class": code.map(|code| code.class().as_str()),
                                     })
                                 );
                             } else {
