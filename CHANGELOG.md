@@ -4,9 +4,32 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
-## [Unreleased]
+## [0.2.40] - 2026-10-13
+
+### Fixed
+
+- An idle terminal attach no longer stops the daemon. A pipe read or write
+  takes the pipe's lock first, even on a non-blocking descriptor, and a child
+  that sleeps holding that lock parks whoever touches the other end. A terminal
+  service that copies its session socket into its stdout with `std::io::copy`
+  does exactly that on Linux (std turns the copy into `splice(2)`, which sleeps
+  with the output pipe locked until the socket has data), so the daemon's next
+  read of the child's stdout, made from inside a task, parked a runtime worker
+  for as long as the terminal was quiet. Attaches to a quiet terminal froze a
+  Linux daemon for about three minutes at a time until the stall watchdog ended
+  it (five times in four days). The exposed-exec and exec services now read and
+  write a child's stdin, stdout and stderr on threads of their own, through
+  bounded channels, so a locked pipe costs one parked thread. A regression test
+  reproduces it with children that copy an idle socket into their stdout and
+  fails (the runtime stops) if the pipes go back on a runtime worker.
 
 ### Added
+
+- Info-level validation-log events for the lifecycle of exec children:
+  `exposed_exec_started` and `exposed_exec_exited` (session, peer, command,
+  pid, exit status) and `child_pipe_closed` for every pipe (which pipe, how it
+  ended, bytes moved, how long it was open, its longest silence), plus
+  `child_pipe_long_wait` for a read that waited more than 30 s.
 
 - The stall report describes each child the daemon has: the command line it
   carries, the wait channel and system call it is in (`child-details=[PID:S

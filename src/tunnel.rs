@@ -19,7 +19,7 @@ use iroh::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::{TcpStream, UnixStream},
-    process::{ChildStderr, Command},
+    process::Command,
     sync::{Mutex, Notify, watch},
 };
 use tokio_util::sync::CancellationToken;
@@ -2153,17 +2153,41 @@ async fn spawn_exec_session(
     let mut child = fabric_service_api::child_spawn::spawn(&spawn_label, command)
         .await
         .with_context(|| format!("failed to spawn exposed exec {program:?}"))?;
-    let stdin = child
-        .stdin
-        .take()
-        .context("exposed exec child stdin was not piped")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("exposed exec child stdout was not piped")?;
+    // The child's pipes are read and written on threads of their own: a pipe
+    // operation takes the pipe's lock even on a non-blocking descriptor, and a
+    // child that sleeps holding it (a splice from an idle socket does) would park
+    // a runtime worker for as long as it sleeps.
+    let pipe_label = format!("{label} (session {session_id})");
+    let stdin = fabric_service_api::child_pipes::stdin_writer(
+        child
+            .stdin
+            .take()
+            .context("exposed exec child stdin was not piped")?,
+        &pipe_label,
+    )
+    .context("exposed exec child stdin could not be handed to its thread")?;
+    let stdout = fabric_service_api::child_pipes::stdout_reader(
+        child
+            .stdout
+            .take()
+            .context("exposed exec child stdout was not piped")?,
+        &pipe_label,
+    )
+    .context("exposed exec child stdout could not be handed to its thread")?;
     if let Some(stderr) = child.stderr.take() {
+        let stderr = fabric_service_api::child_pipes::stderr_reader(stderr, &pipe_label)
+            .context("exposed exec child stderr could not be handed to its thread")?;
         tokio::spawn(log_child_stderr(session_id, label.clone(), stderr));
     }
+    tracing::info!(
+        target: "fabric::validation",
+        event = "exposed_exec_started",
+        session = %session_id,
+        peer = %peer_id,
+        child = %label,
+        pid = child.id().unwrap_or(0),
+        "an exposed exec child was started"
+    );
     let kill = CancellationToken::new();
     let kill_wait = kill.clone();
     tokio::spawn(async move {
@@ -2180,6 +2204,14 @@ async fn spawn_exec_session(
             }
         };
         drop(permit);
+        tracing::info!(
+            target: "fabric::validation",
+            event = "exposed_exec_exited",
+            session = %session_id,
+            child = %label,
+            status = %result.as_ref().map_or_else(|error| format!("wait failed: {error}"), |status| status.to_string()),
+            "an exposed exec child ended"
+        );
         match result {
             Ok(status) if status.success() => {}
             Ok(status) => {
@@ -2200,7 +2232,11 @@ async fn spawn_exec_session(
     ))
 }
 
-async fn log_child_stderr(session_id: TunnelSessionId, label: String, mut stderr: ChildStderr) {
+async fn log_child_stderr(
+    session_id: TunnelSessionId,
+    label: String,
+    mut stderr: impl AsyncRead + Unpin,
+) {
     let mut lines = BufReader::new(&mut stderr).lines();
     loop {
         match lines.next_line().await {
