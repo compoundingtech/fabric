@@ -7,6 +7,7 @@
 //! daemon's decision; nothing here reads a grant.
 
 pub mod daemon_control;
+pub mod error;
 mod home;
 pub mod log;
 pub mod sync;

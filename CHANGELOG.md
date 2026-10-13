@@ -22,6 +22,12 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   stays with the peer's grant; the option is persisted in config.toml
   (`peer_header = true`) and off by default, so existing socket exposures do not
   change.
+- Stable error codes, specified in `docs/errors.md`: a snake_case code for
+  each failure, a class that says what to do about it (`refusal`, `fault` or
+  `usage`), the exit status for each class, the `--json` error object and the
+  `fabric:<code> ` token that close reasons and wire errors will carry ahead of
+  today's text. This adds the `fabric::error` type (in `fabric-config`, so the sync companion shares it) and the specification;
+  commands, close reasons and `--json` adopt it in the next changes.
 
 ### Fixed
 
