@@ -199,6 +199,51 @@ mod tests {
         assert!(!in_flight().contains("test slow"), "{}", in_flight());
     }
 
+    /// A child that writes nothing and never exits must not hold a runtime
+    /// worker: with every worker busy reading its silent pipe, the ticks below
+    /// would stop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn silent_children_that_never_exit_do_not_park_the_runtime() {
+        let mut readers = Vec::new();
+        let mut children = Vec::new();
+        for n in 0..6 {
+            let mut command = Command::new("sleep");
+            command
+                .arg("30")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true);
+            let mut child = spawn(&format!("test silent {n}"), command)
+                .await
+                .expect("spawn sleep");
+            let mut stdout = child.stdout.take().expect("stdout");
+            let mut stderr = child.stderr.take().expect("stderr");
+            readers.push(tokio::spawn(async move {
+                let mut byte = [0u8; 1];
+                let _ = stdout.read(&mut byte).await;
+            }));
+            readers.push(tokio::spawn(async move {
+                let mut byte = [0u8; 1];
+                let _ = stderr.read(&mut byte).await;
+            }));
+            children.push(child);
+        }
+        let ticked = tokio::time::timeout(Duration::from_secs(2), async {
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        for reader in &readers {
+            reader.abort();
+        }
+        for child in &mut children {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        assert!(ticked.is_ok(), "twelve silent pipes stopped the runtime");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_spawn_in_progress_is_named_until_it_ends() {

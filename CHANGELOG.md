@@ -4,6 +4,24 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+## [Unreleased]
+
+### Added
+
+- The stall report describes each child the daemon has: the command line it
+  carries, the wait channel and system call it is in (`child-details=[PID:S
+  cmdline="..." wchan=... syscall=...]`), and the wait channel of every process
+  that holds an end of the pipe a stuck thread is reading. A forked child that
+  has not yet executed still carries the daemon's own command line, one that has
+  executed carries the command it was started for, so the next stall says
+  whether a spawn was waiting on a slow exec or something else was reading that
+  pipe.
+
+### Tests
+
+- A regression test starts six children that write nothing and never exit,
+  reads their stdout and stderr, and requires the runtime to keep running.
+
 ## [0.2.39] - 2026-10-12
 
 ### Added
