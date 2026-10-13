@@ -1543,7 +1543,15 @@ impl DaemonState {
                     mux::StreamActivity::Probe,
                 )
                 .await
-                .with_context(|| format!("failed to connect to {peer:?} built-in echo"))?;
+                .map_err(|error| {
+                    if mux::is_stream_denied(&error) {
+                        error.context(format!(
+                            "{peer:?} is up but has not granted this machine echo, so it cannot be pinged"
+                        ))
+                    } else {
+                        error.context(format!("failed to connect to {peer:?} built-in echo"))
+                    }
+                })?;
             let connection = stream.connection;
             let mut send = stream.send;
             let mut recv = stream.recv;
@@ -2121,6 +2129,7 @@ impl DaemonState {
                 id: peer.id.to_string(),
                 name: peer.name.clone(),
                 roaming: peer.roaming,
+                echo_denied: false,
                 inbound_only: true,
                 reachable: self.peer_connections.connection(peer.id).await.is_some(),
                 bytes: None,
@@ -2162,10 +2171,26 @@ impl DaemonState {
                 name: peer.name.clone(),
                 roaming,
                 inbound_only: false,
+                echo_denied: false,
                 reachable: true,
                 bytes: Some(pong.bytes),
                 round_trip_micros: Some(pong.round_trip.as_micros().try_into().unwrap_or(u64::MAX)),
                 transport: pong.transport,
+                error: None,
+            },
+            // The peer admitted the connection and then refused the echo stream,
+            // so it is up and trusts this machine; it has only not granted
+            // `echo`. That is an answer from a live peer, not an absence.
+            Ok(Err(error)) if mux::is_stream_denied(&error) => PeerReachability {
+                id: peer.id.to_string(),
+                name: peer.name.clone(),
+                roaming,
+                inbound_only: false,
+                echo_denied: true,
+                reachable: true,
+                bytes: None,
+                round_trip_micros: None,
+                transport: None,
                 error: None,
             },
             Ok(Err(error)) => PeerReachability {
@@ -2173,6 +2198,7 @@ impl DaemonState {
                 name: peer.name.clone(),
                 roaming,
                 inbound_only: false,
+                echo_denied: false,
                 reachable: false,
                 bytes: None,
                 round_trip_micros: None,
@@ -2184,6 +2210,7 @@ impl DaemonState {
                 name: peer.name.clone(),
                 roaming,
                 inbound_only: false,
+                echo_denied: false,
                 reachable: false,
                 bytes: None,
                 round_trip_micros: None,
@@ -3497,7 +3524,8 @@ async fn run_peer_health_loop_with(
                     // round trip time and a path and discarded both, so the only
                     // way to compare direct against relay was to parse days of
                     // log text.
-                    if health.reachable {
+                    // A peer that refused the echo is up but measured nothing.
+                    if health.reachable && !health.echo_denied {
                         state.telemetry.record_probe(
                             &label,
                             health.reachable,
@@ -9766,6 +9794,63 @@ mod tests {
         );
 
         phone.shutdown().await?;
+        hub.shutdown().await?;
+        Ok(())
+    }
+
+    /// A peer that trusts this machine but has not granted it `echo` is up, and
+    /// the reachability check must say so: it used to report such a peer as
+    /// offline, with a refusal as the reason, although the refusal was the
+    /// peer answering. Nothing in the liveness loop may treat it as absent
+    /// either, or it would try to recover a connection that is fine.
+    #[tokio::test]
+    async fn a_peer_that_has_not_granted_echo_is_up_not_offline() -> Result<()> {
+        let hub_dir = tempfile::tempdir()?;
+        let peer_dir = tempfile::tempdir()?;
+        let hub_home = FabricHome::new(hub_dir.path());
+        let peer_home = FabricHome::new(peer_dir.path());
+        let hub = FabricNode::start(hub_home.clone()).await?;
+        let peer = FabricNode::start(peer_home.clone()).await?;
+        trust_test_peer_allowing(&hub_home, &hub, peer.id(), "peer", peer.addr(), &["echo"])
+            .await?;
+        for (case, granted) in [("nothing", &[][..]), ("something else", &["send-file"][..])] {
+            trust_test_peer_allowing(&peer_home, &peer, hub.id(), "hub", hub.addr(), granted)
+                .await?;
+
+            let statuses = hub.state().peer_reachability().await;
+            assert_eq!(statuses.len(), 1, "{case}");
+            let status = &statuses[0];
+            assert!(
+                status.reachable,
+                "{case}: a live peer was called offline: {status:?}"
+            );
+            assert!(
+                status.echo_denied,
+                "{case}: the refusal was not recorded: {status:?}"
+            );
+            assert!(status.error.is_none(), "{case}: {status:?}");
+            assert!(status.round_trip_micros.is_none() && status.transport.is_none());
+
+            let error = hub.state().ping("peer").await.expect_err("ping was served");
+            let text = format!("{error:#}");
+            assert!(
+                text.contains("is up but has not granted this machine echo"),
+                "{case}: the refusal did not say the peer is up: {text}"
+            );
+            assert_eq!(
+                crate::error::code_of(&error),
+                crate::error::ErrorCode::PeerNotPermittedForService,
+                "{case}: {text}"
+            );
+        }
+
+        // Granted, the same check measures it and reports no denial.
+        trust_test_peer_allowing(&peer_home, &peer, hub.id(), "hub", hub.addr(), &["echo"]).await?;
+        let status = hub.state().peer_reachability().await.remove(0);
+        assert!(status.reachable && !status.echo_denied, "{status:?}");
+        assert!(status.round_trip_micros.is_some(), "{status:?}");
+
+        peer.shutdown().await?;
         hub.shutdown().await?;
         Ok(())
     }

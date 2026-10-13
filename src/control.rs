@@ -295,6 +295,11 @@ pub struct PeerReachability {
     /// whether it is connected right now.
     #[serde(default)]
     pub inbound_only: bool,
+    /// The peer is up and trusts this machine, but refused the echo stream
+    /// because it has not granted `echo`. `reachable` is then true and there is
+    /// no round trip to report. An older daemon never sets it.
+    #[serde(default)]
+    pub echo_denied: bool,
     pub reachable: bool,
     pub bytes: Option<usize>,
     pub round_trip_micros: Option<u64>,
