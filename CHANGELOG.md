@@ -15,6 +15,18 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   today's text. This adds the `fabric::error` type (in `fabric-config`, so the sync companion shares it) and the specification;
   commands, close reasons and `--json` adopt it in the next changes.
 
+### Fixed
+
+- `fabric exec` no longer loses a refusal to a broken pipe. A peer that refuses
+  exec answers and closes the stream without reading the command, so the
+  client's write of the command could fail with `Broken pipe` while the refusal
+  was already waiting to be read. The client reported that write error, exited 1
+  and, under `fabric doctor`, turned a peer that refuses exec by design into an
+  `unknown` build finding that fails the run. The client now reads the answer
+  first and keeps the write error only when nothing answers. An end-to-end test
+  runs `fabric doctor` against a peer that does not grant exec and requires an
+  informational `versions` line; it failed about one run in twenty-five before.
+
 ## [0.2.40] - 2026-10-13
 
 ### Fixed

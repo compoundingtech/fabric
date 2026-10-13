@@ -133,13 +133,22 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (mut read, mut write) = tokio::io::split(stream);
-    write_client_argv(&mut write, cmd).await?;
+    // A refusal is answered and the stream closed without reading the argv, so
+    // this write can lose that race with a broken pipe. The refusal is already
+    // waiting to be read; the write error only matters if nothing answers.
+    let write_error = write_client_argv(&mut write, cmd).await.err();
 
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
     let mut exit_code = None;
 
-    while let Some(frame) = read_server_frame(&mut read).await? {
+    loop {
+        let frame = match read_server_frame(&mut read).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(_) if write_error.is_some() => break,
+            Err(error) => return Err(error),
+        };
         match frame {
             ServerFrame::Stdout(bytes) => {
                 stdout.write_all(&bytes).await?;
@@ -165,6 +174,9 @@ where
     }
 
     if exit_code.is_none() {
+        if let Some(error) = write_error {
+            return Err(error);
+        }
         stderr
             .write_all(
                 format!(
@@ -740,6 +752,68 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "the exit frame took {elapsed:?}; it waited for the background child"
         );
+    }
+
+    /// The daemon answers a refusal and closes without reading the argv, so the
+    /// client's write can fail while the answer sits unread.
+    struct ClosedForWriting(std::io::Cursor<Vec<u8>>);
+
+    impl AsyncRead for ClosedForWriting {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for ClosedForWriting {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_is_read_even_when_writing_the_argv_failed() {
+        let mut reply = Vec::new();
+        serve_exec_disabled(&mut reply).await.unwrap();
+        let stream = ClosedForWriting(std::io::Cursor::new(reply));
+
+        let code = run_client(stream, "laptop", &["fabric".into(), "--version".into()])
+            .await
+            .unwrap();
+
+        assert_eq!(code, EXIT_EXEC_DISABLED);
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_with_no_reply_is_still_an_error() {
+        let stream = ClosedForWriting(std::io::Cursor::new(Vec::new()));
+
+        let error = run_client(stream, "laptop", &["fabric".into()])
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").to_lowercase().contains("broken pipe"));
     }
 
     #[tokio::test]
