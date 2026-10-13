@@ -71,6 +71,9 @@ Deprecated, Fixed or Security.
   `tests/golden/json/`, so changing one fails a test.
 
 ### Changed
+- README: the sentences that said a peer without an `echo` grant shows as offline
+  now describe the `echo not granted` state, and the `peers.toml` field list gains
+  `inbound_only`.
 - README, sync and architecture: the workspace is five crates, not two; the sync
   bridge is how the companion runs in production, not a bridge "no production
   request selects"; the exec and shell sections no longer carry before-and-after
