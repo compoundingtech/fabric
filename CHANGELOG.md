@@ -84,6 +84,29 @@ Deprecated, Fixed or Security.
   first and keeps the write error only when nothing answers. An end-to-end test
   runs `fabric doctor` against a peer that does not grant exec and requires an
   informational `versions` line; it failed about one run in twenty-five before.
+
+- A tunnel session that finished on both sides no longer logs a reconnect or
+  rewrites telemetry. A short session (one request per connection through a
+  dial listener) often loses a race: the far side finishes its stream, and the
+  client's attach reads the end of it before its own writer has noticed the
+  session is complete. The retry loop took that for a lost transport, recorded
+  a reconnect attempt, logged `generic dial lost its transport; reconnecting`
+  and rewrote `telemetry.json`, for a session with nothing left to resume. On a
+  live pair that was about thirty warnings a minute and roughly doubled the
+  validation log. A session with both sides finished and everything
+  acknowledged is now over however its last attach ended. A transport that ends
+  under a live session retries as before. A two-process test carries 2,400
+  short sessions and requires zero reconnect attempts; it failed on every run
+  before (13, 35 and 31 attempts in three).
+- `fabric exec` no longer loses a refusal to a broken pipe. A peer that refuses
+  exec answers and closes the stream without reading the command, so the
+  client's write of the command could fail with `Broken pipe` while the refusal
+  was already waiting to be read. The client reported that write error, exited 1
+  and, under `fabric doctor`, turned a peer that refuses exec by design into an
+  `unknown` build finding that fails the run. The client now reads the answer
+  first and keeps the write error only when nothing answers. An end-to-end test
+  runs `fabric doctor` against a peer that does not grant exec and requires an
+  informational `versions` line; it failed about one run in twenty-five before.
 - `fabric exec` no longer loses a refusal to a broken pipe. A peer that refuses
   exec answers and closes the stream without reading the command, so the
   client's write of the command could fail with `Broken pipe` while the refusal
