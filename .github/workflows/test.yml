@@ -122,6 +122,9 @@ jobs:
       - name: Doctor command contract
         run: timeout 5m cargo test --locked -p fabric --test doctor -- --test-threads=1
 
+      - name: Error code contract
+        run: timeout 5m cargo test --locked -p fabric --test errors -- --test-threads=1
+
       - name: Real iroh folder sync and restart
         run: timeout 10m cargo test --locked -p fabric-sync --test sync_slice -- --test-threads=1
 

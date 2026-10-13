@@ -58,9 +58,18 @@ in their output instead:
 - `fabric exec` exits with the remote command's status, so a status alone
   cannot tell a fabric failure from the command's own. Read the stderr line.
 - `fabric probe` exits 0 supported, 1 unsupported, 2 unreachable, 3 timeout,
-  and 64 when it cannot answer.
+  and 64 when it cannot answer. These statuses are a legacy contract, kept
+  for scripts that already read them; a grant refusal, for one, has always
+  exited 2. The code is authoritative: `probe --json` prints its answer
+  object, in which `error` is a string or `null`, and `code` and `class` name
+  the code behind any answer other than `supported` (both `null` for
+  `supported`). When it cannot answer, `--json` prints the error object
+  instead. See [`fabric probe --json`](#fabric-probe---json) below.
 - `fabric doctor` exits 0 to 3 as its help describes.
 - `fabric update --check` exits 0 current, 1 available, 2 error.
+- `fabric sync` subcommands other than `add`, `rm` and `reload` are run by the
+  sync companion, which is provisional and does not report codes yet. Their
+  own `--json` goes after the subcommand: `fabric sync ls --json`.
 
 The last line fabric writes to stderr for a failure is:
 
@@ -87,6 +96,32 @@ object, and exits with the status above:
 - Nothing else is printed on stdout for a failure. Stderr still carries the
   human line; do not parse it when you have the JSON.
 
+### `fabric probe --json`
+
+Every probe prints one line. When the probe was answered, it is the answer
+object, which has the same keys every time:
+
+```json
+{"peer":"server","peer_id":"<node id>","protocol":"web","outcome":"supported","round_trip_micros":812,"transport":"direct","error":null,"code":null,"class":null}
+```
+
+| Case | Exit | `outcome` | `code` | `class` |
+| --- | --- | --- | --- | --- |
+| The service answered | 0 | `supported` | `null` | `null` |
+| The peer exposes no such service | 1 | `unsupported` | `service_not_exposed` | `fault` |
+| The peer does not grant the service to this machine | 2 | `unreachable` | `peer_not_permitted_for_service` | `refusal` |
+| The peer does not trust this machine | 2 | `unreachable` | `peer_not_in_allow_list` | `refusal` |
+| No answer, or no path to the peer | 2 | `unreachable` | `unreachable` or `peer_offline` | `fault` |
+| The `--timeout` passed | 3 | `timeout` | `timeout` | `fault` |
+
+`error` is the far side's text, or `null`. When the probe could not be asked
+at all (no daemon, an unknown peer name, an invalid `--timeout`), it exits 64
+and prints the error object instead, for example
+`{"error":{"code":"unknown_peer","class":"fault",...,"peer":"ghost","service":null}}`.
+
+A build before 0.2.41 prints the same answer object without `code` and
+`class`. When it cannot answer, it prints nothing on stdout and exits 64.
+
 A clap usage error (an unknown flag, a missing argument) is found before
 fabric knows `--json` was asked for. It exits 2 with usage text on stderr and
 prints nothing on stdout.
@@ -94,8 +129,9 @@ prints nothing on stdout.
 A build older than 0.2.41 does not know `--json` on most commands, and answers
 the same way: exit 2, usage text on stderr, nothing on stdout. A reader can
 treat "no JSON object on stdout" as an older build and fall back to its text.
-`fabric probe --json` and `fabric sync ls --json` existed before codes; on
-those, look for the `error` key, or compare `fabric --version`.
+`fabric probe --json` and `fabric sync ls --json` existed before codes. On
+`probe`, an error object is one whose `error` is an object (a probe answer's
+`error` is a string or `null`); or compare `fabric --version`.
 
 ## On the wire
 
