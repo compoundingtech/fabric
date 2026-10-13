@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use fabric_config::error::{ErrorCode, FabricError};
 use fabric_config::log_eprintln as eprintln;
 use iroh::{
     EndpointAddr, EndpointId,
@@ -1868,19 +1869,26 @@ fn ensure_room_for_locked(
     peer_id: EndpointId,
 ) -> Result<()> {
     if sessions.len() >= limits.max_total {
-        bail!(
-            "server tunnel session limit reached ({}/{})",
-            sessions.len(),
-            limits.max_total
-        );
+        return Err(FabricError::new(
+            ErrorCode::SessionLimitReached,
+            format!(
+                "server tunnel session limit reached ({}/{})",
+                sessions.len(),
+                limits.max_total
+            ),
+        )
+        .into());
     }
     let peer_sessions = count_peer_sessions_locked(sessions, peer_id);
     if peer_sessions >= limits.max_per_peer {
-        bail!(
-            "server tunnel session limit reached for peer {peer_id} ({}/{})",
-            peer_sessions,
-            limits.max_per_peer
-        );
+        return Err(FabricError::new(
+            ErrorCode::SessionLimitReached,
+            format!(
+                "server tunnel session limit reached for peer {peer_id} ({}/{})",
+                peer_sessions, limits.max_per_peer
+            ),
+        )
+        .into());
     }
     Ok(())
 }
@@ -1944,7 +1952,13 @@ pub async fn serve_connection(
         Ok(admission) => admission,
         Err(error) => {
             let expired_resume = error.downcast_ref::<ExpiredResumeError>().is_some();
-            send_tunnel_error(&connection, &mut send, format!("{error:#}")).await;
+            let code = if expired_resume {
+                ErrorCode::SessionExpired
+            } else {
+                fabric_config::error::code_of(&error)
+            };
+            let message = fabric_config::error::without_tokens(&format!("{error:#}"));
+            send_tunnel_error(&connection, &mut send, code.reason(&message)).await;
             if expired_resume {
                 return Ok(());
             }
@@ -2064,18 +2078,24 @@ async fn create_server_session(
 ) -> Result<(Arc<TunnelSession>, LocalRead)> {
     match target {
         ServerTarget::UnixSocket(local_socket) => {
-            let local = UnixStream::connect(&local_socket).await.with_context(|| {
-                format!(
-                    "failed to connect exposed socket {}",
-                    local_socket.display()
+            let local = UnixStream::connect(&local_socket).await.map_err(|error| {
+                FabricError::new(
+                    ErrorCode::ServiceUnavailable,
+                    format!(
+                        "failed to connect exposed socket {}: {error}",
+                        local_socket.display()
+                    ),
                 )
             })?;
             Ok(TunnelSession::new(session_id, peer_id, local))
         }
         ServerTarget::Tcp { addr } => {
-            let local = TcpStream::connect(&addr)
-                .await
-                .with_context(|| format!("failed to connect exposed tcp {addr}"))?;
+            let local = TcpStream::connect(&addr).await.map_err(|error| {
+                FabricError::new(
+                    ErrorCode::ServiceUnavailable,
+                    format!("failed to connect exposed tcp {addr}: {error}"),
+                )
+            })?;
             let (read, write) = local.into_split();
             Ok(TunnelSession::new_parts(
                 session_id,
@@ -2134,11 +2154,14 @@ async fn spawn_exec_session(
     let Some(program) = argv.first() else {
         bail!("exposed exec command is empty");
     };
-    let permit = limit.try_acquire().with_context(|| {
-        format!(
-            "exposed exec concurrency limit reached ({}/{})",
-            limit.active_children(),
-            limit.max_children()
+    let permit = limit.try_acquire().ok_or_else(|| {
+        FabricError::new(
+            ErrorCode::SessionLimitReached,
+            format!(
+                "exposed exec concurrency limit reached ({}/{})",
+                limit.active_children(),
+                limit.max_children()
+            ),
         )
     })?;
     let label = argv.join(" ");
@@ -2152,7 +2175,12 @@ async fn spawn_exec_session(
     let spawn_label = format!("exposed-exec {label} for {peer_id}");
     let mut child = fabric_service_api::child_spawn::spawn(&spawn_label, command)
         .await
-        .with_context(|| format!("failed to spawn exposed exec {program:?}"))?;
+        .map_err(|error| {
+            FabricError::new(
+                ErrorCode::SpawnFailed,
+                format!("failed to spawn exposed exec {program:?}: {error:#}"),
+            )
+        })?;
     // The child's pipes are read and written on threads of their own: a pipe
     // operation takes the pipe's lock even on a non-blocking descriptor, and a
     // child that sleeps holding it (a splice from an idle socket does) would park

@@ -4,7 +4,10 @@
 use std::process::{Command, Output};
 
 use anyhow::{Context, Result};
-use fabric::{config::FabricHome, daemon::FabricNode};
+use fabric::{
+    config::{FabricHome, PeerBook},
+    daemon::FabricNode,
+};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -131,5 +134,73 @@ async fn the_daemons_code_and_peer_reach_the_command() -> Result<()> {
             .contains("unknown peer \"ghost\""),
         "{error}"
     );
+    Ok(())
+}
+
+/// Trust `peer` in `home`, granting exactly `allow`, and reload.
+async fn trust(
+    home: &TempDir,
+    node: &FabricNode,
+    peer: &FabricNode,
+    name: &str,
+    allow: &[&str],
+) -> Result<()> {
+    let home = FabricHome::new(home.path());
+    let mut peers = PeerBook::load(&home)?;
+    peers.add_with_allow(
+        peer.id(),
+        Some(name.to_string()),
+        Some(peer.addr()),
+        Some(allow.iter().map(|service| (*service).to_string()).collect()),
+    );
+    peers.save(&home)?;
+    node.state().reload_peers().await
+}
+
+/// A probe answer names the code the far daemon chose: a refusal for a
+/// service it does not grant, `service_not_exposed` for one nobody exposes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_probe_answer_names_the_far_sides_code() -> Result<()> {
+    let server_home = TempDir::new()?;
+    let client_home = TempDir::new()?;
+    let server = FabricNode::start(FabricHome::new(server_home.path())).await?;
+    let client = FabricNode::start(FabricHome::new(client_home.path())).await?;
+    let socket = server_home.path().join("web.sock");
+    let _listener = tokio::net::UnixListener::bind(&socket)?;
+    server.expose("web", socket).await?;
+    trust(&server_home, &server, &client, "client", &["echo"]).await?;
+    trust(&client_home, &client, &server, "server", &[]).await?;
+
+    let mut answers = Vec::new();
+    for protocol in ["web", "nothing-here"] {
+        let path = client_home.path().to_path_buf();
+        let output = tokio::task::spawn_blocking(move || {
+            Command::new(env!("CARGO_BIN_EXE_fabric"))
+                .arg("--home")
+                .arg(path)
+                .args(["--json", "probe", "server", protocol, "--timeout", "10"])
+                .output()
+        })
+        .await??;
+        let answer: Value = serde_json::from_slice(&output.stdout)
+            .with_context(|| format!("probe {protocol}: {output:?}"))?;
+        answers.push((output.status.code(), answer));
+    }
+    client.shutdown().await?;
+    server.shutdown().await?;
+
+    // A refusal has always been answered `unreachable`; its code is what
+    // tells it from a network fault. The refusal crossed the shared daemon
+    // connection as a stream denial.
+    let (status, refused) = &answers[0];
+    assert_eq!(*status, Some(2), "{refused}");
+    assert_eq!(refused["outcome"], "unreachable", "{refused}");
+    assert_eq!(
+        refused["code"], "peer_not_permitted_for_service",
+        "{refused}"
+    );
+    let (status, missing) = &answers[1];
+    assert_eq!(*status, Some(1), "{missing}");
+    assert_eq!(missing["code"], "service_not_exposed", "{missing}");
     Ok(())
 }

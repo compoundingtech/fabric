@@ -25,10 +25,23 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   id, an ambiguous peer name and `expose` arguments. `probe` keeps its exit
   statuses; its `--json` answer gains a `code` field.
 
+- Close reasons, stream denials and direct-wire Error frames carry the
+  `fabric:<code> ` token ahead of the text they always had, so a client can
+  tell a refusal from a fault without matching words: both 403 refusals
+  (`peer_not_in_allow_list`, `peer_not_permitted_for_service`, revocations
+  included), `service_not_exposed`, `session_limit_reached`,
+  `session_expired`, `service_unavailable` and `spawn_failed`. A command
+  reports the code the other machine sent, `fabric exec` included, and reads
+  the refusal texts of daemons older than codes as the matching refusal. A
+  failed or skipped connection to a peer is `unreachable` or `peer_offline`.
+
 ### Changed
 
 - A failure's stderr line is now one line, `Error: fabric:<code> <text>`,
   where it used to list each cause on its own `Caused by:` line.
+- `fabric exec` reports a refusal or a failure to start the remote command as
+  `Error: fabric:<code> peer "<name>" <text>` (it printed
+  `fabric: peer "<name>" <text>`); its exit statuses are unchanged.
 
 ### Fixed
 

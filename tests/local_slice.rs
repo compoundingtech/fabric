@@ -1620,6 +1620,10 @@ async fn exec_names_the_peer_and_service_when_the_peer_acl_refuses_it() -> Resul
         stderr.contains("exec"),
         "the refusal omitted the service: {stderr:?}"
     );
+    assert!(
+        stderr.contains("Error: fabric:peer_not_permitted_for_service "),
+        "the refusal did not carry its code: {stderr:?}"
+    );
 
     client.shutdown().await?;
     server.shutdown().await?;

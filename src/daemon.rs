@@ -398,7 +398,9 @@ impl EndpointHooks for AllowListHook {
         } else {
             AfterHandshakeOutcome::Reject {
                 error_code: VarInt::from_u32(403),
-                reason: b"node is not in fabric allow-list".to_vec(),
+                reason: ErrorCode::PeerNotInAllowList
+                    .reason("node is not in fabric allow-list")
+                    .into_bytes(),
             }
         }
     }
@@ -4174,10 +4176,11 @@ fn grant_for_alpn(services: &Services, alpn: &[u8]) -> Grant {
 /// so a client reads it as a refusal rather than a network fault.
 fn close_when_revoked(connection: &Connection, admission: &Admission) {
     let reason = match admission.grant() {
-        Grant::Trust => "node is not in fabric allow-list (access revoked)".to_string(),
-        Grant::Service(service) => {
-            format!("peer not permitted for service {service:?} (access revoked)")
-        }
+        Grant::Trust => ErrorCode::PeerNotInAllowList
+            .reason("node is not in fabric allow-list (access revoked)"),
+        Grant::Service(service) => ErrorCode::PeerNotPermittedForService.reason(&format!(
+            "peer not permitted for service {service:?} (access revoked)"
+        )),
     };
     let revoked = admission.revoked();
     let weak = connection.weak_handle();
@@ -4216,7 +4219,7 @@ async fn until_revoked(
 /// than reporting a reset. A denial nobody can read is indistinguishable from a
 /// network fault, and somebody who cannot tell them apart turns the feature off.
 async fn deny_connection(connection: &Connection, service: &str, denied: &crate::config::Denied) {
-    let reason = denied.to_string();
+    let reason = denied.reason();
     tracing::info!(
         target: VALIDATION_LOG_TARGET,
         event = "permission_denied",
@@ -4447,9 +4450,12 @@ async fn refuse_streams_while_dial_only(connection: &Connection, state: &Arc<Dae
             continue;
         };
         let reason = match state.may(&peer, &header.protocol).await {
-            Err(denied) => denied.to_string(),
+            Err(denied) => denied.reason(),
             // Cleared between the check above and here; refuse this one anyway.
-            Ok(()) => format!("peer not permitted for service {:?}", header.protocol),
+            Ok(()) => ErrorCode::PeerNotPermittedForService.reason(&format!(
+                "peer not permitted for service {:?}",
+                header.protocol
+            )),
         };
         let _ = tokio::time::timeout(
             Duration::from_secs(1),
@@ -4486,7 +4492,8 @@ async fn handle_mux_stream(
     if !reserved && exposure.is_none() {
         mux::write_denied(
             &mut send,
-            &format!("service {:?} is not exposed", header.protocol),
+            &ErrorCode::ServiceNotExposed
+                .reason(&format!("service {:?} is not exposed", header.protocol)),
         )
         .await?;
         return Ok(());
@@ -4506,7 +4513,7 @@ async fn handle_mux_stream(
     if !matches!(&service, Some((service, _)) if service.access() == Access::Grants) {
         let name = service_name_for_alpn(&state.services, alpn);
         if let Err(denied) = state.may(&connection.remote_id(), &name).await {
-            mux::write_denied(&mut send, &denied.to_string()).await?;
+            mux::write_denied(&mut send, &denied.reason()).await?;
             return Ok(());
         }
     }
@@ -8872,10 +8879,93 @@ mod tests {
         send.write_all(&resume).await?;
         let (kind, message) = read_wire_frame(&mut recv).await?;
         assert_eq!(kind, 0x05, "a refused Hello is answered with Error");
-        assert!(String::from_utf8(message).is_ok_and(|message| !message.is_empty()));
+        // Its text starts with the stable token (docs/errors.md); the words
+        // after it are a diagnostic.
+        let message = String::from_utf8(message)?;
+        assert!(
+            message.starts_with("fabric:session_expired ") && message.len() > 23,
+            "{message:?}"
+        );
         assert_nothing_follows(&mut recv, "Error").await?;
 
         client.close().await;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// Both refusals on the direct wire close with 403 and a reason that
+    /// starts with its code's token, followed by the sentence older clients
+    /// match (docs/errors.md).
+    #[tokio::test]
+    async fn direct_wire_refusals_carry_their_code_before_the_old_text() -> Result<()> {
+        const PROTOCOL: &str = "test/wire/refusals";
+        let server_dir = tempfile::tempdir()?;
+        let server_home = FabricHome::new(server_dir.path());
+        let server = FabricNode::start(server_home.clone()).await?;
+        let socket = server_dir.path().join("refusals.sock");
+        let _listener = UnixListener::bind(&socket)?;
+        server.expose(PROTOCOL, socket).await?;
+
+        async fn refusal(client: &Endpoint, server: &FabricNode) -> Result<(u64, String)> {
+            let closed = match client.connect(server.addr(), PROTOCOL.as_bytes()).await {
+                Ok(connection) => {
+                    tokio::time::timeout(Duration::from_secs(10), connection.closed())
+                        .await
+                        .context("a refused connection stayed open")?
+                }
+                Err(error) => {
+                    let error = anyhow::Error::new(error);
+                    return error
+                        .chain()
+                        .find_map(|cause| match cause.downcast_ref() {
+                            Some(iroh::endpoint::ConnectionError::ApplicationClosed(close)) => {
+                                Some((
+                                    close.error_code.into_inner(),
+                                    String::from_utf8_lossy(&close.reason).into_owned(),
+                                ))
+                            }
+                            _ => None,
+                        })
+                        .with_context(|| format!("not an application close: {error:#}"));
+                }
+            };
+            let iroh::endpoint::ConnectionError::ApplicationClosed(close) = closed else {
+                bail!("not an application close: {closed}");
+            };
+            Ok((
+                close.error_code.into_inner(),
+                String::from_utf8_lossy(&close.reason).into_owned(),
+            ))
+        }
+
+        let stranger = Endpoint::bind(iroh::endpoint::presets::N0).await?;
+        let (code, reason) = refusal(&stranger, &server).await?;
+        assert_eq!(code, 403);
+        assert_eq!(
+            reason,
+            "fabric:peer_not_in_allow_list node is not in fabric allow-list"
+        );
+
+        let ungranted = Endpoint::bind(iroh::endpoint::presets::N0).await?;
+        trust_test_peer_allowing(
+            &server_home,
+            &server,
+            ungranted.id(),
+            "ungranted",
+            ungranted.addr(),
+            &["echo"],
+        )
+        .await?;
+        let (code, reason) = refusal(&ungranted, &server).await?;
+        assert_eq!(code, 403);
+        assert!(
+            reason.starts_with("fabric:peer_not_permitted_for_service ")
+                && reason.contains("not permitted for service"),
+            "{reason:?}"
+        );
+
+        stranger.close().await;
+        ungranted.close().await;
         server.shutdown().await?;
         Ok(())
     }

@@ -28,6 +28,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use fabric_config::error::{ErrorCode, FabricError};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId,
     endpoint::{
@@ -73,16 +74,19 @@ fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
 }
 
-#[derive(Debug)]
-pub(crate) struct PeerOffline;
-impl fmt::Display for PeerOffline {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("peer is offline")
-    }
+/// The peer is absent: `unreachable` when this attempt failed to reach it,
+/// `peer_offline` when its recent absence kept fabric from trying again.
+fn peer_offline(code: ErrorCode) -> FabricError {
+    FabricError::new(code, "peer is offline")
 }
-impl std::error::Error for PeerOffline {}
+
 pub(crate) fn is_peer_offline(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<PeerOffline>().is_some()
+    error.downcast_ref::<FabricError>().is_some_and(|error| {
+        matches!(
+            error.code(),
+            ErrorCode::PeerOffline | ErrorCode::Unreachable
+        )
+    })
 }
 
 /// One admitted logical stream on the shared peer connection.
@@ -530,11 +534,11 @@ impl PeerConnections {
                     return Err(error);
                 }
                 self.presence.away(peer_addr.id);
-                return Err(error.context(PeerOffline));
+                return Err(error.context(peer_offline(ErrorCode::Unreachable)));
             }
             Err(_) => {
                 self.presence.away(peer_addr.id);
-                return Err(PeerOffline.into());
+                return Err(peer_offline(ErrorCode::Unreachable).into());
             }
         };
         self.presence.legacy_online(
@@ -728,7 +732,7 @@ impl PeerConnections {
         if self.presence.offline(peer_addr.id)
             && (activity == StreamActivity::Application || !self.presence.probe_due(peer_addr.id))
         {
-            return Err(PeerOffline.into());
+            return Err(peer_offline(ErrorCode::PeerOffline).into());
         }
         let peer_gate = self.peer_gate(peer_addr.id).await;
         let _peer_guard = peer_gate.lock().await;
@@ -760,7 +764,7 @@ impl PeerConnections {
         if self.presence.offline(peer_addr.id)
             && (activity == StreamActivity::Application || !self.presence.probe_due(peer_addr.id))
         {
-            return Err(PeerOffline.into());
+            return Err(peer_offline(ErrorCode::PeerOffline).into());
         }
         if self.mux_probe_deferred(peer_addr.id, generation).await {
             return Ok(None);
@@ -776,7 +780,7 @@ impl PeerConnections {
         let connection = match connected {
             Err(_) => {
                 self.presence.away(peer_addr.id);
-                return Err(PeerOffline.into());
+                return Err(peer_offline(ErrorCode::Unreachable).into());
             }
             Ok(Ok(connection)) => connection,
             Ok(Err(connect_error)) => {
@@ -790,7 +794,7 @@ impl PeerConnections {
                     return Err(error);
                 }
                 self.presence.away(peer_addr.id);
-                return Err(error.context(PeerOffline));
+                return Err(error.context(peer_offline(ErrorCode::Unreachable)));
             }
         };
         let remote_generation = match Self::exchange_generations(&connection, generation).await {

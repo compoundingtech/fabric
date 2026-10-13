@@ -12,6 +12,7 @@
 //! `exec`. An omitted grant denies the service.
 
 use anyhow::{Context, Result, bail};
+use fabric_config::error::{self, ErrorCode};
 use fabric_service_api::{BoxFuture, Bridge, Notice, PeerStream, Protocol, Service};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -54,7 +55,8 @@ where
 {
     serve_exec_failure(
         send,
-        "refused service \"exec\": add exec to this peer's allow array in peers.toml",
+        &ErrorCode::PeerNotPermittedForService
+            .reason("refused service \"exec\": add exec to this peer's allow array in peers.toml"),
         EXIT_EXEC_DISABLED,
     )
     .await
@@ -105,14 +107,30 @@ impl Service for Exec {
     /// The local `fabric exec` otherwise sees only the stream end, and could
     /// not tell a refusal (126) from a command that failed to start (1).
     fn notice(&self, notice: &Notice<'_>) -> Option<Vec<u8>> {
+        // Each carries its code (docs/errors.md): the one the denial or the
+        // failure already named, else the one its kind means.
+        let coded = |error: &str, otherwise: ErrorCode, what: &str| {
+            error::code_in_text(error)
+                .unwrap_or(otherwise)
+                .reason(&format!("{what}: {}", error::without_tokens(error)))
+        };
         let (message, exit_code) = match notice {
             Notice::Refused { error } => (
-                format!("refused service \"exec\": {error}"),
+                coded(
+                    error,
+                    ErrorCode::PeerNotPermittedForService,
+                    "refused service \"exec\"",
+                ),
                 EXIT_EXEC_DISABLED,
             ),
-            Notice::Unavailable { error } => {
-                (format!("failed to start service \"exec\": {error}"), 1)
-            }
+            Notice::Unavailable { error } => (
+                coded(
+                    error,
+                    ErrorCode::ServiceUnavailable,
+                    "failed to start service \"exec\"",
+                ),
+                1,
+            ),
             _ => return None,
         };
         let mut bytes = encode_frame(SERVER_ERROR, message.as_bytes())?;
@@ -159,11 +177,14 @@ where
                 stderr.flush().await?;
             }
             ServerFrame::Error(message) => {
+                // The error line every command ends with (docs/errors.md),
+                // naming the code the peer sent, or the one its old text means.
+                let code = error::code_in_text(&message).unwrap_or(ErrorCode::Internal);
+                let text = error::without_tokens(&message);
+                let line = code.reason(&format!("peer {peer:?} {text}"));
                 stderr
-                    .write_all(format!("fabric: peer {peer:?} ").as_bytes())
+                    .write_all(format!("Error: {line}\n").as_bytes())
                     .await?;
-                stderr.write_all(message.as_bytes()).await?;
-                stderr.write_all(b"\n").await?;
                 stderr.flush().await?;
             }
             ServerFrame::Exit(code) => {
@@ -306,7 +327,10 @@ where
         Err(error) => {
             write_server_frame(
                 send,
-                ServerFrame::Error(format!("failed to spawn {:?}: {error}", argv[0])),
+                ServerFrame::Error(
+                    ErrorCode::SpawnFailed
+                        .reason(&format!("failed to spawn {:?}: {error}", argv[0])),
+                ),
             )
             .await?;
             return write_server_frame(send, ServerFrame::Exit(EXIT_SPAWN_FAILED)).await;
@@ -855,7 +879,24 @@ mod notice_tests {
         assert!(matches!(
             frames(bytes).await.as_slice(),
             [ServerFrame::Error(message), ServerFrame::Exit(126)]
-                if message == "refused service \"exec\": not permitted"
+                if message
+                    == "fabric:peer_not_permitted_for_service refused service \"exec\": not permitted"
+        ));
+    }
+
+    /// A denial that already names its code keeps it, once, at the start.
+    #[tokio::test]
+    async fn a_coded_refusal_keeps_its_code_once() {
+        let bytes = Exec
+            .notice(&Notice::Refused {
+                error: "fabric:peer_not_in_allow_list node is not in fabric allow-list",
+            })
+            .unwrap();
+        assert!(matches!(
+            frames(bytes).await.as_slice(),
+            [ServerFrame::Error(message), ServerFrame::Exit(126)]
+                if message
+                    == "fabric:peer_not_in_allow_list refused service \"exec\": node is not in fabric allow-list"
         ));
     }
 
@@ -867,7 +908,7 @@ mod notice_tests {
         assert!(matches!(
             frames(bytes).await.as_slice(),
             [ServerFrame::Error(message), ServerFrame::Exit(1)]
-                if message == "failed to start service \"exec\": timed out"
+                if message == "fabric:service_unavailable failed to start service \"exec\": timed out"
         ));
     }
 

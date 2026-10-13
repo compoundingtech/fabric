@@ -219,6 +219,23 @@ impl Denied {
     }
 }
 
+impl Denied {
+    /// The stable code of this refusal (docs/errors.md).
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            Denied::NotTrusted => ErrorCode::PeerNotInAllowList,
+            Denied::NoGrants { .. } | Denied::NotPermitted { .. } => {
+                ErrorCode::PeerNotPermittedForService
+            }
+        }
+    }
+
+    /// The refusal as the wire carries it: `fabric:<code> ` and the sentence.
+    pub fn reason(&self) -> String {
+        self.code().reason(&self.to_string())
+    }
+}
+
 impl std::fmt::Display for Denied {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -2193,6 +2210,29 @@ mod tests {
             .to_string(),
             "peer not permitted for service \"web\""
         );
+    }
+
+    /// On the wire each refusal carries its code ahead of the same sentence.
+    #[test]
+    fn a_refusal_names_its_code_ahead_of_its_sentence() {
+        assert_eq!(
+            Denied::NotTrusted.reason(),
+            "fabric:peer_not_in_allow_list peer is not trusted by this node"
+        );
+        for denied in [
+            Denied::NotPermitted {
+                service: "web".into(),
+            },
+            Denied::NoGrants {
+                service: "web".into(),
+            },
+        ] {
+            assert_eq!(denied.code(), ErrorCode::PeerNotPermittedForService);
+            assert_eq!(
+                denied.reason(),
+                format!("fabric:peer_not_permitted_for_service {denied}")
+            );
+        }
     }
 
     /// Re-adding a peer to update its address must not silently widen what it
