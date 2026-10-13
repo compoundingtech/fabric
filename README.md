@@ -75,8 +75,9 @@ fabric up
 
 `--allow` lists the services this machine lets that peer use. `echo` is the
 built-in service that `fabric ping` and the reachability check in `fabric status`
-use; a peer with no `echo` grant is refused, and `fabric status` then lists it
-as offline even though it is up. Add other services (`shell`, `exec`, `sync`,
+use; a peer with no `echo` grant refuses it, and `fabric status` then lists that
+peer as `reachable` with `echo not granted` (it is up; it just cannot be
+measured), while `fabric ping` fails. Add other services (`shell`, `exec`, `sync`,
 an exposed name) only when you mean to.
 
 `fabric add` is only a convenience writer. Automated or image-based installs
@@ -270,8 +271,9 @@ fabric exec server -- echo ok     # if that peer enables exec; prints ok, exit 0
 If `ping`/`status` shows a peer unreachable, the usual causes are one-sided trust
 — confirm BOTH the new machine and that peer ran `fabric add` **and**
 `fabric reload-peers` — or a missing `echo` grant on the peer being pinged
-(`fabric ping` then fails with `not permitted for service "echo"`, and
-`fabric status` shows the peer as offline). Reachability may start on `relay` and upgrade to `direct`
+(`fabric ping` then fails with `is up but has not granted this machine echo`,
+and `fabric status` shows the peer as `reachable` with `echo not granted`).
+Reachability may start on `relay` and upgrade to `direct`
 within a few seconds as iroh hole-punches.
 
 ## Build
@@ -997,9 +999,12 @@ peer is offline regardless of its machine kind. Reachable peers include latency
 and the `direct`, `relay`, or `mixed` transport path when iroh supplies it.
 Status also prints the daemon build.
 
-The check is an echo ping, so a peer that has not granted this machine `echo` is
-refused and listed as offline even though it is up; `fabric ping` on it says
-`not permitted for service "echo"`.
+The check is an echo ping. A peer that trusts this machine but has not granted it
+`echo` refuses the ping, and is listed as `reachable` with `echo not granted`
+(`"echo_denied": true` in `--json`) rather than offline, since the refusal is the
+peer answering; it has no latency or path to show, and `fabric ping` on it says
+the peer is up but has not granted `echo` (exit 77). A peer that does not trust
+this machine at all is still listed as offline.
 
 ```sh
 fabric add <nodeid> [name] [--addr-json JSON] [--allow service,...]
@@ -1009,7 +1014,8 @@ Trust a peer NodeID and optionally assign a human name. `--addr-json` is an
 optional local/direct address hint for deterministic same-machine testing; normal
 key-only dialing relies on iroh address lookup.
 An omitted `--allow` grants no service. A peer that grants nothing cannot be
-pinged and shows as offline in `fabric status`; grant it `echo` for that.
+pinged: `fabric status` shows it as `reachable` with `echo not granted`. Grant it
+`echo` to measure it.
 
 ```sh
 fabric remove <nodeid-or-name>
@@ -1701,6 +1707,10 @@ Each `[[peers]]` entry accepts:
   use anything here; fabric keeps `allow = []` beside it. Set it with
   `fabric add --dial-only`. See
   [A host that runs code you do not trust](#a-host-that-runs-code-you-do-not-trust).
+- `inbound_only` (optional): the peer only ever connects here, such as a phone:
+  it is served under its `allow` list, and this machine never dials, probes or
+  announces to it. Set it with `fabric add --inbound-only`. See
+  [A peer that only dials in](#a-peer-that-only-dials-in).
 - `allow` (optional): the service names this peer may reach. An omitted or
   empty list permits no service.
 
