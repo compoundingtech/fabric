@@ -1025,6 +1025,7 @@ name = "fabric-service-api"
 version = "0.2.39"
 dependencies = [
  "anyhow",
+ "libc",
  "tokio",
  "tokio-util",
  "tracing",

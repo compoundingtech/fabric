@@ -284,7 +284,12 @@ where
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    let mut child = match fabric_service_api::child_spawn::spawn(&format!("exec {:?} for {peer}", argv[0]), command).await {
+    let mut child = match fabric_service_api::child_spawn::spawn(
+        &format!("exec {:?} for {peer}", argv[0]),
+        command,
+    )
+    .await
+    {
         Ok(child) => child,
         Err(error) => {
             write_server_frame(
@@ -296,8 +301,16 @@ where
         }
     };
 
-    let mut stdout = child.stdout.take().context("child stdout missing")?;
-    let mut stderr = child.stderr.take().context("child stderr missing")?;
+    // Read on threads of their own, never on a runtime worker (see child_pipes).
+    let pipe_label = format!("exec {:?} for {peer}", argv[0]);
+    let mut stdout = fabric_service_api::child_pipes::stdout_reader(
+        child.stdout.take().context("child stdout missing")?,
+        &pipe_label,
+    )?;
+    let mut stderr = fabric_service_api::child_pipes::stderr_reader(
+        child.stderr.take().context("child stderr missing")?,
+        &pipe_label,
+    )?;
     let mut out_buf = [0u8; 8192];
     let mut err_buf = [0u8; 8192];
     let mut client_buf = [0u8; 1];
