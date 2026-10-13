@@ -556,3 +556,97 @@ fabric sync add "$ST2_CATALOG/agents" --name st2-bus-default --peers "*" --polic
     assert_eq!(bus_includes, vec!["**/resources/**", "**/status"]);
     Ok(())
 }
+
+fn make_home(temp: &TempDir, name: &str) -> Result<std::path::PathBuf> {
+    let home = temp.path().join(name);
+    fs::create_dir_all(&home)?;
+    stdout(
+        Command::new(fabric_bin())
+            .arg("--home")
+            .arg(&home)
+            .args(["key", "gen", "--out"])
+            .arg(home.join("identity.toml"))
+            .output()?,
+    )?;
+    Ok(home)
+}
+
+fn node_id(home: &std::path::Path) -> Result<String> {
+    stdout(
+        Command::new(fabric_bin())
+            .arg("--home")
+            .arg(home)
+            .arg("id")
+            .output()?,
+    )
+}
+
+fn fabric(home: &std::path::Path, args: &[&str]) -> Result<std::process::Output> {
+    Ok(Command::new(fabric_bin())
+        .arg("--home")
+        .arg(home)
+        .args(args)
+        .output()?)
+}
+
+#[test]
+fn add_inbound_only_marks_the_peer_and_refuses_the_opposite_flag() -> Result<()> {
+    let temp = TempDir::new()?;
+    let home = make_home(&temp, "hub")?;
+    let phone = node_id(&make_home(&temp, "phone")?)?;
+    let ci = node_id(&make_home(&temp, "ci")?)?;
+
+    // The two flags are opposite directions: one command cannot ask for both.
+    let both = fabric(
+        &home,
+        &["add", &phone, "phone", "--inbound-only", "--dial-only"],
+    )?;
+    assert!(!both.status.success(), "both flags were accepted");
+
+    stdout(fabric(
+        &home,
+        &[
+            "add",
+            &phone,
+            "phone",
+            "--inbound-only",
+            "--allow",
+            "echo,web",
+        ],
+    )?)?;
+    let peers = stdout(fabric(&home, &["peers"])?)?;
+    assert_eq!(
+        peers,
+        format!("{phone}\tphone\tinbound-only,echo,web"),
+        "peers did not say so"
+    );
+    let file = fs::read_to_string(home.join("peers.toml"))?;
+    assert!(file.contains("inbound_only = true"), "{file}");
+
+    // A later add without the flag keeps it, and the grants it was given.
+    stdout(fabric(&home, &["add", &phone, "phone"])?)?;
+    let peers = stdout(fabric(&home, &["peers"])?)?;
+    assert!(peers.contains("inbound-only,echo,web"), "{peers}");
+
+    // The opposite flag on an existing peer is refused and changes nothing.
+    let refused = fabric(&home, &["add", &phone, "phone", "--dial-only"])?;
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("opposite direction"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    stdout(fabric(&home, &["add", &ci, "ci", "--dial-only"])?)?;
+    let refused = fabric(&home, &["add", &ci, "ci", "--inbound-only"])?;
+    assert!(!refused.status.success());
+    let peers = stdout(fabric(&home, &["peers"])?)?;
+    assert!(peers.contains(&format!("{phone}\tphone\tinbound-only,echo,web")));
+    assert!(peers.contains(&format!("{ci}\tci\tdial-only")));
+
+    // Removing the peer is the only way back.
+    stdout(fabric(&home, &["remove", "phone"])?)?;
+    stdout(fabric(&home, &["add", &phone, "phone", "--allow", "echo"])?)?;
+    let peers = stdout(fabric(&home, &["peers"])?)?;
+    assert!(peers.contains(&format!("{phone}\tphone\techo")), "{peers}");
+    Ok(())
+}

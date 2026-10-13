@@ -9,6 +9,39 @@ Consumer tools do not link to iroh, know NodeAddr formats, or open QUIC streams.
 They ask fabric for a local socket connected to a remote service, then speak their
 own protocol over that socket.
 
+## Stability
+
+From 1.0.0, each part of fabric is stable, provisional or internal.
+[docs/stability.md](docs/stability.md) lists exactly what is in each level and
+the rules every 1.x release follows.
+
+- **Stable**, unchanged in meaning until 2.0:
+  - identity and the trust model;
+  - `peers.toml` grants;
+  - `expose` and `dial`;
+  - the direct exposure wire ([docs/tunnel-wire.md](docs/tunnel-wire.md));
+  - `fabric://` Git URLs;
+  - the commands programs drive, with their `--json` output and error codes
+    ([docs/errors.md](docs/errors.md)).
+- **Provisional**, which may change in a minor release with a CHANGELOG note:
+  - file sync;
+  - `fabric-stdio`;
+  - `fabric expose --peer-header`;
+  - the conveniences around the core: `shell`, `join`, `ca`, `cert`,
+    `service`, and `restart`.
+- **Internal**, which may change in any release:
+  - the daemon-to-daemon framing (`fabric/mux/2`);
+  - the control socket;
+  - `telemetry.json`;
+  - log event names;
+  - human-readable output;
+  - the update machinery;
+  - the Rust crates as libraries.
+
+In a 1.x release, wire and grant semantics do not change; that waits for 2.0.
+New commands, flags and `--json` fields arrive in minor releases. Patch
+releases only fix bugs.
+
 ## Adopt Fabric On Two Machines
 
 Install the same fabric release on both macOS or Linux machines:
@@ -36,9 +69,15 @@ remote shell and exec remain separate, default-deny target-side capabilities.
 Exchange those NodeIDs over a trusted channel. Trust machine B on machine A:
 
 ```sh
-fabric add <machine-b-node-id> machine-b
+fabric add <machine-b-node-id> machine-b --allow echo
 fabric up
 ```
+
+`--allow` lists the services this machine lets that peer use. `echo` is the
+built-in service that `fabric ping` and the reachability check in `fabric status`
+use; a peer with no `echo` grant is refused, and `fabric status` then lists it
+as offline even though it is up. Add other services (`shell`, `exec`, `sync`,
+an exposed name) only when you mean to.
 
 `fabric add` is only a convenience writer. Automated or image-based installs
 can deploy the complete authorized-keys file instead; see
@@ -47,12 +86,13 @@ can deploy the complete authorized-keys file instead; see
 Trust machine A on machine B:
 
 ```sh
-fabric add <machine-a-node-id> machine-a
+fabric add <machine-a-node-id> machine-a --allow echo
 fabric up
 ```
 
 Trust is deliberately mutual: each daemon accepts connections only from NodeIDs
-in its own allow-list. Verify the connection from either machine:
+in its own allow-list, and each side grants the other what it may use. Verify
+the connection from either machine:
 
 ```sh
 fabric status
@@ -60,7 +100,8 @@ fabric ping machine-b
 ```
 
 Run `fabric ping machine-a` on machine B. A successful check prints `pong`, the
-round-trip latency, and the active transport path when iroh reports it. The two
+round-trip latency, and the active transport path when iroh reports it. `fabric
+ping machine-b` works only because machine B granted machine A `echo`. The two
 daemons are now connected and ready for `fabric expose`, `fabric dial`, or the
 explicitly enabled remote shell.
 
@@ -148,9 +189,12 @@ What each side grants is separate, because ssh access is one-directional:
 
 - `--allow shell,exec` (the default) is what the far machine lets **this**
   machine use, which is what an ssh login already amounts to. Add `sync` or an
-  exposed name deliberately.
+  exposed name deliberately. The default does not include `echo`, so `fabric
+  ping` and `fabric status` cannot reach that machine until you add it:
+  `--allow shell,exec,echo`.
 - `--grant` is what this machine lets the **far** machine use; the default is
-  nothing, because being able to ssh somewhere never let it reach you.
+  nothing, because being able to ssh somewhere never let it reach you. The far
+  machine's own `fabric ping` and `fabric status` need `--grant echo`.
 
 A join is safe to repeat: without `--allow` or `--grant`, a peer either side
 already knows keeps the grants it has. `--name` sets the name the far side
@@ -186,8 +230,8 @@ Get each existing peer's NodeID by running `fabric id` on it (or ask whoever run
 it). Then, on the new machine:
 
 ```sh
-fabric add <DESKTOP_NODEID> desktop
-fabric add <SERVER_NODEID>  server
+fabric add <DESKTOP_NODEID> desktop --allow echo
+fabric add <SERVER_NODEID>  server  --allow echo
 fabric reload-peers
 ```
 
@@ -197,7 +241,7 @@ Using the new machine's NodeID from step 1, run this **on the desktop and on eve
 other existing peer**:
 
 ```sh
-fabric add <NEW_NODEID> laptop
+fabric add <NEW_NODEID> laptop --allow echo
 fabric reload-peers
 ```
 
@@ -206,7 +250,7 @@ new machine to it **without SSH**, from any machine that already has exec access
 to it:
 
 ```sh
-fabric exec server -- ~/.local/bin/fabric add <NEW_NODEID> laptop
+fabric exec server -- ~/.local/bin/fabric add <NEW_NODEID> laptop --allow echo
 fabric exec server -- ~/.local/bin/fabric reload-peers
 ```
 
@@ -221,9 +265,11 @@ fabric ping server                # prints pong + latency + transport (direct/re
 fabric exec server -- echo ok     # if that peer enables exec; prints ok, exit 0
 ```
 
-If `ping`/`status` shows a peer unreachable, the usual cause is one-sided trust —
-confirm BOTH the new machine and that peer ran `fabric add` **and**
-`fabric reload-peers`. Reachability may start on `relay` and upgrade to `direct`
+If `ping`/`status` shows a peer unreachable, the usual causes are one-sided trust
+— confirm BOTH the new machine and that peer ran `fabric add` **and**
+`fabric reload-peers` — or a missing `echo` grant on the peer being pinged
+(`fabric ping` then fails with `not permitted for service "echo"`, and
+`fabric status` shows the peer as offline). Reachability may start on `relay` and upgrade to `direct`
 within a few seconds as iroh hole-punches.
 
 ## Build
@@ -374,8 +420,7 @@ starts a per-user LaunchAgent. The service runs the foreground daemon directly a
 `fabric --home <home> daemon`; it does not run `fabric up`. No memory ceiling
 is set unless you pass `--memory-max-mb`. Fabric declares none by default,
 because a healthy working set has not been measured, and a ceiling nobody chose
-kills the daemon at a number nobody chose. (This README used to say the default
-was 1 GiB. It was not.)
+kills the daemon at a number nobody chose.
 
 On macOS, every command that `fabric exec` runs counts as the daemon's for
 privacy permissions (Desktop, Documents, Downloads, Photos, local network).
@@ -428,6 +473,29 @@ The other direction is the CI host's own `peers.toml`: list each machine that
 drives it with the services it should accept, and nothing else. A machine that
 never needs to dial the CI host should not list it at all, which is stricter
 still: the host is then refused at the handshake like any stranger.
+
+### A peer that only dials in
+
+A phone or a laptop behind a firewall connects to you and is never somewhere
+you can connect to. Without help, fabric probes such a peer every few seconds
+and reports it offline whenever it is not connected:
+
+```sh
+fabric add <phone-nodeid> phone --inbound-only --allow echo,web
+```
+
+`inbound-only` means the peer is served under its `--allow` list when it
+connects, exactly like any other peer, and this machine never dials, probes or
+announces to it. The liveness loop, the network-change checks, the start-up
+announcement and `fabric status` all leave it alone; `status` and `doctor`
+show it as `inbound-only` and connected or not connected, never as offline.
+`fabric ping`, `exec`, `shell`, `dial` and sync for that peer are refused with
+a message that says why, and a sync entry for `peers = "*"` skips it. Its
+build is not checked, because that needs an exec to the peer.
+
+It is the opposite direction from `--dial-only`, and the two cannot be combined
+(`fabric add` refuses the second flag). A later `fabric add` or `fabric join`
+keeps the flag; to undo it, run `fabric remove phone` and add the peer again.
 
 ### Enabling remote shell and exec
 
@@ -522,15 +590,14 @@ Download a release asset directly, verify it against that asset's published
 renames. A release archive contains exactly two members named literal `fabric`
 and `fabric-sync` (not dot-prefixed paths). Verify that shape before extracting:
 
-The process-extraction plan defines one fabric-only transition release before
-the first paired deployment. That gated reader release is the only exception.
-The updater accepts that one-member shape and the paired shape. It rejects all
-other member sets. A one-member install removes an installed companion and
-keeps both prior binaries for rollback.
+The updater accepts two archive shapes and rejects every other member set: the
+pair, `fabric` and `fabric-sync`, and a single `fabric` member. A one-member
+install removes an installed companion and keeps both prior binaries for
+rollback.
 
-Current releases publish the pair at `fabric-<target>.tar.gz`. Release `0.2.4`
-also publishes `fabric-only-<target>.tar.gz` for a strict one-member reader.
-That compatibility asset requires `fabric update --url ... --sha256 ...`.
+Releases publish the pair at `fabric-<target>.tar.gz`. Release `0.2.4` also
+published `fabric-only-<target>.tar.gz` for a strict one-member reader, which an
+installed build could take only through `fabric update --url ... --sha256 ...`.
 
 `fabric update` arms a detached verifier before it replaces either binary. On
 macOS, launchd owns a transient one-shot job across terminal loss and system
@@ -545,7 +612,7 @@ bytes equal the installed pair installs nothing and restarts nothing.
 ```sh
 set -eu
 
-tag='v0.2.0+a0478a6'
+tag='v0.2.40'   # the release to install
 case "$(uname -s):$(uname -m)" in
   Darwin:arm64) target='aarch64-apple-darwin' ;;
   Linux:x86_64) target='x86_64-unknown-linux-gnu' ;;
@@ -579,8 +646,10 @@ if [ "$members" != "$(printf 'fabric\nfabric-sync')" ]; then
   exit 1
 fi
 tar -xzf "$download_dir/$asset" -C "$download_dir"
-test "$("$download_dir/fabric" --version)" = "${tag#v}"
-test "$("$download_dir/fabric-sync" --version)" = "${tag#v}"
+# A binary reports `<version>+<short commit>`; older tags carried the commit too.
+version_ok() { case "$1" in "${tag#v}"|"${tag#v}"+*) return 0 ;; *) return 1 ;; esac; }
+version_ok "$("$download_dir/fabric" --version)"
+version_ok "$("$download_dir/fabric-sync" --version)"
 
 # Confirm this is the exact path in launchd/systemd ExecStart before replacing it.
 fabric_path="${FABRIC_BIN_PATH:-$(command -v fabric)}"
@@ -864,7 +933,15 @@ Print this node's stable NodeID, generating and persisting it on first use.
 fabric peers
 ```
 
-Read and list the entries in the authoritative `peers.toml`.
+Read and list the entries in the authoritative `peers.toml`, one per line:
+NodeID, name, and the services granted (`no services`, or `dial-only` for a peer
+marked that way). With `--json`, one object, `{"peers": [...]}`.
+
+Every command accepts `--json`. Where it has a result to print, it prints one
+JSON object on stdout and nothing else; on a failure it prints one error object
+and exits with the code's status. [docs/json-output.md](docs/json-output.md)
+lists the commands and their exact shapes, and [docs/errors.md](docs/errors.md)
+the error codes. A command not listed there prints what it always did.
 
 ```sh
 fabric git install-helper
@@ -917,8 +994,13 @@ fabric status
 ```
 
 Show the running daemon's local state and check every trusted peer. An absent
-peer is offline regardless of its machine kind. Reachable peers include latency and the `direct`, `relay`, or `mixed`
-transport path when iroh supplies it. Status also prints the daemon build.
+peer is offline regardless of its machine kind. Reachable peers include latency
+and the `direct`, `relay`, or `mixed` transport path when iroh supplies it.
+Status also prints the daemon build.
+
+The check is an echo ping, so a peer that has not granted this machine `echo` is
+refused and listed as offline even though it is up; `fabric ping` on it says
+`not permitted for service "echo"`.
 
 ```sh
 fabric add <nodeid> [name] [--addr-json JSON] [--allow service,...]
@@ -927,7 +1009,8 @@ fabric add <nodeid> [name] [--addr-json JSON] [--allow service,...]
 Trust a peer NodeID and optionally assign a human name. `--addr-json` is an
 optional local/direct address hint for deterministic same-machine testing; normal
 key-only dialing relies on iroh address lookup.
-An omitted `--allow` grants no service.
+An omitted `--allow` grants no service. A peer that grants nothing cannot be
+pinged and shows as offline in `fabric status`; grant it `echo` for that.
 
 ```sh
 fabric remove <nodeid-or-name>
@@ -996,9 +1079,9 @@ default to at most 32 active children per exposure; use `--max-children` to set
 a different per-exposure cap.
 
 Exposes are persisted by default to `<home>/config.toml` and are restored when
-the daemon starts. That same file also stores shell policy; `fabric add` writes
-the separate authoritative `peers.toml`. Use `--ephemeral` for short-lived test
-exposes that should not survive a daemon restart.
+the daemon starts. `fabric add` writes the separate authoritative `peers.toml`,
+which holds every peer's grants. Use `--ephemeral` for short-lived test exposes
+that should not survive a daemon restart.
 
 Only permitted remote NodeIDs are accepted before the local socket is opened or
 the local TCP connection or exec command starts. If no trusted peer can reach a
@@ -1037,6 +1120,69 @@ when `reset` is true, replace the consumer's cached presence with the snapshot.
 `cause` describes observed `connected`, `connection_closed` or `unreachable`
 facts; it does not guess why a remote machine returned. `path` is the observed
 `direct`, `relay`, or `mixed` path when available. `fabric addr` is unchanged.
+
+```sh
+fabric exec <peer> -- <cmd> [args...]
+```
+
+Run a command on a trusted peer without a terminal: its stdout and stderr come
+back on this side's stdout and stderr, and `fabric exec` exits with the remote
+command's exit status. The peer must grant this machine `exec`; a refusal exits
+126 with a message that names the peer and the service. See
+[Enabling remote shell and exec](#enabling-remote-shell-and-exec).
+
+```sh
+fabric probe <peer> <protocol> [--timeout SECONDS]
+```
+
+Ask, with one connect and no state, whether a peer serves one protocol right
+now. The exit status is the answer: 0 supported, 1 unsupported, 2 unreachable, 3
+timed out. A local failure (no daemon, an unknown peer) is not one of those
+answers: it exits 64 with an error, so a broken question is never read as "the
+peer does not serve it". With `--json` it prints
+`{"peer", "peer_id", "protocol", "outcome", "round_trip_micros", "transport",
+"error", "code", "class"}`.
+
+```sh
+fabric send-file <peer> <path> [--as <name>]
+```
+
+Send one file to a peer. It lands in `<home>/inbox/<your NodeID>/<name>` on the
+receiving machine, and the sender cannot choose a different place: `--as` takes a
+relative name only. One shot, one direction, nothing is ever deleted, files up to
+2 GiB. The peer must grant this machine `send-file`.
+
+```sh
+fabric doctor
+```
+
+Say what is wrong with this machine, in words a stranger can act on. Each check
+reads `ok`, `info`, `setup`, `problem` or `unknown`; an `unknown` means a check
+could not answer, and counts as needing attention. The exit status is the answer:
+0 nothing needs attention, 1 a problem or a setup step, 2 a usage error, 3
+unknown. It changes nothing. A peer that refuses `exec` by policy shows its build
+as `info`, not `unknown`, and does not change the exit status.
+
+```sh
+fabric update [--check | --dry-run | --rollback] [--tag TAG | --url URL --sha256 HASH]
+```
+
+Replace this machine's fabric with a verified build and restart it. It refuses a
+build that is not newer unless `--allow-downgrade` is given, and for `--url` it
+runs the downloaded binary to find out; `--expect-version` makes it require one
+exact version. `--check` changes nothing and exits 0 up to date, 1 update
+available, 2 error. See [Upgrading Fabric Safely](#upgrading-fabric-safely).
+
+```sh
+fabric ca init | install | uninstall | status
+fabric cert <name>
+```
+
+A local certificate authority for names ending in `.fabric` and for `localhost`,
+for a listener a browser or phone has to trust over https. `ca init` creates the
+authority and trusts nothing; `ca install` makes this machine trust what it signs
+(it asks first, `--yes` skips the prompt) and `ca uninstall` reverses that.
+`cert <name>` writes a certificate and key for one name.
 
 ### Expose And Dial A Service
 
@@ -1078,7 +1224,8 @@ Connectivity and trust test. `fabric ping` dials the peer's built-in
 ACL-gated echo protocol, sends a random nonce, verifies the same bytes come
 back, and prints the round-trip latency. When available, it also reports whether
 iroh used a direct, relay, or mixed path. Use this first when bringing up a new
-machine.
+machine. The peer must have granted this machine `echo` in its `allow` list;
+without it the ping fails with `not permitted for service "echo"` (exit 77).
 
 ```sh
 fabric shell <peer>
@@ -1855,8 +2002,8 @@ client machine                                      server machine
 ```
 
 The daemon owns one persisted iroh endpoint per fabric home. `<home>/config.toml`
-stores shell policy and persisted exposes; `peers.toml` stores the peer
-allow-list. `fabric expose` registers an ALPN and a local Unix socket, TCP, or
+stores persisted exposes and dials; `peers.toml` stores the peer allow-list and
+each peer's grants. `fabric expose` registers an ALPN and a local Unix socket, TCP, or
 exec target in the running daemon and, by default, writes it to `config.toml`.
 On startup, the daemon restores those exposes before binding its accepted ALPN
 list. Incoming iroh connections pass through an

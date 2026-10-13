@@ -4,10 +4,18 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+From 1.0.0, [docs/stability.md](docs/stability.md) governs what a release may
+change. Patch releases only fix bugs. A minor release may add commands, flags,
+`--json` fields and error codes, and may change a provisional part. Wire and
+grant semantics, and anything else stable, change only in 2.0. Each entry goes
+under [Unreleased] in Added, Changed, Deprecated, Removed, Fixed or Security.
+An entry that changes a provisional part starts with **Provisional:**. In a
+1.x release, a change to something stable appears only under Added,
+Deprecated, Fixed or Security.
+
 ## [Unreleased]
 
 ### Added
-
 - `fabric-stdio`, a small crate for writing an exec service: `bridge` and
   `serve_stdio` move bytes between a process's stdin/stdout and a socket with
   explicit read, write and flush loops, carry end-of-file both ways (the socket's
@@ -21,7 +29,7 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   one in this machine's peers.toml, never anything the peer says; authorization
   stays with the peer's grant; the option is persisted in config.toml
   (`peer_header = true`) and off by default, so existing socket exposures do not
-  change.
+  change. Provisional: the line's format may change in a minor release.
 - Stable error codes, specified in `docs/errors.md`: a snake_case code for
   each failure, a class that says what to do about it (`refusal`, `fault` or
   `usage`), the exit status for each class, the `--json` error object and the
@@ -38,9 +46,20 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   `daemon_not_running`, `unknown_peer`, and `invalid_argument` for a bad node
   id, an ambiguous peer name and `expose` arguments. `probe` keeps its exit
   statuses; its `--json` answer gains a `code` field.
+- `docs/stability.md`: what is stable, provisional and internal from 1.0.0 on,
+  the rules for patch, minor and major releases, deprecation, and how the
+  CHANGELOG records each kind of change. The README summarizes it.
+  `inbound_only` is part of the stable trust model and `--peer-header` is
+  provisional.
+
+- `--json` success output for the commands other programs parse: `id`,
+  `peers`, `status`, `dial` (`{"socket"}`, or `{"address"}` with `--tcp`),
+  `expose`, `unexpose`, `send-file` and `reload-peers`, each one object on
+  stdout and nothing else; `addr` was JSON already and is unchanged. The shapes
+  are in `docs/json-output.md` and pinned by golden files in
+  `tests/golden/json/`, so changing one fails a test.
 
 ### Changed
-
 - README, peer config: the declarative section said that reloading does not close
   active tunnels or shells, which contradicts the Commands section and the code
   (a reload ends the sessions the new file no longer allows); it now says what
@@ -48,24 +67,33 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   no longer split from the list. The provisioning example grants `echo`, which
   `fabric ping` needs. The troubleshooting entry for a daemon and CLI that
   disagree about the home drops its consumer-specific asides.
-
+- README, Commands: `probe`, `send-file`, `doctor`, `update`, `exec`, `ca` and
+  `cert` were not documented; they are now, with the exit statuses and the inbox
+  path checked against the binary. `fabric ping` and `fabric status` say they need
+  an `echo` grant, `--json` is described once for every command, and the claim
+  that `config.toml` stores shell policy (false since format 2, where each
+  peer's `allow` list holds it) is gone.
+- README, install and join steps: the quick start now grants `echo` on both
+  sides, because `fabric ping` and the reachability check in `fabric status` use
+  it and a peer without that grant is refused and listed as offline; the join
+  steps say the same about `--allow shell,exec` (which omits `echo`). The manual
+  upgrade script compared `fabric --version` with the bare tag, which aborts for
+  every release since tags dropped the commit suffix (`0.2.40+a2ca935` is not
+  `0.2.40`); it now accepts the version with its suffix and was run against the
+  published 0.2.40 archive. A stale paragraph about a planned transition release
+  is replaced by what the updater accepts.
 - A failure's stderr line is now one line, `Error: fabric:<code> <text>`,
   where it used to list each cause on its own `Caused by:` line.
 
-### Fixed
-
-- `fabric exec` no longer loses a refusal to a broken pipe. A peer that refuses
-  exec answers and closes the stream without reading the command, so the
-  client's write of the command could fail with `Broken pipe` while the refusal
-  was already waiting to be read. The client reported that write error, exited 1
-  and, under `fabric doctor`, turned a peer that refuses exec by design into an
-  `unknown` build finding that fails the run. The client now reads the answer
-  first and keeps the write error only when nothing answers. An end-to-end test
-  runs `fabric doctor` against a peer that does not grant exec and requires an
-  informational `versions` line; it failed about one run in twenty-five before.
-
-### Changed
-
+- `fabric add --inbound-only` (`inbound_only = true` in `peers.toml`) for a peer
+  that only ever connects here, such as a phone. It is served under its grants
+  when it connects. This machine never dials, probes or announces to it: the
+  liveness loop, the start-up announcement, the network-change checks and
+  `fabric status` leave it alone, so it is never reported offline, and `fabric
+  ping`, `exec`, `shell`, `dial` and sync for it are refused with a message that
+  says why. `fabric status` and `fabric doctor` show it as `inbound-only`,
+  connected or not connected, and doctor does not ask for its build. The flag
+  is the opposite direction from `--dial-only` and cannot be combined with it.
 - `fabric update --url` no longer installs whatever matches the hash. The
   updater runs the staged binary and compares its version with the installed
   one before anything installed changes, as the release-tag path already did:
@@ -78,7 +106,47 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   installs an older one now needs `--allow-downgrade`.
 
 ### Fixed
+- `fabric exec` no longer loses a refusal to a broken pipe. A peer that refuses
+  exec answers and closes the stream without reading the command, so the
+  client's write of the command could fail with `Broken pipe` while the refusal
+  was already waiting to be read. The client reported that write error, exited 1
+  and, under `fabric doctor`, turned a peer that refuses exec by design into an
+  `unknown` build finding that fails the run. The client now reads the answer
+  first and keeps the write error only when nothing answers. An end-to-end test
+  runs `fabric doctor` against a peer that does not grant exec and requires an
+  informational `versions` line; it failed about one run in twenty-five before.
 
+- A tunnel session that finished on both sides no longer logs a reconnect or
+  rewrites telemetry. A short session (one request per connection through a
+  dial listener) often loses a race: the far side finishes its stream, and the
+  client's attach reads the end of it before its own writer has noticed the
+  session is complete. The retry loop took that for a lost transport, recorded
+  a reconnect attempt, logged `generic dial lost its transport; reconnecting`
+  and rewrote `telemetry.json`, for a session with nothing left to resume. On a
+  live pair that was about thirty warnings a minute and roughly doubled the
+  validation log. A session with both sides finished and everything
+  acknowledged is now over however its last attach ended. A transport that ends
+  under a live session retries as before. A two-process test carries 2,400
+  short sessions and requires zero reconnect attempts; it failed on every run
+  before (13, 35 and 31 attempts in three).
+- `fabric exec` no longer loses a refusal to a broken pipe. A peer that refuses
+  exec answers and closes the stream without reading the command, so the
+  client's write of the command could fail with `Broken pipe` while the refusal
+  was already waiting to be read. The client reported that write error, exited 1
+  and, under `fabric doctor`, turned a peer that refuses exec by design into an
+  `unknown` build finding that fails the run. The client now reads the answer
+  first and keeps the write error only when nothing answers. An end-to-end test
+  runs `fabric doctor` against a peer that does not grant exec and requires an
+  informational `versions` line; it failed about one run in twenty-five before.
+- `fabric exec` no longer loses a refusal to a broken pipe. A peer that refuses
+  exec answers and closes the stream without reading the command, so the
+  client's write of the command could fail with `Broken pipe` while the refusal
+  was already waiting to be read. The client reported that write error, exited 1
+  and, under `fabric doctor`, turned a peer that refuses exec by design into an
+  `unknown` build finding that fails the run. The client now reads the answer
+  first and keeps the write error only when nothing answers. An end-to-end test
+  runs `fabric doctor` against a peer that does not grant exec and requires an
+  informational `versions` line; it failed about one run in twenty-five before.
 - A stopping daemon ends every session and waits (up to two seconds) for the
   exec children bound to them. A child left running holds the pipes its daemon
   read; a daemon thread parked reading a pipe that a sleeping child holds locked
@@ -86,7 +154,6 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   watchdog already killed children before leaving; an ordinary stop did not.
 
 ### Tests
-
 - A daemon-level regression test for the 0.2.40 freeze: a real exposure whose
   command answers with one line and then copies an idle socket into a dup of its
   stdout (a `splice(2)` on Linux), twelve idle sessions held open on a
