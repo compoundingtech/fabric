@@ -1571,6 +1571,11 @@ impl DaemonState {
                 })
                 .cloned();
             let found = found.with_context(|| format!("peer {peer:?} is not trusted"))?;
+            if found.inbound_only {
+                bail!(
+                    "{peer} is inbound-only: it only connects to this machine, which never dials it"
+                );
+            }
             found
                 .addr
                 .clone()
@@ -1931,6 +1936,17 @@ impl DaemonState {
         })
     }
 
+    /// The peers this machine may dial, probe and announce to. An inbound-only
+    /// peer only connects here, so every background loop leaves it alone.
+    async fn dialable_peers(&self) -> Vec<Peer> {
+        self.peer_book
+            .read()
+            .await
+            .dialable_peers()
+            .cloned()
+            .collect()
+    }
+
     pub async fn peer_reachability(&self) -> Vec<PeerReachability> {
         let peers = self.peer_book.read().await.peers().to_vec();
         let mut statuses = Vec::with_capacity(peers.len());
@@ -2019,6 +2035,21 @@ impl DaemonState {
     }
 
     async fn check_peer_reachability(&self, peer: &Peer) -> PeerReachability {
+        if peer.inbound_only {
+            // It only connects here, so there is nothing to probe: it is
+            // reachable exactly when it is connected, and never offline.
+            return PeerReachability {
+                id: peer.id.to_string(),
+                name: peer.name.clone(),
+                roaming: peer.roaming,
+                inbound_only: true,
+                reachable: self.peer_connections.connection(peer.id).await.is_some(),
+                bytes: None,
+                round_trip_micros: None,
+                transport: None,
+                error: None,
+            };
+        }
         let roaming = peer.roaming;
         let addr = peer
             .addr
@@ -2051,6 +2082,7 @@ impl DaemonState {
                 id: peer.id.to_string(),
                 name: peer.name.clone(),
                 roaming,
+                inbound_only: false,
                 reachable: true,
                 bytes: Some(pong.bytes),
                 round_trip_micros: Some(pong.round_trip.as_micros().try_into().unwrap_or(u64::MAX)),
@@ -2061,6 +2093,7 @@ impl DaemonState {
                 id: peer.id.to_string(),
                 name: peer.name.clone(),
                 roaming,
+                inbound_only: false,
                 reachable: false,
                 bytes: None,
                 round_trip_micros: None,
@@ -2071,6 +2104,7 @@ impl DaemonState {
                 id: peer.id.to_string(),
                 name: peer.name.clone(),
                 roaming,
+                inbound_only: false,
                 reachable: false,
                 bytes: None,
                 round_trip_micros: None,
@@ -2084,7 +2118,7 @@ impl DaemonState {
     }
 
     async fn announce_to_peers(&self) {
-        let peers = self.peer_book.read().await.peers().to_vec();
+        let peers = self.dialable_peers().await;
         let mut attempts = tokio::task::JoinSet::new();
         for peer in peers {
             let endpoint = self.endpoint_handle();
@@ -2224,7 +2258,7 @@ impl DaemonState {
     /// reset closes only a connection that existed before that probe started,
     /// never one a concurrent redial just opened.
     async fn check_held_peer_connections(&self, context: &str) -> HeldConnectionCheck {
-        let peers = self.peer_book.read().await.peers().to_vec();
+        let peers = self.dialable_peers().await;
         let mut check = HeldConnectionCheck::default();
         for peer in peers {
             let Some(held) = self.peer_connections.connection(peer.id).await else {
@@ -2389,7 +2423,7 @@ impl DaemonState {
         endpoint: CurrentEndpoint,
         context: &str,
     ) -> bool {
-        let peers = self.peer_book.read().await.peers().to_vec();
+        let peers = self.dialable_peers().await;
         for peer in peers {
             let addr = peer
                 .addr
@@ -3255,7 +3289,7 @@ async fn run_peer_health_loop_with(
                 if !state.network_usable.load(Ordering::SeqCst) {
                     continue;
                 }
-                let peers = state.peer_book.read().await.peers().to_vec();
+                let peers = state.dialable_peers().await;
                 // Probe the whole round before recovery, so every status sample
                 // describes the same interval.
                 let mut round = Vec::with_capacity(peers.len());
@@ -4758,7 +4792,8 @@ async fn resolve_sync_peers(state: &DaemonState, peers: &SyncPeers) -> ResolvedP
     let mut resolved = ResolvedPeers::default();
     match peers {
         SyncPeers::Wildcard(selector) => {
-            for peer in book.peers() {
+            // An inbound-only peer never gets dialled, so it cannot be synced.
+            for peer in book.dialable_peers() {
                 resolved.peers.push(peer_ref(peer));
             }
             // "Every trusted peer" on a machine that trusts nobody is
@@ -4809,6 +4844,12 @@ async fn open_outbound_sync_stream(state: &DaemonState, peer: &PeerRef) -> Resul
             .iter()
             .find(|configured| configured.id == peer_id)
             .with_context(|| format!("sync peer {} is no longer trusted", peer.id))?;
+        if configured.inbound_only {
+            bail!(
+                "sync peer {} is inbound-only: it only connects to this machine, which never dials it",
+                peer.id
+            );
+        }
         configured
             .addr
             .clone()
@@ -9389,6 +9430,94 @@ mod tests {
             "a dial-only host held {} of this daemon's stream slots",
             MAX_INCOMING_HANDLERS - dial_only
         );
+        Ok(())
+    }
+
+    /// A phone only ever dials in. Everything this machine does on its own
+    /// (announcing, probing, the liveness loop, the network-change checks, a
+    /// status report) must leave it alone, and a person asking to reach it is
+    /// told why that cannot happen. Its own connection is still served.
+    #[tokio::test]
+    async fn an_inbound_only_peer_is_never_dialled_and_is_still_served() -> Result<()> {
+        let hub_dir = tempfile::tempdir()?;
+        let phone_dir = tempfile::tempdir()?;
+        let hub_home = FabricHome::new(hub_dir.path());
+        let phone_home = FabricHome::new(phone_dir.path());
+        let hub = FabricNode::start(hub_home.clone()).await?;
+        let phone = FabricNode::start(phone_home.clone()).await?;
+        trust_test_peer(&phone_home, &phone, hub.id(), "hub", hub.addr()).await?;
+        let mut peers = PeerBook::load(&hub_home)?;
+        peers.add_inbound_only(
+            phone.id(),
+            Some("phone".into()),
+            Some(phone.addr()),
+            Some(vec!["echo".into()]),
+        );
+        peers.save(&hub_home)?;
+        hub.state().reload_peers().await?;
+
+        // Everything the hub does without being asked.
+        let state = hub.state().clone();
+        let health = tokio::spawn(run_peer_health_loop_with(
+            state.clone(),
+            Duration::from_millis(50),
+            1,
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        ));
+        state.announce_to_peers().await;
+        state.check_held_peer_connections("test").await;
+        let endpoint = state.endpoint_handle();
+        assert!(!state.any_peer_reachable_on_endpoint(endpoint, "test").await);
+        let statuses = state.peer_reachability().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        health.abort();
+
+        assert_eq!(statuses.len(), 1);
+        assert!(statuses[0].inbound_only);
+        assert!(!statuses[0].reachable, "{:?}", statuses[0]);
+        assert!(statuses[0].error.is_none(), "{:?}", statuses[0]);
+        assert_eq!(
+            state.peer_connections.connect_attempts(),
+            0,
+            "the hub dialled an inbound-only peer"
+        );
+
+        // A person who asks to reach it is told why that cannot work, and
+        // that does not dial it either.
+        for result in [
+            state.ping("phone").await.map(|_| ()),
+            state.dial("phone", "echo").await.map(|_| ()),
+            state
+                .open_stream("phone", BUILTIN_ECHO_ALPN)
+                .await
+                .map(|_| ()),
+        ] {
+            let error = result.err().context("an inbound-only peer was dialled")?;
+            assert!(
+                format!("{error:#}").contains("inbound-only"),
+                "the refusal did not say why: {error:#}"
+            );
+        }
+        assert_eq!(state.peer_connections.connect_attempts(), 0);
+
+        // The phone dials in and is served under its grants.
+        let outcome = tokio::time::timeout(Duration::from_secs(20), phone.ping("hub")).await??;
+        assert_eq!(outcome.bytes, 32);
+        let statuses = state.peer_reachability().await;
+        assert!(
+            statuses[0].reachable,
+            "connected, but not reported: {:?}",
+            statuses[0]
+        );
+        assert_eq!(
+            state.peer_connections.connect_attempts(),
+            0,
+            "serving the phone made the hub dial it"
+        );
+
+        phone.shutdown().await?;
+        hub.shutdown().await?;
         Ok(())
     }
 

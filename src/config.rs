@@ -147,6 +147,15 @@ pub struct Peer {
     /// grants it nothing either.
     #[serde(default, skip_serializing_if = "is_false")]
     pub dial_only: bool,
+    /// The peer only ever connects to this machine, such as a phone: it is
+    /// served under its grants when it connects, and this machine never dials,
+    /// probes or announces to it.
+    ///
+    /// The opposite direction from `dial_only`, and the two cannot be combined.
+    /// Without this flag a peer that cannot be dialled is probed every few
+    /// seconds and reported offline for as long as it is not connected.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub inbound_only: bool,
     /// Which services this peer may reach, by the NAME a person types:
     /// `shell`, `exec`, `sync`, `echo`, or any exposed protocol such as `web`.
     ///
@@ -480,6 +489,11 @@ impl PeerBook {
 #        as a CI runner. Whatever allow says, it grants such a peer nothing,
 #        and fabric keeps allow = [] beside it. Set it with `fabric add --dial-only`;
 #        undo it by removing the peer.
+# inbound_only  the peer only ever connects to this machine, such as a phone.
+#        It is served under its allow list when it connects, and this machine
+#        never dials, probes or announces to it, so it is not reported offline.
+#        The opposite of dial_only; the two cannot be combined. Set it with
+#        `fabric add --inbound-only`; undo it by removing the peer.
 # allow  which services this peer may reach, by the name a person types:
 #        shell, exec, sync, echo, or any protocol you expose such as web.
 #        Git grants are git/<remote>/read and git/<remote>/write.
@@ -770,6 +784,61 @@ impl PeerBook {
         }
     }
 
+    /// Trust `id` as a peer that only connects here. Its grants are kept as
+    /// given: it is served under them when it connects.
+    pub fn add_inbound_only(
+        &mut self,
+        id: EndpointId,
+        name: Option<String>,
+        addr: Option<EndpointAddr>,
+        allow: Option<Vec<String>>,
+    ) {
+        self.add_with_allow(id, name, addr, allow);
+        if let Some(peer) = self.peers.iter_mut().find(|peer| peer.id == id) {
+            peer.inbound_only = true;
+        }
+    }
+
+    /// Is `id` a peer that only connects here, and that this machine never dials?
+    pub fn is_inbound_only(&self, id: &EndpointId) -> bool {
+        self.peers
+            .iter()
+            .any(|peer| peer.id == *id && peer.inbound_only)
+    }
+
+    /// The peers this machine may dial, probe and announce to: every peer but
+    /// an inbound-only one.
+    pub fn dialable_peers(&self) -> impl Iterator<Item = &Peer> {
+        self.peers.iter().filter(|peer| !peer.inbound_only)
+    }
+
+    /// Refuse to mix the two directions. `peer` is a name or a NodeID; an
+    /// unknown one is fine, since it will be added with the flag asked for.
+    /// `inbound_only` says which flag is being set now.
+    pub fn refuse_opposite_direction(&self, peer: &str, inbound_only: bool) -> Result<()> {
+        let id = EndpointId::from_str(peer).ok();
+        let Some(existing) = self
+            .peers
+            .iter()
+            .find(|entry| id == Some(entry.id) || entry.name.as_deref() == Some(peer))
+        else {
+            return Ok(());
+        };
+        if inbound_only && existing.dial_only {
+            bail!(
+                "{peer} is dial-only, and inbound-only is the opposite direction. \
+                 Run `fabric remove {peer}` first to change it"
+            );
+        }
+        if !inbound_only && existing.inbound_only {
+            bail!(
+                "{peer} is inbound-only, and dial-only is the opposite direction. \
+                 Run `fabric remove {peer}` first to change it"
+            );
+        }
+        Ok(())
+    }
+
     pub fn add(&mut self, id: EndpointId, name: Option<String>, addr: Option<EndpointAddr>) {
         self.add_with_allow(id, name, addr, None)
     }
@@ -797,6 +866,11 @@ impl PeerBook {
             .iter()
             .find(|peer| peer.id == id)
             .is_some_and(|peer| peer.dial_only);
+        let inbound_only = self
+            .peers
+            .iter()
+            .find(|peer| peer.id == id)
+            .is_some_and(|peer| peer.inbound_only);
         let allow = allow
             .or_else(|| {
                 self.peers
@@ -816,6 +890,7 @@ impl PeerBook {
             addr,
             roaming,
             dial_only,
+            inbound_only,
             allow: if dial_only { Vec::new() } else { allow },
         });
         self.peers
@@ -833,8 +908,11 @@ impl PeerBook {
         self.peers.len() != before
     }
 
+    /// The address to dial `peer` at, by name or NodeID. An inbound-only peer
+    /// has none: this machine never dials it.
     pub fn resolve(&self, peer: &str) -> Result<EndpointAddr> {
         if let Ok(id) = EndpointId::from_str(peer) {
+            self.refuse_inbound_only_dial(peer, &id)?;
             return Ok(self.addr_for_id(id));
         }
 
@@ -844,15 +922,25 @@ impl PeerBook {
             .filter(|entry| entry.name.as_deref() == Some(peer))
             .collect();
         match matches.as_slice() {
-            [entry] => Ok(entry
-                .addr
-                .clone()
-                .unwrap_or_else(|| EndpointAddr::new(entry.id))),
+            [entry] => {
+                self.refuse_inbound_only_dial(peer, &entry.id)?;
+                Ok(entry
+                    .addr
+                    .clone()
+                    .unwrap_or_else(|| EndpointAddr::new(entry.id)))
+            }
             [] => bail!(
                 "unknown peer {peer:?}; add it to peers.toml or use `fabric add <nodeid> [name]`"
             ),
             _ => bail!("ambiguous peer name {peer:?}"),
         }
+    }
+
+    fn refuse_inbound_only_dial(&self, peer: &str, id: &EndpointId) -> Result<()> {
+        if self.is_inbound_only(id) {
+            bail!("{peer} is inbound-only: it only connects to this machine, which never dials it");
+        }
+        Ok(())
     }
 
     fn addr_for_id(&self, id: EndpointId) -> EndpointAddr {
@@ -991,6 +1079,9 @@ fn upsert_peer_tables(
         }
         if old_peer.dial_only != new_peer.dial_only {
             upsert_table_field(table, desired_table, "dial_only")?;
+        }
+        if old_peer.inbound_only != new_peer.inbound_only {
+            upsert_table_field(table, desired_table, "inbound_only")?;
         }
         if old_peer.allow != new_peer.allow {
             upsert_string_array_field(table, desired_table, "allow")?;
@@ -2469,6 +2560,7 @@ mod tests {
             addr: None,
             roaming: false,
             dial_only,
+            inbound_only: false,
             allow,
         }
     }
@@ -2616,5 +2708,83 @@ mod tests {
             "the file lost the flag: {raw}"
         );
         assert!(saved.may(&other, "exec").is_ok());
+    }
+
+    #[test]
+    fn an_inbound_only_peer_keeps_its_grants_and_is_never_resolved_for_dialling() {
+        let id = an_id(0);
+        let mut book = PeerBook::default();
+        book.add_inbound_only(id, Some("phone".into()), None, Some(vec!["echo".into()]));
+
+        assert!(book.is_inbound_only(&id));
+        assert!(book.may(&id, "echo").is_ok(), "its grant was lost");
+        assert!(book.accepts_inbound(&id), "it is not let in");
+        assert_eq!(book.dialable_peers().count(), 0);
+        for peer in [id.to_string(), "phone".to_string()] {
+            let error = book.resolve(&peer).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("inbound-only"),
+                "{peer}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn re_adding_an_inbound_only_peer_keeps_it_inbound_only() {
+        let id = an_id(0);
+        let mut book = PeerBook::default();
+        book.add_inbound_only(id, Some("phone".into()), None, Some(vec!["echo".into()]));
+        book.add(id, Some("phone".into()), None);
+        book.add_with_allow(id, Some("phone".into()), None, Some(vec!["web".into()]));
+
+        assert!(book.is_inbound_only(&id), "a re-add lifted inbound-only");
+        assert!(book.may(&id, "web").is_ok());
+    }
+
+    #[test]
+    fn inbound_only_and_dial_only_refuse_each_other() {
+        let phone = an_id(0);
+        let ci = an_id(1);
+        let mut book = PeerBook::default();
+        book.add_inbound_only(phone, Some("phone".into()), None, None);
+        book.add_dial_only(ci, Some("ci".into()), None);
+
+        for name in [phone.to_string(), "phone".to_string()] {
+            let error = book.refuse_opposite_direction(&name, false).unwrap_err();
+            assert!(format!("{error:#}").contains("inbound-only"), "{error:#}");
+            assert!(book.refuse_opposite_direction(&name, true).is_ok());
+        }
+        for name in [ci.to_string(), "ci".to_string()] {
+            let error = book.refuse_opposite_direction(&name, true).unwrap_err();
+            assert!(format!("{error:#}").contains("dial-only"), "{error:#}");
+            assert!(book.refuse_opposite_direction(&name, false).is_ok());
+        }
+        // A peer nobody has heard of takes either flag.
+        assert!(book.refuse_opposite_direction("new", true).is_ok());
+        assert!(book.refuse_opposite_direction("new", false).is_ok());
+    }
+
+    #[test]
+    fn an_inbound_only_peer_survives_a_save_and_a_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = FabricHome::new(dir.path());
+        let phone = an_id(0);
+        let other = an_id(1);
+        let mut book = PeerBook::default();
+        book.add_inbound_only(phone, Some("phone".into()), None, Some(vec!["echo".into()]));
+        book.add(other, Some("dev".into()), None);
+        book.save(&home).unwrap();
+
+        let saved = PeerBook::load(&home).unwrap();
+        assert!(saved.is_inbound_only(&phone));
+        assert!(!saved.is_inbound_only(&other));
+        assert!(saved.may(&phone, "echo").is_ok());
+        let raw = fs::read_to_string(home.peers_path()).unwrap();
+        assert_eq!(raw.matches("inbound_only = true").count(), 1, "{raw}");
+
+        // A hand edit that adds the flag to a saved file is honoured.
+        let edited = raw.replace("name = \"dev\"", "name = \"dev\"\ninbound_only = true");
+        fs::write(home.peers_path(), edited).unwrap();
+        assert!(PeerBook::load(&home).unwrap().is_inbound_only(&other));
     }
 }
