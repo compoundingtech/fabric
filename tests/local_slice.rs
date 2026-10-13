@@ -1178,6 +1178,303 @@ async fn socket_expose_peer_header_names_the_peer_before_its_bytes() -> Result<(
     Ok(())
 }
 
+/// A service behind a socket exposure that behaves as its first byte asks:
+/// `i` idle (say hello, then read until the client is done), `e` echo, `s` slow
+/// (read 1 KiB every 20 ms), `a` abrupt (say hello and hang up). Counts its live
+/// connections so the test can tell that closed streams are not leaked.
+#[cfg(unix)]
+async fn socket_soak_service(listener: UnixListener, live: Arc<AtomicUsize>) {
+    loop {
+        let (mut stream, _) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                eprintln!("soak service: accept failed, the service stops: {error}");
+                return;
+            }
+        };
+        let live = live.clone();
+        live.fetch_add(1, Ordering::SeqCst);
+        tokio::spawn(async move {
+            let mut mode = [0u8; 1];
+            if stream.read_exact(&mut mode).await.is_ok()
+                && stream.write_all(b"hello\n").await.is_ok()
+            {
+                let mut buf = vec![0u8; 16 * 1024];
+                match mode[0] {
+                    b'i' => while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {},
+                    b'e' => loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if stream.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    },
+                    b's' => loop {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        match stream.read(&mut buf[..1024]).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    },
+                    _ => {} // 'a': drop at once
+                }
+            }
+            live.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+}
+
+/// Read the service's greeting from a freshly opened stream.
+#[cfg(unix)]
+async fn soak_hello(stream: &mut UnixStream, mode: u8) -> Result<()> {
+    stream
+        .write_all(&[mode])
+        .await
+        .with_context(|| format!("writing mode {:?} to a fresh stream", mode as char))?;
+    let mut hello = [0u8; 6];
+    tokio::time::timeout(LOCAL_IO_TIMEOUT, stream.read_exact(&mut hello))
+        .await
+        .context("the socket service never greeted the stream")??;
+    assert_eq!(&hello, b"hello\n");
+    Ok(())
+}
+
+/// A socket exposure under the traffic a terminal service sees: idle streams
+/// that stay open, an echo that moves real data past them, a slow reader, streams
+/// the service hangs up on, and a churn of short sessions, all while the
+/// daemon's runtime (two workers) must keep ticking. Afterwards nothing may be
+/// left open on the service.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn socket_expose_survives_idle_slow_concurrent_and_abrupt_streams() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let finished = Arc::new(AtomicBool::new(false));
+    let watchdog_finished = finished.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(150));
+        if !watchdog_finished.load(Ordering::SeqCst) {
+            eprintln!("the socket soak stopped making progress for 150 s");
+            std::process::exit(3);
+        }
+    });
+
+    let node_a_dir = TempDir::new()?;
+    let node_b_dir = TempDir::new()?;
+    let service_dir = TempDir::new()?;
+    let node_a_home = FabricHome::new(node_a_dir.path());
+    let node_b_home = FabricHome::new(node_b_dir.path());
+    let node_a = FabricNode::start(node_a_home.clone()).await?;
+    let node_b = FabricNode::start(node_b_home.clone()).await?;
+    trust_peer(
+        &node_a_home,
+        &node_a,
+        node_b.id(),
+        Some("node-b"),
+        Some(node_b.addr()),
+    )
+    .await?;
+    trust_peer(
+        &node_b_home,
+        &node_b,
+        node_a.id(),
+        Some("node-a"),
+        Some(node_a.addr()),
+    )
+    .await?;
+
+    let socket_path = service_dir.path().join("soak.sock");
+    let live = Arc::new(AtomicUsize::new(0));
+    let service = tokio::spawn(socket_soak_service(
+        UnixListener::bind(&socket_path)?,
+        live.clone(),
+    ));
+    run_fabric(
+        &node_a_home,
+        &[
+            "expose",
+            "socket-soak",
+            "--socket",
+            socket_path.to_str().unwrap(),
+        ],
+    )?;
+    let dial_socket = node_b.dial("node-a", "socket-soak").await?;
+
+    // The runtime's heartbeat, measured for the whole run.
+    let beat_started = Instant::now();
+    let worst_gap = Arc::new(AtomicUsize::new(0));
+    let beat_gap = worst_gap.clone();
+    let heartbeat = tokio::spawn(async move {
+        let mut last = Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let gap = last.elapsed().as_millis() as usize;
+            beat_gap.fetch_max(gap, Ordering::SeqCst);
+            last = Instant::now();
+        }
+    });
+
+    // Held open for the whole run: idle streams and a slow reader being fed.
+    let mut held = Vec::new();
+    let held_idle: usize = std::env::var("FABRIC_SOAK_HELD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    for _ in 0..held_idle {
+        let mut stream = UnixStream::connect(&dial_socket).await?;
+        soak_hello(&mut stream, b'i').await?;
+        held.push(stream);
+    }
+    let mut slow = UnixStream::connect(&dial_socket).await?;
+    soak_hello(&mut slow, b's').await?;
+    let slow_feeder = tokio::spawn(async move {
+        let chunk = vec![9u8; 4096];
+        for _ in 0..30 {
+            if slow.write_all(&chunk).await.is_err() {
+                return;
+            }
+        }
+        let _ = slow.shutdown().await;
+    });
+
+    // Streams the service hangs up on: the client must see the end promptly.
+    for _ in 0..3 {
+        let mut stream = UnixStream::connect(&dial_socket).await?;
+        soak_hello(&mut stream, b'a')
+            .await
+            .context("abrupt stream")?;
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(20), stream.read_to_end(&mut rest))
+            .await
+            .context("a stream the service closed never ended for its client")?
+            .ok();
+    }
+
+    // Real data through an echo while the idle streams sit open.
+    let payload: Vec<u8> = (0..300_000u32).map(|n| (n % 253) as u8).collect();
+    let mut echo = UnixStream::connect(&dial_socket).await?;
+    soak_hello(&mut echo, b'e').await.context("echo stream")?;
+    let (mut echo_read, mut echo_write) = echo.into_split();
+    let sent = payload.clone();
+    let writer = tokio::spawn(async move {
+        echo_write.write_all(&sent).await.expect("echo write");
+        echo_write.shutdown().await.expect("echo shutdown");
+    });
+    let mut echoed = Vec::new();
+    tokio::time::timeout(LARGE_PAYLOAD_TIMEOUT, echo_read.read_to_end(&mut echoed))
+        .await
+        .context("the echo through the exposure stalled")??;
+    writer.await?;
+    assert_eq!(echoed.len(), payload.len());
+    assert!(echoed == payload, "the echoed bytes differ");
+
+    // A churn of short sessions, four at a time.
+    let mut churn = Vec::new();
+    let churn_workers: u8 = std::env::var("FABRIC_SOAK_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    for worker in 0..churn_workers {
+        let dial_socket = dial_socket.clone();
+        churn.push(tokio::spawn(async move {
+            let pause_ms: u64 = std::env::var("FABRIC_SOAK_PAUSE_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(400);
+            let rounds: u16 = std::env::var("FABRIC_SOAK_ROUNDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(25);
+            for round in 0..rounds {
+                // Paced like people and devices, not like a load generator: a dialing
+                // process serves 32 streams at once and a stream that has just closed
+                // is still winding down for about a second, so more than a few dozen
+                // new streams a second are refused (see docs/failure-modes.md).
+                tokio::time::sleep(Duration::from_millis(pause_ms)).await;
+                let mut stream = UnixStream::connect(&dial_socket).await?;
+                soak_hello(&mut stream, b'e')
+                    .await
+                    .with_context(|| format!("churn worker {worker} round {round}: hello"))?;
+                let message = [worker, (round % 251) as u8, 7, 7];
+                stream
+                    .write_all(&message)
+                    .await
+                    .with_context(|| format!("churn worker {worker} round {round}: write"))?;
+                let mut back = [0u8; 4];
+                tokio::time::timeout(LOCAL_IO_TIMEOUT, stream.read_exact(&mut back))
+                    .await
+                    .context("a short session was not echoed")??;
+                assert_eq!(back, message);
+            }
+            Ok::<_, anyhow::Error>(())
+        }));
+    }
+    let mut churn_error = None;
+    for task in churn {
+        if let Err(error) = task.await? {
+            churn_error.get_or_insert(error);
+        }
+    }
+    if let Some(error) = churn_error {
+        eprintln!(
+            "soak diagnostics: socket exists={} service finished={} live={} node_a status:\n{}\nnode_b status:\n{}",
+            socket_path.exists(),
+            service.is_finished(),
+            live.load(Ordering::SeqCst),
+            run_fabric(&node_a_home, &["status"]).unwrap_or_default(),
+            run_fabric(&node_b_home, &["status"]).unwrap_or_default(),
+        );
+        for (name, home) in [("node_a", &node_a_home), ("node_b", &node_b_home)] {
+            if let Ok(entries) = fs::read_dir(home.root().join("logs")) {
+                for entry in entries.flatten() {
+                    if let Ok(text) = fs::read_to_string(entry.path()) {
+                        let lines: Vec<&str> = text.lines().collect();
+                        let tail = &lines[lines.len().saturating_sub(40)..];
+                        eprintln!(
+                            "--- {name} {}:\n{}",
+                            entry.path().display(),
+                            tail.join("\n")
+                        );
+                    }
+                }
+            }
+        }
+        return Err(error);
+    }
+    slow_feeder.await?;
+
+    assert!(
+        worst_gap.load(Ordering::SeqCst) < 3000,
+        "the runtime stopped ticking for {} ms in {:?}",
+        worst_gap.load(Ordering::SeqCst),
+        beat_started.elapsed()
+    );
+
+    // Close everything; the service must see every connection end.
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while live.load(Ordering::SeqCst) != 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "{} service connections were left open after every client closed",
+            live.load(Ordering::SeqCst)
+        )
+    })?;
+
+    heartbeat.abort();
+    service.abort();
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    finished.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn separate_peer_and_daemon_configs_restore_on_restart() -> Result<()> {
     let _guard = local_slice_guard().await;
@@ -2300,6 +2597,7 @@ async fn trust_peer(
                 "pty-view",
                 "stdio-cat",
                 "idle-splice",
+                "socket-soak",
                 "peer-header",
                 "plain-socket",
                 "limited-cat",
