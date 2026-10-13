@@ -170,10 +170,18 @@ async fn a_probe_answer_names_the_far_sides_code() -> Result<()> {
     server.expose("web", socket).await?;
     trust(&server_home, &server, &client, "client", &["echo"]).await?;
     trust(&client_home, &client, &server, "server", &[]).await?;
+    // A machine the server does not trust at all.
+    let stranger_home = TempDir::new()?;
+    let stranger = FabricNode::start(FabricHome::new(stranger_home.path())).await?;
+    trust(&stranger_home, &stranger, &server, "server", &[]).await?;
 
     let mut answers = Vec::new();
-    for protocol in ["web", "nothing-here"] {
-        let path = client_home.path().to_path_buf();
+    for (home, protocol) in [
+        (&client_home, "web"),
+        (&client_home, "nothing-here"),
+        (&stranger_home, "web"),
+    ] {
+        let path = home.path().to_path_buf();
         let output = tokio::task::spawn_blocking(move || {
             Command::new(env!("CARGO_BIN_EXE_fabric"))
                 .arg("--home")
@@ -186,6 +194,7 @@ async fn a_probe_answer_names_the_far_sides_code() -> Result<()> {
             .with_context(|| format!("probe {protocol}: {output:?}"))?;
         answers.push((output.status.code(), answer));
     }
+    stranger.shutdown().await?;
     client.shutdown().await?;
     server.shutdown().await?;
 
@@ -199,8 +208,14 @@ async fn a_probe_answer_names_the_far_sides_code() -> Result<()> {
         refused["code"], "peer_not_permitted_for_service",
         "{refused}"
     );
+    assert_eq!(refused["class"], "refusal", "{refused}");
     let (status, missing) = &answers[1];
     assert_eq!(*status, Some(1), "{missing}");
     assert_eq!(missing["code"], "service_not_exposed", "{missing}");
+    assert_eq!(missing["class"], "fault", "{missing}");
+    let (status, untrusted) = &answers[2];
+    assert_eq!(*status, Some(2), "{untrusted}");
+    assert_eq!(untrusted["code"], "peer_not_in_allow_list", "{untrusted}");
+    assert_eq!(untrusted["class"], "refusal", "{untrusted}");
     Ok(())
 }

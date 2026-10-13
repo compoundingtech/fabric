@@ -380,6 +380,7 @@ struct ServiceProbe {
     round_trip: Option<Duration>,
     transport: Option<String>,
     error: Option<String>,
+    code: Option<ErrorCode>,
 }
 
 #[derive(Debug)]
@@ -1971,6 +1972,9 @@ impl DaemonState {
             ),
         )
         .await;
+        // The code of an unreachable answer: the refusal or the absence the
+        // attempt met. The command names the code of every other outcome.
+        let mut code = None;
         let (outcome, round_trip, transport, error) = match attempt {
             Err(_elapsed) => (
                 ProbeOutcome::Timeout,
@@ -1991,6 +1995,10 @@ impl DaemonState {
                 {
                     (ProbeOutcome::Unsupported, None, None, None)
                 } else {
+                    code = Some(match fabric_config::error::code_of(&error) {
+                        ErrorCode::Internal => ErrorCode::Unreachable,
+                        code => code,
+                    });
                     (
                         ProbeOutcome::Unreachable,
                         None,
@@ -2018,6 +2026,7 @@ impl DaemonState {
             round_trip,
             transport,
             error,
+            code,
         })
     }
 
@@ -3854,6 +3863,7 @@ async fn process_control_request(
                     .map(|rt| rt.as_micros().try_into().unwrap_or(u64::MAX)),
                 transport: outcome.transport,
                 error: outcome.error,
+                code: outcome.code.map(|code| code.as_str().to_string()),
             }
         }
         ControlRequest::Shell { peer } => {

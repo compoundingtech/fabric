@@ -23,7 +23,7 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   code, so a command reports the code the daemon chose. Codes so far:
   `daemon_not_running`, `unknown_peer`, and `invalid_argument` for a bad node
   id, an ambiguous peer name and `expose` arguments. `probe` keeps its exit
-  statuses; its `--json` answer gains a `code` field.
+  statuses; its `--json` answer gains `code` and `class` fields.
 
 - Close reasons, stream denials and direct-wire Error frames carry the
   `fabric:<code> ` token ahead of the text they always had, so a client can
