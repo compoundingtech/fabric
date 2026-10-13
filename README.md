@@ -1524,7 +1524,7 @@ and retry; do not weaken the include lists to make the proof pass.
 
 `peers.toml` is Fabric's allow-list file. It is intentionally human-editable
 and can be provisioned before Fabric ever runs. Format 2 uses each peer's
-`allow` array as the only policy source. Each `[[peers]]` entry accepts:
+`allow` array as the only policy source.
 
 Fabric commands update this file in place. They preserve comments, spacing,
 entry order, and changes to the generated header. Fabric writes the default
@@ -1540,6 +1540,8 @@ only the matching grants already in peer arrays. A false or missing old key
 removes the matching grants. Fabric names each removed grant and its reason,
 then writes format 2 atomically. Fabric refuses the load if that write fails.
 
+Each `[[peers]]` entry accepts:
+
 - `id` (required): the peer's 64-character hexadecimal iroh NodeID.
 - `name` (optional): a non-empty, unique local alias for commands such as
   `fabric ping workstation`.
@@ -1547,6 +1549,10 @@ then writes format 2 atomically. Fabric refuses the load if that write fails.
   peer's `id`.
 - `roaming` (optional): whether this peer is expected to disconnect and return.
   It defaults to false.
+- `dial_only` (optional): this machine may dial the peer and the peer may never
+  use anything here; fabric keeps `allow = []` beside it. Set it with
+  `fabric add --dial-only`. See
+  [A host that runs code you do not trust](#a-host-that-runs-code-you-do-not-trust).
 - `allow` (optional): the service names this peer may reach. An omitted or
   empty list permits no service.
 
@@ -1630,9 +1636,11 @@ one piece it must not generate: it is a per-machine secret. Let the daemon
 create it on first start, or create it ahead of time with `fabric key gen --out`
 and install it out of band.
 
-Removing an entry and reloading prevents new connections from that NodeID.
-Reloading does not forcibly close an already active tunnel or shell; restart in
-a safe maintenance window when immediate disconnection is required.
+Removing an entry and reloading refuses new connections from that NodeID and
+ends the sessions it had open here. Narrowing its `allow` list ends its sessions
+for the services it lost, attached or detached, and leaves its other services
+alone. A Git request already running finishes; the next one is checked against
+the new grants.
 
 ## Troubleshooting
 
@@ -1640,8 +1648,7 @@ a safe maintenance window when immediate disconnection is required.
 
 **Symptom.** `fabric ping`, `fabric status`, and `fabric shell` all report the
 peer as reachable, yet anything that goes through a **dial** — `fabric dial`, or
-a consumer like `st sync` — fails on a loop. `st sync` shows
-`fabric pull failed: <peer>::… — re-dialing` forever, and
+a consumer built on one — fails on a loop, and
 `~/.local/share/fabric/logs/service.err.log` shows
 `dial socket connection failed: unknown peer "<peer>"`.
 
@@ -1650,10 +1657,8 @@ answer from the daemon's in-memory allow-list, but the dial/tunnel path
 re-resolves the peer from `peers.toml` on disk each connection. If the daemon was
 launched with a `--home` whose `peers.toml` is missing or empty while the CLI
 writes to a different `peers.toml`, the dial path resolves nothing → the tunnel
-never opens → the consumer's socket gets zero bytes and times out. This is a
-fabric transport issue, not a consumer bug (e.g. `st sync`'s
-`SyncFailedError`-on-`rsync --timeout` is that consumer behaving correctly). A
-default-home `fabric add`/`remove` can trigger the split by migrating peers to
+never opens → the consumer's socket gets zero bytes and times out. A default-home
+`fabric add`/`remove` could trigger the split by migrating peers to
 `~/.config/fabric/peers.toml` and removing the legacy in-`--home` copy.
 
 **Fix.** Make sure the peers file the daemon actually reads contains the peer,
@@ -1686,6 +1691,7 @@ Write the new box's `peers.toml` with the peers it should trust:
 [[peers]]
 id = "existing-machine-node-id"
 name = "workstation"
+allow = ["echo"]
 ```
 
 On every existing machine, add the new box to its canonical `peers.toml`:
@@ -1694,7 +1700,12 @@ On every existing machine, add the new box to its canonical `peers.toml`:
 [[peers]]
 id = "<new-box-node-id>"
 name = "new-box"
+allow = ["echo"]
 ```
+
+`allow = ["echo"]` is what lets the other side `fabric ping` this one and see it
+as reachable in `fabric status`; a peer with no `allow` grants nothing. Add the
+services each peer should really use (`shell`, `exec`, `sync`, an exposed name).
 
 Replace `<new-box-node-id>` with the value printed in `BOX_ID`, deploy the file
 with the machine's normal configuration-management or file-copy mechanism, and
@@ -1722,7 +1733,7 @@ The automated integration test is the canonical local walkthrough:
 cargo test --test local_slice
 ```
 
-It starts three fabric nodes on one Mac:
+It starts three fabric nodes in one process:
 
 - node A exposes a dummy Unix-socket echo service under `pty-view`
 - node B trusts node A, dials `pty-view`, and round-trips bytes through fabric

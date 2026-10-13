@@ -41,6 +41,14 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Changed
 
+- README, peer config: the declarative section said that reloading does not close
+  active tunnels or shells, which contradicts the Commands section and the code
+  (a reload ends the sessions the new file no longer allows); it now says what
+  happens. The `peers.toml` field list gains `dial_only`, and its introduction is
+  no longer split from the list. The provisioning example grants `echo`, which
+  `fabric ping` needs. The troubleshooting entry for a daemon and CLI that
+  disagree about the home drops its consumer-specific asides.
+
 - A failure's stderr line is now one line, `Error: fabric:<code> <text>`,
   where it used to list each cause on its own `Caused by:` line.
 
