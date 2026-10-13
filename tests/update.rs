@@ -152,3 +152,170 @@ fn rollback_cannot_be_combined_with_a_source() -> Result<()> {
     );
     Ok(())
 }
+
+/// Everything an explicit-URL update decides, run through the real command
+/// against a copy of the binary in a scratch directory. The service manager is
+/// hidden (no `systemctl` on `PATH`, `HOME` in the scratch directory), so the
+/// binary being replaced is the copy and never an installed one. `--dry-run`
+/// stops after the checks, so nothing is replaced even when an update is allowed.
+mod explicit_url {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::{os::unix::fs::PermissionsExt, path::PathBuf};
+
+    struct Sandbox {
+        _temp: TempDir,
+        bin_dir: PathBuf,
+        empty_path: PathBuf,
+        installed: PathBuf,
+        installed_version: String,
+        installed_bytes: Vec<u8>,
+        archives: PathBuf,
+    }
+
+    impl Sandbox {
+        fn new() -> Result<Self> {
+            let temp = TempDir::new()?;
+            let bin_dir = temp.path().join("bin");
+            std::fs::create_dir_all(&bin_dir)?;
+            let empty_path = temp.path().join("empty");
+            std::fs::create_dir_all(&empty_path)?;
+            let archives = temp.path().join("archives");
+            std::fs::create_dir_all(&archives)?;
+            let installed = bin_dir.join("fabric");
+            std::fs::copy(fabric_bin(), &installed)?;
+            let installed_version = fabric::version_string();
+            let installed_bytes = std::fs::read(&installed)?;
+            Ok(Self {
+                _temp: temp,
+                bin_dir,
+                empty_path,
+                installed,
+                installed_version,
+                installed_bytes,
+                archives,
+            })
+        }
+
+        /// A release archive whose `fabric` is a script that reports `version`.
+        fn archive_reporting(&self, version: &str) -> Result<(String, String)> {
+            let script = format!("#!/bin/sh\necho \"{version}\"\n");
+            let mut tar_bytes = Vec::new();
+            {
+                let mut tar = tar::Builder::new(&mut tar_bytes);
+                let mut header = tar::Header::new_gnu();
+                header.set_size(script.len() as u64);
+                header.set_mode(0o755);
+                header.set_cksum();
+                tar.append_data(&mut header, "fabric", script.as_bytes())?;
+                tar.finish()?;
+            }
+            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            std::io::Write::write_all(&mut gz, &tar_bytes)?;
+            let archive = gz.finish()?;
+            let path = self.archives.join(format!("{}.tar.gz", archive.len()));
+            std::fs::write(&path, &archive)?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+            let hash = Sha256::digest(&archive)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            Ok((format!("file://{}", path.display()), hash))
+        }
+
+        fn update(&self, version: &str, extra: &[&str]) -> Result<std::process::Output> {
+            let (url, hash) = self.archive_reporting(version)?;
+            Command::new(&self.installed)
+                .env("PATH", &self.empty_path)
+                .env("HOME", self.bin_dir.parent().unwrap())
+                .args(["--home"])
+                .arg(self.bin_dir.parent().unwrap().join("home"))
+                .args(["update", "--dry-run", "--url", &url, "--sha256", &hash])
+                .args(extra)
+                .output()
+                .context("failed to run fabric update")
+        }
+
+        /// Nothing installed changed, and nothing was left beside it.
+        fn assert_untouched(&self) -> Result<()> {
+            assert_eq!(std::fs::read(&self.installed)?, self.installed_bytes);
+            let names: Vec<_> = std::fs::read_dir(&self.bin_dir)?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<std::io::Result<_>>()?;
+            assert_eq!(names, vec![std::ffi::OsString::from("fabric")]);
+            Ok(())
+        }
+    }
+
+    fn shown(out: &std::process::Output) -> String {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    }
+
+    #[test]
+    fn a_newer_build_is_accepted() -> Result<()> {
+        let sandbox = Sandbox::new()?;
+        let out = sandbox.update("99.0.0+abcdef0", &[])?;
+        assert!(out.status.success(), "{}", shown(&out));
+        assert!(shown(&out).contains("DRY RUN"), "{}", shown(&out));
+        sandbox.assert_untouched()
+    }
+
+    #[test]
+    fn an_older_build_is_refused_and_leaves_the_install_alone() -> Result<()> {
+        let sandbox = Sandbox::new()?;
+        let out = sandbox.update("0.0.1+abcdef0", &[])?;
+        assert!(!out.status.success(), "an older build was accepted");
+        let said = shown(&out);
+        assert!(said.contains("is older than"), "{said}");
+        assert!(said.contains("--allow-downgrade"), "{said}");
+        assert!(said.contains("nothing was installed"), "{said}");
+        sandbox.assert_untouched()?;
+
+        let out = sandbox.update("0.0.1+abcdef0", &["--allow-downgrade"])?;
+        assert!(out.status.success(), "{}", shown(&out));
+        assert!(shown(&out).contains("WARNING"), "{}", shown(&out));
+        sandbox.assert_untouched()
+    }
+
+    #[test]
+    fn the_same_build_is_refused_unless_it_is_allowed() -> Result<()> {
+        let sandbox = Sandbox::new()?;
+        let out = sandbox.update(&sandbox.installed_version.clone(), &[])?;
+        assert!(!out.status.success(), "the installed build was reinstalled");
+        assert!(shown(&out).contains("already installed"), "{}", shown(&out));
+        sandbox.assert_untouched()?;
+
+        let out = sandbox.update(&sandbox.installed_version.clone(), &["--allow-downgrade"])?;
+        assert!(out.status.success(), "{}", shown(&out));
+        sandbox.assert_untouched()
+    }
+
+    #[test]
+    fn expect_version_must_match_the_artifact() -> Result<()> {
+        let sandbox = Sandbox::new()?;
+        let out = sandbox.update("99.0.0+abcdef0", &["--expect-version", "99.0.0+abcdef0"])?;
+        assert!(out.status.success(), "{}", shown(&out));
+
+        let out = sandbox.update("99.0.0+abcdef0", &["--expect-version", "99.0.0+1111111"])?;
+        assert!(!out.status.success(), "a different build was accepted");
+        let said = shown(&out);
+        assert!(said.contains("--expect-version"), "{said}");
+        assert!(
+            said.contains("99.0.0+abcdef0") && said.contains("99.0.0+1111111"),
+            "{said}"
+        );
+        sandbox.assert_untouched()?;
+
+        // Allowing a downgrade never waives an exact match.
+        let out = sandbox.update(
+            "99.0.0+abcdef0",
+            &["--expect-version", "99.0.0+1111111", "--allow-downgrade"],
+        )?;
+        assert!(!out.status.success());
+        sandbox.assert_untouched()
+    }
+}

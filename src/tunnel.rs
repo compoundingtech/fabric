@@ -67,7 +67,13 @@ pub struct ServerSessionLimits {
 
 #[derive(Debug, Clone)]
 pub enum ServerTarget {
-    UnixSocket(PathBuf),
+    UnixSocket {
+        path: PathBuf,
+        /// Bytes written to the local socket right after connecting and before
+        /// any byte of the peer's: the peer-identity line of a `--peer-header`
+        /// exposure.
+        header: Option<Vec<u8>>,
+    },
     Tcp {
         addr: String,
     },
@@ -1749,6 +1755,20 @@ impl ServerSessionStore {
         }
     }
 
+    /// Close every session, which kills every exec child bound to one. Used when
+    /// the daemon stops: a child left running holds the pipes its daemon read,
+    /// and a daemon thread parked reading such a pipe keeps the process from
+    /// exiting until the child is gone.
+    pub async fn close_all(&self) {
+        let sessions: Vec<Arc<TunnelSession>> = {
+            let mut guard = self.inner.lock().await;
+            guard.drain().map(|(_, session)| session).collect()
+        };
+        for session in sessions {
+            session.close_for_eviction().await;
+        }
+    }
+
     async fn remove_session(&self, session: &Arc<TunnelSession>) {
         session.close_for_eviction().await;
         let mut sessions = self.inner.lock().await;
@@ -2077,8 +2097,11 @@ async fn create_server_session(
     target: ServerTarget,
 ) -> Result<(Arc<TunnelSession>, LocalRead)> {
     match target {
-        ServerTarget::UnixSocket(local_socket) => {
-            let local = UnixStream::connect(&local_socket).await.map_err(|error| {
+        ServerTarget::UnixSocket {
+            path: local_socket,
+            header,
+        } => {
+            let mut local = UnixStream::connect(&local_socket).await.map_err(|error| {
                 FabricError::new(
                     ErrorCode::ServiceUnavailable,
                     format!(
@@ -2087,6 +2110,13 @@ async fn create_server_session(
                     ),
                 )
             })?;
+            if let Some(header) = header {
+                // Before the session exists, so nothing the peer sends can precede it.
+                local
+                    .write_all(&header)
+                    .await
+                    .context("failed to send the peer header to the exposed socket")?;
+            }
             Ok(TunnelSession::new(session_id, peer_id, local))
         }
         ServerTarget::Tcp { addr } => {
@@ -2716,7 +2746,10 @@ mod tests {
             .get_or_create(
                 session.id(),
                 peer,
-                ServerTarget::UnixSocket(PathBuf::from("/missing")),
+                ServerTarget::UnixSocket {
+                    path: PathBuf::from("/missing"),
+                    header: None,
+                },
                 true,
                 Grant::Trust,
             )
@@ -3084,7 +3117,7 @@ mod tests {
             .get_or_create(
                 session_id(4),
                 peer_id(),
-                ServerTarget::UnixSocket(path),
+                ServerTarget::UnixSocket { path, header: None },
                 false,
                 Grant::Trust,
             )

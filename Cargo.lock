@@ -1032,6 +1032,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fabric-stdio"
+version = "0.2.40"
+
+[[package]]
 name = "fabric-sync"
 version = "0.2.40"
 dependencies = [

@@ -890,6 +890,294 @@ async fn exec_expose_streams_payload_larger_than_tunnel_buffer() -> Result<()> {
     Ok(())
 }
 
+/// The exec service the daemon sees for a terminal attach: a child that answers
+/// with one line and then copies an idle socket into a dup of its stdout. On
+/// Linux `std::io::copy` turns that into `splice(2)`, which sleeps with the
+/// stdout pipe locked, and the daemon's read of that pipe used to park a runtime
+/// worker for as long as the terminal stayed quiet. Only started as the exposed
+/// command of the test below (`--ignored --exact`); a normal run skips it.
+#[cfg(unix)]
+#[test]
+#[ignore = "the exposed command of exec_expose_idle_splicing_sessions_do_not_stall_the_daemon"]
+fn idle_splice_exposed_command() {
+    use std::io::Write;
+    use std::os::fd::AsFd;
+    use std::os::unix::net::UnixStream as StdUnixStream;
+
+    let mut stdout = std::fs::File::from(
+        std::io::stdout()
+            .as_fd()
+            .try_clone_to_owned()
+            .expect("dup stdout"),
+    );
+    writeln!(stdout, "{{\"ok\":true}}").expect("answer");
+    // A child that outlived its daemon would hold the output pipe of whatever ran
+    // the test (cargo waits for it); the daemon closing our stdin is the signal to go.
+    std::thread::spawn(|| {
+        let mut sink = [0u8; 4096];
+        let mut stdin = std::io::stdin().lock();
+        while matches!(std::io::Read::read(&mut stdin, &mut sink), Ok(n) if n > 0) {}
+        std::process::exit(0);
+    });
+    let (mut idle, _peer) = StdUnixStream::pair().expect("idle socket");
+    let _ = std::io::copy(&mut idle, &mut stdout);
+}
+
+/// Wait until this process has exactly `count` running idle-splice children.
+#[cfg(unix)]
+async fn wait_for_exposed_children(count: usize) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let found = Command::new("pgrep")
+            .args([
+                "-P",
+                &std::process::id().to_string(),
+                "-f",
+                "idle_splice_exposed_command",
+            ])
+            .output()?;
+        let running = String::from_utf8_lossy(&found.stdout).lines().count();
+        if running == count {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            bail!("{running} idle-splice children are running, expected {count}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Many idle attaches at once, with the daemon running on only two workers: the
+/// runtime must keep ticking, a fresh session must still be served, and closing
+/// the sessions must free the exposure's child slots.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_expose_idle_splicing_sessions_do_not_stall_the_daemon() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    // A runtime that has stopped cannot time itself out, so an ordinary thread does.
+    let finished = Arc::new(AtomicBool::new(false));
+    let watchdog_finished = finished.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(120));
+        if !watchdog_finished.load(Ordering::SeqCst) {
+            eprintln!("idle splicing sessions stopped the daemon's runtime for 120 s");
+            std::process::exit(3);
+        }
+    });
+
+    let node_a_dir = TempDir::new()?;
+    let node_b_dir = TempDir::new()?;
+    let node_a_home = FabricHome::new(node_a_dir.path());
+    let node_b_home = FabricHome::new(node_b_dir.path());
+    let node_a = FabricNode::start(node_a_home.clone()).await?;
+    let node_b = FabricNode::start(node_b_home.clone()).await?;
+    trust_peer(
+        &node_a_home,
+        &node_a,
+        node_b.id(),
+        Some("node-b"),
+        Some(node_b.addr()),
+    )
+    .await?;
+    trust_peer(
+        &node_b_home,
+        &node_b,
+        node_a.id(),
+        Some("node-a"),
+        Some(node_a.addr()),
+    )
+    .await?;
+
+    let exe = std::env::current_exe()?;
+    let exe = exe.to_str().context("test binary path is not UTF-8")?;
+    run_fabric(
+        &node_a_home,
+        &[
+            "expose",
+            "idle-splice",
+            "--exec",
+            "--max-children",
+            "32",
+            "--",
+            exe,
+            "--ignored",
+            "--exact",
+            "idle_splice_exposed_command",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+    )?;
+
+    let dial_socket = node_b.dial("node-a", "idle-splice").await?;
+    // The command's answer is not read: it writes the answer and goes straight into
+    // the splice, so whether the daemon's first read of the pipe beats the child's
+    // splice to the pipe's lock is a race that this test is not about (and that
+    // only the terminal service's own fix removes). What it checks is that the
+    // sessions exist and the daemon stays healthy around them.
+    let sessions = 12;
+    let mut held = Vec::new();
+    for _ in 0..sessions {
+        let mut stream = UnixStream::connect(&dial_socket).await?;
+        stream.write_all(b"x").await?;
+        held.push(stream);
+    }
+    wait_for_exposed_children(sessions).await?;
+    // Every session is now idle: its child sits in a splice with the pipe locked.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .context("the runtime stopped while idle sessions were open")?;
+
+    // The daemon still answers its own control socket and still starts a new session.
+    let status = tokio::time::timeout(Duration::from_secs(10), async {
+        run_fabric(&node_a_home, &["status"])
+    })
+    .await
+    .context("status did not answer while idle sessions were open")??;
+    assert!(status.contains("version"), "{status}");
+    let mut extra = UnixStream::connect(&dial_socket).await?;
+    extra.write_all(b"x").await?;
+    wait_for_exposed_children(sessions + 1)
+        .await
+        .context("a new session was not started while idle sessions were open")?;
+
+    drop(extra);
+    drop(held);
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    // A stopped daemon leaves none of its exec children behind: one that did could
+    // hold a pipe locked and keep the process from exiting.
+    let remaining = Command::new("pgrep")
+        .args([
+            "-P",
+            &std::process::id().to_string(),
+            "-f",
+            "idle_splice_exposed_command",
+        ])
+        .output()?;
+    assert!(
+        remaining.stdout.is_empty(),
+        "exec children survived the daemon: {}",
+        String::from_utf8_lossy(&remaining.stdout)
+    );
+    finished.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Write, half-close, read to the end: for services that answer once their input ends.
+#[cfg(unix)]
+async fn half_close_round_trip(socket: &PathBuf, payload: &[u8]) -> Result<Vec<u8>> {
+    let mut stream = UnixStream::connect(socket).await?;
+    stream.write_all(payload).await?;
+    stream.shutdown().await?;
+    let mut reply = Vec::new();
+    tokio::time::timeout(LOCAL_IO_TIMEOUT, stream.read_to_end(&mut reply))
+        .await
+        .context("the service never answered after the half-close")??;
+    Ok(reply)
+}
+
+/// A socket exposure with `--peer-header` writes the peer's identity as the first
+/// line, before any byte the peer sends; one without it writes nothing extra, and
+/// a peer cannot forge or suppress the line by sending one of its own.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn socket_expose_peer_header_names_the_peer_before_its_bytes() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let node_a_dir = TempDir::new()?;
+    let node_b_dir = TempDir::new()?;
+    let service_dir = TempDir::new()?;
+    let node_a_home = FabricHome::new(node_a_dir.path());
+    let node_b_home = FabricHome::new(node_b_dir.path());
+    let node_a = FabricNode::start(node_a_home.clone()).await?;
+    let node_b = FabricNode::start(node_b_home.clone()).await?;
+    trust_peer(
+        &node_a_home,
+        &node_a,
+        node_b.id(),
+        Some("node-b"),
+        Some(node_b.addr()),
+    )
+    .await?;
+    trust_peer(
+        &node_b_home,
+        &node_b,
+        node_a.id(),
+        Some("node-a"),
+        Some(node_a.addr()),
+    )
+    .await?;
+
+    // Each service answers with everything it was sent, up to the client's half-close.
+    let mut paths = Vec::new();
+    for name in ["with-header.sock", "without-header.sock"] {
+        let path = service_dir.path().join(name);
+        let listener = UnixListener::bind(&path)?;
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut seen = Vec::new();
+                    let _ = stream.read_to_end(&mut seen).await;
+                    let _ = stream.write_all(&seen).await;
+                });
+            }
+        });
+        paths.push(path);
+    }
+    run_fabric(
+        &node_a_home,
+        &[
+            "expose",
+            "peer-header",
+            "--socket",
+            paths[0].to_str().unwrap(),
+            "--peer-header",
+        ],
+    )?;
+    run_fabric(
+        &node_a_home,
+        &[
+            "expose",
+            "plain-socket",
+            "--socket",
+            paths[1].to_str().unwrap(),
+        ],
+    )?;
+
+    // The exposure is persisted with the option, and survives a config round trip.
+    let config = fs::read_to_string(node_a_home.config_path())?;
+    assert!(config.contains("peer_header = true"), "{config}");
+
+    let forged = b"{\"peer\":\"not-me\",\"name\":\"forged\"}\nreal bytes";
+    let with = node_b.dial("node-a", "peer-header").await?;
+    let reply = half_close_round_trip(&with, forged).await?;
+    let text = String::from_utf8(reply)?;
+    let (first, rest) = text.split_once('\n').context("no header line")?;
+    let header: serde_json::Value = serde_json::from_str(first)?;
+    assert_eq!(header["peer"], node_b.id().to_string());
+    assert_eq!(header["name"], "node-b");
+    assert_eq!(
+        rest.as_bytes(),
+        forged,
+        "the peer's own bytes follow, untouched"
+    );
+
+    let without = node_b.dial("node-a", "plain-socket").await?;
+    let reply = half_close_round_trip(&without, b"just bytes").await?;
+    assert_eq!(reply, b"just bytes");
+
+    node_b.shutdown().await?;
+    node_a.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn separate_peer_and_daemon_configs_restore_on_restart() -> Result<()> {
     let _guard = local_slice_guard().await;
@@ -2015,6 +2303,9 @@ async fn trust_peer(
                 "send-file",
                 "pty-view",
                 "stdio-cat",
+                "idle-splice",
+                "peer-header",
+                "plain-socket",
                 "limited-cat",
                 "bad-exec",
                 "tcp-echo",
