@@ -291,6 +291,10 @@ pub struct PeerReachability {
     /// This peer is expected to disconnect and return.
     #[serde(default)]
     pub roaming: bool,
+    /// This peer only connects here and is never probed. `reachable` then says
+    /// whether it is connected right now.
+    #[serde(default)]
+    pub inbound_only: bool,
     pub reachable: bool,
     pub bytes: Option<usize>,
     pub round_trip_micros: Option<u64>,

@@ -115,6 +115,15 @@ enum Commands {
         /// `fabric join` cannot lift it; remove the peer to undo it.
         #[arg(long = "dial-only", conflicts_with = "allow")]
         dial_only: bool,
+        /// The peer only ever connects to this machine, such as a phone. It is
+        /// served under its `--allow` list when it connects; this machine never
+        /// dials, probes or announces to it, so it is never reported offline.
+        ///
+        /// The opposite direction from `--dial-only`, and the two cannot be
+        /// combined. A later `fabric add` keeps the flag; remove the peer to
+        /// undo it.
+        #[arg(long = "inbound-only", conflicts_with = "dial_only")]
+        inbound_only: bool,
     },
     /// Pair with a machine you can already ssh to: one command, both directions.
     ///
@@ -656,6 +665,10 @@ async fn run(cli: Cli) -> Result<()> {
                         let name = peer.name.clone().unwrap_or_default();
                         let policy = if peer.dial_only {
                             "dial-only".to_string()
+                        } else if peer.inbound_only && peer.allow.is_empty() {
+                            "inbound-only, no services".to_string()
+                        } else if peer.inbound_only {
+                            format!("inbound-only,{}", peer.allow.join(","))
                         } else if peer.allow.is_empty() {
                             "no services".to_string()
                         } else {
@@ -750,6 +763,7 @@ async fn run(cli: Cli) -> Result<()> {
                     addr_json,
                     allow,
                     dial_only,
+                    inbound_only,
                 } => {
                     let id = parse_node_id(&nodeid)?;
                     let addr = parse_addr_json(addr_json.as_deref(), id)?;
@@ -760,9 +774,17 @@ async fn run(cli: Cli) -> Result<()> {
                             book.refuse_grants_for_dial_only(name, allow)?;
                         }
                     }
+                    if dial_only || inbound_only {
+                        book.refuse_opposite_direction(&id.to_string(), inbound_only)?;
+                        if let Some(name) = &name {
+                            book.refuse_opposite_direction(name, inbound_only)?;
+                        }
+                    }
                     warn_if_permissions_would_stop_a_sync(&home, &allow)?;
                     if dial_only {
                         book.add_dial_only(id, name, addr);
+                    } else if inbound_only {
+                        book.add_inbound_only(id, name, addr, allow);
                     } else {
                         book.add_with_allow(id, name, addr, allow);
                     }
@@ -1841,6 +1863,7 @@ mod connection_telemetry_tests {
             id: "node-id".to_string(),
             name: Some("laptop".to_string()),
             roaming: true,
+            inbound_only: false,
             reachable: false,
             bytes: None,
             round_trip_micros: None,
@@ -2549,7 +2572,14 @@ fn print_peer_reachability(peers: &[PeerReachability]) {
 
 fn format_peer_reachability(peer: &PeerReachability) -> String {
     let label = peer.name.as_deref().unwrap_or(&peer.id);
-    if peer.reachable {
+    if peer.inbound_only {
+        let state = if peer.reachable {
+            "connected"
+        } else {
+            "not connected"
+        };
+        format!("{label}\t{}\tinbound-only\t{state}", peer.id)
+    } else if peer.reachable {
         let millis = peer.round_trip_micros.unwrap_or_default() as f64 / 1000.0;
         let transport = peer.transport.as_deref().unwrap_or("unknown");
         format!(

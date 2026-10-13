@@ -120,6 +120,10 @@ pub struct PeerFact {
     pub has_grants: Option<bool>,
     /// This machine may dial the peer and the peer may never use anything here.
     pub dial_only: bool,
+    /// The peer only connects here. This machine never dials or probes it, so
+    /// its reachability is whether it is connected now, and its build is not
+    /// asked for.
+    pub inbound_only: bool,
     /// The peer is dial-only and peers.toml still lists grants for it. They are
     /// ignored; the file contradicts itself.
     pub ignored_grants: bool,
@@ -488,6 +492,21 @@ pub fn diagnose(facts: &Facts) -> Vec<Finding> {
 
 fn peer_finding(peer: &PeerFact) -> Finding {
     let label = &peer.label;
+    if peer.inbound_only {
+        let state = if peer.reachable == Some(true) {
+            "connected now"
+        } else {
+            "not connected now, which is normal"
+        };
+        return Finding::new(
+            "peer",
+            Verdict::Informational,
+            format!(
+                "{label} is inbound-only: it only connects here, so this machine never \
+                 dials or probes it ({state})"
+            ),
+        );
+    }
     let finding = match peer.reachable {
         Some(true) => Finding::new("peer", Verdict::Ok, format!("{label} is reachable")),
         Some(false) => Finding::new(
@@ -555,7 +574,12 @@ fn version_findings(facts: &Facts) -> Vec<Finding> {
     let mut unknown: Vec<&PeerFact> = Vec::new();
     let mut policy_unavailable: Vec<&PeerFact> = Vec::new();
     let mut away: Vec<&PeerFact> = Vec::new();
+    let mut inbound: Vec<&PeerFact> = Vec::new();
     for peer in &facts.peers {
+        if peer.inbound_only {
+            inbound.push(peer);
+            continue;
+        }
         match &peer.version {
             Some(version) if version != &facts.own_version => behind.push(peer),
             Some(_) => {}
@@ -589,14 +613,14 @@ fn version_findings(facts: &Facts) -> Vec<Finding> {
         // reported one unknown peer and nothing else, so a reader could not
         // tell "one of three" from "one of one" — and the reassuring half is
         // the half that says how much of the fleet was actually checked.
-        let known = facts.peers.len() - unknown.len() - policy_unavailable.len() - away.len();
+        let asked = facts.peers.len() - inbound.len();
+        let known = asked - unknown.len() - policy_unavailable.len() - away.len();
         if known > 0 && behind.is_empty() {
             out.push(Finding::new(
                 "versions",
                 Verdict::Ok,
                 format!(
-                    "{known} of {} peers answered, and all of them are on {}",
-                    facts.peers.len(),
+                    "{known} of {asked} peers answered, and all of them are on {}",
                     facts.own_version
                 ),
             ));
@@ -651,11 +675,31 @@ fn version_findings(facts: &Facts) -> Vec<Finding> {
         }
     }
 
-    if behind.is_empty() && unknown.is_empty() && policy_unavailable.is_empty() && away.is_empty() {
+    for peer in &inbound {
+        out.push(Finding::new(
+            "versions",
+            Verdict::Informational,
+            format!(
+                "{} build is not checked: it is inbound-only, so this machine never dials it",
+                peer.label
+            ),
+        ));
+    }
+
+    if behind.is_empty()
+        && unknown.is_empty()
+        && policy_unavailable.is_empty()
+        && away.is_empty()
+        && inbound.len() < facts.peers.len()
+    {
         out.push(Finding::new(
             "versions",
             Verdict::Ok,
-            format!("every peer is on {}", facts.own_version),
+            if inbound.is_empty() {
+                format!("every peer is on {}", facts.own_version)
+            } else {
+                format!("every peer this machine dials is on {}", facts.own_version)
+            },
         ));
     }
     out
@@ -951,6 +995,7 @@ mod tests {
                 has_address: true,
                 has_grants: Some(true),
                 dial_only: false,
+                inbound_only: false,
                 ignored_grants: false,
                 reachable: Some(true),
                 version: Some("0.2.0+abc".to_string()),
@@ -1144,6 +1189,83 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A phone that only dials in is not probed, so "not connected" is not
+    /// "offline", and its build is not asked for. Doctor says so.
+    #[test]
+    fn an_inbound_only_peer_is_information_and_is_never_asked_its_build() {
+        for reachable in [Some(true), Some(false)] {
+            let mut facts = configured();
+            facts.peers[0].inbound_only = true;
+            facts.peers[0].reachable = reachable;
+            facts.peers[0].version = None;
+            facts.peers[0].version_error = None;
+
+            let findings = diagnose(&facts);
+            let peer = find(&findings, "peer");
+            assert_eq!(peer.len(), 1);
+            assert_eq!(peer[0].verdict, Verdict::Informational);
+            assert!(
+                peer[0].detail.contains("inbound-only"),
+                "{}",
+                peer[0].detail
+            );
+            assert!(peer[0].detail.contains("never dials"), "{}", peer[0].detail);
+            assert!(!peer[0].detail.contains("offline"), "{}", peer[0].detail);
+
+            let versions = find(&findings, "versions");
+            assert_eq!(versions.len(), 1, "{versions:?}");
+            assert_eq!(versions[0].verdict, Verdict::Informational);
+            assert!(versions[0].detail.contains("inbound-only"));
+            assert_eq!(exit_code(&findings), 0, "{findings:?}");
+        }
+    }
+
+    #[test]
+    fn an_inbound_only_peer_does_not_hide_a_dialled_peer_on_another_build() {
+        let mut facts = configured();
+        facts.peers[0].version = Some("0.1.0+old".to_string());
+        let mut phone = facts.peers[0].clone();
+        phone.label = "phone".to_string();
+        phone.inbound_only = true;
+        phone.version = None;
+        facts.peers.push(phone);
+
+        let findings = diagnose(&facts);
+        let versions = find(&findings, "versions");
+        assert!(
+            versions
+                .iter()
+                .any(|f| f.verdict == Verdict::Problem && f.detail.contains("vps")),
+            "{versions:?}"
+        );
+        assert_eq!(exit_code(&findings), 1);
+    }
+
+    #[test]
+    fn a_fleet_with_an_inbound_only_peer_does_not_claim_the_phone_was_checked() {
+        let mut facts = configured();
+        let mut phone = facts.peers[0].clone();
+        phone.label = "phone".to_string();
+        phone.inbound_only = true;
+        phone.version = None;
+        facts.peers.push(phone);
+
+        let findings = diagnose(&facts);
+        let versions = find(&findings, "versions");
+        assert!(
+            versions
+                .iter()
+                .any(|f| f.verdict == Verdict::Ok && f.detail.contains("this machine dials")),
+            "{versions:?}"
+        );
+        assert!(
+            !versions
+                .iter()
+                .any(|f| f.detail.contains("every peer is on")),
+            "{versions:?}"
+        );
     }
 
     /// A peer with an empty allow list is a valid choice: this machine knows
@@ -1800,6 +1922,7 @@ mod tests {
             has_address: true,
             has_grants: Some(true),
             dial_only: false,
+            inbound_only: false,
             ignored_grants: false,
             reachable: Some(true),
             version: None,
@@ -1906,7 +2029,8 @@ where
         .map(|peer| {
             let label = peer.name.clone().unwrap_or_else(|| peer.id.clone());
 
-            let (version, version_error) = if peer.reachable {
+            let inbound_only = peer.inbound_only;
+            let (version, version_error) = if peer.reachable && !inbound_only {
                 match peer_version(home, &label) {
                     Ok(version) => (Some(version), None),
                     Err(why) => (None, Some(why)),
@@ -1918,6 +2042,7 @@ where
                 version,
                 version_error,
                 roaming: peer.roaming,
+                inbound_only,
                 // "no address" is how an unreachable peer with nowhere to dial
                 // reports itself; the error text is the only signal we have.
                 has_address: !peer

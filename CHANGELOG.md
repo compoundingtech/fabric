@@ -4,10 +4,18 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+From 1.0.0, [docs/stability.md](docs/stability.md) governs what a release may
+change. Patch releases only fix bugs. A minor release may add commands, flags,
+`--json` fields and error codes, and may change a provisional part. Wire and
+grant semantics, and anything else stable, change only in 2.0. Each entry goes
+under [Unreleased] in Added, Changed, Deprecated, Removed, Fixed or Security.
+An entry that changes a provisional part starts with **Provisional:**. In a
+1.x release, a change to something stable appears only under Added,
+Deprecated, Fixed or Security.
+
 ## [Unreleased]
 
 ### Added
-
 - `fabric-stdio`, a small crate for writing an exec service: `bridge` and
   `serve_stdio` move bytes between a process's stdin/stdout and a socket with
   explicit read, write and flush loops, carry end-of-file both ways (the socket's
@@ -38,7 +46,6 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   `daemon_not_running`, `unknown_peer`, and `invalid_argument` for a bad node
   id, an ambiguous peer name and `expose` arguments. `probe` keeps its exit
   statuses; its `--json` answer gains `code` and `class` fields.
-
 - Close reasons, stream denials and direct-wire Error frames carry the
   `fabric:<code> ` token ahead of the text they always had, so a client can
   tell a refusal from a fault without matching words: both 403 refusals
@@ -50,29 +57,26 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   failed or skipped connection to a peer is `unreachable` or `peer_offline`,
   and a protocol, TCP address or address hint fabric rejects is
   `invalid_argument`.
+- `docs/stability.md`: what is stable, provisional and internal from 1.0.0 on,
+  the rules for patch, minor and major releases, deprecation, and how the
+  CHANGELOG records each kind of change. The README summarizes it.
 
 ### Changed
-
 - A failure's stderr line is now one line, `Error: fabric:<code> <text>`,
   where it used to list each cause on its own `Caused by:` line.
 - `fabric exec` reports a refusal or a failure to start the remote command as
   `Error: fabric:<code> peer "<name>" <text>` (it printed
   `fabric: peer "<name>" <text>`); its exit statuses are unchanged.
 
-### Fixed
-
-- `fabric exec` no longer loses a refusal to a broken pipe. A peer that refuses
-  exec answers and closes the stream without reading the command, so the
-  client's write of the command could fail with `Broken pipe` while the refusal
-  was already waiting to be read. The client reported that write error, exited 1
-  and, under `fabric doctor`, turned a peer that refuses exec by design into an
-  `unknown` build finding that fails the run. The client now reads the answer
-  first and keeps the write error only when nothing answers. An end-to-end test
-  runs `fabric doctor` against a peer that does not grant exec and requires an
-  informational `versions` line; it failed about one run in twenty-five before.
-
-### Changed
-
+- `fabric add --inbound-only` (`inbound_only = true` in `peers.toml`) for a peer
+  that only ever connects here, such as a phone. It is served under its grants
+  when it connects. This machine never dials, probes or announces to it: the
+  liveness loop, the start-up announcement, the network-change checks and
+  `fabric status` leave it alone, so it is never reported offline, and `fabric
+  ping`, `exec`, `shell`, `dial` and sync for it are refused with a message that
+  says why. `fabric status` and `fabric doctor` show it as `inbound-only`,
+  connected or not connected, and doctor does not ask for its build. The flag
+  is the opposite direction from `--dial-only` and cannot be combined with it.
 - `fabric update --url` no longer installs whatever matches the hash. The
   updater runs the staged binary and compares its version with the installed
   one before anything installed changes, as the release-tag path already did:
@@ -85,7 +89,24 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   installs an older one now needs `--allow-downgrade`.
 
 ### Fixed
-
+- `fabric exec` no longer loses a refusal to a broken pipe. A peer that refuses
+  exec answers and closes the stream without reading the command, so the
+  client's write of the command could fail with `Broken pipe` while the refusal
+  was already waiting to be read. The client reported that write error, exited 1
+  and, under `fabric doctor`, turned a peer that refuses exec by design into an
+  `unknown` build finding that fails the run. The client now reads the answer
+  first and keeps the write error only when nothing answers. An end-to-end test
+  runs `fabric doctor` against a peer that does not grant exec and requires an
+  informational `versions` line; it failed about one run in twenty-five before.
+- `fabric exec` no longer loses a refusal to a broken pipe. A peer that refuses
+  exec answers and closes the stream without reading the command, so the
+  client's write of the command could fail with `Broken pipe` while the refusal
+  was already waiting to be read. The client reported that write error, exited 1
+  and, under `fabric doctor`, turned a peer that refuses exec by design into an
+  `unknown` build finding that fails the run. The client now reads the answer
+  first and keeps the write error only when nothing answers. An end-to-end test
+  runs `fabric doctor` against a peer that does not grant exec and requires an
+  informational `versions` line; it failed about one run in twenty-five before.
 - A stopping daemon ends every session and waits (up to two seconds) for the
   exec children bound to them. A child left running holds the pipes its daemon
   read; a daemon thread parked reading a pipe that a sleeping child holds locked
@@ -93,7 +114,6 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   watchdog already killed children before leaving; an ordinary stop did not.
 
 ### Tests
-
 - A daemon-level regression test for the 0.2.40 freeze: a real exposure whose
   command answers with one line and then copies an idle socket into a dup of its
   stdout (a `splice(2)` on Linux), twelve idle sessions held open on a
