@@ -124,9 +124,11 @@ Whether an unavailable peer matters is decided by the active session, route,
 sync, or consuming workload—not by a fleet-wide Fabric health classification.
 A `fabric shell` resumes the same PTY across a short loss and starts a new
 shell in the same terminal when the remote daemon restarted or the loss outlived
-the resume window (see the shell continuity notes under "Local Two-Node Test").
-Daemon sleep/wake self-healing remains open work in
-[issue #21](https://github.com/compoundingtech/fabric/issues/21). A future remote
+the resume window (see the shell notes under [Architecture](#architecture)). After
+a wake or a network change the daemon asks each peer it holds a connection to for
+one echo and resets only a connection that does not answer. What is still open in
+[issue #21](https://github.com/compoundingtech/fabric/issues/21) is a deadline on
+the endpoint's own network-change notice and a real laptop sleep/wake run. A future remote
 st2 PTY attachment composes with this boundary: Fabric transports the stream,
 while st2/PTY owns the PTY child, terminal policy, and lifecycle/expiry.
 
