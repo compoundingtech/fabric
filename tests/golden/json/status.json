@@ -11,6 +11,7 @@
     {
       "error": null,
       "id": "<SERVER_ID>",
+      "inbound_only": false,
       "name": "server",
       "reachable": true,
       "roaming": false,

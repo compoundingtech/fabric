@@ -1576,6 +1576,36 @@ mod json_flag_tests {
         assert!(!cli.json);
     }
 
+    /// `peers --json` carries how each peer is treated, so a program can tell a
+    /// phone that only dials in from a server, and a CI host this machine only
+    /// dials, without reading `peers.toml`.
+    #[test]
+    fn peers_json_says_how_each_peer_is_treated() {
+        let mut book = fabric::config::PeerBook::default();
+        let id = |byte: u8| iroh::SecretKey::from_bytes(&[byte; 32]).public();
+        book.add_inbound_only(id(1), Some("phone".into()), None, Some(vec!["echo".into()]));
+        book.add_dial_only(id(2), Some("ci".into()), None);
+        book.add(id(3), Some("server".into()), None);
+
+        let json = peers_json(book.peers());
+        let by_name = |name: &str| {
+            json["peers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|peer| peer["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_name("phone")["inbound_only"], true);
+        assert_eq!(by_name("phone")["dial_only"], false);
+        assert_eq!(by_name("phone")["allow"], serde_json::json!(["echo"]));
+        assert_eq!(by_name("ci")["dial_only"], true);
+        assert_eq!(by_name("ci")["inbound_only"], false);
+        assert_eq!(by_name("server")["inbound_only"], false);
+        assert_eq!(by_name("server")["dial_only"], false);
+    }
+
     #[test]
     fn json_after_an_exec_command_belongs_to_the_command() {
         let cli = Cli::try_parse_from(["fabric", "exec", "box", "--", "tool", "--json"]).unwrap();
@@ -2316,6 +2346,7 @@ fn peers_json(peers: &[fabric::config::Peer]) -> serde_json::Value {
                 "name": peer.name,
                 "allow": peer.allow,
                 "dial_only": peer.dial_only,
+                "inbound_only": peer.inbound_only,
                 "roaming": peer.roaming,
             })
         })
@@ -2343,6 +2374,7 @@ fn status_json(
                 "id": peer.id,
                 "name": peer.name,
                 "reachable": peer.reachable,
+                "inbound_only": peer.inbound_only,
                 "roaming": peer.roaming,
                 "round_trip_micros": peer.round_trip_micros,
                 "transport": peer.transport,
