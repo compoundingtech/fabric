@@ -53,6 +53,16 @@ Deprecated, Fixed or Security.
 ### Changed
 - A failure's stderr line is now one line, `Error: fabric:<code> <text>`,
   where it used to list each cause on its own `Caused by:` line.
+
+- `fabric add --inbound-only` (`inbound_only = true` in `peers.toml`) for a peer
+  that only ever connects here, such as a phone. It is served under its grants
+  when it connects. This machine never dials, probes or announces to it: the
+  liveness loop, the start-up announcement, the network-change checks and
+  `fabric status` leave it alone, so it is never reported offline, and `fabric
+  ping`, `exec`, `shell`, `dial` and sync for it are refused with a message that
+  says why. `fabric status` and `fabric doctor` show it as `inbound-only`,
+  connected or not connected, and doctor does not ask for its build. The flag
+  is the opposite direction from `--dial-only` and cannot be combined with it.
 - `fabric update --url` no longer installs whatever matches the hash. The
   updater runs the staged binary and compares its version with the installed
   one before anything installed changes, as the release-tag path already did:
@@ -65,6 +75,15 @@ Deprecated, Fixed or Security.
   installs an older one now needs `--allow-downgrade`.
 
 ### Fixed
+- `fabric exec` no longer loses a refusal to a broken pipe. A peer that refuses
+  exec answers and closes the stream without reading the command, so the
+  client's write of the command could fail with `Broken pipe` while the refusal
+  was already waiting to be read. The client reported that write error, exited 1
+  and, under `fabric doctor`, turned a peer that refuses exec by design into an
+  `unknown` build finding that fails the run. The client now reads the answer
+  first and keeps the write error only when nothing answers. An end-to-end test
+  runs `fabric doctor` against a peer that does not grant exec and requires an
+  informational `versions` line; it failed about one run in twenty-five before.
 - `fabric exec` no longer loses a refusal to a broken pipe. A peer that refuses
   exec answers and closes the stream without reading the command, so the
   client's write of the command could fail with `Broken pipe` while the refusal

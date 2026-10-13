@@ -387,6 +387,13 @@ impl PeerConnections {
         }
     }
 
+    /// How many times this manager has started to dial a peer.
+    #[cfg(test)]
+    pub(crate) fn connect_attempts(&self) -> usize {
+        self.mux_connect_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     async fn peer_gate(&self, peer: EndpointId) -> Arc<Mutex<()>> {
         self.peer_gates
             .lock()

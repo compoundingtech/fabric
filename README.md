@@ -461,6 +461,29 @@ drives it with the services it should accept, and nothing else. A machine that
 never needs to dial the CI host should not list it at all, which is stricter
 still: the host is then refused at the handshake like any stranger.
 
+### A peer that only dials in
+
+A phone or a laptop behind a firewall connects to you and is never somewhere
+you can connect to. Without help, fabric probes such a peer every few seconds
+and reports it offline whenever it is not connected:
+
+```sh
+fabric add <phone-nodeid> phone --inbound-only --allow echo,web
+```
+
+`inbound-only` means the peer is served under its `--allow` list when it
+connects, exactly like any other peer, and this machine never dials, probes or
+announces to it. The liveness loop, the network-change checks, the start-up
+announcement and `fabric status` all leave it alone; `status` and `doctor`
+show it as `inbound-only` and connected or not connected, never as offline.
+`fabric ping`, `exec`, `shell`, `dial` and sync for that peer are refused with
+a message that says why, and a sync entry for `peers = "*"` skips it. Its
+build is not checked, because that needs an exec to the peer.
+
+It is the opposite direction from `--dial-only`, and the two cannot be combined
+(`fabric add` refuses the second flag). A later `fabric add` or `fabric join`
+keeps the flag; to undo it, run `fabric remove phone` and add the peer again.
+
 ### Enabling remote shell and exec
 
 Both remote shell (`fabric shell <peer>`) and non-interactive remote exec
