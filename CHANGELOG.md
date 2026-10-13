@@ -4,6 +4,17 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+## [Unreleased]
+
+### Added
+
+- Stable error codes, specified in `docs/errors.md`: a snake_case code for
+  each failure, a class that says what to do about it (`refusal`, `fault` or
+  `usage`), the exit status for each class, the `--json` error object and the
+  `fabric:<code> ` token that close reasons and wire errors will carry ahead of
+  today's text. This adds the `fabric::error` type and the specification;
+  commands, close reasons and `--json` adopt it in the next changes.
+
 ## [0.2.40] - 2026-10-13
 
 ### Fixed
