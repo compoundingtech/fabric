@@ -1,0 +1,11 @@
+{
+  "class": null,
+  "code": null,
+  "error": null,
+  "outcome": "supported",
+  "peer": "server",
+  "peer_id": "<SERVER_ID>",
+  "protocol": "fabric/echo/0",
+  "round_trip_micros": "<MICROS>",
+  "transport": "<TRANSPORT>"
+}

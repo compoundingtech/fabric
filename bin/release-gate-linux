@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# The Linux release gate: run on a real Linux host before a release is tagged.
+#
+# macOS CI cannot see behaviour that only Linux has (an idle terminal attach once
+# parked the whole daemon in splice(2)), so the claims that matter are proved on
+# the host that can fail them:
+#
+#   1. The idle-splice daemon test, several times in a row. Twelve idle splicing
+#      exec sessions on a two-worker runtime must leave the runtime ticking, a
+#      fresh session served and no child behind.
+#   2. The paced socket soak: idle, slow, concurrent and abruptly closed streams
+#      through a socket exposure, with the heartbeat asserted. The default
+#      settings are 4 workers x 250 rounds = 1,000 attach/detach cycles.
+#
+# Usage, from a checkout of the revision to release, on the Linux host:
+#
+#   bin/release-gate-linux [--idle-runs N] [--soak-rounds N] [--soak-pause-ms N]
+#
+# To run it on another machine, copy the source with `fabric send-file` (or
+# `git archive`), unpack it, and run this script there. It builds under `nice`
+# so a shared host stays usable. It prints one line per step and a final PASS or
+# FAIL, writes each step's full output under $FABRIC_GATE_LOG_DIR, and exits
+# non-zero if any step failed. A pass is evidence for the revision it prints.
+
+set -u
+
+idle_runs=5
+soak_rounds=250
+soak_pause_ms=400
+log_dir=${FABRIC_GATE_LOG_DIR:-${TMPDIR:-/var/tmp}/fabric-release-gate-$(date -u +%Y%m%dT%H%M%SZ)}
+
+while [ $# -gt 0 ]; do
+    case $1 in
+    --idle-runs) idle_runs=${2:?--idle-runs needs a number}; shift 2 ;;
+    --soak-rounds) soak_rounds=${2:?--soak-rounds needs a number}; shift 2 ;;
+    --soak-pause-ms) soak_pause_ms=${2:?--soak-pause-ms needs a number}; shift 2 ;;
+    -h | --help)
+        sed -n '2,/^set -u/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
+        exit 0
+        ;;
+    *)
+        echo "release-gate-linux: unknown argument $1" >&2
+        exit 2
+        ;;
+    esac
+done
+
+if [ "$(uname -s)" != Linux ]; then
+    echo "release-gate-linux: this gate proves Linux behaviour; run it on a Linux host" >&2
+    exit 2
+fi
+if [ ! -f Cargo.toml ] || [ ! -d tests ]; then
+    echo "release-gate-linux: run it from the root of a fabric checkout" >&2
+    exit 2
+fi
+
+mkdir -p "$log_dir"
+revision=$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+echo "release gate: fabric $version, revision $revision, $(uname -sr), $(nproc) CPUs, load $(cut -d' ' -f1 /proc/loadavg)"
+echo "logs: $log_dir"
+
+failed=0
+
+step() {
+    # step NAME COMMAND...: run COMMAND, keep its output, report the verdict.
+    local name=$1
+    shift
+    local started=$SECONDS
+    if "$@" >"$log_dir/$name.log" 2>&1; then
+        echo "ok    $name ($((SECONDS - started)) s)"
+    else
+        echo "FAIL  $name ($((SECONDS - started)) s): tail of $log_dir/$name.log"
+        tail -n 25 "$log_dir/$name.log" | sed 's/^/        /'
+        failed=$((failed + 1))
+    fi
+}
+
+cargo_test() {
+    nice -n 10 cargo test --locked -p fabric --test local_slice "$@" -- --test-threads=1 --nocapture
+}
+
+# Build once, quietly, so the timed steps below measure the tests.
+step build nice -n 10 cargo test --locked -p fabric --test local_slice --no-run
+
+for run in $(seq 1 "$idle_runs"); do
+    step "idle-splice-$run" cargo_test exec_expose_idle_splicing_sessions_do_not_stall_the_daemon
+done
+
+step "socket-soak-${soak_rounds}x${soak_pause_ms}ms" env \
+    FABRIC_SOAK_ROUNDS="$soak_rounds" FABRIC_SOAK_PAUSE_MS="$soak_pause_ms" \
+    "$BASH" -c "$(declare -f cargo_test); cargo_test socket_expose_survives_idle_slow_concurrent_and_abrupt_streams"
+
+# A test that passes but leaves a child behind is a failure the test itself
+# should have caught; check anyway, because this is the release gate.
+leftover=$(pgrep -f 'target/debug/deps/local_slice-' | wc -l)
+if [ "$leftover" -ne 0 ]; then
+    echo "FAIL  no-leftover-test-processes: $leftover local_slice process(es) still running"
+    failed=$((failed + 1))
+else
+    echo "ok    no-leftover-test-processes"
+fi
+
+if [ "$failed" -eq 0 ]; then
+    echo "PASS: fabric $version at $revision ($idle_runs idle-splice runs, soak $soak_rounds rounds)"
+else
+    echo "FAIL: $failed step(s) failed for fabric $version at $revision; logs in $log_dir"
+    exit 1
+fi
