@@ -4,6 +4,7 @@ members = [
     "crates/fabric-sync",
     "crates/fabric-service-api",
     "crates/fabric-config",
+    "crates/fabric-stdio",
 ]
 # `cargo build` at the root builds both binaries, which is what the release
 # workflow, the nix package, and a plain checkout expect.

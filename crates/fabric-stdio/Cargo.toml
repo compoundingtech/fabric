@@ -1,0 +1,8 @@
+[package]
+name = "fabric-stdio"
+version = "0.2.40"
+edition = "2024"
+description = "Write an exec service for fabric: bridge a process's stdin and stdout to a socket without std::io::copy"
+repository = "https://github.com/compoundingtech/fabric"
+
+[dependencies]

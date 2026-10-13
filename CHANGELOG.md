@@ -4,6 +4,34 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+## [Unreleased]
+
+### Added
+
+- `fabric-stdio`, a small crate for writing an exec service: `bridge` and
+  `serve_stdio` move bytes between a process's stdin/stdout and a socket with
+  explicit read, write and flush loops, carry end-of-file both ways (the socket's
+  write side is shut down when input ends, output is closed when the socket
+  ends) and never call `std::io::copy`, which on Linux becomes a `splice(2)`
+  that holds a pipe's lock while it waits. Provisional: its API may change in a
+  minor release. A test fails if the crate ever calls `io::copy`.
+- `fabric expose NAME --socket PATH --peer-header` writes one line,
+  `{"peer":"<NodeID>","name":"<local name>"}`, to the service's socket before
+  any byte the peer sends, so a service can attribute a stream. The name is the
+  one in this machine's peers.toml, never anything the peer says; authorization
+  stays with the peer's grant; the option is persisted in config.toml
+  (`peer_header = true`) and off by default, so existing socket exposures do not
+  change.
+
+### Tests
+
+- A daemon-level regression test for the 0.2.40 freeze: a real exposure whose
+  command answers with one line and then copies an idle socket into a dup of its
+  stdout (a `splice(2)` on Linux), twelve idle sessions held open on a
+  two-worker runtime. The runtime must keep ticking, the daemon must answer
+  `status`, and a new session must still be served. It hangs against the code
+  before 0.2.40.
+
 ## [0.2.40] - 2026-10-13
 
 ### Fixed

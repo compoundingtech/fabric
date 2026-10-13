@@ -36,6 +36,9 @@ pub enum ControlRequest {
         socket: PathBuf,
         #[serde(default = "default_persist")]
         persist: bool,
+        /// Send the connecting peer's identity as a first line to the socket.
+        #[serde(default)]
+        peer_header: bool,
     },
     ExposeExec {
         protocol: String,

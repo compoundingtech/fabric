@@ -222,6 +222,11 @@ enum Commands {
         /// Do not write this exposure to config.toml.
         #[arg(long)]
         ephemeral: bool,
+        /// With --socket: write one line `{"peer":"<NodeID>","name":"<local name>"}`
+        /// to the service before any of the peer's own bytes, so the service can
+        /// attribute the stream. Authorization stays with the peer's grant.
+        #[arg(long, requires = "socket")]
+        peer_header: bool,
         /// Command argv for --exec. Use `--` before the command.
         #[arg(
             value_name = "CMD",
@@ -914,6 +919,7 @@ async fn main() -> Result<()> {
                     exec,
                     max_children,
                     ephemeral,
+                    peer_header,
                     command,
                 } => {
                     let exposed_protocol = protocol.clone();
@@ -924,6 +930,7 @@ async fn main() -> Result<()> {
                         exec,
                         max_children,
                         ephemeral,
+                        peer_header,
                         command,
                     )?;
                     send_control(&home, request).await?;
@@ -1299,6 +1306,7 @@ fn expose_request(
     exec: bool,
     max_children: Option<usize>,
     ephemeral: bool,
+    peer_header: bool,
     command: Vec<String>,
 ) -> Result<ControlRequest> {
     let persist = !ephemeral;
@@ -1341,6 +1349,7 @@ fn expose_request(
         protocol,
         socket,
         persist,
+        peer_header,
     })
 }
 

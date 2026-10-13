@@ -66,7 +66,13 @@ pub struct ServerSessionLimits {
 
 #[derive(Debug, Clone)]
 pub enum ServerTarget {
-    UnixSocket(PathBuf),
+    UnixSocket {
+        path: PathBuf,
+        /// Bytes written to the local socket right after connecting and before
+        /// any byte of the peer's: the peer-identity line of a `--peer-header`
+        /// exposure.
+        header: Option<Vec<u8>>,
+    },
     Tcp {
         addr: String,
     },
@@ -2063,13 +2069,23 @@ async fn create_server_session(
     target: ServerTarget,
 ) -> Result<(Arc<TunnelSession>, LocalRead)> {
     match target {
-        ServerTarget::UnixSocket(local_socket) => {
-            let local = UnixStream::connect(&local_socket).await.with_context(|| {
+        ServerTarget::UnixSocket {
+            path: local_socket,
+            header,
+        } => {
+            let mut local = UnixStream::connect(&local_socket).await.with_context(|| {
                 format!(
                     "failed to connect exposed socket {}",
                     local_socket.display()
                 )
             })?;
+            if let Some(header) = header {
+                // Before the session exists, so nothing the peer sends can precede it.
+                local
+                    .write_all(&header)
+                    .await
+                    .context("failed to send the peer header to the exposed socket")?;
+            }
             Ok(TunnelSession::new(session_id, peer_id, local))
         }
         ServerTarget::Tcp { addr } => {
@@ -2688,7 +2704,10 @@ mod tests {
             .get_or_create(
                 session.id(),
                 peer,
-                ServerTarget::UnixSocket(PathBuf::from("/missing")),
+                ServerTarget::UnixSocket {
+                    path: PathBuf::from("/missing"),
+                    header: None,
+                },
                 true,
                 Grant::Trust,
             )
@@ -3056,7 +3075,7 @@ mod tests {
             .get_or_create(
                 session_id(4),
                 peer_id(),
-                ServerTarget::UnixSocket(path),
+                ServerTarget::UnixSocket { path, header: None },
                 false,
                 Grant::Trust,
             )

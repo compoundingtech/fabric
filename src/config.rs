@@ -1293,10 +1293,13 @@ pub struct PersistedExpose {
 }
 
 impl PersistedExpose {
-    pub fn socket(protocol: String, socket: PathBuf) -> Self {
+    pub fn socket(protocol: String, socket: PathBuf, peer_header: bool) -> Self {
         Self {
             protocol,
-            target: PersistedExposeTarget::Socket { socket },
+            target: PersistedExposeTarget::Socket {
+                socket,
+                peer_header,
+            },
         }
     }
 
@@ -1320,6 +1323,10 @@ impl PersistedExpose {
 pub enum PersistedExposeTarget {
     Socket {
         socket: PathBuf,
+        /// Write one line naming the connecting peer to the socket before any of
+        /// the peer's own bytes (`{"peer":"<NodeID>","name":"<local name>"}`).
+        #[serde(default, skip_serializing_if = "is_false")]
+        peer_header: bool,
     },
     Tcp {
         addr: String,
@@ -1532,7 +1539,7 @@ impl FabricConfig {
                 bail!("duplicate expose protocol {:?}", expose.protocol);
             }
             match &expose.target {
-                PersistedExposeTarget::Socket { socket } => {
+                PersistedExposeTarget::Socket { socket, .. } => {
                     if !socket.is_absolute() {
                         bail!("expose {:?} socket path must be absolute", expose.protocol);
                     }
