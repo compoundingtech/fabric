@@ -18,6 +18,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, bail};
+use fabric_config::error::{ErrorCode, FabricError};
 use fabric_config::log_eprintln as eprintln;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId,
@@ -569,9 +570,33 @@ struct TcpDial {
     cancel: CancellationToken,
 }
 
+/// Who is on the other end of a stream, as far as this machine's peer list says.
+struct PeerIdentity {
+    id: EndpointId,
+    name: Option<String>,
+}
+
+/// The line a `--peer-header` socket exposure writes before any client byte:
+/// `{"peer":"<NodeID>","name":"<local name or empty>"}` and a newline. The local
+/// name is the one in this machine's peers.toml, never anything the peer says.
+fn peer_header_line(peer: &PeerIdentity) -> Vec<u8> {
+    let mut line = serde_json::json!({
+        "peer": peer.id.to_string(),
+        "name": peer.name.clone().unwrap_or_default(),
+    })
+    .to_string()
+    .into_bytes();
+    line.push(b'\n');
+    line
+}
+
 #[derive(Debug, Clone)]
 enum Exposure {
-    Socket(PathBuf),
+    Socket {
+        path: PathBuf,
+        /// Write the connecting peer's identity to the socket before its bytes.
+        peer_header: bool,
+    },
     Tcp {
         addr: String,
     },
@@ -582,9 +607,12 @@ enum Exposure {
 }
 
 impl Exposure {
-    fn to_server_target(&self) -> tunnel::ServerTarget {
+    fn to_server_target(&self, peer: &PeerIdentity) -> tunnel::ServerTarget {
         match self {
-            Self::Socket(path) => tunnel::ServerTarget::UnixSocket(path.clone()),
+            Self::Socket { path, peer_header } => tunnel::ServerTarget::UnixSocket {
+                path: path.clone(),
+                header: peer_header.then(|| peer_header_line(peer)),
+            },
             Self::Tcp { addr } => tunnel::ServerTarget::Tcp { addr: addr.clone() },
             Self::Exec { argv, limit } => tunnel::ServerTarget::Exec {
                 argv: argv.clone(),
@@ -609,11 +637,17 @@ fn load_persisted_exposures(
             );
         }
         let exposure = match &expose.target {
-            PersistedExposeTarget::Socket { socket } => {
+            PersistedExposeTarget::Socket {
+                socket,
+                peer_header,
+            } => {
                 if !socket.is_absolute() {
                     bail!("expose socket must be an absolute path");
                 }
-                Exposure::Socket(socket.clone())
+                Exposure::Socket {
+                    path: socket.clone(),
+                    peer_header: *peer_header,
+                }
             }
             PersistedExposeTarget::Tcp { addr } => {
                 validate_tcp_addr(addr)?;
@@ -1294,11 +1328,33 @@ impl DaemonState {
         Ok(())
     }
 
-    pub async fn expose(&self, protocol: &str, socket: PathBuf) -> Result<()> {
-        self.expose_socket(protocol, socket, true).await
+    async fn peer_identity(&self, id: EndpointId) -> PeerIdentity {
+        let name = self
+            .peer_book
+            .read()
+            .await
+            .peers()
+            .iter()
+            .find(|peer| peer.id == id)
+            .and_then(|peer| peer.name.clone());
+        PeerIdentity { id, name }
     }
 
-    async fn expose_socket(&self, protocol: &str, socket: PathBuf, persist: bool) -> Result<()> {
+    pub async fn expose(&self, protocol: &str, socket: PathBuf) -> Result<()> {
+        self.expose_socket(protocol, socket, true, false).await
+    }
+
+    pub async fn expose_with_peer_header(&self, protocol: &str, socket: PathBuf) -> Result<()> {
+        self.expose_socket(protocol, socket, true, true).await
+    }
+
+    async fn expose_socket(
+        &self,
+        protocol: &str,
+        socket: PathBuf,
+        persist: bool,
+        peer_header: bool,
+    ) -> Result<()> {
         let alpn = validate_protocol(protocol)?;
         if matches_reserved_alpn(&self.services, &alpn) {
             bail!("{protocol:?} is reserved for fabric's built-in protocols");
@@ -1312,12 +1368,19 @@ impl DaemonState {
                 config.upsert_expose(PersistedExpose::socket(
                     protocol.to_string(),
                     socket.clone(),
+                    peer_header,
                 ));
             })?;
         }
 
         let mut exposures = self.exposures.write().await;
-        exposures.insert(alpn, Exposure::Socket(socket));
+        exposures.insert(
+            alpn,
+            Exposure::Socket {
+                path: socket,
+                peer_header,
+            },
+        );
         self.current_endpoint()
             .set_alpns(accepted_alpns(&self.services, &exposures));
         Ok(())
@@ -1404,7 +1467,7 @@ impl DaemonState {
     }
 
     pub async fn expose_ephemeral(&self, protocol: &str, socket: PathBuf) -> Result<()> {
-        self.expose_socket(protocol, socket, false).await
+        self.expose_socket(protocol, socket, false, false).await
     }
 
     pub async fn expose_tcp_ephemeral(&self, protocol: &str, addr: String) -> Result<()> {
@@ -2890,9 +2953,7 @@ impl DaemonLease {
 }
 
 pub async fn send_control(home: &FabricHome, request: ControlRequest) -> Result<ControlResponse> {
-    let mut stream = UnixStream::connect(home.control_socket_path())
-        .await
-        .with_context(|| "fabric daemon is not running; run `fabric up` first")?;
+    let mut stream = fabric_config::daemon_control::connect(home).await?;
     let mut raw = serde_json::to_vec(&request)?;
     raw.push(b'\n');
     stream.write_all(&raw).await?;
@@ -2900,8 +2961,8 @@ pub async fn send_control(home: &FabricHome, request: ControlRequest) -> Result<
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await?;
     let response: ControlResponse = serde_json::from_slice(&response)?;
-    if let ControlResponse::Error { message } = response {
-        bail!("{message}");
+    if let ControlResponse::Error { message, fields } = response {
+        return Err(fields.into_error(message));
     }
     Ok(response)
 }
@@ -2936,6 +2997,7 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
 
     state.cancel.cancel();
     close_endpoint_bounded(&state.current_endpoint(), "daemon shutdown").await;
+    stop_exec_children(&state).await;
     let _ = fs::remove_file(control_path);
     let _ = fs::remove_file(sync_ipc_path);
     let dial_sockets: Vec<DialSocket> = state
@@ -2949,6 +3011,33 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
         socket.stop().await;
     }
     Ok(())
+}
+
+/// How long a stopping daemon waits for the exec children it killed to be gone.
+const EXEC_CHILD_STOP_WAIT: Duration = Duration::from_secs(2);
+
+/// End every session and wait, briefly, for the exec children bound to them.
+/// A child that outlives its daemon can hold a pipe locked (a terminal service
+/// idle in `splice(2)` does), and a daemon thread blocked reading that pipe
+/// cannot be killed until the child lets go, which would hang the exit.
+async fn stop_exec_children(state: &Arc<DaemonState>) {
+    state.tunnel_sessions.close_all().await;
+    let limits: Vec<Arc<tunnel::ExecLimit>> = state
+        .exposures
+        .read()
+        .await
+        .values()
+        .filter_map(|exposure| match exposure {
+            Exposure::Exec { limit, .. } => Some(limit.clone()),
+            _ => None,
+        })
+        .collect();
+    let deadline = tokio::time::Instant::now() + EXEC_CHILD_STOP_WAIT;
+    while limits.iter().any(|limit| limit.active_children() > 0)
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 async fn wait_for_close<F>(close: F, bound: Duration) -> bool
@@ -3726,9 +3815,7 @@ async fn handle_control_stream(stream: UnixStream, state: Arc<DaemonState>) {
     .await
     {
         Ok(response) => response,
-        Err(error) => ControlResponse::Error {
-            message: format!("{error:#}"),
-        },
+        Err(error) => ControlResponse::error(&error),
     };
 
     let mut stream = reader.into_inner();
@@ -3777,8 +3864,14 @@ async fn process_control_request(
             protocol,
             socket,
             persist,
+            peer_header,
         } => {
-            if persist {
+            if peer_header {
+                if !persist {
+                    bail!("--peer-header exposures are persisted; drop --ephemeral");
+                }
+                state.expose_with_peer_header(&protocol, socket).await?;
+            } else if persist {
                 state.expose(&protocol, socket).await?;
             } else {
                 state.expose_ephemeral(&protocol, socket).await?;
@@ -3917,16 +4010,17 @@ async fn process_control_request(
             let bytes = match std::fs::metadata(&path) {
                 Ok(meta) => meta.len(),
                 Err(error) => {
-                    return Ok(ControlResponse::Error {
-                        message: format!("could not read {}: {error}", path.display()),
-                    });
+                    return Ok(ControlResponse::error(&anyhow::Error::new(
+                        FabricError::new(
+                            ErrorCode::InvalidArgument,
+                            format!("could not read {}: {error}", path.display()),
+                        ),
+                    )));
                 }
             };
             match services::send_file(&state, &peer, &name, &path).await {
                 Ok(()) => ControlResponse::SentFile { peer, name, bytes },
-                Err(error) => ControlResponse::Error {
-                    message: format!("{error:#}"),
-                },
+                Err(error) => ControlResponse::error(&error),
             }
         }
         ControlRequest::SyncStatus => {
@@ -4314,13 +4408,14 @@ async fn process_incoming_iroh(
         connection.close(0u32.into(), b"fabric tunnel blocked");
         return Ok(());
     }
+    let identity = state.peer_identity(admission.peer()).await;
     let (send, recv) = connection.accept_bi().await?;
     tunnel::serve_connection(
         connection,
         send,
         recv,
         admission,
-        exposure.to_server_target(),
+        exposure.to_server_target(&identity),
         None,
         state.tunnel_sessions.clone(),
         state.tunnel_drop_rx(),
@@ -4549,12 +4644,13 @@ async fn handle_mux_stream(
         let peer = connection.remote_id();
         until_revoked(&admission, handle_sync_stream(peer, send, recv, state)).await?;
     } else if let Some(exposure) = exposure {
+        let identity = state.peer_identity(admission.peer()).await;
         tunnel::serve_connection(
             connection,
             send,
             recv,
             admission,
-            exposure.to_server_target(),
+            exposure.to_server_target(&identity),
             Some(state.peer_connections.clone()),
             state.tunnel_sessions.clone(),
             state.tunnel_drop_rx(),

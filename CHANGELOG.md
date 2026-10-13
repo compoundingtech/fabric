@@ -16,16 +16,77 @@ Deprecated, Fixed or Security.
 ## [Unreleased]
 
 ### Added
-
+- `fabric-stdio`, a small crate for writing an exec service: `bridge` and
+  `serve_stdio` move bytes between a process's stdin/stdout and a socket with
+  explicit read, write and flush loops, carry end-of-file both ways (the socket's
+  write side is shut down when input ends, output is closed when the socket
+  ends) and never call `std::io::copy`, which on Linux becomes a `splice(2)`
+  that holds a pipe's lock while it waits. Provisional: its API may change in a
+  minor release. A test fails if the crate ever calls `io::copy`.
+- `fabric expose NAME --socket PATH --peer-header` writes one line,
+  `{"peer":"<NodeID>","name":"<local name>"}`, to the service's socket before
+  any byte the peer sends, so a service can attribute a stream. The name is the
+  one in this machine's peers.toml, never anything the peer says; authorization
+  stays with the peer's grant; the option is persisted in config.toml
+  (`peer_header = true`) and off by default, so existing socket exposures do not
+  change.
 - Stable error codes, specified in `docs/errors.md`: a snake_case code for
   each failure, a class that says what to do about it (`refusal`, `fault` or
   `usage`), the exit status for each class, the `--json` error object and the
   `fabric:<code> ` token that close reasons and wire errors will carry ahead of
-  today's text. This adds the `fabric::error` type (in `fabric-config`, so the sync companion shares it) and the specification;
-  commands, close reasons and `--json` adopt it in the next changes.
+  today's text. This adds the `fabric::error` type (in `fabric-config`, so the
+  sync companion shares it) and the specification; commands, close reasons and
+  `--json` adopt it in the next changes.
+- `--json` is accepted by every command, before or after it. A failing
+  command now ends with `Error: fabric:<code> <text>` on stderr (the text is
+  unchanged) and exits 77 for a refusal, 69 for a fault, 2 for an argument
+  fabric rejects and 1 for anything without a code yet; with `--json` it also
+  prints the error object on stdout. The daemon's control replies carry the
+  code, so a command reports the code the daemon chose. Codes so far:
+  `daemon_not_running`, `unknown_peer`, and `invalid_argument` for a bad node
+  id, an ambiguous peer name and `expose` arguments. `probe` keeps its exit
+  statuses; its `--json` answer gains a `code` field.
 - `docs/stability.md`: what is stable, provisional and internal from 1.0.0 on,
   the rules for patch, minor and major releases, deprecation, and how the
   CHANGELOG records each kind of change. The README summarizes it.
+
+### Changed
+- A failure's stderr line is now one line, `Error: fabric:<code> <text>`,
+  where it used to list each cause on its own `Caused by:` line.
+- `fabric update --url` no longer installs whatever matches the hash. The
+  updater runs the staged binary and compares its version with the installed
+  one before anything installed changes, as the release-tag path already did:
+  an older build, a build with the same version number but a different commit,
+  the same build again, or a version it cannot compare is refused with
+  `nothing was installed` unless `--allow-downgrade` is given. A new optional
+  `--expect-version VERSION` requires the staged binary to report exactly that
+  version, and `--allow-downgrade` does not waive it. Scripts that update to a
+  newer build keep working unchanged; one that reinstalls the same build or
+  installs an older one now needs `--allow-downgrade`.
+
+### Fixed
+- `fabric exec` no longer loses a refusal to a broken pipe. A peer that refuses
+  exec answers and closes the stream without reading the command, so the
+  client's write of the command could fail with `Broken pipe` while the refusal
+  was already waiting to be read. The client reported that write error, exited 1
+  and, under `fabric doctor`, turned a peer that refuses exec by design into an
+  `unknown` build finding that fails the run. The client now reads the answer
+  first and keeps the write error only when nothing answers. An end-to-end test
+  runs `fabric doctor` against a peer that does not grant exec and requires an
+  informational `versions` line; it failed about one run in twenty-five before.
+- A stopping daemon ends every session and waits (up to two seconds) for the
+  exec children bound to them. A child left running holds the pipes its daemon
+  read; a daemon thread parked reading a pipe that a sleeping child holds locked
+  cannot be killed until the child lets go, so the process could not exit. The
+  watchdog already killed children before leaving; an ordinary stop did not.
+
+### Tests
+- A daemon-level regression test for the 0.2.40 freeze: a real exposure whose
+  command answers with one line and then copies an idle socket into a dup of its
+  stdout (a `splice(2)` on Linux), twelve idle sessions held open on a
+  two-worker runtime. The runtime must keep ticking, the daemon must answer
+  `status`, and a new session must still be served. It hangs against the code
+  before 0.2.40.
 
 ## [0.2.40] - 2026-10-13
 

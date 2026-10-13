@@ -350,8 +350,17 @@ platform and that archive's published hash, both read from github.com:
 tag=v0.2.20
 target=aarch64-apple-darwin   # or x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
 url="https://github.com/compoundingtech/fabric/releases/download/$tag/fabric-$target.tar.gz"
-fabric update --url "$url" --sha256 "$(curl -fsSL "$url.sha256" | cut -d ' ' -f 1)"
+fabric update --url "$url" --sha256 "$(curl -fsSL "$url.sha256" | cut -d ' ' -f 1)" \
+  --expect-version 0.2.20+abc1234
 ```
+
+A hash proves the bytes are the ones you named, not that you named the right
+build. So after the download, and before anything installed changes, `--url`
+runs the staged binary and refuses it unless it is newer than the installed
+one: an older build, the same build or one that cannot be compared stops with
+`nothing was installed`, and `--allow-downgrade` is the explicit override. With
+`--expect-version` the staged binary must also report exactly that version,
+and `--allow-downgrade` never waives that.
 
 From a cloned repo:
 

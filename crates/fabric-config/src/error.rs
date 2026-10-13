@@ -10,6 +10,7 @@
 
 use std::{fmt, str::FromStr};
 
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 /// The token that starts a coded reason: `fabric:<code> <text>`.
@@ -214,33 +215,64 @@ impl std::error::Error for FabricError {}
 
 /// The first [`FabricError`] in the chain, outermost first.
 pub fn find(error: &anyhow::Error) -> Option<&FabricError> {
-    error.chain().find_map(|cause| cause.downcast_ref())
+    error
+        .downcast_ref()
+        .or_else(|| error.chain().find_map(|cause| cause.downcast_ref()))
 }
 
-/// The code a text carries: a `fabric:<code> ` token anywhere in it, or one of
-/// the refusal texts peers sent before codes existed. `None` for text that
-/// carries neither, and for a token naming a code this build does not know.
-pub fn code_in_text(text: &str) -> Option<ErrorCode> {
-    let mut rest = text;
-    while let Some(at) = rest.find(TOKEN_PREFIX) {
-        let after = &rest[at + TOKEN_PREFIX.len()..];
+/// Each `fabric:<code> ` token in a text, as (start, end, code name), with
+/// `end` just past the space. A `fabric://` URL is not a token.
+fn tokens(text: &str) -> Vec<(usize, usize, &str)> {
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(at) = text[from..].find(TOKEN_PREFIX) {
+        let start = from + at;
+        let name_start = start + TOKEN_PREFIX.len();
+        let after = &text[name_start..];
         let name_len = after
             .bytes()
-            .take_while(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+            .take_while(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
             .count();
         let starts_with_letter = after.bytes().next().is_some_and(|b| b.is_ascii_lowercase());
         if starts_with_letter && after[name_len..].starts_with(' ') {
-            return after[..name_len].parse().ok();
+            found.push((start, name_start + name_len + 1, &after[..name_len]));
+            from = name_start + name_len + 1;
+        } else {
+            from = name_start;
         }
-        rest = after;
     }
-    if text.contains("not permitted for service") {
-        Some(ErrorCode::PeerNotPermittedForService)
-    } else if text.contains("node is not in fabric allow-list") {
-        Some(ErrorCode::PeerNotInAllowList)
-    } else {
-        None
+    found
+}
+
+/// The code a text carries: the first `fabric:<code> ` token in it that this
+/// build knows, else one of the refusal texts peers sent before codes existed.
+/// `None` for text that carries neither.
+pub fn code_in_text(text: &str) -> Option<ErrorCode> {
+    tokens(text)
+        .into_iter()
+        .find_map(|(_, _, name)| name.parse().ok())
+        .or_else(|| {
+            if text.contains("not permitted for service") {
+                Some(ErrorCode::PeerNotPermittedForService)
+            } else if text.contains("node is not in fabric allow-list") {
+                Some(ErrorCode::PeerNotInAllowList)
+            } else {
+                None
+            }
+        })
+}
+
+/// The text for people: `text` without the tokens that came with it from
+/// another machine, so a report carries one token, at its start.
+pub fn without_tokens(text: &str) -> String {
+    let mut kept = String::with_capacity(text.len());
+    let mut from = 0;
+    for (start, end, _) in tokens(text) {
+        kept.push_str(&text[from..start]);
+        from = end;
     }
+    kept.push_str(&text[from..]);
+    kept
 }
 
 /// The code of a failure: its [`FabricError`], else a code its text carries
@@ -250,6 +282,50 @@ pub fn code_of(error: &anyhow::Error) -> ErrorCode {
         .map(FabricError::code)
         .or_else(|| code_in_text(&format!("{error:#}")))
         .unwrap_or(ErrorCode::Internal)
+}
+
+/// What the daemon's control socket carries beside a failure's message, so
+/// a command reports the code the daemon chose. Every field is absent in a
+/// reply from a daemon older than codes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorFields {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+}
+
+impl ErrorFields {
+    /// The fields of a failure about to be sent as a reply.
+    pub fn of(error: &anyhow::Error) -> Self {
+        let found = find(error);
+        Self {
+            code: Some(code_of(error).as_str().to_string()),
+            peer: found.and_then(FabricError::peer_name).map(str::to_string),
+            service: found
+                .and_then(FabricError::service_name)
+                .map(str::to_string),
+        }
+    }
+
+    /// The failure a reply reported: its code when this build knows it, else
+    /// one its message carries, else a plain error that reports as `internal`.
+    pub fn into_error(self, message: String) -> anyhow::Error {
+        let code = self
+            .code
+            .as_deref()
+            .and_then(|name| name.parse().ok())
+            .or_else(|| code_in_text(&message));
+        let Some(code) = code else {
+            return anyhow::Error::msg(message);
+        };
+        let mut error = FabricError::new(code, without_tokens(&message));
+        error.peer = self.peer;
+        error.service = self.service;
+        error.into()
+    }
 }
 
 /// What a failed command writes and the status it exits with.
@@ -266,7 +342,7 @@ pub struct Report {
 pub fn render(error: &anyhow::Error, json: bool) -> Report {
     let code = code_of(error);
     let found = find(error);
-    let message = format!("{error:#}");
+    let message = without_tokens(&format!("{error:#}"));
     let stdout = json.then(|| {
         json!({
             "error": {
@@ -384,6 +460,82 @@ mod tests {
             code_in_text("fabric://box/notes: fabric:timeout no answer in 3 s"),
             Some(ErrorCode::Timeout)
         );
+    }
+
+    #[test]
+    fn an_unknown_token_does_not_hide_a_known_one_or_the_old_text() {
+        assert_eq!(
+            code_in_text("fabric:peer_gone it left: fabric:timeout late"),
+            Some(ErrorCode::Timeout)
+        );
+        assert_eq!(
+            code_in_text("fabric:grant_expired peer not permitted for service \"web\""),
+            Some(ErrorCode::PeerNotPermittedForService)
+        );
+    }
+
+    #[test]
+    fn a_report_carries_one_token_at_its_start() {
+        assert_eq!(
+            without_tokens("dial web: fabric:peer_offline peer is offline"),
+            "dial web: peer is offline"
+        );
+        assert_eq!(
+            without_tokens("clone fabric://box/notes: fabric:x_y z"),
+            "clone fabric://box/notes: z"
+        );
+        let error = anyhow::anyhow!(
+            "fabric:peer_not_permitted_for_service peer not permitted for service \"web\""
+        )
+        .context("dial web on box");
+        assert_eq!(
+            render(&error, false).stderr,
+            "Error: fabric:peer_not_permitted_for_service dial web on box: peer not permitted for service \"web\""
+        );
+    }
+
+    #[test]
+    fn a_daemon_reply_keeps_the_code_and_names() {
+        let sent = anyhow::Error::new(
+            FabricError::new(ErrorCode::UnknownPeer, "unknown peer \"box\"").peer("box"),
+        )
+        .context("dial web");
+        let fields = ErrorFields::of(&sent);
+        let wire = serde_json::to_value(&fields).unwrap();
+        assert_eq!(wire, json!({"code": "unknown_peer", "peer": "box"}));
+        let fields: ErrorFields = serde_json::from_value(wire).unwrap();
+        let received = fields.into_error(format!("{sent:#}"));
+        let report = render(&received, true);
+        assert_eq!(report.status, EXIT_FAULT);
+        let object: serde_json::Value = serde_json::from_str(&report.stdout.unwrap()).unwrap();
+        assert_eq!(
+            object,
+            json!({"error": {
+                "code": "unknown_peer",
+                "class": "fault",
+                "message": "dial web: unknown peer \"box\"",
+                "peer": "box",
+                "service": null,
+            }})
+        );
+    }
+
+    #[test]
+    fn a_reply_from_a_daemon_before_codes_still_classifies_refusals() {
+        let old: ErrorFields = serde_json::from_value(json!({})).unwrap();
+        let refused = old.clone().into_error(
+            "connection lost: closed by peer: node is not in fabric allow-list (code 403)".into(),
+        );
+        assert_eq!(code_of(&refused), ErrorCode::PeerNotInAllowList);
+        let other = old.into_error("disk full".into());
+        assert_eq!(code_of(&other), ErrorCode::Internal);
+        // A code a newer daemon knows and this build does not.
+        let newer = ErrorFields {
+            code: Some("grant_expired".into()),
+            ..ErrorFields::default()
+        }
+        .into_error("expired".into());
+        assert_eq!(code_of(&newer), ErrorCode::Internal);
     }
 
     #[test]
