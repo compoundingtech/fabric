@@ -228,6 +228,10 @@ pub enum ControlResponse {
         round_trip_micros: Option<u64>,
         transport: Option<String>,
         error: Option<String>,
+        /// The code of a failed probe, when the daemon knows it; absent from
+        /// daemons before codes and for answers the command classifies itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
     },
     SentFile {
         peer: String,

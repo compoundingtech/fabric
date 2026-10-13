@@ -144,7 +144,7 @@ impl Grants for BookGrants {
             .may(&self.peer, permission)
             .map_err(|denied| Denial {
                 no_grants: matches!(denied, Denied::NoGrants { .. }),
-                reason: denied.to_string(),
+                reason: denied.reason(),
             })
     }
 

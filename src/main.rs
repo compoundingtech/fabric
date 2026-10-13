@@ -1202,9 +1202,14 @@ async fn run(cli: Cli) -> Result<()> {
                             round_trip_micros,
                             transport,
                             error,
+                            code,
                         } => {
                             if json {
-                                let code = probe_outcome_code(&outcome, error.as_deref());
+                                let code = probe_outcome_code(
+                                    &outcome,
+                                    error.as_deref(),
+                                    code.as_deref(),
+                                );
                                 println!(
                                     "{}",
                                     serde_json::json!({
@@ -1630,20 +1635,33 @@ mod json_flag_tests {
 
     #[test]
     fn probe_answers_name_their_code() {
-        assert_eq!(probe_outcome_code("supported", None), None);
+        assert_eq!(probe_outcome_code("supported", None, None), None);
         assert_eq!(
-            probe_outcome_code("unsupported", Some("peer not permitted for service \"web\"")),
+            probe_outcome_code(
+                "unsupported",
+                Some("peer not permitted for service \"web\""),
+                None
+            ),
             Some(ErrorCode::PeerNotPermittedForService)
         );
         assert_eq!(
-            probe_outcome_code("unsupported", Some("alpn negotiation failed")),
+            probe_outcome_code("unsupported", Some("alpn negotiation failed"), None),
             Some(ErrorCode::ServiceNotExposed)
         );
         assert_eq!(
-            probe_outcome_code("unreachable", Some("no path")),
+            probe_outcome_code("unreachable", Some("no path"), None),
             Some(ErrorCode::Unreachable)
         );
-        assert_eq!(probe_outcome_code("timeout", None), Some(ErrorCode::Timeout));
+        assert_eq!(probe_outcome_code("timeout", None, None), Some(ErrorCode::Timeout));
+        // The daemon's code wins over the text, which need not name one.
+        assert_eq!(
+            probe_outcome_code(
+                "unreachable",
+                Some("peer is offline"),
+                Some("peer_offline")
+            ),
+            Some(ErrorCode::PeerOffline)
+        );
     }
 }
 
@@ -2791,11 +2809,17 @@ fn invalid_argument(message: String) -> anyhow::Error {
     FabricError::new(ErrorCode::InvalidArgument, message).into()
 }
 
-/// The error code behind a probe answer other than `supported`. A refusal
-/// carries its code in the error text (or the text older peers send); a
-/// protocol nobody refused is one the peer does not expose.
-fn probe_outcome_code(outcome: &str, error: Option<&str>) -> Option<ErrorCode> {
-    let carried = error.and_then(fabric::error::code_in_text);
+/// The error code behind a probe answer other than `supported`: the one the
+/// daemon sent, else one the error text carries (or the text older peers
+/// send); a protocol nobody refused is one the peer does not expose.
+fn probe_outcome_code(
+    outcome: &str,
+    error: Option<&str>,
+    sent: Option<&str>,
+) -> Option<ErrorCode> {
+    let carried = sent
+        .and_then(|code| code.parse().ok())
+        .or_else(|| error.and_then(fabric::error::code_in_text));
     match outcome {
         "supported" => None,
         "unsupported" => Some(carried.unwrap_or(ErrorCode::ServiceNotExposed)),

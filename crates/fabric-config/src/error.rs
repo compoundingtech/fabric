@@ -539,6 +539,18 @@ mod tests {
     }
 
     #[test]
+    fn a_code_given_as_context_is_found_under_more_context() {
+        let error = anyhow::anyhow!("connection refused")
+            .context(FabricError::new(ErrorCode::Unreachable, "peer is offline"))
+            .context("dial web on box");
+        assert_eq!(code_of(&error), ErrorCode::Unreachable);
+        assert_eq!(
+            render(&error, false).stderr,
+            "Error: fabric:unreachable dial web on box: peer is offline: connection refused"
+        );
+    }
+
+    #[test]
     fn the_texts_older_peers_send_still_classify() {
         assert_eq!(
             code_in_text("closed by peer: peer not permitted for service \"web\" (code 403)"),

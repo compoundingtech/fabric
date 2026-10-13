@@ -67,6 +67,11 @@ in their output instead:
   instead. See [`fabric probe --json`](#fabric-probe---json) below.
 - `fabric doctor` exits 0 to 3 as its help describes.
 - `fabric update --check` exits 0 current, 1 available, 2 error.
+- `fabric dial` does not connect: it resolves the peer and opens a local
+  listener, so it fails only for what it can tell locally (`unknown_peer`,
+  `daemon_not_running`, `invalid_argument`). A refusal or a fault met later
+  surfaces as a closed local connection, with no text. To learn why, run
+  `fabric probe <peer> <service> --json` right after and read its `code`.
 - `fabric sync` subcommands other than `add`, `rm` and `reload` are run by the
   sync companion, which is provisional and does not report codes yet. Their
   own `--json` goes after the subcommand: `fabric sync ls --json`.

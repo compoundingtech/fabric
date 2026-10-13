@@ -45,7 +45,18 @@ Deprecated, Fixed or Security.
   code, so a command reports the code the daemon chose. Codes so far:
   `daemon_not_running`, `unknown_peer`, and `invalid_argument` for a bad node
   id, an ambiguous peer name and `expose` arguments. `probe` keeps its exit
-  statuses; its `--json` answer gains a `code` field.
+  statuses; its `--json` answer gains `code` and `class` fields.
+- Close reasons, stream denials and direct-wire Error frames carry the
+  `fabric:<code> ` token ahead of the text they always had, so a client can
+  tell a refusal from a fault without matching words: both 403 refusals
+  (`peer_not_in_allow_list`, `peer_not_permitted_for_service`, revocations
+  included), `service_not_exposed`, `session_limit_reached`,
+  `session_expired`, `service_unavailable` and `spawn_failed`. A command
+  reports the code the other machine sent, `fabric exec` included, and reads
+  the refusal texts of daemons older than codes as the matching refusal. A
+  failed or skipped connection to a peer is `unreachable` or `peer_offline`,
+  and a protocol, TCP address or address hint fabric rejects is
+  `invalid_argument`.
 - `docs/stability.md`: what is stable, provisional and internal from 1.0.0 on,
   the rules for patch, minor and major releases, deprecation, and how the
   CHANGELOG records each kind of change. The README summarizes it.
@@ -89,6 +100,9 @@ Deprecated, Fixed or Security.
   is replaced by what the updater accepts.
 - A failure's stderr line is now one line, `Error: fabric:<code> <text>`,
   where it used to list each cause on its own `Caused by:` line.
+- `fabric exec` reports a refusal or a failure to start the remote command as
+  `Error: fabric:<code> peer "<name>" <text>` (it printed
+  `fabric: peer "<name>" <text>`); its exit statuses are unchanged.
 
 - `fabric add --inbound-only` (`inbound_only = true` in `peers.toml`) for a peer
   that only ever connects here, such as a phone. It is served under its grants

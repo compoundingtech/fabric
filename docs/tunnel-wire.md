@@ -25,10 +25,14 @@ outside fabric should not speak it.
 3. Connect with the ALPN set to the exposure's name, as given to
    `fabric expose`. A name that is not exposed fails ALPN negotiation.
 4. An untrusted NodeID is closed after the handshake with application code
-   403 and the reason `node is not in fabric allow-list`. A trusted NodeID
-   without the grant is closed with code 403 and a reason that contains
+   403 and the reason
+   `fabric:peer_not_in_allow_list node is not in fabric allow-list`. A
+   trusted NodeID without the grant is closed with code 403 and a reason that
+   starts with `fabric:peer_not_permitted_for_service ` and contains
    `not permitted for service`. Neither of these is a network fault, so a
-   client should not retry them as one.
+   client should not retry them as one. The `fabric:<code> ` token is
+   described in [docs/errors.md](errors.md); daemons before 0.2.41 send the
+   same reasons without it.
 5. Open one bidirectional stream and send a Hello at once. The daemon accepts
    one stream per connection and sees it only once bytes arrive. One local
    connection on the client maps to one iroh connection and one session.
@@ -75,11 +79,14 @@ in each direction.
   the client may see the stream end or the connection close. Both mean the
   same at that point. Send the last Ack before you finish or close anything,
   because a QUIC close discards unsent stream data.
-- An Error answers a Hello: the service could not be reached, the session
-  limit was reached, or a resume named a session the daemon no longer holds.
-  The daemon then ends the stream and, within about a second, the connection.
-  The text is a diagnostic, not part of this contract, and it can contain a
-  path on the exposing machine.
+- An Error answers a Hello: the service could not be reached
+  (`service_unavailable`), its command could not be started (`spawn_failed`),
+  the session limit was reached (`session_limit_reached`), or a resume named a
+  session the daemon no longer holds (`session_expired`). The daemon then ends
+  the stream and, within about a second, the connection. The text starts with
+  `fabric:<code> ` (docs/errors.md), which is part of this contract; the words
+  after it are a diagnostic, and they can contain a path on the exposing
+  machine.
 
 ## Detached sessions and limits
 
@@ -108,5 +115,6 @@ A `fabric reload-peers` that succeeds ends every session the new peer book no
 longer allows, attached or detached. A direct connection whose grant was
 removed is closed with code 403 and the same reason a new connection would
 get (`not permitted for service`, or `node is not in fabric allow-list` for a
-peer that was removed), so a client can treat it as a refusal. A reload that
-fails ends nothing.
+peer that was removed), each after its `fabric:<code> ` token and followed by
+`(access revoked)`, so a client can treat it as a refusal. A reload that fails
+ends nothing.

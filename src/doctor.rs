@@ -1879,6 +1879,18 @@ mod tests {
 
         assert!(matches!(refusal, PeerVersionError::PolicyRefusal(_)));
         assert!(matches!(failure, PeerVersionError::Failed(_)));
+
+        // The error line `fabric exec` prints reads as the sentence alone.
+        let coded = classify_peer_version_failure(
+            Some(fabric_service_api::REFUSED_EXIT_CODE),
+            "",
+            "Error: fabric:peer_not_permitted_for_service peer \"laptop\" refused service \"exec\"",
+        );
+        assert!(matches!(
+            coded,
+            PeerVersionError::PolicyRefusal(reason)
+                if reason == "peer \"laptop\" refused service \"exec\""
+        ));
     }
 
     #[test]
@@ -2196,8 +2208,9 @@ fn classify_peer_version_failure(
         .chain(stdout.lines())
         .map(str::trim)
         .find(|line| !line.is_empty())
-        .unwrap_or("the command failed")
-        .to_string();
+        .unwrap_or("the command failed");
+    // A person reads this; the code is for programs (docs/errors.md).
+    let reason = crate::error::without_tokens(reason.strip_prefix("Error: ").unwrap_or(reason));
     if exit_code == Some(fabric_service_api::REFUSED_EXIT_CODE) {
         PeerVersionError::PolicyRefusal(reason)
     } else {

@@ -228,6 +228,23 @@ impl Denied {
     }
 }
 
+impl Denied {
+    /// The stable code of this refusal (docs/errors.md).
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            Denied::NotTrusted => ErrorCode::PeerNotInAllowList,
+            Denied::NoGrants { .. } | Denied::NotPermitted { .. } => {
+                ErrorCode::PeerNotPermittedForService
+            }
+        }
+    }
+
+    /// The refusal as the wire carries it: `fabric:<code> ` and the sentence.
+    pub fn reason(&self) -> String {
+        self.code().reason(&self.to_string())
+    }
+}
+
 impl std::fmt::Display for Denied {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1716,13 +1733,15 @@ pub fn validate_server_session_config(
 
 pub fn validate_tcp_addr(addr: &str) -> Result<()> {
     if addr.trim().is_empty() {
-        bail!("tcp address cannot be empty");
+        return Err(invalid_argument("tcp address cannot be empty".into()));
     }
     if addr.bytes().any(|byte| byte == 0 || byte == b'\n') {
-        bail!("tcp address cannot contain NUL or newline bytes");
+        return Err(invalid_argument(
+            "tcp address cannot contain NUL or newline bytes".into(),
+        ));
     }
     if !addr.contains(':') {
-        bail!("tcp address must be HOST:PORT");
+        return Err(invalid_argument("tcp address must be HOST:PORT".into()));
     }
     Ok(())
 }
@@ -1741,32 +1760,41 @@ pub fn parse_addr_json(addr: Option<&str>, expected: EndpointId) -> Result<Optio
     let Some(addr) = addr else {
         return Ok(None);
     };
-    let parsed: EndpointAddr =
-        serde_json::from_str(addr).context("address hints must be EndpointAddr JSON")?;
+    let parsed: EndpointAddr = serde_json::from_str(addr).map_err(|error| {
+        invalid_argument(format!("address hints must be EndpointAddr JSON: {error}"))
+    })?;
     if parsed.id != expected {
-        bail!(
+        return Err(invalid_argument(format!(
             "address hint id {} does not match node id {}",
-            parsed.id,
-            expected
-        );
+            parsed.id, expected
+        )));
     }
     Ok(Some(parsed))
 }
 
 pub fn validate_protocol(protocol: &str) -> Result<Vec<u8>> {
     if protocol.is_empty() {
-        bail!("protocol cannot be empty");
+        return Err(invalid_argument("protocol cannot be empty".into()));
     }
     if protocol.len() > 255 {
         bail!("protocol ALPN is too long; keep it at 255 bytes or less");
     }
     if protocol.bytes().any(|byte| byte == 0 || byte == b'\n') {
-        bail!("protocol cannot contain NUL or newline bytes");
+        return Err(invalid_argument(
+            "protocol cannot contain NUL or newline bytes".into(),
+        ));
     }
     if protocol.starts_with("git/") {
-        bail!("the git/ protocol namespace is reserved for Fabric Git remotes");
+        return Err(invalid_argument(
+            "the git/ protocol namespace is reserved for Fabric Git remotes".into(),
+        ));
     }
     Ok(protocol.as_bytes().to_vec())
+}
+
+/// An argument fabric rejects: `invalid_argument` (docs/errors.md).
+fn invalid_argument(message: String) -> anyhow::Error {
+    FabricError::new(ErrorCode::InvalidArgument, message).into()
 }
 
 #[cfg(test)]
@@ -2291,6 +2319,29 @@ mod tests {
             .to_string(),
             "peer not permitted for service \"web\""
         );
+    }
+
+    /// On the wire each refusal carries its code ahead of the same sentence.
+    #[test]
+    fn a_refusal_names_its_code_ahead_of_its_sentence() {
+        assert_eq!(
+            Denied::NotTrusted.reason(),
+            "fabric:peer_not_in_allow_list peer is not trusted by this node"
+        );
+        for denied in [
+            Denied::NotPermitted {
+                service: "web".into(),
+            },
+            Denied::NoGrants {
+                service: "web".into(),
+            },
+        ] {
+            assert_eq!(denied.code(), ErrorCode::PeerNotPermittedForService);
+            assert_eq!(
+                denied.reason(),
+                format!("fabric:peer_not_permitted_for_service {denied}")
+            );
+        }
     }
 
     /// Re-adding a peer to update its address must not silently widen what it
