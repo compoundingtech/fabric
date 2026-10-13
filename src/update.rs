@@ -414,6 +414,46 @@ fn enforce_release_direction(
     Ok(())
 }
 
+/// Decide whether a build named only by its URL and hash may replace the
+/// installed one, from what the staged binary says it is.
+///
+/// A release tag promises a version, and the updater compares it with the
+/// installed one before it downloads anything. A URL promises nothing, so the
+/// same two checks wait until the staged binary has answered `--version`:
+/// `expect_version`, when the caller names one, must match exactly, and the
+/// build must be newer than the installed one unless `allow_downgrade` is set.
+/// A hash proves the bytes are the ones the caller named, not that the caller
+/// named the right build.
+fn check_explicit_build(
+    installed: &str,
+    staged: &str,
+    expect_version: Option<&str>,
+    allow_downgrade: bool,
+) -> Result<()> {
+    if let Some(expected) = expect_version
+        && staged != expected
+    {
+        bail!(
+            "the artifact reports {staged} but --expect-version names {expected}; \
+             nothing was installed"
+        );
+    }
+    match release_direction(installed, staged) {
+        Ok(ReleaseDirection::Upgrade) => Ok(()),
+        Ok(ReleaseDirection::Current) if allow_downgrade => Ok(()),
+        Ok(ReleaseDirection::Current) => bail!(
+            "refusing to replace {installed} with {staged}: that build is already installed. \
+             Pass --allow-downgrade to reinstall it explicitly; nothing was installed"
+        ),
+        Ok(direction) => enforce_release_direction(installed, staged, direction, allow_downgrade),
+        Err(_) if allow_downgrade => Ok(()),
+        Err(error) => Err(error.context(format!(
+            "cannot prove that {staged} is newer than {installed}. \
+             Pass --allow-downgrade to replace it explicitly; nothing was installed"
+        ))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Everything below touches the network, the filesystem or the service manager.
 // ---------------------------------------------------------------------------
@@ -1450,6 +1490,10 @@ pub struct UpdateOptions {
     pub no_restart: bool,
     pub rollback: bool,
     pub allow_downgrade: bool,
+    /// The exact version the staged binary must report, such as
+    /// `0.2.41+abc1234`. A mismatch stops the update before anything installed
+    /// changes.
+    pub expect_version: Option<String>,
 }
 
 /// Run an update. Returns the process exit code, which only `--check` uses for
@@ -1611,6 +1655,44 @@ pub async fn run(home: &crate::config::FabricHome, options: UpdateOptions) -> Re
         bail!(
             "the release claims to be {expected} but the binary in it reports \
              {staged_version}; nothing was installed"
+        );
+    }
+
+    // A release tag was compared before the download. A URL names no version,
+    // so the staged binary is what answers here, still before anything
+    // installed changes (and in a dry run too).
+    let explicit = matches!(source, Source::Explicit { .. });
+    let explicit_check = if explicit {
+        check_explicit_build(
+            &installed,
+            &staged_version,
+            options.expect_version.as_deref(),
+            options.allow_downgrade,
+        )
+    } else if let Some(expected) = options.expect_version.as_deref()
+        && staged_version != expected
+    {
+        Err(anyhow::anyhow!(
+            "the artifact reports {staged_version} but --expect-version names {expected}; \
+             nothing was installed"
+        ))
+    } else {
+        Ok(())
+    };
+    if let Err(error) = explicit_check {
+        let _ = std::fs::remove_file(&staged);
+        if let Some(path) = &staged_companion {
+            let _ = std::fs::remove_file(path);
+        }
+        return Err(error);
+    }
+    if explicit
+        && options.allow_downgrade
+        && self::release_direction(&installed, &staged_version)
+            .is_ok_and(|direction| direction != ReleaseDirection::Upgrade)
+    {
+        eprintln!(
+            "WARNING: replacing {installed} with {staged_version} because --allow-downgrade was set"
         );
     }
 
@@ -2269,6 +2351,86 @@ mod tests {
         assert!(message.contains("0.2.0+7f4da21"));
         assert!(message.contains("0.2.0+593a3f7"));
         assert!(message.contains("--allow-downgrade"));
+    }
+
+    const INSTALLED: &str = "0.2.12+addb212";
+
+    fn explicit(staged: &str, expect: Option<&str>, allow: bool) -> Result<()> {
+        check_explicit_build(INSTALLED, staged, expect, allow)
+    }
+
+    #[test]
+    fn an_explicit_url_may_install_a_newer_build() {
+        explicit("0.2.13+1234567", None, false).expect("an upgrade was refused");
+    }
+
+    #[test]
+    fn an_explicit_url_refuses_an_older_build_and_says_how_to_override() {
+        let error = explicit("0.2.11+7f4da21", None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(INSTALLED) && error.contains("0.2.11+7f4da21"),
+            "{error}"
+        );
+        assert!(error.contains("is older than"), "{error}");
+        assert!(error.contains("--allow-downgrade"), "{error}");
+        assert!(error.contains("nothing was installed"), "{error}");
+        explicit("0.2.11+7f4da21", None, true).expect("the override was refused");
+    }
+
+    #[test]
+    fn an_explicit_url_refuses_the_build_that_is_already_installed() {
+        let error = explicit(INSTALLED, None, false).unwrap_err().to_string();
+        assert!(error.contains("already installed"), "{error}");
+        assert!(error.contains("--allow-downgrade"), "{error}");
+        explicit(INSTALLED, None, true).expect("the override was refused");
+    }
+
+    #[test]
+    fn an_explicit_url_refuses_a_build_that_never_shipped_as_that_version() {
+        let error = explicit("0.2.12+0000000", None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not contain"), "{error}");
+        explicit("0.2.12+0000000", None, true).expect("the override was refused");
+    }
+
+    #[test]
+    fn an_explicit_url_that_cannot_be_compared_is_refused_unless_overridden() {
+        for staged in ["unknown", "0.2.13", "dev+abc1234"] {
+            let error = explicit(staged, None, false).unwrap_err().to_string();
+            assert!(error.contains("cannot prove"), "{staged}: {error}");
+            assert!(error.contains("--allow-downgrade"), "{staged}: {error}");
+            explicit(staged, None, true).expect("the override was refused");
+        }
+    }
+
+    #[test]
+    fn expect_version_must_match_exactly_whatever_the_direction() {
+        let upgrade = "0.2.13+1234567";
+        explicit(upgrade, Some(upgrade), false).expect("a match was refused");
+
+        for expected in ["0.2.13+7654321", "0.2.14+1234567", "0.2.13", ""] {
+            let error = explicit(upgrade, Some(expected), false)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("--expect-version"), "{expected}: {error}");
+            assert!(error.contains(upgrade), "{expected}: {error}");
+            assert!(
+                error.contains("nothing was installed"),
+                "{expected}: {error}"
+            );
+            // The override is about direction. It never waives an exact match.
+            assert!(explicit(upgrade, Some(expected), true).is_err());
+        }
+    }
+
+    #[test]
+    fn expect_version_does_not_replace_the_direction_check() {
+        let older = "0.2.11+7f4da21";
+        assert!(explicit(older, Some(older), false).is_err());
+        explicit(older, Some(older), true).expect("a named downgrade was refused");
     }
 
     #[test]

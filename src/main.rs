@@ -362,9 +362,17 @@ enum Commands {
         /// Put the most recent rollback binary back and restart.
         #[arg(long, conflicts_with_all = ["tag", "url", "check", "dry_run", "allow_downgrade"])]
         rollback: bool,
-        /// Permit a release that is older than or diverges from this build.
+        /// Permit a release that is older than or diverges from this build, or
+        /// reinstall the same one. An artifact named by --url is compared with
+        /// this build after it is downloaded and before anything changes.
         #[arg(long)]
         allow_downgrade: bool,
+        /// The exact version the artifact must report, for example
+        /// `0.2.41+abc1234`. A different build stops the update with the
+        /// installed binary untouched. The SHA-256 proves the bytes are the ones
+        /// you named; this proves you named the build you meant.
+        #[arg(long, value_name = "VERSION", conflicts_with = "rollback")]
+        expect_version: Option<String>,
     },
     /// Internal/debug commands for transport testing.
     #[command(hide = true)]
@@ -1227,6 +1235,7 @@ async fn run(cli: Cli) -> Result<()> {
                     no_restart,
                     rollback,
                     allow_downgrade,
+                    expect_version,
                 } => {
                     let result = update::run(
                         &home,
@@ -1239,6 +1248,7 @@ async fn run(cli: Cli) -> Result<()> {
                             no_restart,
                             rollback,
                             allow_downgrade,
+                            expect_version,
                         },
                     )
                     .await;

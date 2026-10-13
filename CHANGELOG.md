@@ -42,6 +42,19 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   runs `fabric doctor` against a peer that does not grant exec and requires an
   informational `versions` line; it failed about one run in twenty-five before.
 
+### Changed
+
+- `fabric update --url` no longer installs whatever matches the hash. The
+  updater runs the staged binary and compares its version with the installed
+  one before anything installed changes, as the release-tag path already did:
+  an older build, a build with the same version number but a different commit,
+  the same build again, or a version it cannot compare is refused with
+  `nothing was installed` unless `--allow-downgrade` is given. A new optional
+  `--expect-version VERSION` requires the staged binary to report exactly that
+  version, and `--allow-downgrade` does not waive it. Scripts that update to a
+  newer build keep working unchanged; one that reinstalls the same build or
+  installs an older one now needs `--allow-downgrade`.
+
 ## [0.2.40] - 2026-10-13
 
 ### Fixed
