@@ -13,7 +13,7 @@ An entry that changes a provisional part starts with **Provisional:**. In a
 1.x release, a change to something stable appears only under Added,
 Deprecated, Fixed or Security.
 
-## [Unreleased]
+## [0.2.41] - 2026-10-13
 
 ### Added
 - `fabric-stdio`, a small crate for writing an exec service: `bridge` and

@@ -12,7 +12,7 @@ default-members = [".", "crates/fabric-sync"]
 
 [package]
 name = "fabric"
-version = "0.2.40"
+version = "0.2.41"
 edition = "2024"
 description = "Local socket facade for iroh-backed cross-machine transports"
 repository = "https://github.com/compoundingtech/fabric"
