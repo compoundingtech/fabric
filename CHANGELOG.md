@@ -50,6 +50,13 @@ Deprecated, Fixed or Security.
   the rules for patch, minor and major releases, deprecation, and how the
   CHANGELOG records each kind of change. The README summarizes it.
 
+- `--json` success output for the commands other programs parse: `id`,
+  `peers`, `status`, `dial` (`{"socket"}`, or `{"address"}` with `--tcp`),
+  `expose`, `unexpose`, `send-file` and `reload-peers`, each one object on
+  stdout and nothing else; `addr` was JSON already and is unchanged. The shapes
+  are in `docs/json-output.md` and pinned by golden files in
+  `tests/golden/json/`, so changing one fails a test.
+
 ### Changed
 - A failure's stderr line is now one line, `Error: fabric:<code> <text>`,
   where it used to list each cause on its own `Caused by:` line.

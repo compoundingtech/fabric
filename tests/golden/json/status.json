@@ -1,0 +1,26 @@
+{
+  "dial_handlers": {
+    "active": 0,
+    "max": 32
+  },
+  "dial_sockets": [],
+  "endpoint_addr": "<ENDPOINT_ADDR>",
+  "exposed_protocols": [],
+  "node_id": "<CLIENT_ID>",
+  "peers": [
+    {
+      "error": null,
+      "id": "<SERVER_ID>",
+      "name": "server",
+      "reachable": true,
+      "roaming": false,
+      "round_trip_micros": "<MICROS>",
+      "transport": "<TRANSPORT>"
+    }
+  ],
+  "sync_runtime": {
+    "companion": "<SYNC>",
+    "owner": "<SYNC>"
+  },
+  "version": "<VERSION>"
+}
