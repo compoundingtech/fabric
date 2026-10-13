@@ -41,6 +41,13 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Changed
 
+- README, Commands: `probe`, `send-file`, `doctor`, `update`, `exec`, `ca` and
+  `cert` were not documented; they are now, with the exit statuses and the inbox
+  path checked against the binary. `fabric ping` and `fabric status` say they need
+  an `echo` grant, `--json` is described once for every command, and the claim
+  that `config.toml` stores shell policy (false since format 2, where each
+  peer's `allow` list holds it) is gone.
+
 - A failure's stderr line is now one line, `Error: fabric:<code> <text>`,
   where it used to list each cause on its own `Caused by:` line.
 
