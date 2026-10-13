@@ -1041,6 +1041,21 @@ async fn exec_expose_idle_splicing_sessions_do_not_stall_the_daemon() -> Result<
     drop(held);
     node_b.shutdown().await?;
     node_a.shutdown().await?;
+    // A stopped daemon leaves none of its exec children behind: one that did could
+    // hold a pipe locked and keep the process from exiting.
+    let remaining = Command::new("pgrep")
+        .args([
+            "-P",
+            &std::process::id().to_string(),
+            "-f",
+            "idle_splice_exposed_command",
+        ])
+        .output()?;
+    assert!(
+        remaining.stdout.is_empty(),
+        "exec children survived the daemon: {}",
+        String::from_utf8_lossy(&remaining.stdout)
+    );
     finished.store(true, Ordering::SeqCst);
     Ok(())
 }

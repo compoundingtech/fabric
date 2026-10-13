@@ -2998,6 +2998,7 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
 
     state.cancel.cancel();
     close_endpoint_bounded(&state.current_endpoint(), "daemon shutdown").await;
+    stop_exec_children(&state).await;
     let _ = fs::remove_file(control_path);
     let _ = fs::remove_file(sync_ipc_path);
     let dial_sockets: Vec<DialSocket> = state
@@ -3011,6 +3012,33 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
         socket.stop().await;
     }
     Ok(())
+}
+
+/// How long a stopping daemon waits for the exec children it killed to be gone.
+const EXEC_CHILD_STOP_WAIT: Duration = Duration::from_secs(2);
+
+/// End every session and wait, briefly, for the exec children bound to them.
+/// A child that outlives its daemon can hold a pipe locked (a terminal service
+/// idle in `splice(2)` does), and a daemon thread blocked reading that pipe
+/// cannot be killed until the child lets go, which would hang the exit.
+async fn stop_exec_children(state: &Arc<DaemonState>) {
+    state.tunnel_sessions.close_all().await;
+    let limits: Vec<Arc<tunnel::ExecLimit>> = state
+        .exposures
+        .read()
+        .await
+        .values()
+        .filter_map(|exposure| match exposure {
+            Exposure::Exec { limit, .. } => Some(limit.clone()),
+            _ => None,
+        })
+        .collect();
+    let deadline = tokio::time::Instant::now() + EXEC_CHILD_STOP_WAIT;
+    while limits.iter().any(|limit| limit.active_children() > 0)
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 async fn wait_for_close<F>(close: F, bound: Duration) -> bool

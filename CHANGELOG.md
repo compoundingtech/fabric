@@ -23,6 +23,14 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   (`peer_header = true`) and off by default, so existing socket exposures do not
   change.
 
+### Fixed
+
+- A stopping daemon ends every session and waits (up to two seconds) for the
+  exec children bound to them. A child left running holds the pipes its daemon
+  read; a daemon thread parked reading a pipe that a sleeping child holds locked
+  cannot be killed until the child lets go, so the process could not exit. The
+  watchdog already killed children before leaving; an ordinary stop did not.
+
 ### Tests
 
 - A daemon-level regression test for the 0.2.40 freeze: a real exposure whose

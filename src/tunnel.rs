@@ -1754,6 +1754,20 @@ impl ServerSessionStore {
         }
     }
 
+    /// Close every session, which kills every exec child bound to one. Used when
+    /// the daemon stops: a child left running holds the pipes its daemon read,
+    /// and a daemon thread parked reading such a pipe keeps the process from
+    /// exiting until the child is gone.
+    pub async fn close_all(&self) {
+        let sessions: Vec<Arc<TunnelSession>> = {
+            let mut guard = self.inner.lock().await;
+            guard.drain().map(|(_, session)| session).collect()
+        };
+        for session in sessions {
+            session.close_for_eviction().await;
+        }
+    }
+
     async fn remove_session(&self, session: &Arc<TunnelSession>) {
         session.close_for_eviction().await;
         let mut sessions = self.inner.lock().await;
