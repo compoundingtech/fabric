@@ -4,6 +4,15 @@ All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
 EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
+From 1.0.0, [docs/stability.md](docs/stability.md) governs what a release may
+change. Patch releases only fix bugs. A minor release may add commands, flags,
+`--json` fields and error codes, and may change a provisional part. Wire and
+grant semantics, and anything else stable, change only in 2.0. Each entry goes
+under [Unreleased] in Added, Changed, Deprecated, Removed, Fixed or Security.
+An entry that changes a provisional part starts with **Provisional:**. In a
+1.x release, a change to something stable appears only under Added,
+Deprecated, Fixed or Security.
+
 ## [Unreleased]
 
 ### Added
@@ -14,6 +23,9 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
   `fabric:<code> ` token that close reasons and wire errors will carry ahead of
   today's text. This adds the `fabric::error` type (in `fabric-config`, so the sync companion shares it) and the specification;
   commands, close reasons and `--json` adopt it in the next changes.
+- `docs/stability.md`: what is stable, provisional and internal from 1.0.0 on,
+  the rules for patch, minor and major releases, deprecation, and how the
+  CHANGELOG records each kind of change. The README summarizes it.
 
 ## [0.2.40] - 2026-10-13
 

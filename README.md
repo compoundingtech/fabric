@@ -9,6 +9,38 @@ Consumer tools do not link to iroh, know NodeAddr formats, or open QUIC streams.
 They ask fabric for a local socket connected to a remote service, then speak their
 own protocol over that socket.
 
+## Stability
+
+From 1.0.0, each part of fabric is stable, provisional or internal.
+[docs/stability.md](docs/stability.md) lists exactly what is in each level and
+the rules every 1.x release follows.
+
+- **Stable**, unchanged in meaning until 2.0:
+  - identity and the trust model;
+  - `peers.toml` grants;
+  - `expose` and `dial`;
+  - the direct exposure wire ([docs/tunnel-wire.md](docs/tunnel-wire.md));
+  - `fabric://` Git URLs;
+  - the commands programs drive, with their `--json` output and error codes
+    ([docs/errors.md](docs/errors.md)).
+- **Provisional**, which may change in a minor release with a CHANGELOG note:
+  - file sync;
+  - `fabric-stdio`;
+  - the conveniences around the core: `shell`, `join`, `ca`, `cert`,
+    `service`, and `restart`.
+- **Internal**, which may change in any release:
+  - the daemon-to-daemon framing (`fabric/mux/2`);
+  - the control socket;
+  - `telemetry.json`;
+  - log event names;
+  - human-readable output;
+  - the update machinery;
+  - the Rust crates as libraries.
+
+In a 1.x release, wire and grant semantics do not change; that waits for 2.0.
+New commands, flags and `--json` fields arrive in minor releases. Patch
+releases only fix bugs.
+
 ## Adopt Fabric On Two Machines
 
 Install the same fabric release on both macOS or Linux machines:
