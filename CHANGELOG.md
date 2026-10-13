@@ -41,6 +41,12 @@ EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
 
 ### Changed
 
+- README, sync and architecture: the workspace is five crates, not two; the sync
+  bridge is how the companion runs in production, not a bridge "no production
+  request selects"; the exec and shell sections no longer carry before-and-after
+  measurements and notes about what an earlier README claimed, which belong in
+  this file. The behaviour they described is unchanged.
+
 - A failure's stderr line is now one line, `Error: fabric:<code> <text>`,
   where it used to list each cause on its own `Caused by:` line.
 

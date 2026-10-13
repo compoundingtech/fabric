@@ -475,10 +475,7 @@ code. A process the command leaves running in the background keeps running, but
 it does not keep `fabric exec` alive: the exit frame follows the command's last
 output after a 200 ms grace, and anything the background process writes to the
 inherited pipes after that is not forwarded. Redirect its output on the remote
-side if you need it. Measured on a two-daemon pair on 2026-09-16, the client
-returned 0.23 s after a command that left a `sleep 15 &` behind, against 17.4 s
-before the change; live on the fleet the same shape cost 5.08 s for a
-`sleep 5 &` before the change, when the `sleep` closed the pipes.
+side if you need it.
 
 **Gotcha — the remote shell runs in the daemon's session, not your login
 session.** `fabric shell` spawns the shell as a child of the remote fabric daemon.
@@ -1205,13 +1202,16 @@ The sync engine receives explicit config and state paths instead of the daemon
 home. It holds `<home>/sync/owner.lock` for its lifetime, so a second engine
 fails before it reads or changes the same state.
 
-The repository is a Cargo workspace of two crates that ship together. The
-core `fabric` crate is the daemon and CLI; of file sync it keeps only what the
-daemon needs to authorize and forward sync streams and to report status: the
-`syncs.toml` config and its validation, the `fabric sync` staging commands, the
-local bridge, the wire framing with the unavailable reply, and a few shared
-definitions. The `fabric-sync` crate (`crates/fabric-sync`) is the engine and
-the supervised companion process: the manifest algebra, a node's durable state,
+The repository is a Cargo workspace whose daemon and sync companion ship
+together. The core `fabric` crate is the daemon and CLI; of file sync it keeps
+only what the daemon needs to authorize and forward sync streams and to report
+status: the `syncs.toml` config and its validation, the `fabric sync` staging
+commands, the local bridge, the wire framing with the unavailable reply, and a
+few shared definitions. `fabric-config` holds the definitions the two share,
+`fabric-service-api` the interface a built-in service implements, and
+`fabric-stdio` (provisional) a bridge for writing an exec service. The
+`fabric-sync` crate (`crates/fabric-sync`) is the engine and the supervised
+companion process: the manifest algebra, a node's durable state,
 the wire sessions, the folder watchers and passes, the state lease, and the
 runtime that attaches to the daemon over the bridge. The daemon never builds
 the engine; the companion owns sync. It takes the state lease, watches the
@@ -1229,7 +1229,7 @@ peer lookups and outbound stream requests; the companion's
 publish. Both check a nonce the daemon mints per process and hands the
 companion over the control socket, with the daemon's node id as the sync
 author. Control messages are bounded and versioned, then a stream carries raw
-`fabric/sync/1` bytes. No production request selects this bridge yet.
+`fabric/sync/1` bytes.
 
 `fabric status`, `fabric sync ls`, and `fabric doctor` report the sync owner and
 companion state. `fabric sync ls` reads `syncs.toml` when the daemon is down. It
@@ -1257,9 +1257,8 @@ sync only ever touches already-trusted peers — it adds no new trust surface.
 - `catalog` — union, newer-wins, and **a delete propagates**: a file present on
   any peer is present on all peers, and a file deleted on any peer is deleted on
   all peers. Tombstones are retained and never swept, so a delete cannot
-  un-stick. Fabric does NOT restore a local deletion. It did until August 2026,
-  and this README said so; that behaviour is gone, and git is the safety net for
-  a file somebody still wanted.
+  un-stick. Fabric does NOT restore a local deletion; git is the safety net for a
+  file somebody still wanted.
 - `bus` — union, newer-wins, and a delete propagates as a versioned tombstone.
   Tombstones are retained by default. Sweeping them is opt-in: set
   `FABRIC_TOMBSTONE_SWEEP_DAYS` in the daemon's environment, and only an entry
@@ -1891,11 +1890,6 @@ cap — 256 MiB at the default of 64 sessions.
 Backpressure, not this TTL, is what bounds a runaway remote process. The TTL
 bounds how long a session lives, not how much it holds.
 
-> An earlier version of this section said the replay buffer had no cap, that a
-> runaway shell would reach roughly 17 MB across this window, and that the TTL
-> was the only backstop. All three were wrong. The "no cap" claim was also the
-> stated reason not to raise the TTL further, so that reason no longer applies.
-
 Past the window, the client does not retry a session the server has already
 refused: it reports `remote shell could not resume` and names the expired
 session. Restarting the remote daemon has the same effect, because the session
@@ -1907,10 +1901,7 @@ session was lost is replaced, in the same raw terminal: the client says
 `starting a new shell`, asks its local daemon for a new session to the same
 peer (and keeps asking once a second if that daemon is itself restarting), and
 announces `new remote shell ... is ready` when the fresh PTY first answers.
-Measured on a two-daemon pair on 2026-09-16, a held shell whose remote daemon
-restarted was back at a fresh prompt 1.98 to 2.02 s after the restart (3 runs);
-before this change the command exited with code 1 after 1.19 to 1.32 s (3
-runs) and the person retyped it. Bytes typed between the loss and the first
+Bytes typed between the loss and the first
 answer are discarded and counted, never replayed: the new shell has a different
 working directory and history from the one they were meant for. Ctrl-C while
 disconnected ends the command with code 130. The replacement is bounded: if no
