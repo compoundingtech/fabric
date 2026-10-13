@@ -1768,6 +1768,72 @@ async fn exec_exits_when_the_command_exits_even_if_a_background_child_holds_its_
     Ok(())
 }
 
+/// A peer that refuses exec by policy is a configuration, not a fault: doctor
+/// says its build is unavailable and does not call the fleet unhealthy for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doctor_reports_an_exec_refusing_peer_build_as_information() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let server_dir = TempDir::new()?;
+    let client_dir = TempDir::new()?;
+    let server_home = FabricHome::new(server_dir.path());
+    let client_home = FabricHome::new(client_dir.path());
+    let server = FabricNode::start(server_home.clone()).await?;
+    let client = FabricNode::start(client_home.clone()).await?;
+
+    let mut server_book = PeerBook::load(&server_home)?;
+    server_book.add_with_allow(
+        client.id(),
+        Some("client".into()),
+        Some(client.addr()),
+        Some(vec!["echo".into()]),
+    );
+    server_book.save(&server_home)?;
+    server.state().reload_peers().await?;
+    trust_peer(
+        &client_home,
+        &client,
+        server.id(),
+        Some("server"),
+        Some(server.addr()),
+    )
+    .await?;
+    assert_eq!(client.ping("server").await?.bytes, 32);
+
+    let output = tokio::time::timeout(
+        FABRIC_COMMAND_TIMEOUT,
+        tokio::process::Command::new(fabric_bin())
+            .arg("--home")
+            .arg(client_home.root())
+            .arg("doctor")
+            .output(),
+    )
+    .await
+    .context("fabric doctor timed out")??;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let versions: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.contains(" versions "))
+        .collect();
+    assert_eq!(versions.len(), 1, "doctor output: {stdout}");
+    assert!(
+        versions[0].starts_with("info "),
+        "an exec refusal was not informational: {stdout}"
+    );
+    assert!(
+        versions[0].contains("server") && versions[0].contains("does not serve exec"),
+        "the line did not name the peer and the reason: {stdout}"
+    );
+    assert!(
+        !stdout.lines().any(|line| line.starts_with("unknown ")),
+        "an exec refusal was reported as unknown: {stdout}"
+    );
+
+    client.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_file_remains_authoritative_when_daemon_config_is_created() -> Result<()> {
     let _guard = local_slice_guard().await;
