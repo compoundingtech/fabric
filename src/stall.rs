@@ -264,7 +264,17 @@ pub fn describe_thread_wait(task: &std::path::Path) -> Option<String> {
         let shown = holders
             .iter()
             .take(8)
-            .map(|(pid, state, name, fds)| format!("{pid}:{state}/{name} fds={fds}"))
+            .map(|(pid, state, name, fds)| {
+                let wait = std::fs::read_to_string(format!("/proc/{pid}/wchan"))
+                    .map(|text| text.trim().to_string())
+                    .unwrap_or_default();
+                let wait = if wait.is_empty() || wait == "0" {
+                    "-"
+                } else {
+                    wait.as_str()
+                };
+                format!("{pid}:{state}/{name} fds={fds} wchan={wait}")
+            })
             .collect::<Vec<_>>()
             .join(" ");
         line.push_str(&format!(" held-by=[{shown}]"));
@@ -343,6 +353,49 @@ pub fn stuck_thread_waits() -> String {
 
 #[cfg(not(target_os = "linux"))]
 pub fn stuck_thread_waits() -> String {
+    String::new()
+}
+
+/// What each direct child of this process is, as `/proc` shows it: the command
+/// line it carries, where it waits and which system call it is in. A forked
+/// child that has not yet executed still carries this program's own command
+/// line; one that has executed carries the command it was started for. That
+/// tells a spawn waiting on a slow exec from one waiting on a command that has
+/// already started.
+#[cfg(target_os = "linux")]
+pub fn child_details() -> String {
+    let me = std::process::id();
+    let mut lines = Vec::new();
+    for (pid, state, _) in children_of(me, &all_processes()).into_iter().take(8) {
+        let read = |file: &str| {
+            std::fs::read_to_string(format!("/proc/{pid}/{file}"))
+                .map(|text| text.trim().to_string())
+                .unwrap_or_default()
+        };
+        let cmdline: String = read("cmdline")
+            .replace('\0', " ")
+            .chars()
+            .take(100)
+            .collect();
+        let wchan = read("wchan");
+        let wchan = if wchan.is_empty() || wchan == "0" {
+            "-".to_string()
+        } else {
+            wchan
+        };
+        let syscall = parse_syscall(&read("syscall")).map_or("-".to_string(), |(number, first)| {
+            format!("{number}({first:#x})")
+        });
+        lines.push(format!(
+            "{pid}:{state} cmdline=\"{}\" wchan={wchan} syscall={syscall}",
+            cmdline.trim()
+        ));
+    }
+    format!("child-details=[{}]", lines.join("; "))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn child_details() -> String {
     String::new()
 }
 
@@ -548,10 +601,11 @@ fn machine_view() -> String {
         .unwrap_or_default();
     let children = summarize_children(&own_name, &children_of(me, &all_processes()));
     format!(
-        "pressure(10s/60s): {pressure} | own-cgroup: {throttling} | {} | {children} | {} | {}",
+        "pressure(10s/60s): {pressure} | own-cgroup: {throttling} | {} | {children} | {} | {} | {}",
         summarize_blocked(&stats),
         stuck_thread_waits(),
-        fabric_service_api::child_spawn::in_flight()
+        fabric_service_api::child_spawn::in_flight(),
+        child_details()
     )
 }
 
@@ -1084,6 +1138,34 @@ mod tests {
     #[test]
     fn the_stuck_thread_report_is_part_of_the_machine_view() {
         assert!(machine_view().contains("stuck-threads=["));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_child_is_described_by_its_command_line_and_wait() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep");
+        // The child may still be the forked copy of this test for a moment.
+        let mut details = String::new();
+        for _ in 0..200 {
+            details = child_details();
+            if details.contains("cmdline=\"sleep 30\"") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(details.contains("cmdline=\"sleep 30\""), "{details}");
+        assert!(details.contains("wchan="), "{details}");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn child_details_are_empty_where_proc_is_not_available() {
+        assert_eq!(child_details(), "");
     }
 
     #[cfg(target_os = "linux")]
