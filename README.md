@@ -36,9 +36,15 @@ remote shell and exec remain separate, default-deny target-side capabilities.
 Exchange those NodeIDs over a trusted channel. Trust machine B on machine A:
 
 ```sh
-fabric add <machine-b-node-id> machine-b
+fabric add <machine-b-node-id> machine-b --allow echo
 fabric up
 ```
+
+`--allow` lists the services this machine lets that peer use. `echo` is the
+built-in service that `fabric ping` and the reachability check in `fabric status`
+use; a peer with no `echo` grant is refused, and `fabric status` then lists it
+as offline even though it is up. Add other services (`shell`, `exec`, `sync`,
+an exposed name) only when you mean to.
 
 `fabric add` is only a convenience writer. Automated or image-based installs
 can deploy the complete authorized-keys file instead; see
@@ -47,12 +53,13 @@ can deploy the complete authorized-keys file instead; see
 Trust machine A on machine B:
 
 ```sh
-fabric add <machine-a-node-id> machine-a
+fabric add <machine-a-node-id> machine-a --allow echo
 fabric up
 ```
 
 Trust is deliberately mutual: each daemon accepts connections only from NodeIDs
-in its own allow-list. Verify the connection from either machine:
+in its own allow-list, and each side grants the other what it may use. Verify
+the connection from either machine:
 
 ```sh
 fabric status
@@ -60,7 +67,8 @@ fabric ping machine-b
 ```
 
 Run `fabric ping machine-a` on machine B. A successful check prints `pong`, the
-round-trip latency, and the active transport path when iroh reports it. The two
+round-trip latency, and the active transport path when iroh reports it. `fabric
+ping machine-b` works only because machine B granted machine A `echo`. The two
 daemons are now connected and ready for `fabric expose`, `fabric dial`, or the
 explicitly enabled remote shell.
 
@@ -148,9 +156,12 @@ What each side grants is separate, because ssh access is one-directional:
 
 - `--allow shell,exec` (the default) is what the far machine lets **this**
   machine use, which is what an ssh login already amounts to. Add `sync` or an
-  exposed name deliberately.
+  exposed name deliberately. The default does not include `echo`, so `fabric
+  ping` and `fabric status` cannot reach that machine until you add it:
+  `--allow shell,exec,echo`.
 - `--grant` is what this machine lets the **far** machine use; the default is
-  nothing, because being able to ssh somewhere never let it reach you.
+  nothing, because being able to ssh somewhere never let it reach you. The far
+  machine's own `fabric ping` and `fabric status` need `--grant echo`.
 
 A join is safe to repeat: without `--allow` or `--grant`, a peer either side
 already knows keeps the grants it has. `--name` sets the name the far side
@@ -186,8 +197,8 @@ Get each existing peer's NodeID by running `fabric id` on it (or ask whoever run
 it). Then, on the new machine:
 
 ```sh
-fabric add <DESKTOP_NODEID> desktop
-fabric add <SERVER_NODEID>  server
+fabric add <DESKTOP_NODEID> desktop --allow echo
+fabric add <SERVER_NODEID>  server  --allow echo
 fabric reload-peers
 ```
 
@@ -197,7 +208,7 @@ Using the new machine's NodeID from step 1, run this **on the desktop and on eve
 other existing peer**:
 
 ```sh
-fabric add <NEW_NODEID> laptop
+fabric add <NEW_NODEID> laptop --allow echo
 fabric reload-peers
 ```
 
@@ -206,7 +217,7 @@ new machine to it **without SSH**, from any machine that already has exec access
 to it:
 
 ```sh
-fabric exec server -- ~/.local/bin/fabric add <NEW_NODEID> laptop
+fabric exec server -- ~/.local/bin/fabric add <NEW_NODEID> laptop --allow echo
 fabric exec server -- ~/.local/bin/fabric reload-peers
 ```
 
@@ -221,9 +232,11 @@ fabric ping server                # prints pong + latency + transport (direct/re
 fabric exec server -- echo ok     # if that peer enables exec; prints ok, exit 0
 ```
 
-If `ping`/`status` shows a peer unreachable, the usual cause is one-sided trust —
-confirm BOTH the new machine and that peer ran `fabric add` **and**
-`fabric reload-peers`. Reachability may start on `relay` and upgrade to `direct`
+If `ping`/`status` shows a peer unreachable, the usual causes are one-sided trust
+— confirm BOTH the new machine and that peer ran `fabric add` **and**
+`fabric reload-peers` — or a missing `echo` grant on the peer being pinged
+(`fabric ping` then fails with `not permitted for service "echo"`, and
+`fabric status` shows the peer as offline). Reachability may start on `relay` and upgrade to `direct`
 within a few seconds as iroh hole-punches.
 
 ## Build
@@ -374,8 +387,7 @@ starts a per-user LaunchAgent. The service runs the foreground daemon directly a
 `fabric --home <home> daemon`; it does not run `fabric up`. No memory ceiling
 is set unless you pass `--memory-max-mb`. Fabric declares none by default,
 because a healthy working set has not been measured, and a ceiling nobody chose
-kills the daemon at a number nobody chose. (This README used to say the default
-was 1 GiB. It was not.)
+kills the daemon at a number nobody chose.
 
 On macOS, every command that `fabric exec` runs counts as the daemon's for
 privacy permissions (Desktop, Documents, Downloads, Photos, local network).
@@ -522,15 +534,14 @@ Download a release asset directly, verify it against that asset's published
 renames. A release archive contains exactly two members named literal `fabric`
 and `fabric-sync` (not dot-prefixed paths). Verify that shape before extracting:
 
-The process-extraction plan defines one fabric-only transition release before
-the first paired deployment. That gated reader release is the only exception.
-The updater accepts that one-member shape and the paired shape. It rejects all
-other member sets. A one-member install removes an installed companion and
-keeps both prior binaries for rollback.
+The updater accepts two archive shapes and rejects every other member set: the
+pair, `fabric` and `fabric-sync`, and a single `fabric` member. A one-member
+install removes an installed companion and keeps both prior binaries for
+rollback.
 
-Current releases publish the pair at `fabric-<target>.tar.gz`. Release `0.2.4`
-also publishes `fabric-only-<target>.tar.gz` for a strict one-member reader.
-That compatibility asset requires `fabric update --url ... --sha256 ...`.
+Releases publish the pair at `fabric-<target>.tar.gz`. Release `0.2.4` also
+published `fabric-only-<target>.tar.gz` for a strict one-member reader, which an
+installed build could take only through `fabric update --url ... --sha256 ...`.
 
 `fabric update` arms a detached verifier before it replaces either binary. On
 macOS, launchd owns a transient one-shot job across terminal loss and system
@@ -545,7 +556,7 @@ bytes equal the installed pair installs nothing and restarts nothing.
 ```sh
 set -eu
 
-tag='v0.2.0+a0478a6'
+tag='v0.2.40'   # the release to install
 case "$(uname -s):$(uname -m)" in
   Darwin:arm64) target='aarch64-apple-darwin' ;;
   Linux:x86_64) target='x86_64-unknown-linux-gnu' ;;
@@ -579,8 +590,10 @@ if [ "$members" != "$(printf 'fabric\nfabric-sync')" ]; then
   exit 1
 fi
 tar -xzf "$download_dir/$asset" -C "$download_dir"
-test "$("$download_dir/fabric" --version)" = "${tag#v}"
-test "$("$download_dir/fabric-sync" --version)" = "${tag#v}"
+# A binary reports `<version>+<short commit>`; older tags carried the commit too.
+version_ok() { case "$1" in "${tag#v}"|"${tag#v}"+*) return 0 ;; *) return 1 ;; esac; }
+version_ok "$("$download_dir/fabric" --version)"
+version_ok "$("$download_dir/fabric-sync" --version)"
 
 # Confirm this is the exact path in launchd/systemd ExecStart before replacing it.
 fabric_path="${FABRIC_BIN_PATH:-$(command -v fabric)}"
