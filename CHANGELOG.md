@@ -66,6 +66,15 @@ Deprecated, Fixed or Security.
   an `echo` grant, `--json` is described once for every command, and the claim
   that `config.toml` stores shell policy (false since format 2, where each
   peer's `allow` list holds it) is gone.
+- README, install and join steps: the quick start now grants `echo` on both
+  sides, because `fabric ping` and the reachability check in `fabric status` use
+  it and a peer without that grant is refused and listed as offline; the join
+  steps say the same about `--allow shell,exec` (which omits `echo`). The manual
+  upgrade script compared `fabric --version` with the bare tag, which aborts for
+  every release since tags dropped the commit suffix (`0.2.40+a2ca935` is not
+  `0.2.40`); it now accepts the version with its suffix and was run against the
+  published 0.2.40 archive. A stale paragraph about a planned transition release
+  is replaced by what the updater accepts.
 - A failure's stderr line is now one line, `Error: fabric:<code> <text>`,
   where it used to list each cause on its own `Caused by:` line.
 
