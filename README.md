@@ -26,6 +26,7 @@ the rules every 1.x release follows.
 - **Provisional**, which may change in a minor release with a CHANGELOG note:
   - file sync;
   - `fabric-stdio`;
+  - `fabric expose --peer-header`;
   - the conveniences around the core: `shell`, `join`, `ca`, `cert`,
     `service`, and `restart`.
 - **Internal**, which may change in any release:

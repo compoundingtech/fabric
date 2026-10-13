@@ -29,7 +29,7 @@ Deprecated, Fixed or Security.
   one in this machine's peers.toml, never anything the peer says; authorization
   stays with the peer's grant; the option is persisted in config.toml
   (`peer_header = true`) and off by default, so existing socket exposures do not
-  change.
+  change. Provisional: the line's format may change in a minor release.
 - Stable error codes, specified in `docs/errors.md`: a snake_case code for
   each failure, a class that says what to do about it (`refusal`, `fault` or
   `usage`), the exit status for each class, the `--json` error object and the
@@ -49,6 +49,8 @@ Deprecated, Fixed or Security.
 - `docs/stability.md`: what is stable, provisional and internal from 1.0.0 on,
   the rules for patch, minor and major releases, deprecation, and how the
   CHANGELOG records each kind of change. The README summarizes it.
+  `inbound_only` is part of the stable trust model and `--peer-header` is
+  provisional.
 
 - `--json` success output for the commands other programs parse: `id`,
   `peers`, `status`, `dial` (`{"socket"}`, or `{"address"}` with `--tcp`),
