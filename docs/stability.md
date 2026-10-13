@@ -17,7 +17,7 @@ Anything this page does not name is internal.
 | Area | What exactly |
 | --- | --- |
 | Identity | A NodeID is the public half of the machine's ed25519 key. The `identity.toml` format. `fabric key gen` and `fabric id`. |
-| Trust and grants | `peers.toml`: each peer's `id`, `name`, `allow` and `dial_only`. A grant is the full service name, matched exactly, and an unlisted service is refused. An untrusted NodeID is refused. `fabric reload-peers` ends every session the new file no longer allows. `fabric add`, `fabric remove`, `fabric peers`. |
+| Trust and grants | `peers.toml`: each peer's `id`, `name`, `allow`, `dial_only` and `inbound_only`. A grant is the full service name, matched exactly, and an unlisted service is refused. An untrusted NodeID is refused. An inbound-only peer is never dialled or probed by this machine. `fabric reload-peers` ends every session the new file no longer allows. `fabric add` (with `--allow`, `--dial-only` and `--inbound-only`), `fabric remove`, `fabric peers`. |
 | Exposures and dials | `fabric expose` (a Unix socket, a TCP address or `--exec` command), `fabric unexpose`, `fabric dial` (a Unix socket, or `--tcp`), `fabric undial`. A service name is its ALPN. Persisted exposures and dials come back after a restart. |
 | The direct exposure wire | Everything in [docs/tunnel-wire.md](tunnel-wire.md): admission, the frame layout, Hello, Data, Ack, Close and Error, resume, the limits and their defaults, and the 403 refusals with their reasons. |
 | Git over fabric | `fabric://<peer>/<remote>` URLs, the grants `git/<remote>/read` and `git/<remote>/write`, and `fabric git share`, `unshare`, `grant` and `revoke`. |
