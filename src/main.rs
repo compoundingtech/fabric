@@ -634,6 +634,7 @@ async fn run(cli: Cli) -> Result<()> {
                             current_connection_health,
                             active_dial_handlers,
                             max_dial_handlers,
+                            dial_restore_failures,
                         } => {
                             let sync_runtime = match send_control(
                                 &home,
@@ -657,6 +658,7 @@ async fn run(cli: Cli) -> Result<()> {
                                     &peers,
                                     (active_dial_handlers, max_dial_handlers),
                                     &sync_runtime,
+                                    &dial_restore_failures,
                                 ))?;
                                 return Ok(());
                             }
@@ -674,6 +676,7 @@ async fn run(cli: Cli) -> Result<()> {
                                 &current_connection_health,
                                 (active_dial_handlers, max_dial_handlers),
                                 &sync_runtime,
+                                &dial_restore_failures,
                             )?;
                         }
                         response => bail!("unexpected daemon response: {response:?}"),
@@ -2385,6 +2388,7 @@ fn status_json(
     peers: &[PeerReachability],
     dial_handlers: (usize, usize),
     sync_runtime: &SyncRuntimeStatus,
+    dial_restore_failures: &[fabric::control::DialRestoreFailure],
 ) -> serde_json::Value {
     let peers: Vec<_> = peers
         .iter()
@@ -2408,6 +2412,7 @@ fn status_json(
         "endpoint_addr": endpoint_addr,
         "exposed_protocols": exposed_protocols,
         "dial_sockets": dial_sockets,
+        "dial_restore_failures": dial_restore_failures,
         "dial_handlers": { "active": dial_handlers.0, "max": dial_handlers.1 },
         "sync_runtime": { "owner": sync_runtime.owner, "companion": sync_runtime.companion },
         "peers": peers,
@@ -2429,6 +2434,7 @@ fn print_status(
     current_connection_health: &BTreeMap<String, fabric::mux::CurrentConnectionHealth>,
     dial_handlers: (usize, usize),
     sync_runtime: &SyncRuntimeStatus,
+    dial_restore_failures: &[fabric::control::DialRestoreFailure],
 ) -> Result<()> {
     println!("version\t{version}");
     println!("node\t{node_id}");
@@ -2439,6 +2445,12 @@ fn print_status(
         .map(|path| path.display().to_string())
         .collect();
     println!("dials\t{}", joined_or_dash(&dials));
+    for failure in dial_restore_failures {
+        println!(
+            "dial restore failed\t{}\t{}\tfabric:{} {}",
+            failure.peer, failure.protocol, failure.code, failure.error
+        );
+    }
     // Shell, exec and every dial share these. When all are held, a new one
     // waits with no error, which reads as "hangs while ping answers".
     let (active, max) = dial_handlers;

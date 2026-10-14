@@ -147,6 +147,18 @@ fn default_persist() -> bool {
     true
 }
 
+/// A configured listener skipped at daemon startup. The declaration remains
+/// in config so it can be retried after its path or port is repaired.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DialRestoreFailure {
+    pub peer: String,
+    pub protocol: String,
+    pub tcp: Option<String>,
+    pub code: String,
+    pub class: String,
+    pub error: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlResponse {
@@ -193,6 +205,8 @@ pub enum ControlResponse {
         active_dial_handlers: usize,
         #[serde(default)]
         max_dial_handlers: usize,
+        #[serde(default)]
+        dial_restore_failures: Vec<DialRestoreFailure>,
     },
     Restarting {
         log: PathBuf,
@@ -542,6 +556,7 @@ mod tests {
             )]),
             active_dial_handlers: 0,
             max_dial_handlers: 32,
+            dial_restore_failures: Vec::new(),
         };
 
         let bytes = serde_json::to_vec(&response)

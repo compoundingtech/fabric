@@ -13,6 +13,15 @@ An entry that changes a provisional part starts with **Provisional:**. In a
 1.x release, a change to something stable appears only under Added,
 Deprecated, Fixed or Security.
 
+## [Unreleased]
+
+### Fixed
+- A failed Unix dial never saves a listener declaration. Socket paths that exceed
+  the platform's limit report `fabric:invalid_argument` and the maximum home
+  length before binding. One saved listener that cannot be restored (including
+  an occupied TCP port) no longer prevents the daemon from starting; human
+  status and `status --json` report it in `dial_restore_failures` (#297).
+
 ## [0.2.41] - 2026-10-13
 
 ### Added
