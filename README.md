@@ -1150,6 +1150,30 @@ Detached sessions can be evicted to admit new ones before their 900-second
 retention period ends; evicted sessions cannot resume. Raising the caps allows
 more live sessions but increases the possible memory use.
 
+Relay candidates can be set with a root-level `relays` array in `config.toml`:
+
+```toml
+relays = ["https://relay.example/"]
+```
+
+Omitting `relays` keeps the n0 defaults. `relays = []` disables relay transport
+and leaves direct IP transport enabled. The list is read at daemon startup;
+restart after editing it. Endpoint recovery keeps that startup selection.
+`status --json` shows `relays {source, urls}` (`default`, `custom` or `disabled`)
+for the running daemon, rather than the current file or a relay liveness probe.
+
+These are home-relay candidates. Peers using different sets can still connect
+by direct IP or by contacting a peer's advertised home relay if it is reachable
+and admits them; the lists need not overlap. A dial can contact that advertised
+relay even if it is outside its own list. To measure an owned relay, configure
+both peers to use it and verify the connection's actual path.
+
+The [n0 public relays](https://www.iroh.computer/blog/shared-relays) are
+rate-limited and best-effort. A deployment that needs sustained relay throughput
+runs its own `iroh-relay`. Use an HTTP or HTTPS relay URL (without credentials,
+query or fragment); this setting does not add relay authentication tokens.
+Trust and exact service grants still decide who can open an application stream.
+
 Generic dial listeners share a queue per peer, across Unix/TCP listeners and
 protocols. Each dialing daemon allows 16 active sessions per peer and bounds
 outstanding connections to 144 (16 active plus 128 waiting). New connections

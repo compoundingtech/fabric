@@ -232,6 +232,14 @@ async fn every_json_command_prints_one_stable_object() -> Result<()> {
     let mut status_value: Value = serde_json::from_str(ok(&status)?.trim())?;
     assert_eq!(status_value["peers"][0]["reachable"], true);
     status_value["endpoint_addr"] = "<ENDPOINT_ADDR>".into();
+    assert_eq!(status_value["relays"]["source"], "default");
+    assert!(
+        !status_value["relays"]["urls"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    status_value["relays"]["urls"] = "<RELAY_URLS>".into();
     normaliser.check("status", &serde_json::to_string(&status_value)?)?;
 
     // expose / dial / unexpose
@@ -327,6 +335,7 @@ async fn status_says_a_peer_that_has_not_granted_echo_is_up() -> Result<()> {
     assert_eq!(value["peers"][0]["echo_denied"], true, "{value}");
     assert_eq!(value["peers"][0]["error"], Value::Null, "{value}");
     value["endpoint_addr"] = "<ENDPOINT_ADDR>".into();
+    value["relays"]["urls"] = "<RELAY_URLS>".into();
     normaliser.check("status_echo_denied", &serde_json::to_string(&value)?)?;
 
     // The human form says the same, and never "offline".

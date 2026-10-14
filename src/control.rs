@@ -152,6 +152,22 @@ fn default_persist() -> bool {
     true
 }
 
+/// The relay candidates selected at daemon startup, not a liveness probe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayConfigStatus {
+    pub source: String,
+    pub urls: Vec<String>,
+}
+
+impl Default for RelayConfigStatus {
+    fn default() -> Self {
+        Self {
+            source: "unknown".into(),
+            urls: Vec::new(),
+        }
+    }
+}
+
 /// The latest failure observed by a local dial listener in this daemon run.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DialLastError {
@@ -209,6 +225,8 @@ pub enum ControlResponse {
         dial_sockets: Vec<PathBuf>,
         #[serde(default)]
         dials: Vec<DialStatus>,
+        #[serde(default)]
+        relays: RelayConfigStatus,
         allow_shell: bool,
         #[serde(default)]
         allow_exec: bool,
@@ -584,6 +602,7 @@ mod tests {
             max_dial_handlers: 32,
             dial_restore_failures: Vec::new(),
             dials: Vec::new(),
+            relays: RelayConfigStatus::default(),
         };
 
         let bytes = serde_json::to_vec(&response)

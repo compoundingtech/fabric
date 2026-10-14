@@ -15,6 +15,12 @@ Deprecated, Fixed or Security.
 
 ## [Unreleased]
 
+### Added
+- A root-level `relays` array selects custom home-relay candidates at startup;
+  omission keeps n0 defaults and an empty list disables relay transport while
+  preserving direct IP. `status --json` reports the running selection in
+  `relays {source, urls}`. Endpoint recovery retains this startup configuration.
+
 ### Fixed
 - `fabric down` waits up to 15 seconds for the daemon lease to be released,
   including endpoint and exec-child cleanup. An immediate `down && up` no

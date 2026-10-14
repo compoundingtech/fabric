@@ -642,6 +642,7 @@ async fn run(cli: Cli) -> Result<()> {
                             max_dial_handlers,
                             dial_restore_failures,
                             dials,
+                            relays,
                         } => {
                             let sync_runtime = match send_control(
                                 &home,
@@ -667,6 +668,7 @@ async fn run(cli: Cli) -> Result<()> {
                                     &sync_runtime,
                                     &dial_restore_failures,
                                     &dials,
+                                    &relays,
                                 ))?;
                                 return Ok(());
                             }
@@ -2407,6 +2409,7 @@ fn status_json(
     sync_runtime: &SyncRuntimeStatus,
     dial_restore_failures: &[fabric::control::DialRestoreFailure],
     dials: &[fabric::control::DialStatus],
+    relays: &fabric::control::RelayConfigStatus,
 ) -> serde_json::Value {
     let peers: Vec<_> = peers
         .iter()
@@ -2431,6 +2434,7 @@ fn status_json(
         "exposed_protocols": exposed_protocols,
         "dial_sockets": dial_sockets,
         "dials": dials,
+        "relays": relays,
         "dial_restore_failures": dial_restore_failures,
         "dial_handlers": { "active": dial_handlers.0, "max": dial_handlers.1 },
         "sync_runtime": { "owner": sync_runtime.owner, "companion": sync_runtime.companion },

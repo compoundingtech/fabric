@@ -1562,6 +1562,9 @@ pub struct FabricConfig {
     macos_signing_identity: Option<String>,
     #[serde(default)]
     server_sessions: ServerSessionConfig,
+    /// Omitted: n0 defaults. Empty: disable relay transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relays: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     peers: Vec<Peer>,
     #[serde(default)]
@@ -1634,6 +1637,29 @@ impl FabricConfig {
         self.legacy_allow_exec
     }
 
+    pub fn relays(&self) -> Option<&[String]> {
+        self.relays.as_deref()
+    }
+
+    pub fn relay_mode(&self) -> Result<iroh::RelayMode> {
+        let Some(relays) = self.relays() else {
+            return Ok(iroh::endpoint::default_relay_mode());
+        };
+        if relays.is_empty() {
+            return Ok(iroh::RelayMode::Disabled);
+        }
+        let urls = relays.iter().enumerate().map(|(index, raw)| {
+            let url: iroh::RelayUrl = raw.parse().map_err(|_| invalid_argument(format!("relays[{index}] must be an absolute HTTP or HTTPS URL")))?;
+            if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none()
+                || !url.username().is_empty() || url.password().is_some()
+                || url.query().is_some() || url.fragment().is_some() {
+                return Err(invalid_argument(format!("relays[{index}] must be an HTTP or HTTPS URL without credentials, query or fragment")));
+            }
+            Ok(url)
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(iroh::RelayMode::custom(urls))
+    }
+
     pub fn memory_max_mb(&self) -> Option<u64> {
         self.memory_max_mb
     }
@@ -1703,6 +1729,8 @@ impl FabricConfig {
             self.server_sessions.max_per_peer,
             self.server_sessions.detached_ttl_secs,
         )?;
+
+        self.relay_mode()?;
 
         let mut dials = HashSet::new();
         for dial in &self.dials {
@@ -1859,6 +1887,46 @@ fn invalid_argument(message: String) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relay_selection_is_additive_validated_and_survives_unrelated_saves() -> anyhow::Result<()> {
+        let legacy: super::FabricConfig = toml::from_str("")?;
+        assert!(legacy.relays().is_none());
+        assert!(!toml::to_string(&legacy)?.contains("relays"));
+        let mut config: super::FabricConfig =
+            toml::from_str("relays = ['https://relay.example/', 'https://relay.example/']")?;
+        let temp = tempfile::TempDir::new()?;
+        let home = super::FabricHome::new(temp.path());
+        config.set_memory_max_mb(Some(64));
+        config.save(&home)?;
+        let restored = super::FabricConfig::load(&home)?;
+        assert_eq!(restored.relays(), config.relays());
+        assert_eq!(restored.relay_mode()?.relay_map().urls::<Vec<_>>().len(), 1);
+        let disabled: super::FabricConfig = toml::from_str("relays = []")?;
+        assert!(matches!(disabled.relay_mode()?, iroh::RelayMode::Disabled));
+        disabled.save(&home)?;
+        assert!(matches!(
+            super::FabricConfig::load(&home)?.relay_mode()?,
+            iroh::RelayMode::Disabled
+        ));
+        for raw in [
+            "relative",
+            "file:///tmp/relay",
+            "ftp://relay.example/",
+            "https://user:secret@relay.example/",
+            "https://relay.example/?token=x",
+            "https://relay.example/#fragment",
+        ] {
+            let invalid: super::FabricConfig = toml::from_str(&format!("relays = [{raw:?}]"))?;
+            let error = invalid.save(&home).unwrap_err();
+            assert_eq!(
+                fabric_config::error::code_of(&error),
+                fabric_config::error::ErrorCode::InvalidArgument
+            );
+            assert!(!format!("{error:#}").contains("secret"));
+        }
+        Ok(())
+    }
+
     #[test]
     fn dial_queue_timeout_is_additive_and_rejects_invalid_deadlines() -> anyhow::Result<()> {
         let legacy: super::PersistedDial = toml::from_str("peer = 'example'\nprotocol = 'web'\n")?;

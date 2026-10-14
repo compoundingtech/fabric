@@ -22,6 +22,10 @@
       "transport": "<TRANSPORT>"
     }
   ],
+  "relays": {
+    "source": "default",
+    "urls": "<RELAY_URLS>"
+  },
   "sync_runtime": {
     "companion": "<SYNC>",
     "owner": "<SYNC>"

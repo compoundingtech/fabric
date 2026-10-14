@@ -62,6 +62,8 @@ rcgen = { version = "0.14.9", default-features = false, features = ["pem", "ring
 netdev = { path = "vendor/netdev" }
 
 [dev-dependencies]
+# Local relay fixture; server support is not part of the shipped runtime.
+iroh-relay = { version = "=1.0.2", features = ["server"] }
 tokio = { version = "1", features = ["test-util"] }
 proptest = "1"
 tempfile = "3"

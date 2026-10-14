@@ -419,6 +419,8 @@ pub struct DaemonState {
     home: FabricHome,
     endpoint_tx: watch::Sender<CurrentEndpoint>,
     endpoint_recycle: Mutex<()>,
+    relay_mode: iroh::RelayMode,
+    relay_config: crate::control::RelayConfigStatus,
     last_endpoint_recycle: Mutex<Option<Instant>>,
     peer_book: RwLock<PeerBook>,
     allowed: Arc<RwLock<HashSet<EndpointId>>>,
@@ -797,15 +799,19 @@ async fn build_daemon_endpoint(
     allowed: Arc<RwLock<HashSet<EndpointId>>>,
     services: &Services,
     exposures: &HashMap<Vec<u8>, Exposure>,
+    relay_mode: &iroh::RelayMode,
 ) -> Result<Endpoint> {
     let secret_key = load_or_create_identity(home)?;
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
+        .relay_mode(relay_mode.clone())
         .alpns(accepted_alpns(services, exposures))
         .hooks(AllowListHook { allowed })
         .bind()
         .await?;
-    let _ = tokio::time::timeout(ENDPOINT_ONLINE_TIMEOUT, endpoint.online()).await;
+    if !matches!(relay_mode, iroh::RelayMode::Disabled) {
+        let _ = tokio::time::timeout(ENDPOINT_ONLINE_TIMEOUT, endpoint.online()).await;
+    }
     Ok(endpoint)
 }
 
@@ -1069,6 +1075,23 @@ impl DaemonState {
     ) -> Result<Arc<Self>> {
         home.prepare()?;
         let config = FabricConfig::load(&home)?;
+        let relay_mode = config.relay_mode()?;
+        let mut urls: Vec<_> = relay_mode
+            .relay_map()
+            .urls::<Vec<_>>()
+            .into_iter()
+            .map(|url| url.to_string())
+            .collect();
+        urls.sort();
+        let relay_config = crate::control::RelayConfigStatus {
+            source: match config.relays() {
+                None => "default",
+                Some([]) => "disabled",
+                Some(_) => "custom",
+            }
+            .into(),
+            urls,
+        };
         let (tunnel_session_limits, tunnel_session_detached_ttl) =
             resolve_server_session_settings(&config, options)?;
         let peer_book = PeerBook::load(&home)?;
@@ -1082,7 +1105,9 @@ impl DaemonState {
         }
         let exposures = load_persisted_exposures(&home, &services)?;
         let allowed = Arc::new(RwLock::new(peer_book.trusted_ids()));
-        let endpoint = build_daemon_endpoint(&home, allowed.clone(), &services, &exposures).await?;
+        let endpoint =
+            build_daemon_endpoint(&home, allowed.clone(), &services, &exposures, &relay_mode)
+                .await?;
         let generation = next_endpoint_generation(&home, 0)?;
         let (endpoint_tx, _) = watch::channel(CurrentEndpoint {
             generation,
@@ -1101,6 +1126,8 @@ impl DaemonState {
             home,
             endpoint_tx,
             endpoint_recycle: Mutex::new(()),
+            relay_mode,
+            relay_config,
             last_endpoint_recycle: Mutex::new(None),
             peer_book: RwLock::new(peer_book),
             allowed,
@@ -2094,6 +2121,7 @@ impl DaemonState {
             max_dial_handlers: self.max_dial_handlers(),
             dial_restore_failures: self.dial_restore_failures.lock().await.clone(),
             dials,
+            relays: self.relay_config.clone(),
         })
     }
 
@@ -2852,9 +2880,14 @@ impl DaemonState {
         let started = Instant::now();
         let rss_before_bytes = current_rss_bytes();
         let exposures = self.exposures.read().await;
-        let new_endpoint =
-            build_daemon_endpoint(&self.home, self.allowed.clone(), &self.services, &exposures)
-                .await?;
+        let new_endpoint = build_daemon_endpoint(
+            &self.home,
+            self.allowed.clone(),
+            &self.services,
+            &exposures,
+            &self.relay_mode,
+        )
+        .await?;
         drop(exposures);
 
         if new_endpoint.id() != old.endpoint.id() {
@@ -6372,6 +6405,167 @@ mod tests {
     // which is ambiguous with the prelude's. Test diagnostics go to the test
     // harness, which captures only the standard macro.
     use std::eprintln;
+
+    #[tokio::test]
+    async fn configured_relay_is_used_and_endpoint_recycle_retains_startup_selection() -> Result<()>
+    {
+        use iroh::Watcher;
+        use iroh_relay::server::{RelayConfig, Server, ServerConfig};
+        let mut config = ServerConfig::default();
+        config.relay = Some(RelayConfig::new((std::net::Ipv4Addr::LOCALHOST, 0)));
+        let relay = Server::spawn(config).await?;
+        let url: iroh::RelayUrl = format!("http://{}", relay.http_addr().unwrap()).parse()?;
+        let dir = tempfile::TempDir::new()?;
+        let home = FabricHome::new(dir.path());
+        home.prepare()?;
+        fs::write(
+            home.config_path(),
+            format!("relays = [{:?}]\n", url.to_string()),
+        )?;
+        let node = FabricNode::start(home.clone()).await?;
+        let selected = node
+            .state()
+            .endpoint_handle()
+            .endpoint
+            .home_relay_status()
+            .get();
+        assert!(
+            selected
+                .iter()
+                .any(|status| status.url() == &url && status.is_connected()),
+            "configured local relay was not used: {selected:?}"
+        );
+        let before = node.state().reachability_status_response().await?;
+        if let ControlResponse::ReachabilityStatus { relays, .. } = before {
+            assert_eq!(relays.source, "custom");
+            assert_eq!(relays.urls, [url.to_string()]);
+        } else {
+            bail!("not reachability status");
+        }
+        // An unrelated config save or recovery must not silently switch an
+        // existing endpoint away from the selection reported by status.
+        fs::write(home.config_path(), "relays = []\n")?;
+        node.state()
+            .force_endpoint_recycle("relay selection regression")
+            .await?;
+        let selected = node
+            .state()
+            .endpoint_handle()
+            .endpoint
+            .home_relay_status()
+            .get();
+        assert!(
+            selected
+                .iter()
+                .any(|status| status.url() == &url && status.is_connected())
+        );
+        if let ControlResponse::ReachabilityStatus { relays, .. } =
+            node.state().reachability_status_response().await?
+        {
+            assert_eq!(relays.source, "custom");
+            assert_eq!(relays.urls, [url.to_string()]);
+        }
+        node.shutdown().await?;
+        let node = FabricNode::start(home).await?;
+        assert!(
+            node.state()
+                .endpoint_handle()
+                .endpoint
+                .home_relay_status()
+                .get()
+                .is_empty()
+        );
+        assert!(
+            !node
+                .state()
+                .endpoint_handle()
+                .endpoint
+                .bound_sockets()
+                .is_empty(),
+            "disabling relays must leave direct IP transport enabled"
+        );
+        if let ControlResponse::ReachabilityStatus { relays, .. } =
+            node.state().reachability_status_response().await?
+        {
+            assert_eq!(relays.source, "disabled");
+            assert!(relays.urls.is_empty());
+        }
+        node.shutdown().await?;
+        relay.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn different_relay_candidate_sets_can_reach_an_advertised_remote_relay() -> Result<()> {
+        use iroh_relay::server::{RelayConfig, Server, ServerConfig};
+        async fn local_relay() -> Result<(Server, iroh::RelayUrl)> {
+            let mut config = ServerConfig::default();
+            config.relay = Some(RelayConfig::new((std::net::Ipv4Addr::LOCALHOST, 0)));
+            let server = Server::spawn(config).await?;
+            let url = format!("http://{}", server.http_addr().unwrap()).parse()?;
+            Ok((server, url))
+        }
+        let (relay_a, url_a) = local_relay().await?;
+        let (relay_b, url_b) = local_relay().await?;
+        let config_a: FabricConfig =
+            toml::from_str(&format!("relays = [{:?}]", url_a.to_string()))?;
+        let config_b: FabricConfig =
+            toml::from_str(&format!("relays = [{:?}]", url_b.to_string()))?;
+        let alpn = b"fabric/relay-config-test/0";
+        let a = Endpoint::builder(presets::N0)
+            .relay_mode(config_a.relay_mode()?)
+            .clear_ip_transports()
+            .alpns(vec![alpn.to_vec()])
+            .bind()
+            .await?;
+        let b = Endpoint::builder(presets::N0)
+            .relay_mode(config_b.relay_mode()?)
+            .clear_ip_transports()
+            .alpns(vec![alpn.to_vec()])
+            .bind()
+            .await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            a.online().await;
+            b.online().await;
+        })
+        .await?;
+        assert!(
+            a.bound_sockets().is_empty() && b.bound_sockets().is_empty(),
+            "test must carry bytes entirely over relays"
+        );
+        let accepting = b.clone();
+        let serve = tokio::spawn(async move {
+            let conn = accepting
+                .accept()
+                .await
+                .context("no relay connection")?
+                .await?;
+            let (mut send, mut recv) = conn.accept_bi().await?;
+            let mut bytes = [0; 5];
+            recv.read_exact(&mut bytes).await?;
+            assert_eq!(&bytes, b"hello");
+            send.write_all(b"world").await?;
+            send.finish()?;
+            Ok::<_, anyhow::Error>(conn)
+        });
+        // Only B's relay is advertised here, outside A's configured set.
+        let conn =
+            tokio::time::timeout(Duration::from_secs(5), a.connect(b.addr(), alpn)).await??;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        send.write_all(b"hello").await?;
+        send.finish()?;
+        let mut reply = [0; 5];
+        tokio::time::timeout(Duration::from_secs(5), recv.read_exact(&mut reply)).await??;
+        assert_eq!(&reply, b"world");
+        let served = serve.await??;
+        served.close(0u32.into(), b"done");
+        conn.close(0u32.into(), b"done");
+        a.close().await;
+        b.close().await;
+        relay_a.shutdown().await?;
+        relay_b.shutdown().await?;
+        Ok(())
+    }
 
     /// A long quiet exec keeps its request half open while waiting for the exit
     /// frame. If the connection is replaced after the remote command finishes,

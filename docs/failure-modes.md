@@ -244,3 +244,22 @@ started both a watcher pass and an explicit reload. Both were valid inbound
 transactions, while the test required exactly one. The test now uses one
 trigger for each exact expected count. See [known-flaky-tests.md](known-flaky-tests.md)
 for the measured retirement record.
+
+## Relay selection and throughput
+
+Omitted root-level `relays` in `config.toml` keeps the n0 defaults; a nonempty
+array selects custom home-relay candidates, and `relays = []` disables relays
+while preserving direct IP. Restart to apply a change; recovery retains the
+startup selection shown in `status --json` as `relays {source, urls}`.
+
+Different candidate sets do not inherently isolate peers. A connection can
+use direct IP or dial the other peer's advertised relay, including one outside
+its own configured list, if network access and the relay's admission allow it.
+The reported candidates do not prove the active transport. For an owned-relay
+measurement, configure both peers with that relay and verify a relay path.
+
+The [n0 public relays](https://www.iroh.computer/blog/shared-relays) are
+rate-limited and best-effort; sustained relay throughput requires an owned
+relay. Configurability alone does not establish a throughput improvement.
+The relay-only/direct-only diagnostic modes and the dependency upgrade,
+RateLimited diagnostic, and local-relay throughput proof are separate changes.
