@@ -44,6 +44,41 @@ nothing tells you to look.
 | Both sides connect concurrently | Deterministic admission preserves one shared connection. | Bounded convergence; subsequent traffic keeps its identity | `simultaneous_peer_traffic_converges_to_one_shared_connection`, `duplicate_incoming_keeps_an_admitted_live_connection` |
 | Interface/address/wake notifications | Refresh paths and announce; preserve healthy traffic and declarations. | Scripted isolated matrix | `interface_address_and_wake_changes_preserve_live_sessions_and_declarations` |
 
+## Session limits
+
+Every local connection through a generic Unix or TCP dial listener creates one
+resumable tunnel session. The exposing daemon's `<home>/config.toml` controls
+the remote admission limit, shared across all exposed protocols:
+
+```toml
+[server_sessions]
+max_per_peer = 16
+max_total = 64
+detached_ttl_secs = 900
+```
+
+These are the defaults. All values must be positive; `max_per_peer` cannot
+exceed `max_total`. Restart the exposing daemon to apply a change. The startup
+flags `--server-session-max-per-peer`, `--server-session-max-total`, and
+`--server-session-detached-ttl-secs` override individual settings. The dialing
+daemon's server limits govern services it exposes, not the peer it dials.
+
+When the cap is full, completed sessions are reaped and detached sessions can
+be evicted to make room. Live sessions are not evicted for a new connection.
+An evicted detached session cannot resume, even before its retention period
+ends. Each session can retain up to 4 MiB of outgoing unacknowledged data,
+alongside transport and service memory; raising the cap increases that budget.
+
+**NOT FIXED:** a dial listener does not queue connections above the remote cap.
+The refusal carries `fabric:session_limit_reached` in the dialing daemon's log,
+but the local client sees EOF. The per-peer cap counts sessions across listeners
+and protocols, so limiting each listener to 16 connections separately does not
+prevent a refusal. Limit aggregate concurrency to the same peer, reuse streams,
+or retry. The separate local dial-handler limit and short-session wind-down
+described in the table can also refuse a connection before remote admission.
+This documents the current behavior; it does not claim a new benchmark or fix
+for [#304](https://github.com/compoundingtech/fabric/issues/304).
+
 ## What you see while it is broken
 
 An offline peer is normal on any machine. A known-offline dial closes locally
