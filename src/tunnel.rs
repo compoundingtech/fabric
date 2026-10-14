@@ -5,7 +5,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -165,6 +165,7 @@ pub struct ClientConnectionNotices {
     encode: Arc<NoticeEncoder>,
     gauge: Option<Arc<ClientAttachGauge>>,
     admission_deadline: Option<tokio::time::Instant>,
+    initial_error_preface: bool,
 }
 
 impl ClientConnectionNotices {
@@ -175,6 +176,7 @@ impl ClientConnectionNotices {
             encode: Arc::new(encode),
             gauge: None,
             admission_deadline: None,
+            initial_error_preface: false,
         }
     }
 
@@ -196,9 +198,18 @@ impl ClientConnectionNotices {
         self
     }
 
+    pub(crate) fn with_initial_error_preface(mut self, enabled: bool) -> Self {
+        self.initial_error_preface = enabled;
+        self
+    }
+
     async fn emit(&self, session: &TunnelSession, event: ClientConnectionEvent) {
         if let Some(bytes) = (self.encode)(&event) {
-            let _ = session.write_local_notice(&bytes).await;
+            if self.initial_error_preface && matches!(event, ClientConnectionEvent::Failed { .. }) {
+                let _ = session.write_initial_error_preface(&bytes).await;
+            } else {
+                let _ = session.write_local_notice(&bytes).await;
+            }
         }
     }
 }
@@ -344,6 +355,7 @@ pub struct TunnelSession {
     /// session held out to a peer has none.
     grant: std::sync::OnceLock<Grant>,
     local_write: Mutex<Option<LocalWrite>>,
+    local_output_started: AtomicBool,
     cleanup: Mutex<Option<SessionCleanup>>,
     state: Mutex<TunnelState>,
     notify: Notify,
@@ -439,6 +451,7 @@ impl TunnelSession {
             peer_id,
             grant: std::sync::OnceLock::new(),
             local_write: Mutex::new(Some(write)),
+            local_output_started: AtomicBool::new(false),
             cleanup: Mutex::new(cleanup),
             state: Mutex::new(TunnelState {
                 send_next: 0,
@@ -545,6 +558,24 @@ impl TunnelSession {
         write.write_all(bytes).await?;
         write.flush().await?;
         Ok(())
+    }
+
+    /// Serialize the preface with service output. Mark output before attempting
+    /// its write: even a partially failed service write forbids an error line.
+    async fn write_initial_error_preface(&self, bytes: &[u8]) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut write = self.local_write.lock().await;
+            if self.local_output_started.swap(true, Ordering::SeqCst) {
+                return Ok(());
+            }
+            if let Some(write) = write.as_mut() {
+                write.write_all(bytes).await?;
+                write.flush().await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("error preface write timed out")?
     }
 
     async fn begin_attach(&self) -> Result<()> {
@@ -717,6 +748,7 @@ impl TunnelSession {
             let Some(write) = write.as_mut() else {
                 bail!("tunnel {} local write is closed", self.id);
             };
+            self.local_output_started.store(true, Ordering::SeqCst);
             match write.write_all(&bytes).await {
                 Ok(()) => write.flush().await.err(),
                 Err(error) => Some(error),
@@ -1187,7 +1219,23 @@ async fn run_client_connection_parts(
     notices: Option<ClientConnectionNotices>,
     initial_stream: Option<MuxStream>,
 ) -> Result<()> {
-    let peer_id = PeerBook::load(&home)?.resolve(&peer)?.id;
+    let peer_id = match PeerBook::load(&home).and_then(|book| book.resolve(&peer)) {
+        Ok(peer) => peer.id,
+        Err(error) => {
+            if let Some(notices) = notices.as_ref() {
+                let event = ClientConnectionEvent::Failed {
+                    error: crate::dial_queue::diagnostic(&error),
+                };
+                if let Some(bytes) = (notices.encode)(&event) {
+                    let mut local_write = local_write;
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(1), local_write.write_all(&bytes))
+                            .await;
+                }
+            }
+            return Err(error);
+        }
+    };
     let session_id = TunnelSessionId::random();
     let (session, local_read) =
         TunnelSession::new_parts(session_id, peer_id, local_read, local_write);
@@ -1400,7 +1448,7 @@ async fn fail_permanently(
             .emit(
                 session,
                 ClientConnectionEvent::Failed {
-                    error: format!("{error:#}"),
+                    error: crate::dial_queue::diagnostic(&error),
                 },
             )
             .await;
@@ -2514,6 +2562,73 @@ mod tests {
 
     fn peer_id() -> EndpointId {
         SecretKey::generate().public()
+    }
+
+    #[tokio::test]
+    async fn error_preface_is_once_before_output_and_never_after_partial_output() {
+        use std::{
+            pin::Pin,
+            sync::Mutex as StdMutex,
+            task::{Context, Poll},
+        };
+        struct PartialFailure(Arc<StdMutex<Vec<u8>>>);
+        impl AsyncWrite for PartialFailure {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                let mut seen = self.0.lock().unwrap();
+                if seen.is_empty() {
+                    seen.push(bytes[0]);
+                    Poll::Ready(Ok(1))
+                } else {
+                    Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+                }
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let (write, mut read) = tokio::io::duplex(1024);
+        let (session, _) = TunnelSession::new_parts(
+            session_id(70),
+            peer_id(),
+            Box::new(tokio::io::empty()),
+            Box::new(write),
+        );
+        session
+            .write_initial_error_preface(b"fabric:internal failed\n")
+            .await
+            .unwrap();
+        session
+            .write_initial_error_preface(b"duplicate\n")
+            .await
+            .unwrap();
+        session.abort_local().await.unwrap();
+        let mut bytes = Vec::new();
+        read.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"fabric:internal failed\n");
+
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let (session, _) = TunnelSession::new_parts(
+            session_id(71),
+            peer_id(),
+            Box::new(tokio::io::empty()),
+            Box::new(PartialFailure(seen.clone())),
+        );
+        assert!(session.accept_data(0, b"service".to_vec()).await.is_err());
+        session
+            .write_initial_error_preface(b"fabric:internal failed\n")
+            .await
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), b"s");
     }
 
     fn session_id(byte: u8) -> TunnelSessionId {

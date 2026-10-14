@@ -1154,6 +1154,20 @@ admitted are never retried as new sessions. Different dialing daemons have
 separate queues; contention at the exposing daemon's total cap still waits
 within each caller's deadline. Applications can reuse connections or retry a
 refusal after that deadline.
+`status --json` always reports `dials[].last_error` with the latest failure's
+`code`, `class` and UTC `at` timestamp. It is listener history for this daemon
+run, and remains after a later successful connection; it does not establish
+current authorization. It is `null` before a failure.
+
+For a generic Unix or TCP dial, add `--error-preface` to receive one line
+`fabric:<code> <text>\n` before closure on a refusal or fault. This flag is
+saved with the listener. Fabric writes it only before any service output has
+reached the local client, including a partial write; an established stream
+never receives an error line after service bytes. Without the flag, the socket
+still closes without added bytes. Applications must opt in only when they can
+recognize this line in their protocol. `probe --json` remains the fallback for
+classifying a failure against an older daemon.
+
 See [the session-limit failure mode](docs/failure-modes.md#session-limits).
 
 ```sh

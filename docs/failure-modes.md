@@ -82,9 +82,14 @@ deadline. Each dialing daemon queues independently; there is no cross-daemon
 fairness guarantee. Policy denials and service failures are not retried, and a
 session that was admitted is never restarted as a new request.
 
-**NOT FIXED:** a full queue or expired deadline still closes the local socket
-without a reason on the data path; `fabric:session_limit_reached` is in the daemon's log. The
-short-session wind-down is also unchanged. The table records the local replay
+A full queue or expired deadline closes the local socket and records
+`fabric:session_limit_reached` in the daemon log and `dials[].last_error` in
+`status --json`. Generic dials can opt into a saved `--error-preface`: before
+any service output, a refusal or fault writes one coded line and closes. The
+default adds no bytes, and failures after service output never append a line.
+The last error is listener history, retained after successes until the listener
+is replaced or the daemon restarts. It is not current authorization. Use
+`probe --json` against an older daemon. The short-session wind-down is unchanged. The table records the local replay
 of [#304](https://github.com/compoundingtech/fabric/issues/304); it does not
 claim a new two-machine or forced-relay measurement.
 

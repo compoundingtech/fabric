@@ -7,7 +7,7 @@ use std::{
     process::{Command as ProcessCommand, Stdio},
     sync::{
         Arc, RwLock as StdRwLock,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -511,7 +511,7 @@ impl DaemonOptions {
 
 #[derive(Debug)]
 struct DialSocket {
-    queue_timeout_ms: Arc<AtomicU64>,
+    dial_state: Arc<crate::dial_state::DialListenerState>,
     path: PathBuf,
     peer_addr: EndpointAddr,
     listener_cancel: CancellationToken,
@@ -576,7 +576,7 @@ impl Drop for DialListenerLease {
 
 #[derive(Debug, Clone)]
 struct TcpDial {
-    queue_timeout_ms: Arc<AtomicU64>,
+    dial_state: Arc<crate::dial_state::DialListenerState>,
     addr: String,
     peer_addr: EndpointAddr,
     cancel: CancellationToken,
@@ -1756,9 +1756,7 @@ impl DaemonState {
                 })
             })?;
             existing.peer_addr = peer_addr;
-            existing
-                .queue_timeout_ms
-                .store(options.queue_timeout_ms, Ordering::Relaxed);
+            existing.dial_state.update(options);
             self.clear_dial_restore_failure(&key.0, protocol, Some(&addr))
                 .await;
             return Ok(addr);
@@ -1776,11 +1774,11 @@ impl DaemonState {
                 options,
             });
         })?;
-        let queue_timeout_ms = Arc::new(AtomicU64::new(options.queue_timeout_ms));
+        let dial_state = Arc::new(crate::dial_state::DialListenerState::new(options));
         tcp_dials.insert(
             key,
             TcpDial {
-                queue_timeout_ms: queue_timeout_ms.clone(),
+                dial_state: dial_state.clone(),
                 addr: addr.clone(),
                 peer_addr: peer_addr.clone(),
                 cancel: listener_cancel.clone(),
@@ -1801,7 +1799,7 @@ impl DaemonState {
             self.peer_connections.clone(),
             self.client_attaches.clone(),
             self.connection_recorder(),
-            queue_timeout_ms,
+            dial_state,
         ));
 
         self.clear_dial_restore_failure(&peer_addr.id.to_string(), protocol, Some(&addr))
@@ -1871,7 +1869,7 @@ impl DaemonState {
         if !options.is_default() && self.services.find(&alpn).is_some() {
             return Err(FabricError::new(
                 ErrorCode::InvalidArgument,
-                "queue timeout applies to generic Unix dials, not registered service sockets",
+                "dial options apply to generic Unix dials, not registered service sockets",
             )
             .into());
         }
@@ -1890,9 +1888,7 @@ impl DaemonState {
         {
             if persist {
                 self.persist_unix_dial(&peer_addr.id.to_string(), protocol, options)?;
-                existing
-                    .queue_timeout_ms
-                    .store(options.queue_timeout_ms, Ordering::Relaxed);
+                existing.dial_state.update(options);
             }
             return Ok(existing.path.clone());
         }
@@ -1923,7 +1919,7 @@ impl DaemonState {
         let listener_cancel = CancellationToken::new();
         let lease = DialListenerLease::new(self.active_dial_listeners.clone());
 
-        let queue_timeout_ms = Arc::new(AtomicU64::new(options.queue_timeout_ms));
+        let dial_state = Arc::new(crate::dial_state::DialListenerState::new(options));
         // A service's one-shot protocol is one raw stream per local connection.
         // A resumable protocol negotiates its own tunnel session and falls back
         // to the service's one-shot protocol when the peer does not speak it.
@@ -1977,13 +1973,13 @@ impl DaemonState {
                 lease,
                 self.client_attaches.clone(),
                 self.connection_recorder(),
-                queue_timeout_ms.clone(),
+                dial_state.clone(),
             )),
         };
         sockets.insert(
             key,
             DialSocket {
-                queue_timeout_ms,
+                dial_state,
                 path: socket_path.clone(),
                 peer_addr: peer_addr.clone(),
                 listener_cancel,
@@ -2036,12 +2032,51 @@ impl DaemonState {
         })
     }
 
+    async fn dial_status(&self) -> Vec<crate::control::DialStatus> {
+        let mut dials: Vec<_> = self
+            .dial_sockets
+            .lock()
+            .await
+            .iter()
+            .map(|((peer, protocol), dial)| crate::control::DialStatus {
+                peer: peer.clone(),
+                protocol: protocol.clone(),
+                socket: Some(dial.path.clone()),
+                tcp: None,
+                last_error: dial.dial_state.last_error(),
+            })
+            .collect();
+        dials.extend(
+            self.tcp_dials
+                .lock()
+                .await
+                .iter()
+                .map(|((peer, protocol, _), dial)| crate::control::DialStatus {
+                    peer: peer.clone(),
+                    protocol: protocol.clone(),
+                    socket: None,
+                    tcp: Some(dial.addr.clone()),
+                    last_error: dial.dial_state.last_error(),
+                }),
+        );
+        dials.sort_by(|a, b| {
+            (&a.peer, &a.protocol, &a.socket, &a.tcp).cmp(&(
+                &b.peer,
+                &b.protocol,
+                &b.socket,
+                &b.tcp,
+            ))
+        });
+        dials
+    }
+
     async fn reachability_status_response(&self) -> Result<ControlResponse> {
         let (node_id, endpoint_addr, exposed_protocols, dial_sockets) =
             self.local_status_fields().await?;
         let peers = self.peer_reachability().await;
         let current_connection_health = self.current_connection_health().await;
         let telemetry = self.telemetry.snapshot();
+        let dials = self.dial_status().await;
         let peer_book = self.peer_book.read().await;
         Ok(ControlResponse::ReachabilityStatus {
             version: crate::version_string(),
@@ -2058,6 +2093,7 @@ impl DaemonState {
             active_dial_handlers: self.active_dial_handlers(),
             max_dial_handlers: self.max_dial_handlers(),
             dial_restore_failures: self.dial_restore_failures.lock().await.clone(),
+            dials,
         })
     }
 
@@ -5426,7 +5462,7 @@ async fn run_dial_socket(
     _lease: DialListenerLease,
     gauge: Arc<tunnel::ClientAttachGauge>,
     recorder: ConnectionRecorder,
-    queue_timeout_ms: Arc<AtomicU64>,
+    dial_state: Arc<crate::dial_state::DialListenerState>,
 ) {
     let backoff_key = BackoffKey::dial(&peer, &alpn);
     let queue = match peer
@@ -5449,14 +5485,15 @@ async fn run_dial_socket(
             _ = listener_cancel.cancelled() => break,
             _ = daemon_cancel.cancelled() => break,
             accepted = listener.accept() => {
-                let Ok((local, _)) = accepted else {
+                let Ok((mut local, _)) = accepted else {
                     break;
                 };
-                let reservation = match queue.reserve(Duration::from_millis(queue_timeout_ms.load(Ordering::Relaxed))) {
+                let options = dial_state.options();
+                let reservation = match queue.reserve(Duration::from_millis(options.queue_timeout_ms)) {
                     Ok(reservation) => reservation,
                     Err(error) => {
                         dial_failures.record_failure_for_diagnostics(&backoff_key, "dial queue refused connection", &crate::dial_queue::diagnostic(&error)).await;
-                        drop(local);
+                        dial_state.refuse(&mut local, options, &error).await;
                         continue;
                     }
                 };
@@ -5471,11 +5508,14 @@ async fn run_dial_socket(
                 let dial_failures = dial_failures.clone();
                 let backoff_key = backoff_key.clone();
                 let peer_connections = peer_connections.clone();
+                let dial_state = dial_state.clone();
                 let notices = Some(generic_dial_notices(
                     peer.clone(),
                     String::from_utf8_lossy(&alpn).to_string(),
                     gauge.clone(),
                     recorder.clone(),
+                    dial_state.clone(),
+                    options.error_preface,
                 ).with_admission_deadline(admission_deadline));
                 tokio::spawn(async move {
                     let _permit = match reservation.acquire(dial_slots, &cancel).await {
@@ -5483,6 +5523,7 @@ async fn run_dial_socket(
                         Ok(None) => return,
                         Err(error) => {
                             dial_failures.record_failure_for_diagnostics(&backoff_key, "dial queue refused connection", &crate::dial_queue::diagnostic(&error)).await;
+                            dial_state.refuse(&mut local, options, &error).await;
                             return;
                         }
                     };
@@ -5501,8 +5542,9 @@ async fn run_dial_socket(
                             .await
                     {
                         Ok(()) => dial_failures.record_success(&backoff_key).await,
-                        Err(error) if mux::is_peer_offline(&error) => {}
+                        Err(error) if mux::is_peer_offline(&error) => { dial_state.record(&error); }
                         Err(error) => {
+                            dial_state.record(&error);
                             dial_failures
                                 .record_failure_for_diagnostics(&backoff_key, "dial socket connection failed", &crate::dial_queue::diagnostic(&error))
                                 .await;
@@ -5920,7 +5962,8 @@ impl ConnectionRecorder {
 ///
 /// A generic dial carries raw bytes for somebody else's protocol, so the status
 /// frames the shell path renders into its terminal would corrupt it. The encoder
-/// therefore returns None for every event and only the log records it. Without
+/// therefore emits no bytes by default. An opt-in error preface is gated by
+/// the tunnel session before any service output; all failures update status. Without
 /// this, a pty-remote or st sync tunnel lost and resumed its transport with no
 /// trace anywhere, which made "did my tunnel drop" unanswerable for exactly the
 /// consumers most likely to be long-lived.
@@ -5929,10 +5972,18 @@ fn generic_dial_notices(
     protocol: String,
     gauge: Arc<tunnel::ClientAttachGauge>,
     recorder: ConnectionRecorder,
+    dial_state: Arc<crate::dial_state::DialListenerState>,
+    error_preface: bool,
 ) -> tunnel::ClientConnectionNotices {
     tunnel::ClientConnectionNotices::new(move |event| {
         recorder.record(&peer, event);
-        if matches!(event, tunnel::ClientConnectionEvent::Failed { error } | tunnel::ClientConnectionEvent::Reconnecting { error, .. } if error.contains("peer is offline")) { return None; }
+        if let tunnel::ClientConnectionEvent::Failed { error } = event {
+            dial_state.record_text(error);
+        }
+        if matches!(event, tunnel::ClientConnectionEvent::Failed { error } | tunnel::ClientConnectionEvent::Reconnecting { error, .. } if error.contains("peer is offline")) { return match event {
+            tunnel::ClientConnectionEvent::Failed { error } if error_preface => Some(crate::dial_state::error_preface(error)),
+            _ => None,
+        }; }
         match event {
             tunnel::ClientConnectionEvent::Reconnecting {
                 attempt,
@@ -5964,10 +6015,13 @@ fn generic_dial_notices(
                 "generic dial session ended and will not retry"
             ),
         }
-        // Never any bytes: this stream belongs to another protocol.
-        None
+        match event {
+            tunnel::ClientConnectionEvent::Failed { error } if error_preface => Some(crate::dial_state::error_preface(error)),
+            _ => None,
+        }
     })
     .with_gauge(gauge)
+    .with_initial_error_preface(error_preface)
 }
 
 /// A resumable service's connection notices, rendered twice on purpose.
@@ -6065,7 +6119,7 @@ async fn run_dial_tcp_listener(
     peer_connections: Arc<mux::PeerConnections>,
     gauge: Arc<tunnel::ClientAttachGauge>,
     recorder: ConnectionRecorder,
-    queue_timeout_ms: Arc<AtomicU64>,
+    dial_state: Arc<crate::dial_state::DialListenerState>,
 ) {
     let backoff_key = BackoffKey::dial(&peer, &alpn);
     let queue = match peer
@@ -6086,14 +6140,15 @@ async fn run_dial_tcp_listener(
         tokio::select! {
             _ = cancel.cancelled() => break,
             accepted = listener.accept() => {
-                let Ok((local, _)) = accepted else {
+                let Ok((mut local, _)) = accepted else {
                     break;
                 };
-                let reservation = match queue.reserve(Duration::from_millis(queue_timeout_ms.load(Ordering::Relaxed))) {
+                let options = dial_state.options();
+                let reservation = match queue.reserve(Duration::from_millis(options.queue_timeout_ms)) {
                     Ok(reservation) => reservation,
                     Err(error) => {
                         dial_failures.record_failure_for_diagnostics(&backoff_key, "dial queue refused connection", &crate::dial_queue::diagnostic(&error)).await;
-                        drop(local);
+                        dial_state.refuse(&mut local, options, &error).await;
                         continue;
                     }
                 };
@@ -6108,11 +6163,14 @@ async fn run_dial_tcp_listener(
                 let dial_failures = dial_failures.clone();
                 let backoff_key = backoff_key.clone();
                 let peer_connections = peer_connections.clone();
+                let dial_state = dial_state.clone();
                 let notices = Some(generic_dial_notices(
                     peer.clone(),
                     String::from_utf8_lossy(&alpn).to_string(),
                     gauge.clone(),
                     recorder.clone(),
+                    dial_state.clone(),
+                    options.error_preface,
                 ).with_admission_deadline(admission_deadline));
                 tokio::spawn(async move {
                     let _permit = match reservation.acquire(dial_slots, &cancel).await {
@@ -6120,6 +6178,7 @@ async fn run_dial_tcp_listener(
                         Ok(None) => return,
                         Err(error) => {
                             dial_failures.record_failure_for_diagnostics(&backoff_key, "dial queue refused connection", &crate::dial_queue::diagnostic(&error)).await;
+                            dial_state.refuse(&mut local, options, &error).await;
                             return;
                         }
                     };
@@ -6138,8 +6197,9 @@ async fn run_dial_tcp_listener(
                             .await
                     {
                         Ok(()) => dial_failures.record_success(&backoff_key).await,
-                        Err(error) if mux::is_peer_offline(&error) => {}
+                        Err(error) if mux::is_peer_offline(&error) => { dial_state.record(&error); }
                         Err(error) => {
+                            dial_state.record(&error);
                             dial_failures
                                 .record_failure_for_diagnostics(&backoff_key, "dial tcp connection failed", &crate::dial_queue::diagnostic(&error))
                                 .await;
@@ -7592,8 +7652,8 @@ mod tests {
             })
         };
         let graceful = DialSocket {
-            queue_timeout_ms: Arc::new(AtomicU64::new(
-                crate::config::DEFAULT_DIAL_QUEUE_TIMEOUT_MS,
+            dial_state: Arc::new(crate::dial_state::DialListenerState::new(
+                DialOptions::default(),
             )),
             path: graceful_path.clone(),
             peer_addr: peer_addr.clone(),
@@ -7628,8 +7688,8 @@ mod tests {
             .await
             .expect("wedged listener task did not start");
         let wedged = DialSocket {
-            queue_timeout_ms: Arc::new(AtomicU64::new(
-                crate::config::DEFAULT_DIAL_QUEUE_TIMEOUT_MS,
+            dial_state: Arc::new(crate::dial_state::DialListenerState::new(
+                DialOptions::default(),
             )),
             path: wedged_path.clone(),
             peer_addr,
@@ -8900,6 +8960,10 @@ mod tests {
                 Arc::new(TelemetryStore::ephemeral()),
                 Arc::new(StdRwLock::new(HashMap::new())),
             ),
+            Arc::new(crate::dial_state::DialListenerState::new(
+                DialOptions::default(),
+            )),
+            false,
         );
         for event in [
             tunnel::ClientConnectionEvent::Reconnecting {

@@ -38,6 +38,139 @@ const LOCAL_IO_TIMEOUT: Duration = Duration::from_secs(60);
 const LARGE_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const LOCAL_SLICE_SETTLE: Duration = Duration::from_millis(500);
 
+trait RefusalStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> RefusalStream for T {}
+
+/// The #302 proof: a service refusal is observable in status for every dial,
+/// while a saved opt-in preface affects only connections with no service output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generic_dial_refusal_status_and_error_preface_survive_restart() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let server_dir = TempDir::new()?;
+    let client_dir = TempDir::new()?;
+    let server_home = FabricHome::new(server_dir.path());
+    let client_home = FabricHome::new(client_dir.path());
+    let server = FabricNode::start(server_home.clone()).await?;
+    let mut client = FabricNode::start(client_home.clone()).await?;
+    trust_peer_allowing(
+        &server_home,
+        &server,
+        client.id(),
+        Some("client"),
+        Some(client.addr()),
+        &["echo"],
+    )
+    .await?;
+    trust_peer_allowing(
+        &client_home,
+        &client,
+        server.id(),
+        Some("server"),
+        Some(server.addr()),
+        &[],
+    )
+    .await?;
+    let (echo_addr, hits, service) = spawn_tcp_echo_service().await?;
+    server.expose_tcp("private-echo", echo_addr).await?;
+    let socket = PathBuf::from(run_fabric(
+        &client_home,
+        &["dial", "server", "private-echo"],
+    )?);
+    let tcp = run_fabric(
+        &client_home,
+        &["dial", "server", "private-echo", "--tcp", "127.0.0.1:0"],
+    )?;
+    for enabled in [false, true] {
+        if enabled {
+            run_fabric(
+                &client_home,
+                &["dial", "server", "private-echo", "--error-preface"],
+            )?;
+            run_fabric(
+                &client_home,
+                &[
+                    "dial",
+                    "server",
+                    "private-echo",
+                    "--tcp",
+                    "127.0.0.1:0",
+                    "--error-preface",
+                ],
+            )?;
+            assert!(
+                FabricConfig::load(&client_home)?
+                    .dials()
+                    .iter()
+                    .all(|dial| dial.options.error_preface)
+            );
+            client.shutdown().await?;
+            client = FabricNode::start(client_home.clone()).await?;
+            let status: serde_json::Value =
+                serde_json::from_str(&run_fabric(&client_home, &["status", "--json"])?)?;
+            assert!(
+                status["dials"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|dial| dial["last_error"].is_null())
+            );
+        }
+        for unix in [true, false] {
+            let mut stream: Box<dyn RefusalStream> = if unix {
+                Box::new(UnixStream::connect(&socket).await?)
+            } else {
+                Box::new(TcpStream::connect(&tcp).await?)
+            };
+            stream.write_all(b"denied request").await?;
+            let mut bytes = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut bytes))
+                .await
+                .context("refusal did not close local socket")??;
+            if enabled {
+                let text = String::from_utf8(bytes)?;
+                assert!(
+                    text.starts_with("fabric:peer_not_permitted_for_service "),
+                    "{text:?}"
+                );
+                assert_eq!(text.bytes().filter(|byte| *byte == b'\n').count(), 1);
+                assert!(text.ends_with('\n'));
+            } else {
+                assert!(bytes.is_empty(), "default dial injected bytes");
+            }
+            let status: serde_json::Value =
+                serde_json::from_str(&run_fabric(&client_home, &["status", "--json"])?)?;
+            let dial = status["dials"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|dial| {
+                    if unix {
+                        dial["socket"].is_string()
+                    } else {
+                        dial["tcp"].is_string()
+                    }
+                })
+                .unwrap();
+            let latest = &dial["last_error"];
+            assert_eq!(latest["code"], "peer_not_permitted_for_service");
+            assert_eq!(latest["class"], "refusal");
+            time::OffsetDateTime::parse(
+                latest["at"].as_str().unwrap(),
+                &time::format_description::well_known::Rfc3339,
+            )?;
+        }
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "denial must not open the service"
+    );
+    service.abort();
+    client.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
 /// The #304 workload: ten batches of twenty fresh HTTP connections through
 /// one dial listener. A successful bind must not conceal admission failures.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -161,7 +294,8 @@ async fn tcp_dial_queue_timeout_survives_restart_and_updates_the_live_listener()
                         "--tcp",
                         &addr,
                         "--queue-timeout",
-                        seconds
+                        seconds,
+                        "--error-preface",
                     ]
                 )?,
                 addr
@@ -170,12 +304,24 @@ async fn tcp_dial_queue_timeout_survives_restart_and_updates_the_live_listener()
         let started = Instant::now();
         let mut waiting = TcpStream::connect(&addr).await?;
         waiting.write_all(b"must-not-reach-service").await?;
-        let mut byte = [0];
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), waiting.read_to_end(&mut bytes)).await??;
+        if expected_ms == 300 {
+            assert!(
+                bytes.starts_with(b"fabric:session_limit_reached "),
+                "{bytes:?}"
+            );
+            assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
+        } else {
+            assert!(bytes.is_empty(), "default queue timeout injected bytes");
+        }
+        let status: serde_json::Value =
+            serde_json::from_str(&run_fabric(&client_home, &["status", "--json"])?)?;
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(3), waiting.read(&mut byte)).await??,
-            0,
-            "a full remote cap must expire with EOF"
+            status["dials"][0]["last_error"]["code"],
+            "session_limit_reached"
         );
+        assert_eq!(status["dials"][0]["last_error"]["class"], "fault");
         assert!(
             started.elapsed() >= Duration::from_millis(expected_ms - 25),
             "capacity was refused before the queue deadline"
@@ -754,7 +900,10 @@ async fn generic_tunnel_reap_closes_existing_client_socket() -> Result<()> {
     let echo_task = spawn_echo_service(&echo_socket, echo_hits.clone()).await?;
     node_a.expose("pty-view", echo_socket).await?;
 
-    let dial_socket = node_b.dial("node-a", "pty-view").await?;
+    let dial_socket = PathBuf::from(run_fabric(
+        &node_b_home,
+        &["dial", "node-a", "pty-view", "--error-preface"],
+    )?);
     let mut stream = UnixStream::connect(&dial_socket).await?;
     stream_round_trip(&mut stream, b"before-reap").await?;
 
@@ -775,6 +924,9 @@ async fn generic_tunnel_reap_closes_existing_client_socket() -> Result<()> {
         "expired reconnect should not open a replacement service connection"
     );
 
+    let status: serde_json::Value =
+        serde_json::from_str(&run_fabric(&node_b_home, &["status", "--json"])?)?;
+    assert_eq!(status["dials"][0]["last_error"]["code"], "session_expired");
     echo_task.abort();
     node_b.shutdown().await?;
     node_a.shutdown().await?;
