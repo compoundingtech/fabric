@@ -2224,7 +2224,7 @@ mod tests {
         std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o755))?;
 
         // An updater that has already exited: the restart runs at once.
-        let mut finished = std::process::Command::new("/usr/bin/true").spawn()?;
+        let mut finished = std::process::Command::new("true").spawn()?;
         let finished_pid = finished.id();
         finished.wait()?;
         let (pid, log) = spawn_detached_restart(&home, &managed, finished_pid)?;
@@ -2265,7 +2265,7 @@ mod tests {
         )?;
         std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o755))?;
 
-        let mut updater = std::process::Command::new("/bin/sleep").arg("1").spawn()?;
+        let mut updater = std::process::Command::new("sleep").arg("1").spawn()?;
         spawn_detached_restart(&home, &managed, updater.id())?;
         std::thread::sleep(std::time::Duration::from_millis(600));
         assert!(
@@ -3165,8 +3165,11 @@ mod supervisor_tests {
         generation_file: &Path,
         generation: &str,
     ) -> std::process::ExitStatus {
+        // Exercise the macOS script on Linux too. The test host may provide
+        // utilities through PATH; the production script keeps fixed macOS paths.
+        let script = MACOS_SUPERVISOR_SCRIPT.replace("/usr/bin/", "").replace("/bin/", "");
         std::process::Command::new("/bin/sh")
-            .args(["-c", MACOS_SUPERVISOR_SCRIPT, "fabric-update-supervisor"])
+            .args(["-c", &script, "fabric-update-supervisor"])
             .arg("gui/501/com.compoundingtech.fabric.update-supervisor.test")
             .arg(plist)
             .arg(installed)
@@ -3495,7 +3498,7 @@ mod supervisor_tests {
         executable(&installed, "#!/bin/sh\nexit 99\n");
         executable(
             &rollback,
-            "#!/bin/sh\ninstalled=${0%%.rollback-*}\n/bin/cp \"$0\" \"$installed\"\nexit 0\n",
+            "#!/bin/sh\ninstalled=${0%%.rollback-*}\ncp \"$0\" \"$installed\"\nexit 0\n",
         );
         std::fs::write(&plist, b"loaded").unwrap();
         executable(
