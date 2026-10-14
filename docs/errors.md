@@ -27,6 +27,7 @@ Each code has a class, and the class says what a caller should do:
 | `unreachable` | fault | 69 | Fabric tried and could not reach the peer. |
 | `timeout` | fault | 69 | The caller's deadline passed before an answer. |
 | `daemon_not_running` | fault | 69 | The local daemon is not running (`fabric up` starts it). |
+| `daemon_stop_timeout` | fault | 69 | The daemon is still stopping after the bounded wait; its lease is not free yet. |
 | `service_not_exposed` | fault | 69 | The peer is reachable but exposes no service by that name. |
 | `service_unavailable` | fault | 69 | The service is exposed, but its socket or address could not be reached. |
 | `session_limit_reached` | fault | 69 | The peer holds as many sessions as its limits allow, all attached. |

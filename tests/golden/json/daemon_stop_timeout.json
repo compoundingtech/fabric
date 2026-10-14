@@ -1,0 +1,9 @@
+{
+  "error": {
+    "class": "fault",
+    "code": "daemon_stop_timeout",
+    "message": "daemon is still stopping; lease was not released within 15s",
+    "peer": null,
+    "service": null
+  }
+}

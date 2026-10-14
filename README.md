@@ -1040,7 +1040,11 @@ change policy.
 fabric down
 ```
 
-Stop the local daemon.
+Stop the local daemon and wait for its lease to be released, including endpoint
+and exec-child cleanup. An immediate `fabric down && fabric up` can then start
+without racing the old process. The wait is bounded at 15 seconds; if the lease
+is still held, `down` reports `fabric:daemon_stop_timeout` (fault, exit 69) and
+says the daemon is still stopping.
 
 ```sh
 fabric restart
@@ -1082,6 +1086,12 @@ pass the command as argv after `--`, not as a shell string. Child stderr is
 written to the fabric daemon log with the tunnel session id. Exec exposures
 default to at most 32 active children per exposure; use `--max-children` to set
 a different per-exposure cap.
+
+Through a generic dial listener, an exposure's child-limit refusal now waits
+up to the dial's queue timeout (default 10 seconds) before the local client sees
+EOF; it cannot start an extra child. Set `fabric dial --queue-timeout 0` to
+restore immediate refusal. Zero disables local capacity waiting and remote
+capacity retries, while ordinary connections with available capacity work.
 
 Exposes are persisted by default to `<home>/config.toml` and are restored when
 the daemon starts. `fabric add` writes the separate authoritative `peers.toml`,
@@ -1145,7 +1155,7 @@ protocols. Each dialing daemon allows 16 active sessions per peer and bounds
 outstanding connections to 144 (16 active plus 128 waiting). New connections
 wait for local capacity; a remote session-cap refusal before admission is
 retried within the same 10-second deadline. Set `--queue-timeout` in seconds
-(at least 0.001); it is saved with the dial and restored on daemon startup.
+(0 for immediate refusal, otherwise at least 0.001); it is saved with the dial and restored on daemon startup.
 Repeating a dial updates the listener's timeout for new connections. Waiting
 connections keep their original deadline. A full queue or an expired deadline
 reports `fabric:session_limit_reached` in the dialing daemon's log; the local

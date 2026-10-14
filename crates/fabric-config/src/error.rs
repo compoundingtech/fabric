@@ -102,6 +102,7 @@ error_codes! {
     Unreachable => "unreachable", Fault;
     Timeout => "timeout", Fault;
     DaemonNotRunning => "daemon_not_running", Fault;
+    DaemonStopTimeout => "daemon_stop_timeout", Fault;
     ServiceNotExposed => "service_not_exposed", Fault;
     ServiceUnavailable => "service_unavailable", Fault;
     SessionLimitReached => "session_limit_reached", Fault;
