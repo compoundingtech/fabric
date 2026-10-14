@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Paired loopback TCP/Fabric baseline, using disposable homes and one backend.
+
+Optional browser graph requires Node and Playwright (CHROMIUM selects Chrome).
+Raw samples preserve misses; this is not an automated performance gate.
+"""
+import argparse
+import concurrent.futures
+import hashlib
+import http.server
+import json
+import os
+import pathlib
+import platform
+import socket
+import statistics
+import subprocess
+import tempfile
+import threading
+import time
+
+
+def summary(samples):
+    ordered = sorted(samples)
+    return dict(n=len(samples), p50_ms=statistics.median(samples),
+                p90_ms=ordered[(len(samples) * 9 - 1) // 10], samples_ms=samples)
+
+
+def request(port, size):
+    start = time.perf_counter()
+    with socket.create_connection(('127.0.0.1', port), timeout=30) as stream:
+        stream.sendall(f'GET /size/{size} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'.encode())
+        chunks = [stream.recv(1)]
+        first = time.perf_counter()
+        while chunk := stream.recv(65536):
+            chunks.append(chunk)
+    done = time.perf_counter()
+    headers, body = b''.join(chunks).split(b'\r\n\r\n', 1)
+    assert headers.startswith(b'HTTP/1.1 200 '), headers
+    assert body == b'x' * size, (len(body), size)
+    return (done - start) * 1000, (first - start) * 1000
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        if self.path.startswith('/m'):
+            i = int(self.path.split('/m')[1].split('.')[0])
+            body = (f'globalThis.module{i}=1;\n' + ' ' * 47500).encode()[:47500]
+            kind = 'application/javascript'
+        elif self.path.startswith('/size/'):
+            body = b'x' * int(self.path.split('/size/')[1])
+            kind = 'application/octet-stream'
+        else:
+            body = ('<!doctype html><meta charset="utf-8"><title>Fixed graph</title>'
+                    '<link rel="icon" href="data:,">' + ''.join(
+                    f'<script defer src="/m{i}.js"></script>' for i in range(360))).encode()
+            kind = 'text/html'
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Content-Type', kind)
+        self.send_header('Cache-Control', 'public, max-age=3600')
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--binary', required=True, type=pathlib.Path)
+    parser.add_argument('--output', required=True, type=pathlib.Path)
+    parser.add_argument('--browser', action='store_true')
+    args = parser.parse_args()
+    binary = args.binary.resolve()
+    processes, logs = [], []
+    homes_dir = tempfile.TemporaryDirectory(prefix='fabric-short-stream-')
+    backend = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    threading.Thread(target=backend.serve_forever, daemon=True).start()
+    result = dict(binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
+                  platform=dict(system=platform.system(), machine=platform.machine(),
+                                python=platform.python_version()), load_before=os.getloadavg(),
+                  backend=dict(protocol='HTTP/1.1', threaded=True,
+                               listen_backlog=backend.request_queue_size, tcp_nodelay=False),
+                  method='alternating paired carriers; fresh local connections; warm shared Fabric connection',
+                  carriers=dict(tcp={}, fabric={}))
+
+    def run(home, *argv):
+        completed = subprocess.run([str(binary), '--home', str(home), *argv],
+                                   capture_output=True, text=True, timeout=15)
+        if completed.returncode:
+            raise RuntimeError(completed.stderr)
+        return completed.stdout.strip()
+
+    try:
+        server, client = [pathlib.Path(homes_dir.name) / name for name in ['server', 'client']]
+        for home in [server, client]:
+            home.mkdir()
+            log = (home / 'foreground.log').open('w')
+            logs.append(log)
+            processes.append(subprocess.Popen([str(binary), '--home', str(home), 'up', '--foreground'], stdout=log, stderr=log))
+            for _ in range(100):
+                if processes[-1].poll() is not None:
+                    raise RuntimeError('scratch daemon exited')
+                try:
+                    run(home, 'addr')
+                    break
+                except RuntimeError:
+                    time.sleep(.1)
+            else:
+                raise RuntimeError('scratch daemon did not start')
+        result['version'] = run(client, '--version')
+        run(server, 'add', run(client, 'id'), 'client', '--addr-json', run(client, 'addr'), '--allow', 'web', '--inbound-only')
+        run(client, 'add', run(server, 'id'), 'server', '--addr-json', run(server, 'addr'), '--dial-only')
+        run(server, 'expose', 'web', '--tcp', f'127.0.0.1:{backend.server_port}')
+        dial = run(client, 'dial', 'server', 'web', '--tcp', '127.0.0.1:0')
+        ports = dict(tcp=backend.server_port, fabric=int(dial.rsplit(':', 1)[1]))
+        for port in ports.values():
+            request(port, 3)
+        probe = json.loads(run(client, 'probe', 'server', 'web', '--json'))
+        result['probe'] = {key: probe[key] for key in ['outcome', 'transport']}
+        assert probe['outcome'] == 'supported' and probe['transport'] == 'direct', result['probe']
+        for size in [1024, 16384, 262144]:
+            samples = {name: dict(total=[], first=[]) for name in ports}
+            for trial in range(100):
+                for name in (['tcp', 'fabric'] if trial % 2 == 0 else ['fabric', 'tcp']):
+                    total, first = request(ports[name], size)
+                    samples[name]['total'].append(total)
+                    samples[name]['first'].append(first)
+            for name in ports:
+                result['carriers'][name][f'short_{size}'] = dict(total=summary(samples[name]['total']), first_response_byte=summary(samples[name]['first']))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            for size in [262144, 1048576]:
+                samples = {name: [] for name in ports}
+                for trial in range(20):
+                    for name in (['tcp', 'fabric'] if trial % 2 == 0 else ['fabric', 'tcp']):
+                        start = time.perf_counter()
+                        list(pool.map(lambda _: request(ports[name], size), range(4)))
+                        samples[name].append((time.perf_counter() - start) * 1000)
+                for name in ports:
+                    result['carriers'][name][f'four_streams_{size}_each'] = summary(samples[name])
+        if args.browser:
+            script = pathlib.Path(__file__).with_name('fabric-short-stream-browser.cjs')
+            completed = subprocess.run(['node', str(script), *[f'http://127.0.0.1:{ports[name]}/' for name in ['tcp', 'fabric']]], capture_output=True, text=True, timeout=360)
+            if completed.returncode:
+                raise RuntimeError(completed.stderr)
+            result['browser'] = json.loads(completed.stdout)
+        result['load_after'] = os.getloadavg()
+        args.output.write_text(json.dumps(result, indent=2) + '\n')
+        print(json.dumps(dict(version=result['version'], probe=result['probe'], output=str(args.output))))
+    finally:
+        for process in processes:
+            process.terminate()
+        for process in processes:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        for log in logs:
+            log.close()
+        backend.shutdown()
+        backend.server_close()
+        homes_dir.cleanup()
+
+
+if __name__ == '__main__':
+    main()
