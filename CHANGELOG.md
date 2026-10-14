@@ -15,33 +15,15 @@ Deprecated, Fixed or Security.
 
 ## [Unreleased]
 
-Changes since 0.2.40 for the 1.0.0 cut; the original release notes remain below.
-
-### Added
-
-- Stable error codes, refusal/fault/usage classes, exit statuses, and coded close reasons and wire errors are specified in `docs/errors.md` and shared with the sync companion.
-- `--json` accepts flags before or after commands and prints one stable success object for `id`, `peers`, `status`, `dial`, `expose`, `unexpose`, `send-file`, and `reload-peers`; `probe --json` includes `code` and `class`.
-- `fabric add --inbound-only` serves a peer under its grants without dialing or probing it, and status and doctor report its connection state instead of calling it offline.
-- **Provisional:** `fabric-stdio` provides `bridge` and `serve_stdio` for exec services with explicit read/write/flush and half-close handling, avoiding Linux `splice(2)` pipe stalls.
-- **Provisional:** `fabric expose --socket PATH --peer-header` sends the authenticated peer's NodeID and local name as a JSON line to the service and persists the option.
-- `docs/stability.md` defines stable, provisional, and internal surfaces and the patch/minor/major release and deprecation rules from 1.0.0.
-
 ### Changed
 
-- Command failures print one `Error: fabric:<code> <text>` line and use their code's exit status; `exec` and `probe` retain their existing exit contracts and recognize older peers' refusal text.
-- `fabric update --url` checks the staged version before installing, requires `--allow-downgrade` for older or equal builds, and supports `--expect-version` without bypassing that check.
-- README and JSON documentation distinguish echo-only status samples from exact-service probes, explain `echo_denied` and inbound/dial-only grants, and document service caps without requiring broader permissions.
-- README documents the commands and their exit statuses, per-peer shell/exec policy, grant revocation, the five-crate workspace and companion bridge, and upgrades whose versions include a commit suffix.
+- README documents the existing server session limits and the current EOF behavior of refused dial sessions (#306).
+- README and the JSON contract distinguish echo status samples from exact-service probes without requiring broader grants (#311).
 
 ### Fixed
 
 - A failed Unix dial is never persisted, overlong socket paths report `fabric:invalid_argument` and the maximum home length, and failed saved Unix or TCP listeners are skipped at startup and reported by status in `dial_restore_failures` (#297).
 - `fabric down` waits up to 15 seconds for lease release through endpoint and child cleanup, so immediate `down && up` succeeds or reports `fabric:daemon_stop_timeout` (fault, exit 69) while still stopping (#298).
-- A trusted peer without an echo grant is reachable with `echo_denied`, no round trip or transport sample, and an informational doctor finding instead of being reported offline.
-- `fabric exec` reads a peer's refusal before discarding a failed command write, preserving the coded reason instead of reporting a broken pipe or an unknown doctor build finding.
-- Network-change notification has a ten-second deadline, so a stalled iroh notice cannot stop held-connection checks and peer announcements (#21).
-- A fully acknowledged tunnel session ends without a reconnect warning or unnecessary telemetry rewrite; a live session still resumes after transport loss.
-- Daemon shutdown ends sessions and waits up to two seconds for their exec children, preventing a child-held output pipe from keeping the daemon alive.
 
 ## [0.2.41] - 2026-10-13
 
