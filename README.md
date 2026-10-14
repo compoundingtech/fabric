@@ -1114,6 +1114,37 @@ not remove its listener. Remove all listeners for that peer and protocol with
 `fabric undial <peer> <protocol>`. Per-command shell and exec sockets stay
 transient.
 
+Each connection through a generic Unix or TCP dial listener uses one resumable
+tunnel session. The daemon **exposing** the service limits sessions to 16 per
+peer and 64 across all peers by default. These are shared across protocols, not
+separate limits for each listener. Set them in that daemon's `<home>/config.toml`:
+
+```toml
+[server_sessions]
+max_per_peer = 16
+max_total = 64
+detached_ttl_secs = 900
+```
+
+Restart the exposing daemon after changing these settings. All values must be
+positive, and `max_per_peer` must not exceed `max_total`. Startup flags
+`--server-session-max-per-peer`, `--server-session-max-total`, and
+`--server-session-detached-ttl-secs` override the corresponding config values
+for that daemon invocation. Changing the dialing daemon's server limits does
+not change the remote service's cap.
+
+The limits bound memory and retained service connections: a session can buffer
+up to 4 MiB of outgoing unacknowledged data, plus transport and service memory.
+Detached sessions can be evicted to admit new ones before their 900-second
+retention period ends; evicted sessions cannot resume. Raising the caps allows
+more live sessions but increases the possible memory use.
+
+Currently, connections above the remote cap are refused with
+`fabric:session_limit_reached` in the dialing daemon's log; the local client sees
+EOF. The dial listener does not yet queue them. Applications opening many short
+connections should bound concurrency, reuse connections, or retry refusals.
+See [the session-limit failure mode](docs/failure-modes.md#session-limits).
+
 ```sh
 fabric peer-events [--watch] [--instance TOKEN] [--after CURSOR]
 ```
