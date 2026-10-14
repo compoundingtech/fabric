@@ -3168,6 +3168,11 @@ mod supervisor_tests {
         // Exercise the macOS script on Linux too. The test host may provide
         // utilities through PATH; the production script keeps fixed macOS paths.
         let script = MACOS_SUPERVISOR_SCRIPT.replace("/usr/bin/", "").replace("/bin/", "");
+        // Use an exited child: u32::MAX wraps to -1 in Linux kill(2), which
+        // checks every process instead of representing an absent updater.
+        let mut updater = std::process::Command::new("true").spawn().unwrap();
+        let updater_pid = updater.id();
+        assert!(updater.wait().unwrap().success());
         std::process::Command::new("/bin/sh")
             .args(["-c", &script, "fabric-update-supervisor"])
             .arg("gui/501/com.compoundingtech.fabric.update-supervisor.test")
@@ -3176,7 +3181,7 @@ mod supervisor_tests {
             .arg(rollback)
             .arg("fabric 0.2.1+new")
             .arg("/tmp/fabric-home")
-            .arg(u32::MAX.to_string())
+            .arg(updater_pid.to_string())
             .arg(launchctl)
             .arg(generation_file)
             .arg(generation)
