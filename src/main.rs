@@ -11,7 +11,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use fabric::{
     error::{ErrorCode, FabricError},
     config::{
-        DEFAULT_EXEC_MAX_CHILDREN, FabricHome, GitAccess, PeerBook, generate_identity_file,
+        DEFAULT_EXEC_MAX_CHILDREN, DialOptions, FabricHome, GitAccess, PeerBook, generate_identity_file,
         load_or_create_identity, parse_addr_json, parse_node_id,
     },
     control::{ControlRequest, ControlResponse, PeerReachability, SyncRuntimeStatus},
@@ -261,6 +261,9 @@ enum Commands {
         /// Listen on a local TCP address instead of creating a Unix socket.
         #[arg(long)]
         tcp: Option<String>,
+        /// Seconds a generic dial connection may wait for session capacity.
+        #[arg(long, default_value = "10")]
+        queue_timeout: f64,
     },
     /// Remove durable Unix and TCP listeners for this peer and protocol.
     Undial { peer: String, protocol: String },
@@ -1049,7 +1052,9 @@ async fn run(cli: Cli) -> Result<()> {
                     peer,
                     protocol,
                     tcp,
+                    queue_timeout,
                 } => {
+                    let options = DialOptions::from_seconds(queue_timeout)?;
                     if let Some(bind) = tcp {
                         match send_control(
                             &home,
@@ -1057,6 +1062,7 @@ async fn run(cli: Cli) -> Result<()> {
                                 peer,
                                 protocol,
                                 bind,
+                                options,
                             },
                         )
                         .await?
@@ -1068,7 +1074,7 @@ async fn run(cli: Cli) -> Result<()> {
                             response => bail!("unexpected daemon response: {response:?}"),
                         }
                     } else {
-                        match send_control(&home, ControlRequest::Dial { peer, protocol }).await? {
+                        match send_control(&home, ControlRequest::Dial { peer, protocol, options }).await? {
                             ControlResponse::Dial { socket } if json => {
                                 print_json(&serde_json::json!({ "socket": socket }))?;
                             }

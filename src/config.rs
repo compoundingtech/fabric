@@ -1471,6 +1471,44 @@ pub struct PersistedDial {
     pub protocol: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp: Option<String>,
+    #[serde(flatten)]
+    pub options: DialOptions,
+}
+
+pub const DEFAULT_DIAL_QUEUE_TIMEOUT_MS: u64 = 10_000;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DialOptions {
+    #[serde(default = "default_dial_queue_timeout_ms", skip_serializing_if = "is_default_dial_queue_timeout_ms")]
+    pub queue_timeout_ms: u64,
+}
+
+fn default_dial_queue_timeout_ms() -> u64 { DEFAULT_DIAL_QUEUE_TIMEOUT_MS }
+fn is_default_dial_queue_timeout_ms(value: &u64) -> bool { *value == DEFAULT_DIAL_QUEUE_TIMEOUT_MS }
+
+impl Default for DialOptions {
+    fn default() -> Self { Self { queue_timeout_ms: DEFAULT_DIAL_QUEUE_TIMEOUT_MS } }
+}
+
+impl DialOptions {
+    pub fn is_default(&self) -> bool { *self == Self::default() }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.queue_timeout_ms == 0 {
+            return Err(invalid_argument("queue timeout must be at least one millisecond".into()));
+        }
+        Ok(())
+    }
+
+    pub fn from_seconds(seconds: f64) -> Result<Self> {
+        let duration = std::time::Duration::try_from_secs_f64(seconds)
+            .map_err(|_| invalid_argument("queue timeout must be finite and positive".into()))?;
+        let queue_timeout_ms = u64::try_from(duration.as_millis())
+            .map_err(|_| invalid_argument("queue timeout is too large".into()))?;
+        let options = Self { queue_timeout_ms };
+        options.validate()?;
+        Ok(options)
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -1647,6 +1685,7 @@ impl FabricConfig {
 
         let mut dials = HashSet::new();
         for dial in &self.dials {
+            dial.options.validate()?;
             dial.peer
                 .parse::<EndpointId>()
                 .context("invalid persisted dial peer id")?;
