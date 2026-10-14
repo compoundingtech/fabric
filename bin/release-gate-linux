@@ -15,6 +15,7 @@
 # Usage, from a checkout of the revision to release, on the Linux host:
 #
 #   bin/release-gate-linux [--idle-runs N] [--soak-rounds N] [--soak-pause-ms N]
+#   FABRIC_DOWN_CYCLES=100 bin/release-gate-linux  # also run idle/live down-up cycles
 #
 # To run it on another machine, copy the source with `fabric send-file` (or
 # `git archive`), unpack it, and run this script there. It builds under `nice`
@@ -90,6 +91,11 @@ done
 step "socket-soak-${soak_rounds}x${soak_pause_ms}ms" env \
     FABRIC_SOAK_ROUNDS="$soak_rounds" FABRIC_SOAK_PAUSE_MS="$soak_pause_ms" \
     "$BASH" -c "$(declare -f cargo_test); cargo_test socket_expose_survives_idle_slow_concurrent_and_abrupt_streams"
+
+# Optional longer stop-barrier check; CI uses 10 cycles per mode by default.
+if [ -n "${FABRIC_DOWN_CYCLES:-}" ]; then
+    step "down-up-$FABRIC_DOWN_CYCLES" cargo_test down_then_up_is_a_barrier_for_idle_and_live_exec_cycles
+fi
 
 # A test that passes but leaves a child behind is a failure the test itself
 # should have caught; check anyway, because this is the release gate.

@@ -16,6 +16,10 @@ Deprecated, Fixed or Security.
 ## [Unreleased]
 
 ### Fixed
+- `fabric down` waits up to 15 seconds for the daemon lease to be released,
+  including endpoint and exec-child cleanup. An immediate `down && up` no
+  longer races the old daemon; a timeout is `fabric:daemon_stop_timeout`
+  (fault, exit 69), so the caller knows it is still stopping (#298).
 - A failed Unix dial never saves a listener declaration. Socket paths that exceed
   the platform's limit report `fabric:invalid_argument` and the maximum home
   length before binding. One saved listener that cannot be restored (including
@@ -32,6 +36,13 @@ Deprecated, Fixed or Security.
   one coded line before closing only if no service output reached the local
   client; default streams and streams that already carried output receive no
   extra bytes (#302).
+
+### Changed
+- Through a generic dial listener, an exposure's exec child-limit refusal now
+  waits for capacity up to the queue timeout (default 10 seconds) before the
+  local client sees EOF. `--queue-timeout 0` restores immediate refusal and
+  disables local capacity waiting and remote capacity retries. Existing
+  admitted requests are not replayed and no child starts above the limit.
 
 ## [0.2.41] - 2026-10-13
 

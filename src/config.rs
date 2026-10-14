@@ -1510,23 +1510,20 @@ impl DialOptions {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.queue_timeout_ms == 0 {
-            return Err(invalid_argument(
-                "queue timeout must be at least one millisecond".into(),
-            ));
-        }
         Ok(())
     }
 
     pub fn from_seconds(seconds: f64) -> Result<Self> {
         let duration = std::time::Duration::try_from_secs_f64(seconds)
-            .map_err(|_| invalid_argument("queue timeout must be finite and positive".into()))?;
+            .map_err(|_| invalid_argument("queue timeout must be finite and nonnegative".into()))?;
         let queue_timeout_ms = u64::try_from(duration.as_millis())
             .map_err(|_| invalid_argument("queue timeout is too large".into()))?;
-        let options = Self {
-            queue_timeout_ms,
-            ..Self::default()
-        };
+        if seconds > 0.0 && queue_timeout_ms == 0 {
+            return Err(invalid_argument(
+                "positive queue timeout must be at least one millisecond".into(),
+            ));
+        }
+        let options = Self { queue_timeout_ms, ..Self::default() };
         options.validate()?;
         Ok(options)
     }
@@ -1869,7 +1866,8 @@ mod tests {
         let encoded = toml::to_string(&configured)?;
         let decoded: super::PersistedDial = toml::from_str(&encoded)?;
         assert_eq!(decoded, configured);
-        for seconds in [0.0, -1.0, f64::NAN, f64::INFINITY, 0.0001] {
+        assert_eq!(super::DialOptions::from_seconds(0.0)?.queue_timeout_ms, 0);
+        for seconds in [-1.0, f64::NAN, f64::INFINITY, 0.0001] {
             let error = super::DialOptions::from_seconds(seconds).unwrap_err();
             assert_eq!(
                 fabric_config::error::code_of(&error),

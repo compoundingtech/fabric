@@ -1181,7 +1181,7 @@ async fn exec_expose_enforces_per_exposure_child_limit() -> Result<()> {
             vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
-                "printf spawn >> \"$1\"; printf ready > \"$2\"; while [ ! -e \"$3\" ]; do sleep 0.1; done; exec /bin/cat".to_string(),
+                "printf spawn >> \"$1\"; printf ready > \"$2\"; while [ ! -e \"$3\" ]; do sleep 0.1; done; exec cat".to_string(),
                 "fabric-test".to_string(),
                 marker.display().to_string(),
                 ready.display().to_string(),
@@ -1191,17 +1191,39 @@ async fn exec_expose_enforces_per_exposure_child_limit() -> Result<()> {
         )
         .await?;
 
-    let dial_socket = node_b.dial("node-a", "limited-cat").await?;
+    // A child-cap refusal now waits in the generic dial admission queue.
+    // Keep this test focused on enforcing the cap and expiring that wait.
+    let dial_socket = PathBuf::from(run_fabric(
+        &node_b_home,
+        &["dial", "node-a", "limited-cat", "--queue-timeout", "0.15"],
+    )?);
     let mut first = UnixStream::connect(&dial_socket).await?;
     wait_for_file_contents(&ready, "ready").await?;
     assert_eq!(fs::read_to_string(&marker)?, "spawn");
 
-    assert_tunnel_rejects_quickly(&dial_socket, b"second-child").await?;
-    assert_eq!(
-        fs::read_to_string(&marker)?,
-        "spawn",
-        "limit rejection must not spawn a second child"
-    );
+    for seconds in ["0", "0.15"] {
+        run_fabric(
+            &node_b_home,
+            &["dial", "node-a", "limited-cat", "--queue-timeout", seconds],
+        )?;
+        let start = Instant::now();
+        assert_tunnel_rejects_quickly(&dial_socket, b"second-child").await?;
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "short or disabled queue did not refuse promptly"
+        );
+        if seconds == "0.15" {
+            assert!(
+                start.elapsed() >= Duration::from_millis(125),
+                "refused before the queue deadline"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(&marker)?,
+            "spawn",
+            "limit rejection must not spawn a second child"
+        );
+    }
 
     fs::write(&release, "go")?;
     stream_round_trip(&mut first, b"first-still-alive").await?;
@@ -1209,6 +1231,112 @@ async fn exec_expose_enforces_per_exposure_child_limit() -> Result<()> {
     drop(first);
     node_b.shutdown().await?;
     node_a.shutdown().await?;
+    Ok(())
+}
+
+/// Hold the new default through an actual daemon listener, including the
+/// coded diagnostic that is emitted after the admission deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_child_cap_default_waits_ten_seconds_then_reports_coded_refusal() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    struct Foreground(std::process::Child);
+    impl Drop for Foreground {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let server_dir = TempDir::new()?;
+    let client_dir = TempDir::new()?;
+    let server_home = FabricHome::new(server_dir.path());
+    let client_home = FabricHome::new(client_dir.path());
+    let server = FabricNode::start(server_home.clone()).await?;
+    let log_path = client_dir.path().join("foreground.log");
+    let log = fs::File::create(&log_path)?;
+    let _client = Foreground(
+        Command::new(env!("CARGO_BIN_EXE_fabric"))
+            .args([
+                "--home",
+                client_home.root().to_str().unwrap(),
+                "up",
+                "--foreground",
+            ])
+            .stdout(Stdio::from(log.try_clone()?))
+            .stderr(Stdio::from(log))
+            .spawn()?,
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !client_home.control_socket_path().exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("foreground dialer never started")?;
+    let client_id = run_fabric(&client_home, &["id"])?.parse()?;
+    let client_addr = serde_json::from_str(&run_fabric(&client_home, &["addr"])?)?;
+    trust_peer(
+        &server_home,
+        &server,
+        client_id,
+        Some("client"),
+        Some(client_addr),
+    )
+    .await?;
+    run_fabric(
+        &client_home,
+        &[
+            "add",
+            &server.id().to_string(),
+            "server",
+            "--addr-json",
+            &serde_json::to_string(&server.addr())?,
+            "--dial-only",
+        ],
+    )?;
+    let ready = server_dir.path().join("ready");
+    let release = server_dir.path().join("release");
+    let marker = server_dir.path().join("spawns");
+    server.expose_exec_with_limit("limited-cat", vec![
+        "/bin/sh".into(), "-c".into(),
+        "printf spawn >> \"$1\"; printf ready > \"$2\"; while [ ! -e \"$3\" ]; do sleep 0.1; done; exec cat".into(),
+        "fabric-test".into(), marker.display().to_string(), ready.display().to_string(), release.display().to_string(),
+    ], 1).await?;
+    let socket = PathBuf::from(run_fabric(
+        &client_home,
+        &["dial", "server", "limited-cat"],
+    )?);
+    let mut first = UnixStream::connect(&socket).await?;
+    wait_for_file_contents(&ready, "ready").await?;
+    let started = Instant::now();
+    let mut second = UnixStream::connect(&socket).await?;
+    second.write_all(b"no-second-child").await?;
+    let mut bytes = Vec::new();
+    tokio::time::timeout(Duration::from_secs(15), second.read_to_end(&mut bytes))
+        .await
+        .context("default child-cap queue never expired")??;
+    assert!(bytes.is_empty(), "default dial injected bytes");
+    assert!(
+        started.elapsed() >= Duration::from_millis(9_975),
+        "default refusal did not wait ten seconds"
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if fs::read_to_string(&log_path)?
+                .contains("fabric:session_limit_reached dial queue timeout expired")
+            {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("default refusal did not report its coded diagnostic")??;
+    assert_eq!(fs::read_to_string(&marker)?, "spawn");
+    fs::write(&release, "go")?;
+    stream_round_trip(&mut first, b"first-still-alive").await?;
+    drop(first);
+    run_fabric(&client_home, &["down"])?;
+    server.shutdown().await?;
     Ok(())
 }
 
@@ -4169,5 +4297,104 @@ async fn peer_online_signal_answers_without_an_application_request() -> Result<(
     );
     b.shutdown().await?;
     a.shutdown().await?;
+    Ok(())
+}
+
+/// Exercise the actual CLI and process lease, rather than in-process node
+/// shutdown (which never owns the daemon lease). The live half alternates a
+/// normal child with one that inherits SIGTERM ignored through exec. CI runs
+/// 10 cycles per mode; FABRIC_DOWN_CYCLES=100 runs the full release check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn down_then_up_is_a_barrier_for_idle_and_live_exec_cycles() -> Result<()> {
+    let cycles = match std::env::var("FABRIC_DOWN_CYCLES") {
+        Ok(value) => value
+            .parse::<usize>()
+            .context("FABRIC_DOWN_CYCLES must be an integer of at least 2")?,
+        Err(std::env::VarError::NotPresent) => 10,
+        Err(error) => return Err(error.into()),
+    };
+    if cycles < 2 {
+        bail!(
+            "FABRIC_DOWN_CYCLES must be at least 2 to cover normal and SIGTERM-ignoring children"
+        );
+    }
+    let _guard = local_slice_guard().await;
+    let server_dir = TempDir::new()?;
+    let client_dir = TempDir::new()?;
+    let server_home = FabricHome::new(server_dir.path());
+    let client_home = FabricHome::new(client_dir.path());
+    struct StopOnDrop(FabricHome);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            let _ = run_fabric(&self.0, &["down"]);
+        }
+    }
+    run_fabric(&server_home, &["up"])?;
+    let _cleanup = StopOnDrop(server_home.clone());
+    let started = Instant::now();
+    for cycle in 0..cycles {
+        run_fabric(&server_home, &["down"]).with_context(|| format!("idle down {cycle}"))?;
+        assert!(
+            fabric::daemon::daemon_lock_available(&server_home)?,
+            "idle down {cycle} returned with lease held"
+        );
+        run_fabric(&server_home, &["up"]).with_context(|| format!("idle up {cycle}"))?;
+    }
+    println!("idle down/up: {cycles}/{cycles} in {:?}", started.elapsed());
+
+    let client = FabricNode::start(client_home.clone()).await?;
+    let server_id = run_fabric(&server_home, &["id"])?;
+    let server_id = server_id.trim().parse::<iroh::EndpointId>()?;
+    run_fabric(
+        &server_home,
+        &[
+            "add",
+            &client.id().to_string(),
+            "client",
+            "--allow",
+            "stdio-cat/normal,stdio-cat/ignore-term",
+            "--inbound-only",
+        ],
+    )?;
+    for (protocol, script) in [
+        ("stdio-cat/normal", "printf ready; exec cat"),
+        (
+            "stdio-cat/ignore-term",
+            "trap '' TERM; printf ready; exec cat",
+        ),
+    ] {
+        run_fabric(
+            &server_home,
+            &["expose", protocol, "--exec", "--", "/bin/sh", "-c", script],
+        )?;
+    }
+    let started = Instant::now();
+    for cycle in 0..cycles {
+        let addr: iroh::EndpointAddr = serde_json::from_str(&run_fabric(&server_home, &["addr"])?)?;
+        trust_peer(&client_home, &client, server_id, Some("server"), Some(addr)).await?;
+        let protocol = if cycle % 2 == 0 {
+            "stdio-cat/normal"
+        } else {
+            "stdio-cat/ignore-term"
+        };
+        let path = client.dial("server", protocol).await?;
+        let mut stream = UnixStream::connect(path).await?;
+        let mut ready = [0; 5];
+        tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut ready)).await??;
+        assert_eq!(&ready, b"ready", "live exec must start before down {cycle}");
+        run_fabric(&server_home, &["down"]).with_context(|| format!("live down {cycle}"))?;
+        assert!(
+            fabric::daemon::daemon_lock_available(&server_home)?,
+            "live down {cycle} returned with lease held"
+        );
+        run_fabric(&server_home, &["up"]).with_context(|| format!("live up {cycle}"))?;
+        drop(stream);
+    }
+    println!(
+        "live exec down/up: {cycles}/{cycles} ({} SIGTERM-ignoring children) in {:?}",
+        cycles / 2,
+        started.elapsed()
+    );
+    client.shutdown().await?;
     Ok(())
 }

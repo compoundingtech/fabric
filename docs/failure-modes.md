@@ -73,12 +73,16 @@ alongside transport and service memory; raising the cap increases that budget.
 Generic Unix and TCP dial listeners share 16 active slots and a bound of 144
 outstanding local connections per peer (16 active plus 128 waiting). Waiting
 for the daemon's global dial-handler budget uses the same 10-second deadline.
-`fabric dial --queue-timeout SECONDS` changes this deadline (minimum 0.001 s),
+`fabric dial --queue-timeout SECONDS` changes this deadline (0 for immediate refusal, otherwise minimum 0.001 s),
 persists with the listener, and survives a daemon restart. Repeating the dial
 updates the timeout for new connections, leaving existing deadlines intact.
 If the exposing daemon has a smaller cap, or its total cap is occupied by
 other peers, an initial `session_limit_reached` reply is retried within that
-deadline. Each dialing daemon queues independently; there is no cross-daemon
+deadline. This includes the exposure's exec child limit: through a generic
+dial listener, a child-limit refusal waits up to the queue timeout (default
+10 seconds) before the local client sees EOF. `--queue-timeout 0` restores
+immediate refusal, disabling local waiting and remote capacity retries.
+Each dialing daemon queues independently; there is no cross-daemon
 fairness guarantee. Policy denials and service failures are not retried, and a
 session that was admitted is never restarted as a new request.
 

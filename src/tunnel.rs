@@ -193,8 +193,11 @@ impl ClientConnectionNotices {
         self
     }
 
-    pub(crate) fn with_admission_deadline(mut self, deadline: tokio::time::Instant) -> Self {
-        self.admission_deadline = Some(deadline);
+    pub(crate) fn with_admission_deadline(
+        mut self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Self {
+        self.admission_deadline = deadline;
         self
     }
 
