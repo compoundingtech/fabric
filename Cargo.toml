@@ -24,7 +24,7 @@ anyhow = "1"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29.0"
-iroh = "1.0.2"
+iroh = "=1.1.0"
 libc = "0.2"
 notify = "8"
 netwatch = "0.19.1"
@@ -63,7 +63,7 @@ netdev = { path = "vendor/netdev" }
 
 [dev-dependencies]
 # Local relay fixture; server support is not part of the shipped runtime.
-iroh-relay = { version = "=1.0.2", features = ["server"] }
+iroh-relay = { version = "=1.1.0", features = ["server"] }
 tokio = { version = "1", features = ["test-util"] }
 proptest = "1"
 tempfile = "3"
