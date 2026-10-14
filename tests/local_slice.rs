@@ -76,6 +76,129 @@ async fn tcp_dial_queues_competing_dialers_at_the_total_server_cap() -> Result<(
     .await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_dial_queue_timeout_survives_restart_and_updates_the_live_listener() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let server_dir = TempDir::new()?;
+    let client_dir = TempDir::new()?;
+    let server_home = FabricHome::new(server_dir.path());
+    let client_home = FabricHome::new(client_dir.path());
+    let server = FabricNode::start_with_daemon_options(
+        server_home.clone(),
+        DaemonOptions {
+            server_session_max_total: Some(1),
+            server_session_max_per_peer: Some(1),
+            ..DaemonOptions::default()
+        },
+    )
+    .await?;
+    let client = FabricNode::start(client_home.clone()).await?;
+    trust_peer_allowing(
+        &server_home,
+        &server,
+        client.id(),
+        Some("client"),
+        Some(client.addr()),
+        &["tcp-echo"],
+    )
+    .await?;
+    trust_peer_allowing(
+        &client_home,
+        &client,
+        server.id(),
+        Some("server"),
+        Some(server.addr()),
+        &[],
+    )
+    .await?;
+    let (echo_addr, _, service) = spawn_tcp_echo_service().await?;
+    server.expose_tcp("tcp-echo", echo_addr).await?;
+    let addr = run_fabric(
+        &client_home,
+        &[
+            "dial",
+            "server",
+            "tcp-echo",
+            "--tcp",
+            "127.0.0.1:0",
+            "--queue-timeout",
+            "0.15",
+        ],
+    )?;
+    assert_eq!(
+        FabricConfig::load(&client_home)?.dials()[0]
+            .options
+            .queue_timeout_ms,
+        150
+    );
+    client.shutdown().await?;
+    let client = FabricNode::start(client_home.clone()).await?;
+    trust_peer_allowing(
+        &server_home,
+        &server,
+        client.id(),
+        Some("client"),
+        Some(client.addr()),
+        &["tcp-echo"],
+    )
+    .await?;
+    let mut live = TcpStream::connect(&addr).await?;
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        tcp_stream_round_trip(&mut live, b"hold-capacity"),
+    )
+    .await??;
+
+    for (seconds, expected_ms) in [("0.15", 150), ("0.30", 300)] {
+        if expected_ms == 300 {
+            assert_eq!(
+                run_fabric(
+                    &client_home,
+                    &[
+                        "dial",
+                        "server",
+                        "tcp-echo",
+                        "--tcp",
+                        &addr,
+                        "--queue-timeout",
+                        seconds
+                    ]
+                )?,
+                addr
+            );
+        }
+        let started = Instant::now();
+        let mut waiting = TcpStream::connect(&addr).await?;
+        waiting.write_all(b"must-not-reach-service").await?;
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), waiting.read(&mut byte)).await??,
+            0,
+            "a full remote cap must expire with EOF"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(expected_ms - 25),
+            "capacity was refused before the queue deadline"
+        );
+        assert_eq!(
+            FabricConfig::load(&client_home)?.dials()[0]
+                .options
+                .queue_timeout_ms,
+            expected_ms
+        );
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            tcp_stream_round_trip(&mut live, b"still-live"),
+        )
+        .await??;
+    }
+    drop(live);
+    client.shutdown().await?;
+    server.shutdown().await?;
+    service.abort();
+    Ok(())
+}
+
 async fn tcp_dial_fanout(
     options: DaemonOptions,
     batches: &[usize],

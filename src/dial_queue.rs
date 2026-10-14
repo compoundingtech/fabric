@@ -17,7 +17,9 @@ use tokio_util::sync::CancellationToken;
 use crate::config::DEFAULT_SERVER_SESSION_MAX_PER_PEER;
 
 const MAX_WAITING_PER_PEER: usize = 128;
-pub(crate) const DEFAULT_QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+pub(crate) const DEFAULT_QUEUE_TIMEOUT: Duration =
+    Duration::from_millis(crate::config::DEFAULT_DIAL_QUEUE_TIMEOUT_MS);
 
 #[derive(Debug, Default)]
 pub(crate) struct DialQueues(Mutex<HashMap<EndpointId, Weak<DialQueue>>>);
@@ -54,6 +56,9 @@ impl DialQueue {
 
     /// Reserve before spawning: waiting sockets/tasks cannot grow without bound.
     pub(crate) fn reserve(self: &Arc<Self>, timeout: Duration) -> Result<DialReservation> {
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            FabricError::new(ErrorCode::InvalidArgument, "queue timeout is too large")
+        })?;
         let permit = self
             .outstanding
             .clone()
@@ -62,13 +67,20 @@ impl DialQueue {
         Ok(DialReservation {
             queue: self.clone(),
             _outstanding: permit,
-            deadline: Instant::now() + timeout,
+            deadline,
         })
     }
 }
 
 pub(crate) fn limit_error(message: &str) -> anyhow::Error {
     FabricError::new(ErrorCode::SessionLimitReached, message).into()
+}
+
+/// Typed local errors display prose alone. Preserve their code in listener
+/// diagnostics just as the remote's coded rejection preserves its code.
+pub(crate) fn diagnostic(error: &anyhow::Error) -> String {
+    fabric_config::error::code_of(error)
+        .reason(&fabric_config::error::without_tokens(&format!("{error:#}")))
 }
 
 pub(crate) struct DialReservation {

@@ -1102,6 +1102,7 @@ Stop accepting a protocol and remove its persisted config entry.
 ```sh
 fabric dial <peer> <protocol>
 fabric dial <peer> <protocol> --tcp <local-host:port>
+fabric dial <peer> <protocol> --tcp <local-host:port> --queue-timeout 10
 ```
 
 Create and print a local Unix socket path. Connections to that socket are
@@ -1143,9 +1144,12 @@ Generic dial listeners share a queue per peer, across Unix/TCP listeners and
 protocols. Each dialing daemon allows 16 active sessions per peer and bounds
 outstanding connections to 144 (16 active plus 128 waiting). New connections
 wait for local capacity; a remote session-cap refusal before admission is
-retried within the same 10-second deadline. A full queue or an expired deadline
+retried within the same 10-second deadline. Set `--queue-timeout` in seconds
+(at least 0.001); it is saved with the dial and restored on daemon startup.
+Repeating a dial updates the listener's timeout for new connections. Waiting
+connections keep their original deadline. A full queue or an expired deadline
 reports `fabric:session_limit_reached` in the dialing daemon's log; the local
-client sees EOF. Other remote refusals fail immediately, and requests already
+client's socket closes. Other remote refusals fail immediately, and requests already
 admitted are never retried as new sessions. Different dialing daemons have
 separate queues; contention at the exposing daemon's total cap still waits
 within each caller's deadline. Applications can reuse connections or retry a

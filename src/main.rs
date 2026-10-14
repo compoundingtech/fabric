@@ -11,8 +11,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 use fabric::{
     error::{ErrorCode, FabricError},
     config::{
-        DEFAULT_EXEC_MAX_CHILDREN, DialOptions, FabricHome, GitAccess, PeerBook, generate_identity_file,
-        load_or_create_identity, parse_addr_json, parse_node_id,
+        DEFAULT_EXEC_MAX_CHILDREN, DialOptions, FabricHome, GitAccess, PeerBook,
+        generate_identity_file, load_or_create_identity, parse_addr_json, parse_node_id,
     },
     control::{ControlRequest, ControlResponse, PeerReachability, SyncRuntimeStatus},
     daemon::{
@@ -1074,7 +1074,10 @@ async fn run(cli: Cli) -> Result<()> {
                             response => bail!("unexpected daemon response: {response:?}"),
                         }
                     } else {
-                        match send_control(&home, ControlRequest::Dial { peer, protocol, options }).await? {
+                        match send_control(
+                            &home,
+                            ControlRequest::Dial { peer, protocol, options },
+                        ).await? {
                             ControlResponse::Dial { socket } if json => {
                                 print_json(&serde_json::json!({ "socket": socket }))?;
                             }

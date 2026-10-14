@@ -7,7 +7,7 @@ use std::{
     process::{Command as ProcessCommand, Stdio},
     sync::{
         Arc, RwLock as StdRwLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -41,9 +41,9 @@ use tracing_subscriber::EnvFilter;
 use crate::{
     admission::{Admission, Admissions, Grant},
     config::{
-        DEFAULT_EXEC_MAX_CHILDREN, FabricConfig, FabricHome, Peer, PeerBook, PersistedDial,
-        PersistedExpose, PersistedExposeTarget, load_or_create_identity, validate_protocol,
-        validate_server_session_config, validate_tcp_addr, write_atomic,
+        DEFAULT_EXEC_MAX_CHILDREN, DialOptions, FabricConfig, FabricHome, Peer, PeerBook,
+        PersistedDial, PersistedExpose, PersistedExposeTarget, load_or_create_identity,
+        validate_protocol, validate_server_session_config, validate_tcp_addr, write_atomic,
     },
     control::{
         ControlRequest, ControlResponse, DialRestoreFailure, PeerReachability, SyncEntryStatus,
@@ -511,6 +511,7 @@ impl DaemonOptions {
 
 #[derive(Debug)]
 struct DialSocket {
+    queue_timeout_ms: Arc<AtomicU64>,
     path: PathBuf,
     peer_addr: EndpointAddr,
     listener_cancel: CancellationToken,
@@ -575,6 +576,7 @@ impl Drop for DialListenerLease {
 
 #[derive(Debug, Clone)]
 struct TcpDial {
+    queue_timeout_ms: Arc<AtomicU64>,
     addr: String,
     peer_addr: EndpointAddr,
     cancel: CancellationToken,
@@ -1600,21 +1602,33 @@ impl DaemonState {
     }
 
     pub async fn dial(&self, peer: &str, protocol: &str) -> Result<PathBuf> {
+        self.dial_with_options(peer, protocol, DialOptions::default())
+            .await
+    }
+
+    pub async fn dial_with_options(
+        &self,
+        peer: &str,
+        protocol: &str,
+        options: DialOptions,
+    ) -> Result<PathBuf> {
+        options.validate()?;
         let alpn = validate_protocol(protocol)?;
         let id = self.peer_book.read().await.resolve(peer)?.id.to_string();
         let path = self
-            .dial_alpn_with_persistence(&id, protocol, alpn, true, true)
+            .dial_alpn_with_persistence(&id, protocol, alpn, true, true, options)
             .await?;
         self.clear_dial_restore_failure(&id, protocol, None).await;
         Ok(path)
     }
 
-    fn persist_unix_dial(&self, peer: &str, protocol: &str) -> Result<()> {
+    fn persist_unix_dial(&self, peer: &str, protocol: &str, options: DialOptions) -> Result<()> {
         self.update_config(|config| {
             config.upsert_dial(PersistedDial {
                 peer: peer.into(),
                 protocol: protocol.into(),
                 tcp: None,
+                options,
             });
         })
     }
@@ -1713,6 +1727,18 @@ impl DaemonState {
     }
 
     pub async fn dial_tcp(&self, peer: &str, protocol: &str, bind: String) -> Result<String> {
+        self.dial_tcp_with_options(peer, protocol, bind, DialOptions::default())
+            .await
+    }
+
+    pub async fn dial_tcp_with_options(
+        &self,
+        peer: &str,
+        protocol: &str,
+        bind: String,
+        options: DialOptions,
+    ) -> Result<String> {
+        options.validate()?;
         validate_tcp_addr(&bind)?;
         let alpn = validate_protocol(protocol)?;
         let peer_addr = self.peer_book.read().await.resolve(peer)?;
@@ -1720,8 +1746,19 @@ impl DaemonState {
 
         let mut tcp_dials = self.tcp_dials.lock().await;
         if let Some(existing) = tcp_dials.get_mut(&key) {
-            existing.peer_addr = peer_addr;
             let addr = existing.addr.clone();
+            self.update_config(|config| {
+                config.upsert_dial(PersistedDial {
+                    peer: peer_addr.id.to_string(),
+                    protocol: protocol.into(),
+                    tcp: Some(addr.clone()),
+                    options,
+                })
+            })?;
+            existing.peer_addr = peer_addr;
+            existing
+                .queue_timeout_ms
+                .store(options.queue_timeout_ms, Ordering::Relaxed);
             self.clear_dial_restore_failure(&key.0, protocol, Some(&addr))
                 .await;
             return Ok(addr);
@@ -1736,11 +1773,14 @@ impl DaemonState {
                 peer: peer_addr.id.to_string(),
                 protocol: protocol.into(),
                 tcp: Some(addr.clone()),
+                options,
             });
         })?;
+        let queue_timeout_ms = Arc::new(AtomicU64::new(options.queue_timeout_ms));
         tcp_dials.insert(
             key,
             TcpDial {
+                queue_timeout_ms: queue_timeout_ms.clone(),
                 addr: addr.clone(),
                 peer_addr: peer_addr.clone(),
                 cancel: listener_cancel.clone(),
@@ -1761,6 +1801,7 @@ impl DaemonState {
             self.peer_connections.clone(),
             self.client_attaches.clone(),
             self.connection_recorder(),
+            queue_timeout_ms,
         ));
 
         self.clear_dial_restore_failure(&peer_addr.id.to_string(), protocol, Some(&addr))
@@ -1806,8 +1847,15 @@ impl DaemonState {
         alpn: Vec<u8>,
         reuse_existing: bool,
     ) -> Result<PathBuf> {
-        self.dial_alpn_with_persistence(peer, protocol, alpn, reuse_existing, false)
-            .await
+        self.dial_alpn_with_persistence(
+            peer,
+            protocol,
+            alpn,
+            reuse_existing,
+            false,
+            DialOptions::default(),
+        )
+        .await
     }
 
     async fn dial_alpn_with_persistence(
@@ -1817,7 +1865,16 @@ impl DaemonState {
         alpn: Vec<u8>,
         reuse_existing: bool,
         persist: bool,
+        options: DialOptions,
     ) -> Result<PathBuf> {
+        options.validate()?;
+        if !options.is_default() && self.services.find(&alpn).is_some() {
+            return Err(FabricError::new(
+                ErrorCode::InvalidArgument,
+                "queue timeout applies to generic Unix dials, not registered service sockets",
+            )
+            .into());
+        }
         let peer_addr = self.peer_book.read().await.resolve(peer)?;
         let key = (peer_addr.id.to_string(), protocol.to_string());
 
@@ -1832,7 +1889,10 @@ impl DaemonState {
                 .is_some_and(|task| !task.is_finished())
         {
             if persist {
-                self.persist_unix_dial(&peer_addr.id.to_string(), protocol)?;
+                self.persist_unix_dial(&peer_addr.id.to_string(), protocol, options)?;
+                existing
+                    .queue_timeout_ms
+                    .store(options.queue_timeout_ms, Ordering::Relaxed);
             }
             return Ok(existing.path.clone());
         }
@@ -1853,7 +1913,9 @@ impl DaemonState {
         }
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("failed to bind {}", socket_path.display()))?;
-        if persist && let Err(error) = self.persist_unix_dial(&peer_addr.id.to_string(), protocol) {
+        if persist
+            && let Err(error) = self.persist_unix_dial(&peer_addr.id.to_string(), protocol, options)
+        {
             drop(listener);
             let _ = fs::remove_file(&socket_path);
             return Err(error);
@@ -1861,6 +1923,7 @@ impl DaemonState {
         let listener_cancel = CancellationToken::new();
         let lease = DialListenerLease::new(self.active_dial_listeners.clone());
 
+        let queue_timeout_ms = Arc::new(AtomicU64::new(options.queue_timeout_ms));
         // A service's one-shot protocol is one raw stream per local connection.
         // A resumable protocol negotiates its own tunnel session and falls back
         // to the service's one-shot protocol when the peer does not speak it.
@@ -1914,11 +1977,13 @@ impl DaemonState {
                 lease,
                 self.client_attaches.clone(),
                 self.connection_recorder(),
+                queue_timeout_ms.clone(),
             )),
         };
         sockets.insert(
             key,
             DialSocket {
+                queue_timeout_ms,
                 path: socket_path.clone(),
                 peer_addr: peer_addr.clone(),
                 listener_cancel,
@@ -2882,11 +2947,14 @@ impl FabricNode {
             }
             let result = if let Some(bind) = &dial.tcp {
                 state
-                    .dial_tcp(&dial.peer, &dial.protocol, bind.clone())
+                    .dial_tcp_with_options(&dial.peer, &dial.protocol, bind.clone(), dial.options)
                     .await
                     .map(|_| ())
             } else {
-                state.dial(&dial.peer, &dial.protocol).await.map(|_| ())
+                state
+                    .dial_with_options(&dial.peer, &dial.protocol, dial.options)
+                    .await
+                    .map(|_| ())
             };
             if let Err(error) = result {
                 let code = crate::error::code_of(&error);
@@ -4097,16 +4165,23 @@ async fn process_control_request(
             state.unexpose(&protocol).await?;
             ControlResponse::Ok
         }
-        ControlRequest::Dial { peer, protocol } => {
-            let socket = state.dial(&peer, &protocol).await?;
+        ControlRequest::Dial {
+            peer,
+            protocol,
+            options,
+        } => {
+            let socket = state.dial_with_options(&peer, &protocol, options).await?;
             ControlResponse::Dial { socket }
         }
         ControlRequest::DialTcp {
             peer,
             protocol,
             bind,
+            options,
         } => {
-            let addr = state.dial_tcp(&peer, &protocol, bind).await?;
+            let addr = state
+                .dial_tcp_with_options(&peer, &protocol, bind, options)
+                .await?;
             ControlResponse::DialTcp { addr }
         }
         ControlRequest::Ping { peer } => {
@@ -5351,6 +5426,7 @@ async fn run_dial_socket(
     _lease: DialListenerLease,
     gauge: Arc<tunnel::ClientAttachGauge>,
     recorder: ConnectionRecorder,
+    queue_timeout_ms: Arc<AtomicU64>,
 ) {
     let backoff_key = BackoffKey::dial(&peer, &alpn);
     let queue = match peer
@@ -5376,10 +5452,10 @@ async fn run_dial_socket(
                 let Ok((local, _)) = accepted else {
                     break;
                 };
-                let reservation = match queue.reserve(crate::dial_queue::DEFAULT_QUEUE_TIMEOUT) {
+                let reservation = match queue.reserve(Duration::from_millis(queue_timeout_ms.load(Ordering::Relaxed))) {
                     Ok(reservation) => reservation,
                     Err(error) => {
-                        dial_failures.record_failure_for_diagnostics(&backoff_key, "dial queue refused connection", &error).await;
+                        dial_failures.record_failure_for_diagnostics(&backoff_key, "dial queue refused connection", &crate::dial_queue::diagnostic(&error)).await;
                         drop(local);
                         continue;
                     }
@@ -5406,7 +5482,7 @@ async fn run_dial_socket(
                         Ok(Some(permit)) => permit,
                         Ok(None) => return,
                         Err(error) => {
-                            dial_failures.record_failure_for_diagnostics(&backoff_key, "dial queue refused connection", &error).await;
+                            dial_failures.record_failure_for_diagnostics(&backoff_key, "dial queue refused connection", &crate::dial_queue::diagnostic(&error)).await;
                             return;
                         }
                     };
@@ -5428,7 +5504,7 @@ async fn run_dial_socket(
                         Err(error) if mux::is_peer_offline(&error) => {}
                         Err(error) => {
                             dial_failures
-                                .record_failure_for_diagnostics(&backoff_key, "dial socket connection failed", &error)
+                                .record_failure_for_diagnostics(&backoff_key, "dial socket connection failed", &crate::dial_queue::diagnostic(&error))
                                 .await;
                         }
                     }
@@ -5989,6 +6065,7 @@ async fn run_dial_tcp_listener(
     peer_connections: Arc<mux::PeerConnections>,
     gauge: Arc<tunnel::ClientAttachGauge>,
     recorder: ConnectionRecorder,
+    queue_timeout_ms: Arc<AtomicU64>,
 ) {
     let backoff_key = BackoffKey::dial(&peer, &alpn);
     let queue = match peer
@@ -6012,10 +6089,10 @@ async fn run_dial_tcp_listener(
                 let Ok((local, _)) = accepted else {
                     break;
                 };
-                let reservation = match queue.reserve(crate::dial_queue::DEFAULT_QUEUE_TIMEOUT) {
+                let reservation = match queue.reserve(Duration::from_millis(queue_timeout_ms.load(Ordering::Relaxed))) {
                     Ok(reservation) => reservation,
                     Err(error) => {
-                        dial_failures.record_failure_for_diagnostics(&backoff_key, "dial queue refused connection", &error).await;
+                        dial_failures.record_failure_for_diagnostics(&backoff_key, "dial queue refused connection", &crate::dial_queue::diagnostic(&error)).await;
                         drop(local);
                         continue;
                     }
@@ -6042,7 +6119,7 @@ async fn run_dial_tcp_listener(
                         Ok(Some(permit)) => permit,
                         Ok(None) => return,
                         Err(error) => {
-                            dial_failures.record_failure_for_diagnostics(&backoff_key, "dial queue refused connection", &error).await;
+                            dial_failures.record_failure_for_diagnostics(&backoff_key, "dial queue refused connection", &crate::dial_queue::diagnostic(&error)).await;
                             return;
                         }
                     };
@@ -6064,7 +6141,7 @@ async fn run_dial_tcp_listener(
                         Err(error) if mux::is_peer_offline(&error) => {}
                         Err(error) => {
                             dial_failures
-                                .record_failure_for_diagnostics(&backoff_key, "dial tcp connection failed", &error)
+                                .record_failure_for_diagnostics(&backoff_key, "dial tcp connection failed", &crate::dial_queue::diagnostic(&error))
                                 .await;
                         }
                     }
@@ -7515,6 +7592,9 @@ mod tests {
             })
         };
         let graceful = DialSocket {
+            queue_timeout_ms: Arc::new(AtomicU64::new(
+                crate::config::DEFAULT_DIAL_QUEUE_TIMEOUT_MS,
+            )),
             path: graceful_path.clone(),
             peer_addr: peer_addr.clone(),
             listener_cancel: graceful_cancel,
@@ -7548,6 +7628,9 @@ mod tests {
             .await
             .expect("wedged listener task did not start");
         let wedged = DialSocket {
+            queue_timeout_ms: Arc::new(AtomicU64::new(
+                crate::config::DEFAULT_DIAL_QUEUE_TIMEOUT_MS,
+            )),
             path: wedged_path.clone(),
             peer_addr,
             listener_cancel: wedged_cancel,
@@ -10549,6 +10632,7 @@ mod tests {
         node.shutdown().await?;
         let mut config = FabricConfig::load(&home)?;
         config.upsert_dial(PersistedDial {
+            options: DialOptions::default(),
             peer: id.clone(),
             protocol: "audit/echo".into(),
             tcp: None,
@@ -10613,6 +10697,7 @@ mod tests {
         node.shutdown().await?;
         let mut config = FabricConfig::load(&home)?;
         config.upsert_dial(PersistedDial {
+            options: DialOptions::default(),
             peer: id,
             protocol: "audit/echo".into(),
             tcp: Some(blocked_addr.clone()),
