@@ -859,7 +859,7 @@ async fn exec_expose_reconnect_keeps_child_bound_to_tunnel_session() -> Result<(
             vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
-                "printf spawn >> \"$1\"; exec /bin/cat".to_string(),
+                "printf spawn >> \"$1\"; exec cat".to_string(),
                 "fabric-test".to_string(),
                 marker.display().to_string(),
             ],
