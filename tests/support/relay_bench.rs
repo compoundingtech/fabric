@@ -123,9 +123,14 @@ async fn owned_relay_throughput() -> Result<()> {
         .map(|value| value.parse())
         .transpose()?
         .unwrap_or(16 * 1024 * 1024);
-    let streams = 4;
+    let streams = std::env::var("FABRIC_BENCH_STREAMS")
+        .ok()
+        .map(|value| value.parse())
+        .transpose()?
+        .unwrap_or(1);
     let trials = 3;
     assert!(bytes > 0 && bytes <= 128 * 1024 * 1024);
+    assert!(streams > 0 && streams <= 16);
     let backend = TcpListener::bind("127.0.0.1:0").await?;
     let backend_addr = backend.local_addr()?.to_string();
     let sink = tokio::spawn(async move {
