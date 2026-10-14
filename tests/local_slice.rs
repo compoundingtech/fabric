@@ -38,6 +38,109 @@ const LOCAL_IO_TIMEOUT: Duration = Duration::from_secs(60);
 const LARGE_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const LOCAL_SLICE_SETTLE: Duration = Duration::from_millis(500);
 
+/// The #304 workload: ten batches of twenty fresh HTTP connections through
+/// one dial listener. A successful bind must not conceal admission failures.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_dial_serves_all_two_hundred_fanout_requests() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let server_dir = TempDir::new()?;
+    let client_dir = TempDir::new()?;
+    let server_home = FabricHome::new(server_dir.path());
+    let client_home = FabricHome::new(client_dir.path());
+    let server = FabricNode::start(server_home.clone()).await?;
+    let client = FabricNode::start(client_home.clone()).await?;
+    trust_peer_allowing(
+        &server_home,
+        &server,
+        client.id(),
+        Some("client"),
+        Some(client.addr()),
+        &["web"],
+    )
+    .await?;
+    trust_peer_allowing(
+        &client_home,
+        &client,
+        server.id(),
+        Some("server"),
+        Some(server.addr()),
+        &[],
+    )
+    .await?;
+    let http = TcpListener::bind("127.0.0.1:0").await?;
+    let http_addr = http.local_addr()?.to_string();
+    let service = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = http.accept().await {
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                loop {
+                    let mut byte = [0];
+                    if stream.read_exact(&mut byte).await.is_err() {
+                        return;
+                    }
+                    request.push(byte[0]);
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                    if request.len() > 4096 {
+                        return;
+                    }
+                }
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n",
+                    )
+                    .await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    server.expose_tcp("web", http_addr).await?;
+    let addr = client
+        .dial_tcp("server", "web", "127.0.0.1:0".into())
+        .await?;
+    let mut successes = 0;
+    let started = Instant::now();
+    for batch in 0..10 {
+        let barrier = Arc::new(tokio::sync::Barrier::new(20));
+        let mut requests = tokio::task::JoinSet::new();
+        for _ in 0..20 {
+            let addr = addr.clone();
+            let barrier = barrier.clone();
+            requests.spawn(async move {
+                barrier.wait().await;
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    let mut stream = TcpStream::connect(addr).await?;
+                    stream
+                        .write_all(
+                            b"GET /small HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                        )
+                        .await?;
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).await?;
+                    anyhow::ensure!(byte[0] == b'H', "unexpected first response byte");
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await
+                .map(|result| result.is_ok())
+                .unwrap_or(false)
+            });
+        }
+        let mut ok = 0;
+        while let Some(result) = requests.join_next().await {
+            ok += usize::from(result?);
+        }
+        eprintln!("fanout batch {batch}: {ok}/20 first bytes");
+        successes += ok;
+    }
+    eprintln!("fanout total: {successes}/200 in {:?}", started.elapsed());
+    client.shutdown().await?;
+    server.shutdown().await?;
+    service.abort();
+    assert_eq!(successes, 200, "every request must get a first byte");
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn git_clone_push_and_revocation_use_exact_repository_grants() -> Result<()> {
