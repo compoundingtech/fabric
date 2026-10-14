@@ -276,7 +276,7 @@ tests establish path control; they do not claim released relay throughput.
 
 The manual `owned_relay_throughput` benchmark starts two disposable CLI daemons
 and a local `iroh-relay` fixture, checks the actual path with an exact-service
-probe, and compares four streams to the same TCP sink. The sink verifies every
+probe, and compares streams to the same TCP sink. The sink verifies every
 payload byte before acknowledging the transferred length. It includes fresh
 local socket/session setup with a warm shared peer transport. Its receipt
 records raw timings, payload rate, runtime version, binary hash and relay
@@ -290,7 +290,9 @@ FABRIC_BENCH_BIN=/path/to/fabric FABRIC_BENCH_OUTPUT=relay-baseline.json \
 ```
 
 Omit `FABRIC_BENCH_BIN` to use the freshly built CLI. `FABRIC_BENCH_BYTES` changes
-bytes per stream (default 16 MiB, four streams, three trials per carrier).
+bytes per stream (default 16 MiB, one stream, three trials per carrier).
+Use `FABRIC_BENCH_BYTES=134217728` for the issue's 128 MiB single-stream case,
+or `FABRIC_BENCH_STREAMS=4` for a concurrent comparison (maximum 16 streams).
 Timing is recorded without a machine-dependent CI threshold. A completed
 transfer or a path mismatch is checked exactly; a throughput result only
 becomes release evidence when its named released artifact was measured.
