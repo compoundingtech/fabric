@@ -67,6 +67,10 @@ jobs:
         timeout-minutes: 10
         run: cargo test --locked --workspace --lib
 
+      - name: Daemon stop barrier and timeout contract
+        timeout-minutes: 5
+        run: cargo test --locked -p fabric --bin fabric stop_tests
+
       - name: Adversarial folder sync matrix
         timeout-minutes: 15
         run: cargo test --locked -p fabric-sync --test folder_sync -- --test-threads=1

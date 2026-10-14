@@ -1040,7 +1040,11 @@ change policy.
 fabric down
 ```
 
-Stop the local daemon.
+Stop the local daemon and wait for its lease to be released, including endpoint
+and exec-child cleanup. An immediate `fabric down && fabric up` can then start
+without racing the old process. The wait is bounded at 15 seconds; if the lease
+is still held, `down` reports `fabric:daemon_stop_timeout` (fault, exit 69) and
+says the daemon is still stopping.
 
 ```sh
 fabric restart
