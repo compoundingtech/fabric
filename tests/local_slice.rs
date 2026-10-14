@@ -172,7 +172,12 @@ async fn generic_dial_refusal_status_and_error_preface_survive_restart() -> Resu
             } else {
                 Box::new(TcpStream::connect(&tcp).await?)
             };
-            stream.write_all(b"denied request").await?;
+            // Admission can refuse immediately, before the local request is
+            // written. The response/history and zero backend hits remain the
+            // proof; a write to that already closed socket may be BrokenPipe.
+            if let Err(error) = stream.write_all(b"denied request").await {
+                assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe, "{error}");
+            }
             let mut bytes = Vec::new();
             tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut bytes))
                 .await
