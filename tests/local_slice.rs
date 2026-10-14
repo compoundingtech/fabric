@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use fabric::{
     config::{FabricConfig, FabricHome, GitAccess, PeerBook, generate_identity_file},
     control::{ControlRequest, ControlResponse},
-    daemon::{FabricNode, send_control},
+    daemon::{DaemonOptions, FabricNode, send_control},
 };
 
 #[cfg(unix)]
@@ -43,101 +43,170 @@ const LOCAL_SLICE_SETTLE: Duration = Duration::from_millis(500);
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tcp_dial_serves_all_two_hundred_fanout_requests() -> Result<()> {
     let _guard = local_slice_guard().await;
+    tcp_dial_fanout(DaemonOptions::default(), &[20; 10], 1).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_dial_queues_sixty_four_connections_above_a_custom_server_cap() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    tcp_dial_fanout(
+        DaemonOptions {
+            server_session_max_total: Some(4),
+            server_session_max_per_peer: Some(2),
+            ..DaemonOptions::default()
+        },
+        &[64],
+        1,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_dial_queues_competing_dialers_at_the_total_server_cap() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    tcp_dial_fanout(
+        DaemonOptions {
+            server_session_max_total: Some(2),
+            server_session_max_per_peer: Some(2),
+            ..DaemonOptions::default()
+        },
+        &[32],
+        2,
+    )
+    .await
+}
+
+async fn tcp_dial_fanout(
+    options: DaemonOptions,
+    batches: &[usize],
+    client_count: usize,
+) -> Result<()> {
     let server_dir = TempDir::new()?;
-    let client_dir = TempDir::new()?;
     let server_home = FabricHome::new(server_dir.path());
-    let client_home = FabricHome::new(client_dir.path());
-    let server = FabricNode::start(server_home.clone()).await?;
-    let client = FabricNode::start(client_home.clone()).await?;
-    trust_peer_allowing(
-        &server_home,
-        &server,
-        client.id(),
-        Some("client"),
-        Some(client.addr()),
-        &["web"],
-    )
-    .await?;
-    trust_peer_allowing(
-        &client_home,
-        &client,
-        server.id(),
-        Some("server"),
-        Some(server.addr()),
-        &[],
-    )
-    .await?;
+    let server = FabricNode::start_with_daemon_options(server_home.clone(), options).await?;
+    let mut clients = Vec::new();
+    for i in 0..client_count {
+        let dir = TempDir::new()?;
+        let home = FabricHome::new(dir.path());
+        let client = FabricNode::start(home.clone()).await?;
+        trust_peer_allowing(
+            &server_home,
+            &server,
+            client.id(),
+            Some(&format!("client-{i}")),
+            Some(client.addr()),
+            &["web"],
+        )
+        .await?;
+        trust_peer_allowing(
+            &home,
+            &client,
+            server.id(),
+            Some("server"),
+            Some(server.addr()),
+            &[],
+        )
+        .await?;
+        clients.push((dir, client));
+    }
     let http = TcpListener::bind("127.0.0.1:0").await?;
     let http_addr = http.local_addr()?.to_string();
-    let service = tokio::spawn(async move {
-        while let Ok((mut stream, _)) = http.accept().await {
-            tokio::spawn(async move {
-                let mut request = Vec::new();
-                loop {
-                    let mut byte = [0];
-                    if stream.read_exact(&mut byte).await.is_err() {
-                        return;
+    let requests_served = Arc::new(AtomicUsize::new(0));
+    let service = tokio::spawn({
+        let requests_served = requests_served.clone();
+        async move {
+            while let Ok((mut stream, _)) = http.accept().await {
+                let requests_served = requests_served.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    loop {
+                        let mut byte = [0];
+                        if stream.read_exact(&mut byte).await.is_err() {
+                            return;
+                        }
+                        request.push(byte[0]);
+                        if request.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                        if request.len() > 4096 {
+                            return;
+                        }
                     }
-                    request.push(byte[0]);
-                    if request.ends_with(b"\r\n\r\n") {
-                        break;
-                    }
-                    if request.len() > 4096 {
-                        return;
-                    }
-                }
-                let _ = stream
+                    requests_served.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream
                     .write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n",
                     )
                     .await;
-                let _ = stream.shutdown().await;
-            });
+                    let _ = stream.shutdown().await;
+                });
+            }
         }
     });
     server.expose_tcp("web", http_addr).await?;
-    let addr = client
-        .dial_tcp("server", "web", "127.0.0.1:0".into())
-        .await?;
+    let mut addrs = Vec::new();
+    for (_, client) in &clients {
+        addrs.push(
+            client
+                .dial_tcp("server", "web", "127.0.0.1:0".into())
+                .await?,
+        );
+    }
     let mut successes = 0;
     let started = Instant::now();
-    for batch in 0..10 {
-        let barrier = Arc::new(tokio::sync::Barrier::new(20));
+    for (batch, &count) in batches.iter().enumerate() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(count * client_count));
         let mut requests = tokio::task::JoinSet::new();
-        for _ in 0..20 {
-            let addr = addr.clone();
-            let barrier = barrier.clone();
-            requests.spawn(async move {
-                barrier.wait().await;
-                tokio::time::timeout(Duration::from_secs(30), async {
-                    let mut stream = TcpStream::connect(addr).await?;
-                    stream
+        for addr in &addrs {
+            for _ in 0..count {
+                let addr = addr.clone();
+                let barrier = barrier.clone();
+                requests.spawn(async move {
+                    barrier.wait().await;
+                    tokio::time::timeout(Duration::from_secs(30), async {
+                        let mut stream = TcpStream::connect(addr).await?;
+                        stream
                         .write_all(
                             b"GET /small HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
                         )
                         .await?;
-                    let mut byte = [0];
-                    stream.read_exact(&mut byte).await?;
-                    anyhow::ensure!(byte[0] == b'H', "unexpected first response byte");
-                    Ok::<_, anyhow::Error>(())
-                })
-                .await
-                .map(|result| result.is_ok())
-                .unwrap_or(false)
-            });
+                        let mut byte = [0];
+                        stream.read_exact(&mut byte).await?;
+                        anyhow::ensure!(byte[0] == b'H', "unexpected first response byte");
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+                    .map(|result| result.is_ok())
+                    .unwrap_or(false)
+                });
+            }
         }
         let mut ok = 0;
         while let Some(result) = requests.join_next().await {
             ok += usize::from(result?);
         }
-        eprintln!("fanout batch {batch}: {ok}/20 first bytes");
+        eprintln!(
+            "fanout batch {batch}: {ok}/{} first bytes",
+            count * client_count
+        );
         successes += ok;
     }
-    eprintln!("fanout total: {successes}/200 in {:?}", started.elapsed());
-    client.shutdown().await?;
+    let expected: usize = batches.iter().sum::<usize>() * client_count;
+    eprintln!(
+        "fanout total: {successes}/{expected} in {:?}",
+        started.elapsed()
+    );
+    for (_, client) in clients {
+        client.shutdown().await?;
+    }
     server.shutdown().await?;
     service.abort();
-    assert_eq!(successes, 200, "every request must get a first byte");
+    assert_eq!(successes, expected, "every request must get a first byte");
+    assert_eq!(
+        requests_served.load(Ordering::SeqCst),
+        expected,
+        "admission retries must not duplicate application requests"
+    );
     Ok(())
 }
 
@@ -1485,16 +1554,15 @@ async fn socket_expose_survives_idle_slow_concurrent_and_abrupt_streams() -> Res
             let pause_ms: u64 = std::env::var("FABRIC_SOAK_PAUSE_MS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(400);
+                .unwrap_or(0);
             let rounds: u16 = std::env::var("FABRIC_SOAK_ROUNDS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(25);
             for round in 0..rounds {
-                // Paced like people and devices, not like a load generator: a dialing
-                // process serves 32 streams at once and a stream that has just closed
-                // is still winding down for about a second, so more than a few dozen
-                // new streams a second are refused (see docs/failure-modes.md).
+                // Unpaced by default: the shared peer queue must absorb short
+                // sessions without the caller pausing to avoid a refusal.
+                // A release soak can still request a pause explicitly.
                 tokio::time::sleep(Duration::from_millis(pause_ms)).await;
                 let mut stream = UnixStream::connect(&dial_socket).await?;
                 soak_hello(&mut stream, b'e')

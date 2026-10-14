@@ -21,6 +21,12 @@ Deprecated, Fixed or Security.
   length before binding. One saved listener that cannot be restored (including
   an occupied TCP port) no longer prevents the daemon from starting; human
   status and `status --json` report it in `dial_restore_failures` (#297).
+- Generic Unix and TCP dial listeners queue new connections at shared per-peer
+  and daemon-wide session limits. A bounded queue waits up to 10 seconds and
+  retries only a remote session-cap refusal before admission, preserving the
+  request's bytes and session identity. Queue overflow or timeout logs the
+  existing `fabric:session_limit_reached` code; local refusal reporting remains
+  unchanged. No wire format or server cap changes.
 
 ## [0.2.41] - 2026-10-13
 

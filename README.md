@@ -1139,10 +1139,17 @@ Detached sessions can be evicted to admit new ones before their 900-second
 retention period ends; evicted sessions cannot resume. Raising the caps allows
 more live sessions but increases the possible memory use.
 
-Currently, connections above the remote cap are refused with
-`fabric:session_limit_reached` in the dialing daemon's log; the local client sees
-EOF. The dial listener does not yet queue them. Applications opening many short
-connections should bound concurrency, reuse connections, or retry refusals.
+Generic dial listeners share a queue per peer, across Unix/TCP listeners and
+protocols. Each dialing daemon allows 16 active sessions per peer and bounds
+outstanding connections to 144 (16 active plus 128 waiting). New connections
+wait for local capacity; a remote session-cap refusal before admission is
+retried within the same 10-second deadline. A full queue or an expired deadline
+reports `fabric:session_limit_reached` in the dialing daemon's log; the local
+client sees EOF. Other remote refusals fail immediately, and requests already
+admitted are never retried as new sessions. Different dialing daemons have
+separate queues; contention at the exposing daemon's total cap still waits
+within each caller's deadline. Applications can reuse connections or retry a
+refusal after that deadline.
 See [the session-limit failure mode](docs/failure-modes.md#session-limits).
 
 ```sh

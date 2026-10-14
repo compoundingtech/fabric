@@ -5353,6 +5353,20 @@ async fn run_dial_socket(
     recorder: ConnectionRecorder,
 ) {
     let backoff_key = BackoffKey::dial(&peer, &alpn);
+    let queue = match peer
+        .parse::<EndpointId>()
+        .map_err(anyhow::Error::from)
+        .or_else(|_| {
+            PeerBook::load(&home)
+                .and_then(|book| book.resolve(&peer))
+                .map(|addr| addr.id)
+        }) {
+        Ok(id) => peer_connections.dial_queue(id),
+        Err(error) => {
+            warn!(%peer, %error, "dial listener could not resolve its peer");
+            return;
+        }
+    };
     loop {
         tokio::select! {
             biased;
@@ -5362,10 +5376,16 @@ async fn run_dial_socket(
                 let Ok((local, _)) = accepted else {
                     break;
                 };
-                let Ok(permit) = dial_slots.clone().try_acquire_owned() else {
-                    drop(local);
-                    continue;
+                let reservation = match queue.reserve(crate::dial_queue::DEFAULT_QUEUE_TIMEOUT) {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        dial_failures.record_failure_for_diagnostics(&backoff_key, "dial queue refused connection", &error).await;
+                        drop(local);
+                        continue;
+                    }
                 };
+                let admission_deadline = reservation.deadline;
+                let dial_slots = dial_slots.clone();
                 let endpoint_rx = endpoint_rx.clone();
                 let home = home.clone();
                 let peer = peer.clone();
@@ -5380,9 +5400,16 @@ async fn run_dial_socket(
                     String::from_utf8_lossy(&alpn).to_string(),
                     gauge.clone(),
                     recorder.clone(),
-                ));
+                ).with_admission_deadline(admission_deadline));
                 tokio::spawn(async move {
-                    let _permit = permit;
+                    let _permit = match reservation.acquire(dial_slots, &cancel).await {
+                        Ok(Some(permit)) => permit,
+                        Ok(None) => return,
+                        Err(error) => {
+                            dial_failures.record_failure_for_diagnostics(&backoff_key, "dial queue refused connection", &error).await;
+                            return;
+                        }
+                    };
                     match
                         tunnel::run_client_connection(
                             local,
@@ -5964,6 +5991,20 @@ async fn run_dial_tcp_listener(
     recorder: ConnectionRecorder,
 ) {
     let backoff_key = BackoffKey::dial(&peer, &alpn);
+    let queue = match peer
+        .parse::<EndpointId>()
+        .map_err(anyhow::Error::from)
+        .or_else(|_| {
+            PeerBook::load(&home)
+                .and_then(|book| book.resolve(&peer))
+                .map(|addr| addr.id)
+        }) {
+        Ok(id) => peer_connections.dial_queue(id),
+        Err(error) => {
+            warn!(%peer, %error, "dial listener could not resolve its peer");
+            return;
+        }
+    };
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -5971,10 +6012,16 @@ async fn run_dial_tcp_listener(
                 let Ok((local, _)) = accepted else {
                     break;
                 };
-                let Ok(permit) = dial_slots.clone().try_acquire_owned() else {
-                    drop(local);
-                    continue;
+                let reservation = match queue.reserve(crate::dial_queue::DEFAULT_QUEUE_TIMEOUT) {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        dial_failures.record_failure_for_diagnostics(&backoff_key, "dial queue refused connection", &error).await;
+                        drop(local);
+                        continue;
+                    }
                 };
+                let admission_deadline = reservation.deadline;
+                let dial_slots = dial_slots.clone();
                 let endpoint_rx = endpoint_rx.clone();
                 let home = home.clone();
                 let peer = peer.clone();
@@ -5989,9 +6036,16 @@ async fn run_dial_tcp_listener(
                     String::from_utf8_lossy(&alpn).to_string(),
                     gauge.clone(),
                     recorder.clone(),
-                ));
+                ).with_admission_deadline(admission_deadline));
                 tokio::spawn(async move {
-                    let _permit = permit;
+                    let _permit = match reservation.acquire(dial_slots, &cancel).await {
+                        Ok(Some(permit)) => permit,
+                        Ok(None) => return,
+                        Err(error) => {
+                            dial_failures.record_failure_for_diagnostics(&backoff_key, "dial queue refused connection", &error).await;
+                            return;
+                        }
+                    };
                     match
                         tunnel::run_client_tcp_connection(
                             local,
