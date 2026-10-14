@@ -20,6 +20,10 @@ Deprecated, Fixed or Security.
   omission keeps n0 defaults and an empty list disables relay transport while
   preserving direct IP. `status --json` reports the running selection in
   `relays {source, urls}`. Endpoint recovery retains this startup configuration.
+- Internal `up --diagnostic-path-mode` selects `relay-only`, `direct-only` or
+  normal `auto` transport for temporary diagnosis. It is outside the stability
+  promise and is not persisted. Endpoint recovery retains the startup mode;
+  trust, grants and local dial/expose sockets keep their normal behavior.
 
 ### Fixed
 - `fabric down` waits up to 15 seconds for the daemon lease to be released,

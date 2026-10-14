@@ -1181,6 +1181,24 @@ runs its own `iroh-relay`. Use an HTTP or HTTPS relay URL (without credentials,
 query or fragment); this setting does not add relay authentication tokens.
 Trust and exact service grants still decide who can open an application stream.
 
+For a disposable diagnostic home, force the path at startup:
+
+```sh
+fabric --home /tmp/fabric-path-test up --foreground --diagnostic-path-mode relay-only
+# or --diagnostic-path-mode direct-only
+```
+
+`auto` is the normal default. `relay-only` removes inter-daemon IP transports;
+`direct-only` removes relay transports. Local TCP and Unix dial/expose sockets
+still work normally. Relay-only requires at least one configured relay.
+The diagnostic option is **outside the stability promise**, is not saved in
+config, and must be supplied again after a restart. Start a fresh daemon for
+these comparisons; `up` does not change an already running daemon's mode.
+Recovery retains the startup mode. `status --json` reports configured relay
+candidates; the diagnostic mode can prevent their use. Check the actual route
+with `fabric probe PEER SERVICE --json` (`transport` is `relay` or `direct`),
+using a service that the peer grants rather than assuming an echo grant.
+
 Generic dial listeners share a queue per peer, across Unix/TCP listeners and
 protocols. Each dialing daemon allows 16 active sessions per peer and bounds
 outstanding connections to 144 (16 active plus 128 waiting). New connections

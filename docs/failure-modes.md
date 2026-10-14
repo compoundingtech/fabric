@@ -263,3 +263,34 @@ rate-limited and best-effort; sustained relay throughput requires an owned
 relay. Configurability alone does not establish a throughput improvement.
 The relay-only/direct-only diagnostic modes and the dependency upgrade,
 RateLimited diagnostic, and local-relay throughput proof are separate changes.
+
+For an owned-relay comparison, start fresh diagnostic daemons with
+`up --foreground --diagnostic-path-mode relay-only`; `direct-only` gives the
+corresponding IP baseline. Both modes are outside the stability promise and
+are startup options, not persisted settings. Local dial/expose sockets remain
+available. Recovery retains the chosen restriction. The relay candidate list
+in status describes configuration, while `probe PEER SERVICE --json` samples
+the actual transport for a permitted service. A diagnostic mode does not
+change trust or exact service grants. These modes and their local correctness
+tests establish path control; they do not claim released relay throughput.
+
+The manual `owned_relay_throughput` benchmark starts two disposable CLI daemons
+and a local `iroh-relay` fixture, checks the actual path with an exact-service
+probe, and compares four streams to the same TCP sink. The sink verifies every
+payload byte before acknowledging the transferred length. It includes fresh
+local socket/session setup with a warm shared peer transport. Its receipt
+records raw timings, payload rate, runtime version, binary hash and relay
+fixture version. The local relay uses HTTP without TLS and avoids the pasta
+hop; that fixture does not reproduce an Internet HTTPS relay's latency or load.
+Run it with an optimized harness and the exact released binary under test:
+
+```sh
+FABRIC_BENCH_BIN=/path/to/fabric FABRIC_BENCH_OUTPUT=relay-baseline.json \
+  cargo test --release --locked -p fabric --test local_slice owned_relay_throughput -- --ignored --nocapture
+```
+
+Omit `FABRIC_BENCH_BIN` to use the freshly built CLI. `FABRIC_BENCH_BYTES` changes
+bytes per stream (default 16 MiB, four streams, three trials per carrier).
+Timing is recorded without a machine-dependent CI threshold. A completed
+transfer or a path mismatch is checked exactly; a throughput result only
+becomes release evidence when its named released artifact was measured.

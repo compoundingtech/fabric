@@ -28,6 +28,9 @@ use tokio::{
     task::JoinHandle,
 };
 
+#[path = "support/relay_bench.rs"]
+mod relay_bench;
+
 // These tests start real iroh endpoints and daemon tasks; keep the default
 // test runner from exercising that transport stack concurrently.
 // Each test still creates its Tokio runtime before acquiring the guard, so keep
@@ -37,6 +40,54 @@ const FABRIC_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 const LOCAL_IO_TIMEOUT: Duration = Duration::from_secs(60);
 const LARGE_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const LOCAL_SLICE_SETTLE: Duration = Duration::from_millis(500);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostic_path_mode_is_forwarded_to_the_background_daemon() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    use iroh_relay::server::{RelayConfig, Server, ServerConfig};
+    struct StopHome(FabricHome);
+    impl Drop for StopHome {
+        fn drop(&mut self) {
+            let _ = run_fabric(&self.0, &["down"]);
+        }
+    }
+    let mut config = ServerConfig::default();
+    config.relay = Some(RelayConfig::new((std::net::Ipv4Addr::LOCALHOST, 0)));
+    let relay = Server::spawn(config).await?;
+    let url = format!("http://{}/", relay.http_addr().unwrap());
+    for mode in ["relay-only", "direct-only"] {
+        let dir = TempDir::new()?;
+        let home = FabricHome::new(dir.path());
+        home.prepare()?;
+        fs::write(home.config_path(), format!("relays = [{url:?}]\n"))?;
+        let guard = StopHome(home.clone());
+        run_fabric(&home, &["up", "--diagnostic-path-mode", mode])?;
+        let addr: iroh::EndpointAddr = serde_json::from_str(&run_fabric(&home, &["addr"])?)?;
+        if mode == "relay-only" {
+            assert_eq!(
+                addr.ip_addrs().count(),
+                0,
+                "background daemon kept direct addresses"
+            );
+            assert_eq!(
+                addr.relay_urls().count(),
+                1,
+                "background daemon did not select the owned relay"
+            );
+        } else {
+            assert!(addr.ip_addrs().count() > 0);
+            assert_eq!(
+                addr.relay_urls().count(),
+                0,
+                "background daemon kept a relay address"
+            );
+        }
+        run_fabric(&home, &["down"])?;
+        drop(guard);
+    }
+    relay.shutdown().await?;
+    Ok(())
+}
 
 trait RefusalStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> RefusalStream for T {}

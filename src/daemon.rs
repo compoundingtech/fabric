@@ -420,6 +420,7 @@ pub struct DaemonState {
     endpoint_tx: watch::Sender<CurrentEndpoint>,
     endpoint_recycle: Mutex<()>,
     relay_mode: iroh::RelayMode,
+    diagnostic_path_mode: DiagnosticPathMode,
     relay_config: crate::control::RelayConfigStatus,
     last_endpoint_recycle: Mutex<Option<Instant>>,
     peer_book: RwLock<PeerBook>,
@@ -493,6 +494,25 @@ pub(crate) struct CurrentEndpoint {
     pub(crate) endpoint: Endpoint,
 }
 
+/// Temporary transport restriction for diagnosis, outside the stability promise.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum DiagnosticPathMode {
+    #[default]
+    Auto,
+    RelayOnly,
+    DirectOnly,
+}
+
+impl DiagnosticPathMode {
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::RelayOnly => "relay-only",
+            Self::DirectOnly => "direct-only",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DaemonOptions {
     pub allow_shell: bool,
@@ -500,6 +520,7 @@ pub struct DaemonOptions {
     pub server_session_max_total: Option<usize>,
     pub server_session_max_per_peer: Option<usize>,
     pub server_session_detached_ttl_secs: Option<u64>,
+    pub diagnostic_path_mode: DiagnosticPathMode,
 }
 
 impl DaemonOptions {
@@ -800,16 +821,31 @@ async fn build_daemon_endpoint(
     services: &Services,
     exposures: &HashMap<Vec<u8>, Exposure>,
     relay_mode: &iroh::RelayMode,
+    path_mode: DiagnosticPathMode,
 ) -> Result<Endpoint> {
     let secret_key = load_or_create_identity(home)?;
-    let endpoint = Endpoint::builder(presets::N0)
+    if path_mode == DiagnosticPathMode::RelayOnly && matches!(relay_mode, iroh::RelayMode::Disabled)
+    {
+        return Err(FabricError::new(
+            ErrorCode::InvalidArgument,
+            "relay-only diagnostics require at least one configured relay",
+        )
+        .into());
+    }
+    let builder = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .relay_mode(relay_mode.clone())
         .alpns(accepted_alpns(services, exposures))
-        .hooks(AllowListHook { allowed })
-        .bind()
-        .await?;
-    if !matches!(relay_mode, iroh::RelayMode::Disabled) {
+        .hooks(AllowListHook { allowed });
+    let builder = match path_mode {
+        DiagnosticPathMode::Auto => builder,
+        DiagnosticPathMode::RelayOnly => builder.clear_ip_transports(),
+        DiagnosticPathMode::DirectOnly => builder.clear_relay_transports(),
+    };
+    let endpoint = builder.bind().await?;
+    if path_mode != DiagnosticPathMode::DirectOnly
+        && !matches!(relay_mode, iroh::RelayMode::Disabled)
+    {
         let _ = tokio::time::timeout(ENDPOINT_ONLINE_TIMEOUT, endpoint.online()).await;
     }
     Ok(endpoint)
@@ -1076,6 +1112,7 @@ impl DaemonState {
         home.prepare()?;
         let config = FabricConfig::load(&home)?;
         let relay_mode = config.relay_mode()?;
+        let diagnostic_path_mode = options.diagnostic_path_mode;
         let mut urls: Vec<_> = relay_mode
             .relay_map()
             .urls::<Vec<_>>()
@@ -1105,9 +1142,15 @@ impl DaemonState {
         }
         let exposures = load_persisted_exposures(&home, &services)?;
         let allowed = Arc::new(RwLock::new(peer_book.trusted_ids()));
-        let endpoint =
-            build_daemon_endpoint(&home, allowed.clone(), &services, &exposures, &relay_mode)
-                .await?;
+        let endpoint = build_daemon_endpoint(
+            &home,
+            allowed.clone(),
+            &services,
+            &exposures,
+            &relay_mode,
+            diagnostic_path_mode,
+        )
+        .await?;
         let generation = next_endpoint_generation(&home, 0)?;
         let (endpoint_tx, _) = watch::channel(CurrentEndpoint {
             generation,
@@ -1127,6 +1170,7 @@ impl DaemonState {
             endpoint_tx,
             endpoint_recycle: Mutex::new(()),
             relay_mode,
+            diagnostic_path_mode,
             relay_config,
             last_endpoint_recycle: Mutex::new(None),
             peer_book: RwLock::new(peer_book),
@@ -2886,6 +2930,7 @@ impl DaemonState {
             &self.services,
             &exposures,
             &self.relay_mode,
+            self.diagnostic_path_mode,
         )
         .await?;
         drop(exposures);
@@ -6564,6 +6609,178 @@ mod tests {
         b.close().await;
         relay_a.shutdown().await?;
         relay_b.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn diagnostic_path_modes_carry_generic_tunnels_on_the_requested_transport() -> Result<()>
+    {
+        use iroh::Watcher;
+        use iroh_relay::server::{RelayConfig, Server, ServerConfig};
+        use tokio::net::TcpStream;
+        let mut config = ServerConfig::default();
+        config.relay = Some(RelayConfig::new((std::net::Ipv4Addr::LOCALHOST, 0)));
+        let relay = Server::spawn(config).await?;
+        let url: iroh::RelayUrl = format!("http://{}", relay.http_addr().unwrap()).parse()?;
+        for (mode, transport) in [
+            (DiagnosticPathMode::DirectOnly, "direct"),
+            (DiagnosticPathMode::RelayOnly, "relay"),
+        ] {
+            let server_dir = tempfile::tempdir()?;
+            let client_dir = tempfile::tempdir()?;
+            let server_home = FabricHome::new(server_dir.path());
+            let client_home = FabricHome::new(client_dir.path());
+            for home in [&server_home, &client_home] {
+                home.prepare()?;
+                fs::write(
+                    home.config_path(),
+                    format!("relays = [{:?}]\n", url.to_string()),
+                )?;
+            }
+            let options = DaemonOptions {
+                diagnostic_path_mode: mode,
+                ..DaemonOptions::default()
+            };
+            let server =
+                FabricNode::start_with_daemon_options(server_home.clone(), options).await?;
+            let client =
+                FabricNode::start_with_daemon_options(client_home.clone(), options).await?;
+            for node in [&server, &client] {
+                let endpoint = node.state().endpoint_handle().endpoint;
+                if mode == DiagnosticPathMode::RelayOnly {
+                    assert!(
+                        endpoint.bound_sockets().is_empty(),
+                        "relay-only mode left IP transport enabled"
+                    );
+                } else {
+                    assert!(!endpoint.bound_sockets().is_empty());
+                    assert!(
+                        endpoint.home_relay_status().get().is_empty(),
+                        "direct-only mode selected a relay"
+                    );
+                }
+            }
+            trust_test_peer_allowing(
+                &server_home,
+                &server,
+                client.id(),
+                "client",
+                client.addr(),
+                &["path-echo"],
+            )
+            .await?;
+            trust_test_peer_allowing(
+                &client_home,
+                &client,
+                server.id(),
+                "server",
+                server.addr(),
+                &[],
+            )
+            .await?;
+            let backend = TcpListener::bind("127.0.0.1:0").await?;
+            let backend_addr = backend.local_addr()?.to_string();
+            let echo = tokio::spawn(async move {
+                loop {
+                    let (stream, _) = backend.accept().await?;
+                    tokio::spawn(async move {
+                        let (mut read, mut write) = stream.into_split();
+                        let _ = tokio::io::copy(&mut read, &mut write).await;
+                        let _ = write.shutdown().await;
+                    });
+                }
+                #[allow(unreachable_code)]
+                Ok::<_, anyhow::Error>(())
+            });
+            server.expose_tcp("path-echo", backend_addr.clone()).await?;
+            server.expose_tcp("denied-path", backend_addr).await?;
+            let probe = client
+                .state()
+                .probe_service("server", "path-echo", Duration::from_secs(5))
+                .await?;
+            assert_eq!(probe.outcome, ProbeOutcome::Supported, "{probe:?}");
+            assert_eq!(probe.transport.as_deref(), Some(transport), "{probe:?}");
+            let generation = client.state().endpoint_handle().generation;
+            client
+                .state()
+                .force_endpoint_recycle("diagnostic path regression")
+                .await?;
+            let rebuilt = client.state().endpoint_handle();
+            assert!(rebuilt.generation > generation);
+            if mode == DiagnosticPathMode::RelayOnly {
+                assert!(rebuilt.endpoint.bound_sockets().is_empty());
+            } else {
+                assert!(rebuilt.endpoint.home_relay_status().get().is_empty());
+            }
+            let after_recovery = client
+                .state()
+                .probe_service("server", "path-echo", Duration::from_secs(5))
+                .await?;
+            assert_eq!(
+                after_recovery.outcome,
+                ProbeOutcome::Supported,
+                "{after_recovery:?}"
+            );
+            assert_eq!(
+                after_recovery.transport.as_deref(),
+                Some(transport),
+                "{after_recovery:?}"
+            );
+            let addr = client
+                .dial_tcp("server", "path-echo", "127.0.0.1:0".into())
+                .await?;
+            let mut stream = TcpStream::connect(addr).await?;
+            let payload = vec![b'p'; 1024 * 1024];
+            let transfer = async {
+                stream.write_all(&payload).await?;
+                stream.shutdown().await?;
+                let mut reply = Vec::new();
+                stream.read_to_end(&mut reply).await?;
+                assert!(
+                    reply == payload,
+                    "{mode:?}: received {} of {} bytes; dial status {:?}",
+                    reply.len(),
+                    payload.len(),
+                    client.state().dial_status().await
+                );
+                Ok::<_, anyhow::Error>(())
+            };
+            tokio::time::timeout(Duration::from_secs(10), transfer).await??;
+            // Diagnostic restrictions cannot weaken exact service admission.
+            let refused = client
+                .state()
+                .probe_service("server", "denied-path", Duration::from_secs(5))
+                .await?;
+            assert_eq!(refused.outcome, ProbeOutcome::Unreachable, "{refused:?}");
+            assert_eq!(refused.code, Some(ErrorCode::PeerNotPermittedForService));
+            client.shutdown().await?;
+            server.shutdown().await?;
+            echo.abort();
+        }
+        relay.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_only_diagnostic_with_disabled_relays_is_a_usage_error() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        home.prepare()?;
+        fs::write(home.config_path(), "relays = []\n")?;
+        let error = FabricNode::start_with_daemon_options(
+            home,
+            DaemonOptions {
+                diagnostic_path_mode: DiagnosticPathMode::RelayOnly,
+                ..DaemonOptions::default()
+            },
+        )
+        .await
+        .err()
+        .context("disabled relays unexpectedly admitted relay-only mode")?;
+        assert_eq!(
+            fabric_config::error::code_of(&error),
+            ErrorCode::InvalidArgument
+        );
         Ok(())
     }
 

@@ -22,7 +22,7 @@ Anything this page does not name is internal.
 | The direct exposure wire | Everything in [docs/tunnel-wire.md](tunnel-wire.md): admission, the frame layout, Hello, Data, Ack, Close and Error, resume, the limits and their defaults, and the 403 refusals with their reasons. |
 | Git over fabric | `fabric://<peer>/<remote>` URLs, the grants `git/<remote>/read` and `git/<remote>/write`, and `fabric git share`, `unshare`, `grant` and `revoke`. |
 | Error codes | Everything in [docs/errors.md](errors.md): the codes, their classes, exit statuses, the `--json` error object and the `fabric:<code> ` token on the wire. |
-| The commands programs drive | `id`, `addr`, `peers`, `add`, `remove`, `reload-peers`, `expose`, `unexpose`, `dial`, `undial`, `probe`, `peer-events --watch`, `send-file`, `exec`, `up` and `down`. This covers their arguments and flags, their exit statuses, and the `--json` output of each command that has it. Human-readable output is not part of it, so parse `--json`. |
+| The commands programs drive | `id`, `addr`, `peers`, `add`, `remove`, `reload-peers`, `expose`, `unexpose`, `dial`, `undial`, `probe`, `peer-events --watch`, `send-file`, `exec`, `up` and `down`. This covers their arguments and flags, their exit statuses, and the `--json` output of each command that has it. Human-readable output is not part of it, so parse `--json`. Diagnostic transport selection (`--diagnostic-path-mode`) is internal, as listed below. |
 | Talking across versions | Any two 1.x daemons can trust, dial, expose to and run exec on each other, whatever their minor versions. |
 
 ## What is provisional
@@ -48,6 +48,9 @@ Anything this page does not name is internal.
 - The human output of every command, `doctor` and `status` included.
 - How `fabric update` and the restart supervisor work: their helper
   processes, generation records and jobs.
+- `up --diagnostic-path-mode` and the matching hidden `daemon` option. The
+  `auto`, `relay-only` and `direct-only` selectors are for temporary tests and
+  diagnosis, outside the stability promise.
 - `fabric debug` and the hidden commands (`daemon`, `restart-helper`,
   `restart-detacher`, `supervise-restart`, `install-helper`).
 - Files under the state directory other than `identity.toml`, and the

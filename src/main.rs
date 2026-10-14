@@ -16,7 +16,8 @@ use fabric::{
     },
     control::{ControlRequest, ControlResponse, PeerReachability, SyncRuntimeStatus},
     daemon::{
-        DaemonOptions, FabricNode, init_daemon_tracing, run_daemon_with_options, send_control,
+        DaemonOptions, DiagnosticPathMode, FabricNode, init_daemon_tracing,
+        run_daemon_with_options, send_control,
     },
     service::{self, ServiceInstallOptions},
     sync::cli::SyncCommands,
@@ -209,6 +210,9 @@ enum Commands {
         /// Seconds to keep a detached server-side tunnel session for reconnect.
         #[arg(long)]
         server_session_detached_ttl_secs: Option<u64>,
+        /// Diagnostic transport restriction, outside the stability promise.
+        #[arg(long, value_enum, default_value = "auto")]
+        diagnostic_path_mode: DiagnosticPathMode,
     },
     /// Stop the local fabric daemon.
     Down,
@@ -415,6 +419,9 @@ enum Commands {
         server_session_max_per_peer: Option<usize>,
         #[arg(long)]
         server_session_detached_ttl_secs: Option<u64>,
+        /// Diagnostic transport restriction, outside the stability promise.
+        #[arg(long, value_enum, default_value = "auto")]
+        diagnostic_path_mode: DiagnosticPathMode,
     },
     /// Internal restart detacher.
     #[command(hide = true)]
@@ -959,6 +966,7 @@ async fn run(cli: Cli) -> Result<()> {
                     server_session_max_total,
                     server_session_max_per_peer,
                     server_session_detached_ttl_secs,
+                    diagnostic_path_mode,
                 } => {
                     let options = daemon_options(
                         allow_shell,
@@ -966,6 +974,7 @@ async fn run(cli: Cli) -> Result<()> {
                         server_session_max_total,
                         server_session_max_per_peer,
                         server_session_detached_ttl_secs,
+                        diagnostic_path_mode,
                     );
                     if foreground {
                         init_daemon_tracing(&home)?;
@@ -1418,6 +1427,7 @@ async fn run(cli: Cli) -> Result<()> {
                     server_session_max_total,
                     server_session_max_per_peer,
                     server_session_detached_ttl_secs,
+                    diagnostic_path_mode,
                 } => {
                     if let Err(error) = run_daemon_with_options(
                         home,
@@ -1427,6 +1437,7 @@ async fn run(cli: Cli) -> Result<()> {
                             server_session_max_total,
                             server_session_max_per_peer,
                             server_session_detached_ttl_secs,
+                            diagnostic_path_mode,
                         ),
                     )
                     .await
@@ -2902,6 +2913,7 @@ fn daemon_options(
     server_session_max_total: Option<usize>,
     server_session_max_per_peer: Option<usize>,
     server_session_detached_ttl_secs: Option<u64>,
+    diagnostic_path_mode: DiagnosticPathMode,
 ) -> DaemonOptions {
     DaemonOptions {
         allow_shell,
@@ -2909,6 +2921,7 @@ fn daemon_options(
         server_session_max_total,
         server_session_max_per_peer,
         server_session_detached_ttl_secs,
+        diagnostic_path_mode,
     }
 }
 
@@ -3453,6 +3466,11 @@ async fn spawn_daemon(home: &FabricHome, options: DaemonOptions) -> Result<()> {
         command
             .arg("--server-session-detached-ttl-secs")
             .arg(detached_ttl_secs.to_string());
+    }
+    if options.diagnostic_path_mode != DiagnosticPathMode::Auto {
+        command
+            .arg("--diagnostic-path-mode")
+            .arg(options.diagnostic_path_mode.as_arg());
     }
     command
         .stdin(Stdio::null())
