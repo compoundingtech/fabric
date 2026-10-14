@@ -15,16 +15,33 @@ Deprecated, Fixed or Security.
 
 ## [Unreleased]
 
+Changes since 0.2.40 for the 1.0.0 cut; the original release notes remain below.
+
+### Added
+
+- Stable error codes, refusal/fault/usage classes, exit statuses, and coded close reasons and wire errors are specified in `docs/errors.md` and shared with the sync companion.
+- `--json` accepts flags before or after commands and prints one stable success object for `id`, `peers`, `status`, `dial`, `expose`, `unexpose`, `send-file`, and `reload-peers`; `probe --json` includes `code` and `class`.
+- `fabric add --inbound-only` serves a peer under its grants without dialing or probing it, and status and doctor report its connection state instead of calling it offline.
+- **Provisional:** `fabric-stdio` provides `bridge` and `serve_stdio` for exec services with explicit read/write/flush and half-close handling, avoiding Linux `splice(2)` pipe stalls.
+- **Provisional:** `fabric expose --socket PATH --peer-header` sends the authenticated peer's NodeID and local name as a JSON line to the service and persists the option.
+- `docs/stability.md` defines stable, provisional, and internal surfaces and the patch/minor/major release and deprecation rules from 1.0.0.
+
+### Changed
+
+- Command failures print one `Error: fabric:<code> <text>` line and use their code's exit status; `exec` and `probe` retain their existing exit contracts and recognize older peers' refusal text.
+- `fabric update --url` checks the staged version before installing, requires `--allow-downgrade` for older or equal builds, and supports `--expect-version` without bypassing that check.
+- README and JSON documentation distinguish echo-only status samples from exact-service probes, explain `echo_denied` and inbound/dial-only grants, and document service caps without requiring broader permissions.
+- README documents the commands and their exit statuses, per-peer shell/exec policy, grant revocation, the five-crate workspace and companion bridge, and upgrades whose versions include a commit suffix.
+
 ### Fixed
-- `fabric down` waits up to 15 seconds for the daemon lease to be released,
-  including endpoint and exec-child cleanup. An immediate `down && up` no
-  longer races the old daemon; a timeout is `fabric:daemon_stop_timeout`
-  (fault, exit 69), so the caller knows it is still stopping (#298).
-- A failed Unix dial never saves a listener declaration. Socket paths that exceed
-  the platform's limit report `fabric:invalid_argument` and the maximum home
-  length before binding. One saved listener that cannot be restored (including
-  an occupied TCP port) no longer prevents the daemon from starting; human
-  status and `status --json` report it in `dial_restore_failures` (#297).
+
+- A failed Unix dial is never persisted, overlong socket paths report `fabric:invalid_argument` and the maximum home length, and failed saved Unix or TCP listeners are skipped at startup and reported by status in `dial_restore_failures` (#297).
+- `fabric down` waits up to 15 seconds for lease release through endpoint and child cleanup, so immediate `down && up` succeeds or reports `fabric:daemon_stop_timeout` (fault, exit 69) while still stopping (#298).
+- A trusted peer without an echo grant is reachable with `echo_denied`, no round trip or transport sample, and an informational doctor finding instead of being reported offline.
+- `fabric exec` reads a peer's refusal before discarding a failed command write, preserving the coded reason instead of reporting a broken pipe or an unknown doctor build finding.
+- Network-change notification has a ten-second deadline, so a stalled iroh notice cannot stop held-connection checks and peer announcements (#21).
+- A fully acknowledged tunnel session ends without a reconnect warning, attach-failure count, or unnecessary telemetry rewrite; a live session still resumes after transport loss.
+- Daemon shutdown ends sessions and waits up to two seconds for their exec children, preventing a child-held output pipe from keeping the daemon alive.
 
 ## [0.2.41] - 2026-10-13
 
@@ -602,7 +619,13 @@ Deprecated, Fixed or Security.
   network-change contracts, including virtual five-minute/four-hour outages
   with real endpoints returning at a changed UDP address.
 
-## [Unreleased]
+- **CI refuses real machine, person, and agent names.** `bin/check-public-text`
+  fails on the names of real machines, home directories under `/home/` or
+  `/Users/` that are not an invented example, `person/` IDs that are not an
+  invented example, and internal agent and mission IDs. It runs as the
+  `public-text` job, after a self test that plants each kind of name and proves
+  the scan refuses it. Examples, tests, and docs now use invented names such as
+  `laptop`, `vps`, `/home/example`, and `person/alex`.
 
 ### Removed
 
@@ -610,6 +633,11 @@ Deprecated, Fixed or Security.
   and two July 2026 reliability reports. Their lasting design, how a peer probe
   decides a peer is alive and why it stays simple, is now
   `docs/peer-liveness.md`.
+
+## [0.2.2–0.2.20] — Earlier releases
+
+### Removed
+
 - **The sync engine is out of the `fabric` binary.** The repository is a
   workspace: the core `fabric` crate keeps what the daemon needs to authorize
   and forward sync streams and to report status, which is the `syncs.toml`
@@ -679,13 +707,6 @@ Deprecated, Fixed or Security.
 
 ### Added
 
-- **CI refuses real machine, person, and agent names.** `bin/check-public-text`
-  fails on the names of real machines, home directories under `/home/` or
-  `/Users/` that are not an invented example, `person/` IDs that are not an
-  invented example, and internal agent and mission IDs. It runs as the
-  `public-text` job, after a self test that plants each kind of name and proves
-  the scan refuses it. Examples, tests, and docs now use invented names such as
-  `laptop`, `vps`, `/home/example`, and `person/alex`.
 - **Service logs say when each line was written.** The daemon and the
   `fabric-sync` companion now start every line they write to their service
   output with an RFC 3339 UTC timestamp. That covers each line of a multiline
