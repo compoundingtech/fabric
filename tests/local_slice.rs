@@ -3728,9 +3728,22 @@ async fn peer_online_signal_answers_without_an_application_request() -> Result<(
 
 /// Exercise the actual CLI and process lease, rather than in-process node
 /// shutdown (which never owns the daemon lease). The live half alternates a
-/// normal child with one that inherits SIGTERM ignored through exec.
+/// normal child with one that inherits SIGTERM ignored through exec. CI runs
+/// 10 cycles per mode; FABRIC_DOWN_CYCLES=100 runs the full release check.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn down_then_up_is_a_barrier_for_100_idle_and_100_live_exec_cycles() -> Result<()> {
+async fn down_then_up_is_a_barrier_for_idle_and_live_exec_cycles() -> Result<()> {
+    let cycles = match std::env::var("FABRIC_DOWN_CYCLES") {
+        Ok(value) => value
+            .parse::<usize>()
+            .context("FABRIC_DOWN_CYCLES must be an integer of at least 2")?,
+        Err(std::env::VarError::NotPresent) => 10,
+        Err(error) => return Err(error.into()),
+    };
+    if cycles < 2 {
+        bail!(
+            "FABRIC_DOWN_CYCLES must be at least 2 to cover normal and SIGTERM-ignoring children"
+        );
+    }
     let _guard = local_slice_guard().await;
     let server_dir = TempDir::new()?;
     let client_dir = TempDir::new()?;
@@ -3745,7 +3758,7 @@ async fn down_then_up_is_a_barrier_for_100_idle_and_100_live_exec_cycles() -> Re
     run_fabric(&server_home, &["up"])?;
     let _cleanup = StopOnDrop(server_home.clone());
     let started = Instant::now();
-    for cycle in 0..100 {
+    for cycle in 0..cycles {
         run_fabric(&server_home, &["down"]).with_context(|| format!("idle down {cycle}"))?;
         assert!(
             fabric::daemon::daemon_lock_available(&server_home)?,
@@ -3753,7 +3766,7 @@ async fn down_then_up_is_a_barrier_for_100_idle_and_100_live_exec_cycles() -> Re
         );
         run_fabric(&server_home, &["up"]).with_context(|| format!("idle up {cycle}"))?;
     }
-    println!("idle down/up: 100/100 in {:?}", started.elapsed());
+    println!("idle down/up: {cycles}/{cycles} in {:?}", started.elapsed());
 
     let client = FabricNode::start(client_home.clone()).await?;
     let server_id = run_fabric(&server_home, &["id"])?;
@@ -3782,7 +3795,7 @@ async fn down_then_up_is_a_barrier_for_100_idle_and_100_live_exec_cycles() -> Re
         )?;
     }
     let started = Instant::now();
-    for cycle in 0..100 {
+    for cycle in 0..cycles {
         let addr: iroh::EndpointAddr = serde_json::from_str(&run_fabric(&server_home, &["addr"])?)?;
         trust_peer(&client_home, &client, server_id, Some("server"), Some(addr)).await?;
         let protocol = if cycle % 2 == 0 {
@@ -3804,7 +3817,8 @@ async fn down_then_up_is_a_barrier_for_100_idle_and_100_live_exec_cycles() -> Re
         drop(stream);
     }
     println!(
-        "live exec down/up: 100/100 (50 SIGTERM-ignoring children) in {:?}",
+        "live exec down/up: {cycles}/{cycles} ({} SIGTERM-ignoring children) in {:?}",
+        cycles / 2,
         started.elapsed()
     );
     client.shutdown().await?;
