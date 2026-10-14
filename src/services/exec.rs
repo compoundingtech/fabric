@@ -684,8 +684,12 @@ mod tests {
         write_client_argv(&mut client_send, &argv).await.unwrap();
         let pid = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if let Ok(contents) = fs::read_to_string(&pid_file) {
-                    break contents.parse::<i32>().unwrap();
+                // The shell creates/truncates the file before writing its PID.
+                // A readable empty file is not evidence the child is ready.
+                if let Ok(contents) = fs::read_to_string(&pid_file)
+                    && let Ok(pid) = contents.parse::<i32>()
+                {
+                    break pid;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

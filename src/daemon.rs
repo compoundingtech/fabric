@@ -46,7 +46,8 @@ use crate::{
         validate_server_session_config, validate_tcp_addr, write_atomic,
     },
     control::{
-        ControlRequest, ControlResponse, PeerReachability, SyncEntryStatus, SyncRuntimeStatus,
+        ControlRequest, ControlResponse, DialRestoreFailure, PeerReachability, SyncEntryStatus,
+        SyncRuntimeStatus,
     },
     mux, pathwatch,
     services::{self, Access, Bridge, Notice, PeerStream, Service, Services},
@@ -423,6 +424,7 @@ pub struct DaemonState {
     allowed: Arc<RwLock<HashSet<EndpointId>>>,
     exposures: RwLock<HashMap<Vec<u8>, Exposure>>,
     dial_sockets: Mutex<HashMap<(String, String), DialSocket>>,
+    dial_restore_failures: Mutex<Vec<DialRestoreFailure>>,
     active_dial_listeners: Arc<AtomicUsize>,
     tcp_dials: Mutex<HashMap<(String, String, String), TcpDial>>,
     tunnel_sessions: tunnel::ServerSessionStore,
@@ -1102,6 +1104,7 @@ impl DaemonState {
             allowed,
             exposures: RwLock::new(exposures),
             dial_sockets: Mutex::new(HashMap::new()),
+            dial_restore_failures: Mutex::new(Vec::new()),
             active_dial_listeners: Arc::new(AtomicUsize::new(0)),
             tcp_dials: Mutex::new(HashMap::new()),
             tunnel_sessions,
@@ -1599,14 +1602,27 @@ impl DaemonState {
     pub async fn dial(&self, peer: &str, protocol: &str) -> Result<PathBuf> {
         let alpn = validate_protocol(protocol)?;
         let id = self.peer_book.read().await.resolve(peer)?.id.to_string();
+        let path = self
+            .dial_alpn_with_persistence(&id, protocol, alpn, true, true)
+            .await?;
+        self.clear_dial_restore_failure(&id, protocol, None).await;
+        Ok(path)
+    }
+
+    fn persist_unix_dial(&self, peer: &str, protocol: &str) -> Result<()> {
         self.update_config(|config| {
             config.upsert_dial(PersistedDial {
-                peer: id.clone(),
+                peer: peer.into(),
                 protocol: protocol.into(),
                 tcp: None,
             });
-        })?;
-        self.dial_alpn(&id, protocol, alpn, true).await
+        })
+    }
+
+    async fn clear_dial_restore_failure(&self, peer: &str, protocol: &str, tcp: Option<&str>) {
+        self.dial_restore_failures.lock().await.retain(|failure| {
+            failure.peer != peer || failure.protocol != protocol || failure.tcp.as_deref() != tcp
+        });
     }
 
     /// A local socket that reaches `peer`'s `name` service with the newest
@@ -1705,7 +1721,10 @@ impl DaemonState {
         let mut tcp_dials = self.tcp_dials.lock().await;
         if let Some(existing) = tcp_dials.get_mut(&key) {
             existing.peer_addr = peer_addr;
-            return Ok(existing.addr.clone());
+            let addr = existing.addr.clone();
+            self.clear_dial_restore_failure(&key.0, protocol, Some(&addr))
+                .await;
+            return Ok(addr);
         }
         let listener = TcpListener::bind(&bind)
             .await
@@ -1744,6 +1763,8 @@ impl DaemonState {
             self.connection_recorder(),
         ));
 
+        self.clear_dial_restore_failure(&peer_addr.id.to_string(), protocol, Some(&addr))
+            .await;
         Ok(addr)
     }
 
@@ -1771,6 +1792,10 @@ impl DaemonState {
                     true
                 }
             });
+        self.dial_restore_failures
+            .lock()
+            .await
+            .retain(|failure| failure.peer != id || failure.protocol != protocol);
         Ok(())
     }
 
@@ -1780,6 +1805,18 @@ impl DaemonState {
         protocol: &str,
         alpn: Vec<u8>,
         reuse_existing: bool,
+    ) -> Result<PathBuf> {
+        self.dial_alpn_with_persistence(peer, protocol, alpn, reuse_existing, false)
+            .await
+    }
+
+    async fn dial_alpn_with_persistence(
+        &self,
+        peer: &str,
+        protocol: &str,
+        alpn: Vec<u8>,
+        reuse_existing: bool,
+        persist: bool,
     ) -> Result<PathBuf> {
         let peer_addr = self.peer_book.read().await.resolve(peer)?;
         let key = (peer_addr.id.to_string(), protocol.to_string());
@@ -1794,10 +1831,14 @@ impl DaemonState {
                 .as_ref()
                 .is_some_and(|task| !task.is_finished())
         {
+            if persist {
+                self.persist_unix_dial(&peer_addr.id.to_string(), protocol)?;
+            }
             return Ok(existing.path.clone());
         }
 
         let socket_path = self.home.dial_socket_path(peer_addr.id, protocol);
+        validate_dial_socket_path(&self.home, &socket_path)?;
         if let Some(existing) = sockets.remove(&key) {
             // Shell and exec deliberately replace their deterministic socket
             // path for each command. Stop and join the previous accept loop
@@ -1812,6 +1853,11 @@ impl DaemonState {
         }
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("failed to bind {}", socket_path.display()))?;
+        if persist && let Err(error) = self.persist_unix_dial(&peer_addr.id.to_string(), protocol) {
+            drop(listener);
+            let _ = fs::remove_file(&socket_path);
+            return Err(error);
+        }
         let listener_cancel = CancellationToken::new();
         let lease = DialListenerLease::new(self.active_dial_listeners.clone());
 
@@ -1946,6 +1992,7 @@ impl DaemonState {
             current_connection_health,
             active_dial_handlers: self.active_dial_handlers(),
             max_dial_handlers: self.max_dial_handlers(),
+            dial_restore_failures: self.dial_restore_failures.lock().await.clone(),
         })
     }
 
@@ -2778,6 +2825,23 @@ pub struct PingOutcome {
     pub transport: Option<String>,
 }
 
+/// Reserve one byte for sockaddr_un's terminating NUL on every supported OS.
+fn validate_dial_socket_path(home: &FabricHome, path: &std::path::Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let max = address.sun_path.len() - 1;
+    let path_len = path.as_os_str().as_bytes().len();
+    if path_len > max {
+        let suffix_len = path_len.saturating_sub(home.root().as_os_str().as_bytes().len());
+        let max_home = max.saturating_sub(suffix_len);
+        return Err(FabricError::new(ErrorCode::InvalidArgument, format!(
+            "dial socket path is {path_len} bytes; maximum is {max} bytes: {}; use a --home path of at most {max_home} bytes",
+            path.display()
+        )).into());
+    }
+    Ok(())
+}
+
 pub struct FabricNode {
     state: Arc<DaemonState>,
     task: JoinHandle<Result<()>>,
@@ -2816,12 +2880,30 @@ impl FabricNode {
             if state.peer_book.read().await.resolve(&dial.peer).is_err() {
                 continue;
             }
-            if let Some(bind) = &dial.tcp {
+            let result = if let Some(bind) = &dial.tcp {
                 state
                     .dial_tcp(&dial.peer, &dial.protocol, bind.clone())
-                    .await?;
+                    .await
+                    .map(|_| ())
             } else {
-                state.dial(&dial.peer, &dial.protocol).await?;
+                state.dial(&dial.peer, &dial.protocol).await.map(|_| ())
+            };
+            if let Err(error) = result {
+                let code = crate::error::code_of(&error);
+                warn!(peer = %dial.peer, protocol = %dial.protocol, %error,
+                    "saved dial could not be restored; skipping listener");
+                state
+                    .dial_restore_failures
+                    .lock()
+                    .await
+                    .push(DialRestoreFailure {
+                        peer: dial.peer.clone(),
+                        protocol: dial.protocol.clone(),
+                        tcp: dial.tcp.clone(),
+                        code: code.as_str().into(),
+                        class: code.class().as_str().into(),
+                        error: format!("{error:#}"),
+                    });
             }
         }
 
@@ -10374,6 +10456,148 @@ mod tests {
             .await
             .context("the rehome loop did not return after the daemon was cancelled")???;
         router.shutdown().await?;
+        Ok(())
+    }
+
+    fn long_dial_home(dir: &std::path::Path) -> FabricHome {
+        use std::os::unix::ffi::OsStrExt;
+        // Leave room for run/control.sock on macOS while making the dial
+        // socket about 120 bytes, beyond both supported sockaddr_un limits.
+        let extra = 80 - dir.as_os_str().as_bytes().len() - 1;
+        FabricHome::new(dir.join("x".repeat(extra)))
+    }
+
+    #[tokio::test]
+    async fn failed_long_unix_dial_is_not_saved_and_restart_succeeds() -> Result<()> {
+        let dir = tempfile::tempdir_in("/tmp")?;
+        let home = long_dial_home(dir.path());
+        let node = FabricNode::start(home.clone()).await?;
+        trust_test_peer(&home, &node, node.id(), "peer", node.addr()).await?;
+        let before = fs::read(home.config_path()).ok();
+        let error = node.dial("peer", "audit/echo").await.unwrap_err();
+        assert_eq!(crate::error::code_of(&error), ErrorCode::InvalidArgument);
+        assert!(format!("{error:#}").contains("--home path of at most"));
+        assert_eq!(fs::read(home.config_path()).ok(), before);
+        assert_eq!(node.state().active_dial_listeners.load(Ordering::SeqCst), 0);
+        node.shutdown().await?;
+        let restarted = FabricNode::start(home).await?;
+        restarted.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bad_saved_unix_dial_is_reported_without_stopping_startup() -> Result<()> {
+        let dir = tempfile::tempdir_in("/tmp")?;
+        let home = long_dial_home(dir.path());
+        let node = FabricNode::start(home.clone()).await?;
+        trust_test_peer(&home, &node, node.id(), "peer", node.addr()).await?;
+        let id = node.id().to_string();
+        node.shutdown().await?;
+        let mut config = FabricConfig::load(&home)?;
+        config.upsert_dial(PersistedDial {
+            peer: id.clone(),
+            protocol: "audit/echo".into(),
+            tcp: None,
+        });
+        config.save(&home)?;
+        let before = fs::read(home.config_path())?;
+        let restarted = FabricNode::start(home.clone()).await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    send_control(&home, ControlRequest::Status).await,
+                    Ok(ControlResponse::Status { .. })
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        match send_control(&home, ControlRequest::ReachabilityStatus).await? {
+            ControlResponse::ReachabilityStatus {
+                dial_restore_failures,
+                ..
+            } => {
+                assert_eq!(dial_restore_failures.len(), 1);
+                assert_eq!(dial_restore_failures[0].peer, id);
+                assert_eq!(dial_restore_failures[0].code, "invalid_argument");
+            }
+            response => panic!("unexpected {response:?}"),
+        }
+        assert_eq!(fs::read(home.config_path())?, before);
+        restarted.state().undial("peer", "audit/echo").await?;
+        assert!(
+            restarted
+                .state()
+                .dial_restore_failures
+                .lock()
+                .await
+                .is_empty()
+        );
+        restarted.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn occupied_saved_tcp_dial_is_skipped_and_other_listener_restores() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let node = FabricNode::start(home.clone()).await?;
+        trust_test_peer(&home, &node, node.id(), "peer", node.addr()).await?;
+        let occupied = TcpListener::bind("127.0.0.1:0").await?;
+        let blocked_addr = occupied.local_addr()?.to_string();
+        let before = fs::read(home.config_path()).ok();
+        assert!(
+            node.dial_tcp("peer", "audit/echo", blocked_addr.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(home.config_path()).ok(), before);
+        let valid_path = node.dial("peer", "audit/echo").await?;
+        let id = node.id().to_string();
+        node.shutdown().await?;
+        let mut config = FabricConfig::load(&home)?;
+        config.upsert_dial(PersistedDial {
+            peer: id,
+            protocol: "audit/echo".into(),
+            tcp: Some(blocked_addr.clone()),
+        });
+        config.save(&home)?;
+        let before = fs::read(home.config_path())?;
+        let restarted = FabricNode::start(home.clone()).await?;
+        assert!(
+            UnixStream::connect(&valid_path).await.is_ok(),
+            "unrelated saved listener must bind"
+        );
+        let state = restarted.state();
+        let failures = state.dial_restore_failures.lock().await.clone();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].tcp.as_deref(), Some(blocked_addr.as_str()));
+        assert_eq!(fs::read(home.config_path())?, before);
+        drop(occupied);
+        restarted
+            .dial_tcp("peer", "audit/echo", blocked_addr)
+            .await?;
+        assert!(state.dial_restore_failures.lock().await.is_empty());
+        restarted.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn config_save_failure_leaves_no_unix_dial_listener() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let node = FabricNode::start(home.clone()).await?;
+        trust_test_peer(&home, &node, node.id(), "peer", node.addr()).await?;
+        // Invalid config forces persistence to fail after the successful bind.
+        fs::write(home.config_path(), "[")?;
+        let path = home.dial_socket_path(node.id(), "audit/echo");
+        assert!(node.dial("peer", "audit/echo").await.is_err());
+        assert!(!path.exists());
+        assert_eq!(fs::read(home.config_path())?, b"[");
+        assert_eq!(node.state().active_dial_listeners.load(Ordering::SeqCst), 0);
+        node.shutdown().await?;
         Ok(())
     }
 
