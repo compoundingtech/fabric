@@ -1006,6 +1006,13 @@ peer answering; it has no latency or path to show, and `fabric ping` on it says
 the peer is up but has not granted `echo` (exit 77). A peer that does not trust
 this machine at all is still listed as offline.
 
+The status latency and transport describe only that echo sample. With
+`echo_denied`, their null values are not evidence for a different service's
+availability or route. Keep the exact grants you need and run
+`fabric probe PEER SERVICE --json` to measure the permitted protocol; its
+`protocol` field names what was tested. A successful probe is a sample of that
+protocol at that instant, not proof of the path of every workload session.
+
 ```sh
 fabric add <nodeid> [name] [--addr-json JSON] [--allow service,...]
 ```
