@@ -15,16 +15,15 @@ Deprecated, Fixed or Security.
 
 ## [Unreleased]
 
+### Changed
+
+- README documents the existing server session limits and the current EOF behavior of refused dial sessions (#306).
+- README and the JSON contract distinguish echo status samples from exact-service probes without requiring broader grants (#311).
+
 ### Fixed
-- `fabric down` waits up to 15 seconds for the daemon lease to be released,
-  including endpoint and exec-child cleanup. An immediate `down && up` no
-  longer races the old daemon; a timeout is `fabric:daemon_stop_timeout`
-  (fault, exit 69), so the caller knows it is still stopping (#298).
-- A failed Unix dial never saves a listener declaration. Socket paths that exceed
-  the platform's limit report `fabric:invalid_argument` and the maximum home
-  length before binding. One saved listener that cannot be restored (including
-  an occupied TCP port) no longer prevents the daemon from starting; human
-  status and `status --json` report it in `dial_restore_failures` (#297).
+
+- A failed Unix dial is never persisted, overlong socket paths report `fabric:invalid_argument` and the maximum home length, and failed saved Unix or TCP listeners are skipped at startup and reported by status in `dial_restore_failures` (#297).
+- `fabric down` waits up to 15 seconds for lease release through endpoint and child cleanup, so immediate `down && up` succeeds or reports `fabric:daemon_stop_timeout` (fault, exit 69) while still stopping (#298).
 
 ## [0.2.41] - 2026-10-13
 
@@ -602,7 +601,13 @@ Deprecated, Fixed or Security.
   network-change contracts, including virtual five-minute/four-hour outages
   with real endpoints returning at a changed UDP address.
 
-## [Unreleased]
+- **CI refuses real machine, person, and agent names.** `bin/check-public-text`
+  fails on the names of real machines, home directories under `/home/` or
+  `/Users/` that are not an invented example, `person/` IDs that are not an
+  invented example, and internal agent and mission IDs. It runs as the
+  `public-text` job, after a self test that plants each kind of name and proves
+  the scan refuses it. Examples, tests, and docs now use invented names such as
+  `laptop`, `vps`, `/home/example`, and `person/alex`.
 
 ### Removed
 
@@ -610,6 +615,11 @@ Deprecated, Fixed or Security.
   and two July 2026 reliability reports. Their lasting design, how a peer probe
   decides a peer is alive and why it stays simple, is now
   `docs/peer-liveness.md`.
+
+## [0.2.2–0.2.20] — Earlier releases
+
+### Removed
+
 - **The sync engine is out of the `fabric` binary.** The repository is a
   workspace: the core `fabric` crate keeps what the daemon needs to authorize
   and forward sync streams and to report status, which is the `syncs.toml`
@@ -679,13 +689,6 @@ Deprecated, Fixed or Security.
 
 ### Added
 
-- **CI refuses real machine, person, and agent names.** `bin/check-public-text`
-  fails on the names of real machines, home directories under `/home/` or
-  `/Users/` that are not an invented example, `person/` IDs that are not an
-  invented example, and internal agent and mission IDs. It runs as the
-  `public-text` job, after a self test that plants each kind of name and proves
-  the scan refuses it. Examples, tests, and docs now use invented names such as
-  `laptop`, `vps`, `/home/example`, and `person/alex`.
 - **Service logs say when each line was written.** The daemon and the
   `fabric-sync` companion now start every line they write to their service
   output with an RFC 3339 UTC timestamp. That covers each line of a multiline
