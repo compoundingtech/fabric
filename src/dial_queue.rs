@@ -56,9 +56,13 @@ impl DialQueue {
 
     /// Reserve before spawning: waiting sockets/tasks cannot grow without bound.
     pub(crate) fn reserve(self: &Arc<Self>, timeout: Duration) -> Result<DialReservation> {
-        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
-            FabricError::new(ErrorCode::InvalidArgument, "queue timeout is too large")
-        })?;
+        let deadline = if timeout.is_zero() {
+            None
+        } else {
+            Some(Instant::now().checked_add(timeout).ok_or_else(|| {
+                FabricError::new(ErrorCode::InvalidArgument, "queue timeout is too large")
+            })?)
+        };
         let permit = self
             .outstanding
             .clone()
@@ -86,7 +90,7 @@ pub(crate) fn diagnostic(error: &anyhow::Error) -> String {
 pub(crate) struct DialReservation {
     queue: Arc<DialQueue>,
     _outstanding: OwnedSemaphorePermit,
-    pub(crate) deadline: Instant,
+    pub(crate) deadline: Option<Instant>,
 }
 
 /// Holds the per-peer and daemon-wide session budgets until the stream ends.
@@ -102,6 +106,27 @@ impl DialReservation {
         global: Arc<Semaphore>,
         cancel: &CancellationToken,
     ) -> Result<Option<DialPermit>> {
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
+        let Some(deadline) = self.deadline else {
+            // Zero disables waiting and remote admission retries, while a
+            // connection with immediately available capacity can still run.
+            let active = self
+                .queue
+                .active
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| limit_error("dial peer capacity is full"))?;
+            let global = global
+                .try_acquire_owned()
+                .map_err(|_| limit_error("dial daemon capacity is full"))?;
+            return Ok(Some(DialPermit {
+                _reservation: self,
+                _active: active,
+                _global: global,
+            }));
+        };
         let wait = async {
             let active = self.queue.active.clone().acquire_owned().await?;
             let global = global.acquire_owned().await?;
@@ -110,7 +135,7 @@ impl DialReservation {
         let (active, global) = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Ok(None),
-            _ = tokio::time::sleep_until(self.deadline) => return Err(limit_error("dial queue timeout expired")),
+            _ = tokio::time::sleep_until(deadline) => return Err(limit_error("dial queue timeout expired")),
             permits = wait => permits?,
         };
         Ok(Some(DialPermit {
@@ -155,6 +180,47 @@ mod tests {
         assert!(other_permit.is_some());
         drop(held);
         assert!(waiting.await??.is_some());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_timeout_admits_available_capacity_and_never_waits() -> Result<()> {
+        let queue = Arc::new(DialQueue::new(1, 1));
+        let global = Arc::new(Semaphore::new(1));
+        let cancel = CancellationToken::new();
+        let reservation = queue.reserve(Duration::ZERO)?;
+        assert!(reservation.deadline.is_none());
+        let live = reservation.acquire(global.clone(), &cancel).await?;
+        let start = Instant::now();
+        let error = queue
+            .reserve(Duration::ZERO)?
+            .acquire(global.clone(), &cancel)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(Instant::now(), start);
+        assert_eq!(
+            fabric_config::error::code_of(&error),
+            ErrorCode::SessionLimitReached
+        );
+        drop(live);
+        let held = global.clone().acquire_owned().await?;
+        assert!(
+            queue
+                .reserve(Duration::ZERO)?
+                .acquire(global.clone(), &cancel)
+                .await
+                .is_err()
+        );
+        assert_eq!(queue.active.available_permits(), 1);
+        drop(held);
+        assert!(
+            queue
+                .reserve(Duration::ZERO)?
+                .acquire(global, &cancel)
+                .await?
+                .is_some()
+        );
         Ok(())
     }
 

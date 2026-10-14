@@ -29,6 +29,13 @@ Deprecated, Fixed or Security.
   existing `fabric:session_limit_reached` code; local refusal reporting remains
   unchanged. No wire format or server cap changes.
 
+### Changed
+- Through a generic dial listener, an exposure's exec child-limit refusal now
+  waits for capacity up to the queue timeout (default 10 seconds) before the
+  local client sees EOF. `--queue-timeout 0` restores immediate refusal and
+  disables local capacity waiting and remote capacity retries. Existing
+  admitted requests are not replayed and no child starts above the limit.
+
 ## [0.2.41] - 2026-10-13
 
 ### Added
