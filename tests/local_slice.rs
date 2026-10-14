@@ -1014,7 +1014,7 @@ async fn exec_expose_round_trips_stdio_handler() -> Result<()> {
 
     run_fabric(
         &node_a_home,
-        &["expose", "stdio-cat", "--exec", "--", "/bin/cat"],
+        &["expose", "stdio-cat", "--exec", "--", "cat"],
     )?;
 
     let dial_socket = node_b.dial("node-a", "stdio-cat").await?;
@@ -1486,7 +1486,7 @@ async fn exec_expose_streams_payload_larger_than_tunnel_buffer() -> Result<()> {
     .await?;
 
     node_a
-        .expose_exec("stdio-cat", vec!["/bin/cat".to_string()])
+        .expose_exec("stdio-cat", vec!["cat".to_string()])
         .await?;
 
     let dial_socket = node_b.dial("node-a", "stdio-cat").await?;
@@ -2129,7 +2129,7 @@ async fn separate_peer_and_daemon_configs_restore_on_restart() -> Result<()> {
     .await?;
 
     node_a
-        .expose_exec("stdio-cat", vec!["/bin/cat".to_string()])
+        .expose_exec("stdio-cat", vec!["cat".to_string()])
         .await?;
     assert_status_exposes(&node_a_home, "stdio-cat").await?;
     assert_status_has_shell_grant(&node_a_home).await?;
@@ -2177,7 +2177,7 @@ async fn unexpose_clears_persisted_config_and_restart_does_not_restore() -> Resu
 
     let node_a = FabricNode::start(node_a_home.clone()).await?;
     node_a
-        .expose_exec("stdio-cat", vec!["/bin/cat".to_string()])
+        .expose_exec("stdio-cat", vec!["cat".to_string()])
         .await?;
     assert_status_exposes(&node_a_home, "stdio-cat").await?;
     assert!(fs::read_to_string(node_a_home.config_path())?.contains("stdio-cat"));
@@ -4205,7 +4205,7 @@ async fn registered_dials_and_default_exposure_survive_both_daemon_restarts() ->
     let b = FabricNode::start(b_home.clone()).await?;
     trust_peer(&a_home, &a, b.id(), Some("node-b"), Some(b.addr())).await?;
     trust_peer(&b_home, &b, a.id(), Some("node-a"), Some(a.addr())).await?;
-    a.expose_exec("stdio-cat", vec!["/bin/cat".into()]).await?;
+    a.expose_exec("stdio-cat", vec!["cat".into()]).await?;
     let socket = b.dial("node-a", "stdio-cat").await?;
     let addr = b
         .dial_tcp("node-a", "stdio-cat", "127.0.0.1:0".into())
@@ -4255,7 +4255,7 @@ async fn an_offline_peer_closes_new_tcp_requests_in_milliseconds_without_retry_e
     let b = FabricNode::start(b_home.clone()).await?;
     trust_peer(&a_home, &a, b.id(), Some("node-b"), Some(b.addr())).await?;
     trust_peer(&b_home, &b, a.id(), Some("node-a"), Some(a.addr())).await?;
-    a.expose_exec("stdio-cat", vec!["/bin/cat".into()]).await?;
+    a.expose_exec("stdio-cat", vec!["cat".into()]).await?;
     let addr = b
         .dial_tcp("node-a", "stdio-cat", "127.0.0.1:0".into())
         .await?;

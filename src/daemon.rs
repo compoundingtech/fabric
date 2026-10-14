@@ -11271,7 +11271,7 @@ mod tests {
         let b = FabricNode::start(b_home.clone()).await?;
         trust_test_peer(&a_home, &a, b.id(), "client", b.addr()).await?;
         trust_test_peer(&b_home, &b, a.id(), "server", a.addr()).await?;
-        a.expose_exec("audit/echo", vec!["/bin/cat".into()]).await?;
+        a.expose_exec("audit/echo", vec!["cat".into()]).await?;
         let addr = b
             .dial_tcp("server", "audit/echo", "127.0.0.1:0".into())
             .await?;
@@ -11368,7 +11368,7 @@ mod tests {
         let b = FabricNode::start(b_home.clone()).await?;
         trust_test_peer(&a_home, &a, b.id(), "client", b.addr()).await?;
         trust_test_peer(&b_home, &b, a.id(), "server", a.addr()).await?;
-        a.expose_exec("audit/echo", vec!["/bin/cat".into()]).await?;
+        a.expose_exec("audit/echo", vec!["cat".into()]).await?;
         let addr = b
             .dial_tcp("server", "audit/echo", "127.0.0.1:0".into())
             .await?;
