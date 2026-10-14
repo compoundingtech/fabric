@@ -40,7 +40,7 @@ Changes since 0.2.40 for the 1.0.0 cut; the original release notes remain below.
 - A trusted peer without an echo grant is reachable with `echo_denied`, no round trip or transport sample, and an informational doctor finding instead of being reported offline.
 - `fabric exec` reads a peer's refusal before discarding a failed command write, preserving the coded reason instead of reporting a broken pipe or an unknown doctor build finding.
 - Network-change notification has a ten-second deadline, so a stalled iroh notice cannot stop held-connection checks and peer announcements (#21).
-- A fully acknowledged tunnel session ends without a reconnect warning, attach-failure count, or unnecessary telemetry rewrite; a live session still resumes after transport loss.
+- A fully acknowledged tunnel session ends without a reconnect warning or unnecessary telemetry rewrite; a live session still resumes after transport loss.
 - Daemon shutdown ends sessions and waits up to two seconds for their exec children, preventing a child-held output pipe from keeping the daemon alive.
 
 ## [0.2.41] - 2026-10-13
