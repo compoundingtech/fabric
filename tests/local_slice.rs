@@ -1029,7 +1029,7 @@ async fn exec_expose_enforces_per_exposure_child_limit() -> Result<()> {
             vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
-                "printf spawn >> \"$1\"; printf ready > \"$2\"; while [ ! -e \"$3\" ]; do sleep 0.1; done; exec /bin/cat".to_string(),
+                "printf spawn >> \"$1\"; printf ready > \"$2\"; while [ ! -e \"$3\" ]; do sleep 0.1; done; exec cat".to_string(),
                 "fabric-test".to_string(),
                 marker.display().to_string(),
                 ready.display().to_string(),
@@ -1039,7 +1039,12 @@ async fn exec_expose_enforces_per_exposure_child_limit() -> Result<()> {
         )
         .await?;
 
-    let dial_socket = node_b.dial("node-a", "limited-cat").await?;
+    // A child-cap refusal now waits in the generic dial admission queue.
+    // Keep this test focused on enforcing the cap and expiring that wait.
+    let dial_socket = PathBuf::from(run_fabric(
+        &node_b_home,
+        &["dial", "node-a", "limited-cat", "--queue-timeout", "0.15"],
+    )?);
     let mut first = UnixStream::connect(&dial_socket).await?;
     wait_for_file_contents(&ready, "ready").await?;
     assert_eq!(fs::read_to_string(&marker)?, "spawn");
