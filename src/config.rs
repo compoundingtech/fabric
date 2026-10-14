@@ -1523,7 +1523,10 @@ impl DialOptions {
                 "positive queue timeout must be at least one millisecond".into(),
             ));
         }
-        let options = Self { queue_timeout_ms, ..Self::default() };
+        let options = Self {
+            queue_timeout_ms,
+            ..Self::default()
+        };
         options.validate()?;
         Ok(options)
     }
