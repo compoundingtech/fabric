@@ -3428,7 +3428,7 @@ fn pid_cat_argv(pid_file: &Path) -> Vec<String> {
     vec![
         "/bin/sh".to_string(),
         "-c".to_string(),
-        "printf '%s' \"$$\" > \"$1\"; exec /bin/cat".to_string(),
+        "printf '%s' \"$$\" > \"$1\"; exec cat".to_string(),
         "fabric-test".to_string(),
         pid_file.display().to_string(),
     ]
