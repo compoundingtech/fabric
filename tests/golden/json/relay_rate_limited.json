@@ -1,0 +1,9 @@
+{
+  "error": {
+    "class": "fault",
+    "code": "relay_rate_limited",
+    "message": "relay reported rate limiting; traffic may continue at a lower rate",
+    "peer": null,
+    "service": null
+  }
+}

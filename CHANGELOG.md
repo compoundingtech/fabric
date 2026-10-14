@@ -16,6 +16,9 @@ Deprecated, Fixed or Security.
 ## [Unreleased]
 
 ### Added
+- Daemon logs report explicit relay RateLimited notices as
+  `fabric:relay_rate_limited` (fault), using iroh's typed connection counter.
+  The diagnostic does not close traffic or infer limiting from transfer speed.
 - A root-level `relays` array selects custom home-relay candidates at startup;
   omission keeps n0 defaults and an empty list disables relay transport while
   preserving direct IP. `status --json` reports the running selection in

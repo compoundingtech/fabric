@@ -111,26 +111,7 @@ async fn measure(
     )
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "manual bulk proof; use --release and optionally FABRIC_BENCH_BIN for a released artifact"]
-async fn owned_relay_throughput() -> Result<()> {
-    let _guard = super::local_slice_guard().await;
-    let binary = std::env::var_os("FABRIC_BENCH_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_fabric")));
-    let bytes = std::env::var("FABRIC_BENCH_BYTES")
-        .ok()
-        .map(|value| value.parse())
-        .transpose()?
-        .unwrap_or(16 * 1024 * 1024);
-    let streams = std::env::var("FABRIC_BENCH_STREAMS")
-        .ok()
-        .map(|value| value.parse())
-        .transpose()?
-        .unwrap_or(1);
-    let trials = 3;
-    assert!(bytes > 0 && bytes <= 128 * 1024 * 1024);
-    assert!(streams > 0 && streams <= 16);
+async fn start_sink() -> Result<(String, tokio::task::JoinHandle<Result<()>>)> {
     let backend = TcpListener::bind("127.0.0.1:0").await?;
     let backend_addr = backend.local_addr()?.to_string();
     let sink = tokio::spawn(async move {
@@ -156,6 +137,30 @@ async fn owned_relay_throughput() -> Result<()> {
         #[allow(unreachable_code)]
         Ok::<_, anyhow::Error>(())
     });
+    Ok((backend_addr, sink))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual bulk proof; use --release and optionally FABRIC_BENCH_BIN for a released artifact"]
+async fn owned_relay_throughput() -> Result<()> {
+    let _guard = super::local_slice_guard().await;
+    let binary = std::env::var_os("FABRIC_BENCH_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_fabric")));
+    let bytes = std::env::var("FABRIC_BENCH_BYTES")
+        .ok()
+        .map(|value| value.parse())
+        .transpose()?
+        .unwrap_or(16 * 1024 * 1024);
+    let streams = std::env::var("FABRIC_BENCH_STREAMS")
+        .ok()
+        .map(|value| value.parse())
+        .transpose()?
+        .unwrap_or(1);
+    let trials = 3;
+    assert!(bytes > 0 && bytes <= 128 * 1024 * 1024);
+    assert!(streams > 0 && streams <= 16);
+    let (backend_addr, sink) = start_sink().await?;
     let mut relay_config = ServerConfig::default();
     relay_config.relay = Some(RelayConfig::new((std::net::Ipv4Addr::LOCALHOST, 0)));
     let relay = Server::spawn(relay_config).await?;
@@ -249,6 +254,97 @@ async fn owned_relay_throughput() -> Result<()> {
     if let Some(output) = std::env::var_os("FABRIC_BENCH_OUTPUT") {
         fs::write(output, serde_json::to_string_pretty(&receipt)? + "\n")?;
     }
+    sink.abort();
+    relay.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_rate_notice_is_coded_without_aborting_payload() -> Result<()> {
+    let _guard = super::local_slice_guard().await;
+    use iroh_relay::server::ClientRateLimit;
+    use std::num::NonZeroU32;
+    let mut config = ServerConfig::default();
+    let mut relay_config = RelayConfig::new((std::net::Ipv4Addr::LOCALHOST, 0));
+    let mut limit = ClientRateLimit::new(NonZeroU32::new(512 * 1024).unwrap());
+    limit.max_burst_bytes = NonZeroU32::new(16 * 1024);
+    relay_config.limits.client_rx = Some(limit);
+    config.relay = Some(relay_config);
+    let relay = Server::spawn(config).await?;
+    let url = format!("http://{}/", relay.http_addr().unwrap());
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_fabric"));
+    let server_dir = TempDir::new()?;
+    let client_dir = TempDir::new()?;
+    let server = FabricHome::new(server_dir.path());
+    let client = FabricHome::new(client_dir.path());
+    for home in [&server, &client] {
+        home.prepare()?;
+        fs::write(home.config_path(), format!("relays = [{url:?}]\n"))?;
+    }
+    let server_daemon = start(&binary, &server, "relay-only").await?;
+    let client_daemon = start(&binary, &client, "relay-only").await?;
+    cli(
+        &binary,
+        &server,
+        &[
+            "add",
+            &cli(&binary, &client, &["id"])?,
+            "client",
+            "--addr-json",
+            &cli(&binary, &client, &["addr"])?,
+            "--allow",
+            "bench-sink",
+            "--inbound-only",
+        ],
+    )?;
+    cli(
+        &binary,
+        &client,
+        &[
+            "add",
+            &cli(&binary, &server, &["id"])?,
+            "server",
+            "--addr-json",
+            &cli(&binary, &server, &["addr"])?,
+            "--dial-only",
+        ],
+    )?;
+    let (backend_addr, sink) = start_sink().await?;
+    cli(
+        &binary,
+        &server,
+        &["expose", "bench-sink", "--tcp", &backend_addr],
+    )?;
+    let probe: serde_json::Value = serde_json::from_str(&cli(
+        &binary,
+        &client,
+        &["probe", "server", "bench-sink", "--json"],
+    )?)?;
+    assert_eq!(probe["transport"], "relay");
+    let addr = cli(
+        &binary,
+        &client,
+        &["dial", "server", "bench-sink", "--tcp", "127.0.0.1:0"],
+    )?;
+    // More than the burst allowance makes the relay send its typed status.
+    // The sink verifies every byte before acknowledging the payload length.
+    tokio::time::timeout(Duration::from_secs(20), stream(addr, 1024 * 1024)).await??;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let log = fs::read_to_string(client.root().join("foreground.log"))?;
+            if log.contains("fabric:relay_rate_limited relay reported rate limiting") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("typed relay notice was not logged")??;
+    cli(&binary, &client, &["down"])?;
+    cli(&binary, &server, &["down"])?;
+    drop(client_daemon);
+    drop(server_daemon);
     sink.abort();
     relay.shutdown().await?;
     Ok(())

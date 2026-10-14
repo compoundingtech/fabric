@@ -3337,6 +3337,7 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
         result = run_endpoint_presence_loop(state.clone()) => result?,
         result = run_endpoint_health_poll_loop(state.clone()) => result?,
         result = run_endpoint_rss_observe_loop(state.clone()) => result?,
+        result = run_relay_rate_notice_loop(state.clone()) => result?,
         result = run_peer_health_loop(state.clone()) => result?,
         result = run_endpoint_snapshot_loop(state.clone()) => result?,
         _ = state.cancel.cancelled() => {}
@@ -4003,6 +4004,83 @@ fn recycle_blocked_by_sessions(
 
 fn bytes_to_mib(bytes: u64) -> u64 {
     bytes / (1024 * 1024)
+}
+
+#[derive(Default)]
+struct RelayRateNotices {
+    generation: u64,
+    reported: u64,
+}
+
+impl RelayRateNotices {
+    fn observe(&mut self, generation: u64, total: u64) -> u64 {
+        if self.generation != generation {
+            self.generation = generation;
+            self.reported = 0;
+        }
+        let newly_limited = total.saturating_sub(self.reported);
+        self.reported = total;
+        newly_limited
+    }
+}
+
+/// iroh counts connections whose relay sent the typed RateLimited status,
+/// at most once per connection. Do not infer limiting from transfer speed.
+async fn run_relay_rate_notice_loop(state: Arc<DaemonState>) -> Result<()> {
+    let mut notices = RelayRateNotices::default();
+    let mut observed = state.endpoint_handle();
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = state.cancel.cancelled() => break,
+            _ = interval.tick() => {
+                let current = state.endpoint_handle();
+                // Retain the previous handle long enough to sample its
+                // counter before switching to a replacement's fresh counter.
+                if observed.generation != current.generation {
+                    report_relay_rate_notices(&mut notices, &observed);
+                }
+                report_relay_rate_notices(&mut notices, &current);
+                observed = current;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn report_relay_rate_notices(notices: &mut RelayRateNotices, current: &CurrentEndpoint) {
+    let total = current
+        .endpoint
+        .metrics()
+        .socket
+        .relay_conns_ratelimited
+        .get();
+    let newly_limited = notices.observe(current.generation, total);
+    if newly_limited > 0 {
+        let reason = ErrorCode::RelayRateLimited.reason(&format!(
+            "relay reported rate limiting on {newly_limited} connection(s) in endpoint generation {}; traffic may continue at a lower rate",
+            current.generation,
+        ));
+        warn!(target: VALIDATION_LOG_TARGET, event = "relay_rate_limited",
+            generation = current.generation, newly_limited, "{reason}");
+        eprintln!("{reason}");
+    }
+}
+
+#[cfg(test)]
+mod relay_rate_notice_tests {
+    use super::RelayRateNotices;
+
+    #[test]
+    fn a_replaced_endpoint_can_report_its_first_limited_connection() {
+        let mut notices = RelayRateNotices::default();
+        assert_eq!(notices.observe(7, 3), 3);
+        assert_eq!(notices.observe(7, 3), 0);
+        assert_eq!(notices.observe(7, 5), 2);
+        assert_eq!(notices.observe(8, 1), 1);
+        assert_eq!(notices.observe(8, 1), 0);
+    }
 }
 
 async fn run_endpoint_rss_observe_loop(state: Arc<DaemonState>) -> Result<()> {

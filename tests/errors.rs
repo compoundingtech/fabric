@@ -109,6 +109,27 @@ fn a_clap_usage_error_prints_no_json() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn relay_rate_limited_has_the_fault_and_json_contract() -> Result<()> {
+    use fabric::error::{ErrorCode, FabricError};
+    let error = anyhow::Error::new(FabricError::new(
+        ErrorCode::RelayRateLimited,
+        "relay reported rate limiting; traffic may continue at a lower rate",
+    ));
+    let report = fabric::error::render(&error, true);
+    assert_eq!(report.status, 69);
+    assert!(
+        report
+            .stderr
+            .starts_with("Error: fabric:relay_rate_limited ")
+    );
+    let actual: Value = serde_json::from_str(report.stdout.as_deref().unwrap())?;
+    let expected: Value =
+        serde_json::from_str(include_str!("golden/json/relay_rate_limited.json"))?;
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_daemons_code_and_peer_reach_the_command() -> Result<()> {
     let home = TempDir::new()?;

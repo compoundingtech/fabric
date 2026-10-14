@@ -296,3 +296,10 @@ or `FABRIC_BENCH_STREAMS=4` for a concurrent comparison (maximum 16 streams).
 Timing is recorded without a machine-dependent CI threshold. A completed
 transfer or a path mismatch is checked exactly; a throughput result only
 becomes release evidence when its named released artifact was measured.
+
+With iroh 1.1.0, the daemon logs `fabric:relay_rate_limited` when a relay sends
+the explicit RateLimited status. It polls iroh's connection counter once per
+second and reports new notices, resetting its count when the endpoint is
+replaced. A slow transfer alone does not emit the code. This diagnostic does
+not close a connection or fail a command: traffic may continue at the limited
+rate. It does not identify which relay was responsible when several are used.

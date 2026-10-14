@@ -26,6 +26,7 @@ Each code has a class, and the class says what a caller should do:
 | `peer_offline` | fault | 69 | The peer was recently found absent, so fabric did not try again yet. |
 | `unreachable` | fault | 69 | Fabric tried and could not reach the peer. |
 | `timeout` | fault | 69 | The caller's deadline passed before an answer. |
+| `relay_rate_limited` | fault | 69 | A relay explicitly reported rate limiting. Traffic can continue at a lower rate; the notice does not prove a transfer failed. |
 | `daemon_not_running` | fault | 69 | The local daemon is not running (`fabric up` starts it). |
 | `daemon_stop_timeout` | fault | 69 | The daemon is still stopping after the bounded wait; its lease is not free yet. |
 | `service_not_exposed` | fault | 69 | The peer is reachable but exposes no service by that name. |

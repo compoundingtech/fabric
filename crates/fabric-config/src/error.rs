@@ -101,6 +101,7 @@ error_codes! {
     PeerOffline => "peer_offline", Fault;
     Unreachable => "unreachable", Fault;
     Timeout => "timeout", Fault;
+    RelayRateLimited => "relay_rate_limited", Fault;
     DaemonNotRunning => "daemon_not_running", Fault;
     DaemonStopTimeout => "daemon_stop_timeout", Fault;
     ServiceNotExposed => "service_not_exposed", Fault;
