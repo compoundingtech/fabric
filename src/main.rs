@@ -973,6 +973,7 @@ async fn run(cli: Cli) -> Result<()> {
                         warn_home_daemon_mismatch(&home).await;
                         return Err(error);
                     }
+                    wait_for_daemon_stop(&home, Duration::from_secs(15)).await?;
                     println!("stopped");
                 }
                 Commands::Restart {
@@ -2938,6 +2939,84 @@ async fn run_restart_helper(home: &FabricHome, _allow_shell: bool) -> Result<()>
             }
             Err(ready_error)
         }
+    }
+}
+
+/// `down` is a barrier for the daemon process, whose lease lasts through
+/// endpoint close, child cleanup, and runtime shutdown. Do not query its
+/// closing control socket: a reply that never ends must not defeat the bound.
+async fn wait_for_daemon_stop(home: &FabricHome, timeout: Duration) -> Result<()> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if fabric::daemon::daemon_lock_available(home)? {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        FabricError::new(
+            ErrorCode::DaemonStopTimeout,
+            format!("daemon is still stopping; lease was not released within {timeout:?}"),
+        )
+    })?
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    fn held_lease(home: &FabricHome) -> std::fs::File {
+        home.prepare().unwrap();
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(home.root().join("run/daemon.lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        file
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn down_timeout_is_a_coded_fault_with_stable_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = FabricHome::new(dir.path());
+        let _lease = held_lease(&home);
+        let error = wait_for_daemon_stop(&home, Duration::from_secs(15))
+            .await
+            .unwrap_err();
+        assert_eq!(fabric::error::code_of(&error), ErrorCode::DaemonStopTimeout);
+        let report = fabric::error::render(&error, true);
+        assert_eq!(report.status, 69);
+        let got: serde_json::Value = serde_json::from_str(&report.stdout.unwrap()).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/golden/json/daemon_stop_timeout.json"
+        ))
+        .unwrap();
+        assert_eq!(got, expected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn down_waits_until_the_lease_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = FabricHome::new(dir.path());
+        let lease = held_lease(&home);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(lease);
+        });
+        let start = tokio::time::Instant::now();
+        wait_for_daemon_stop(&home, Duration::from_secs(15))
+            .await
+            .unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(100));
+        assert!(fabric::daemon::daemon_lock_available(&home).unwrap());
     }
 }
 

@@ -16,6 +16,10 @@ Deprecated, Fixed or Security.
 ## [Unreleased]
 
 ### Fixed
+- `fabric down` waits up to 15 seconds for the daemon lease to be released,
+  including endpoint and exec-child cleanup. An immediate `down && up` no
+  longer races the old daemon; a timeout is `fabric:daemon_stop_timeout`
+  (fault, exit 69), so the caller knows it is still stopping (#298).
 - A failed Unix dial never saves a listener declaration. Socket paths that exceed
   the platform's limit report `fabric:invalid_argument` and the maximum home
   length before binding. One saved listener that cannot be restored (including
