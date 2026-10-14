@@ -47,3 +47,10 @@ this history: it is not a request-specific result or proof of current service
 authorization. Registered service sockets use their own framing and do not
 populate this generic tunnel history. Older daemon replies default `dials` to
 an empty array. `probe --json` remains the older-daemon fallback.
+
+The peer latency and transport in `status` measure the built-in echo protocol.
+When `echo_denied` is true, their null values say nothing about another service's
+availability, latency, or transport. No additional echo grant is needed to
+measure a permitted service: use `fabric probe PEER SERVICE --json` and read its
+`protocol`, `outcome`, `transport`, and `round_trip_micros`. That probe describes
+one protocol sample, not the route of every application session.
