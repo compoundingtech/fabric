@@ -36,3 +36,10 @@ at startup (for example, a Unix socket path that is too long or a TCP port now
 held by another process). The daemon keeps running and restores its other
 listeners. The declaration stays in `config.toml` for a later restart; repairing
 and successfully dialing it, or `undial`, clears its failure from status.
+
+The peer latency and transport in `status` measure the built-in echo protocol.
+When `echo_denied` is true, their null values say nothing about another service's
+availability, latency, or transport. No additional echo grant is needed to
+measure a permitted service: use `fabric probe PEER SERVICE --json` and read its
+`protocol`, `outcome`, `transport`, and `round_trip_micros`. That probe describes
+one protocol sample, not the route of every application session.
