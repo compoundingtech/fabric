@@ -56,3 +56,10 @@ relay health or an outgoing relay allow-list: iroh may contact a peer's
 advertised relay outside these candidates. Older daemon replies produce
 `source: "unknown"` with an empty URL list. Editing config or reloading peers
 does not change this snapshot; restart to use a different selection.
+
+The peer latency and transport in `status` measure the built-in echo protocol.
+When `echo_denied` is true, their null values say nothing about another service's
+availability, latency, or transport. No additional echo grant is needed to
+measure a permitted service: use `fabric probe PEER SERVICE --json` and read its
+`protocol`, `outcome`, `transport`, and `round_trip_micros`. That probe describes
+one protocol sample, not the route of every application session.
