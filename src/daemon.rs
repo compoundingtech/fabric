@@ -15,6 +15,8 @@ use std::{
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, bail};
@@ -79,6 +81,8 @@ const INCOMING_FAILURE_MAX_BACKOFF: Duration = Duration::from_secs(5);
 const DIAL_FAILURE_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const DIAL_FAILURE_MAX_BACKOFF: Duration = Duration::from_secs(15);
 const DIAL_LISTENER_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+/// A CLI that disappears before connecting must not leave a listener behind.
+const ONE_SHOT_DIAL_WAIT: Duration = Duration::from_secs(30);
 /// Bound a stalled peer while it holds an inbound sync entry guard. Progressing
 /// transfers can run longer than this interval.
 const INBOUND_SYNC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -424,6 +428,7 @@ pub struct DaemonState {
     allowed: Arc<RwLock<HashSet<EndpointId>>>,
     exposures: RwLock<HashMap<Vec<u8>, Exposure>>,
     dial_sockets: Mutex<HashMap<(String, String), DialSocket>>,
+    one_shot_dials: Mutex<Vec<JoinHandle<()>>>,
     dial_restore_failures: Mutex<Vec<DialRestoreFailure>>,
     active_dial_listeners: Arc<AtomicUsize>,
     tcp_dials: Mutex<HashMap<(String, String, String), TcpDial>>,
@@ -553,6 +558,73 @@ impl Drop for DialSocket {
             task.abort();
         }
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Own only the local rendezvous path, never the accepted command session.
+struct OneShotDialSocket {
+    path: PathBuf,
+    deadline: tokio::time::Instant,
+}
+
+impl Drop for OneShotDialSocket {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+async fn one_shot_dial_expired(socket: &Option<OneShotDialSocket>) {
+    match socket {
+        Some(socket) => tokio::time::sleep_until(socket.deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn sweep_one_shot_dials(home: &FabricHome) {
+    let dir = home.root().join("dials");
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                warn!(path = %dir.display(), %error, "failed to scan stale one-shot dial sockets");
+            }
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    warn!(path = %dir.display(), %error, "failed to read stale one-shot dial entry");
+                }
+                continue;
+            }
+        };
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Only the private one-shot namespace. Persisted/shared sockets and
+        // unrelated files are left to their existing owners.
+        if let Some(nonce) = name
+            .strip_prefix("once-")
+            .and_then(|s| s.strip_suffix(".sock"))
+            && nonce.len() == 16
+            && nonce.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            let result = entry.file_type().and_then(|kind| {
+                if kind.is_socket() {
+                    fs::remove_file(&path)
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(error) = result
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(path = %path.display(), %error, "failed to remove stale one-shot dial socket");
+            }
+        }
     }
 }
 
@@ -1066,6 +1138,7 @@ impl DaemonState {
         services: Services,
     ) -> Result<Arc<Self>> {
         home.prepare()?;
+        sweep_one_shot_dials(&home);
         let config = FabricConfig::load(&home)?;
         let (tunnel_session_limits, tunnel_session_detached_ttl) =
             resolve_server_session_settings(&config, options)?;
@@ -1104,6 +1177,7 @@ impl DaemonState {
             allowed,
             exposures: RwLock::new(exposures),
             dial_sockets: Mutex::new(HashMap::new()),
+            one_shot_dials: Mutex::new(Vec::new()),
             dial_restore_failures: Mutex::new(Vec::new()),
             active_dial_listeners: Arc::new(AtomicUsize::new(0)),
             tcp_dials: Mutex::new(HashMap::new()),
@@ -1627,8 +1701,8 @@ impl DaemonState {
 
     /// A local socket that reaches `peer`'s `name` service with the newest
     /// protocol the service speaks: a fresh socket per command unless the
-    /// service shares one. The socket is named after the service's oldest
-    /// protocol, as it was before a service spoke two.
+    /// service shares one. Exec and shell rendezvous sockets accept once and
+    /// expire if the command never connects.
     async fn dial_service(&self, peer: &str, name: &str) -> Result<PathBuf> {
         let service = self
             .services
@@ -1820,6 +1894,12 @@ impl DaemonState {
     ) -> Result<PathBuf> {
         let peer_addr = self.peer_book.read().await.resolve(peer)?;
         let key = (peer_addr.id.to_string(), protocol.to_string());
+        let one_shot = !reuse_existing
+            && !persist
+            && self
+                .services
+                .find(&alpn)
+                .is_some_and(|(service, _)| matches!(service.name(), "exec" | "shell"));
 
         let mut sockets = self.dial_sockets.lock().await;
         if let Some(existing) = sockets.get(&key)
@@ -1837,17 +1917,19 @@ impl DaemonState {
             return Ok(existing.path.clone());
         }
 
-        let socket_path = self.home.dial_socket_path(peer_addr.id, protocol);
+        let socket_path = if one_shot {
+            self.home
+                .root()
+                .join("dials")
+                .join(format!("once-{:016x}.sock", rand::random::<u64>()))
+        } else {
+            self.home.dial_socket_path(peer_addr.id, protocol)
+        };
         validate_dial_socket_path(&self.home, &socket_path)?;
-        if let Some(existing) = sockets.remove(&key) {
-            // Shell and exec deliberately replace their deterministic socket
-            // path for each command. Stop and join the previous accept loop
-            // before binding its replacement so its unlinked listener FD
-            // cannot accumulate for the daemon's lifetime. Accepted sessions
-            // have their own daemon-scoped lifetime and continue below.
+        if !one_shot && let Some(existing) = sockets.remove(&key) {
             existing.stop().await;
         }
-        if socket_path.exists() {
+        if !one_shot && socket_path.exists() {
             fs::remove_file(&socket_path)
                 .with_context(|| format!("failed to remove stale {}", socket_path.display()))?;
         }
@@ -1860,6 +1942,10 @@ impl DaemonState {
         }
         let listener_cancel = CancellationToken::new();
         let lease = DialListenerLease::new(self.active_dial_listeners.clone());
+        let one_shot_socket = one_shot.then(|| OneShotDialSocket {
+            path: socket_path.clone(),
+            deadline: tokio::time::Instant::now() + ONE_SHOT_DIAL_WAIT,
+        });
 
         // A service's one-shot protocol is one raw stream per local connection.
         // A resumable protocol negotiates its own tunnel session and falls back
@@ -1883,6 +1969,7 @@ impl DaemonState {
                     lease,
                     self.client_attaches.clone(),
                     self.connection_recorder(),
+                    one_shot_socket,
                 ))
             }
             Some((service, _)) => tokio::spawn(run_raw_dial_socket(
@@ -1898,6 +1985,7 @@ impl DaemonState {
                 self.dial_slots.clone(),
                 self.peer_connections.clone(),
                 lease,
+                one_shot_socket,
             )),
             None => tokio::spawn(run_dial_socket(
                 listener,
@@ -1916,6 +2004,14 @@ impl DaemonState {
                 self.connection_recorder(),
             )),
         };
+        if one_shot {
+            // Reap completed handles on the next call; shutdown joins every
+            // outstanding accept loop after signalling daemon cancellation.
+            let mut tasks = self.one_shot_dials.lock().await;
+            tasks.retain(|task| !task.is_finished());
+            tasks.push(listener_task);
+            return Ok(socket_path);
+        }
         sockets.insert(
             key,
             DialSocket {
@@ -3174,6 +3270,16 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
         .collect();
     for socket in dial_sockets {
         socket.stop().await;
+    }
+    let tasks = std::mem::take(&mut *state.one_shot_dials.lock().await);
+    for mut task in tasks {
+        if tokio::time::timeout(DIAL_LISTENER_STOP_TIMEOUT, &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
     }
     Ok(())
 }
@@ -5429,6 +5535,7 @@ async fn run_resumable_dial_socket(
     _lease: DialListenerLease,
     gauge: Arc<tunnel::ClientAttachGauge>,
     recorder: ConnectionRecorder,
+    one_shot: Option<OneShotDialSocket>,
 ) {
     let backoff_key = BackoffKey::dial(&peer, protocol.alpn);
     loop {
@@ -5436,12 +5543,14 @@ async fn run_resumable_dial_socket(
             biased;
             _ = listener_cancel.cancelled() => break,
             _ = daemon_cancel.cancelled() => break,
+            _ = one_shot_dial_expired(&one_shot) => break,
             accepted = listener.accept() => {
                 let Ok((local, _)) = accepted else {
                     break;
                 };
                 let Ok(permit) = dial_slots.clone().try_acquire_owned() else {
                     drop(local);
+                    if one_shot.is_some() { break; }
                     continue;
                 };
                 let endpoint_rx = endpoint_rx.clone();
@@ -5484,6 +5593,7 @@ async fn run_resumable_dial_socket(
                         }
                     }
                 });
+                if one_shot.is_some() { break; }
             }
         }
     }
@@ -6033,6 +6143,7 @@ async fn run_raw_dial_socket(
     dial_slots: Arc<Semaphore>,
     peer_connections: Arc<mux::PeerConnections>,
     _lease: DialListenerLease,
+    one_shot: Option<OneShotDialSocket>,
 ) {
     let backoff_key = BackoffKey::dial(&peer_addr.id.to_string(), &alpn);
     loop {
@@ -6040,12 +6151,14 @@ async fn run_raw_dial_socket(
             biased;
             _ = listener_cancel.cancelled() => break,
             _ = daemon_cancel.cancelled() => break,
+            _ = one_shot_dial_expired(&one_shot) => break,
             accepted = listener.accept() => {
                 let Ok((local, _)) = accepted else {
                     break;
                 };
                 let Ok(permit) = dial_slots.clone().try_acquire_owned() else {
                     drop(local);
+                    if one_shot.is_some() { break; }
                     continue;
                 };
                 let endpoint = endpoint_rx.borrow().clone();
@@ -6078,6 +6191,7 @@ async fn run_raw_dial_socket(
                         }
                     }
                 });
+                if one_shot.is_some() { break; }
             }
         }
     }
@@ -7513,7 +7627,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_exec_and_shell_dials_keep_one_listener_per_path() -> Result<()> {
+    async fn replaced_dials_stop_old_listeners_and_reusable_dials_keep_their_task() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = FabricHome::new(temp.path());
         let peer_a = iroh::SecretKey::generate().public();
@@ -7526,10 +7640,10 @@ mod tests {
         let node = FabricNode::start(home.clone()).await?;
         let state = node.state();
         let cases = [
-            ("peer-a", exec::EXEC_PROTOCOL, exec::EXEC_ALPN),
-            ("peer-a", shell::SHELL_PROTOCOL, shell::RESUMABLE_SHELL_ALPN),
-            ("peer-b", exec::EXEC_PROTOCOL, exec::EXEC_ALPN),
-            ("peer-b", shell::SHELL_PROTOCOL, shell::RESUMABLE_SHELL_ALPN),
+            ("peer-a", "test/replaced/1", b"test/replaced/1".as_slice()),
+            ("peer-a", "test/replaced/2", b"test/replaced/2".as_slice()),
+            ("peer-b", "test/replaced/1", b"test/replaced/1".as_slice()),
+            ("peer-b", "test/replaced/2", b"test/replaced/2".as_slice()),
         ];
 
         // More replacements than the production macOS soft FD limit. The old
@@ -7623,7 +7737,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacing_exec_listener_preserves_accepted_session() -> Result<()> {
+    async fn one_shot_exec_listener_cleanup_preserves_accepted_session() -> Result<()> {
         let server_dir = tempfile::tempdir()?;
         let client_dir = tempfile::tempdir()?;
         let server_home = FabricHome::new(server_dir.path());
@@ -7642,14 +7756,7 @@ mod tests {
         trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
 
         let state = client.state();
-        let socket = state
-            .dial_alpn(
-                "server",
-                exec::EXEC_PROTOCOL,
-                exec::EXEC_ALPN.to_vec(),
-                false,
-            )
-            .await?;
+        let socket = state.dial_service("server", "exec").await?;
         let mut first = UnixStream::connect(&socket).await?;
         let release = server_dir.path().join("release-exec");
         let argv = vec![
@@ -7677,25 +7784,20 @@ mod tests {
         .await??;
         assert_eq!(ready, b"ready");
 
-        let replacement = state
-            .dial_alpn(
-                "server",
-                exec::EXEC_PROTOCOL,
-                exec::EXEC_ALPN.to_vec(),
-                false,
-            )
-            .await?;
-        assert_eq!(replacement, socket);
+        let replacement = state.dial_service("server", "exec").await?;
+        assert_ne!(replacement, socket);
+        assert!(
+            !socket.exists(),
+            "first accept left its rendezvous path behind"
+        );
+        assert!(UnixStream::connect(&socket).await.is_err());
         assert_eq!(state.active_dial_listeners.load(Ordering::SeqCst), 1);
 
         fs::write(&release, b"go")?;
         let (stdout, exit) =
             tokio::time::timeout(Duration::from_secs(10), collect_exec(&mut first)).await??;
         assert_eq!(stdout, b"done");
-        assert_eq!(
-            exit, 0,
-            "accepted exec did not survive listener replacement"
-        );
+        assert_eq!(exit, 0, "accepted exec did not survive listener cleanup");
 
         let mut second = UnixStream::connect(&replacement).await?;
         exec::write_client_argv(
@@ -7715,6 +7817,213 @@ mod tests {
         server.shutdown().await?;
         client.shutdown().await?;
         assert_eq!(state.active_dial_listeners.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    /// All calls obtain their rendezvous before any connects. Reusing the
+    /// deterministic peer/protocol path fails the uniqueness check, even when
+    /// scheduling happens to hide the original connect/unlink race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_shot_concurrent_exec_and_shell_calls_keep_their_own_output() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let client_home = FabricHome::new(temp.path().join("client"));
+        let client = FabricNode::start(client_home.clone()).await?;
+        let state = client.state();
+        // Exercise rendezvous isolation above the unrelated 32-handler and
+        // 16-session defaults, without changing either production limit.
+        state.dial_slots.add_permits(64);
+        let mut servers = Vec::new();
+        for label in ["peer-a", "peer-b"] {
+            let home = FabricHome::new(temp.path().join(label));
+            let server = FabricNode::start_with_daemon_options(
+                home.clone(),
+                DaemonOptions {
+                    server_session_max_total: Some(128),
+                    server_session_max_per_peer: Some(128),
+                    ..DaemonOptions::default()
+                },
+            )
+            .await?;
+            trust_test_peer(&home, &server, client.id(), "client", client.addr()).await?;
+            trust_test_peer(&client_home, &client, server.id(), label, server.addr()).await?;
+            servers.push(server);
+        }
+        for _ in 0..2 {
+            for service in ["exec", "shell"] {
+                for mixed in [false, true] {
+                    let barrier = Arc::new(tokio::sync::Barrier::new(50));
+                    let mut calls = tokio::task::JoinSet::new();
+                    for index in 0..50 {
+                        let state = state.clone();
+                        let barrier = barrier.clone();
+                        calls.spawn(async move {
+                            let peer = if mixed && index % 2 == 1 {
+                                "peer-b"
+                            } else {
+                                "peer-a"
+                            };
+                            let path = state.dial_service(peer, service).await?;
+                            barrier.wait().await;
+                            let mut stream = UnixStream::connect(&path).await?;
+                            let command = format!("printf 'out%03d' {index}; exit {}", index % 7);
+                            let (output, code) = if service == "exec" {
+                                exec::write_client_argv(
+                                    &mut stream,
+                                    &["/bin/sh".into(), "-c".into(), command],
+                                )
+                                .await?;
+                                collect_exec(&mut stream).await?
+                            } else {
+                                shell::write_client_stdin(
+                                    &mut stream,
+                                    format!("{command}\n").as_bytes(),
+                                )
+                                .await?;
+                                let mut output = Vec::new();
+                                let code = loop {
+                                    match shell::read_server_frame(&mut stream).await? {
+                                        Some(shell::ServerFrame::Output(bytes)) => {
+                                            output.extend(bytes)
+                                        }
+                                        Some(shell::ServerFrame::Exit(code)) => break code,
+                                        Some(shell::ServerFrame::Error(error)) => bail!("{error}"),
+                                        Some(shell::ServerFrame::Status(_)) => {}
+                                        None => bail!("shell closed without exit status"),
+                                    }
+                                };
+                                (output, code)
+                            };
+                            assert_eq!(code, index % 7);
+                            let expected = format!("out{index:03}");
+                            if service == "exec" {
+                                assert_eq!(output, expected.as_bytes());
+                            } else {
+                                assert!(
+                                    String::from_utf8_lossy(&output).contains(&expected),
+                                    "shell output: {:?}",
+                                    String::from_utf8_lossy(&output)
+                                );
+                            }
+                            Ok::<_, anyhow::Error>(path)
+                        });
+                    }
+                    let paths = tokio::time::timeout(Duration::from_secs(30), async {
+                        let mut paths = HashSet::new();
+                        while let Some(result) = calls.join_next().await {
+                            paths.insert(result??);
+                        }
+                        Ok::<_, anyhow::Error>(paths)
+                    })
+                    .await??;
+                    assert_eq!(paths.len(), 50, "commands shared a rendezvous path");
+                    assert!(paths.iter().all(|path| !path.exists()));
+                    assert!(state.dial_sockets.lock().await.is_empty());
+                    assert_eq!(state.active_dial_listeners.load(Ordering::SeqCst), 0);
+                    assert_eq!(fs::read_dir(client_home.root().join("dials"))?.count(), 0);
+                }
+            }
+        }
+        for server in servers {
+            server.shutdown().await?;
+        }
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_shot_unused_sockets_expire_and_shutdown_removes_pending_ones() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = FabricHome::new(temp.path());
+        let mut peers = PeerBook::default();
+        peers.add(
+            iroh::SecretKey::generate().public(),
+            Some("peer".into()),
+            None,
+        );
+        peers.save(&home)?;
+        let node = FabricNode::start(home.clone()).await?;
+        let state = node.state();
+        for service in ["exec", "shell"] {
+            let socket = state.dial_service("peer", service).await?;
+            assert!(socket.exists());
+            tokio::time::pause();
+            tokio::time::advance(ONE_SHOT_DIAL_WAIT + Duration::from_millis(1)).await;
+            // Join the accept task rather than race its cleanup after advance.
+            let tasks = std::mem::take(&mut *state.one_shot_dials.lock().await);
+            for task in tasks {
+                task.await?;
+            }
+            tokio::time::resume();
+            assert!(!socket.exists());
+            assert!(UnixStream::connect(&socket).await.is_err());
+            assert_eq!(state.active_dial_listeners.load(Ordering::SeqCst), 0);
+        }
+        let exec = state.dial_service("peer", "exec").await?;
+        let shell = state.dial_service("peer", "shell").await?;
+        node.shutdown().await?;
+        assert!(!exec.exists() && !shell.exists());
+        assert_eq!(state.active_dial_listeners.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_shot_service_dials_preserve_shared_git_and_persisted_exec_dials() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = FabricHome::new(temp.path());
+        let mut peers = PeerBook::default();
+        peers.add(
+            iroh::SecretKey::generate().public(),
+            Some("peer".into()),
+            None,
+        );
+        peers.save(&home)?;
+        let node = FabricNode::start(home).await?;
+        let state = node.state();
+        let git = state.dial_service("peer", "git").await?;
+        assert_eq!(state.dial_service("peer", "git").await?, git);
+        let persisted = state.dial("peer", exec::EXEC_PROTOCOL).await?;
+        assert_eq!(state.dial("peer", exec::EXEC_PROTOCOL).await?, persisted);
+        let command = state.dial_service("peer", "exec").await?;
+        assert_ne!(command, persisted);
+        assert!(git.exists() && persisted.exists() && command.exists());
+        assert_eq!(state.dial_sockets.lock().await.len(), 2);
+        node.shutdown().await?;
+        assert!(!git.exists() && !persisted.exists() && !command.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn one_shot_startup_sweep_preserves_shared_dials_and_other_files() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = FabricHome::new(temp.path());
+        home.prepare()?;
+        let dir = home.root().join("dials");
+        let stale = dir.join("once-0123456789abcdef.sock");
+        let shared = dir.join("12345678-0123456789abcdef.sock");
+        let other = dir.join("once-not-a-nonce.sock");
+        let regular = dir.join("once-fedcba9876543210.sock");
+        let directory = dir.join("once-aaaaaaaaaaaaaaaa.sock");
+        fs::create_dir(&directory)?;
+        // std sockets do not require a Tokio runtime for this startup test.
+        let _stale = std::os::unix::net::UnixListener::bind(&stale)?;
+        let _shared = std::os::unix::net::UnixListener::bind(&shared)?;
+        let _other = std::os::unix::net::UnixListener::bind(&other)?;
+        fs::write(&regular, b"keep")?;
+        sweep_one_shot_dials(&home);
+        assert!(!stale.exists());
+        assert!(shared.exists() && other.exists() && regular.exists() && directory.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn one_shot_startup_sweep_tolerates_missing_or_unreadable_directory() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = FabricHome::new(temp.path());
+        sweep_one_shot_dials(&home); // No dials directory yet.
+        let dir = home.root().join("dials");
+        fs::write(&dir, b"not a directory")?;
+        sweep_one_shot_dials(&home); // Deterministic read_dir error on both OSes.
+        assert_eq!(fs::read(&dir)?, b"not a directory");
         Ok(())
     }
 

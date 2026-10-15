@@ -44,6 +44,16 @@ nothing tells you to look.
 | Both sides connect concurrently | Deterministic admission preserves one shared connection. | Bounded convergence; subsequent traffic keeps its identity | `simultaneous_peer_traffic_converges_to_one_shared_connection`, `duplicate_incoming_keeps_an_admitted_live_connection` |
 | Interface/address/wake notifications | Refresh paths and announce; preserve healthy traffic and declarations. | Scripted isolated matrix | `interface_address_and_wake_changes_preserve_live_sessions_and_declarations` |
 
+## Concurrent exec and shell commands
+
+Each exec or shell command gets its own local rendezvous socket. That listener
+closes and its path is removed after the first accept; the accepted session
+continues for the command's lifetime. If the CLI never connects, the listener
+expires after 30 seconds. Startup removes stale sockets in this private one-shot
+namespace. Explicit persisted dials and shared Git sockets keep their existing
+listener behavior. This isolates simultaneous commands to the same peer; the
+separate admission limits below still apply.
+
 ## Session limits
 
 Every local connection through a generic Unix or TCP dial listener creates one
