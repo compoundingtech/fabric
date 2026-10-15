@@ -580,9 +580,28 @@ async fn one_shot_dial_expired(socket: &Option<OneShotDialSocket>) {
     }
 }
 
-fn sweep_one_shot_dials(home: &FabricHome) -> Result<()> {
-    for entry in fs::read_dir(home.root().join("dials"))? {
-        let entry = entry?;
+fn sweep_one_shot_dials(home: &FabricHome) {
+    let dir = home.root().join("dials");
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                warn!(path = %dir.display(), %error, "failed to scan stale one-shot dial sockets");
+            }
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    warn!(path = %dir.display(), %error, "failed to read stale one-shot dial entry");
+                }
+                continue;
+            }
+        };
+        let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
         // Only the private one-shot namespace. Persisted/shared sockets and
@@ -592,12 +611,21 @@ fn sweep_one_shot_dials(home: &FabricHome) -> Result<()> {
             .and_then(|s| s.strip_suffix(".sock"))
             && nonce.len() == 16
             && nonce.bytes().all(|b| b.is_ascii_hexdigit())
-            && entry.file_type()?.is_socket()
         {
-            fs::remove_file(entry.path())?;
+            let result = entry.file_type().and_then(|kind| {
+                if kind.is_socket() {
+                    fs::remove_file(&path)
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(error) = result
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(path = %path.display(), %error, "failed to remove stale one-shot dial socket");
+            }
         }
     }
-    Ok(())
 }
 
 struct DialListenerLease {
@@ -1110,7 +1138,7 @@ impl DaemonState {
         services: Services,
     ) -> Result<Arc<Self>> {
         home.prepare()?;
-        sweep_one_shot_dials(&home)?;
+        sweep_one_shot_dials(&home);
         let config = FabricConfig::load(&home)?;
         let (tunnel_session_limits, tunnel_session_detached_ttl) =
             resolve_server_session_settings(&config, options)?;
@@ -7943,7 +7971,11 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let home = FabricHome::new(temp.path());
         let mut peers = PeerBook::default();
-        peers.add(iroh::SecretKey::generate().public(), Some("peer".into()), None);
+        peers.add(
+            iroh::SecretKey::generate().public(),
+            Some("peer".into()),
+            None,
+        );
         peers.save(&home)?;
         let node = FabricNode::start(home).await?;
         let state = node.state();
@@ -7970,14 +8002,28 @@ mod tests {
         let shared = dir.join("12345678-0123456789abcdef.sock");
         let other = dir.join("once-not-a-nonce.sock");
         let regular = dir.join("once-fedcba9876543210.sock");
+        let directory = dir.join("once-aaaaaaaaaaaaaaaa.sock");
+        fs::create_dir(&directory)?;
         // std sockets do not require a Tokio runtime for this startup test.
         let _stale = std::os::unix::net::UnixListener::bind(&stale)?;
         let _shared = std::os::unix::net::UnixListener::bind(&shared)?;
         let _other = std::os::unix::net::UnixListener::bind(&other)?;
         fs::write(&regular, b"keep")?;
-        sweep_one_shot_dials(&home)?;
+        sweep_one_shot_dials(&home);
         assert!(!stale.exists());
-        assert!(shared.exists() && other.exists() && regular.exists());
+        assert!(shared.exists() && other.exists() && regular.exists() && directory.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn one_shot_startup_sweep_tolerates_missing_or_unreadable_directory() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = FabricHome::new(temp.path());
+        sweep_one_shot_dials(&home); // No dials directory yet.
+        let dir = home.root().join("dials");
+        fs::write(&dir, b"not a directory")?;
+        sweep_one_shot_dials(&home); // Deterministic read_dir error on both OSes.
+        assert_eq!(fs::read(&dir)?, b"not a directory");
         Ok(())
     }
 
