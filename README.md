@@ -1,4 +1,4 @@
-> Status: EXPERIMENTAL. Early spike / prototype -- the CLI, APIs, and on-disk formats will change without notice; no stability or security guarantees yet; not production-ready. Use at your own risk.
+> Status: 1.0. What is stable, provisional and internal is defined in [docs/stability.md](docs/stability.md); anything that page does not name is internal.
 
 # fabric
 

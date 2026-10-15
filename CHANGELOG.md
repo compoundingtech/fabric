@@ -1,8 +1,8 @@
 # Changelog
 
 All notable changes to fabric are recorded here. Format follows
-[Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
-EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
+[Keep a Changelog](https://keepachangelog.com/). Releases before 1.0.0 were
+EXPERIMENTAL and could change on-disk formats and the CLI without notice.
 
 From 1.0.0, [docs/stability.md](docs/stability.md) governs what a release may
 change. Patch releases only fix bugs. A minor release may add commands, flags,
@@ -14,6 +14,12 @@ An entry that changes a provisional part starts with **Provisional:**. In a
 Deprecated, Fixed or Security.
 
 ## [Unreleased]
+
+## [1.0.0] - 2026-10-16
+
+The first stable release. Its code is 0.2.41 plus the fixes below. What 1.0.0
+keeps stable is defined in [docs/stability.md](docs/stability.md); the
+changes from 0.2.40 are in the 0.2.41 section.
 
 ### Changed
 
