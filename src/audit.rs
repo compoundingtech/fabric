@@ -1063,7 +1063,14 @@ mod tests {
         let root = tempfile::tempdir()?;
         let script = root.path().join("emit.sh");
         fs::write(&script, b"AUDIT_PRIVATE_VALUE=environment-sentinel-4916; export AUDIT_PRIVATE_VALUE; printf '%s' \"$AUDIT_PRIVATE_VALUE\"; printf output-sentinel-6124 >&2; exit 7\n")?;
-        let audit = Audit::start(root.path());
+        let mut files = AuditFiles::new(
+            root.path().into(),
+            Options {
+                max_file_bytes: 1,
+                ..Options::default()
+            },
+        );
+        let audit = Audit::with_sink(16, 65536, move |record| files.append(record));
         let argv = vec!["/bin/sh".into(), script.to_string_lossy().into_owned()];
         let (output, code) = run_audited_exec(&audit, argv.clone()).await?;
         assert_eq!(code, 7);
@@ -1085,7 +1092,13 @@ mod tests {
         let failed = records[3].call().unwrap();
         assert_eq!(failed.outcome, Some(Outcome::SpawnFailed));
         assert_eq!(failed.code.as_deref(), Some("fabric:spawn_failed"));
-        let text = fs::read_to_string(root.path().join(AUDIT_FILE))?;
+        let paths = audit_paths(root.path())?;
+        assert_eq!(paths.len(), 4, "each real event must exercise rotation");
+        let text = paths
+            .iter()
+            .map(fs::read_to_string)
+            .collect::<io::Result<Vec<_>>>()?
+            .join("\n");
         for secret in [
             "environment-sentinel-4916",
             "output-sentinel-6124",

@@ -2142,7 +2142,12 @@ async fn serve_connection_inner(
     let revoked = admission.revoked();
     let hello = tokio::select! {
         biased;
-        _ = revoked.cancelled() => return Ok(()),
+        _ = revoked.cancelled() => {
+            if let Some(audit) = crate::audit::current() {
+                audit.refused(ErrorCode::PeerNotPermittedForService);
+            }
+            return Ok(());
+        },
         hello = read_frame(&mut recv) => hello?,
     };
     let Some(Frame::Hello {
@@ -2517,6 +2522,14 @@ async fn spawn_exec_session(
             _ = kill_wait.cancelled() => {
                 match child.kill().await {
                     Ok(()) => {
+                        // kill() also waits/reaps. Its cached status can name
+                        // a natural exit that raced session cleanup, or the
+                        // signal we sent; retain either observed fact.
+                        if let Some(audit) = &audit
+                            && let Ok(Some(status)) = child.try_wait()
+                        {
+                            audit.observe_exit(crate::audit::exit_status(status));
+                        }
                         eprintln!("fabric: exec {label:?} session {session_id} killed after tunnel session expiry");
                         return;
                     }

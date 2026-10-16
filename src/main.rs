@@ -640,18 +640,34 @@ async fn run(cli: Cli) -> Result<()> {
                     response => bail!("unexpected daemon response: {response:?}"),
                 },
                 Commands::Audit { since, peer } => {
-                    let since = since.as_deref().map(parse_audit_duration).transpose()?
-                        .map(|duration| SystemTime::now().checked_sub(duration)
-                            .ok_or_else(|| FabricError::new(ErrorCode::InvalidArgument, "audit duration is too large")))
+                    let since = since
+                        .as_deref()
+                        .map(parse_audit_duration)
+                        .transpose()?
+                        .map(|duration| {
+                            SystemTime::now().checked_sub(duration).ok_or_else(|| {
+                                FabricError::new(
+                                    ErrorCode::InvalidArgument,
+                                    "audit duration is too large",
+                                )
+                            })
+                        })
                         .transpose()?;
                     let records = fabric::audit::read(home.root(), since, peer.as_deref())?;
-                    let audit = match tokio::time::timeout(Duration::from_millis(500), send_control(&home, ControlRequest::Status)).await {
+                    let audit = match tokio::time::timeout(
+                        Duration::from_millis(500),
+                        send_control(&home, ControlRequest::Status),
+                    )
+                    .await
+                    {
                         Ok(Ok(ControlResponse::Status { audit, .. })) => audit,
                         _ => None,
                     };
                     if json {
-                        print_json(&serde_json::json!({ "records": records.records, "audit": audit,
-                            "malformed_records": records.malformed_records }))?;
+                        print_json(
+                            &serde_json::json!({ "records": records.records, "audit": audit,
+                            "malformed_records": records.malformed_records }),
+                        )?;
                     } else {
                         print_audit(&records, audit.as_ref())?;
                     }
@@ -2434,21 +2450,38 @@ fn peers_json(peers: &[fabric::config::Peer]) -> serde_json::Value {
 }
 
 fn parse_audit_duration(value: &str) -> Result<Duration> {
-    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") { (number, 0.001) }
-        else if let Some(number) = value.strip_suffix('s') { (number, 1.0) }
-        else if let Some(number) = value.strip_suffix('m') { (number, 60.0) }
-        else if let Some(number) = value.strip_suffix('h') { (number, 3600.0) }
-        else if let Some(number) = value.strip_suffix('d') { (number, 86400.0) }
-        else { (value, 1.0) };
-    let invalid = || FabricError::new(ErrorCode::InvalidArgument,
-        "audit --since must be a nonnegative duration such as 30m, 1h, or 2d");
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
+        (number, 0.001)
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1.0)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60.0)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 3600.0)
+    } else if let Some(number) = value.strip_suffix('d') {
+        (number, 86400.0)
+    } else {
+        (value, 1.0)
+    };
+    let invalid = || {
+        FabricError::new(
+            ErrorCode::InvalidArgument,
+            "audit --since must be a nonnegative duration such as 30m, 1h, or 2d",
+        )
+    };
     let number: f64 = number.parse().map_err(|_| invalid())?;
     Duration::try_from_secs_f64(number * multiplier).map_err(|_| invalid().into())
 }
 
-fn print_audit(records: &fabric::audit::AuditRead, audit: Option<&fabric::audit::AuditStatus>) -> Result<()> {
+fn print_audit(
+    records: &fabric::audit::AuditRead,
+    audit: Option<&fabric::audit::AuditStatus>,
+) -> Result<()> {
     match audit {
-        Some(audit) => println!("audit loss\tdropped={} queued={} since={}", audit.dropped_records, audit.queued_records, audit.since),
+        Some(audit) => println!(
+            "audit loss\tdropped={} queued={} since={}",
+            audit.dropped_records, audit.queued_records, audit.since
+        ),
         None => println!("audit loss\tunknown (daemon unavailable or older reply)"),
     }
     for record in &records.records {
@@ -2456,7 +2489,10 @@ fn print_audit(records: &fabric::audit::AuditRead, audit: Option<&fabric::audit:
         println!("{}", serde_json::to_string(record)?);
     }
     if records.malformed_records != 0 {
-        eprintln!("fabric: skipped {} malformed audit records", records.malformed_records);
+        eprintln!(
+            "fabric: skipped {} malformed audit records",
+            records.malformed_records
+        );
     }
     Ok(())
 }

@@ -71,6 +71,10 @@ jobs:
         timeout-minutes: 5
         run: cargo test --locked -p fabric --bin fabric stop_tests
 
+      - name: Audit crash trace and JSON contracts
+        timeout-minutes: 5
+        run: cargo test --locked -p fabric --test audit --test json_output -- --test-threads=1
+
       - name: Adversarial folder sync matrix
         timeout-minutes: 15
         run: cargo test --locked -p fabric-sync --test folder_sync -- --test-threads=1
@@ -128,6 +132,9 @@ jobs:
 
       - name: Error code contract
         run: timeout 5m cargo test --locked -p fabric --test errors -- --test-threads=1
+
+      - name: Audit crash trace
+        run: timeout 5m cargo test --locked -p fabric --test audit -- --test-threads=1
 
       - name: JSON output shapes
         run: timeout 5m cargo test --locked -p fabric --test json_output -- --test-threads=1

@@ -8514,7 +8514,15 @@ mod tests {
         assert_eq!(ends.len(), 1);
         assert_eq!(refused.len(), 1);
         assert_eq!(starts[0].session_id, ends[0].session_id);
-        assert_eq!(ends[0].exit_status, Some(7));
+        match ends[0].outcome {
+            Some(crate::audit::Outcome::Ok) => assert_eq!(ends[0].exit_status, Some(7)),
+            Some(crate::audit::Outcome::Cancelled) => {
+                // Transport EOF can reap the session before child.wait wins
+                // the race. kill() has reaped it, so retain that actual status.
+                assert!(matches!(ends[0].exit_status, Some(7) | Some(137)));
+            }
+            ref outcome => panic!("unexpected exposed command outcome: {outcome:?}"),
+        }
         assert_eq!(
             ends[0].bytes_in,
             (payload.len() + b"after-resume".len()) as u64
@@ -8542,6 +8550,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn audit_shell_resume_keeps_one_start_and_end_without_keystrokes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let server_home = FabricHome::new(temp.path().join("server"));
+        let client_home = FabricHome::new(temp.path().join("client"));
+        let server = start_shell_server(server_home.clone()).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+        let state = client.state();
+        let path = state
+            .dial_alpn(
+                "server",
+                shell::SHELL_PROTOCOL,
+                shell::RESUMABLE_SHELL_ALPN.to_vec(),
+                false,
+            )
+            .await?;
+        let mut stream = UnixStream::connect(path).await?;
+        let first = b"AUDIT_MARK=private-6942; printf '%s-%s\n' before drop\n";
+        shell::write_client_stdin(&mut stream, first).await?;
+        read_shell_marker(&mut stream, b"before-drop").await?;
+        // Seeing the synced start before reconnect also proves that a live,
+        // unfinished shell has an audit trace; it does not await process exit.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let records =
+                crate::audit::read(server_home.root(), None, Some(&client.id().to_string()))?
+                    .records;
+            if records
+                .iter()
+                .any(|record| matches!(record, crate::audit::Record::ShellStart(_)))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "running shell never wrote its start"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        state.drop_tunnel_connections();
+        let second = b"printf '%s-%s\n' $AUDIT_MARK survived\n";
+        shell::write_client_stdin(&mut stream, second).await?;
+        read_shell_marker(&mut stream, b"private-6942-survived").await?;
+        shell::write_client_stdin(&mut stream, b"exit 9\n").await?;
+        let code = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match shell::read_server_frame(&mut stream).await? {
+                    Some(shell::ServerFrame::Exit(code)) => return Ok::<_, anyhow::Error>(code),
+                    Some(shell::ServerFrame::Error(error)) => bail!("{error}"),
+                    Some(_) => {}
+                    None => bail!("shell closed without exit"),
+                }
+            }
+        })
+        .await??;
+        assert_eq!(code, 9);
+        assert!(server.state().audit.drain(Duration::from_secs(3)).await);
+        let records =
+            crate::audit::read(server_home.root(), None, Some(&client.id().to_string()))?.records;
+        let starts: Vec<_> = records
+            .iter()
+            .filter_map(|record| match record {
+                crate::audit::Record::ShellStart(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        let ends: Vec<_> = records
+            .iter()
+            .filter_map(|record| match record {
+                crate::audit::Record::ShellEnd(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(ends.len(), 1);
+        assert_eq!(starts[0].session_id, ends[0].session_id);
+        assert_eq!(ends[0].exit_status, Some(9));
+        assert_eq!(
+            ends[0].bytes_in,
+            (first.len() + second.len() + b"exit 9\n".len()) as u64
+        );
+        assert!(ends[0].bytes_out > 0);
+        assert!(starts[0].argv.is_none() && ends[0].argv.is_none());
+        let text = serde_json::to_string(&records)?;
+        assert!(!text.contains("private-6942") && !text.contains("AUDIT_MARK"));
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn audit_stalled_writer_leaves_same_daemon_exec_and_echo_responsive() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let server_home = FabricHome::new(temp.path().join("server"));
@@ -8550,7 +8650,7 @@ mod tests {
         let sink_armed = armed.clone();
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
-        let audit = crate::audit::Audit::with_sink(16, 65536, move |_| {
+        let audit = crate::audit::Audit::with_sink(1, 65536, move |_| {
             if sink_armed.swap(false, Ordering::AcqRel) {
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
@@ -8587,6 +8687,29 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), collect_exec(&mut stream)).await??;
         assert_eq!(output, b"ready");
         assert_eq!(code, 0);
+        // The writer still holds the first start. One queued end fills the
+        // queue; another real call must fail open and surface both losses.
+        let path = client.state().dial_service("server", "exec").await?;
+        let mut second = UnixStream::connect(path).await?;
+        exec::write_client_argv(
+            &mut second,
+            &["/bin/sh".into(), "-c".into(), "printf second".into()],
+        )
+        .await?;
+        let (output, code) =
+            tokio::time::timeout(Duration::from_secs(1), collect_exec(&mut second)).await??;
+        assert_eq!(output, b"second");
+        assert_eq!(code, 0);
+        match server.state().status_response().await? {
+            ControlResponse::Status {
+                audit: Some(status),
+                ..
+            } => {
+                assert_eq!(status.dropped_records, 2);
+                assert_eq!(status.queued_records, 2);
+            }
+            response => panic!("missing live audit loss counter: {response:?}"),
+        }
         for _ in 0..3 {
             tokio::time::timeout(Duration::from_millis(500), client.ping("server")).await??;
         }
