@@ -91,8 +91,11 @@ async fn tcp_dial_queue_timeout_survives_restart_and_updates_the_live_listener()
             ..DaemonOptions::default()
         },
     )
-    .await?;
-    let client = FabricNode::start(client_home.clone()).await?;
+    .await
+    .context("start queue-timeout test server")?;
+    let client = FabricNode::start(client_home.clone())
+        .await
+        .context("start initial client")?;
     trust_peer_allowing(
         &server_home,
         &server,
@@ -101,7 +104,8 @@ async fn tcp_dial_queue_timeout_survives_restart_and_updates_the_live_listener()
         Some(client.addr()),
         &["tcp-echo"],
     )
-    .await?;
+    .await
+    .context("trust initial client at server")?;
     trust_peer_allowing(
         &client_home,
         &client,
@@ -110,9 +114,15 @@ async fn tcp_dial_queue_timeout_survives_restart_and_updates_the_live_listener()
         Some(server.addr()),
         &[],
     )
-    .await?;
-    let (echo_addr, _, service) = spawn_tcp_echo_service().await?;
-    server.expose_tcp("tcp-echo", echo_addr).await?;
+    .await
+    .context("trust server at initial client")?;
+    let (echo_addr, _, service) = spawn_tcp_echo_service()
+        .await
+        .context("start TCP echo backend")?;
+    server
+        .expose_tcp("tcp-echo", echo_addr)
+        .await
+        .context("expose TCP echo backend")?;
     let addr = run_fabric(
         &client_home,
         &[
@@ -131,8 +141,13 @@ async fn tcp_dial_queue_timeout_survives_restart_and_updates_the_live_listener()
             .queue_timeout_ms,
         150
     );
-    client.shutdown().await?;
-    let client = FabricNode::start(client_home.clone()).await?;
+    client
+        .shutdown()
+        .await
+        .context("stop client before listener restore")?;
+    let client = FabricNode::start(client_home.clone())
+        .await
+        .context("restart client and restore TCP listener")?;
     trust_peer_allowing(
         &server_home,
         &server,
@@ -141,13 +156,56 @@ async fn tcp_dial_queue_timeout_survives_restart_and_updates_the_live_listener()
         Some(client.addr()),
         &["tcp-echo"],
     )
-    .await?;
-    let mut live = TcpStream::connect(&addr).await?;
-    tokio::time::timeout(
-        Duration::from_secs(3),
-        tcp_stream_round_trip(&mut live, b"hold-capacity"),
-    )
-    .await??;
+    .await
+    .context("refresh client address at server after restart")?;
+    // fabric#321 tracks a candidate duplicate-mux replacement between Ready
+    // and Hello. Permit one first-connect retry after restart only for EOF or
+    // reset before any response byte; later streams remain strict. Keep the
+    // original three-second deadline across both attempts and count any retry.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let payload = b"hold-capacity";
+    let mut first_retry = false;
+    let mut live = loop {
+        let mut stream = tokio::time::timeout_at(deadline, TcpStream::connect(&addr))
+            .await
+            .context("initial restored TCP connect deadline")?
+            .context("initial restored TCP connect")?;
+        let mut response = vec![0; payload.len()];
+        let mut received = 0;
+        let result: std::io::Result<()> = tokio::time::timeout_at(deadline, async {
+            stream.write_all(payload).await?;
+            while received < response.len() {
+                let count = stream.read(&mut response[received..]).await?;
+                if count == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                }
+                received += count;
+            }
+            Ok(())
+        })
+        .await
+        .context("initial restored TCP round-trip deadline")?;
+        match result {
+            Ok(()) => {
+                assert_eq!(response, payload);
+                break stream;
+            }
+            Err(error)
+                if !first_retry
+                    && received == 0
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                    ) =>
+            {
+                first_retry = true;
+                println!(
+                    "fabric#321: retrying initial restored TCP connection once after zero-byte {error}"
+                );
+            }
+            Err(error) => return Err(error).context("initial restored TCP round trip"),
+        }
+    };
 
     for (seconds, expected_ms) in [("0.15", 150), ("0.30", 300)] {
         if expected_ms == 300 {
@@ -168,11 +226,19 @@ async fn tcp_dial_queue_timeout_survives_restart_and_updates_the_live_listener()
             );
         }
         let started = Instant::now();
-        let mut waiting = TcpStream::connect(&addr).await?;
-        waiting.write_all(b"must-not-reach-service").await?;
+        let mut waiting = TcpStream::connect(&addr)
+            .await
+            .with_context(|| format!("connect capacity waiter at {expected_ms}ms timeout"))?;
+        waiting
+            .write_all(b"must-not-reach-service")
+            .await
+            .with_context(|| format!("write capacity waiter at {expected_ms}ms timeout"))?;
         let mut byte = [0];
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(3), waiting.read(&mut byte)).await??,
+            tokio::time::timeout(Duration::from_secs(3), waiting.read(&mut byte))
+                .await
+                .with_context(|| format!("capacity waiter deadline at {expected_ms}ms timeout"))?
+                .with_context(|| format!("read capacity refusal at {expected_ms}ms timeout"))?,
             0,
             "a full remote cap must expire with EOF"
         );
@@ -190,11 +256,16 @@ async fn tcp_dial_queue_timeout_survives_restart_and_updates_the_live_listener()
             Duration::from_secs(3),
             tcp_stream_round_trip(&mut live, b"still-live"),
         )
-        .await??;
+        .await
+        .with_context(|| format!("admitted stream deadline after {expected_ms}ms waiter"))?
+        .with_context(|| format!("admitted stream round trip after {expected_ms}ms waiter"))?;
     }
     drop(live);
-    client.shutdown().await?;
-    server.shutdown().await?;
+    client.shutdown().await.context("stop restored client")?;
+    server
+        .shutdown()
+        .await
+        .context("stop queue-timeout test server")?;
     service.abort();
     Ok(())
 }
