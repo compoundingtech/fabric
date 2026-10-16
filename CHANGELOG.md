@@ -18,6 +18,12 @@ Deprecated, Fixed or Security.
 
 ### Added
 
+- Generic dial refusals and faults appear in `status --json` as
+  `dials[].last_error {code, class, at}`. A saved `--error-preface` opt-in writes
+  one coded line before closing only if no service output reached the local
+  client; default streams and streams that already carried output receive no
+  extra bytes (#302).
+
 - Exec and shell audit JSONL records identify the authenticated caller, local
   label, exec argv, session, outcome, exit status, duration and payload counts.
   Shell events retain no keystrokes. A dedicated bounded writer fails open,
@@ -64,11 +70,6 @@ line; the contract it will hold is drafted in [docs/stability.md](docs/stability
   retries only a remote session-cap refusal before admission, preserving the
   request's bytes and session identity. Queue overflow or timeout logs the
   existing `fabric:session_limit_reached` code. No wire format or server cap changes.
-- Generic dial refusals and faults appear in `status --json` as
-  `dials[].last_error {code, class, at}`. A saved `--error-preface` opt-in writes
-  one coded line before closing only if no service output reached the local
-  client; default streams and streams that already carried output receive no
-  extra bytes (#302).
 
 ## [0.2.41] - 2026-10-13
 
