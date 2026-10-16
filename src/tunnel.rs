@@ -2241,15 +2241,18 @@ async fn serve_connection_inner(
         audit.session_id(session_id);
     }
     let peer_id = admission.peer();
-    let (session, is_new_session) = match sessions
-        .get_or_create(
+    let children = fabric_service_api::child_tracking::Children::current()
+        .unwrap_or_default()
+        .with_session(session_id);
+    let (session, is_new_session) = match children
+        .scope(sessions.get_or_create(
             session_id,
             peer_id,
             target,
             resume,
             admission.grant().clone(),
             &revoked,
-        )
+        ))
         .await
     {
         Ok(admission) => admission,

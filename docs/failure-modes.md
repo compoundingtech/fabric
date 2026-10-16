@@ -266,3 +266,32 @@ A partial or complete Hello, a lost Hello reply, a policy refusal, or a second
 replacement is outside this recovery. Established sessions continue to use the
 existing durable resume protocol. This does not change mux direction preference
 or retry an application request.
+
+
+## A daemon exits while an exec or shell is running
+
+Owned commands start in their own process group. Orderly cancellation and
+shutdown end that group. On Linux the direct child also receives SIGKILL when
+its spawning daemon thread dies. The spawn workers remain alive for the
+process lifetime; retiring an idle runtime worker cannot end a healthy child.
+The signal follows the kernel's [parent-death inheritance and credential
+rules](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html).
+
+Before user code can execute, the parent syncs a record under `children/` in
+the state root containing the PID, kernel start identity and session identifier.
+One-shot calls use their admission identifier; durable sessions use their tunnel
+session ID. After a crash, startup signals only records whose PID and kernel start
+identity still match, then removes completed or stale entries. Linux records
+also include the boot identity. On macOS this startup sweep provides cleanup
+because the kernel has no parent-death signal.
+
+A failed ownership commit refuses that command with `fabric:spawn_failed`.
+Unavailable ownership storage or an incomplete sweep leaves networking and
+control available while refusing new child commands. After a startup sweep
+failure, repair storage and restart to retry cleanup. Spawn, record work and
+waiting for commit have bounded queues/workers and the existing 20-second spawn
+limit; no user command runs after a failed or expired commit. Service children
+close the daemon lease descriptor before waiting for commit, so a pre-exec
+child cannot pin a crashed daemon's lease. Cleanup does not
+invent an audit end event or turn an unconfirmed runtime cancellation receipt
+into observed completion.

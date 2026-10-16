@@ -10,9 +10,10 @@
 //! on 2026-10-09 and 2026-10-10 had exactly one worker parked in a pipe read
 //! while the daemon's only child was a command it had just started.
 //!
-//! So the spawn runs on the blocking pool, which exists for this, and the caller
-//! waits for it with a limit. A spawn that does not finish in time fails that one
-//! request; it no longer fails the daemon. If it finishes after the limit, the
+//! So the spawn runs on a bounded native pool, and the caller waits for it
+//! with a limit. Its threads remain alive for Linux's parent-death signal.
+//! A spawn that does not finish in time fails that one request; it no longer
+//! fails the daemon. If it finishes after the limit, the
 //! child it produced is killed instead of left behind.
 
 use std::{
@@ -25,7 +26,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::process::{Child, Command};
+pub use crate::child_ownership::Child;
+use tokio::process::Command;
 
 /// Spawns that have started and not yet come back, by sequence number: what each
 /// was for and when it began. A stall report reads this to say which request a
@@ -87,22 +89,32 @@ pub async fn spawn(label: &str, command: Command) -> io::Result<Child> {
     spawn_within(label, command, SPAWN_LIMIT).await
 }
 
-async fn spawn_within(label: &str, mut command: Command, limit: Duration) -> io::Result<Child> {
+async fn spawn_within(label: &str, command: Command, limit: Duration) -> io::Result<Child> {
     let began = Instant::now();
     let in_flight = InFlight::begin(label);
     let children = crate::child_tracking::Children::current();
     let spawning = children.as_ref().map(|children| children.begin_spawn());
-    let mut start = tokio::task::spawn_blocking(move || {
+    let runtime = tokio::runtime::Handle::current();
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let spawn_cancelled = cancelled.clone();
+    struct CancelOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let _cancel_on_drop = CancelOnDrop(cancelled.clone());
+    let deadline = crate::child_ownership::deadline_after(limit)?;
+    let (reply, mut start) = tokio::sync::oneshot::channel();
+    crate::child_ownership::submit(Box::new(move || {
         let _spawning = spawning;
-        if children.is_some() {
-            command.kill_on_drop(true);
+        let _runtime = runtime.enter();
+        if reply.is_closed() {
+            return;
         }
-        let child = command.spawn()?;
-        if let (Some(children), Some(pid)) = (children, child.id()) {
-            children.register(pid);
-        }
-        Ok(child)
-    });
+        let result = crate::child_ownership::spawn(command, children, spawn_cancelled, deadline);
+        let _ = reply.send(result);
+    }))?;
     let result = tokio::time::timeout(limit, &mut start).await;
     let took = began.elapsed();
     if took >= SLOW_SPAWN {
@@ -119,6 +131,7 @@ async fn spawn_within(label: &str, mut command: Command, limit: Duration) -> io:
         Ok(Ok(result)) => result,
         Ok(Err(join)) => Err(io::Error::other(format!("spawn task failed: {join}"))),
         Err(_) => {
+            cancelled.store(true, Ordering::Release);
             // The blocking call is still running: keep it in the in-flight list
             // until it ends, and kill whatever it eventually produces.
             tokio::spawn(async move {
@@ -275,4 +288,10 @@ mod tests {
         child.wait().await.expect("wait");
         assert!(!in_flight().contains("test named spawn"), "{}", in_flight());
     }
+}
+
+/// Close a daemon-owned descriptor in service children before any commit wait.
+/// The caller keeps this file alive for as long as it owns the descriptor.
+pub fn protect_from_children(file: std::sync::Arc<std::fs::File>) {
+    crate::child_ownership::protect(file);
 }

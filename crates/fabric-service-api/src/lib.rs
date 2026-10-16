@@ -17,6 +17,7 @@
 //! prefix the daemon's log filter admits.
 
 pub mod audit;
+mod child_ownership;
 pub mod child_pipes;
 pub mod child_spawn;
 

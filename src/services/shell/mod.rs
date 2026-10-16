@@ -3,6 +3,8 @@
 
 use std::{
     io::{Read, Write},
+    os::unix::fs::OpenOptionsExt,
+    process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -17,6 +19,7 @@ use fabric_service_api::{BoxFuture, Bridge, Notice, PeerStream, Protocol, Servic
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    process::Command,
     sync::mpsc,
 };
 use tokio_util::sync::CancellationToken;
@@ -191,8 +194,8 @@ const SHELL_HANGUP_GRACE: Duration = Duration::from_secs(2);
 /// expects when its terminal goes away: SIGHUP, then SIGKILL if it is still
 /// there after a grace period.
 ///
-/// Nothing is sent once the child has been reaped, so a reused pid is never
-/// signalled.
+/// Once the wait or its managed handle is released, final cleanup belongs
+/// to the managed child and this delayed task stops using the raw pid.
 struct HangUpOnDrop {
     pid: Option<libc::pid_t>,
     reaped: Arc<AtomicBool>,
@@ -206,14 +209,31 @@ impl Drop for HangUpOnDrop {
         if self.reaped.load(Ordering::SeqCst) {
             return;
         }
-        unsafe { libc::kill(pid, libc::SIGHUP) };
+        unsafe { libc::kill(-pid, libc::SIGHUP) };
         let reaped = self.reaped.clone();
         std::thread::spawn(move || {
             std::thread::sleep(SHELL_HANGUP_GRACE);
             if !reaped.load(Ordering::SeqCst) {
-                unsafe { libc::kill(pid, libc::SIGKILL) };
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
             }
         });
+    }
+}
+
+// Dropping an unpolled/cancelled wait still hands final cleanup to the
+// managed child. The delayed hangup task must then stop using its raw pid.
+struct ShellChild {
+    child: fabric_service_api::child_spawn::Child,
+    reaped: Arc<AtomicBool>,
+}
+impl ShellChild {
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait().await
+    }
+}
+impl Drop for ShellChild {
+    fn drop(&mut self) {
+        self.reaped.store(true, Ordering::SeqCst);
     }
 }
 
@@ -248,14 +268,76 @@ where
         }
         error
     })?;
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let mut command = CommandBuilder::new(shell);
-    // Markers so a user's shell rc can tell it's inside a fabric shell (which runs
-    // in the daemon's session, not the caller's) and skip session-fragile startup.
-    // FABRIC_PEER is the connecting peer's NodeID — who opened this shell.
-    command.env("FABRIC_SHELL", "1");
-    command.env("FABRIC_PEER", peer);
-    let mut child = pair.slave.spawn_command(command).map_err(|error| {
+    let setup: Result<Command> = (|| {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let environment = CommandBuilder::new(&shell);
+        let mut command = Command::new(shell);
+        command.env("SHELL", environment.get_shell());
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                use std::os::unix::ffi::OsStrExt;
+                let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+                let mut result = std::ptr::null_mut();
+                let mut buffer = vec![0u8; 16384];
+                let status = unsafe {
+                    libc::getpwuid_r(
+                        libc::getuid(),
+                        &mut entry,
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len(),
+                        &mut result,
+                    )
+                };
+                if status == 0 && !result.is_null() {
+                    let path = unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) };
+                    std::path::PathBuf::from(std::ffi::OsStr::from_bytes(path.to_bytes()))
+                } else {
+                    std::path::PathBuf::from("/")
+                }
+            });
+        command.current_dir(home);
+        command.env("FABRIC_SHELL", "1");
+        command.env("FABRIC_PEER", peer);
+        // Keep portable-pty's terminal allocation, resizing and I/O. Spawn the
+        // shell through the common pre-exec ownership gate, which its opaque
+        // spawn_command entry point cannot install.
+        let tty = pair
+            .master
+            .tty_name()
+            .context("PTY has no slave terminal path")?;
+        let slave = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(tty)?;
+        command
+            .stdin(Stdio::from(slave.try_clone()?))
+            .stdout(Stdio::from(slave.try_clone()?))
+            .stderr(Stdio::from(slave));
+        unsafe {
+            command.pre_exec(|| {
+                for signal in [
+                    libc::SIGCHLD,
+                    libc::SIGHUP,
+                    libc::SIGINT,
+                    libc::SIGQUIT,
+                    libc::SIGTERM,
+                    libc::SIGALRM,
+                ] {
+                    libc::signal(signal, libc::SIG_DFL);
+                }
+                let empty: libc::sigset_t = std::mem::zeroed();
+                libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        Ok(command)
+    })();
+    let command = setup.map_err(|error| {
         if let Some(audit) = audit.take() {
             audit.finish(
                 audit::Outcome::SpawnFailed,
@@ -265,14 +347,18 @@ where
         }
         error
     })?;
-    if let Some(pid) = child.process_id() {
-        fabric_service_api::child_tracking::register(pid);
-    }
-    let reaped = Arc::new(AtomicBool::new(false));
-    let hang_up = HangUpOnDrop {
-        pid: child.process_id().map(|pid| pid as libc::pid_t),
-        reaped: reaped.clone(),
-    };
+    let child = fabric_service_api::child_spawn::spawn("shell PTY", command)
+        .await
+        .map_err(|error| {
+            if let Some(audit) = audit.take() {
+                audit.finish(
+                    audit::Outcome::SpawnFailed,
+                    None,
+                    Some(fabric_config::error::ErrorCode::SpawnFailed.as_str()),
+                );
+            }
+            error
+        })?;
     let mut reader = pair.master.try_clone_reader().map_err(|error| {
         if let Some(audit) = audit.take() {
             audit.finish(
@@ -298,6 +384,13 @@ where
     };
     let master = pair.master;
     drop(pair.slave);
+    let reaped = Arc::new(AtomicBool::new(false));
+    let pid = child.id().map(|pid| pid as libc::pid_t);
+    let mut child = ShellChild {
+        child,
+        reaped: reaped.clone(),
+    };
+    let hang_up = HangUpOnDrop { pid, reaped };
 
     let (output_tx, mut output_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let reader_counts = counts.clone();
@@ -332,11 +425,7 @@ where
         }
     });
 
-    let mut wait_task = tokio::task::spawn_blocking(move || {
-        let status = child.wait();
-        reaped.store(true, Ordering::SeqCst);
-        status
-    });
+    let mut wait_task = tokio::spawn(async move { child.wait().await });
     let mut stdin_done = false;
     let mut output_done = false;
     let mut exit_code = None;
@@ -379,10 +468,8 @@ where
                 }
                 status = &mut wait_task, if exit_code.is_none() => {
                     let status = status.context("shell wait task failed")??;
-                    let code = status.exit_code().min(i32::MAX as u32) as i32;
-                    // portable-pty replaces a signal exit with code 1 and a
-                    // localized signal name. Do not invent a numeric status.
-                    audit_exit_status = status.signal().is_none().then_some(code);
+                    let code = status.code().unwrap_or(1);
+                    audit_exit_status = status.code();
                     if let Some(audit) = &audit
                         && let Some(status) = audit_exit_status
                     {
@@ -407,10 +494,10 @@ where
         drop(hang_up);
         let _ = input_tx.send(None);
         if let Ok(Ok(status)) = wait_task.await
-            && status.signal().is_none()
+            && let Some(code) = status.code()
             && let Some(audit) = &audit
         {
-            audit.observe_exit(status.exit_code().min(i32::MAX as u32) as i32);
+            audit.observe_exit(code);
         }
     }
     drop(input_tx);

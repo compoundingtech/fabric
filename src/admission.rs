@@ -42,6 +42,7 @@ impl Grant {
 #[derive(Debug, Default)]
 pub struct Admissions {
     live: Mutex<Live>,
+    child_owner: Option<Arc<dyn fabric_service_api::child_tracking::Owner>>,
 }
 
 #[derive(Debug, Default)]
@@ -61,17 +62,29 @@ struct Entry {
 }
 
 impl Admissions {
+    pub(crate) fn with_child_owner(
+        owner: Arc<dyn fabric_service_api::child_tracking::Owner>,
+    ) -> Self {
+        Self {
+            child_owner: Some(owner),
+            ..Self::default()
+        }
+    }
     /// Record an admission before its grant is checked. A reload that lands
     /// between the check and the record would otherwise miss it; recorded
     /// first, it is either revoked by that reload or refused by the new book.
     pub fn admit(self: &Arc<Self>, peer: EndpointId, grant: Grant) -> Admission {
         let revoked = CancellationToken::new();
         let done = CancellationToken::new();
-        let children = fabric_service_api::child_tracking::Children::default();
+
         let requirements = Requirements::default();
         let mut live = self.live.lock().unwrap();
         let id = live.next;
         live.next += 1;
+        let mut children = fabric_service_api::child_tracking::Children::default();
+        if let Some(owner) = &self.child_owner {
+            children = children.with_owner(owner.clone(), format!("admission-{id}"));
+        }
         live.entries.insert(
             id,
             Entry {
