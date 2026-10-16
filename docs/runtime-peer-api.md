@@ -105,8 +105,9 @@ publication. Persistence uses a private same-directory temporary file, file
 fsync, rename, and directory fsync on the blocking pool. A success means both
 state and effective policy are installed. A pre-rename failure leaves the old
 policy and receipt history intact for runtime transactions. Any failed static
-reload, including a composition conflict or a pre-rename storage failure, closes
-new admissions and leaves existing work alone. A successful repair/reload then
+reload closes new admissions, preserving existing work when no valid candidate
+exists but cancelling exactly the candidate's withdrawals when only its
+persistence fails before rename. A successful repair/reload then
 revokes work no longer permitted. If rename succeeds but durability is
 uncertain, `runtime_commit_indeterminate` closes network admissions and cancels
 old work. Repair the storage problem, let quarantined work end, and explicitly
