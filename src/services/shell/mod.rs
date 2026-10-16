@@ -264,6 +264,9 @@ where
         }
         error
     })?;
+    if let Some(pid) = child.process_id() {
+        fabric_service_api::child_tracking::register(pid);
+    }
     let reaped = Arc::new(AtomicBool::new(false));
     let hang_up = HangUpOnDrop {
         pid: child.process_id().map(|pid| pid as libc::pid_t),

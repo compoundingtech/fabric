@@ -190,7 +190,6 @@ pub struct Audit {
     shared: Arc<Shared>,
     since: String,
     max_bytes: usize,
-    labels: Arc<Mutex<std::collections::BTreeMap<String, String>>>,
 }
 
 impl Audit {
@@ -266,25 +265,7 @@ impl Audit {
             shared,
             since: timestamp(SystemTime::now()),
             max_bytes,
-            labels: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
         }
-    }
-
-    pub(crate) fn update_labels(&self, labels: impl Iterator<Item = (String, Option<String>)>) {
-        *self
-            .labels
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = labels
-            .filter_map(|(id, name)| name.map(|name| (id, name)))
-            .collect();
-    }
-
-    pub(crate) fn peer_name(&self, peer: &str) -> Option<String> {
-        self.labels
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(peer)
-            .cloned()
     }
 
     pub fn record(&self, record: Record) {

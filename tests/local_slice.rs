@@ -199,9 +199,11 @@ async fn tcp_dial_queue_timeout_survives_restart_and_updates_the_live_listener()
                     ) =>
             {
                 first_retry = true;
-                println!(
-                    "fabric#321: retrying initial restored TCP connection once after zero-byte {error}"
-                );
+                // Direct stderr bypasses libtest's capture of passing tests.
+                std::io::Write::write_fmt(
+                    &mut std::io::stderr().lock(),
+                    format_args!("fabric#321: retrying initial restored TCP connection once after zero-byte {error}\n"),
+                )?;
             }
             Err(error) => return Err(error).context("initial restored TCP round trip"),
         }
@@ -4315,5 +4317,91 @@ async fn down_then_up_is_a_barrier_for_idle_and_live_exec_cycles() -> Result<()>
         started.elapsed()
     );
     client.shutdown().await?;
+    Ok(())
+}
+
+/// The detached restart helper must carry the explicit runtime-mode choice;
+/// otherwise a healthy restart quietly replaces effective runtime policy with
+/// the static-only book.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_peer_mode_and_grants_survive_the_real_restart_helper() -> Result<()> {
+    use fabric::runtime_peers::{Direction, Operation, Request, Transaction};
+    let _serial = local_slice_guard().await;
+    let dir = TempDir::new()?;
+    let home = FabricHome::new(dir.path());
+    struct Cleanup(FabricHome);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = run_fabric(&self.0, &["down"]);
+        }
+    }
+    let _cleanup = Cleanup(home.clone());
+    run_fabric(&home, &["up", "--runtime-peers"])?;
+    let list = || ControlRequest::RuntimePeers {
+        request: Request::List { cursor: None },
+    };
+    let before = match send_control(&home, list()).await? {
+        ControlResponse::RuntimePeers { reply } => {
+            reply.snapshot.context("missing runtime snapshot")?
+        }
+        other => bail!("unexpected runtime response {other:?}"),
+    };
+    let node_id = iroh::SecretKey::from_bytes(&[93; 32]).public();
+    let request = ControlRequest::RuntimePeers {
+        request: Request::Batch {
+            transaction: Transaction {
+                owner: "controller-a".into(),
+                request_id: "install".into(),
+                expected_revision: 0,
+                operations: vec![
+                    Operation::AddPeer {
+                        node_id,
+                        name: Some("phone".into()),
+                        direction: Some(Direction::InboundOnly),
+                        addr: None,
+                    },
+                    Operation::SetGrants {
+                        node_id,
+                        grants: vec!["work/0".into()],
+                    },
+                ],
+            },
+        },
+    };
+    match send_control(&home, request).await? {
+        ControlResponse::RuntimePeers { reply } => {
+            assert!(reply.error.is_none(), "{:?}", reply.error);
+            assert_eq!(reply.mutation.unwrap().committed_revision, 1);
+        }
+        other => bail!("unexpected runtime response {other:?}"),
+    }
+    assert!(matches!(
+        send_control(&home, ControlRequest::Restart { allow_shell: None }).await?,
+        ControlResponse::Restarting { .. }
+    ));
+    let after = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(ControlResponse::RuntimePeers { reply }) = send_control(&home, list()).await {
+                if let Some(snapshot) = reply.snapshot {
+                    if snapshot.instance != before.instance {
+                        break snapshot;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .context("restart helper did not restore runtime mode")?;
+    assert_eq!(after.policy_revision, 1);
+    assert_eq!(after.peers.len(), 1);
+    assert_eq!(after.peers[0].node_id, node_id);
+    assert!(after.peers[0].services.contains_key("work/0"));
+    assert!(!after.peers[0].services.contains_key("echo"));
+    assert!(
+        !home.peers_path().exists(),
+        "runtime operations created static peer input"
+    );
+    run_fabric(&home, &["down"])?;
     Ok(())
 }

@@ -29,7 +29,7 @@ use fabric_service_api::{PeerStream, Service};
 
 use crate::{
     admission::{Admission, Grant},
-    config::{FabricHome, PeerBook},
+    config::FabricHome,
     daemon::CurrentEndpoint,
     mux::{MuxStream, PeerConnections, StreamActivity},
 };
@@ -348,6 +348,10 @@ pub struct TunnelSession {
     grant: std::sync::OnceLock<Grant>,
     local_write: Mutex<Option<LocalWrite>>,
     cleanup: Mutex<Option<SessionCleanup>>,
+    cleanup_kill: CancellationToken,
+    cleanup_done: CancellationToken,
+    local_reader_done: CancellationToken,
+    children: fabric_service_api::child_tracking::Children,
     state: Mutex<TunnelState>,
     notify: Notify,
     done: CancellationToken,
@@ -387,6 +391,7 @@ struct TunnelSessionStats {
 #[derive(Debug)]
 struct SessionCleanup {
     kill: CancellationToken,
+    done: CancellationToken,
 }
 
 #[derive(Debug)]
@@ -437,7 +442,16 @@ impl TunnelSession {
         write: LocalWrite,
         cleanup: Option<SessionCleanup>,
     ) -> (Arc<Self>, LocalRead) {
+        let cleanup_kill = cleanup.as_ref().map(|c| c.kill.clone()).unwrap_or_default();
+        let cleanup_done = cleanup
+            .as_ref()
+            .map(|c| c.done.clone())
+            .unwrap_or_else(completed_token);
         let session = Arc::new(Self {
+            cleanup_kill,
+            cleanup_done,
+            local_reader_done: CancellationToken::new(),
+            children: fabric_service_api::child_tracking::Children::current().unwrap_or_default(),
             id,
             peer_id,
             grant: std::sync::OnceLock::new(),
@@ -574,6 +588,7 @@ impl TunnelSession {
     }
 
     pub async fn run_local_reader(self: Arc<Self>, mut read: LocalRead) -> Result<()> {
+        let _completed = self.local_reader_done.clone().drop_guard();
         let mut buf = [0; LOCAL_READ_BUF];
         loop {
             // A closed session closes its socket. Closing shuts down only the
@@ -915,10 +930,12 @@ impl TunnelSession {
             tokio::select! {
                 result = &mut writer => {
                     reader.abort();
+                    let _ = reader.await;
                     result?
                 }
                 result = &mut reader => {
                     writer.abort();
+                    let _ = writer.await;
                     result?
                 }
             }
@@ -1190,7 +1207,7 @@ async fn run_client_connection_parts(
     notices: Option<ClientConnectionNotices>,
     initial_stream: Option<MuxStream>,
 ) -> Result<()> {
-    let peer_id = PeerBook::load(&home)?.resolve(&peer)?.id;
+    let peer_id = connections.resolve_peer(&home, &peer).await?.id;
     let session_id = TunnelSessionId::random();
     let (session, local_read) =
         TunnelSession::new_parts(session_id, peer_id, local_read, local_write);
@@ -1258,7 +1275,13 @@ async fn run_client_attach_loop(
             )
             .await
         } else {
-            let peer_addr = resolve_peer_for_attempt(&home, &peer, session.peer_id()).await;
+            let peer_addr = match connections
+                .resolve_peer_or_legacy_hint(&home, &peer, EndpointAddr::new(session.peer_id()))
+                .await
+            {
+                Ok(addr) => addr,
+                Err(error) => return fail_permanently(&session, notices.as_ref(), error).await,
+            };
             let endpoint = endpoint_rx.borrow().clone();
             connect_and_attach(
                 session.clone(),
@@ -1449,16 +1472,6 @@ async fn wait_for_reconnect(
             error = session.watch_local_endpoint() => return ReconnectWait::LocalGone(error),
         }
     }
-}
-
-async fn resolve_peer_for_attempt(
-    home: &FabricHome,
-    peer: &str,
-    fallback_id: EndpointId,
-) -> EndpointAddr {
-    PeerBook::load(home)
-        .and_then(|book| book.resolve(peer))
-        .unwrap_or_else(|_| EndpointAddr::new(fallback_id))
 }
 
 async fn connect_and_attach(
@@ -1988,6 +2001,74 @@ fn count_peer_sessions_locked(
         .count()
 }
 
+fn completed_token() -> CancellationToken {
+    let token = CancellationToken::new();
+    token.cancel();
+    token
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SessionRevocation {
+    pub id: String,
+    session: Arc<TunnelSession>,
+    closed: CancellationToken,
+}
+impl SessionRevocation {
+    pub async fn complete(&self) -> bool {
+        self.closed.is_cancelled()
+            && self.session.local_reader_done.is_cancelled()
+            && self.session.cleanup_done.is_cancelled()
+            && self.session.children.complete()
+            && self.session.state.lock().await.active_attaches == 0
+    }
+}
+impl ServerSessionStore {
+    pub(crate) async fn select_withdrawn(
+        &self,
+        book: &crate::config::PeerBook,
+    ) -> Vec<SessionRevocation> {
+        self.inner
+            .lock()
+            .await
+            .values()
+            .filter(|session| {
+                session
+                    .grant
+                    .get()
+                    .is_some_and(|grant| !grant.permitted(book, &session.peer_id))
+            })
+            .map(|session| SessionRevocation {
+                id: session.id().to_string(),
+                session: session.clone(),
+                closed: CancellationToken::new(),
+            })
+            .collect()
+    }
+    pub(crate) async fn revoke_selected(&self, selected: &[SessionRevocation]) {
+        {
+            let mut sessions = self.inner.lock().await;
+            for selected in selected {
+                if sessions
+                    .get(&selected.session.id())
+                    .is_some_and(|session| Arc::ptr_eq(session, &selected.session))
+                {
+                    sessions.remove(&selected.session.id());
+                }
+                selected.session.done.cancel();
+                selected.session.cleanup_kill.cancel();
+            }
+        }
+        for selected in selected {
+            let session = selected.session.clone();
+            let closed = selected.closed.clone();
+            tokio::spawn(async move {
+                session.close_for_eviction().await;
+                closed.cancel();
+            });
+        }
+    }
+}
+
 pub fn spawn_server_session_reaper(sessions: ServerSessionStore, cancel: CancellationToken) {
     tokio::spawn(async move {
         loop {
@@ -2002,6 +2083,31 @@ pub fn spawn_server_session_reaper(sessions: ServerSessionStore, cancel: Cancell
 }
 
 pub async fn serve_connection(
+    connection: Connection,
+    send: SendStream,
+    recv: RecvStream,
+    admission: Admission,
+    target: ServerTarget,
+    connections: Option<Arc<PeerConnections>>,
+    sessions: ServerSessionStore,
+    drop_rx: watch::Receiver<u64>,
+) -> Result<()> {
+    let children = admission.children();
+    children
+        .scope(serve_connection_inner(
+            connection,
+            send,
+            recv,
+            admission,
+            target,
+            connections,
+            sessions,
+            drop_rx,
+        ))
+        .await
+}
+
+async fn serve_connection_inner(
     connection: Connection,
     mut send: SendStream,
     mut recv: RecvStream,
@@ -2063,6 +2169,12 @@ pub async fn serve_connection(
         bail!("tunnel session {session_id} belongs to a different peer");
     }
 
+    if admission.revoked().is_cancelled() {
+        sessions.remove_session(&session).await;
+        session.cleanup_done.cancelled().await;
+        return Ok(());
+    }
+
     if let Err(error) = write_frame(
         &mut send,
         Frame::Hello {
@@ -2092,7 +2204,9 @@ pub async fn serve_connection(
             // it ends the attach, whose writer stops once the session is done.
             // The store's own sweep may get there first; either is enough.
             sessions.remove_session(&session).await;
-            attach.await
+            let result = attach.await;
+            session.cleanup_done.cancelled().await;
+            result
         }
     };
     if attach_end_counts_against_connection(&result, true)
@@ -2223,6 +2337,9 @@ async fn spawn_service_session(
     let (service_read, service_write) = tokio::io::split(service_end);
     let (tunnel_read, tunnel_write) = tokio::io::split(tunnel);
     let kill = CancellationToken::new();
+    let done = CancellationToken::new();
+    let finished = done.clone();
+    let children = fabric_service_api::child_tracking::Children::current().unwrap_or_default();
     let name = service.name();
     let audit = crate::audit::current();
     if let Some(audit) = &audit {
@@ -2236,7 +2353,8 @@ async fn spawn_service_session(
         grants: None,
     });
     tokio::spawn(async move {
-        if let Err(error) = crate::audit::scope(audit, serving).await {
+        let _finished = finished.drop_guard();
+        if let Err(error) = children.scope(crate::audit::scope(audit, serving)).await {
             eprintln!("fabric: {name} session {session_id} failed: {error:#}");
         }
     });
@@ -2246,7 +2364,7 @@ async fn spawn_service_session(
         peer_id,
         Box::new(tunnel_read),
         Box::new(tunnel_write),
-        Some(SessionCleanup { kill }),
+        Some(SessionCleanup { kill, done }),
     ))
 }
 
@@ -2364,7 +2482,10 @@ async fn spawn_exec_session(
     );
     let kill = CancellationToken::new();
     let kill_wait = kill.clone();
+    let done = CancellationToken::new();
+    let finished = done.clone();
     tokio::spawn(async move {
+        let _finished = finished.drop_guard();
         let result = tokio::select! {
             result = child.wait() => result,
             _ = kill_wait.cancelled() => {
@@ -2428,7 +2549,7 @@ async fn spawn_exec_session(
         peer_id,
         Box::new(stdout),
         Box::new(stdin),
-        Some(SessionCleanup { kill }),
+        Some(SessionCleanup { kill, done }),
     ))
 }
 
@@ -2630,7 +2751,10 @@ mod tests {
             peer,
             Box::new(read),
             Box::new(write),
-            Some(SessionCleanup { kill }),
+            Some(SessionCleanup {
+                kill,
+                done: completed_token(),
+            }),
         );
         session
     }

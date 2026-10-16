@@ -118,6 +118,10 @@ pub(crate) struct BookGrants {
     book: PeerBook,
     peer: EndpointId,
     service: &'static str,
+    live: Option<(
+        Arc<tokio::sync::RwLock<PeerBook>>,
+        crate::admission::Requirements,
+    )>,
 }
 
 impl BookGrants {
@@ -126,7 +130,16 @@ impl BookGrants {
             book,
             peer,
             service,
+            live: None,
         }
+    }
+    pub(crate) fn with_live(
+        mut self,
+        book: Arc<tokio::sync::RwLock<PeerBook>>,
+        requirements: crate::admission::Requirements,
+    ) -> Self {
+        self.live = Some((book, requirements));
+        self
     }
 }
 
@@ -140,6 +153,20 @@ impl Grants for BookGrants {
     }
 
     fn may(&self, permission: &str) -> Result<(), Denial> {
+        if let Some((book, requirements)) = &self.live {
+            // This synchronous service API must not block a runtime worker on
+            // the durable writer. Refuse transiently while publication is held.
+            let book = book.try_read().map_err(|_| Denial {
+                no_grants: false,
+                reason: crate::error::ErrorCode::RuntimeStateUnavailable
+                    .reason("policy commit in progress; retry this request"),
+            })?;
+            requirements.record(permission);
+            return book.may(&self.peer, permission).map_err(|denied| Denial {
+                no_grants: matches!(denied, Denied::NoGrants { .. }),
+                reason: denied.reason(),
+            });
+        }
         self.book
             .may(&self.peer, permission)
             .map_err(|denied| Denial {
@@ -189,6 +216,49 @@ mod tests {
         fn serve(&self, _stream: PeerStream) -> BoxFuture<'static, Result<()>> {
             Box::pin(async { Ok(()) })
         }
+    }
+
+    #[tokio::test]
+    async fn live_narrow_grants_track_the_exact_operation_and_fail_closed_during_commit() {
+        let id = iroh::SecretKey::from_bytes(&[91; 32]).public();
+        let mut book = PeerBook::default();
+        book.add_with_allow(
+            id,
+            Some("client".into()),
+            None,
+            Some(vec!["git/one/read".into(), "git/two/read".into()]),
+        );
+        let policy = Arc::new(tokio::sync::RwLock::new(book.clone()));
+        let admissions = Arc::new(crate::admission::Admissions::default());
+        let one = admissions.admit(id, crate::admission::Grant::Trust);
+        let two = admissions.admit(id, crate::admission::Grant::Trust);
+        let first =
+            BookGrants::new(book.clone(), id, "git").with_live(policy.clone(), one.requirements());
+        let second =
+            BookGrants::new(book.clone(), id, "git").with_live(policy.clone(), two.requirements());
+        assert!(first.may("git/one/read").is_ok());
+        assert!(second.may("git/two/read").is_ok());
+        let guard = policy.write().await;
+        assert!(
+            first
+                .may("git/one/read")
+                .unwrap_err()
+                .reason
+                .contains("fabric:runtime_state_unavailable")
+        );
+        drop(guard);
+        book.add_with_allow(
+            id,
+            Some("client".into()),
+            None,
+            Some(vec!["git/two/read".into()]),
+        );
+        assert_eq!(admissions.revoke(&book), 1);
+        assert!(one.revoked().is_cancelled());
+        assert!(!two.revoked().is_cancelled());
+        *policy.write().await = book;
+        assert!(first.may("git/one/read").is_err());
+        assert!(second.may("git/two/read").is_ok());
     }
 
     const ONE: &[Protocol] = &[Protocol {
