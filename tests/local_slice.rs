@@ -199,9 +199,11 @@ async fn tcp_dial_queue_timeout_survives_restart_and_updates_the_live_listener()
                     ) =>
             {
                 first_retry = true;
-                println!(
-                    "fabric#321: retrying initial restored TCP connection once after zero-byte {error}"
-                );
+                // Direct stderr bypasses libtest's capture of passing tests.
+                std::io::Write::write_fmt(
+                    &mut std::io::stderr().lock(),
+                    format_args!("fabric#321: retrying initial restored TCP connection once after zero-byte {error}\n"),
+                )?;
             }
             Err(error) => return Err(error).context("initial restored TCP round trip"),
         }
