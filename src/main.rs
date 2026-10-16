@@ -3,7 +3,7 @@ use std::{
     fs::{self, OpenOptions},
     path::PathBuf,
     process::{Command as ProcessCommand, Stdio},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result, bail};
@@ -82,6 +82,18 @@ enum Commands {
     Addr,
     /// Show daemon state and echo-ping reachability for trusted peers.
     Status,
+    /// Read retained exec/shell audit events and the running daemon's loss count.
+    Audit {
+        /// Keep events from this duration ago (for example 30m, 1h, or 2d).
+        #[arg(long)]
+        since: Option<String>,
+        /// Filter by caller NodeID or the local name recorded for that call.
+        #[arg(long)]
+        peer: Option<String>,
+        /// Maximum newest records (also bounded to 16 MiB of encoded lines).
+        #[arg(long, default_value_t = fabric::audit::DEFAULT_READ_LIMIT as u32, value_parser = clap::value_parser!(u32).range(1..=100_000))]
+        limit: u32,
+    },
     /// List trusted peers and their service grants.
     Peers,
     /// Share Git repositories with exact per-peer read and write grants.
@@ -630,6 +642,55 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                     response => bail!("unexpected daemon response: {response:?}"),
                 },
+                Commands::Audit {
+                    since,
+                    peer,
+                    limit,
+                } => {
+                    let since = since
+                        .as_deref()
+                        .map(parse_audit_duration)
+                        .transpose()?
+                        .map(|duration| {
+                            SystemTime::now().checked_sub(duration).ok_or_else(|| {
+                                FabricError::new(
+                                    ErrorCode::InvalidArgument,
+                                    "audit duration is too large",
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    let records = fabric::audit::read_with_limit(
+                        home.root(),
+                        since,
+                        peer.as_deref(),
+                        limit as usize,
+                    )?;
+                    let audit = match tokio::time::timeout(
+                        Duration::from_millis(500),
+                        send_control(&home, ControlRequest::Status),
+                    )
+                    .await
+                    {
+                        Ok(Ok(ControlResponse::Status { audit, .. })) => audit,
+                        _ => None,
+                    };
+                    if json {
+                        #[derive(serde::Serialize)]
+                        struct Response<'a> {
+                            #[serde(flatten)]
+                            history: &'a fabric::audit::AuditRead,
+                            audit: Option<&'a fabric::audit::AuditStatus>,
+                        }
+                        let response = Response {
+                            history: &records,
+                            audit: audit.as_ref(),
+                        };
+                        println!("{}", String::from_utf8(fabric::audit::encode(&response)?)?);
+                    } else {
+                        print_audit(&records, audit.as_ref())?;
+                    }
+                }
                 Commands::Status => {
                     match send_control(&home, ControlRequest::ReachabilityStatus).await? {
                         ControlResponse::ReachabilityStatus {
@@ -647,6 +708,7 @@ async fn run(cli: Cli) -> Result<()> {
                             active_dial_handlers,
                             max_dial_handlers,
                             dial_restore_failures,
+                            audit,
                         } => {
                             let sync_runtime = match send_control(
                                 &home,
@@ -671,6 +733,7 @@ async fn run(cli: Cli) -> Result<()> {
                                     (active_dial_handlers, max_dial_handlers),
                                     &sync_runtime,
                                     &dial_restore_failures,
+                                    audit.as_ref(),
                                 ))?;
                                 return Ok(());
                             }
@@ -2405,6 +2468,60 @@ fn peers_json(peers: &[fabric::config::Peer]) -> serde_json::Value {
     serde_json::json!({ "peers": peers })
 }
 
+fn parse_audit_duration(value: &str) -> Result<Duration> {
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
+        (number, 0.001)
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1.0)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60.0)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 3600.0)
+    } else if let Some(number) = value.strip_suffix('d') {
+        (number, 86400.0)
+    } else {
+        (value, 1.0)
+    };
+    let invalid = || {
+        FabricError::new(
+            ErrorCode::InvalidArgument,
+            "audit --since must be a nonnegative duration such as 30m, 1h, or 2d",
+        )
+    };
+    let number: f64 = number.parse().map_err(|_| invalid())?;
+    Duration::try_from_secs_f64(number * multiplier).map_err(|_| invalid().into())
+}
+
+fn print_audit(
+    records: &fabric::audit::AuditRead,
+    audit: Option<&fabric::audit::AuditStatus>,
+) -> Result<()> {
+    match audit {
+        Some(audit) => println!(
+            "audit loss\tdropped={} queued={} since={}",
+            audit.dropped_records, audit.queued_records, audit.since
+        ),
+        None => println!("audit loss\tunknown (daemon unavailable or older reply)"),
+    }
+    for record in &records.records {
+        // JSON lines retain argv boundaries without printing shell keystrokes.
+        println!("{}", String::from_utf8(fabric::audit::encode(record)?)?);
+    }
+    if records.truncated {
+        eprintln!(
+            "fabric: audit history truncated to newest {} records / 16 MiB",
+            records.limit
+        );
+    }
+    if records.malformed_records != 0 {
+        eprintln!(
+            "fabric: skipped {} malformed audit records",
+            records.malformed_records
+        );
+    }
+    Ok(())
+}
+
 /// `fabric status --json`. Connection telemetry is left out on purpose: it is
 /// not part of the stable surface, and `telemetry.json` carries it.
 #[allow(clippy::too_many_arguments)]
@@ -2418,6 +2535,7 @@ fn status_json(
     dial_handlers: (usize, usize),
     sync_runtime: &SyncRuntimeStatus,
     dial_restore_failures: &[fabric::control::DialRestoreFailure],
+    audit: Option<&fabric::audit::AuditStatus>,
 ) -> serde_json::Value {
     let peers: Vec<_> = peers
         .iter()
@@ -2442,6 +2560,7 @@ fn status_json(
         "exposed_protocols": exposed_protocols,
         "dial_sockets": dial_sockets,
         "dial_restore_failures": dial_restore_failures,
+        "audit": audit,
         "dial_handlers": { "active": dial_handlers.0, "max": dial_handlers.1 },
         "sync_runtime": { "owner": sync_runtime.owner, "companion": sync_runtime.companion },
         "peers": peers,

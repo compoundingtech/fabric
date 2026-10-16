@@ -13,6 +13,7 @@
 
 use anyhow::{Context, Result, bail};
 use fabric_config::error::{self, ErrorCode};
+use fabric_service_api::audit;
 use fabric_service_api::{BoxFuture, Bridge, Notice, PeerStream, Protocol, Service};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -279,11 +280,23 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let mut audit = audit::exec_attempt();
+    let counts = audit.as_ref().map(|audit| audit.counts());
     let argv = match read_argv(recv).await? {
         Some(argv) => argv,
         None => return Ok(()),
     };
+    if let Some(audit) = &audit {
+        audit.start_exec(&argv);
+    }
     if argv.is_empty() {
+        if let Some(audit) = audit.take() {
+            audit.finish(
+                audit::Outcome::SpawnFailed,
+                None,
+                Some(ErrorCode::SpawnFailed.as_str()),
+            );
+        }
         write_server_frame(send, ServerFrame::Error("empty command".to_string())).await?;
         return write_server_frame(send, ServerFrame::Exit(EXIT_SPAWN_FAILED)).await;
     }
@@ -325,6 +338,13 @@ where
     {
         Ok(child) => child,
         Err(error) => {
+            if let Some(audit) = audit.take() {
+                audit.finish(
+                    audit::Outcome::SpawnFailed,
+                    None,
+                    Some(ErrorCode::SpawnFailed.as_str()),
+                );
+            }
             write_server_frame(
                 send,
                 ServerFrame::Error(
@@ -374,11 +394,17 @@ where
             },
             result = stdout.read(&mut out_buf), if !out_done => match result? {
                 0 => out_done = true,
-                n => write_server_frame(send, ServerFrame::Stdout(out_buf[..n].to_vec())).await?,
+                n => {
+                    if let Some(counts) = &counts { counts.add_out(n); }
+                    write_server_frame(send, ServerFrame::Stdout(out_buf[..n].to_vec())).await?;
+                },
             },
             result = stderr.read(&mut err_buf), if !err_done => match result? {
                 0 => err_done = true,
-                n => write_server_frame(send, ServerFrame::Stderr(err_buf[..n].to_vec())).await?,
+                n => {
+                    if let Some(counts) = &counts { counts.add_out(n); }
+                    write_server_frame(send, ServerFrame::Stderr(err_buf[..n].to_vec())).await?;
+                },
             },
             result = child.wait() => status = Some(result.context("exec wait failed")?),
         }
@@ -395,6 +421,10 @@ where
         },
     };
 
+    if let Some(audit) = &audit {
+        audit.observe_exit(audit::exit_status(status));
+    }
+
     // The command has exited. Forward what it left in the pipes, then stop at
     // end of file or after a short silence, whichever comes first: a pipe that
     // stays open now belongs to a descendant that outlived the command.
@@ -403,16 +433,25 @@ where
         tokio::select! {
             result = stdout.read(&mut out_buf), if !out_done => match result? {
                 0 => out_done = true,
-                n => write_server_frame(send, ServerFrame::Stdout(out_buf[..n].to_vec())).await?,
+                n => {
+                    if let Some(counts) = &counts { counts.add_out(n); }
+                    write_server_frame(send, ServerFrame::Stdout(out_buf[..n].to_vec())).await?;
+                },
             },
             result = stderr.read(&mut err_buf), if !err_done => match result? {
                 0 => err_done = true,
-                n => write_server_frame(send, ServerFrame::Stderr(err_buf[..n].to_vec())).await?,
+                n => {
+                    if let Some(counts) = &counts { counts.add_out(n); }
+                    write_server_frame(send, ServerFrame::Stderr(err_buf[..n].to_vec())).await?;
+                },
             },
             _ = tokio::time::sleep_until(drain_until) => break,
         }
     }
 
+    if let Some(audit) = audit.take() {
+        audit.finish(audit::Outcome::Ok, Some(audit::exit_status(status)), None);
+    }
     // `code()` is None when the child was killed by a signal; report 1 there.
     write_server_frame(send, ServerFrame::Exit(status.code().unwrap_or(1))).await
 }

@@ -1,4 +1,9 @@
 {
+  "audit": {
+    "dropped_records": 0,
+    "queued_records": 0,
+    "since": "<AUDIT_SINCE>"
+  },
   "dial_handlers": {
     "active": 0,
     "max": 32

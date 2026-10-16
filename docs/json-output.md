@@ -20,7 +20,8 @@ a new key may be added, so read objects by key and ignore keys you do not know.
 | `addr` | the daemon's `EndpointAddr` object (`{"id": ..., "addrs": [...]}`), with or without `--json`; it was JSON before the flag existed |
 | `peers` | `{"peers": [{"node", "name" (or null), "allow": [...], "dial_only", "inbound_only", "roaming"}]}` |
 | `probe PEER PROTOCOL` | `{"peer", "peer_id", "protocol", "outcome", "round_trip_micros", "transport", "error", "code", "class"}`; `outcome` is `supported`, `unsupported`, `unreachable` or `timeout`, and the exit status is unchanged |
-| `status` | `{"version", "node_id", "endpoint_addr", "exposed_protocols", "dial_sockets", "dial_restore_failures": [{"peer", "protocol", "tcp", "code", "class", "error"}], "dial_handlers": {"active", "max"}, "sync_runtime": {"owner", "companion"}, "peers": [{"id", "name", "reachable", "echo_denied", "inbound_only", "roaming", "round_trip_micros", "transport", "error"}]}`; connection telemetry is not part of it. A peer that trusts this machine but has not granted it `echo` is `reachable: true` with `echo_denied: true`, `error: null` and no round trip or transport |
+| `status` | `{"version", "node_id", "endpoint_addr", "exposed_protocols", "dial_sockets", "audit": {"dropped_records", "queued_records", "since"} (or null), "dial_restore_failures": [{"peer", "protocol", "tcp", "code", "class", "error"}], "dial_handlers": {"active", "max"}, "sync_runtime": {"owner", "companion"}, "peers": [{"id", "name", "reachable", "echo_denied", "inbound_only", "roaming", "round_trip_micros", "transport", "error"}]}`; connection telemetry is not part of it. A peer that trusts this machine but has not granted it `echo` is `reachable: true` with `echo_denied: true`, `error: null` and no round trip or transport |
+| `audit` | `{"records": [...], "audit": {"dropped_records", "queued_records", "since"} (or null), "malformed_records": N, "truncated": bool, "limit": N}`; records and limitations are described in [audit.md](audit.md) |
 | `dial PEER PROTOCOL` | `{"socket": "<path>"}` |
 | `dial PEER PROTOCOL --tcp ADDR` | `{"address": "<host:port>"}` |
 | `expose`, `unexpose` | `{"ok": true, "protocol": "<name>"}` |
@@ -59,3 +60,29 @@ Unconfirmed receipts after restart retain remaining IDs and return
 and the absence of observed child exit. Restart alone is not completion proof.
 A pure no-op returns the current revision in `mutation` without retaining a
 receipt; its request ID cannot be queried later through `cancellation`.
+
+## Audit records
+
+The additive `audit` field in `status --json` and `audit --json` counts dropped
+records and queued records for the current daemon lifetime, starting at the
+RFC3339 `since` time. An older reply or unavailable daemon yields `audit: null`,
+which means unknown rather than zero loss. Retained `audit_loss` records describe
+older gaps even after the live counter restarts.
+
+Audit call records have `event`, `time`, `peer`, nullable `name`, nullable
+`service`, nullable `argv`, `session_id`, nullable `outcome`, nullable `code`,
+nullable `exit_status`, nullable `duration_millis`, `bytes_in`, and `bytes_out`.
+Events are `exec_start`, `exec_end`, `shell_start`, `shell_end`, or `refused`.
+Outcomes are `ok` (including a nonzero command exit), `refused`, `spawn_failed`,
+or `cancelled`; start events have no outcome yet. Codes use `fabric:<code>`;
+legacy uncoded diagnostic rejections have a null code. `audit_loss` records
+instead contain `event`, `time`, `count`, `first_time`, and `last_time`.
+
+The audit reader defaults to the newest 10,000 matching records (`--limit N`,
+1–100,000) and at most 16 MiB of retained encoded lines. `truncated` indicates
+omitted matches under either bound, and `limit` is the requested record cap.
+Call records with shortened argv add `truncated: true` and `original_argc`;
+pre-auth refusal coalescing adds nonzero `suppressed_refusals` for the pair and
+`other_refusals_suppressed` for uncached/expired pairs. These optional fields
+default to false, null or zero for older records. Unicode separators, DEL/C1
+and bidi controls are escaped in file and CLI JSON as well as human output.

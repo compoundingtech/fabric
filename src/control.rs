@@ -187,6 +187,8 @@ pub enum ControlResponse {
         allow_shell: bool,
         #[serde(default)]
         allow_exec: bool,
+        #[serde(default)]
+        audit: Option<crate::audit::AuditStatus>,
     },
     ReachabilityStatus {
         version: String,
@@ -197,6 +199,8 @@ pub enum ControlResponse {
         allow_shell: bool,
         #[serde(default)]
         allow_exec: bool,
+        #[serde(default)]
+        audit: Option<crate::audit::AuditStatus>,
         peers: Vec<PeerReachability>,
         /// Durable loss/resume counters, keyed by peer label. Defaulted so an
         /// older client still decodes a newer daemon's reply.
@@ -547,6 +551,7 @@ mod tests {
             exposed_protocols: vec!["audit/echo".to_string()],
             dial_sockets: vec![PathBuf::from("/tmp/dial.sock")],
             allow_shell: true,
+            audit: None,
             allow_exec: false,
             peers: Vec::new(),
             connection_telemetry: BTreeMap::from([("desktop".to_string(), populated_peer())]),

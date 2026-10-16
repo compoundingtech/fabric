@@ -16,6 +16,7 @@
 //! A service that logs through `tracing` uses a target under `fabric::`, the
 //! prefix the daemon's log filter admits.
 
+pub mod audit;
 pub mod child_pipes;
 pub mod child_spawn;
 
