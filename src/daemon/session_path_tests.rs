@@ -33,6 +33,8 @@ async fn replace_with_relay(node: &FabricNode, url: iroh::RelayUrl) -> Result<En
         ))
         .hooks(AllowListHook {
             policy: state.peer_book.clone(),
+            services: state.services.clone(),
+            audit: state.audit.clone(),
         })
         .relay_mode(iroh::RelayMode::custom([url]))
         .clear_ip_transports()
