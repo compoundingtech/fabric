@@ -27,6 +27,7 @@ Deprecated, Fixed or Security.
 
 ### Fixed
 
+- Concurrent exec and shell commands use independent one-shot local sockets, preventing one command from unlinking another command's socket. Unused sockets expire after 30 seconds and stale one-shot sockets are removed at startup (#316).
 - A failed Unix dial is never persisted, overlong socket paths report `fabric:invalid_argument` and the maximum home length, and failed saved Unix or TCP listeners are skipped at startup and reported by status in `dial_restore_failures` (#297).
 - `fabric down` waits up to 15 seconds for lease release through endpoint and child cleanup, so immediate `down && up` succeeds or reports `fabric:daemon_stop_timeout` (fault, exit 69) while still stopping (#298).
 
