@@ -425,7 +425,13 @@ impl RuntimePeers {
         };
         let result = (|| -> Result<PeerBook> {
             store.static_input = StaticInput::load(home)?;
-            let exists = store.path.try_exists()?;
+            // A dangling link is an unreadable existing state, not a new
+            // daemon with no state. Never replace it with an empty policy.
+            let exists = match fs::symlink_metadata(&store.path) {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            };
             if exists {
                 use std::os::unix::fs::MetadataExt;
                 let metadata = fs::metadata(&store.path)?;
@@ -1252,6 +1258,21 @@ mod tests {
         assert!(store.snapshot(None)?.fault.is_some());
         Ok(())
     }
+    #[test]
+    fn broken_runtime_symlink_is_a_fault_and_is_never_replaced() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let path = dir.path().join("runtime-peers.toml");
+        let missing = dir.path().join("missing-state.toml");
+        std::os::unix::fs::symlink(&missing, &path)?;
+        let (store, book) = RuntimePeers::open(&home);
+        assert!(store.fault().is_some());
+        assert!(book.peers().is_empty());
+        assert_eq!(fs::read_link(&path)?, missing);
+        assert!(!missing.exists());
+        Ok(())
+    }
+
     #[test]
     fn failed_pre_rename_write_keeps_policy_and_receipts_unchanged() -> Result<()> {
         let dir = tempfile::tempdir()?;
