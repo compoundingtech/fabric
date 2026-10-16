@@ -57,6 +57,8 @@ there is no implicit echo, shell, exec, prefix, or future-service grant.
 Directions are `normal`, `inbound_only`, and `dial_only`. An inbound-only node is
 never dialled, probed, announced to, or retried by this daemon. A dial-only node
 cannot carry inbound grants. A conflicting source is refused explicitly.
+Switching between the two opposite directions requires removing and re-adding
+the owner's record in one batch; the replacement starts with no grants.
 Optional `addr` is the existing EndpointAddr JSON address hint and must identify
 the same NodeID. Mutations do not interpret membership signatures.
 

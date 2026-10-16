@@ -971,6 +971,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn withdrawal_ends_a_mux_admission_waiting_for_tunnel_hello() -> Result<()> {
+        let _serial = SERIAL.lock().await;
+        let server_dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let home = FabricHome::new(server_dir.path());
+        let client_home = FabricHome::new(client_dir.path());
+        let server = FabricNode::start_with_daemon_options(home.clone(), options()).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_server(&client_home, &client, &server).await?;
+        let (echo, task) = echo_server().await?;
+        server.expose_tcp("work/0", echo).await?;
+        mutate(
+            &home,
+            "install",
+            0,
+            vec![add(&client, "client"), grant(&client, &["work/0"])],
+        )
+        .await?;
+        // Ready admits the logical stream; never send its tunnel Hello.
+        // Keeping trust means revocation cannot rely on closing the whole mux.
+        let mut stream = client.state().open_stream("server", b"work/0").await?;
+        mutate(&home, "withdraw", 1, vec![grant(&client, &[])]).await?;
+        let receipt = cancellation(&home, "withdraw").await?;
+        assert_eq!(receipt.cancellation.state, CancellationState::Complete);
+        assert!(!receipt.cancellation.admissions.is_empty());
+        assert!(receipt.cancellation.sessions.is_empty());
+        let mut byte = [0];
+        let ended = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte)).await?;
+        assert!(!matches!(ended, Ok(1..)));
+        client.shutdown().await?;
+        server.shutdown().await?;
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn waiting_for_policy_storage_keeps_control_responsive() -> Result<()> {
         let _serial = SERIAL.lock().await;
         let dir = tempfile::tempdir()?;

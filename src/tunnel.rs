@@ -1748,6 +1748,7 @@ impl ServerSessionStore {
         target: ServerTarget,
         resume: bool,
         grant: Grant,
+        revoked: &CancellationToken,
     ) -> Result<(Arc<TunnelSession>, bool)> {
         self.reap_expired(self.detached_ttl).await;
         if let Some(session) = self.get(session_id).await {
@@ -1760,7 +1761,25 @@ impl ServerSessionStore {
         self.evict_to_make_room(peer_id).await;
         self.ensure_room_for(peer_id).await?;
 
-        let (session, local_read) = create_server_session(session_id, peer_id, target).await?;
+        let (session, local_read) = tokio::select! {
+            biased;
+            _ = revoked.cancelled() => {
+                return Err(FabricError::new(ErrorCode::PeerNotPermittedForService,
+                    "tunnel admission revoked before session creation").into());
+            }
+            created = create_server_session(session_id, peer_id, target) => created?,
+        };
+        // Creation may have finished on the same poll as the withdrawal. End
+        // its owned work before dropping the admission, including late spawns.
+        if revoked.is_cancelled() {
+            session.close_for_eviction().await;
+            session.cleanup_done.cancelled().await;
+            return Err(FabricError::new(
+                ErrorCode::PeerNotPermittedForService,
+                "tunnel admission revoked during session creation",
+            )
+            .into());
+        }
         let _ = session.grant.set(grant);
         session.state.lock().await.drain_server_output = true;
         match self.insert_created(session.clone()).await {
@@ -2120,11 +2139,17 @@ async fn serve_connection_inner(
     attach_drop_closer(&connection, drop_rx);
     let health =
         connections.map(|connections| AttachConnectionHealth::new(connections, &connection));
+    let revoked = admission.revoked();
+    let hello = tokio::select! {
+        biased;
+        _ = revoked.cancelled() => return Ok(()),
+        hello = read_frame(&mut recv) => hello?,
+    };
     let Some(Frame::Hello {
         session_id,
         recv_next,
         resume,
-    }) = read_frame(&mut recv).await?
+    }) = hello
     else {
         bail!("tunnel client did not send hello");
     };
@@ -2137,6 +2162,7 @@ async fn serve_connection_inner(
             target,
             resume,
             admission.grant().clone(),
+            &revoked,
         )
         .await
     {
@@ -2726,6 +2752,7 @@ mod tests {
                 ServerTarget::Tcp { addr },
                 false,
                 Grant::Trust,
+                &CancellationToken::new(),
             )
             .await
             .unwrap();
@@ -2772,6 +2799,7 @@ mod tests {
                     ServerTarget::Tcp { addr: addr.clone() },
                     false,
                     Grant::Trust,
+                    &CancellationToken::new(),
                 )
                 .await
                 .unwrap();
@@ -2941,6 +2969,7 @@ mod tests {
                 },
                 true,
                 Grant::Trust,
+                &CancellationToken::new(),
             )
             .await
             .unwrap_err();
@@ -3309,6 +3338,7 @@ mod tests {
                 ServerTarget::UnixSocket { path, header: None },
                 false,
                 Grant::Trust,
+                &CancellationToken::new(),
             )
             .await
             .unwrap();

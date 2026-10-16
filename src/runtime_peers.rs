@@ -706,6 +706,15 @@ impl RuntimePeers {
                             peer.name = name.clone();
                         }
                         if let Some(direction) = direction {
+                            if matches!(
+                                (Direction::of(peer), direction),
+                                (Direction::InboundOnly, Direction::DialOnly)
+                                    | (Direction::DialOnly, Direction::InboundOnly)
+                            ) {
+                                return Err(invalid(
+                                    "replace an opposite-direction record with remove_peer and add_peer in one batch",
+                                ));
+                            }
                             direction.apply(peer);
                         }
                         if addr.is_some() {
@@ -1297,6 +1306,29 @@ mod tests {
                 .prepare(&tx("a", "dial-grant", 1, vec![dial, grants(2, &["exec"])]))
                 .is_err()
         );
+        let opposite = Operation::AddPeer {
+            node_id: id(1),
+            name: Some("phone".into()),
+            direction: Some(Direction::DialOnly),
+            addr: None,
+        };
+        assert!(
+            store
+                .prepare(&tx("a", "flip", 1, vec![opposite.clone(), grants(1, &[])]))
+                .is_err()
+        );
+        let replaced = commit(
+            &mut store,
+            &tx(
+                "a",
+                "replace-direction",
+                1,
+                vec![Operation::RemovePeer { node_id: id(1) }, opposite],
+            ),
+        )?;
+        assert_eq!(replaced.committed_revision, 2);
+        assert_eq!(replaced.affected[0].direction, Direction::DialOnly);
+        assert!(replaced.affected[0].services.is_empty());
         Ok(())
     }
     #[test]
