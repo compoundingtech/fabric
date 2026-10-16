@@ -2426,6 +2426,9 @@ impl DaemonState {
                 echo_denied: false,
                 inbound_only: true,
                 reachable: self.peer_connections.connection(peer.id).await.is_some(),
+                measured: None,
+                probe_outcome: None,
+                probe_code: None,
                 bytes: None,
                 round_trip_micros: None,
                 transport: None,
@@ -2467,6 +2470,9 @@ impl DaemonState {
                 inbound_only: false,
                 echo_denied: false,
                 reachable: true,
+                measured: Some("echo".into()),
+                probe_outcome: None,
+                probe_code: None,
                 bytes: Some(pong.bytes),
                 round_trip_micros: Some(pong.round_trip.as_micros().try_into().unwrap_or(u64::MAX)),
                 transport: pong.transport,
@@ -2482,6 +2488,9 @@ impl DaemonState {
                 inbound_only: false,
                 echo_denied: true,
                 reachable: true,
+                measured: Some("echo".into()),
+                probe_outcome: None,
+                probe_code: None,
                 bytes: None,
                 round_trip_micros: None,
                 transport: None,
@@ -2494,6 +2503,9 @@ impl DaemonState {
                 inbound_only: false,
                 echo_denied: false,
                 reachable: false,
+                measured: Some("echo".into()),
+                probe_outcome: None,
+                probe_code: None,
                 bytes: None,
                 round_trip_micros: None,
                 transport: None,
@@ -2506,6 +2518,9 @@ impl DaemonState {
                 inbound_only: false,
                 echo_denied: false,
                 reachable: false,
+                measured: Some("echo".into()),
+                probe_outcome: None,
+                probe_code: None,
                 bytes: None,
                 round_trip_micros: None,
                 transport: None,
@@ -10705,6 +10720,10 @@ mod tests {
 
         assert_eq!(statuses.len(), 1);
         assert!(statuses[0].inbound_only);
+        assert!(
+            statuses[0].measured.is_none(),
+            "an inbound-only peer has no sampled service"
+        );
         assert!(!statuses[0].reachable, "{:?}", statuses[0]);
         assert!(statuses[0].error.is_none(), "{:?}", statuses[0]);
         assert_eq!(
@@ -10781,6 +10800,8 @@ mod tests {
                 status.echo_denied,
                 "{case}: the refusal was not recorded: {status:?}"
             );
+            assert_eq!(status.measured.as_deref(), Some("echo"));
+            assert!(status.probe_outcome.is_none() && status.probe_code.is_none());
             assert!(status.error.is_none(), "{case}: {status:?}");
             assert!(status.round_trip_micros.is_none() && status.transport.is_none());
 

@@ -27,7 +27,8 @@ a new key may be added, so read objects by key and ignore keys you do not know.
 | `send-file` | `{"ok": true, "peer", "name", "bytes"}` |
 | `reload-peers` | `{"ok": true}` |
 
-`peer-events` already prints one JSON object per line and is unchanged. `exec`
+`peer-events` continues to print one JSON object per line; its optional session
+evidence is described below. `exec`
 streams the remote command's own output and returns its exit status, so
 `--json` changes only how a failure of `exec` itself is reported.
 
@@ -43,6 +44,67 @@ availability, latency, or transport. No additional echo grant is needed to
 measure a permitted service: use `fabric probe PEER SERVICE --json` and read its
 `protocol`, `outcome`, `transport`, and `round_trip_micros`. That probe describes
 one protocol sample, not the route of every application session.
+
+## Service-specific status samples
+
+Each status peer has `measured`, naming the service used for its latency and
+transport sample. The default is `"echo"`. An inbound-only peer is never dialed
+or probed and has `measured: null`; a reply from an older daemon without this
+field also decodes as null, meaning the measurement service is unknown.
+
+`fabric status --probe-service SERVICE --json` takes one fresh sample of that
+exact service for each dialable peer, using its existing grants. Its `measured`
+is the requested service, and `probe_outcome` is `supported`, `unsupported`,
+`unreachable`, `timeout`, or `error` (a local control/request failure).
+`probe_code` retains a failure code when supplied. An inbound-only peer instead
+has `measured: null` and `probe_outcome: "not_probed"`. Without this option,
+`probe_outcome` and `probe_code` are null; the cached echo health keeps its
+existing `reachable` and `echo_denied` fields.
+
+An exact-service sample replaces the echo RTT, transport, and error evidence;
+on failure its RTT and transport are null. It leaves cached `reachable` and
+`echo_denied` facts alone: a refusal from one service does not make the peer
+offline, and a successful service probe does not grant echo. `measured` always
+names the service the sample used, never the route of other services or a
+particular application session. The exact-service RTT measures stream admission,
+not the execution time of an application request. Probes do not create resumable
+session records.
+
+## Session path evidence
+
+`status --json` includes `sessions`, the live resumable tunnel sessions known to
+this daemon. `peer-events` adds `session_attached` and `session_closed` events
+with a `session` object of the same shape. Each successful resume produces
+another attach event for the same `session_id`; completion produces one close
+event. The bounded event journal can discard older events: use its existing
+cursor/reset contract rather than treating it as a durable audit log.
+
+Each session records `peer_id`, local `direction` (`inbound` or `outbound`),
+`attached`, `attach_count`, `active_attaches`, `path_at_attach`, `current_path`,
+`path_at_close`, `path_changes`, and `missed_path_events`. `path_at_attach` is the
+most recent accepted attach, and `current_path` is the latest observation for
+that attach, retained while detached. A path snapshot contains the daemon-local
+`connection_id`, `class` (`direct`, `relay`, `mixed`, or null), `remote_addr`, and
+`remote_addrs`. Addresses appear in local JSON output; path tracing records
+carry counts and classes without remote or local addresses.
+
+Only selected paths contribute to the class and remote addresses. A direct
+address is an IP socket address; a relay address is a relay URL. Exactly one
+selected remote fills `remote_addr`; several selected remotes appear in
+`remote_addrs` with `remote_addr: null`. No known selection means `class: null`,
+`remote_addr: null`, and an empty array. An unavailable attach/close observation
+is null rather than an inferred path. A close after its connection disappeared
+can therefore have `path_at_close: null` while retaining the earlier sample.
+
+These are observations of the shared connection at attach, at close, and when
+the selected-path watcher reports a change. They do not prove the route of every
+byte. `path_changes` counts observed changes of selected connection/path
+identity, including replacement on resume and changes between paths with the
+same remote address. `missed_path_events` reports lost watcher notifications;
+when nonzero, the change count is incomplete. Session events do not change
+cached peer liveness, and a session closing does not imply the peer is offline.
+The attach/resume/close reply shape is pinned in
+`tests/golden/json/session_path_events.json`.
 
 ## Provisional runtime-peer control replies
 

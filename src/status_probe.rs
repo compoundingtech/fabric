@@ -27,6 +27,18 @@ pub(super) struct ServiceSample {
 }
 
 impl ServiceSample {
+    /// Replace only measurement evidence. Cached peer liveness and echo
+    /// permission remain independent facts, including on service refusal.
+    pub(super) fn apply(self, peer: &mut PeerReachability) {
+        peer.measured = self.measured;
+        peer.probe_outcome = Some(self.outcome);
+        peer.probe_code = self.code;
+        peer.bytes = None;
+        peer.round_trip_micros = self.round_trip_micros;
+        peer.transport = self.transport;
+        peer.error = self.error;
+    }
+
     fn empty(measured: Option<String>, outcome: &str) -> Self {
         Self {
             measured,
@@ -246,6 +258,26 @@ mod tests {
         assert_eq!(samples["incoming"].measured, None);
         assert_eq!(samples["incoming"].outcome, "not_probed");
         assert_eq!(samples["allowed"].measured.as_deref(), Some("work/0"));
+        let mut cached = peer("denied", false);
+        cached.echo_denied = true;
+        samples["denied"].clone().apply(&mut cached);
+        assert!(
+            cached.reachable,
+            "a service refusal must not turn cached liveness into an outage"
+        );
+        assert!(
+            cached.echo_denied,
+            "the independent echo permission fact must be preserved"
+        );
+        assert_eq!(cached.measured.as_deref(), Some("work/0"));
+        assert_eq!(cached.probe_outcome.as_deref(), Some("unreachable"));
+        assert_eq!(
+            cached.probe_code.as_deref(),
+            Some("peer_not_permitted_for_service")
+        );
+        assert_eq!(cached.bytes, None);
+        assert_eq!(cached.round_trip_micros, None);
+        assert_eq!(cached.transport, None);
         daemon.await??;
         Ok(())
     }

@@ -326,6 +326,16 @@ pub struct PeerReachability {
     #[serde(default)]
     pub echo_denied: bool,
     pub reachable: bool,
+    /// The service sampled for these latency/transport values. Null means no
+    /// sample (inbound-only), or a reply from a daemon predating this field.
+    #[serde(default)]
+    pub measured: Option<String>,
+    /// Set by a fresh exact-service status probe; cached echo health retains
+    /// its existing reachable/echo_denied fields instead.
+    #[serde(default)]
+    pub probe_outcome: Option<String>,
+    #[serde(default)]
+    pub probe_code: Option<String>,
     pub bytes: Option<usize>,
     pub round_trip_micros: Option<u64>,
     pub transport: Option<String>,
