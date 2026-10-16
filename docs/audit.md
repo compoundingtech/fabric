@@ -32,6 +32,9 @@ are recorded before reading denied argv: `argv` is null and the existing
 refusal code is retained. A handshake refusal can precede the mux target, so
 its service and session identity are unavailable; the service stays null and
 the record uses a fresh audit correlation ID.
+A dial waiting for capacity can retry before attachment; each server-side
+refusal is an attempt and remains visible under the same tunnel session ID,
+even if a later attempt starts the command.
 
 Fields include UTC time, authenticated caller NodeID, local label, service
 (`exec`, `shell`, or the exposure name), exec argv, session ID, exit status,
