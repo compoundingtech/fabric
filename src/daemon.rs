@@ -11433,20 +11433,31 @@ mod tests {
             Duration::from_secs(5 * 60),
             Duration::from_secs(4 * 60 * 60),
         ] {
-            let mut online = tokio::net::TcpStream::connect(&addr).await?;
-            online.write_all(b"x").await?;
+            let mut online = tokio::net::TcpStream::connect(&addr)
+                .await
+                .with_context(|| format!("outage={outage:?}: initial readiness connect"))?;
+            online
+                .write_all(b"x")
+                .await
+                .with_context(|| format!("outage={outage:?}: initial readiness write"))?;
             let mut byte = [0u8; 1];
-            tokio::time::timeout(Duration::from_secs(3), online.read_exact(&mut byte)).await??;
+            tokio::time::timeout(Duration::from_secs(3), online.read_exact(&mut byte))
+                .await
+                .with_context(|| format!("outage={outage:?}: initial readiness read timed out"))?
+                .with_context(|| format!("outage={outage:?}: initial readiness read"))?;
             drop(online);
             let peer = a.id();
-            a.shutdown().await?;
+            a.shutdown()
+                .await
+                .with_context(|| format!("outage={outage:?}: stop peer before outage"))?;
             let state = b.state();
             tokio::time::timeout(Duration::from_secs(3), async {
                 while !state.peer_connections.presence.offline(peer) {
                     tokio::task::yield_now().await;
                 }
             })
-            .await?;
+            .await
+            .with_context(|| format!("outage={outage:?}: wait for offline presence"))?;
             let failures_before = state
                 .telemetry
                 .peer("server")
@@ -11472,7 +11483,9 @@ mod tests {
                 "absence was counted as a failure"
             );
             let returned = Instant::now();
-            a = FabricNode::start(a_home.clone()).await?;
+            a = FabricNode::start(a_home.clone())
+                .await
+                .with_context(|| format!("outage={outage:?}: restart peer"))?;
             tokio::time::timeout(Duration::from_secs(3), async {
                 loop {
                     if !state.peer_connections.presence.offline(peer) {
@@ -11480,13 +11493,20 @@ mod tests {
                     }
                     tokio::task::yield_now().await;
                 }
-                let mut live = tokio::net::TcpStream::connect(&addr).await?;
-                live.write_all(b"y").await?;
-                live.read_exact(&mut byte).await?;
+                let mut live = tokio::net::TcpStream::connect(&addr)
+                    .await
+                    .with_context(|| format!("outage={outage:?}: post-return connect"))?;
+                live.write_all(b"y")
+                    .await
+                    .with_context(|| format!("outage={outage:?}: post-return write"))?;
+                live.read_exact(&mut byte)
+                    .await
+                    .with_context(|| format!("outage={outage:?}: post-return read"))?;
                 assert_eq!(byte, *b"y");
                 Ok::<_, anyhow::Error>(())
             })
-            .await??;
+            .await
+            .with_context(|| format!("outage={outage:?}: wait for online presence and return reply"))??;
             assert!(returned.elapsed() < Duration::from_secs(5));
             println!(
                 "outage={outage:?} virtual; real return tunnel={:?}",
