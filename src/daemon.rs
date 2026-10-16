@@ -412,27 +412,24 @@ impl EndpointHooks for AllowListHook {
         if policy.accepts_inbound(&conn.remote_id()) {
             AfterHandshakeOutcome::Accept
         } else {
-            // The handshake identifies the peer before any argv or mux request
-            // is read. A mux target is unknown here and stays null in the audit.
-            let peer = conn.remote_id().to_string();
-            let service = self
+            // Do not let unrelated ALPNs or rotating-key floods fill the audit
+            // queue. Denied input is never read to discover a mux target.
+            if let Some(service) = self
                 .services
                 .find(conn.alpn())
                 .map(|(service, _)| service.name())
                 .filter(|name| matches!(*name, "exec" | "shell"))
-                .map(str::to_string);
-            self.audit
-                .call(
-                    peer.clone(),
+            {
+                self.audit.preauth_refused(
+                    conn.remote_id().to_string(),
                     policy
                         .peers()
                         .iter()
                         .find(|entry| entry.id == conn.remote_id())
                         .and_then(|entry| entry.name.clone()),
                     service,
-                    crate::audit::Kind::Exec,
-                )
-                .refused(ErrorCode::PeerNotInAllowList);
+                );
+            }
             AfterHandshakeOutcome::Reject {
                 error_code: VarInt::from_u32(403),
                 reason: ErrorCode::PeerNotInAllowList
@@ -8639,6 +8636,102 @@ mod tests {
         assert!(starts[0].argv.is_none() && ends[0].argv.is_none());
         let text = serde_json::to_string(&records)?;
         assert!(!text.contains("private-6942") && !text.contains("AUDIT_MARK"));
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit_rejected_handshake_flood_preserves_legitimate_exec_start_and_end() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let server_home = FabricHome::new(temp.path().join("server"));
+        let client_home = FabricHome::new(temp.path().join("client"));
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let records = output.clone();
+        let mut first = true;
+        let audit = crate::audit::Audit::with_sink(16, 65536, move |record| {
+            if first {
+                first = false;
+                release_rx.recv().unwrap();
+            }
+            records.lock().unwrap().push(record.clone());
+            Ok(())
+        });
+        let server = FabricNode::start_with_audit(
+            server_home.clone(),
+            DaemonOptions::default(),
+            services::builtin(&server_home),
+            Some(audit.clone()),
+        )
+        .await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+        client.ping("server").await?;
+        // Each endpoint has a different authenticated key. Also reject echo:
+        // unrelated ALPNs must not consume audit capacity at all.
+        for _ in 0..32 {
+            let untrusted = Endpoint::builder(presets::N0)
+                .relay_mode(iroh::RelayMode::Disabled)
+                .bind()
+                .await?;
+            for alpn in [exec::EXEC_ALPN, BUILTIN_ECHO_ALPN] {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    untrusted.connect(server.addr(), alpn),
+                )
+                .await?;
+                let text = match result {
+                    Ok(connection) => format!(
+                        "{}",
+                        tokio::time::timeout(Duration::from_secs(3), connection.closed()).await?
+                    ),
+                    Err(error) => format!("{error:#}"),
+                };
+                assert!(text.contains("fabric:peer_not_in_allow_list"), "{text}");
+            }
+            untrusted.close().await;
+        }
+        assert_eq!(audit.status().dropped_records, 0);
+        assert!(audit.status().queued_records <= 4);
+        let path = client.state().dial_service("server", "exec").await?;
+        let mut stream = UnixStream::connect(path).await?;
+        exec::write_client_argv(
+            &mut stream,
+            &["/bin/sh".into(), "-c".into(), "printf ready".into()],
+        )
+        .await?;
+        let (stdout, code) =
+            tokio::time::timeout(Duration::from_secs(3), collect_exec(&mut stream)).await??;
+        assert_eq!(stdout, b"ready");
+        assert_eq!(code, 0);
+        assert_eq!(audit.status().dropped_records, 0);
+        release_tx.send(())?;
+        assert!(audit.drain(Duration::from_secs(3)).await);
+        let records = output.lock().unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| matches!(r, crate::audit::Record::ExecStart(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| matches!(r, crate::audit::Record::ExecEnd(_)))
+                .count(),
+            1
+        );
+        assert!(
+            records
+                .iter()
+                .filter_map(|r| r.call())
+                .all(|r| r.service.as_deref() == Some("exec"))
+        );
+        drop(records);
         client.shutdown().await?;
         server.shutdown().await?;
         Ok(())

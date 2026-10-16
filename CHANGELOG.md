@@ -23,7 +23,9 @@ Deprecated, Fixed or Security.
   Shell events retain no keystrokes. A dedicated bounded writer fails open,
   reports loss summaries, rotates private files, and exposes its running loss
   counter in `status --json` and `fabric audit`; the reader supports time and
-  peer filters and a documented JSON shape (#315).
+  peer filters and a documented JSON shape. Encoded argv snapshots, retained
+  reader results and pre-auth refusal traffic are bounded; truncation and
+  refusal coalescing have explicit metadata (#315).
 
 - **Provisional:** opt-in `--runtime-peers` control API persists owner-scoped exact grants, atomic replacement batches, policy revisions and durable request/cancellation receipts without editing static peer input (#312).
 

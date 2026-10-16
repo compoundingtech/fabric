@@ -1,5 +1,6 @@
 {
   "audit": null,
+  "limit": 10000,
   "malformed_records": 1,
   "records": [
     {
@@ -26,5 +27,6 @@
       "last_time": "2026-10-16T00:00:01Z",
       "time": "2026-10-16T00:00:02Z"
     }
-  ]
+  ],
+  "truncated": false
 }

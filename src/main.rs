@@ -90,6 +90,9 @@ enum Commands {
         /// Filter by caller NodeID or the local name recorded for that call.
         #[arg(long)]
         peer: Option<String>,
+        /// Maximum newest records (also bounded to 16 MiB of encoded lines).
+        #[arg(long, default_value_t = fabric::audit::DEFAULT_READ_LIMIT as u32, value_parser = clap::value_parser!(u32).range(1..=100_000))]
+        limit: u32,
     },
     /// List trusted peers and their service grants.
     Peers,
@@ -639,7 +642,11 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                     response => bail!("unexpected daemon response: {response:?}"),
                 },
-                Commands::Audit { since, peer } => {
+                Commands::Audit {
+                    since,
+                    peer,
+                    limit,
+                } => {
                     let since = since
                         .as_deref()
                         .map(parse_audit_duration)
@@ -653,7 +660,12 @@ async fn run(cli: Cli) -> Result<()> {
                             })
                         })
                         .transpose()?;
-                    let records = fabric::audit::read(home.root(), since, peer.as_deref())?;
+                    let records = fabric::audit::read_with_limit(
+                        home.root(),
+                        since,
+                        peer.as_deref(),
+                        limit as usize,
+                    )?;
                     let audit = match tokio::time::timeout(
                         Duration::from_millis(500),
                         send_control(&home, ControlRequest::Status),
@@ -664,10 +676,17 @@ async fn run(cli: Cli) -> Result<()> {
                         _ => None,
                     };
                     if json {
-                        print_json(
-                            &serde_json::json!({ "records": records.records, "audit": audit,
-                            "malformed_records": records.malformed_records }),
-                        )?;
+                        #[derive(serde::Serialize)]
+                        struct Response<'a> {
+                            #[serde(flatten)]
+                            history: &'a fabric::audit::AuditRead,
+                            audit: Option<&'a fabric::audit::AuditStatus>,
+                        }
+                        let response = Response {
+                            history: &records,
+                            audit: audit.as_ref(),
+                        };
+                        println!("{}", String::from_utf8(fabric::audit::encode(&response)?)?);
                     } else {
                         print_audit(&records, audit.as_ref())?;
                     }
@@ -2486,7 +2505,13 @@ fn print_audit(
     }
     for record in &records.records {
         // JSON lines retain argv boundaries without printing shell keystrokes.
-        println!("{}", serde_json::to_string(record)?);
+        println!("{}", String::from_utf8(fabric::audit::encode(record)?)?);
+    }
+    if records.truncated {
+        eprintln!(
+            "fabric: audit history truncated to newest {} records / 16 MiB",
+            records.limit
+        );
     }
     if records.malformed_records != 0 {
         eprintln!(
