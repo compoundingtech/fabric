@@ -840,6 +840,21 @@ next redundant health probe for that peer.
 A peer is listed on probe evidence alone, so a healthy peer that has never
 dropped a session still shows its paths.
 
+Daemon diagnostics use dedicated writer threads. Validation output has a queue
+of 4,096 records plus one being written, bounded to 4 MiB including that record;
+stderr has 1,024 queued records plus one, bounded to 1 MiB. Producers drop a
+record when either bound is full, when it exceeds the byte bound, or when a
+write fails. The writer reports the accumulated dropped-record count when the
+sink recovers. CLI output remains synchronous.
+
+Connection telemetry replaces one pending snapshot with the latest counters;
+serialization, writing and atomic rename run on a separate thread, outside the
+in-memory counters mutex. Failed writes retry the latest snapshot. Shutdown
+allows up to one second for telemetry and another half-second for diagnostics;
+a stalled disk does not extend these waits. Abrupt exit can lose queued log
+records, pending loss summaries and telemetry updates that have not reached
+disk. These files provide best-effort diagnostics rather than durable auditing.
+
 ### Fabric deletes its own old logs
 
 The daemon writes one validation log per day to `<home>/logs/` and **keeps the
