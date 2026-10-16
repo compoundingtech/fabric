@@ -1504,6 +1504,8 @@ pub struct DialOptions {
         skip_serializing_if = "is_default_dial_queue_timeout_ms"
     )]
     pub queue_timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub error_preface: bool,
 }
 
 fn default_dial_queue_timeout_ms() -> u64 {
@@ -1517,6 +1519,7 @@ impl Default for DialOptions {
     fn default() -> Self {
         Self {
             queue_timeout_ms: DEFAULT_DIAL_QUEUE_TIMEOUT_MS,
+            error_preface: false,
         }
     }
 }
@@ -1540,7 +1543,10 @@ impl DialOptions {
                 "positive queue timeout must be at least one millisecond".into(),
             ));
         }
-        let options = Self { queue_timeout_ms };
+        let options = Self {
+            queue_timeout_ms,
+            ..Self::default()
+        };
         options.validate()?;
         Ok(options)
     }

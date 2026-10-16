@@ -3766,6 +3766,7 @@ mod supervisor_failure_tests {
                     active_dial_handlers: 0,
                     max_dial_handlers: 32,
                     dial_restore_failures: Vec::new(),
+                    dials: Vec::new(),
                 };
                 let _ = stream
                     .write_all(&serde_json::to_vec(&reply).unwrap())

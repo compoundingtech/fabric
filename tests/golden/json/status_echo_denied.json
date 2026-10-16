@@ -10,6 +10,7 @@
   },
   "dial_restore_failures": [],
   "dial_sockets": [],
+  "dials": [],
   "endpoint_addr": "<ENDPOINT_ADDR>",
   "exposed_protocols": [],
   "node_id": "<CLIENT_ID>",

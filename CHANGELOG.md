@@ -16,6 +16,14 @@ Deprecated, Fixed or Security.
 
 ## [Unreleased]
 
+### Added
+
+- Generic dial refusals and faults appear in `status --json` as
+  `dials[].last_error {code, class, at}`. A saved `--error-preface` opt-in writes
+  one coded line before closing only if no service output reached the local
+  client; default streams and streams that already carried output receive no
+  extra bytes (#302).
+
 ## [0.9.1] - 2026-10-16
 
 ### Added

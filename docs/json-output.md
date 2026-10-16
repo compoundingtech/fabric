@@ -20,7 +20,7 @@ a new key may be added, so read objects by key and ignore keys you do not know.
 | `addr` | the daemon's `EndpointAddr` object (`{"id": ..., "addrs": [...]}`), with or without `--json`; it was JSON before the flag existed |
 | `peers` | `{"peers": [{"node", "name" (or null), "allow": [...], "dial_only", "inbound_only", "roaming"}]}` |
 | `probe PEER PROTOCOL` | `{"peer", "peer_id", "protocol", "outcome", "round_trip_micros", "transport", "error", "code", "class"}`; `outcome` is `supported`, `unsupported`, `unreachable` or `timeout`, and the exit status is unchanged |
-| `status` | `{"version", "node_id", "endpoint_addr", "exposed_protocols", "dial_sockets", "audit": {"dropped_records", "queued_records", "since"} (or null), "dial_restore_failures": [{"peer", "protocol", "tcp", "code", "class", "error"}], "dial_handlers": {"active", "max"}, "sync_runtime": {"owner", "companion"}, "peers": [{"id", "name", "reachable", "echo_denied", "inbound_only", "roaming", "round_trip_micros", "transport", "error"}]}`; connection telemetry is not part of it. A peer that trusts this machine but has not granted it `echo` is `reachable: true` with `echo_denied: true`, `error: null` and no round trip or transport |
+| `status` | `{"version", "node_id", "endpoint_addr", "exposed_protocols", "dial_sockets", "audit": {"dropped_records", "queued_records", "since"} (or null), "dials": [{"peer", "protocol", "socket" or "tcp", "last_error": null or {"code", "class", "at"}}], "dial_restore_failures": [{"peer", "protocol", "tcp", "code", "class", "error"}], "dial_handlers": {"active", "max"}, "sync_runtime": {"owner", "companion"}, "peers": [{"id", "name", "reachable", "echo_denied", "inbound_only", "roaming", "round_trip_micros", "transport", "error"}]}`; connection telemetry is not part of it. A peer that trusts this machine but has not granted it `echo` is `reachable: true` with `echo_denied: true`, `error: null` and no round trip or transport |
 | `audit` | `{"records": [...], "audit": {"dropped_records", "queued_records", "since"} (or null), "malformed_records": N, "truncated": bool, "limit": N}`; records and limitations are described in [audit.md](audit.md) |
 | `dial PEER PROTOCOL` | `{"socket": "<path>"}` |
 | `dial PEER PROTOCOL --tcp ADDR` | `{"address": "<host:port>"}` |
@@ -37,6 +37,17 @@ at startup (for example, a Unix socket path that is too long or a TCP port now
 held by another process). The daemon keeps running and restores its other
 listeners. The declaration stays in `config.toml` for a later restart; repairing
 and successfully dialing it, or `undial`, clears its failure from status.
+
+`dials` describes active local Unix and TCP listeners. `peer` is the stable peer
+identity; the endpoint is `socket` for Unix or `tcp` for TCP. For generic byte
+tunnels, `last_error` is the latest session or admission failure in this daemon
+run, even without `--error-preface`. `at` is its RFC 3339 UTC timestamp. It is
+`null` before a failure, resets when the listener is replaced or the daemon
+restarts, and remains after successful sessions. Concurrent sessions share
+this history: it is not a request-specific result or proof of current service
+authorization. Registered service sockets use their own framing and do not
+populate this generic tunnel history. Older daemon replies default `dials` to
+an empty array. `probe --json` remains the older-daemon fallback.
 
 The peer latency and transport in `status` measure the built-in echo protocol.
 When `echo_denied` is true, their null values say nothing about another service's

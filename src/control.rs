@@ -155,6 +155,25 @@ fn default_persist() -> bool {
     true
 }
 
+/// The latest failure observed by a local dial listener in this daemon run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DialLastError {
+    pub code: String,
+    pub class: String,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DialStatus {
+    pub peer: String,
+    pub protocol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub socket: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tcp: Option<String>,
+    pub last_error: Option<DialLastError>,
+}
+
 /// A configured listener skipped at daemon startup. The declaration remains
 /// in config so it can be retried after its path or port is repaired.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,6 +215,8 @@ pub enum ControlResponse {
         endpoint_addr: serde_json::Value,
         exposed_protocols: Vec<String>,
         dial_sockets: Vec<PathBuf>,
+        #[serde(default)]
+        dials: Vec<DialStatus>,
         allow_shell: bool,
         #[serde(default)]
         allow_exec: bool,
@@ -573,6 +594,7 @@ mod tests {
             active_dial_handlers: 0,
             max_dial_handlers: 32,
             dial_restore_failures: Vec::new(),
+            dials: Vec::new(),
         };
 
         let bytes = serde_json::to_vec(&response)

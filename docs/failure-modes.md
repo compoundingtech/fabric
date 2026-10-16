@@ -101,9 +101,14 @@ Built-in exec and shell one-shot calls share the same local budget and fixed
 cleanup. This does not retry remote service refusals. Queue expiry or overflow
 produces a framed exec error, or closes shell, and logs the capacity code.
 
-**NOT FIXED:** a full queue or expired deadline still closes the local socket
-without a reason on the data path; `fabric:session_limit_reached` is in the daemon's log. The
-short-session wind-down is also unchanged. The table records the local replay
+A full queue or expired deadline closes the local socket and records
+`fabric:session_limit_reached` in the daemon log and `dials[].last_error` in
+`status --json`. Generic dials can opt into a saved `--error-preface`: before
+any service output, a refusal or fault writes one coded line and closes. The
+default adds no bytes, and failures after service output never append a line.
+The last error is listener history, retained after successes until the listener
+is replaced or the daemon restarts. It is not current authorization. Use
+`probe --json` against an older daemon. The short-session wind-down is unchanged. The table records the local replay
 of [#304](https://github.com/compoundingtech/fabric/issues/304); it does not
 claim a new two-machine or forced-relay measurement.
 

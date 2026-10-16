@@ -279,6 +279,9 @@ enum Commands {
         /// Seconds a generic dial connection may wait for session capacity.
         #[arg(long, default_value = "10")]
         queue_timeout: f64,
+        /// Write a coded error line on failure before any service output.
+        #[arg(long)]
+        error_preface: bool,
     },
     /// Remove durable Unix and TCP listeners for this peer and protocol.
     Undial { peer: String, protocol: String },
@@ -708,6 +711,7 @@ async fn run(cli: Cli) -> Result<()> {
                             active_dial_handlers,
                             max_dial_handlers,
                             dial_restore_failures,
+                            dials,
                             audit,
                         } => {
                             let sync_runtime = match send_control(
@@ -733,6 +737,7 @@ async fn run(cli: Cli) -> Result<()> {
                                     (active_dial_handlers, max_dial_handlers),
                                     &sync_runtime,
                                     &dial_restore_failures,
+                                    &dials,
                                     audit.as_ref(),
                                 ))?;
                                 return Ok(());
@@ -1128,8 +1133,10 @@ async fn run(cli: Cli) -> Result<()> {
                     protocol,
                     tcp,
                     queue_timeout,
+                    error_preface,
                 } => {
-                    let options = DialOptions::from_seconds(queue_timeout)?;
+                    let mut options = DialOptions::from_seconds(queue_timeout)?;
+                    options.error_preface = error_preface;
                     if let Some(bind) = tcp {
                         match send_control(
                             &home,
@@ -2535,6 +2542,7 @@ fn status_json(
     dial_handlers: (usize, usize),
     sync_runtime: &SyncRuntimeStatus,
     dial_restore_failures: &[fabric::control::DialRestoreFailure],
+    dials: &[fabric::control::DialStatus],
     audit: Option<&fabric::audit::AuditStatus>,
 ) -> serde_json::Value {
     let peers: Vec<_> = peers
@@ -2559,6 +2567,7 @@ fn status_json(
         "endpoint_addr": endpoint_addr,
         "exposed_protocols": exposed_protocols,
         "dial_sockets": dial_sockets,
+        "dials": dials,
         "dial_restore_failures": dial_restore_failures,
         "audit": audit,
         "dial_handlers": { "active": dial_handlers.0, "max": dial_handlers.1 },
