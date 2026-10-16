@@ -284,13 +284,26 @@ async fn abrupt_daemon_death(check_cleanup: bool, is_shell: bool) -> Result<()> 
 }
 
 #[tokio::test]
-async fn failed_child_storage_preserves_control_and_echo_but_never_executes_user_code() -> Result<()>
-{
+async fn unwritable_child_storage_keeps_exec_control_and_echo_available() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let server_home = FabricHome::new(temp.path().join("server"));
     let client_home = FabricHome::new(temp.path().join("client"));
     std::fs::create_dir_all(server_home.root())?;
-    std::fs::write(server_home.root().join("children"), b"occupied")?;
+    let children_dir = server_home.root().join("children");
+    std::fs::create_dir(&children_dir)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&children_dir, std::fs::Permissions::from_mode(0o500))?;
+    struct RestorePermissions(PathBuf);
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let _restore = RestorePermissions(children_dir.clone());
+    anyhow::ensure!(
+        std::fs::write(children_dir.join("probe"), b"unwritable").is_err(),
+        "fixture must run without permission-bypass capabilities"
+    );
     let server = FabricNode::start(server_home.clone()).await?;
     let client = FabricNode::start(client_home.clone()).await?;
     let mut book = PeerBook::load(&server_home)?;
@@ -313,7 +326,7 @@ async fn failed_child_storage_preserves_control_and_echo_but_never_executes_user
     client.ping("server").await?;
     let socket = client.dial("server", exec::EXEC_PROTOCOL).await?;
     let mut stream = UnixStream::connect(socket).await?;
-    let marker = temp.path().join("must-not-run");
+    let marker = temp.path().join("recovery-command-ran");
     exec::write_client_argv(
         &mut stream,
         &[
@@ -326,23 +339,20 @@ async fn failed_child_storage_preserves_control_and_echo_but_never_executes_user
     )
     .await?;
     let reply = tokio::time::timeout(Duration::from_secs(3), async {
-        let mut refused = false;
         while let Some(frame) = exec::read_server_frame(&mut stream).await? {
             match frame {
-                exec::ServerFrame::Error(message) => {
-                    refused |= message.contains("fabric:spawn_failed")
-                }
+                exec::ServerFrame::Error(message) => bail!("recovery exec failed: {message}"),
                 exec::ServerFrame::Exit(code) => {
-                    anyhow::ensure!(refused && code == 127);
+                    anyhow::ensure!(code == 0);
                     return Ok::<_, anyhow::Error>(());
                 }
                 _ => {}
             }
         }
-        bail!("spawn failure was not returned");
+        bail!("recovery exec did not return an exit status");
     })
     .await?;
-    assert!(!marker.exists());
+    assert_eq!(std::fs::read(&marker)?, b"ran");
     client.shutdown().await?;
     server.shutdown().await?;
     reply

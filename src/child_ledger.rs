@@ -1,5 +1,5 @@
-//! Durable ownership of service children. User code is released only after its
-//! pid, kernel start identity and session identifier are synced by the parent.
+//! Best-effort durable ownership of service children. Storage is bounded so
+//! remote commands remain available when an operator needs to repair the disk.
 use fabric_service_api::child_tracking::{Owner, Record};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -7,11 +7,73 @@ use std::{
     io::{self, Read, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
 const MAX_RECORDS: usize = 4096;
+// Leave most of the existing 20-second spawn budget for the OS. A stalled
+// ownership disk must not hold the only command that can repair it.
+const STORAGE_LIMIT: Duration = Duration::from_millis(250);
+type StorageJob = Box<dyn FnOnce() + Send>;
+static STORAGE: OnceLock<Result<mpsc::SyncSender<StorageJob>, String>> = OnceLock::new();
+
+fn storage<T: Send + 'static>(
+    work: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    let workers = STORAGE.get_or_init(|| {
+        let (send, receive) = mpsc::sync_channel::<StorageJob>(64);
+        let receive = Arc::new(Mutex::new(receive));
+        for n in 0..4 {
+            let receive = receive.clone();
+            std::thread::Builder::new()
+                .name(format!("fabric-child-storage-{n}"))
+                .spawn(move || {
+                    loop {
+                        let Ok(work) = receive.lock().unwrap().recv() else {
+                            break;
+                        };
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+                    }
+                })
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(send)
+    });
+    let (reply, result) = mpsc::sync_channel(1);
+    let expired = Arc::new(AtomicBool::new(false));
+    let skip = expired.clone();
+    workers
+        .as_ref()
+        .map_err(|error| io::Error::other(error.clone()))?
+        .try_send(Box::new(move || {
+            if !skip.load(Ordering::Acquire) {
+                let _ = reply.send(work());
+            }
+        }))
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "child ownership storage queue full",
+            )
+        })?;
+    let result = result.recv_timeout(STORAGE_LIMIT).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("child ownership storage exceeded 250 ms: {error}"),
+        )
+    });
+    expired.store(true, Ordering::Release);
+    result?
+}
+
+#[derive(Debug)]
+struct Unrecorded;
+impl Record for Unrecorded {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Identity {
     boot: String,
@@ -72,7 +134,8 @@ pub(crate) struct Ledger {
 #[derive(Debug)]
 struct Inner {
     dir: PathBuf,
-    fault: Option<String>,
+    warning: Mutex<Option<Instant>>,
+    swept: AtomicBool,
     write: Mutex<()>,
     cleanup: Option<mpsc::SyncSender<Entry>>,
 }
@@ -94,32 +157,9 @@ impl Drop for ChildRecord {
 impl Ledger {
     pub(crate) fn start(root: &Path) -> Self {
         let dir = root.join("children");
-        let opened = Self::open(&dir);
-        match opened {
-            Ok(ledger) => ledger,
-            Err(error) => {
-                tracing::warn!(path = %dir.display(), %error,
-                    "child ownership storage unavailable; child commands will be refused");
-                Self {
-                    inner: Arc::new(Inner {
-                        dir,
-                        fault: Some(error.to_string()),
-                        write: Mutex::new(()),
-                        cleanup: None,
-                    }),
-                }
-            }
-        }
-    }
-    fn open(dir: &Path) -> io::Result<Self> {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
-        Self::sweep(dir)?;
         let (send, recv) = mpsc::sync_channel::<Entry>(1024);
         let path = dir.to_owned();
-        std::thread::Builder::new()
+        let cleanup = std::thread::Builder::new()
             .name("fabric-child-cleanup".into())
             .spawn(move || {
                 let mut pending: Vec<Entry> = Vec::new();
@@ -155,15 +195,51 @@ impl Ledger {
                         pending.clear();
                     }
                 }
-            })?;
-        Ok(Self {
+            });
+        let ledger = Self {
             inner: Arc::new(Inner {
-                dir: dir.into(),
-                fault: None,
+                dir: dir.clone(),
+                warning: Mutex::new(None),
+                swept: AtomicBool::new(false),
                 write: Mutex::new(()),
-                cleanup: Some(send),
+                cleanup: cleanup.as_ref().ok().map(|_| send),
             }),
-        })
+        };
+        if let Err(error) = cleanup {
+            ledger.warn(&error);
+        }
+        let startup = ledger.inner.clone();
+        if let Err(error) = storage(move || {
+            // A slow startup sweep must not discover records from commands
+            // admitted after its wait timed out. Commits share this barrier.
+            let _write = startup.write.lock().unwrap();
+            let result = (|| {
+                fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(&dir)?;
+                Self::sweep(&dir)
+            })();
+            startup.swept.store(true, Ordering::Release);
+            if let Err(error) = &result {
+                Ledger {
+                    inner: startup.clone(),
+                }
+                .warn(error);
+            }
+            result
+        }) {
+            ledger.warn(&error);
+        }
+        ledger
+    }
+    fn warn(&self, error: &io::Error) {
+        let mut last = self.inner.warning.lock().unwrap();
+        if last.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
+            *last = Some(Instant::now());
+            tracing::warn!(path = %self.inner.dir.display(), %error,
+                "child ownership storage unavailable; allowing commands without durable crash cleanup");
+        }
     }
     fn sweep(dir: &Path) -> io::Result<()> {
         let mut selected = Vec::new();
@@ -228,11 +304,29 @@ impl Ledger {
 }
 impl Owner for Ledger {
     fn before_exec(&self, pid: u32, session: &str) -> io::Result<Box<dyn Record>> {
-        if let Some(fault) = &self.inner.fault {
-            return Err(io::Error::other(format!(
-                "child ownership storage unavailable: {fault}"
-            )));
+        let inner = self.inner.clone();
+        let session = session.to_owned();
+        match storage(move || {
+            let ledger = Ledger { inner };
+            let result = ledger.commit(pid, &session);
+            if let Err(error) = &result {
+                ledger.warn(error);
+            }
+            result
+        }) {
+            Ok(entry) => Ok(Box::new(ChildRecord {
+                ledger: self.inner.clone(),
+                entry,
+            })),
+            Err(error) => {
+                self.warn(&error);
+                Ok(Box::new(Unrecorded))
+            }
         }
+    }
+}
+impl Ledger {
+    fn commit(&self, pid: u32, session: &str) -> io::Result<Entry> {
         if session.is_empty() || session.len() > 128 {
             return Err(io::Error::other(
                 "invalid child ownership session identifier",
@@ -248,6 +342,11 @@ impl Owner for Ledger {
             ));
         }
         let _write = self.inner.write.lock().unwrap();
+        if !self.inner.swept.load(Ordering::Acquire) {
+            return Err(io::Error::other(
+                "child ownership startup sweep has not completed",
+            ));
+        }
         if fs::read_dir(&self.inner.dir)?.take(MAX_RECORDS).count() >= MAX_RECORDS {
             return Err(io::Error::other("child ownership record limit reached"));
         }
@@ -271,10 +370,10 @@ impl Owner for Ledger {
             let _ = fs::remove_file(path);
             return Err(error);
         }
-        Ok(Box::new(ChildRecord {
-            ledger: self.inner.clone(),
-            entry,
-        }))
+        // Return plain metadata: a late commit must never drop a ChildRecord
+        // and kill a command that already continued after the storage bound.
+        // Its durable entry can instead be checked by the next startup sweep.
+        Ok(entry)
     }
 }
 
@@ -409,12 +508,82 @@ mod tests {
         assert!(child.0.try_wait().unwrap().is_none());
         assert_eq!(fs::read_dir(dir).unwrap().count(), 0);
     }
+    #[tokio::test]
+    async fn a_stalled_commit_allows_exec_and_a_late_write_does_not_kill_it() {
+        let root = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(Ledger::start(root.path()));
+        let lock = ledger.inner.write.lock().unwrap();
+        let children = fabric_service_api::child_tracking::Children::default()
+            .with_owner(ledger.clone(), "stalled-storage".into());
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "printf running; exec sleep 60"])
+            .stdout(std::process::Stdio::piped());
+        let mut child = tokio::time::timeout(
+            Duration::from_secs(3),
+            children.scope(fabric_service_api::child_spawn::spawn(
+                "stalled ownership storage",
+                command,
+            )),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        use tokio::io::AsyncReadExt;
+        let mut output = [0; 7];
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            child.stdout.as_mut().unwrap().read_exact(&mut output),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&output, b"running");
+        assert!(!children.complete());
+        drop(lock);
+        // The in-flight write may finish after fail-open. It leaves metadata
+        // for startup instead of dropping an ownership guard and killing exec.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while fs::read_dir(root.path().join("children")).unwrap().count() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        child.kill().await.unwrap();
+    }
     #[test]
-    fn unavailable_ownership_storage_refuses_spawns_without_failing_startup() {
+    fn a_sweep_error_does_not_disable_subsequent_records() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("children");
+        fs::create_dir(&dir).unwrap();
+        // Force the real sweep limit error without root-sensitive permissions.
+        // Removing those files then permits records on this same ledger.
+        for n in 0..=MAX_RECORDS {
+            fs::write(dir.join(format!("ignored-{n}")), b"").unwrap();
+        }
+        let ledger = Ledger::start(root.path());
+        for n in 0..=MAX_RECORDS {
+            fs::remove_file(dir.join(format!("ignored-{n}"))).unwrap();
+        }
+        let child = child();
+        let record = ledger
+            .before_exec(child.0.id(), "after-sweep-error")
+            .unwrap();
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        drop(record);
+    }
+    #[test]
+    fn unavailable_ownership_storage_allows_spawns_without_failing_startup() {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("children"), b"occupied").unwrap();
         let ledger = Ledger::start(root.path());
         let child = child();
-        assert!(ledger.before_exec(child.0.id(), "blocked-session").is_err());
+        assert!(
+            ledger
+                .before_exec(child.0.id(), "unrecorded-session")
+                .is_ok()
+        );
     }
 }

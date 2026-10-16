@@ -24,7 +24,8 @@ Deprecated, Fixed or Security.
   socket, buffered input and admission deadline (#321).
 - Owned exec and shell children terminate when their Linux daemon dies.
   Synced child identity records let startup clean up a crashed daemon's
-  matching children on macOS; orderly cleanup ends the process group (#325).
+  matching children on macOS; orderly cleanup ends the process group. Storage
+  errors warn and keep exec/shell available, with bounded record waits (#325).
 
 ## [0.9.1] - 2026-10-16
 
