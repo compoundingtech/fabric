@@ -6,6 +6,8 @@
 //! on nothing else of the daemon's. Which peer may use which service stays the
 //! daemon's decision; nothing here reads a grant.
 
+#[doc(hidden)]
+pub mod background_writer;
 pub mod daemon_control;
 pub mod error;
 mod home;
