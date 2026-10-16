@@ -13,6 +13,7 @@
 
 use anyhow::{Context, Result, bail};
 use fabric_config::error::{self, ErrorCode};
+use fabric_service_api::audit;
 use fabric_service_api::{BoxFuture, Bridge, Notice, PeerStream, Protocol, Service};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -279,7 +280,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut audit = crate::audit::exec_attempt();
+    let mut audit = audit::exec_attempt();
     let counts = audit.as_ref().map(|audit| audit.counts());
     let argv = match read_argv(recv).await? {
         Some(argv) => argv,
@@ -291,9 +292,9 @@ where
     if argv.is_empty() {
         if let Some(audit) = audit.take() {
             audit.finish(
-                crate::audit::Outcome::SpawnFailed,
+                audit::Outcome::SpawnFailed,
                 Some(EXIT_SPAWN_FAILED),
-                Some(ErrorCode::SpawnFailed),
+                Some(ErrorCode::SpawnFailed.as_str()),
             );
         }
         write_server_frame(send, ServerFrame::Error("empty command".to_string())).await?;
@@ -339,9 +340,9 @@ where
         Err(error) => {
             if let Some(audit) = audit.take() {
                 audit.finish(
-                    crate::audit::Outcome::SpawnFailed,
+                    audit::Outcome::SpawnFailed,
                     Some(EXIT_SPAWN_FAILED),
-                    Some(ErrorCode::SpawnFailed),
+                    Some(ErrorCode::SpawnFailed.as_str()),
                 );
             }
             write_server_frame(
@@ -420,6 +421,10 @@ where
         },
     };
 
+    if let Some(audit) = &audit {
+        audit.observe_exit(audit::exit_status(status));
+    }
+
     // The command has exited. Forward what it left in the pipes, then stop at
     // end of file or after a short silence, whichever comes first: a pipe that
     // stays open now belongs to a descendant that outlived the command.
@@ -445,11 +450,7 @@ where
     }
 
     if let Some(audit) = audit.take() {
-        audit.finish(
-            crate::audit::Outcome::Ok,
-            Some(crate::audit::exit_status(status)),
-            None,
-        );
+        audit.finish(audit::Outcome::Ok, Some(audit::exit_status(status)), None);
     }
     // `code()` is None when the child was killed by a signal; report 1 there.
     write_server_frame(send, ServerFrame::Exit(status.code().unwrap_or(1))).await

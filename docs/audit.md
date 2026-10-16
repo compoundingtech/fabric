@@ -39,10 +39,14 @@ duration and byte counts. An admitted durable session uses its tunnel session
 ID. Exec and shell start/end events share the same ID. `ok` means the command
 ran, including a nonzero exit; `spawn_failed` means it could not start, and
 `cancelled` covers a call ended by disconnect, revocation or shutdown. A status
-that was not observed remains null. Signal exits use 128 plus the signal.
+that was not observed remains null. Exec signal exits use 128 plus the signal. Shell signal exits have null status
+because the PTY API supplies a signal description without its number; the
+existing shell wire reply still uses that API's fallback code.
 
 Counters measure process payload observed or accepted by the daemon, excluding
-argv, protocol frames, shell resize frames and tunnel retransmissions. Exec
+argv, protocol frames, shell resize frames and tunnel retransmissions. A
+cancelled call records bytes observed up to its end event; later pipe data is
+excluded. Exec
 output includes stdout and stderr; built-in exec has null stdin and counts
 zero input bytes. Completion includes output processing. A descendant holding
 an exec-exposure pipe open can delay the end until it closes or the session is

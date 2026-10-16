@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use fabric_service_api::audit;
 use fabric_service_api::{BoxFuture, Bridge, Notice, PeerStream, Protocol, Service};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::{
@@ -234,15 +235,15 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut audit = crate::audit::shell_start();
+    let mut audit = audit::shell_start();
     let counts = audit.as_ref().map(|audit| audit.counts());
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize::default()).map_err(|error| {
         if let Some(audit) = audit.take() {
             audit.finish(
-                crate::audit::Outcome::SpawnFailed,
+                audit::Outcome::SpawnFailed,
                 None,
-                Some(fabric_config::error::ErrorCode::SpawnFailed),
+                Some(fabric_config::error::ErrorCode::SpawnFailed.as_str()),
             );
         }
         error
@@ -257,9 +258,9 @@ where
     let mut child = pair.slave.spawn_command(command).map_err(|error| {
         if let Some(audit) = audit.take() {
             audit.finish(
-                crate::audit::Outcome::SpawnFailed,
+                audit::Outcome::SpawnFailed,
                 None,
-                Some(fabric_config::error::ErrorCode::SpawnFailed),
+                Some(fabric_config::error::ErrorCode::SpawnFailed.as_str()),
             );
         }
         error
@@ -273,7 +274,7 @@ where
         reaped: reaped.clone(),
     };
     let mut reader = pair.master.try_clone_reader()?;
-    let mut writer = crate::audit::CountWriter {
+    let mut writer = audit::CountWriter {
         inner: pair.master.take_writer()?,
         counts: counts.clone(),
     };
@@ -321,6 +322,7 @@ where
     let mut stdin_done = false;
     let mut output_done = false;
     let mut exit_code = None;
+    let mut audit_exit_status = None;
     let mut cancelled = false;
 
     let result: Result<()> = async {
@@ -360,6 +362,14 @@ where
                 status = &mut wait_task, if exit_code.is_none() => {
                     let status = status.context("shell wait task failed")??;
                     let code = status.exit_code().min(i32::MAX as u32) as i32;
+                    // portable-pty replaces a signal exit with code 1 and a
+                    // localized signal name. Do not invent a numeric status.
+                    audit_exit_status = status.signal().is_none().then_some(code);
+                    if let Some(audit) = &audit
+                        && let Some(status) = audit_exit_status
+                    {
+                        audit.observe_exit(status);
+                    }
                     exit_code = Some(code);
                     let _ = input_tx.send(None);
                 }
@@ -378,7 +388,12 @@ where
     if exit_code.is_none() {
         drop(hang_up);
         let _ = input_tx.send(None);
-        let _ = wait_task.await;
+        if let Ok(Ok(status)) = wait_task.await
+            && status.signal().is_none()
+            && let Some(audit) = &audit
+        {
+            audit.observe_exit(status.exit_code().min(i32::MAX as u32) as i32);
+        }
     }
     drop(input_tx);
     let _ = reader_task.await;
@@ -388,7 +403,7 @@ where
         Ok(())
     } else if let Some(code) = exit_code {
         if let Some(audit) = audit.take() {
-            audit.finish(crate::audit::Outcome::Ok, Some(code), None);
+            audit.finish(audit::Outcome::Ok, audit_exit_status, None);
         }
         write_server_frame(send, ServerFrame::Exit(code)).await
     } else {

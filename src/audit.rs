@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -337,19 +337,7 @@ pub(crate) enum Kind {
     Shell,
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct Counts {
-    input: AtomicU64,
-    output: AtomicU64,
-}
-impl Counts {
-    pub(crate) fn add_in(&self, bytes: usize) {
-        self.input.fetch_add(bytes as u64, Ordering::Relaxed);
-    }
-    pub(crate) fn add_out(&self, bytes: usize) {
-        self.output.fetch_add(bytes as u64, Ordering::Relaxed);
-    }
-}
+pub(crate) use fabric_service_api::audit::Counts;
 
 #[derive(Debug)]
 struct CallState {
@@ -457,6 +445,10 @@ impl Call {
         exit_status: Option<i32>,
         code: Option<fabric_config::error::ErrorCode>,
     ) {
+        self.finish_coded(outcome, exit_status, code.map(|code| code.as_str()));
+    }
+
+    fn finish_coded(&self, outcome: Outcome, exit_status: Option<i32>, code: Option<&str>) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if state.finished {
             return;
@@ -466,11 +458,11 @@ impl Call {
         record.time = timestamp(SystemTime::now());
         record.outcome = Some(outcome);
         record.exit_status = exit_status.or(record.exit_status);
-        record.code = code.map(|code| format!("fabric:{}", code.as_str()));
+        record.code = code.map(|code| format!("fabric:{code}"));
         record.duration_millis =
             Some(state.began.elapsed().as_millis().min(u64::MAX as u128) as u64);
-        record.bytes_in = self.counts.input.load(Ordering::Acquire);
-        record.bytes_out = self.counts.output.load(Ordering::Acquire);
+        record.bytes_in = self.counts.input();
+        record.bytes_out = self.counts.output();
         let record = match state.kind {
             Kind::Exec => Record::ExecEnd(record),
             Kind::Shell => Record::ShellEnd(record),
@@ -566,23 +558,6 @@ impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CountAsyncWrite
     }
 }
 
-pub(crate) struct CountWriter<W> {
-    pub(crate) inner: W,
-    pub(crate) counts: Option<Arc<Counts>>,
-}
-impl<W: Write> Write for CountWriter<W> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let written = self.inner.write(bytes)?;
-        if let Some(counts) = &self.counts {
-            counts.add_in(written);
-        }
-        Ok(written)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
 /// A future dropped by disconnect/revocation/shutdown still leaves an end fact.
 #[derive(Debug)]
 pub(crate) struct CallGuard(Call);
@@ -631,6 +606,52 @@ impl Drop for CallGuard {
     }
 }
 
+#[derive(Debug)]
+struct ServiceObserver(Call);
+impl fabric_service_api::audit::Observer for ServiceObserver {
+    fn begin(&self) {
+        self.0
+            .audit
+            .shared
+            .active_calls
+            .fetch_add(1, Ordering::Release);
+    }
+    fn end(&self) {
+        self.0
+            .audit
+            .shared
+            .active_calls
+            .fetch_sub(1, Ordering::Release);
+    }
+    fn start(&self, argv: Option<&[String]>) -> bool {
+        self.0.start(argv)
+    }
+    fn counts(&self) -> Arc<Counts> {
+        self.0.counts.clone()
+    }
+    fn observe_exit(&self, status: i32) {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .record
+            .exit_status = Some(status);
+    }
+    fn finish(
+        &self,
+        outcome: fabric_service_api::audit::Outcome,
+        status: Option<i32>,
+        code: Option<&str>,
+    ) {
+        let outcome = match outcome {
+            fabric_service_api::audit::Outcome::Ok => Outcome::Ok,
+            fabric_service_api::audit::Outcome::SpawnFailed => Outcome::SpawnFailed,
+            fabric_service_api::audit::Outcome::Cancelled => Outcome::Cancelled,
+        };
+        self.0.finish_coded(outcome, status, code);
+    }
+}
+
 tokio::task_local! { static CURRENT: Option<Call>; }
 
 pub(crate) fn current() -> Option<Call> {
@@ -638,34 +659,18 @@ pub(crate) fn current() -> Option<Call> {
 }
 
 pub(crate) async fn scope<F: std::future::Future>(call: Option<Call>, future: F) -> F::Output {
-    CURRENT.scope(call, future).await
+    let observer = call.clone().map(|call| {
+        Arc::new(ServiceObserver(call)) as Arc<dyn fabric_service_api::audit::Observer>
+    });
+    CURRENT
+        .scope(call, fabric_service_api::audit::scope(observer, future))
+        .await
 }
 
 pub(crate) fn exec_attempt() -> Option<CallGuard> {
     current().map(CallGuard::new)
 }
-pub(crate) fn shell_start() -> Option<CallGuard> {
-    let call = current()?;
-    if call.start(None) {
-        Some(CallGuard::new(call))
-    } else {
-        None
-    }
-}
-
-pub(crate) fn exit_status(status: std::process::ExitStatus) -> i32 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        status
-            .code()
-            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
-    }
-    #[cfg(not(unix))]
-    {
-        status.code().unwrap_or(1)
-    }
-}
+pub(crate) use fabric_service_api::audit::exit_status;
 
 fn audit_write_warning(last: &mut Option<Instant>, error: &anyhow::Error) {
     if last.is_none_or(|last| last.elapsed() >= Duration::from_secs(1)) {
@@ -1058,6 +1063,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shell_signal_exit_does_not_invent_the_pty_fallback_as_a_real_exit_status() -> Result<()>
+    {
+        use tokio::io::split;
+        let root = tempfile::tempdir()?;
+        let audit = Audit::start(root.path());
+        let call = audit.call("peer-a".into(), None, Some("shell".into()), Kind::Shell);
+        let (mut client, server) = tokio::io::duplex(65536);
+        let serving = tokio::spawn(async move {
+            let (mut read, mut write) = split(server);
+            scope(
+                Some(call),
+                crate::services::shell::serve_shell_session(&mut read, &mut write, "peer-a"),
+            )
+            .await
+        });
+        crate::services::shell::write_client_stdin(&mut client, b"kill -KILL $$\n").await?;
+        let code = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match crate::services::shell::read_server_frame(&mut client).await? {
+                    Some(crate::services::shell::ServerFrame::Exit(code)) => {
+                        return Ok::<_, anyhow::Error>(code);
+                    }
+                    Some(_) => {}
+                    None => anyhow::bail!("shell closed without its wire exit code"),
+                }
+            }
+        })
+        .await??;
+        assert_eq!(code, 1, "retain the existing PTY wire fallback");
+        serving.await??;
+        assert!(audit.drain(Duration::from_secs(2)).await);
+        let records = read(root.path(), None, None)?.records;
+        assert_eq!(records.len(), 2);
+        let Record::ShellEnd(end) = &records[1] else {
+            panic!("missing shell end");
+        };
+        assert!(end.exit_status.is_none(), "a signal is not a real exit 1");
+        assert_eq!(end.outcome, Some(Outcome::Ok));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn real_exec_records_nonzero_exit_payload_counts_and_spawn_failure_without_output_content()
     -> Result<()> {
         let root = tempfile::tempdir()?;
@@ -1142,7 +1189,7 @@ mod tests {
             Kind::Shell,
         );
         scope(Some(shell), async {
-            drop(shell_start().unwrap());
+            drop(fabric_service_api::audit::shell_start().unwrap());
         })
         .await;
         assert!(audit.drain(Duration::from_secs(2)).await);
