@@ -1578,6 +1578,28 @@ mod tests {
             0,
             "shutdown skipped owned-child cleanup after the drain timeout"
         );
+        // The serve error must come after bounded audit flushing, so the
+        // completed call remains readable even on the failed-drain path.
+        let records =
+            crate::audit::read(home.root(), None, Some(&client.id().to_string()))?.records;
+        let calls: Vec<_> = records
+            .iter()
+            .filter(|record| {
+                record
+                    .call()
+                    .is_some_and(|call| call.service.as_deref() == Some("work/0"))
+            })
+            .collect();
+        assert_eq!(calls.len(), 2);
+        let crate::audit::Record::ExecStart(start) = calls[0] else {
+            panic!("missing exec start");
+        };
+        let crate::audit::Record::ExecEnd(end) = calls[1] else {
+            panic!("shutdown error skipped audit end flush");
+        };
+        assert_eq!(start.session_id, end.session_id);
+        assert_eq!(end.bytes_in, 8);
+        assert_eq!(end.bytes_out, 8);
         client.shutdown().await?;
         Ok(())
     }
