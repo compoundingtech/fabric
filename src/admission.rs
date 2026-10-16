@@ -139,8 +139,13 @@ impl Admissions {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Requirements(Arc<Mutex<Vec<String>>>);
 impl Requirements {
-    pub fn first(&self) -> Option<String> {
-        self.0.lock().unwrap().first().cloned()
+    pub fn first_withdrawn(&self, book: &PeerBook, peer: &EndpointId) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|service| book.may(peer, service).is_err())
+            .cloned()
     }
     pub fn record(&self, service: &str) {
         let mut services = self.0.lock().unwrap();

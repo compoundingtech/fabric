@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use fabric::{
     config::{FabricConfig, FabricHome, GitAccess, PeerBook, generate_identity_file},
     control::{ControlRequest, ControlResponse},
-    daemon::{FabricNode, send_control},
+    daemon::{DaemonOptions, FabricNode, send_control},
 };
 
 #[cfg(unix)]
@@ -37,6 +37,374 @@ const FABRIC_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 const LOCAL_IO_TIMEOUT: Duration = Duration::from_secs(60);
 const LARGE_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const LOCAL_SLICE_SETTLE: Duration = Duration::from_millis(500);
+
+/// The #304 workload: ten batches of twenty fresh HTTP connections through
+/// one dial listener. A successful bind must not conceal admission failures.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_dial_serves_all_two_hundred_fanout_requests() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    tcp_dial_fanout(DaemonOptions::default(), &[20; 10], 1).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_dial_queues_sixty_four_connections_above_a_custom_server_cap() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    tcp_dial_fanout(
+        DaemonOptions {
+            server_session_max_total: Some(4),
+            server_session_max_per_peer: Some(2),
+            ..DaemonOptions::default()
+        },
+        &[64],
+        1,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_dial_queues_competing_dialers_at_the_total_server_cap() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    tcp_dial_fanout(
+        DaemonOptions {
+            server_session_max_total: Some(2),
+            server_session_max_per_peer: Some(2),
+            ..DaemonOptions::default()
+        },
+        &[32],
+        2,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_dial_queue_timeout_survives_restart_and_updates_the_live_listener() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    let server_dir = TempDir::new()?;
+    let client_dir = TempDir::new()?;
+    let server_home = FabricHome::new(server_dir.path());
+    let client_home = FabricHome::new(client_dir.path());
+    let server = FabricNode::start_with_daemon_options(
+        server_home.clone(),
+        DaemonOptions {
+            server_session_max_total: Some(1),
+            server_session_max_per_peer: Some(1),
+            ..DaemonOptions::default()
+        },
+    )
+    .await
+    .context("start queue-timeout test server")?;
+    let client = FabricNode::start(client_home.clone())
+        .await
+        .context("start initial client")?;
+    trust_peer_allowing(
+        &server_home,
+        &server,
+        client.id(),
+        Some("client"),
+        Some(client.addr()),
+        &["tcp-echo"],
+    )
+    .await
+    .context("trust initial client at server")?;
+    trust_peer_allowing(
+        &client_home,
+        &client,
+        server.id(),
+        Some("server"),
+        Some(server.addr()),
+        &[],
+    )
+    .await
+    .context("trust server at initial client")?;
+    let (echo_addr, _, service) = spawn_tcp_echo_service()
+        .await
+        .context("start TCP echo backend")?;
+    server
+        .expose_tcp("tcp-echo", echo_addr)
+        .await
+        .context("expose TCP echo backend")?;
+    let addr = run_fabric(
+        &client_home,
+        &[
+            "dial",
+            "server",
+            "tcp-echo",
+            "--tcp",
+            "127.0.0.1:0",
+            "--queue-timeout",
+            "0.15",
+        ],
+    )?;
+    assert_eq!(
+        FabricConfig::load(&client_home)?.dials()[0]
+            .options
+            .queue_timeout_ms,
+        150
+    );
+    client
+        .shutdown()
+        .await
+        .context("stop client before listener restore")?;
+    let client = FabricNode::start(client_home.clone())
+        .await
+        .context("restart client and restore TCP listener")?;
+    trust_peer_allowing(
+        &server_home,
+        &server,
+        client.id(),
+        Some("client"),
+        Some(client.addr()),
+        &["tcp-echo"],
+    )
+    .await
+    .context("refresh client address at server after restart")?;
+    // fabric#321 tracks a candidate duplicate-mux replacement between Ready
+    // and Hello. Permit one first-connect retry after restart only for EOF or
+    // reset before any response byte; later streams remain strict. Keep the
+    // original three-second deadline across both attempts and count any retry.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let payload = b"hold-capacity";
+    let mut first_retry = false;
+    let mut live = loop {
+        let mut stream = tokio::time::timeout_at(deadline, TcpStream::connect(&addr))
+            .await
+            .context("initial restored TCP connect deadline")?
+            .context("initial restored TCP connect")?;
+        let mut response = vec![0; payload.len()];
+        let mut received = 0;
+        let result: std::io::Result<()> = tokio::time::timeout_at(deadline, async {
+            stream.write_all(payload).await?;
+            while received < response.len() {
+                let count = stream.read(&mut response[received..]).await?;
+                if count == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                }
+                received += count;
+            }
+            Ok(())
+        })
+        .await
+        .context("initial restored TCP round-trip deadline")?;
+        match result {
+            Ok(()) => {
+                assert_eq!(response, payload);
+                break stream;
+            }
+            Err(error)
+                if !first_retry
+                    && received == 0
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                    ) =>
+            {
+                first_retry = true;
+                // Direct stderr bypasses libtest's capture of passing tests.
+                std::io::Write::write_fmt(
+                    &mut std::io::stderr().lock(),
+                    format_args!("fabric#321: retrying initial restored TCP connection once after zero-byte {error}\n"),
+                )?;
+            }
+            Err(error) => return Err(error).context("initial restored TCP round trip"),
+        }
+    };
+
+    for (seconds, expected_ms) in [("0.15", 150), ("0.30", 300)] {
+        if expected_ms == 300 {
+            assert_eq!(
+                run_fabric(
+                    &client_home,
+                    &[
+                        "dial",
+                        "server",
+                        "tcp-echo",
+                        "--tcp",
+                        &addr,
+                        "--queue-timeout",
+                        seconds
+                    ]
+                )?,
+                addr
+            );
+        }
+        let started = Instant::now();
+        let mut waiting = TcpStream::connect(&addr)
+            .await
+            .with_context(|| format!("connect capacity waiter at {expected_ms}ms timeout"))?;
+        waiting
+            .write_all(b"must-not-reach-service")
+            .await
+            .with_context(|| format!("write capacity waiter at {expected_ms}ms timeout"))?;
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), waiting.read(&mut byte))
+                .await
+                .with_context(|| format!("capacity waiter deadline at {expected_ms}ms timeout"))?
+                .with_context(|| format!("read capacity refusal at {expected_ms}ms timeout"))?,
+            0,
+            "a full remote cap must expire with EOF"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(expected_ms - 25),
+            "capacity was refused before the queue deadline"
+        );
+        assert_eq!(
+            FabricConfig::load(&client_home)?.dials()[0]
+                .options
+                .queue_timeout_ms,
+            expected_ms
+        );
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            tcp_stream_round_trip(&mut live, b"still-live"),
+        )
+        .await
+        .with_context(|| format!("admitted stream deadline after {expected_ms}ms waiter"))?
+        .with_context(|| format!("admitted stream round trip after {expected_ms}ms waiter"))?;
+    }
+    drop(live);
+    client.shutdown().await.context("stop restored client")?;
+    server
+        .shutdown()
+        .await
+        .context("stop queue-timeout test server")?;
+    service.abort();
+    Ok(())
+}
+
+async fn tcp_dial_fanout(
+    options: DaemonOptions,
+    batches: &[usize],
+    client_count: usize,
+) -> Result<()> {
+    let server_dir = TempDir::new()?;
+    let server_home = FabricHome::new(server_dir.path());
+    let server = FabricNode::start_with_daemon_options(server_home.clone(), options).await?;
+    let mut clients = Vec::new();
+    for i in 0..client_count {
+        let dir = TempDir::new()?;
+        let home = FabricHome::new(dir.path());
+        let client = FabricNode::start(home.clone()).await?;
+        trust_peer_allowing(
+            &server_home,
+            &server,
+            client.id(),
+            Some(&format!("client-{i}")),
+            Some(client.addr()),
+            &["web"],
+        )
+        .await?;
+        trust_peer_allowing(
+            &home,
+            &client,
+            server.id(),
+            Some("server"),
+            Some(server.addr()),
+            &[],
+        )
+        .await?;
+        clients.push((dir, client));
+    }
+    let http = TcpListener::bind("127.0.0.1:0").await?;
+    let http_addr = http.local_addr()?.to_string();
+    let requests_served = Arc::new(AtomicUsize::new(0));
+    let service = tokio::spawn({
+        let requests_served = requests_served.clone();
+        async move {
+            while let Ok((mut stream, _)) = http.accept().await {
+                let requests_served = requests_served.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    loop {
+                        let mut byte = [0];
+                        if stream.read_exact(&mut byte).await.is_err() {
+                            return;
+                        }
+                        request.push(byte[0]);
+                        if request.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                        if request.len() > 4096 {
+                            return;
+                        }
+                    }
+                    requests_served.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n",
+                    )
+                    .await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        }
+    });
+    server.expose_tcp("web", http_addr).await?;
+    let mut addrs = Vec::new();
+    for (_, client) in &clients {
+        addrs.push(
+            client
+                .dial_tcp("server", "web", "127.0.0.1:0".into())
+                .await?,
+        );
+    }
+    let mut successes = 0;
+    let started = Instant::now();
+    for (batch, &count) in batches.iter().enumerate() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(count * client_count));
+        let mut requests = tokio::task::JoinSet::new();
+        for addr in &addrs {
+            for _ in 0..count {
+                let addr = addr.clone();
+                let barrier = barrier.clone();
+                requests.spawn(async move {
+                    barrier.wait().await;
+                    tokio::time::timeout(Duration::from_secs(30), async {
+                        let mut stream = TcpStream::connect(addr).await?;
+                        stream
+                        .write_all(
+                            b"GET /small HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                        )
+                        .await?;
+                        let mut byte = [0];
+                        stream.read_exact(&mut byte).await?;
+                        anyhow::ensure!(byte[0] == b'H', "unexpected first response byte");
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+                    .map(|result| result.is_ok())
+                    .unwrap_or(false)
+                });
+            }
+        }
+        let mut ok = 0;
+        while let Some(result) = requests.join_next().await {
+            ok += usize::from(result?);
+        }
+        eprintln!(
+            "fanout batch {batch}: {ok}/{} first bytes",
+            count * client_count
+        );
+        successes += ok;
+    }
+    let expected: usize = batches.iter().sum::<usize>() * client_count;
+    eprintln!(
+        "fanout total: {successes}/{expected} in {:?}",
+        started.elapsed()
+    );
+    for (_, client) in clients {
+        client.shutdown().await?;
+    }
+    server.shutdown().await?;
+    service.abort();
+    assert_eq!(successes, expected, "every request must get a first byte");
+    assert_eq!(
+        requests_served.load(Ordering::SeqCst),
+        expected,
+        "admission retries must not duplicate application requests"
+    );
+    Ok(())
+}
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -564,7 +932,7 @@ async fn exec_expose_reconnect_keeps_child_bound_to_tunnel_session() -> Result<(
             vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
-                "printf spawn >> \"$1\"; exec /bin/cat".to_string(),
+                "printf spawn >> \"$1\"; exec cat".to_string(),
                 "fabric-test".to_string(),
                 marker.display().to_string(),
             ],
@@ -734,7 +1102,7 @@ async fn exec_expose_enforces_per_exposure_child_limit() -> Result<()> {
             vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
-                "printf spawn >> \"$1\"; printf ready > \"$2\"; while [ ! -e \"$3\" ]; do sleep 0.1; done; exec /bin/cat".to_string(),
+                "printf spawn >> \"$1\"; printf ready > \"$2\"; while [ ! -e \"$3\" ]; do sleep 0.1; done; exec cat".to_string(),
                 "fabric-test".to_string(),
                 marker.display().to_string(),
                 ready.display().to_string(),
@@ -744,17 +1112,39 @@ async fn exec_expose_enforces_per_exposure_child_limit() -> Result<()> {
         )
         .await?;
 
-    let dial_socket = node_b.dial("node-a", "limited-cat").await?;
+    // A child-cap refusal now waits in the generic dial admission queue.
+    // Keep this test focused on enforcing the cap and expiring that wait.
+    let dial_socket = PathBuf::from(run_fabric(
+        &node_b_home,
+        &["dial", "node-a", "limited-cat", "--queue-timeout", "0.15"],
+    )?);
     let mut first = UnixStream::connect(&dial_socket).await?;
     wait_for_file_contents(&ready, "ready").await?;
     assert_eq!(fs::read_to_string(&marker)?, "spawn");
 
-    assert_tunnel_rejects_quickly(&dial_socket, b"second-child").await?;
-    assert_eq!(
-        fs::read_to_string(&marker)?,
-        "spawn",
-        "limit rejection must not spawn a second child"
-    );
+    for seconds in ["0", "0.15"] {
+        run_fabric(
+            &node_b_home,
+            &["dial", "node-a", "limited-cat", "--queue-timeout", seconds],
+        )?;
+        let start = Instant::now();
+        assert_tunnel_rejects_quickly(&dial_socket, b"second-child").await?;
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "short or disabled queue did not refuse promptly"
+        );
+        if seconds == "0.15" {
+            assert!(
+                start.elapsed() >= Duration::from_millis(125),
+                "refused before the queue deadline"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(&marker)?,
+            "spawn",
+            "limit rejection must not spawn a second child"
+        );
+    }
 
     fs::write(&release, "go")?;
     stream_round_trip(&mut first, b"first-still-alive").await?;
@@ -762,6 +1152,112 @@ async fn exec_expose_enforces_per_exposure_child_limit() -> Result<()> {
     drop(first);
     node_b.shutdown().await?;
     node_a.shutdown().await?;
+    Ok(())
+}
+
+/// Hold the new default through an actual daemon listener, including the
+/// coded diagnostic that is emitted after the admission deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_child_cap_default_waits_ten_seconds_then_reports_coded_refusal() -> Result<()> {
+    let _guard = local_slice_guard().await;
+    struct Foreground(std::process::Child);
+    impl Drop for Foreground {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let server_dir = TempDir::new()?;
+    let client_dir = TempDir::new()?;
+    let server_home = FabricHome::new(server_dir.path());
+    let client_home = FabricHome::new(client_dir.path());
+    let server = FabricNode::start(server_home.clone()).await?;
+    let log_path = client_dir.path().join("foreground.log");
+    let log = fs::File::create(&log_path)?;
+    let _client = Foreground(
+        Command::new(env!("CARGO_BIN_EXE_fabric"))
+            .args([
+                "--home",
+                client_home.root().to_str().unwrap(),
+                "up",
+                "--foreground",
+            ])
+            .stdout(Stdio::from(log.try_clone()?))
+            .stderr(Stdio::from(log))
+            .spawn()?,
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !client_home.control_socket_path().exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("foreground dialer never started")?;
+    let client_id = run_fabric(&client_home, &["id"])?.parse()?;
+    let client_addr = serde_json::from_str(&run_fabric(&client_home, &["addr"])?)?;
+    trust_peer(
+        &server_home,
+        &server,
+        client_id,
+        Some("client"),
+        Some(client_addr),
+    )
+    .await?;
+    run_fabric(
+        &client_home,
+        &[
+            "add",
+            &server.id().to_string(),
+            "server",
+            "--addr-json",
+            &serde_json::to_string(&server.addr())?,
+            "--dial-only",
+        ],
+    )?;
+    let ready = server_dir.path().join("ready");
+    let release = server_dir.path().join("release");
+    let marker = server_dir.path().join("spawns");
+    server.expose_exec_with_limit("limited-cat", vec![
+        "/bin/sh".into(), "-c".into(),
+        "printf spawn >> \"$1\"; printf ready > \"$2\"; while [ ! -e \"$3\" ]; do sleep 0.1; done; exec cat".into(),
+        "fabric-test".into(), marker.display().to_string(), ready.display().to_string(), release.display().to_string(),
+    ], 1).await?;
+    let socket = PathBuf::from(run_fabric(
+        &client_home,
+        &["dial", "server", "limited-cat"],
+    )?);
+    let mut first = UnixStream::connect(&socket).await?;
+    wait_for_file_contents(&ready, "ready").await?;
+    let started = Instant::now();
+    let mut second = UnixStream::connect(&socket).await?;
+    second.write_all(b"no-second-child").await?;
+    let mut bytes = Vec::new();
+    tokio::time::timeout(Duration::from_secs(15), second.read_to_end(&mut bytes))
+        .await
+        .context("default child-cap queue never expired")??;
+    assert!(bytes.is_empty(), "default dial injected bytes");
+    assert!(
+        started.elapsed() >= Duration::from_millis(9_975),
+        "default refusal did not wait ten seconds"
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if fs::read_to_string(&log_path)?
+                .contains("fabric:session_limit_reached dial queue timeout expired")
+            {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("default refusal did not report its coded diagnostic")??;
+    assert_eq!(fs::read_to_string(&marker)?, "spawn");
+    fs::write(&release, "go")?;
+    stream_round_trip(&mut first, b"first-still-alive").await?;
+    drop(first);
+    run_fabric(&client_home, &["down"])?;
+    server.shutdown().await?;
     Ok(())
 }
 
@@ -1382,16 +1878,15 @@ async fn socket_expose_survives_idle_slow_concurrent_and_abrupt_streams() -> Res
             let pause_ms: u64 = std::env::var("FABRIC_SOAK_PAUSE_MS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(400);
+                .unwrap_or(0);
             let rounds: u16 = std::env::var("FABRIC_SOAK_ROUNDS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(25);
             for round in 0..rounds {
-                // Paced like people and devices, not like a load generator: a dialing
-                // process serves 32 streams at once and a stream that has just closed
-                // is still winding down for about a second, so more than a few dozen
-                // new streams a second are refused (see docs/failure-modes.md).
+                // Unpaced by default: the shared peer queue must absorb short
+                // sessions without the caller pausing to avoid a refusal.
+                // A release soak can still request a pause explicitly.
                 tokio::time::sleep(Duration::from_millis(pause_ms)).await;
                 let mut stream = UnixStream::connect(&dial_socket).await?;
                 soak_hello(&mut stream, b'e')
@@ -3006,7 +3501,7 @@ fn pid_cat_argv(pid_file: &Path) -> Vec<String> {
     vec![
         "/bin/sh".to_string(),
         "-c".to_string(),
-        "printf '%s' \"$$\" > \"$1\"; exec /bin/cat".to_string(),
+        "printf '%s' \"$$\" > \"$1\"; exec cat".to_string(),
         "fabric-test".to_string(),
         pid_file.display().to_string(),
     ]

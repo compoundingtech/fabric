@@ -8,6 +8,7 @@ pub use fabric_config::sync::status::{
 };
 
 use crate::{
+    config::DialOptions,
     error::ErrorFields,
     mux::CurrentConnectionHealth,
     telemetry::{PeerTelemetry, TelemetryWindow},
@@ -63,11 +64,15 @@ pub enum ControlRequest {
     Dial {
         peer: String,
         protocol: String,
+        #[serde(default, skip_serializing_if = "DialOptions::is_default")]
+        options: DialOptions,
     },
     DialTcp {
         peer: String,
         protocol: String,
         bind: String,
+        #[serde(default, skip_serializing_if = "DialOptions::is_default")]
+        options: DialOptions,
     },
     Ping {
         peer: String,

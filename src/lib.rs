@@ -10,6 +10,7 @@ pub mod ca;
 pub mod config;
 pub mod control;
 pub mod daemon;
+mod dial_queue;
 pub mod doctor;
 /// Stable error codes (docs/errors.md), shared with the sync companion.
 pub use fabric_config::error;

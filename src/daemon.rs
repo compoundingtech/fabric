@@ -7,7 +7,7 @@ use std::{
     process::{Command as ProcessCommand, Stdio},
     sync::{
         Arc, RwLock as StdRwLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -43,9 +43,9 @@ use tracing_subscriber::EnvFilter;
 use crate::{
     admission::{Admission, Admissions, Grant},
     config::{
-        DEFAULT_EXEC_MAX_CHILDREN, FabricConfig, FabricHome, Peer, PeerBook, PersistedDial,
-        PersistedExpose, PersistedExposeTarget, load_or_create_identity, validate_protocol,
-        validate_server_session_config, validate_tcp_addr, write_atomic,
+        DEFAULT_EXEC_MAX_CHILDREN, DialOptions, FabricConfig, FabricHome, Peer, PeerBook,
+        PersistedDial, PersistedExpose, PersistedExposeTarget, load_or_create_identity,
+        validate_protocol, validate_server_session_config, validate_tcp_addr, write_atomic,
     },
     control::{
         ControlRequest, ControlResponse, DialRestoreFailure, PeerReachability, SyncEntryStatus,
@@ -521,6 +521,7 @@ impl DaemonOptions {
 
 #[derive(Debug)]
 struct DialSocket {
+    queue_timeout_ms: Arc<AtomicU64>,
     path: PathBuf,
     peer_addr: EndpointAddr,
     listener_cancel: CancellationToken,
@@ -652,6 +653,7 @@ impl Drop for DialListenerLease {
 
 #[derive(Debug, Clone)]
 struct TcpDial {
+    queue_timeout_ms: Arc<AtomicU64>,
     addr: String,
     peer_addr: EndpointAddr,
     cancel: CancellationToken,
@@ -1708,20 +1710,37 @@ impl DaemonState {
     }
 
     pub async fn dial(&self, peer: &str, protocol: &str) -> Result<PathBuf> {
+        self.dial_with_options(peer, protocol, DialOptions::default())
+            .await
+    }
+
+    pub async fn dial_with_options(
+        &self,
+        peer: &str,
+        protocol: &str,
+        options: DialOptions,
+    ) -> Result<PathBuf> {
+        options.validate()?;
         let alpn = validate_protocol(protocol)?;
         let id = self.peer_book.read().await.resolve(peer)?.id.to_string();
         let path = self
-            .dial_alpn_with_persistence(&id, protocol, alpn, true, true)
+            .dial_alpn_with_persistence(&id, protocol, alpn, true, true, options)
             .await?;
         self.clear_dial_restore_failure(&id, protocol, None).await;
         Ok(path)
     }
 
-    async fn persist_unix_dial(&self, peer: &str, protocol: &str) -> Result<()> {
+    async fn persist_unix_dial(
+        &self,
+        peer: &str,
+        protocol: &str,
+        options: DialOptions,
+    ) -> Result<()> {
         self.update_config(runtime_control::ConfigUpdate::UpsertDial(PersistedDial {
             peer: peer.into(),
             protocol: protocol.into(),
             tcp: None,
+            options,
         }))
         .await
     }
@@ -1822,6 +1841,18 @@ impl DaemonState {
     }
 
     pub async fn dial_tcp(&self, peer: &str, protocol: &str, bind: String) -> Result<String> {
+        self.dial_tcp_with_options(peer, protocol, bind, DialOptions::default())
+            .await
+    }
+
+    pub async fn dial_tcp_with_options(
+        &self,
+        peer: &str,
+        protocol: &str,
+        bind: String,
+        options: DialOptions,
+    ) -> Result<String> {
+        options.validate()?;
         validate_tcp_addr(&bind)?;
         let alpn = validate_protocol(protocol)?;
         let peer_addr = self.peer_book.read().await.resolve(peer)?;
@@ -1829,8 +1860,18 @@ impl DaemonState {
 
         let mut tcp_dials = self.tcp_dials.lock().await;
         if let Some(existing) = tcp_dials.get_mut(&key) {
-            existing.peer_addr = peer_addr;
             let addr = existing.addr.clone();
+            self.update_config(runtime_control::ConfigUpdate::UpsertDial(PersistedDial {
+                peer: peer_addr.id.to_string(),
+                protocol: protocol.into(),
+                tcp: Some(addr.clone()),
+                options,
+            }))
+            .await?;
+            existing.peer_addr = peer_addr;
+            existing
+                .queue_timeout_ms
+                .store(options.queue_timeout_ms, Ordering::Relaxed);
             self.clear_dial_restore_failure(&key.0, protocol, Some(&addr))
                 .await;
             return Ok(addr);
@@ -1844,11 +1885,14 @@ impl DaemonState {
             peer: peer_addr.id.to_string(),
             protocol: protocol.into(),
             tcp: Some(addr.clone()),
+            options,
         }))
         .await?;
+        let queue_timeout_ms = Arc::new(AtomicU64::new(options.queue_timeout_ms));
         tcp_dials.insert(
             key,
             TcpDial {
+                queue_timeout_ms: queue_timeout_ms.clone(),
                 addr: addr.clone(),
                 peer_addr: peer_addr.clone(),
                 cancel: listener_cancel.clone(),
@@ -1869,6 +1913,7 @@ impl DaemonState {
             self.peer_connections.clone(),
             self.client_attaches.clone(),
             self.connection_recorder(),
+            queue_timeout_ms,
         ));
 
         self.clear_dial_restore_failure(&peer_addr.id.to_string(), protocol, Some(&addr))
@@ -1916,8 +1961,15 @@ impl DaemonState {
         alpn: Vec<u8>,
         reuse_existing: bool,
     ) -> Result<PathBuf> {
-        self.dial_alpn_with_persistence(peer, protocol, alpn, reuse_existing, false)
-            .await
+        self.dial_alpn_with_persistence(
+            peer,
+            protocol,
+            alpn,
+            reuse_existing,
+            false,
+            DialOptions::default(),
+        )
+        .await
     }
 
     async fn dial_alpn_with_persistence(
@@ -1927,7 +1979,16 @@ impl DaemonState {
         alpn: Vec<u8>,
         reuse_existing: bool,
         persist: bool,
+        options: DialOptions,
     ) -> Result<PathBuf> {
+        options.validate()?;
+        if !options.is_default() && self.services.find(&alpn).is_some() {
+            return Err(FabricError::new(
+                ErrorCode::InvalidArgument,
+                "queue timeout applies to generic Unix dials, not registered service sockets",
+            )
+            .into());
+        }
         let peer_addr = self.peer_book.read().await.resolve(peer)?;
         let key = (peer_addr.id.to_string(), protocol.to_string());
         let one_shot = !reuse_existing
@@ -1948,8 +2009,11 @@ impl DaemonState {
                 .is_some_and(|task| !task.is_finished())
         {
             if persist {
-                self.persist_unix_dial(&peer_addr.id.to_string(), protocol)
+                self.persist_unix_dial(&peer_addr.id.to_string(), protocol, options)
                     .await?;
+                existing
+                    .queue_timeout_ms
+                    .store(options.queue_timeout_ms, Ordering::Relaxed);
             }
             return Ok(existing.path.clone());
         }
@@ -1974,7 +2038,7 @@ impl DaemonState {
             .with_context(|| format!("failed to bind {}", socket_path.display()))?;
         if persist
             && let Err(error) = self
-                .persist_unix_dial(&peer_addr.id.to_string(), protocol)
+                .persist_unix_dial(&peer_addr.id.to_string(), protocol, options)
                 .await
         {
             drop(listener);
@@ -1988,6 +2052,7 @@ impl DaemonState {
             deadline: tokio::time::Instant::now() + ONE_SHOT_DIAL_WAIT,
         });
 
+        let queue_timeout_ms = Arc::new(AtomicU64::new(options.queue_timeout_ms));
         // A service's one-shot protocol is one raw stream per local connection.
         // A resumable protocol negotiates its own tunnel session and falls back
         // to the service's one-shot protocol when the peer does not speak it.
@@ -2043,6 +2108,7 @@ impl DaemonState {
                 lease,
                 self.client_attaches.clone(),
                 self.connection_recorder(),
+                queue_timeout_ms.clone(),
             )),
         };
         if one_shot {
@@ -2056,6 +2122,7 @@ impl DaemonState {
         sockets.insert(
             key,
             DialSocket {
+                queue_timeout_ms,
                 path: socket_path.clone(),
                 peer_addr: peer_addr.clone(),
                 listener_cancel,
@@ -3039,11 +3106,14 @@ impl FabricNode {
             }
             let result = if let Some(bind) = &dial.tcp {
                 state
-                    .dial_tcp(&dial.peer, &dial.protocol, bind.clone())
+                    .dial_tcp_with_options(&dial.peer, &dial.protocol, bind.clone(), dial.options)
                     .await
                     .map(|_| ())
             } else {
-                state.dial(&dial.peer, &dial.protocol).await.map(|_| ())
+                state
+                    .dial_with_options(&dial.peer, &dial.protocol, dial.options)
+                    .await
+                    .map(|_| ())
             };
             if let Err(error) = result {
                 let code = crate::error::code_of(&error);
@@ -4280,16 +4350,23 @@ async fn process_control_request(
             state.unexpose(&protocol).await?;
             ControlResponse::Ok
         }
-        ControlRequest::Dial { peer, protocol } => {
-            let socket = state.dial(&peer, &protocol).await?;
+        ControlRequest::Dial {
+            peer,
+            protocol,
+            options,
+        } => {
+            let socket = state.dial_with_options(&peer, &protocol, options).await?;
             ControlResponse::Dial { socket }
         }
         ControlRequest::DialTcp {
             peer,
             protocol,
             bind,
+            options,
         } => {
-            let addr = state.dial_tcp(&peer, &protocol, bind).await?;
+            let addr = state
+                .dial_tcp_with_options(&peer, &protocol, bind, options)
+                .await?;
             ControlResponse::DialTcp { addr }
         }
         ControlRequest::Ping { peer } => {
@@ -4662,9 +4739,13 @@ fn close_when_revoked(
             _ = closed => {}
             _ = revoked.cancelled() => {
                 if let Some(connection) = weak.upgrade() {
-                    let reason = if let Some(service) = requirements.first() {
-                        if policy.read().await.accepts_inbound(&peer) { ErrorCode::PeerNotPermittedForService.reason(&format!("permission {service:?} for this active operation was revoked")) }
-                        else { ErrorCode::PeerNotInAllowList.reason("node is not in fabric allow-list (access revoked)") }
+                    let policy = policy.read().await;
+                    let reason = if let Some(service) = requirements.first_withdrawn(&policy, &peer) {
+                        if policy.accepts_inbound(&peer) {
+                            ErrorCode::PeerNotPermittedForService.reason(&format!("permission {service:?} for this active operation was revoked"))
+                        } else {
+                            ErrorCode::PeerNotInAllowList.reason("node is not in fabric allow-list (access revoked)")
+                        }
                     } else { reason };
                     connection.close(VarInt::from_u32(403), reason.as_bytes());
                 }
@@ -4681,13 +4762,13 @@ async fn until_revoked(
 ) -> Result<()> {
     let revoked = admission.revoked();
     admission.children().scope(async {
-    tokio::select! {
-        result = work => result,
-        _ = revoked.cancelled() => {
-            debug!(peer = %admission.peer(), "ended one-shot work whose access a reload took away");
-            Ok(())
+        tokio::select! {
+            result = work => result,
+            _ = revoked.cancelled() => {
+                debug!(peer = %admission.peer(), "ended one-shot work whose access a reload took away");
+                Ok(())
+            }
         }
-    }
     }).await
 }
 
@@ -5550,8 +5631,23 @@ async fn run_dial_socket(
     _lease: DialListenerLease,
     gauge: Arc<tunnel::ClientAttachGauge>,
     recorder: ConnectionRecorder,
+    queue_timeout_ms: Arc<AtomicU64>,
 ) {
     let backoff_key = BackoffKey::dial(&peer, &alpn);
+    let queue_peer = match peer.parse::<EndpointId>() {
+        Ok(id) => Ok(id),
+        Err(_) => peer_connections
+            .resolve_peer(&home, &peer)
+            .await
+            .map(|addr| addr.id),
+    };
+    let queue = match queue_peer {
+        Ok(id) => peer_connections.dial_queue(id),
+        Err(error) => {
+            warn!(%peer, %error, "dial listener could not resolve its peer");
+            return;
+        }
+    };
     loop {
         tokio::select! {
             biased;
@@ -5561,10 +5657,16 @@ async fn run_dial_socket(
                 let Ok((local, _)) = accepted else {
                     break;
                 };
-                let Ok(permit) = dial_slots.clone().try_acquire_owned() else {
-                    drop(local);
-                    continue;
+                let reservation = match queue.reserve(Duration::from_millis(queue_timeout_ms.load(Ordering::Relaxed))) {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        dial_failures.record_failure_for_diagnostics(&backoff_key, "dial queue refused connection", &crate::dial_queue::diagnostic(&error)).await;
+                        drop(local);
+                        continue;
+                    }
                 };
+                let admission_deadline = reservation.deadline;
+                let dial_slots = dial_slots.clone();
                 let endpoint_rx = endpoint_rx.clone();
                 let home = home.clone();
                 let peer = peer.clone();
@@ -5579,9 +5681,16 @@ async fn run_dial_socket(
                     String::from_utf8_lossy(&alpn).to_string(),
                     gauge.clone(),
                     recorder.clone(),
-                ));
+                ).with_admission_deadline(admission_deadline));
                 tokio::spawn(async move {
-                    let _permit = permit;
+                    let _permit = match reservation.acquire(dial_slots, &cancel).await {
+                        Ok(Some(permit)) => permit,
+                        Ok(None) => return,
+                        Err(error) => {
+                            dial_failures.record_failure_for_diagnostics(&backoff_key, "dial queue refused connection", &crate::dial_queue::diagnostic(&error)).await;
+                            return;
+                        }
+                    };
                     match
                         tunnel::run_client_connection(
                             local,
@@ -5600,7 +5709,7 @@ async fn run_dial_socket(
                         Err(error) if mux::is_peer_offline(&error) => {}
                         Err(error) => {
                             dial_failures
-                                .record_failure_for_diagnostics(&backoff_key, "dial socket connection failed", &error)
+                                .record_failure_for_diagnostics(&backoff_key, "dial socket connection failed", &crate::dial_queue::diagnostic(&error))
                                 .await;
                         }
                     }
@@ -5608,6 +5717,75 @@ async fn run_dial_socket(
             }
         }
     }
+}
+
+/// A service rendezvous reserves its bounded queue entry before a task is
+/// spawned. Shared service listeners retain their immediate-admission behavior.
+enum ServiceDialReservation {
+    Immediate(OwnedSemaphorePermit),
+    Queued(crate::dial_queue::DialReservation),
+}
+
+enum ServiceDialPermit {
+    Immediate {
+        _permit: OwnedSemaphorePermit,
+    },
+    Queued {
+        _permit: crate::dial_queue::DialPermit,
+    },
+}
+
+impl ServiceDialReservation {
+    fn reserve(
+        slots: &Arc<Semaphore>,
+        queue: Option<&Arc<crate::dial_queue::DialQueue>>,
+    ) -> Result<Self> {
+        if let Some(queue) = queue {
+            return queue
+                .reserve(Duration::from_millis(
+                    crate::config::DEFAULT_DIAL_QUEUE_TIMEOUT_MS,
+                ))
+                .map(Self::Queued);
+        }
+        slots
+            .clone()
+            .try_acquire_owned()
+            .map(Self::Immediate)
+            .map_err(|_| crate::dial_queue::limit_error("dial daemon capacity is full"))
+    }
+
+    async fn acquire(
+        self,
+        slots: Arc<Semaphore>,
+        cancel: &CancellationToken,
+    ) -> Result<Option<ServiceDialPermit>> {
+        match self {
+            Self::Immediate(permit) => Ok(Some(ServiceDialPermit::Immediate { _permit: permit })),
+            Self::Queued(reservation) => Ok(reservation
+                .acquire(slots, cancel)
+                .await?
+                .map(|permit| ServiceDialPermit::Queued { _permit: permit })),
+        }
+    }
+}
+
+async fn refuse_queued_service_dial(
+    local: &mut UnixStream,
+    service: &dyn Service,
+    failures: &FailureBackoff,
+    key: &BackoffKey,
+    error: &anyhow::Error,
+) {
+    let message = crate::dial_queue::diagnostic(error);
+    failures
+        .record_failure_for_diagnostics(key, "dial queue refused connection", &message)
+        .await;
+    // The CLI still expects service frames, never a generic text preface.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(1),
+        write_service_notice(local, service, Notice::Unavailable { error: &message }),
+    )
+    .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5631,6 +5809,9 @@ async fn run_resumable_dial_socket(
     one_shot: Option<OneShotDialSocket>,
 ) {
     let backoff_key = BackoffKey::dial(&peer, protocol.alpn);
+    let queue = one_shot
+        .as_ref()
+        .map(|_| peer_connections.dial_queue(peer_addr.id));
     loop {
         tokio::select! {
             biased;
@@ -5638,14 +5819,20 @@ async fn run_resumable_dial_socket(
             _ = daemon_cancel.cancelled() => break,
             _ = one_shot_dial_expired(&one_shot) => break,
             accepted = listener.accept() => {
-                let Ok((local, _)) = accepted else {
+                let Ok((mut local, _)) = accepted else {
                     break;
                 };
-                let Ok(permit) = dial_slots.clone().try_acquire_owned() else {
-                    drop(local);
-                    if one_shot.is_some() { break; }
-                    continue;
+                let reservation = match ServiceDialReservation::reserve(&dial_slots, queue.as_ref()) {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        if one_shot.is_some() {
+                            refuse_queued_service_dial(&mut local, service.as_ref(), &dial_failures, &backoff_key, &error).await;
+                            break;
+                        }
+                        continue;
+                    }
                 };
+                let dial_slots = dial_slots.clone();
                 let endpoint_rx = endpoint_rx.clone();
                 let home = home.clone();
                 let peer = peer.clone();
@@ -5659,7 +5846,14 @@ async fn run_resumable_dial_socket(
                 let gauge = gauge.clone();
                 let recorder = recorder.clone();
                 tokio::spawn(async move {
-                    let _permit = permit;
+                    let _permit = match reservation.acquire(dial_slots, &cancel).await {
+                        Ok(Some(permit)) => permit,
+                        Ok(None) => return,
+                        Err(error) => {
+                            refuse_queued_service_dial(&mut local, service.as_ref(), &dial_failures, &backoff_key, &error).await;
+                            return;
+                        }
+                    };
                     let failure = format!("{} dial socket connection failed", service.name());
                     match handle_resumable_dial_socket_connection(
                         local,
@@ -6167,8 +6361,23 @@ async fn run_dial_tcp_listener(
     peer_connections: Arc<mux::PeerConnections>,
     gauge: Arc<tunnel::ClientAttachGauge>,
     recorder: ConnectionRecorder,
+    queue_timeout_ms: Arc<AtomicU64>,
 ) {
     let backoff_key = BackoffKey::dial(&peer, &alpn);
+    let queue_peer = match peer.parse::<EndpointId>() {
+        Ok(id) => Ok(id),
+        Err(_) => peer_connections
+            .resolve_peer(&home, &peer)
+            .await
+            .map(|addr| addr.id),
+    };
+    let queue = match queue_peer {
+        Ok(id) => peer_connections.dial_queue(id),
+        Err(error) => {
+            warn!(%peer, %error, "dial listener could not resolve its peer");
+            return;
+        }
+    };
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -6176,10 +6385,16 @@ async fn run_dial_tcp_listener(
                 let Ok((local, _)) = accepted else {
                     break;
                 };
-                let Ok(permit) = dial_slots.clone().try_acquire_owned() else {
-                    drop(local);
-                    continue;
+                let reservation = match queue.reserve(Duration::from_millis(queue_timeout_ms.load(Ordering::Relaxed))) {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        dial_failures.record_failure_for_diagnostics(&backoff_key, "dial queue refused connection", &crate::dial_queue::diagnostic(&error)).await;
+                        drop(local);
+                        continue;
+                    }
                 };
+                let admission_deadline = reservation.deadline;
+                let dial_slots = dial_slots.clone();
                 let endpoint_rx = endpoint_rx.clone();
                 let home = home.clone();
                 let peer = peer.clone();
@@ -6194,9 +6409,16 @@ async fn run_dial_tcp_listener(
                     String::from_utf8_lossy(&alpn).to_string(),
                     gauge.clone(),
                     recorder.clone(),
-                ));
+                ).with_admission_deadline(admission_deadline));
                 tokio::spawn(async move {
-                    let _permit = permit;
+                    let _permit = match reservation.acquire(dial_slots, &cancel).await {
+                        Ok(Some(permit)) => permit,
+                        Ok(None) => return,
+                        Err(error) => {
+                            dial_failures.record_failure_for_diagnostics(&backoff_key, "dial queue refused connection", &crate::dial_queue::diagnostic(&error)).await;
+                            return;
+                        }
+                    };
                     match
                         tunnel::run_client_tcp_connection(
                             local,
@@ -6215,7 +6437,7 @@ async fn run_dial_tcp_listener(
                         Err(error) if mux::is_peer_offline(&error) => {}
                         Err(error) => {
                             dial_failures
-                                .record_failure_for_diagnostics(&backoff_key, "dial tcp connection failed", &error)
+                                .record_failure_for_diagnostics(&backoff_key, "dial tcp connection failed", &crate::dial_queue::diagnostic(&error))
                                 .await;
                         }
                     }
@@ -6241,6 +6463,9 @@ async fn run_raw_dial_socket(
     one_shot: Option<OneShotDialSocket>,
 ) {
     let backoff_key = BackoffKey::dial(&peer_addr.id.to_string(), &alpn);
+    let queue = one_shot
+        .as_ref()
+        .map(|_| peer_connections.dial_queue(peer_addr.id));
     loop {
         tokio::select! {
             biased;
@@ -6248,15 +6473,22 @@ async fn run_raw_dial_socket(
             _ = daemon_cancel.cancelled() => break,
             _ = one_shot_dial_expired(&one_shot) => break,
             accepted = listener.accept() => {
-                let Ok((local, _)) = accepted else {
+                let Ok((mut local, _)) = accepted else {
                     break;
                 };
-                let Ok(permit) = dial_slots.clone().try_acquire_owned() else {
-                    drop(local);
-                    if one_shot.is_some() { break; }
-                    continue;
+                let reservation = match ServiceDialReservation::reserve(&dial_slots, queue.as_ref()) {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        if one_shot.is_some() {
+                            refuse_queued_service_dial(&mut local, service.as_ref(), &dial_failures, &backoff_key, &error).await;
+                            break;
+                        }
+                        continue;
+                    }
                 };
-                let endpoint = endpoint_rx.borrow().clone();
+                let dial_slots = dial_slots.clone();
+                let endpoint_rx = endpoint_rx.clone();
+                let cancel = daemon_cancel.clone();
                 let peer = peer.clone();
                 let peer_addr = peer_addr.clone();
                 let alpn = alpn.clone();
@@ -6265,7 +6497,15 @@ async fn run_raw_dial_socket(
                 let backoff_key = backoff_key.clone();
                 let peer_connections = peer_connections.clone();
                 tokio::spawn(async move {
-                    let _permit = permit;
+                    let _permit = match reservation.acquire(dial_slots, &cancel).await {
+                        Ok(Some(permit)) => permit,
+                        Ok(None) => return,
+                        Err(error) => {
+                            refuse_queued_service_dial(&mut local, service.as_ref(), &dial_failures, &backoff_key, &error).await;
+                            return;
+                        }
+                    };
+                    let endpoint = endpoint_rx.borrow().clone();
                     match handle_raw_dial_socket_connection(
                         local,
                         endpoint,
@@ -7670,6 +7910,9 @@ mod tests {
             })
         };
         let graceful = DialSocket {
+            queue_timeout_ms: Arc::new(AtomicU64::new(
+                crate::config::DEFAULT_DIAL_QUEUE_TIMEOUT_MS,
+            )),
             path: graceful_path.clone(),
             peer_addr: peer_addr.clone(),
             listener_cancel: graceful_cancel,
@@ -7703,6 +7946,9 @@ mod tests {
             .await
             .expect("wedged listener task did not start");
         let wedged = DialSocket {
+            queue_timeout_ms: Arc::new(AtomicU64::new(
+                crate::config::DEFAULT_DIAL_QUEUE_TIMEOUT_MS,
+            )),
             path: wedged_path.clone(),
             peer_addr,
             listener_cancel: wedged_cancel,
@@ -7912,6 +8158,126 @@ mod tests {
         server.shutdown().await?;
         client.shutdown().await?;
         assert_eq!(state.active_dial_listeners.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_shot_queue_uses_default_deadline_and_releases_cancelled_reservations() -> Result<()>
+    {
+        let queues = crate::dial_queue::DialQueues::default();
+        let queue = queues.peer(iroh::SecretKey::generate().public());
+        let slots = Arc::new(Semaphore::new(0));
+        let cancel = CancellationToken::new();
+        let reservation = ServiceDialReservation::reserve(&slots, Some(&queue))?;
+        let waiting = tokio::spawn({
+            let slots = slots.clone();
+            let cancel = cancel.clone();
+            async move { reservation.acquire(slots, &cancel).await }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(
+            crate::config::DEFAULT_DIAL_QUEUE_TIMEOUT_MS - 1,
+        ))
+        .await;
+        assert!(!waiting.is_finished());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let error = match waiting.await? {
+            Err(error) => error,
+            Ok(_) => bail!("full daemon capacity did not expire"),
+        };
+        assert_eq!(
+            fabric_config::error::code_of(&error),
+            ErrorCode::SessionLimitReached
+        );
+        let reservation = ServiceDialReservation::reserve(&slots, Some(&queue))?;
+        cancel.cancel();
+        assert!(reservation.acquire(slots.clone(), &cancel).await?.is_none());
+        slots.add_permits(1);
+        let reservation = ServiceDialReservation::reserve(&slots, Some(&queue))?;
+        let active = reservation
+            .acquire(slots.clone(), &CancellationToken::new())
+            .await?;
+        assert!(active.is_some());
+        drop(active);
+        assert_eq!(slots.available_permits(), 1);
+        Ok(())
+    }
+
+    /// Removing a one-shot rendezvous after accept must not discard a call
+    /// waiting for the same daemon budget used by generic dial listeners.
+    #[tokio::test]
+    async fn one_shot_exec_and_shell_wait_for_capacity_without_sharing_sockets() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let server_home = FabricHome::new(temp.path().join("server"));
+        let client_home = FabricHome::new(temp.path().join("client"));
+        let server = FabricNode::start(server_home.clone()).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+        let state = client.state();
+        let held = state
+            .dial_slots
+            .clone()
+            .acquire_many_owned(state.dial_slots.available_permits() as u32)
+            .await?;
+        let mut paths = HashSet::new();
+        let mut calls = tokio::task::JoinSet::new();
+        for index in 0..4 {
+            let service = if index % 2 == 0 { "exec" } else { "shell" };
+            let path = state.dial_service("server", service).await?;
+            assert!(paths.insert(path.clone()), "calls shared a rendezvous");
+            let mut stream = UnixStream::connect(&path).await?;
+            calls.spawn(async move {
+                let expected = format!("queued{index}");
+                let command = format!("printf '{expected}'; exit {index}");
+                let (output, code) = if service == "exec" {
+                    exec::write_client_argv(&mut stream, &["/bin/sh".into(), "-c".into(), command])
+                        .await?;
+                    collect_exec(&mut stream).await?
+                } else {
+                    shell::write_client_stdin(&mut stream, format!("{command}\n").as_bytes())
+                        .await?;
+                    let mut output = Vec::new();
+                    let code = loop {
+                        match shell::read_server_frame(&mut stream).await? {
+                            Some(shell::ServerFrame::Output(bytes)) => output.extend(bytes),
+                            Some(shell::ServerFrame::Exit(code)) => break code,
+                            Some(shell::ServerFrame::Error(error)) => bail!("{error}"),
+                            Some(shell::ServerFrame::Status(_)) => {}
+                            None => bail!("queued shell closed without exit status"),
+                        }
+                    };
+                    (output, code)
+                };
+                assert_eq!(code, index);
+                assert!(String::from_utf8_lossy(&output).contains(&expected));
+                Ok::<_, anyhow::Error>(())
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.active_dial_listeners.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(paths.iter().all(|path| !path.exists()));
+        assert!(state.dial_sockets.lock().await.is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), calls.join_next())
+                .await
+                .is_err(),
+            "one-shot call ended while daemon capacity was still occupied"
+        );
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while let Some(result) = calls.join_next().await {
+                result??;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        server.shutdown().await?;
+        client.shutdown().await?;
         Ok(())
     }
 
@@ -10899,6 +11265,7 @@ mod tests {
         node.shutdown().await?;
         let mut config = FabricConfig::load(&home)?;
         config.upsert_dial(PersistedDial {
+            options: DialOptions::default(),
             peer: id.clone(),
             protocol: "audit/echo".into(),
             tcp: None,
@@ -10963,6 +11330,7 @@ mod tests {
         node.shutdown().await?;
         let mut config = FabricConfig::load(&home)?;
         config.upsert_dial(PersistedDial {
+            options: DialOptions::default(),
             peer: id,
             protocol: "audit/echo".into(),
             tcp: Some(blocked_addr.clone()),

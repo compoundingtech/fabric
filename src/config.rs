@@ -1491,6 +1491,59 @@ pub struct PersistedDial {
     pub protocol: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp: Option<String>,
+    #[serde(flatten)]
+    pub options: DialOptions,
+}
+
+pub const DEFAULT_DIAL_QUEUE_TIMEOUT_MS: u64 = 10_000;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DialOptions {
+    #[serde(
+        default = "default_dial_queue_timeout_ms",
+        skip_serializing_if = "is_default_dial_queue_timeout_ms"
+    )]
+    pub queue_timeout_ms: u64,
+}
+
+fn default_dial_queue_timeout_ms() -> u64 {
+    DEFAULT_DIAL_QUEUE_TIMEOUT_MS
+}
+fn is_default_dial_queue_timeout_ms(value: &u64) -> bool {
+    *value == DEFAULT_DIAL_QUEUE_TIMEOUT_MS
+}
+
+impl Default for DialOptions {
+    fn default() -> Self {
+        Self {
+            queue_timeout_ms: DEFAULT_DIAL_QUEUE_TIMEOUT_MS,
+        }
+    }
+}
+
+impl DialOptions {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn from_seconds(seconds: f64) -> Result<Self> {
+        let duration = std::time::Duration::try_from_secs_f64(seconds)
+            .map_err(|_| invalid_argument("queue timeout must be finite and nonnegative".into()))?;
+        let queue_timeout_ms = u64::try_from(duration.as_millis())
+            .map_err(|_| invalid_argument("queue timeout is too large".into()))?;
+        if seconds > 0.0 && queue_timeout_ms == 0 {
+            return Err(invalid_argument(
+                "positive queue timeout must be at least one millisecond".into(),
+            ));
+        }
+        let options = Self { queue_timeout_ms };
+        options.validate()?;
+        Ok(options)
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -1667,6 +1720,7 @@ impl FabricConfig {
 
         let mut dials = HashSet::new();
         for dial in &self.dials {
+            dial.options.validate()?;
             dial.peer
                 .parse::<EndpointId>()
                 .context("invalid persisted dial peer id")?;
@@ -1819,6 +1873,36 @@ fn invalid_argument(message: String) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dial_queue_timeout_is_additive_and_rejects_invalid_deadlines() -> anyhow::Result<()> {
+        let legacy: super::PersistedDial = toml::from_str("peer = 'example'\nprotocol = 'web'\n")?;
+        assert_eq!(legacy.options, super::DialOptions::default());
+        let mut configured = legacy;
+        configured.options = super::DialOptions::from_seconds(0.15)?;
+        assert_eq!(configured.options.queue_timeout_ms, 150);
+        let encoded = toml::to_string(&configured)?;
+        let decoded: super::PersistedDial = toml::from_str(&encoded)?;
+        assert_eq!(decoded, configured);
+        assert_eq!(super::DialOptions::from_seconds(0.0)?.queue_timeout_ms, 0);
+        for seconds in [-1.0, f64::NAN, f64::INFINITY, 0.0001] {
+            let error = super::DialOptions::from_seconds(seconds).unwrap_err();
+            assert_eq!(
+                fabric_config::error::code_of(&error),
+                fabric_config::error::ErrorCode::InvalidArgument
+            );
+        }
+        let request: crate::control::ControlRequest = serde_json::from_str(
+            r#"{"type":"dial_tcp","peer":"example","protocol":"web","bind":"127.0.0.1:0"}"#,
+        )?;
+        assert!(
+            !serde_json::to_value(request)?
+                .as_object()
+                .unwrap()
+                .contains_key("options")
+        );
+        Ok(())
+    }
+
     use super::*;
 
     #[derive(Debug, Deserialize)]

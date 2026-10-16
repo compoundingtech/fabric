@@ -164,6 +164,7 @@ impl Drop for ClientAttachGuard {
 pub struct ClientConnectionNotices {
     encode: Arc<NoticeEncoder>,
     gauge: Option<Arc<ClientAttachGauge>>,
+    admission_deadline: Option<tokio::time::Instant>,
 }
 
 impl ClientConnectionNotices {
@@ -173,6 +174,7 @@ impl ClientConnectionNotices {
         Self {
             encode: Arc::new(encode),
             gauge: None,
+            admission_deadline: None,
         }
     }
 
@@ -186,6 +188,14 @@ impl ClientConnectionNotices {
     /// outbound sessions.
     pub fn with_gauge(mut self, gauge: Arc<ClientAttachGauge>) -> Self {
         self.gauge = Some(gauge);
+        self
+    }
+
+    pub(crate) fn with_admission_deadline(
+        mut self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Self {
+        self.admission_deadline = deadline;
         self
     }
 
@@ -1240,6 +1250,19 @@ async fn run_client_attach_loop(
         if session.is_complete().await {
             return Ok(());
         }
+        if !session.has_attached().await
+            && let Some(deadline) = notices.as_ref().and_then(|n| n.admission_deadline)
+            && tokio::time::Instant::now() >= deadline
+        {
+            return fail_permanently(
+                &session,
+                notices.as_ref(),
+                crate::dial_queue::limit_error(
+                    "dial queue timeout expired while waiting for remote session capacity",
+                ),
+            )
+            .await;
+        }
 
         let result = if let Some(stream) = initial_stream.take() {
             attach_stream(
@@ -1319,6 +1342,26 @@ async fn run_client_attach_loop(
             // and log a reconnect for a session that was already over.
             Err(_) if session.is_complete().await => return Ok(()),
             Err(error) => {
+                // A full server has not created this session or consumed its
+                // application bytes. Retry that admission, with the same id,
+                // inside the local queue's original deadline. Other refusals
+                // and failures retain their existing behavior.
+                if !session.has_attached().await
+                    && error.downcast_ref::<ServerRejected>().is_some()
+                    && fabric_config::error::code_of(&error) == ErrorCode::SessionLimitReached
+                    && let Some(deadline) = notices.as_ref().and_then(|n| n.admission_deadline)
+                {
+                    if let Err(error) = session.probe_local_endpoint().await {
+                        return fail_permanently(&session, notices.as_ref(), error).await;
+                    }
+                    let retry_at =
+                        (tokio::time::Instant::now() + Duration::from_millis(50)).min(deadline);
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => { session.abort_local().await?; return Ok(()); }
+                        _ = tokio::time::sleep_until(retry_at) => continue,
+                    }
+                }
                 // A temporary admission refusal is a reply from a live peer.
                 // It must not inherit an absent peer's long retry schedule.
                 if crate::mux::is_temporary_stream_denial(&error) {
@@ -1445,6 +1488,7 @@ async fn connect_and_attach(
     // to fail. The consumer may leave during it, and then the rest of the
     // attempt is for nobody.
     let initial = !session.has_attached().await;
+    let admission_deadline = notices.and_then(|n| n.admission_deadline);
     let protocol = std::str::from_utf8(alpn).context("tunnel protocol is not UTF-8")?;
     let stream = tokio::select! {
         connected = connections.open_stream(
@@ -1467,6 +1511,9 @@ async fn connect_and_attach(
                 "peer did not accept the initial tunnel within {:?}",
                 INITIAL_CONNECT_TIMEOUT
             )
+        }
+        _ = tokio::time::sleep_until(admission_deadline.unwrap_or_else(|| tokio::time::Instant::now() + INITIAL_CONNECT_TIMEOUT)), if initial && admission_deadline.is_some() => {
+            return Err(crate::dial_queue::limit_error("dial queue timeout expired during remote admission"));
         }
         error = session.watch_local_endpoint() => return Err(error),
     };
@@ -1556,17 +1603,28 @@ async fn attach_stream_inner(
     attach_drop_closer(&connection, drop_rx);
 
     let resume = session.has_attached().await;
-    write_frame(
-        &mut send,
-        Frame::Hello {
-            session_id: session.id(),
-            recv_next: session.recv_next().await,
-            resume,
-        },
-    )
-    .await?;
-
-    let (session_id, recv_next) = match read_frame(&mut recv).await? {
+    let hello = async {
+        write_frame(
+            &mut send,
+            Frame::Hello {
+                session_id: session.id(),
+                recv_next: session.recv_next().await,
+                resume,
+            },
+        )
+        .await?;
+        read_frame(&mut recv).await
+    };
+    let reply = if !resume && let Some(deadline) = notices.and_then(|n| n.admission_deadline) {
+        tokio::time::timeout_at(deadline, hello)
+            .await
+            .map_err(|_| {
+                crate::dial_queue::limit_error("dial queue timeout expired during remote admission")
+            })??
+    } else {
+        hello.await?
+    };
+    let (session_id, recv_next) = match reply {
         Some(Frame::Hello {
             session_id,
             recv_next,
