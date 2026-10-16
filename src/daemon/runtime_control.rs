@@ -84,6 +84,14 @@ impl ConfigUpdate {
 
 impl DaemonState {
     pub(super) async fn drain_policy_commits(&self) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(3), self.wait_policy_commits())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("policy/config commits did not drain within three seconds")
+            })?
+    }
+
+    async fn wait_policy_commits(&self) -> Result<()> {
         let _policy = self.policy_update.lock().await;
         let config = self.config_write.clone();
         let runtime = self.runtime_peers.clone();
@@ -173,7 +181,12 @@ impl DaemonState {
         });
     }
 
-    async fn quarantine_runtime_policy(&self, published: &mut PeerBook, error: &anyhow::Error) {
+    async fn quarantine_runtime_policy(
+        &self,
+        published: &mut PeerBook,
+        error: &anyhow::Error,
+        cancel_existing: bool,
+    ) {
         *published = PeerBook::default();
         if let Some(runtime) = &self.runtime_peers {
             let fault = format!("{error:#}");
@@ -183,7 +196,17 @@ impl DaemonState {
             })
             .await;
         }
-        let mut selected = self.select_runtime_revocations(published).await;
+        // A failed static edit closes new admissions without destroying work
+        // admitted by the last accepted policy. Unknown committed state is the
+        // only fault that must also cancel that work before reconciliation.
+        let mut selected = if cancel_existing {
+            self.select_runtime_revocations(published).await
+        } else {
+            Revocations {
+                admissions: vec![],
+                sessions: vec![],
+            }
+        };
         for previous in self.pending_policy_revocations.lock().unwrap().iter() {
             selected
                 .admissions
@@ -194,7 +217,9 @@ impl DaemonState {
         selected.admissions.dedup_by_key(|entry| entry.id);
         selected.sessions.sort_by(|a, b| a.id.cmp(&b.id));
         selected.sessions.dedup_by(|a, b| a.id == b.id);
-        self.signal_runtime_revocations(&selected).await;
+        if cancel_existing {
+            self.signal_runtime_revocations(&selected).await;
+        }
         *self.policy_quarantine.lock().await = Some(selected);
     }
 
@@ -307,10 +332,6 @@ impl DaemonState {
         runtime: Arc<std::sync::Mutex<runtime_peers::RuntimePeers>>,
         transaction: runtime_peers::Transaction,
     ) -> Result<runtime_peers::MutationReply> {
-        // Every admission and narrow grant check uses this same generation.
-        // Readers cannot observe durable state before publication, or half of
-        // a peer-book / handshake allow-list update.
-        let mut published = self.peer_book.write().await;
         let prepared = {
             let runtime = runtime.clone();
             let transaction = transaction.clone();
@@ -320,7 +341,7 @@ impl DaemonState {
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner())
                     .prepare(&transaction)?;
-                if !prepared.replay {
+                if !prepared.replay && prepared.no_op.is_none() {
                     SyncBook::load(&home)?.validate_against(&prepared.book)?;
                 }
                 Ok::<_, anyhow::Error>(prepared)
@@ -333,6 +354,13 @@ impl DaemonState {
             })
             .await;
         }
+        if let Some(reply) = prepared.no_op.clone() {
+            return Ok(reply);
+        }
+        // Preparation and sync-file I/O happen before this barrier. Policy
+        // writers are serialized; commit also rechecks the prepared revision.
+        // Admissions see one durable, published generation.
+        let mut published = self.peer_book.write().await;
         let selected = self.select_runtime_revocations(&prepared.book).await;
         let cancellation = selected.pending();
         let book = prepared.book.clone();
@@ -342,7 +370,7 @@ impl DaemonState {
             tokio::task::spawn_blocking(move || {
                 runtime
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|poison| poison.into_inner())
                     .commit(prepared, &request_id, cancellation)
             })
             .await
@@ -358,7 +386,8 @@ impl DaemonState {
             Ok(receipt) => receipt,
             Err(error) => {
                 if crate::error::code_of(&error) == ErrorCode::RuntimeCommitIndeterminate {
-                    self.quarantine_runtime_policy(&mut published, &error).await;
+                    self.quarantine_runtime_policy(&mut published, &error, true)
+                        .await;
                 }
                 return Err(error);
             }
@@ -377,7 +406,6 @@ impl DaemonState {
             return Err(FabricError::new(ErrorCode::DaemonNotRunning, "daemon is stopping").into());
         }
         let runtime = self.runtime_peers.as_ref().expect("runtime mode").clone();
-        let mut published = self.peer_book.write().await;
         if with_runtime(runtime.clone(), |runtime| Ok(runtime.fault().is_some())).await? {
             if let Some(selected) = self.policy_quarantine.lock().await.as_ref() {
                 if selected.status(false).await.state != CancellationState::Complete {
@@ -393,30 +421,59 @@ impl DaemonState {
                     .reconcile(&home)
             })
             .await?;
-            *published = result?;
+            let book = result?;
+            let mut published = self.peer_book.write().await;
+            let selected = self.select_runtime_revocations(&book).await;
+            *published = book;
+            self.signal_runtime_revocations(&selected).await;
             *self.policy_quarantine.lock().await = None;
+            drop(published);
+            self.monitor_runtime_revocations(runtime, None, selected);
+            self.peer_connections.presence.retry_now();
             return Ok(());
         }
         let home = self.home.clone();
         let input =
             match tokio::task::spawn_blocking(move || runtime_peers::StaticInput::load(&home))
-                .await?
+                .await
+                .unwrap_or_else(|error| Err(error.into()))
             {
                 Ok(input) => input,
                 Err(error) => {
-                    self.quarantine_runtime_policy(&mut published, &error).await;
+                    let mut published = self.peer_book.write().await;
+                    self.quarantine_runtime_policy(&mut published, &error, false)
+                        .await;
                     return Err(error);
                 }
             };
         let preview = input.clone();
-        let candidate = with_runtime(runtime.clone(), move |runtime| {
+        let candidate = match with_runtime(runtime.clone(), move |runtime| {
             runtime.reload_candidate(preview)
         })
-        .await?;
+        .await
+        {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                let mut published = self.peer_book.write().await;
+                self.quarantine_runtime_policy(&mut published, &error, false)
+                    .await;
+                return Err(error);
+            }
+        };
         let home = self.home.clone();
         let validation = candidate.clone();
-        tokio::task::spawn_blocking(move || SyncBook::load(&home)?.validate_against(&validation))
-            .await??;
+        let validation = tokio::task::spawn_blocking(move || {
+            SyncBook::load(&home)?.validate_against(&validation)
+        })
+        .await
+        .unwrap_or_else(|error| Err(error.into()));
+        if let Err(error) = validation {
+            let mut published = self.peer_book.write().await;
+            self.quarantine_runtime_policy(&mut published, &error, false)
+                .await;
+            return Err(error);
+        }
+        let mut published = self.peer_book.write().await;
         let selected = self.select_runtime_revocations(&candidate).await;
         let store = runtime.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -436,9 +493,10 @@ impl DaemonState {
         match result {
             Ok(book) => *published = book,
             Err(error) => {
-                if crate::error::code_of(&error) == ErrorCode::RuntimeCommitIndeterminate {
-                    self.quarantine_runtime_policy(&mut published, &error).await;
-                }
+                let indeterminate =
+                    crate::error::code_of(&error) == ErrorCode::RuntimeCommitIndeterminate;
+                self.quarantine_runtime_policy(&mut published, &error, indeterminate)
+                    .await;
                 return Err(error);
             }
         }
@@ -1039,10 +1097,19 @@ mod tests {
             .lock()
             .unwrap()
             .fail_directory_sync_for_test();
+        let trusted = server
+            .state()
+            .admissions
+            .admit(client.id(), crate::admission::Grant::Trust);
         let withdrawal = transaction("controller", "uncertain", 1, vec![grant(&client, &[])]);
         let reply = request(&home, withdrawal.clone()).await?;
         assert_eq!(reply.error.unwrap().code, "runtime_commit_indeterminate");
         assert!(server.state().peer_book.read().await.peers().is_empty());
+        assert!(
+            trusted.revoked().is_cancelled(),
+            "indeterminate state must cancel existing trust admissions too"
+        );
+        drop(trusted);
         assert!(reply.snapshot.unwrap().fault.is_some());
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
@@ -1210,6 +1277,249 @@ mod tests {
         Ok(())
     }
 
+    // Exercise actual existing traffic, not only the quarantined snapshot.
+    async fn failed_static_reload_preserves_work(kind: &str) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let _serial = SERIAL.lock().await;
+        let dir = tempfile::tempdir()?;
+        let remote_dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let remote_home = FabricHome::new(remote_dir.path());
+        let client = FabricNode::start(remote_home.clone()).await?;
+        let mut static_book = PeerBook::default();
+        static_book.add_with_allow(
+            client.id(),
+            Some("client".into()),
+            Some(client.addr()),
+            Some(vec!["work/0".into()]),
+        );
+        if kind == "git" {
+            static_book.share_git_remote("repo", dir.path().join("repo.git"))?;
+        }
+        static_book.save(&home)?;
+        let server = FabricNode::start_with_daemon_options(home.clone(), options()).await?;
+        trust_server(&remote_home, &client, &server).await?;
+        if kind == "git" {
+            mutate(
+                &home,
+                "install-git",
+                0,
+                vec![
+                    Operation::AddPeer {
+                        node_id: client.id(),
+                        name: Some("client".into()),
+                        direction: None,
+                        addr: Some(client.addr()),
+                    },
+                    grant(&client, &["git/repo/read"]),
+                ],
+            )
+            .await?;
+        }
+        let (echo, task) = echo_server().await?;
+        server.expose_tcp("work/0", echo).await?;
+        let port = client
+            .dial_tcp("server", "work/0", "127.0.0.1:0".into())
+            .await?;
+        let mut live = tokio::net::TcpStream::connect(port).await?;
+        round_trip(&mut live, b"before-bad-reload").await?;
+        let original_static = fs::read(home.peers_path())?;
+        let state = server.state();
+        let admitted = state.admissions.admit(
+            client.id(),
+            crate::admission::Grant::Service("work/0".into()),
+        );
+        if kind == "malformed" {
+            fs::write(home.peers_path(), "format = [")?;
+        } else if kind == "git" {
+            static_book.unshare_git_remote("repo")?;
+            static_book.save(&home)?;
+        } else {
+            static_book.add_with_allow(
+                client.id(),
+                Some("client".into()),
+                Some(client.addr()),
+                Some(vec![]),
+            );
+            static_book.save(&home)?;
+        }
+        let original_mode = fs::metadata(dir.path())?.permissions();
+        if kind == "read-only" {
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500))?;
+            assert!(
+                fs::File::create(dir.path().join("write-probe")).is_err(),
+                "test must run without permission bypass"
+            );
+        }
+        let reload = state.reload_peers().await;
+        // Restore directory permissions before any assertion/fixture cleanup.
+        fs::set_permissions(dir.path(), original_mode)?;
+        assert!(reload.is_err());
+        if kind == "git" {
+            assert!(format!("{:#}", reload.unwrap_err()).contains("unshared"));
+        }
+        assert!(state.peer_book.read().await.peers().is_empty());
+        assert!(
+            state
+                .runtime_peers
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .fault()
+                .is_some()
+        );
+        assert!(
+            !admitted.revoked().is_cancelled(),
+            "invalid static edit cancelled accepted work"
+        );
+        round_trip(&mut live, b"still-running-after-fault").await?;
+        // New logical streams are refused on the already existing connection.
+        assert!(
+            client
+                .state()
+                .open_stream("server", b"work/0")
+                .await
+                .is_err()
+        );
+        if kind == "malformed" {
+            fs::write(home.peers_path(), original_static)?;
+        } else if kind == "git" {
+            static_book.share_git_remote("repo", dir.path().join("repo.git"))?;
+            static_book.save(&home)?;
+        }
+        state.reload_peers().await?;
+        if kind == "read-only" {
+            assert!(
+                admitted.revoked().is_cancelled(),
+                "successful repair must apply the withdrawal"
+            );
+        } else {
+            assert!(!admitted.revoked().is_cancelled());
+            round_trip(&mut live, b"running-after-repair").await?;
+        }
+        drop(admitted);
+        client.shutdown().await?;
+        server.shutdown().await?;
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn static_reload_with_read_only_state_closes_new_admissions_but_preserves_work()
+    -> Result<()> {
+        failed_static_reload_preserves_work("read-only").await
+    }
+    #[tokio::test]
+    async fn static_reload_with_runtime_git_conflict_fails_closed_and_preserves_work() -> Result<()>
+    {
+        failed_static_reload_preserves_work("git").await
+    }
+    #[tokio::test]
+    async fn malformed_static_reload_preserves_work_and_repairs_without_cancelling_it() -> Result<()>
+    {
+        failed_static_reload_preserves_work("malformed").await
+    }
+
+    #[tokio::test]
+    async fn preparing_a_transaction_does_not_hold_the_admission_barrier() -> Result<()> {
+        let _serial = SERIAL.lock().await;
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let server = FabricNode::start_with_daemon_options(home.clone(), options()).await?;
+        let state = server.state();
+        let store = state.runtime_peers.as_ref().unwrap().clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _guard = store.lock().unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+        });
+        held_rx.recv_timeout(Duration::from_secs(1))?;
+        let mutation_state = state.clone();
+        let mutation = tokio::spawn(async move {
+            mutation_state
+                .runtime_peer_request(transaction(
+                    "a",
+                    "prepare",
+                    0,
+                    vec![Operation::AddPeer {
+                        node_id: iroh::SecretKey::from_bytes(&[95; 32]).public(),
+                        name: Some("node".into()),
+                        direction: None,
+                        addr: None,
+                    }],
+                ))
+                .await
+        });
+        while state.policy_update.try_lock().is_ok() {
+            tokio::task::yield_now().await;
+        }
+        let available = state.peer_book.try_read().is_ok();
+        release_tx.send(())?;
+        worker.join().unwrap();
+        assert!(mutation.await?.error.is_none());
+        assert!(
+            available,
+            "preparation occupied the admission write barrier"
+        );
+        server.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn shutdown_still_closes_sessions_when_policy_drain_is_stalled() -> Result<()> {
+        let _serial = SERIAL.lock().await;
+        let dir = tempfile::tempdir()?;
+        let remote_dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let remote_home = FabricHome::new(remote_dir.path());
+        let server = FabricNode::start_with_daemon_options(home.clone(), options()).await?;
+        let client = FabricNode::start(remote_home.clone()).await?;
+        trust_server(&remote_home, &client, &server).await?;
+        let pid_path = dir.path().join("shutdown-child.pid");
+        server
+            .expose_exec(
+                "work/0",
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "echo $$ > \"$1\"; exec cat".into(),
+                    "child".into(),
+                    pid_path.to_string_lossy().into_owned(),
+                ],
+            )
+            .await?;
+        mutate(
+            &home,
+            "install",
+            0,
+            vec![add(&client, "client"), grant(&client, &["work/0"])],
+        )
+        .await?;
+        let port = client
+            .dial_tcp("server", "work/0", "127.0.0.1:0".into())
+            .await?;
+        let mut live = tokio::net::TcpStream::connect(port).await?;
+        round_trip(&mut live, b"attached").await?;
+        let pid: i32 = fs::read_to_string(pid_path)?.trim().parse()?;
+        let state = server.state();
+        let barrier = state.policy_update.lock().await;
+        let stopped = tokio::time::timeout(Duration::from_secs(6), server.shutdown()).await;
+        drop(barrier);
+        let error = stopped?.unwrap_err();
+        assert!(error.to_string().contains("commits did not drain"));
+        assert_eq!(state.tunnel_sessions.stats().await.total_sessions, 0);
+        assert!(!home.control_socket_path().exists());
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "shutdown skipped owned-child cleanup after the drain timeout"
+        );
+        client.shutdown().await?;
+        Ok(())
+    }
+
     #[derive(Debug)]
     struct Uncooperative {
         started: Arc<AtomicBool>,
@@ -1313,7 +1623,14 @@ mod tests {
             .fail_directory_sync_for_test();
         let fault = request(
             &home,
-            transaction("controller", "uncertain", 2, vec![grant(&client, &[])]),
+            transaction(
+                "controller",
+                "uncertain",
+                2,
+                vec![Operation::RemovePeer {
+                    node_id: client.id(),
+                }],
+            ),
         )
         .await?;
         assert_eq!(fault.error.unwrap().code, "runtime_commit_indeterminate");

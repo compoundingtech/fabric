@@ -148,11 +148,13 @@ existing receipt before the revision comparison. A retry with the same ID and
 same request digest returns its recorded outcome and committed revision,
 plus the **current** effective-access view; it never applies the mutation a
 second time. Reusing an ID with different contents is refused. Receipts retain
-bounded metadata for 24 hours, with 1,024 reserved slots; refuse new mutations
-when retention capacity is exhausted rather than evict unexpired receipts.
+bounded metadata for 24 hours in 1,024 slots, reserving 64 for withdrawal-only
+mutations; refuse mutations at their applicable capacity rather than evict
+unexpired receipts. There are at most 1,024 owner/NodeID records in total.
 After retention, an old expected revision prevents a stale mutation from
 reinstalling access; the client must reconcile instead of inventing a new ID
-for an uncertain request. No-op mutations return the current revision.
+for an uncertain request. No-op mutations return the current revision without
+storing a receipt.
 
 Rotation defaults to immediate replacement. Explicit overlap uses a batch that
 installs the new record and sets an immutable expiry on the old owner's record,
