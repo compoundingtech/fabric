@@ -167,7 +167,7 @@ fn is_no_application_protocol(error: &ConnectionError) -> bool {
     )
 }
 
-fn is_duplicate_connection(error: &anyhow::Error) -> bool {
+pub(crate) fn is_duplicate_connection(error: &anyhow::Error) -> bool {
     fn is_duplicate_close(error: &ConnectionError) -> bool {
         matches!(
             error,

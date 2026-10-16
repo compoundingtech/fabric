@@ -68,6 +68,9 @@ use crate::{
 
 mod runtime_control;
 
+#[cfg(test)]
+mod duplicate_attach_tests;
+
 const BUILTIN_ECHO_ALPN: &[u8] = b"fabric/echo/0";
 const SYNC_ALPN: &[u8] = b"fabric/sync/1";
 const ECHO_SERVICE: &str = "echo";

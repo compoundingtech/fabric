@@ -16,6 +16,13 @@ Deprecated, Fixed or Security.
 
 ## [Unreleased]
 
+### Fixed
+
+- A preferred duplicate connection arriving after mux admission no longer
+  closes a fresh tunnel request whose Hello was never sent. The daemon reopens
+  that unserved stream once on the canonical connection, preserving its local
+  socket, buffered input and admission deadline (#321).
+
 ## [0.9.1] - 2026-10-16
 
 ### Added

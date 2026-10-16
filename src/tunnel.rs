@@ -1243,6 +1243,7 @@ async fn run_client_attach_loop(
     mut initial_stream: Option<MuxStream>,
 ) -> Result<()> {
     let mut backoff = Backoff::new();
+    let mut initial_reopen_available = true;
     let mut presence_rx = connections.presence.subscribe();
     let mut peer_presence_sequence = connections.presence.peer_sequence(session.peer_id());
 
@@ -1342,6 +1343,19 @@ async fn run_client_attach_loop(
             // and log a reconnect for a session that was already over.
             Err(_) if session.is_complete().await => return Ok(()),
             Err(error) => {
+                if initial_reopen_available && error.downcast_ref::<UnsentInitialHello>().is_some()
+                {
+                    // This stream lost its connection before sending any
+                    // Hello byte. No backend could have accepted the session.
+                    // Preserve the local socket and buffered input, reopening
+                    // once under the same admission deadline and session id.
+                    initial_reopen_available = false;
+                    if cancel.is_cancelled() {
+                        return session.abort_local().await;
+                    }
+                    session.probe_local_endpoint().await?;
+                    continue;
+                }
                 // A full server has not created this session or consumed its
                 // application bytes. Retry that admission, with the same id,
                 // inside the local queue's original deadline. Other refusals
@@ -1586,6 +1600,48 @@ async fn attach_stream(
     result
 }
 
+#[derive(Debug)]
+struct UnsentInitialHello;
+impl fmt::Display for UnsentInitialHello {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("mux connection replaced before initial tunnel Hello was sent")
+    }
+}
+impl std::error::Error for UnsentInitialHello {}
+
+/// Count bytes actually accepted by AsyncWrite, including a partial write
+/// followed by failure. A failed flush after a complete Hello is not unsent.
+struct HelloWriter<'a, W> {
+    inner: &'a mut W,
+    written: &'a mut usize,
+}
+impl<W: AsyncWrite + Unpin> AsyncWrite for HelloWriter<'_, W> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut *this.inner).poll_write(cx, bytes);
+        if let std::task::Poll::Ready(Ok(written)) = &result {
+            *this.written += written;
+        }
+        result
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 async fn attach_stream_inner(
     session: Arc<TunnelSession>,
     stream: MuxStream,
@@ -1603,9 +1659,13 @@ async fn attach_stream_inner(
     attach_drop_closer(&connection, drop_rx);
 
     let resume = session.has_attached().await;
+    let mut hello_written = 0;
     let hello = async {
         write_frame(
-            &mut send,
+            &mut HelloWriter {
+                inner: &mut send,
+                written: &mut hello_written,
+            },
             Frame::Hello {
                 session_id: session.id(),
                 recv_next: session.recv_next().await,
@@ -1620,9 +1680,27 @@ async fn attach_stream_inner(
             .await
             .map_err(|_| {
                 crate::dial_queue::limit_error("dial queue timeout expired during remote admission")
-            })??
+            })
+            .and_then(|result| result)
     } else {
-        hello.await?
+        hello.await
+    };
+    let reply = match reply {
+        Err(error) if !resume && hello_written == 0 && !is_permanent_failure(&error) => {
+            let replacement = health
+                .connections
+                .connection(health.peer)
+                .await
+                .is_some_and(|current| current.stable_id() != connection.stable_id());
+            if connection.alpn() == crate::mux::MUX_ALPN
+                && (crate::mux::is_duplicate_connection(&error)
+                    || (connection.close_reason().is_some() && replacement))
+            {
+                return Err(error.context(UnsentInitialHello));
+            }
+            return Err(error);
+        }
+        reply => reply?,
     };
     let (session_id, recv_next) = match reply {
         Some(Frame::Hello {
@@ -2768,6 +2846,65 @@ mod tests {
     use super::*;
     use iroh::SecretKey;
     use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn initial_hello_byte_count_includes_partial_writes_and_failed_flushes() {
+        struct FailingWriter {
+            limit: usize,
+            bytes: Vec<u8>,
+        }
+        impl AsyncWrite for FailingWriter {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                bytes: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                let this = self.get_mut();
+                let count = bytes.len().min(this.limit.saturating_sub(this.bytes.len()));
+                if count == 0 {
+                    return std::task::Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()));
+                }
+                this.bytes.extend_from_slice(&bytes[..count]);
+                std::task::Poll::Ready(Ok(count))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()))
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        // Hello has a five-byte header and a 25-byte body. The last case
+        // accepts the whole frame, then fails its flush: it is not unsent.
+        for limit in [0, 1, 5, 29, 30] {
+            let mut output = FailingWriter {
+                limit,
+                bytes: Vec::new(),
+            };
+            let mut written = 0;
+            let result = write_frame(
+                &mut HelloWriter {
+                    inner: &mut output,
+                    written: &mut written,
+                },
+                Frame::Hello {
+                    session_id: session_id(91),
+                    recv_next: 0,
+                    resume: false,
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(written, limit);
+            assert_eq!(written, output.bytes.len());
+        }
+    }
 
     fn peer_id() -> EndpointId {
         SecretKey::generate().public()
