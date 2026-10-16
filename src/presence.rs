@@ -16,6 +16,8 @@ pub struct PeerEvent {
     pub path: Option<String>,
     pub cause: String,
     pub observed_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<crate::session_paths::SessionPathStatus>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerEvents {
@@ -185,6 +187,7 @@ impl Presence {
                 online,
                 path,
                 cause: cause.into(),
+                session: None,
                 observed_at_unix_ms: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -211,6 +214,40 @@ impl Presence {
             },
         );
     }
+    /// Session events share the bounded journal and cursor, while leaving the
+    /// cached peer liveness and reconnect sequence untouched.
+    pub(crate) fn session_event(
+        &self,
+        peer: EndpointId,
+        cause: &str,
+        session: crate::session_paths::SessionPathStatus,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        state.sequence += 1;
+        let event = PeerEvent {
+            sequence: state.sequence,
+            peer_id: peer.to_string(),
+            online: state.entries.get(&peer).is_none_or(|entry| entry.online),
+            path: if cause == "session_closed" {
+                session.path_at_close.as_ref()
+            } else {
+                session.current_path.as_ref()
+            }
+            .and_then(|path| path.class.clone()),
+            cause: cause.into(),
+            observed_at_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+            session: Some(session),
+        };
+        state.events.push_back(event);
+        while state.events.len() > 256 {
+            state.events.pop_front();
+        }
+        self.changed.send_replace(state.sequence);
+    }
     pub fn batch(&self, instance: Option<&str>, after: u64) -> PeerEvents {
         let state = self.state.lock().unwrap();
         let reset = instance != Some(self.instance.as_str())
@@ -233,6 +270,15 @@ impl Presence {
                 .cloned()
                 .collect()
         };
+        if reset {
+            events.extend(
+                state
+                    .events
+                    .iter()
+                    .filter(|event| event.session.is_some())
+                    .cloned(),
+            );
+        }
         events.sort_by_key(|event| event.sequence);
         PeerEvents {
             instance: self.instance.clone(),

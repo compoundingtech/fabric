@@ -67,6 +67,8 @@ use crate::{
 };
 
 mod runtime_control;
+#[cfg(test)]
+mod session_path_tests;
 
 const BUILTIN_ECHO_ALPN: &[u8] = b"fabric/echo/0";
 const SYNC_ALPN: &[u8] = b"fabric/sync/1";
@@ -1197,9 +1199,6 @@ impl DaemonState {
             endpoint,
         });
         let (tunnel_drop_tx, _) = watch::channel(0);
-        let tunnel_sessions =
-            tunnel::ServerSessionStore::new(tunnel_session_limits, tunnel_session_detached_ttl);
-        tunnel::spawn_server_session_reaper(tunnel_sessions.clone(), cancel.clone());
         let telemetry_path = home.telemetry_path();
         let telemetry = Arc::new(
             tokio::task::spawn_blocking(move || TelemetryStore::load(telemetry_path)).await?,
@@ -1207,6 +1206,10 @@ impl DaemonState {
         let local_id = endpoint_tx.borrow().endpoint.id();
         let (opened_mux_tx, opened_mux_rx) = mpsc::unbounded_channel();
         let peer_connections = Arc::new(mux::PeerConnections::new(local_id, opened_mux_tx));
+        let tunnel_sessions =
+            tunnel::ServerSessionStore::new(tunnel_session_limits, tunnel_session_detached_ttl)
+                .with_paths(peer_connections.session_paths.clone());
+        tunnel::spawn_server_session_reaper(tunnel_sessions.clone(), cancel.clone());
         if runtime_peers.is_some() {
             peer_connections.use_runtime_policy(peer_book.clone());
         }

@@ -346,6 +346,7 @@ pub struct TunnelSession {
     /// What admitted a session this daemon serves. Set once, at creation; a
     /// session held out to a peer has none.
     grant: std::sync::OnceLock<Grant>,
+    path_observation: std::sync::OnceLock<crate::session_paths::SessionPathHandle>,
     local_write: Mutex<Option<LocalWrite>>,
     cleanup: Mutex<Option<SessionCleanup>>,
     cleanup_kill: CancellationToken,
@@ -416,6 +417,14 @@ impl fmt::Debug for TunnelSession {
     }
 }
 
+impl Drop for TunnelSession {
+    fn drop(&mut self) {
+        if let Some(observed) = self.path_observation.get() {
+            observed.close();
+        }
+    }
+}
+
 impl TunnelSession {
     pub fn new(
         id: TunnelSessionId,
@@ -455,6 +464,7 @@ impl TunnelSession {
             id,
             peer_id,
             grant: std::sync::OnceLock::new(),
+            path_observation: std::sync::OnceLock::new(),
             local_write: Mutex::new(Some(write)),
             cleanup: Mutex::new(cleanup),
             state: Mutex::new(TunnelState {
@@ -876,11 +886,17 @@ impl TunnelSession {
 
     pub async fn abort_local(&self) -> Result<()> {
         self.done.cancel();
+        if let Some(observed) = self.path_observation.get() {
+            observed.close();
+        }
         self.shutdown_local_write().await
     }
 
     async fn close(&self) {
         self.done.cancel();
+        if let Some(observed) = self.path_observation.get() {
+            observed.close();
+        }
         let _ = self.shutdown_local_write().await;
         if let Some(cleanup) = self.cleanup.lock().await.take() {
             cleanup.kill.cancel();
@@ -921,6 +937,24 @@ impl TunnelSession {
         health: Option<AttachConnectionHealth>,
     ) -> Result<()> {
         self.begin_attach().await?;
+        let context = crate::session_paths::AttachContext::current().or_else(|| {
+            health
+                .as_ref()
+                .map(|health| crate::session_paths::AttachContext {
+                    registry: health.connections.session_paths.clone(),
+                    connection: health.connection.clone(),
+                    direction: crate::session_paths::SessionDirection::Outbound,
+                })
+        });
+        let _path = context.map(|context| {
+            self.path_observation
+                .get_or_init(|| {
+                    context
+                        .registry
+                        .session(self.id.to_string(), self.peer_id, context.direction)
+                })
+                .attach(&context.connection)
+        });
         self.apply_peer_ack(peer_recv_next).await;
 
         let result = async {
@@ -943,6 +977,11 @@ impl TunnelSession {
         .await;
 
         self.end_attach().await;
+        if self.done.is_cancelled() || self.is_complete().await {
+            if let Some(observed) = self.path_observation.get() {
+                observed.close();
+            }
+        }
         result
     }
 }
@@ -1522,6 +1561,7 @@ async fn connect_and_attach(
 
 #[derive(Clone)]
 struct AttachConnectionHealth {
+    connection: Connection,
     connections: Arc<PeerConnections>,
     peer: EndpointId,
     stable_id: usize,
@@ -1531,6 +1571,7 @@ struct AttachConnectionHealth {
 impl AttachConnectionHealth {
     fn new(connections: Arc<PeerConnections>, connection: &Connection) -> Self {
         Self {
+            connection: connection.clone(),
             connections,
             peer: connection.remote_id(),
             stable_id: connection.stable_id(),
@@ -1730,6 +1771,7 @@ pub struct ServerSessionStore {
     inner: Arc<Mutex<HashMap<TunnelSessionId, Arc<TunnelSession>>>>,
     limits: ServerSessionLimits,
     detached_ttl: Duration,
+    session_paths: Option<Arc<crate::session_paths::SessionPaths>>,
 }
 
 impl ServerSessionStore {
@@ -1738,7 +1780,13 @@ impl ServerSessionStore {
             inner: Arc::new(Mutex::new(HashMap::new())),
             limits,
             detached_ttl,
+            session_paths: None,
         }
+    }
+
+    pub(crate) fn with_paths(mut self, paths: Arc<crate::session_paths::SessionPaths>) -> Self {
+        self.session_paths = Some(paths);
+        self
     }
 
     async fn get_or_create(
@@ -2112,18 +2160,30 @@ pub async fn serve_connection(
     drop_rx: watch::Receiver<u64>,
 ) -> Result<()> {
     let children = admission.children();
-    children
-        .scope(serve_connection_inner(
-            connection,
-            send,
-            recv,
-            admission,
-            target,
-            connections,
-            sessions,
-            drop_rx,
-        ))
-        .await
+    let context = connections
+        .as_ref()
+        .map(|connections| connections.session_paths.clone())
+        .or_else(|| sessions.session_paths.clone())
+        .map(|registry| crate::session_paths::AttachContext {
+            registry,
+            connection: connection.clone(),
+            direction: crate::session_paths::SessionDirection::Inbound,
+        });
+    let serving = children.scope(serve_connection_inner(
+        connection,
+        send,
+        recv,
+        admission,
+        target,
+        connections,
+        sessions,
+        drop_rx,
+    ));
+    if let Some(context) = context {
+        context.scope(serving).await
+    } else {
+        serving.await
+    }
 }
 
 async fn serve_connection_inner(

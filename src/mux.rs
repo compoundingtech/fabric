@@ -376,12 +376,15 @@ pub struct PeerConnections {
     legacy_fallbacks: Mutex<HashMap<(EndpointId, u64), LegacyFallback>>,
     opened_tx: mpsc::UnboundedSender<Connection>,
     pub(crate) presence: Arc<crate::presence::Presence>,
+    pub(crate) session_paths: Arc<crate::session_paths::SessionPaths>,
     #[cfg(test)]
     mux_connect_attempts: std::sync::atomic::AtomicUsize,
 }
 
 impl PeerConnections {
     pub fn new(local_id: EndpointId, opened_tx: mpsc::UnboundedSender<Connection>) -> Self {
+        let presence = Arc::new(crate::presence::Presence::default());
+        let session_paths = crate::session_paths::SessionPaths::new(presence.clone());
         Self {
             local_id,
             runtime_policy: std::sync::OnceLock::new(),
@@ -391,7 +394,8 @@ impl PeerConnections {
             legacy_notices: Mutex::new(HashSet::new()),
             legacy_fallbacks: Mutex::new(HashMap::new()),
             opened_tx,
-            presence: Arc::new(crate::presence::Presence::default()),
+            presence,
+            session_paths,
             #[cfg(test)]
             mux_connect_attempts: std::sync::atomic::AtomicUsize::new(0),
         }
