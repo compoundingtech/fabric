@@ -71,7 +71,8 @@ line; the contract it will hold is drafted in [docs/stability.md](docs/stability
   default (`--queue-timeout`, persisted with the listener) and
   retries only a remote session-cap refusal before admission, preserving the
   request's bytes and session identity. Queue overflow or timeout logs the
-  existing `fabric:session_limit_reached` code. No wire format or server cap changes.
+  existing `fabric:session_limit_reached` code; local refusal reporting remains
+  unchanged. No wire format or server cap changes.
 
 ## [0.2.41] - 2026-10-13
 
