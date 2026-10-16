@@ -57,6 +57,8 @@ there is no implicit echo, shell, exec, prefix, or future-service grant.
 Directions are `normal`, `inbound_only`, and `dial_only`. An inbound-only node is
 never dialled, probed, announced to, or retried by this daemon. A dial-only node
 cannot carry inbound grants. A conflicting source is refused explicitly.
+Switching between the two opposite directions requires removing and re-adding
+the owner's record in one batch; the replacement starts with no grants.
 Optional `addr` is the existing EndpointAddr JSON address hint and must identify
 the same NodeID. Mutations do not interpret membership signatures.
 
@@ -150,7 +152,9 @@ its selected handlers, tunnel cleanup, and owned children to end. A separate
 monitor targets completion within **two seconds** of the success reply, without
 holding the policy writer behind an uncooperative service. A missed bound
 returns `cancellation_timeout` on receipt queries together with the committed
-receipt and remaining IDs; it never rolls back policy. Completion persistence
+receipt and remaining IDs; it never rolls back policy. A recorded timeout stays
+visible after work ends or the daemon restarts; its remaining-ID lists become
+empty when completion is confirmed. Completion persistence
 failure retains the durable pending receipt and is logged. Restart ends old
 work and resolves pending receipts with `restart_ended_work=true`.
 

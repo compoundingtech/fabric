@@ -117,33 +117,62 @@ impl DaemonState {
         request_id: Option<String>,
         selected: Revocations,
     ) {
-        // Capture before spawning: executor delay must count against the bound.
+        if selected.admissions.is_empty() && selected.sessions.is_empty() {
+            return;
+        }
+        // Retain timed-out detached work until it actually ends. It has been
+        // removed from the session store, but reconciliation must still wait.
+        let selected = Arc::new(selected);
+        let pending = self.pending_policy_revocations.clone();
+        pending.lock().unwrap().push(selected.clone());
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         let cancel = self.cancel.clone();
         tokio::spawn(async move {
-            let status = loop {
-                let status = selected
+            let mut reported_timeout = false;
+            loop {
+                let mut status = selected
                     .status(tokio::time::Instant::now() >= deadline)
                     .await;
-                if status.state != CancellationState::Pending {
-                    break status;
+                let complete = status.state == CancellationState::Complete;
+                let first_timeout =
+                    status.state == CancellationState::TimedOut && !reported_timeout;
+                if first_timeout {
+                    reported_timeout = true;
+                    warn!(event = "policy_cancellation_timeout", code = "cancellation_timeout", ?request_id, admissions = ?status.remaining_admissions, sessions = ?status.remaining_sessions, "revocation did not finish within two seconds");
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            };
-            if status.state == CancellationState::TimedOut {
-                warn!(event = "policy_cancellation_timeout", code = "cancellation_timeout", ?request_id, admissions = ?status.remaining_admissions, sessions = ?status.remaining_sessions, "revocation did not finish within two seconds");
-            }
-            if let Some(request_id) = request_id {
-                let _ = tokio::task::spawn_blocking(move || {
-                    let mut runtime = runtime.lock().unwrap_or_else(|poison| poison.into_inner());
-                    if cancel.is_cancelled() { return; }
-                    if let Err(error) = runtime.update_cancellation(&request_id, status) {
-                        warn!(?request_id, error = %error, "could not persist cancellation completion; retained durable pending receipt");
+                // Keep the missed bound visible even after the remaining
+                // work ends; empty remaining IDs then prove late completion.
+                if complete && reported_timeout {
+                    status.state = CancellationState::TimedOut;
+                }
+                if complete || first_timeout {
+                    if let Some(request_id) = request_id.clone() {
+                        let runtime = runtime.clone();
+                        let cancel = cancel.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let mut runtime = runtime.lock().unwrap_or_else(|poison| poison.into_inner());
+                            if cancel.is_cancelled() { return; }
+                            if let Err(error) = runtime.update_cancellation(&request_id, status) {
+                                warn!(?request_id, error = %error, "could not persist cancellation completion; retained previous durable receipt");
+                            }
+                        }).await;
                     }
-                }).await;
+                }
+                if complete {
+                    pending
+                        .lock()
+                        .unwrap()
+                        .retain(|entry| !Arc::ptr_eq(entry, &selected));
+                    break;
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(if reported_timeout { 100 } else { 10 })) => {}
+                }
             }
         });
     }
+
     async fn quarantine_runtime_policy(&self, published: &mut PeerBook, error: &anyhow::Error) {
         *published = PeerBook::default();
         if let Some(runtime) = &self.runtime_peers {
@@ -154,7 +183,17 @@ impl DaemonState {
             })
             .await;
         }
-        let selected = self.select_runtime_revocations(published).await;
+        let mut selected = self.select_runtime_revocations(published).await;
+        for previous in self.pending_policy_revocations.lock().unwrap().iter() {
+            selected
+                .admissions
+                .extend(previous.admissions.iter().cloned());
+            selected.sessions.extend(previous.sessions.iter().cloned());
+        }
+        selected.admissions.sort_by_key(|entry| entry.id);
+        selected.admissions.dedup_by_key(|entry| entry.id);
+        selected.sessions.sort_by(|a, b| a.id.cmp(&b.id));
+        selected.sessions.dedup_by(|a, b| a.id == b.id);
         self.signal_runtime_revocations(&selected).await;
         *self.policy_quarantine.lock().await = Some(selected);
     }
@@ -971,6 +1010,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn withdrawal_ends_a_mux_admission_waiting_for_tunnel_hello() -> Result<()> {
+        let _serial = SERIAL.lock().await;
+        let server_dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let home = FabricHome::new(server_dir.path());
+        let client_home = FabricHome::new(client_dir.path());
+        let server = FabricNode::start_with_daemon_options(home.clone(), options()).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_server(&client_home, &client, &server).await?;
+        let (echo, task) = echo_server().await?;
+        server.expose_tcp("work/0", echo).await?;
+        mutate(
+            &home,
+            "install",
+            0,
+            vec![add(&client, "client"), grant(&client, &["work/0"])],
+        )
+        .await?;
+        // Ready admits the logical stream; never send its tunnel Hello.
+        // Keeping trust means revocation cannot rely on closing the whole mux.
+        let mut stream = client.state().open_stream("server", b"work/0").await?;
+        mutate(&home, "withdraw", 1, vec![grant(&client, &[])]).await?;
+        let receipt = cancellation(&home, "withdraw").await?;
+        assert_eq!(receipt.cancellation.state, CancellationState::Complete);
+        assert!(!receipt.cancellation.admissions.is_empty());
+        assert!(receipt.cancellation.sessions.is_empty());
+        let mut byte = [0];
+        let ended = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte)).await?;
+        assert!(!matches!(ended, Ok(1..)));
+        client.shutdown().await?;
+        server.shutdown().await?;
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn waiting_for_policy_storage_keeps_control_responsive() -> Result<()> {
         let _serial = SERIAL.lock().await;
         let dir = tempfile::tempdir()?;
@@ -1073,7 +1148,10 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct Uncooperative(Arc<AtomicBool>);
+    struct Uncooperative {
+        started: Arc<AtomicBool>,
+        finish: Arc<tokio::sync::Notify>,
+    }
     const HANG_PROTOCOL: &[services::Protocol] = &[services::Protocol {
         alpn: b"runtime/hang/0",
         resumable: true,
@@ -1087,11 +1165,13 @@ mod tests {
             HANG_PROTOCOL
         }
         fn serve(&self, stream: PeerStream) -> services::BoxFuture<'static, Result<()>> {
-            let started = self.0.clone();
+            let started = self.started.clone();
+            let finish = self.finish.clone();
             Box::pin(async move {
                 let _stream = stream;
                 started.store(true, Ordering::SeqCst);
-                std::future::pending().await
+                finish.notified().await;
+                Ok(())
             })
         }
     }
@@ -1103,10 +1183,14 @@ mod tests {
         let home = FabricHome::new(dir.path());
         let client_home = FabricHome::new(client_dir.path());
         let started = Arc::new(AtomicBool::new(false));
+        let finish = Arc::new(tokio::sync::Notify::new());
         let server = FabricNode::start_with_services(
             home.clone(),
             options(),
-            Services::new().with(Uncooperative(started.clone())),
+            Services::new().with(Uncooperative {
+                started: started.clone(),
+                finish: finish.clone(),
+            }),
         )
         .await?;
         let client = FabricNode::start(client_home.clone()).await?;
@@ -1128,6 +1212,21 @@ mod tests {
             }
         })
         .await?;
+        send_control(&home, ControlRequest::SetTunnelBlocked { blocked: true }).await?;
+        send_control(&home, ControlRequest::DropTunnelConnections).await?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while server
+                .state()
+                .tunnel_sessions
+                .stats()
+                .await
+                .detached_sessions
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
         mutate(&home, "withdraw", 1, vec![grant(&client, &[])]).await?;
         let receipt = cancellation(&home, "withdraw").await?;
         assert_eq!(receipt.cancellation.state, CancellationState::TimedOut);
@@ -1141,6 +1240,70 @@ mod tests {
         assert_eq!(fault.error.unwrap().code, "cancellation_timeout");
         assert!(!receipt.cancellation.remaining_sessions.is_empty());
         assert!(server.state().may(&client.id(), "hung").await.is_err());
+        let state = server.state();
+        state
+            .runtime_peers
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .fail_directory_sync_for_test();
+        let fault = request(
+            &home,
+            transaction("controller", "uncertain", 2, vec![grant(&client, &[])]),
+        )
+        .await?;
+        assert_eq!(fault.error.unwrap().code, "runtime_commit_indeterminate");
+        // Current connection admissions have ended, but the detached handler
+        // removed by the earlier withdrawal is still running.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let done = state
+                    .policy_quarantine
+                    .lock()
+                    .await
+                    .as_ref()
+                    .unwrap()
+                    .admissions
+                    .iter()
+                    .all(|entry| entry.complete());
+                if done {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let error = state.reload_peers().await.unwrap_err();
+        assert_eq!(
+            crate::error::code_of(&error),
+            ErrorCode::RuntimeStateUnavailable
+        );
+        finish.notify_one();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if state
+                    .policy_quarantine
+                    .lock()
+                    .await
+                    .as_ref()
+                    .unwrap()
+                    .status(false)
+                    .await
+                    .state
+                    == CancellationState::Complete
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        state.reload_peers().await?;
+        let late = cancellation(&home, "withdraw").await?.cancellation;
+        assert_eq!(late.state, CancellationState::TimedOut);
+        assert!(late.remaining_admissions.is_empty());
+        assert!(late.remaining_sessions.is_empty());
         client.shutdown().await?;
         server.shutdown().await?;
         Ok(())

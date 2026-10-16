@@ -425,7 +425,13 @@ impl RuntimePeers {
         };
         let result = (|| -> Result<PeerBook> {
             store.static_input = StaticInput::load(home)?;
-            let exists = store.path.try_exists()?;
+            // A dangling link is an unreadable existing state, not a new
+            // daemon with no state. Never replace it with an empty policy.
+            let exists = match fs::symlink_metadata(&store.path) {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            };
             if exists {
                 use std::os::unix::fs::MetadataExt;
                 let metadata = fs::metadata(&store.path)?;
@@ -449,10 +455,12 @@ impl RuntimePeers {
             store.stored.static_digest = store.static_input.digest.clone();
             for receipt in &mut store.stored.receipts {
                 if receipt.cancellation.state != CancellationState::Complete {
-                    receipt.cancellation.state = CancellationState::Complete;
+                    if receipt.cancellation.state == CancellationState::Pending {
+                        receipt.cancellation.state = CancellationState::Complete;
+                    }
                     receipt.cancellation.remaining_admissions.clear();
                     receipt.cancellation.remaining_sessions.clear();
-                    receipt.cancellation.restart_ended_work = restarted;
+                    receipt.cancellation.restart_ended_work |= restarted;
                     changed = true;
                 }
             }
@@ -706,6 +714,15 @@ impl RuntimePeers {
                             peer.name = name.clone();
                         }
                         if let Some(direction) = direction {
+                            if matches!(
+                                (Direction::of(peer), direction),
+                                (Direction::InboundOnly, Direction::DialOnly)
+                                    | (Direction::DialOnly, Direction::InboundOnly)
+                            ) {
+                                return Err(invalid(
+                                    "replace an opposite-direction record with remove_peer and add_peer in one batch",
+                                ));
+                            }
                             direction.apply(peer);
                         }
                         if addr.is_some() {
@@ -1244,6 +1261,21 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn broken_runtime_symlink_is_a_fault_and_is_never_replaced() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let path = dir.path().join("runtime-peers.toml");
+        let missing = dir.path().join("missing-state.toml");
+        std::os::unix::fs::symlink(&missing, &path)?;
+        let (store, book) = RuntimePeers::open(&home);
+        assert!(store.fault().is_some());
+        assert!(book.peers().is_empty());
+        assert_eq!(fs::read_link(&path)?, missing);
+        assert!(!missing.exists());
+        Ok(())
+    }
+
+    #[test]
     fn failed_pre_rename_write_keeps_policy_and_receipts_unchanged() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut store = open(&dir);
@@ -1297,6 +1329,29 @@ mod tests {
                 .prepare(&tx("a", "dial-grant", 1, vec![dial, grants(2, &["exec"])]))
                 .is_err()
         );
+        let opposite = Operation::AddPeer {
+            node_id: id(1),
+            name: Some("phone".into()),
+            direction: Some(Direction::DialOnly),
+            addr: None,
+        };
+        assert!(
+            store
+                .prepare(&tx("a", "flip", 1, vec![opposite.clone(), grants(1, &[])]))
+                .is_err()
+        );
+        let replaced = commit(
+            &mut store,
+            &tx(
+                "a",
+                "replace-direction",
+                1,
+                vec![Operation::RemovePeer { node_id: id(1) }, opposite],
+            ),
+        )?;
+        assert_eq!(replaced.committed_revision, 2);
+        assert_eq!(replaced.affected[0].direction, Direction::DialOnly);
+        assert!(replaced.affected[0].services.is_empty());
         Ok(())
     }
     #[test]
@@ -1314,11 +1369,24 @@ mod tests {
                 ..Cancellation::default()
             },
         )?;
-        let store = open(&dir);
+        let mut store = open(&dir);
         let receipt = store.receipt("pending")?;
         assert_eq!(receipt.cancellation.state, CancellationState::Complete);
         assert!(receipt.cancellation.restart_ended_work);
         assert!(receipt.cancellation.remaining_admissions.is_empty());
+        store.update_cancellation(
+            "pending",
+            Cancellation {
+                state: CancellationState::TimedOut,
+                admissions: vec![8],
+                remaining_admissions: vec![8],
+                ..Cancellation::default()
+            },
+        )?;
+        let late = open(&dir).receipt("pending")?;
+        assert_eq!(late.cancellation.state, CancellationState::TimedOut);
+        assert!(late.cancellation.remaining_admissions.is_empty());
+        assert!(late.cancellation.restart_ended_work);
         Ok(())
     }
     #[test]
