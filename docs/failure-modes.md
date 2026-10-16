@@ -96,6 +96,11 @@ Each dialing daemon queues independently; there is no cross-daemon
 fairness guarantee. Policy denials and service failures are not retried, and a
 session that was admitted is never restarted as a new request.
 
+Built-in exec and shell one-shot calls share the same local budget and fixed
+10-second wait, preserving each call's independent socket and one-accept
+cleanup. This does not retry remote service refusals. Queue expiry or overflow
+produces a framed exec error, or closes shell, and logs the capacity code.
+
 **NOT FIXED:** a full queue or expired deadline still closes the local socket
 without a reason on the data path; `fabric:session_limit_reached` is in the daemon's log. The
 short-session wind-down is also unchanged. The table records the local replay

@@ -1171,6 +1171,13 @@ admitted are never retried as new sessions. Different dialing daemons have
 separate queues; contention at the exposing daemon's total cap still waits
 within each caller's deadline. Applications can reuse connections or retry a
 refusal after that deadline.
+Built-in exec and shell calls use this same local peer and daemon budget,
+with a fixed 10-second capacity wait. Each call keeps its own one-shot socket;
+accepting it removes the rendezvous path while the accepted connection waits.
+Exec reports an expired or full queue in its framed error response; shell
+closes the connection, and both log `fabric:session_limit_reached`. This local
+wait does not add remote admission retries to built-in services. The
+`--queue-timeout` setting applies to generic dial listeners.
 See [the session-limit failure mode](docs/failure-modes.md#session-limits).
 
 ```sh

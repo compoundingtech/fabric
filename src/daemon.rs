@@ -5620,6 +5620,75 @@ async fn run_dial_socket(
     }
 }
 
+/// A service rendezvous reserves its bounded queue entry before a task is
+/// spawned. Shared service listeners retain their immediate-admission behavior.
+enum ServiceDialReservation {
+    Immediate(OwnedSemaphorePermit),
+    Queued(crate::dial_queue::DialReservation),
+}
+
+enum ServiceDialPermit {
+    Immediate {
+        _permit: OwnedSemaphorePermit,
+    },
+    Queued {
+        _permit: crate::dial_queue::DialPermit,
+    },
+}
+
+impl ServiceDialReservation {
+    fn reserve(
+        slots: &Arc<Semaphore>,
+        queue: Option<&Arc<crate::dial_queue::DialQueue>>,
+    ) -> Result<Self> {
+        if let Some(queue) = queue {
+            return queue
+                .reserve(Duration::from_millis(
+                    crate::config::DEFAULT_DIAL_QUEUE_TIMEOUT_MS,
+                ))
+                .map(Self::Queued);
+        }
+        slots
+            .clone()
+            .try_acquire_owned()
+            .map(Self::Immediate)
+            .map_err(|_| crate::dial_queue::limit_error("dial daemon capacity is full"))
+    }
+
+    async fn acquire(
+        self,
+        slots: Arc<Semaphore>,
+        cancel: &CancellationToken,
+    ) -> Result<Option<ServiceDialPermit>> {
+        match self {
+            Self::Immediate(permit) => Ok(Some(ServiceDialPermit::Immediate { _permit: permit })),
+            Self::Queued(reservation) => Ok(reservation
+                .acquire(slots, cancel)
+                .await?
+                .map(|permit| ServiceDialPermit::Queued { _permit: permit })),
+        }
+    }
+}
+
+async fn refuse_queued_service_dial(
+    local: &mut UnixStream,
+    service: &dyn Service,
+    failures: &FailureBackoff,
+    key: &BackoffKey,
+    error: &anyhow::Error,
+) {
+    let message = crate::dial_queue::diagnostic(error);
+    failures
+        .record_failure_for_diagnostics(key, "dial queue refused connection", &message)
+        .await;
+    // The CLI still expects service frames, never a generic text preface.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(1),
+        write_service_notice(local, service, Notice::Unavailable { error: &message }),
+    )
+    .await;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_resumable_dial_socket(
     listener: UnixListener,
@@ -5641,6 +5710,9 @@ async fn run_resumable_dial_socket(
     one_shot: Option<OneShotDialSocket>,
 ) {
     let backoff_key = BackoffKey::dial(&peer, protocol.alpn);
+    let queue = one_shot
+        .as_ref()
+        .map(|_| peer_connections.dial_queue(peer_addr.id));
     loop {
         tokio::select! {
             biased;
@@ -5648,14 +5720,20 @@ async fn run_resumable_dial_socket(
             _ = daemon_cancel.cancelled() => break,
             _ = one_shot_dial_expired(&one_shot) => break,
             accepted = listener.accept() => {
-                let Ok((local, _)) = accepted else {
+                let Ok((mut local, _)) = accepted else {
                     break;
                 };
-                let Ok(permit) = dial_slots.clone().try_acquire_owned() else {
-                    drop(local);
-                    if one_shot.is_some() { break; }
-                    continue;
+                let reservation = match ServiceDialReservation::reserve(&dial_slots, queue.as_ref()) {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        if one_shot.is_some() {
+                            refuse_queued_service_dial(&mut local, service.as_ref(), &dial_failures, &backoff_key, &error).await;
+                            break;
+                        }
+                        continue;
+                    }
                 };
+                let dial_slots = dial_slots.clone();
                 let endpoint_rx = endpoint_rx.clone();
                 let home = home.clone();
                 let peer = peer.clone();
@@ -5669,7 +5747,14 @@ async fn run_resumable_dial_socket(
                 let gauge = gauge.clone();
                 let recorder = recorder.clone();
                 tokio::spawn(async move {
-                    let _permit = permit;
+                    let _permit = match reservation.acquire(dial_slots, &cancel).await {
+                        Ok(Some(permit)) => permit,
+                        Ok(None) => return,
+                        Err(error) => {
+                            refuse_queued_service_dial(&mut local, service.as_ref(), &dial_failures, &backoff_key, &error).await;
+                            return;
+                        }
+                    };
                     let failure = format!("{} dial socket connection failed", service.name());
                     match handle_resumable_dial_socket_connection(
                         local,
@@ -6277,6 +6362,9 @@ async fn run_raw_dial_socket(
     one_shot: Option<OneShotDialSocket>,
 ) {
     let backoff_key = BackoffKey::dial(&peer_addr.id.to_string(), &alpn);
+    let queue = one_shot
+        .as_ref()
+        .map(|_| peer_connections.dial_queue(peer_addr.id));
     loop {
         tokio::select! {
             biased;
@@ -6284,15 +6372,22 @@ async fn run_raw_dial_socket(
             _ = daemon_cancel.cancelled() => break,
             _ = one_shot_dial_expired(&one_shot) => break,
             accepted = listener.accept() => {
-                let Ok((local, _)) = accepted else {
+                let Ok((mut local, _)) = accepted else {
                     break;
                 };
-                let Ok(permit) = dial_slots.clone().try_acquire_owned() else {
-                    drop(local);
-                    if one_shot.is_some() { break; }
-                    continue;
+                let reservation = match ServiceDialReservation::reserve(&dial_slots, queue.as_ref()) {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        if one_shot.is_some() {
+                            refuse_queued_service_dial(&mut local, service.as_ref(), &dial_failures, &backoff_key, &error).await;
+                            break;
+                        }
+                        continue;
+                    }
                 };
-                let endpoint = endpoint_rx.borrow().clone();
+                let dial_slots = dial_slots.clone();
+                let endpoint_rx = endpoint_rx.clone();
+                let cancel = daemon_cancel.clone();
                 let peer = peer.clone();
                 let peer_addr = peer_addr.clone();
                 let alpn = alpn.clone();
@@ -6301,7 +6396,15 @@ async fn run_raw_dial_socket(
                 let backoff_key = backoff_key.clone();
                 let peer_connections = peer_connections.clone();
                 tokio::spawn(async move {
-                    let _permit = permit;
+                    let _permit = match reservation.acquire(dial_slots, &cancel).await {
+                        Ok(Some(permit)) => permit,
+                        Ok(None) => return,
+                        Err(error) => {
+                            refuse_queued_service_dial(&mut local, service.as_ref(), &dial_failures, &backoff_key, &error).await;
+                            return;
+                        }
+                    };
+                    let endpoint = endpoint_rx.borrow().clone();
                     match handle_raw_dial_socket_connection(
                         local,
                         endpoint,
@@ -7954,6 +8057,126 @@ mod tests {
         server.shutdown().await?;
         client.shutdown().await?;
         assert_eq!(state.active_dial_listeners.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_shot_queue_uses_default_deadline_and_releases_cancelled_reservations() -> Result<()>
+    {
+        let queues = crate::dial_queue::DialQueues::default();
+        let queue = queues.peer(iroh::SecretKey::generate().public());
+        let slots = Arc::new(Semaphore::new(0));
+        let cancel = CancellationToken::new();
+        let reservation = ServiceDialReservation::reserve(&slots, Some(&queue))?;
+        let waiting = tokio::spawn({
+            let slots = slots.clone();
+            let cancel = cancel.clone();
+            async move { reservation.acquire(slots, &cancel).await }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(
+            crate::config::DEFAULT_DIAL_QUEUE_TIMEOUT_MS - 1,
+        ))
+        .await;
+        assert!(!waiting.is_finished());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let error = match waiting.await? {
+            Err(error) => error,
+            Ok(_) => bail!("full daemon capacity did not expire"),
+        };
+        assert_eq!(
+            fabric_config::error::code_of(&error),
+            ErrorCode::SessionLimitReached
+        );
+        let reservation = ServiceDialReservation::reserve(&slots, Some(&queue))?;
+        cancel.cancel();
+        assert!(reservation.acquire(slots.clone(), &cancel).await?.is_none());
+        slots.add_permits(1);
+        let reservation = ServiceDialReservation::reserve(&slots, Some(&queue))?;
+        let active = reservation
+            .acquire(slots.clone(), &CancellationToken::new())
+            .await?;
+        assert!(active.is_some());
+        drop(active);
+        assert_eq!(slots.available_permits(), 1);
+        Ok(())
+    }
+
+    /// Removing a one-shot rendezvous after accept must not discard a call
+    /// waiting for the same daemon budget used by generic dial listeners.
+    #[tokio::test]
+    async fn one_shot_exec_and_shell_wait_for_capacity_without_sharing_sockets() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let server_home = FabricHome::new(temp.path().join("server"));
+        let client_home = FabricHome::new(temp.path().join("client"));
+        let server = FabricNode::start(server_home.clone()).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+        let state = client.state();
+        let held = state
+            .dial_slots
+            .clone()
+            .acquire_many_owned(state.dial_slots.available_permits() as u32)
+            .await?;
+        let mut paths = HashSet::new();
+        let mut calls = tokio::task::JoinSet::new();
+        for index in 0..4 {
+            let service = if index % 2 == 0 { "exec" } else { "shell" };
+            let path = state.dial_service("server", service).await?;
+            assert!(paths.insert(path.clone()), "calls shared a rendezvous");
+            let mut stream = UnixStream::connect(&path).await?;
+            calls.spawn(async move {
+                let expected = format!("queued{index}");
+                let command = format!("printf '{expected}'; exit {index}");
+                let (output, code) = if service == "exec" {
+                    exec::write_client_argv(&mut stream, &["/bin/sh".into(), "-c".into(), command])
+                        .await?;
+                    collect_exec(&mut stream).await?
+                } else {
+                    shell::write_client_stdin(&mut stream, format!("{command}\n").as_bytes())
+                        .await?;
+                    let mut output = Vec::new();
+                    let code = loop {
+                        match shell::read_server_frame(&mut stream).await? {
+                            Some(shell::ServerFrame::Output(bytes)) => output.extend(bytes),
+                            Some(shell::ServerFrame::Exit(code)) => break code,
+                            Some(shell::ServerFrame::Error(error)) => bail!("{error}"),
+                            Some(shell::ServerFrame::Status(_)) => {}
+                            None => bail!("queued shell closed without exit status"),
+                        }
+                    };
+                    (output, code)
+                };
+                assert_eq!(code, index);
+                assert!(String::from_utf8_lossy(&output).contains(&expected));
+                Ok::<_, anyhow::Error>(())
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.active_dial_listeners.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(paths.iter().all(|path| !path.exists()));
+        assert!(state.dial_sockets.lock().await.is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), calls.join_next())
+                .await
+                .is_err(),
+            "one-shot call ended while daemon capacity was still occupied"
+        );
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while let Some(result) = calls.join_next().await {
+                result??;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        server.shutdown().await?;
+        client.shutdown().await?;
         Ok(())
     }
 

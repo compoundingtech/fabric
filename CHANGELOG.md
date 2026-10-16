@@ -17,6 +17,11 @@ Deprecated, Fixed or Security.
 
 ### Changed
 
+- Built-in exec and shell one-shot calls now wait up to 10 seconds for the
+  shared local peer and daemon dial capacity, preserving independent sockets
+  and one-accept cleanup. A full or expired queue logs
+  `fabric:session_limit_reached`; exec also receives a framed error.
+
 - Through a generic dial listener, an exposure's exec child-limit refusal now
   waits for capacity up to the queue timeout (default 10 seconds) before the
   local client sees EOF. `--queue-timeout 0` restores immediate refusal and
