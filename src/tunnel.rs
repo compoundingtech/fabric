@@ -2202,7 +2202,12 @@ async fn serve_connection_inner(
     let revoked = admission.revoked();
     let hello = tokio::select! {
         biased;
-        _ = revoked.cancelled() => return Ok(()),
+        _ = revoked.cancelled() => {
+            if let Some(audit) = crate::audit::current() {
+                audit.refused(ErrorCode::PeerNotPermittedForService);
+            }
+            return Ok(());
+        },
         hello = read_frame(&mut recv) => hello?,
     };
     let Some(Frame::Hello {
@@ -2214,6 +2219,9 @@ async fn serve_connection_inner(
         bail!("tunnel client did not send hello");
     };
 
+    if let Some(audit) = crate::audit::current() {
+        audit.session_id(session_id);
+    }
     let peer_id = admission.peer();
     let (session, is_new_session) = match sessions
         .get_or_create(
@@ -2234,6 +2242,9 @@ async fn serve_connection_inner(
             } else {
                 fabric_config::error::code_of(&error)
             };
+            if let Some(audit) = crate::audit::current() {
+                audit.refused(code);
+            }
             let message = fabric_config::error::without_tokens(&format!("{error:#}"));
             send_tunnel_error(&connection, &mut send, code.reason(&message)).await;
             if expired_resume {
@@ -2243,6 +2254,9 @@ async fn serve_connection_inner(
         }
     };
     if session.peer_id() != peer_id {
+        if let Some(audit) = crate::audit::current() {
+            audit.refused(ErrorCode::PeerNotPermittedForService);
+        }
         if is_new_session {
             sessions.remove_session(&session).await;
         }
@@ -2421,6 +2435,10 @@ async fn spawn_service_session(
     let finished = done.clone();
     let children = fabric_service_api::child_tracking::Children::current().unwrap_or_default();
     let name = service.name();
+    let audit = crate::audit::current();
+    if let Some(audit) = &audit {
+        audit.session_id(session_id);
+    }
     let serving = service.serve(PeerStream {
         peer: peer_id.to_string(),
         read: Box::new(service_read),
@@ -2430,7 +2448,7 @@ async fn spawn_service_session(
     });
     tokio::spawn(async move {
         let _finished = finished.drop_guard();
-        if let Err(error) = children.scope(serving).await {
+        if let Err(error) = children.scope(crate::audit::scope(audit, serving)).await {
             eprintln!("fabric: {name} session {session_id} failed: {error:#}");
         }
     });
@@ -2450,10 +2468,22 @@ async fn spawn_exec_session(
     argv: Vec<String>,
     limit: Arc<ExecLimit>,
 ) -> Result<(Arc<TunnelSession>, LocalRead)> {
+    let mut audit = crate::audit::exec_attempt();
     let Some(program) = argv.first() else {
+        if let Some(audit) = audit.take() {
+            audit.start_exec(&argv);
+            audit.finish(
+                crate::audit::Outcome::SpawnFailed,
+                None,
+                Some(ErrorCode::SpawnFailed),
+            );
+        }
         bail!("exposed exec command is empty");
     };
     let permit = limit.try_acquire().ok_or_else(|| {
+        if let Some(audit) = crate::audit::current() {
+            audit.refused(ErrorCode::SessionLimitReached);
+        }
         FabricError::new(
             ErrorCode::SessionLimitReached,
             format!(
@@ -2463,6 +2493,12 @@ async fn spawn_exec_session(
             ),
         )
     })?;
+    if let Some(audit) = &audit {
+        audit.start_exec(&argv);
+    }
+    let counts = audit.as_ref().map(|audit| audit.counts());
+    let output_done = Arc::new(crate::audit::Drain::default());
+    let error_done = Arc::new(crate::audit::Drain::default());
     let label = argv.join(" ");
     let mut command = Command::new(program);
     command
@@ -2475,6 +2511,13 @@ async fn spawn_exec_session(
     let mut child = fabric_service_api::child_spawn::spawn(&spawn_label, command)
         .await
         .map_err(|error| {
+            if let Some(audit) = audit.take() {
+                audit.finish(
+                    crate::audit::Outcome::SpawnFailed,
+                    None,
+                    Some(ErrorCode::SpawnFailed),
+                );
+            }
             FabricError::new(
                 ErrorCode::SpawnFailed,
                 format!("failed to spawn exposed exec {program:?}: {error:#}"),
@@ -2493,6 +2536,10 @@ async fn spawn_exec_session(
         &pipe_label,
     )
     .context("exposed exec child stdin could not be handed to its thread")?;
+    let stdin = crate::audit::CountAsyncWriter {
+        inner: stdin,
+        counts: counts.clone(),
+    };
     let stdout = fabric_service_api::child_pipes::stdout_reader(
         child
             .stdout
@@ -2501,10 +2548,22 @@ async fn spawn_exec_session(
         &pipe_label,
     )
     .context("exposed exec child stdout could not be handed to its thread")?;
+    let stdout = crate::audit::CountRead {
+        inner: stdout,
+        counts: counts.clone(),
+        drain: output_done.clone(),
+    };
     if let Some(stderr) = child.stderr.take() {
         let stderr = fabric_service_api::child_pipes::stderr_reader(stderr, &pipe_label)
             .context("exposed exec child stderr could not be handed to its thread")?;
+        let stderr = crate::audit::CountRead {
+            inner: stderr,
+            counts: counts.clone(),
+            drain: error_done.clone(),
+        };
         tokio::spawn(log_child_stderr(session_id, label.clone(), stderr));
+    } else {
+        error_done.finish();
     }
     tracing::info!(
         target: "fabric::validation",
@@ -2526,6 +2585,15 @@ async fn spawn_exec_session(
             _ = kill_wait.cancelled() => {
                 match child.kill().await {
                     Ok(()) => {
+                        // kill() also waits/reaps. Its cached status can name
+                        // a natural exit that raced session cleanup, or the
+                        // signal we sent; retain either observed fact.
+                        if let Some(audit) = audit.take() {
+                            if let Ok(Some(status)) = child.try_wait() {
+                                audit.observe_exit(crate::audit::exit_status(status));
+                            }
+                            finish_cancelled_exec_audit(audit, output_done, error_done);
+                        }
                         eprintln!("fabric: exec {label:?} session {session_id} killed after tunnel session expiry");
                         return;
                     }
@@ -2542,6 +2610,11 @@ async fn spawn_exec_session(
             status = %result.as_ref().map_or_else(|error| format!("wait failed: {error}"), |status| status.to_string()),
             "an exposed exec child ended"
         );
+        let observed_status = result
+            .as_ref()
+            .ok()
+            .map(|status| crate::audit::exit_status(*status));
+        let wait_failed = result.is_err();
         match result {
             Ok(status) if status.success() => {}
             Ok(status) => {
@@ -2549,6 +2622,23 @@ async fn spawn_exec_session(
             }
             Err(error) => {
                 eprintln!("fabric: exec {label:?} session {session_id} wait failed: {error:#}");
+            }
+        }
+        if let Some(audit) = audit {
+            let status = observed_status;
+            if let Some(status) = status {
+                audit.observe_exit(status);
+            }
+            // Completion includes payload processing. A descendant holding a
+            // pipe open keeps the call open; reaping/cancellation still ends it.
+            let cancelled = tokio::select! {
+                _ = async { tokio::join!(output_done.wait(), error_done.wait()); } => false,
+                _ = kill_wait.cancelled() => true,
+            };
+            if cancelled || wait_failed {
+                finish_cancelled_exec_audit(audit, output_done, error_done);
+            } else {
+                audit.finish(crate::audit::Outcome::Ok, status, None);
             }
         }
     });
@@ -2560,6 +2650,23 @@ async fn spawn_exec_session(
         Box::new(stdin),
         Some(SessionCleanup { kill, done }),
     ))
+}
+
+/// The process is already reaped. Let buffered pipe observations finish before
+/// recording its end, without holding the session cleanup handle or child cap.
+/// A descendant retaining a pipe cannot hold the audit call indefinitely.
+fn finish_cancelled_exec_audit(
+    audit: crate::audit::CallGuard,
+    output_done: Arc<crate::audit::Drain>,
+    error_done: Arc<crate::audit::Drain>,
+) {
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_millis(200), async {
+            tokio::join!(output_done.wait(), error_done.wait());
+        })
+        .await;
+        audit.finish(crate::audit::Outcome::Cancelled, None, None);
+    });
 }
 
 async fn log_child_stderr(

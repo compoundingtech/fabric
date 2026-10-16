@@ -1,3 +1,5 @@
+#[doc(hidden)]
+pub mod audit;
 use anyhow::Result;
 use iroh::{
     Endpoint, EndpointAddr,

@@ -1,0 +1,32 @@
+{
+  "audit": null,
+  "limit": 10000,
+  "malformed_records": 1,
+  "records": [
+    {
+      "argv": [
+        "true"
+      ],
+      "bytes_in": 0,
+      "bytes_out": 5,
+      "code": null,
+      "duration_millis": 12,
+      "event": "exec_end",
+      "exit_status": 7,
+      "name": "laptop",
+      "outcome": "ok",
+      "peer": "peer-a",
+      "service": "exec",
+      "session_id": "session-1",
+      "time": "2026-10-16T00:00:00Z"
+    },
+    {
+      "count": 2,
+      "event": "audit_loss",
+      "first_time": "2026-10-16T00:00:00Z",
+      "last_time": "2026-10-16T00:00:01Z",
+      "time": "2026-10-16T00:00:02Z"
+    }
+  ],
+  "truncated": false
+}

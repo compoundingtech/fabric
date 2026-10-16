@@ -1,0 +1,11 @@
+{
+  "audit": {
+    "dropped_records": 0,
+    "queued_records": 0,
+    "since": "<AUDIT_SINCE>"
+  },
+  "limit": 10000,
+  "malformed_records": 0,
+  "records": [],
+  "truncated": false
+}
