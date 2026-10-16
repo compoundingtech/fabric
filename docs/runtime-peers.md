@@ -1,17 +1,19 @@
 # Runtime peers, grants, and the control client
 
-Status: proposed design for review, not implemented. This is provisional 1.1
-work after the 1.0.0 tag. Request names, limits, and the new pairing protocol
-below are proposals. The surface remains provisional through at least one
-minor release of real use, with an explicit review before promotion. These
-proposals do not describe a released API or change the
-[stability contract](stability.md). This note covers [#312](https://github.com/compoundingtech/fabric/issues/312)
+Status: approved design. Runtime mode, direct peer/grant transactions, revisions,
+and revocation receipts are implemented as a provisional API; see the
+[runtime peer API](runtime-peer-api.md). Rotation expiry, policy watches,
+pairing and the typed client are follow-up slices whose request names and
+limits below remain proposals. The surface remains provisional through at
+least one minor release of real use, with an explicit review before promotion.
+This note covers [#312](https://github.com/compoundingtech/fabric/issues/312)
 and its typed control client, [#310](https://github.com/compoundingtech/fabric/issues/310).
 
 ## Existing behavior and the implementation boundary
 
-The source baseline is main at `e5126b9`. [`ControlRequest`](../src/control.rs)
-has `ReloadPeers`, but no peer/grant mutations. A control connection carries
+At the design baseline `e5126b9`, [`ControlRequest`](../src/control.rs)
+had `ReloadPeers` and no direct peer/grant mutations. The first runtime slice
+adds those requests without a second endpoint. A control connection carries
 one newline-delimited JSON request and one response, then closes.
 [`daemon_control`](../crates/fabric-config/src/daemon_control.rs) already has a
 client for a subset of that schema. The new client must share extracted
@@ -27,10 +29,10 @@ is insufficient.
 policy and cancel withdrawn direct admissions and attached or detached server
 sessions. A peer-load failure clears the book for new admissions without
 ending existing work; sync validation failure leaves the old book installed.
-The current book and connection allow-list use separate locks, and cancellation
-counts are not completion acknowledgments. The transactional runtime contract
-below needs one policy generation and explicit completion tracking, while
-preserving those existing failed-reload distinctions.
+At that baseline the book and connection allow-list used separate locks, and
+cancellation counts were not completion acknowledgments. The first runtime
+slice shares one policy generation and tracks completion explicitly, while
+preserving those existing failed-reload distinctions without the flag.
 
 ## State and ownership
 

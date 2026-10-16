@@ -363,6 +363,7 @@ struct LegacyFallback {
 #[derive(Debug)]
 pub struct PeerConnections {
     local_id: EndpointId,
+    runtime_policy: std::sync::OnceLock<Arc<tokio::sync::RwLock<crate::config::PeerBook>>>,
     conns: Mutex<HashMap<EndpointId, PeerConn>>,
     /// Serializes connection replacement for one peer without making a slow
     /// dial block every other peer in the map. This keeps one small entry per
@@ -380,6 +381,7 @@ impl PeerConnections {
     pub fn new(local_id: EndpointId, opened_tx: mpsc::UnboundedSender<Connection>) -> Self {
         Self {
             local_id,
+            runtime_policy: std::sync::OnceLock::new(),
             conns: Mutex::new(HashMap::new()),
             peer_gates: Mutex::new(HashMap::new()),
             legacy_notices: Mutex::new(HashSet::new()),
@@ -388,6 +390,41 @@ impl PeerConnections {
             presence: Arc::new(crate::presence::Presence::default()),
             #[cfg(test)]
             mux_connect_attempts: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn use_runtime_policy(
+        &self,
+        policy: Arc<tokio::sync::RwLock<crate::config::PeerBook>>,
+    ) {
+        let _ = self.runtime_policy.set(policy);
+    }
+    pub(crate) fn has_runtime_policy(&self) -> bool {
+        self.runtime_policy.get().is_some()
+    }
+    pub(crate) async fn resolve_peer(
+        &self,
+        home: &crate::config::FabricHome,
+        peer: &str,
+    ) -> Result<EndpointAddr> {
+        if let Some(policy) = self.runtime_policy.get() {
+            return policy.read().await.resolve(peer);
+        }
+        let home = home.clone();
+        let peer = peer.to_string();
+        tokio::task::spawn_blocking(move || crate::config::PeerBook::load(&home)?.resolve(&peer))
+            .await?
+    }
+    pub(crate) async fn resolve_peer_or_legacy_hint(
+        &self,
+        home: &crate::config::FabricHome,
+        peer: &str,
+        hint: EndpointAddr,
+    ) -> Result<EndpointAddr> {
+        match self.resolve_peer(home, peer).await {
+            Ok(addr) => Ok(addr),
+            Err(error) if self.has_runtime_policy() => Err(error),
+            Err(_) => Ok(hint),
         }
     }
 

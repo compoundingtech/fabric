@@ -1,0 +1,295 @@
+{
+  "coded_errors": [
+    {
+      "reply": {
+        "affected": [],
+        "error": {
+          "class": "refusal",
+          "code": "runtime_peers_disabled",
+          "message": "example failure"
+        },
+        "mutation": null,
+        "snapshot": null
+      },
+      "type": "runtime_peers"
+    },
+    {
+      "reply": {
+        "affected": [],
+        "error": {
+          "class": "refusal",
+          "code": "peer_managed_statically",
+          "message": "example failure"
+        },
+        "mutation": null,
+        "snapshot": null
+      },
+      "type": "runtime_peers"
+    },
+    {
+      "reply": {
+        "affected": [],
+        "error": {
+          "class": "refusal",
+          "code": "peer_owned_elsewhere",
+          "message": "example failure"
+        },
+        "mutation": null,
+        "snapshot": null
+      },
+      "type": "runtime_peers"
+    },
+    {
+      "reply": {
+        "affected": [],
+        "error": {
+          "class": "fault",
+          "code": "policy_revision_conflict",
+          "message": "example failure"
+        },
+        "mutation": null,
+        "snapshot": null
+      },
+      "type": "runtime_peers"
+    },
+    {
+      "reply": {
+        "affected": [],
+        "error": {
+          "class": "fault",
+          "code": "runtime_state_unavailable",
+          "message": "example failure"
+        },
+        "mutation": null,
+        "snapshot": null
+      },
+      "type": "runtime_peers"
+    },
+    {
+      "reply": {
+        "affected": [],
+        "error": {
+          "class": "fault",
+          "code": "runtime_commit_indeterminate",
+          "message": "example failure"
+        },
+        "mutation": null,
+        "snapshot": null
+      },
+      "type": "runtime_peers"
+    },
+    {
+      "reply": {
+        "affected": [],
+        "error": {
+          "class": "fault",
+          "code": "runtime_receipt_capacity",
+          "message": "example failure"
+        },
+        "mutation": null,
+        "snapshot": null
+      },
+      "type": "runtime_peers"
+    },
+    {
+      "reply": {
+        "affected": [],
+        "error": {
+          "class": "usage",
+          "code": "request_id_conflict",
+          "message": "example failure"
+        },
+        "mutation": null,
+        "snapshot": null
+      },
+      "type": "runtime_peers"
+    },
+    {
+      "reply": {
+        "affected": [],
+        "error": {
+          "class": "fault",
+          "code": "cancellation_timeout",
+          "message": "example failure"
+        },
+        "mutation": null,
+        "snapshot": null
+      },
+      "type": "runtime_peers"
+    }
+  ],
+  "list_reply": {
+    "reply": {
+      "affected": [],
+      "error": null,
+      "mutation": null,
+      "snapshot": {
+        "fault": null,
+        "instance": "instance-a",
+        "next_cursor": null,
+        "peers": [
+          {
+            "direction": "inbound_only",
+            "direction_sources": [
+              {
+                "kind": "static",
+                "path": "/config/peers.toml"
+              },
+              {
+                "kind": "runtime",
+                "owner": "controller-b"
+              }
+            ],
+            "name": "laptop",
+            "node_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+            "services": {
+              "work/0": [
+                {
+                  "kind": "static",
+                  "path": "/config/peers.toml"
+                },
+                {
+                  "kind": "runtime",
+                  "owner": "controller-b"
+                }
+              ]
+            },
+            "trust_sources": [
+              {
+                "kind": "static",
+                "path": "/config/peers.toml"
+              },
+              {
+                "kind": "runtime",
+                "owner": "controller-b"
+              }
+            ]
+          }
+        ],
+        "policy_revision": 9,
+        "static_digest": "digest-a"
+      }
+    },
+    "type": "runtime_peers"
+  },
+  "mutation_reply": {
+    "reply": {
+      "affected": [
+        {
+          "direction": "inbound_only",
+          "direction_sources": [
+            {
+              "kind": "static",
+              "path": "/config/peers.toml"
+            },
+            {
+              "kind": "runtime",
+              "owner": "controller-b"
+            }
+          ],
+          "name": "laptop",
+          "node_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+          "services": {
+            "work/0": [
+              {
+                "kind": "static",
+                "path": "/config/peers.toml"
+              },
+              {
+                "kind": "runtime",
+                "owner": "controller-b"
+              }
+            ]
+          },
+          "trust_sources": [
+            {
+              "kind": "static",
+              "path": "/config/peers.toml"
+            },
+            {
+              "kind": "runtime",
+              "owner": "controller-b"
+            }
+          ]
+        }
+      ],
+      "error": null,
+      "mutation": {
+        "affected": [
+          {
+            "direction": "inbound_only",
+            "direction_sources": [
+              {
+                "kind": "static",
+                "path": "/config/peers.toml"
+              },
+              {
+                "kind": "runtime",
+                "owner": "controller-b"
+              }
+            ],
+            "name": "laptop",
+            "node_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+            "services": {
+              "work/0": [
+                {
+                  "kind": "static",
+                  "path": "/config/peers.toml"
+                },
+                {
+                  "kind": "runtime",
+                  "owner": "controller-b"
+                }
+              ]
+            },
+            "trust_sources": [
+              {
+                "kind": "static",
+                "path": "/config/peers.toml"
+              },
+              {
+                "kind": "runtime",
+                "owner": "controller-b"
+              }
+            ]
+          }
+        ],
+        "cancellation": {
+          "admissions": [],
+          "remaining_admissions": [],
+          "remaining_sessions": [],
+          "restart_ended_work": false,
+          "sessions": [],
+          "state": "complete"
+        },
+        "committed_revision": 7,
+        "current_revision": 9,
+        "removals": [
+          {
+            "effective_trust_removed": false,
+            "node_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+            "owner_record_removed": true
+          }
+        ],
+        "request_id": "replace-17"
+      },
+      "snapshot": null
+    },
+    "type": "runtime_peers"
+  },
+  "request": {
+    "request": {
+      "expected_revision": 6,
+      "operation": "batch",
+      "operations": [
+        {
+          "node_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+          "op": "remove_peer"
+        }
+      ],
+      "owner": "controller-a",
+      "request_id": "replace-17"
+    },
+    "type": "runtime_peers"
+  }
+}

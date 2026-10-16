@@ -15,6 +15,10 @@ Deprecated, Fixed or Security.
 
 ## [Unreleased]
 
+### Added
+
+- **Provisional:** opt-in `--runtime-peers` control API persists owner-scoped exact grants, atomic replacement batches, policy revisions and durable request/cancellation receipts without editing static peer input (#312).
+
 ### Changed
 
 - README documents the existing server session limits and the current EOF behavior of refused dial sessions (#306).

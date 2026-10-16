@@ -43,3 +43,14 @@ availability, latency, or transport. No additional echo grant is needed to
 measure a permitted service: use `fabric probe PEER SERVICE --json` and read its
 `protocol`, `outcome`, `transport`, and `round_trip_micros`. That probe describes
 one protocol sample, not the route of every application session.
+
+## Provisional runtime-peer control replies
+
+`--runtime-peers` adds the `runtime_peers` request/reply family on the daemon's
+existing JSON-lines control socket. It does not change `fabric peers --json`,
+which continues to read static file policy. Runtime clients use the effective
+snapshot and per-source mutation results described in
+[runtime-peer-api.md](runtime-peer-api.md). Replies expose explicit `snapshot`,
+`mutation`, `affected`, and coded `error` fields. A cancellation fault can
+accompany a committed mutation receipt; clients must inspect both. Protocol
+fixtures are pinned in `tests/golden/json/runtime_peer_control.json`.

@@ -244,6 +244,9 @@ where
     command.env("FABRIC_SHELL", "1");
     command.env("FABRIC_PEER", peer);
     let mut child = pair.slave.spawn_command(command)?;
+    if let Some(pid) = child.process_id() {
+        fabric_service_api::child_tracking::register(pid);
+    }
     let reaped = Arc::new(AtomicBool::new(false));
     let hang_up = HangUpOnDrop {
         pid: child.process_id().map(|pid| pid as libc::pid_t),
