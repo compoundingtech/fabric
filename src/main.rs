@@ -1,3 +1,5 @@
+mod status_probe;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
