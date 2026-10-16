@@ -222,13 +222,19 @@ pub enum CancellationState {
     TimedOut,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RestartEvidence {
+    pub daemon_instance_changed: bool,
+    pub child_exit_observed: bool,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Cancellation {
     pub state: CancellationState,
     pub admissions: Vec<u64>,
     pub sessions: Vec<String>,
     pub remaining_admissions: Vec<u64>,
     pub remaining_sessions: Vec<String>,
-    pub restart_ended_work: bool,
+    #[serde(default)]
+    pub restart_evidence: Option<RestartEvidence>,
 }
 impl Cancellation {
     pub fn empty() -> Self {
@@ -454,13 +460,30 @@ impl RuntimePeers {
             }
             store.stored.static_digest = store.static_input.digest.clone();
             for receipt in &mut store.stored.receipts {
-                if receipt.cancellation.state != CancellationState::Complete {
-                    if receipt.cancellation.state == CancellationState::Pending {
-                        receipt.cancellation.state = CancellationState::Complete;
+                let cancellation = &mut receipt.cancellation;
+                if cancellation.state == CancellationState::Complete {
+                    continue;
+                }
+                if restarted {
+                    if cancellation.state == CancellationState::Pending
+                        || !cancellation.remaining_admissions.is_empty()
+                        || !cancellation.remaining_sessions.is_empty()
+                    {
+                        cancellation.state = CancellationState::TimedOut;
+                        cancellation.restart_evidence = Some(RestartEvidence {
+                            daemon_instance_changed: true,
+                            child_exit_observed: false,
+                        });
+                        changed = true;
                     }
-                    receipt.cancellation.remaining_admissions.clear();
-                    receipt.cancellation.remaining_sessions.clear();
-                    receipt.cancellation.restart_ended_work |= restarted;
+                } else if cancellation.restart_evidence.is_none() {
+                    // The live daemon proved its quarantined work ended. A
+                    // prior crash's unknown children cannot use that proof.
+                    if cancellation.state == CancellationState::Pending {
+                        cancellation.state = CancellationState::Complete;
+                    }
+                    cancellation.remaining_admissions.clear();
+                    cancellation.remaining_sessions.clear();
                     changed = true;
                 }
             }
@@ -1355,7 +1378,7 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn restart_completes_pending_cancellation_without_reinstalling_access() -> Result<()> {
+    fn restart_faults_unconfirmed_cancellation_and_preserves_observed_completion() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut store = open(&dir);
         let request = tx("a", "pending", 0, vec![add(1, "node")]);
@@ -1371,22 +1394,35 @@ mod tests {
         )?;
         let mut store = open(&dir);
         let receipt = store.receipt("pending")?;
-        assert_eq!(receipt.cancellation.state, CancellationState::Complete);
-        assert!(receipt.cancellation.restart_ended_work);
-        assert!(receipt.cancellation.remaining_admissions.is_empty());
+        assert_eq!(receipt.cancellation.state, CancellationState::TimedOut);
+        assert_eq!(receipt.cancellation.remaining_admissions, [7]);
+        let evidence = receipt.cancellation.restart_evidence.unwrap();
+        assert!(evidence.daemon_instance_changed);
+        assert!(!evidence.child_exit_observed);
+        // Live reconciliation cannot establish exits from an older daemon.
+        store.reconcile(&FabricHome::new(dir.path()))?;
+        assert_eq!(
+            store.receipt("pending")?.cancellation.remaining_admissions,
+            [7]
+        );
+        // Actual completion, once observed, survives another restart.
+        store.update_cancellation("pending", Cancellation::empty())?;
+        let observed = open(&dir).receipt("pending")?.cancellation;
+        assert_eq!(observed.state, CancellationState::Complete);
+        assert!(observed.restart_evidence.is_none());
+        // A missed deadline whose work later ended keeps that outcome too.
         store.update_cancellation(
             "pending",
             Cancellation {
                 state: CancellationState::TimedOut,
                 admissions: vec![8],
-                remaining_admissions: vec![8],
                 ..Cancellation::default()
             },
         )?;
-        let late = open(&dir).receipt("pending")?;
-        assert_eq!(late.cancellation.state, CancellationState::TimedOut);
-        assert!(late.cancellation.remaining_admissions.is_empty());
-        assert!(late.cancellation.restart_ended_work);
+        let late = open(&dir).receipt("pending")?.cancellation;
+        assert_eq!(late.state, CancellationState::TimedOut);
+        assert!(late.remaining_admissions.is_empty());
+        assert!(late.restart_evidence.is_none());
         Ok(())
     }
     #[test]

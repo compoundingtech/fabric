@@ -218,8 +218,11 @@ and bounded child termination are required; an arbitrary service must not make
 the policy writer wait forever. Failure to meet the bound is reported as a
 cancellation fault with remaining IDs, not a rollback of the committed policy.
 A receipt/status query and watch event distinguish complete from timed out.
-Disconnecting the caller never cancels revocation. Restart ends old work and
-resolves its pending cancellation receipts without reviving sessions.
+Disconnecting the caller never cancels revocation. Restart resolves unconfirmed
+cancellation receipts as `cancellation_timeout`, retaining remaining IDs and
+explicit restart evidence that child exit was not observed; only observed
+completion stays complete, and cross-crash child cleanup is tracked separately
+in [#325](https://github.com/compoundingtech/fabric/issues/325).
 
 ## Pairing protocol and bounded join exchange
 

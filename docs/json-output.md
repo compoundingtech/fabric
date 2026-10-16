@@ -54,3 +54,6 @@ snapshot and per-source mutation results described in
 `mutation`, `affected`, and coded `error` fields. A cancellation fault can
 accompany a committed mutation receipt; clients must inspect both. Protocol
 fixtures are pinned in `tests/golden/json/runtime_peer_control.json`.
+Unconfirmed receipts after restart retain remaining IDs and return
+`cancellation_timeout` with `restart_evidence` naming the changed daemon instance
+and the absence of observed child exit. Restart alone is not completion proof.
