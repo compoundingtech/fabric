@@ -2,7 +2,8 @@
 
 All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
-EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
+EXPERIMENTAL, so on-disk formats and the CLI may change without notice. The
+0.9 releases are previews of 1.0.
 
 From 1.0.0, [docs/stability.md](docs/stability.md) governs what a release may
 change. Patch releases only fix bugs. A minor release may add commands, flags,
@@ -18,6 +19,11 @@ Deprecated, Fixed or Security.
 ### Added
 
 - **Provisional:** opt-in `--runtime-peers` control API persists owner-scoped exact grants, atomic replacement batches, policy revisions and durable request/cancellation receipts without editing static peer input (#312).
+
+## [0.9.0] - 2026-10-16
+
+A preview of 1.0. The code is 0.2.41 plus the fixes below. 1.0 comes from this
+line; the contract it will hold is drafted in [docs/stability.md](docs/stability.md).
 
 ### Changed
 

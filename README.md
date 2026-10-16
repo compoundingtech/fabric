@@ -1,4 +1,4 @@
-> Status: EXPERIMENTAL. Early spike / prototype -- the CLI, APIs, and on-disk formats will change without notice; no stability or security guarantees yet; not production-ready. Use at your own risk.
+> Status: 0.9 preview of 1.0. The CLI, `--json` output, error codes and the direct exposure wire are being held steady for 1.0 as described in [docs/stability.md](docs/stability.md), but until 1.0.0 that page is a plan, not a promise; on-disk formats and the CLI can still change.
 
 # fabric
 
