@@ -1206,6 +1206,11 @@ impl DaemonState {
     ) -> Result<Arc<Self>> {
         home.prepare()?;
         sweep_one_shot_dials(&home);
+        let child_root = home.root().to_owned();
+        let child_owner = Arc::new(
+            tokio::task::spawn_blocking(move || crate::child_ledger::Ledger::start(&child_root))
+                .await?,
+        );
         let config = FabricConfig::load(&home)?;
         let (tunnel_session_limits, tunnel_session_detached_ttl) =
             resolve_server_session_settings(&config, options)?;
@@ -1276,7 +1281,7 @@ impl DaemonState {
             active_dial_listeners: Arc::new(AtomicUsize::new(0)),
             tcp_dials: Mutex::new(HashMap::new()),
             tunnel_sessions,
-            admissions: Arc::new(Admissions::default()),
+            admissions: Arc::new(Admissions::with_child_owner(child_owner)),
             client_attaches: tunnel::ClientAttachGauge::new(),
             tunnel_drop_tx,
             tunnel_blocked: AtomicBool::new(false),
@@ -3388,7 +3393,7 @@ pub async fn run_daemon_with_options(home: FabricHome, options: DaemonOptions) -
 }
 
 struct DaemonLease {
-    _file: std::fs::File,
+    _file: Arc<std::fs::File>,
 }
 
 pub fn daemon_lock_available(home: &FabricHome) -> Result<bool> {
@@ -3465,6 +3470,10 @@ impl DaemonLease {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
+        let file = Arc::new(file);
+        // A child awaiting its durable ownership commit has not reached exec
+        // yet. Close the lease before that wait, as well as at ordinary exec.
+        fabric_service_api::child_spawn::protect_from_children(file.clone());
         Ok(Self { _file: file })
     }
 }

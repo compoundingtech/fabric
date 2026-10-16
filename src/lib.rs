@@ -9,6 +9,7 @@ use iroh::{
 
 mod admission;
 pub mod ca;
+mod child_ledger;
 pub mod config;
 pub mod control;
 pub mod daemon;

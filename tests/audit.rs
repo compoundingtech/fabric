@@ -6,13 +6,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use fabric::{
     audit::{self, Record},
     config::{FabricHome, PeerBook},
     control::{ControlRequest, ControlResponse},
     daemon::{FabricNode, send_control},
-    services::exec,
+    services::{exec, shell},
 };
 use tokio::net::UnixStream;
 
@@ -34,6 +34,93 @@ impl Drop for CommandCleanup {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_running_exec_has_a_start_trace_after_abrupt_daemon_death() -> Result<()> {
+    abrupt_daemon_death(false, false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_exec_child_cannot_outlive_an_abruptly_killed_daemon() -> Result<()> {
+    abrupt_daemon_death(true, false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shell_child_cannot_outlive_an_abruptly_killed_daemon() -> Result<()> {
+    abrupt_daemon_death(true, true).await
+}
+
+fn server_command(home: &FabricHome) -> tokio::process::Command {
+    let binary = std::env::var_os("FABRIC_CRASH_TEST_BIN")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_fabric").into());
+    let mut command = tokio::process::Command::new(binary);
+    command
+        .arg("--home")
+        .arg(home.root())
+        .args(["daemon", "--allow-shell"])
+        .env("SHELL", "/bin/sh")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    command
+}
+
+fn child_running(pid: i32) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let state = stat
+            .rsplit_once(')')
+            .context("invalid child kernel stat")?
+            .1
+            .trim_start();
+        Ok(!state.starts_with('Z') && !state.starts_with('X'))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of_val(&info) as i32;
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        if got == size {
+            return Ok(info.pbi_status != 5);
+        }
+        let error = std::io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) {
+            Ok(false)
+        } else {
+            Err(error.into())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(false)
+        } else {
+            Err(error.into())
+        }
+    }
+}
+
+async fn abrupt_daemon_death(check_cleanup: bool, is_shell: bool) -> Result<()> {
     let temp = tempfile::tempdir()?;
     let server_home = FabricHome::new(temp.path().join("server"));
     let client_home = FabricHome::new(temp.path().join("client"));
@@ -43,18 +130,10 @@ async fn a_running_exec_has_a_start_trace_after_abrupt_daemon_death() -> Result<
         client.id(),
         Some("client".into()),
         Some(client.addr()),
-        Some(vec!["exec".into()]),
+        Some(vec!["exec".into(), "shell".into()]),
     );
     book.save(&server_home)?;
-    let mut server = tokio::process::Command::new(env!("CARGO_BIN_EXE_fabric"))
-        .arg("--home")
-        .arg(server_home.root())
-        .arg("daemon")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()?;
+    let mut server = server_command(&server_home).spawn()?;
     let deadline = Instant::now() + Duration::from_secs(10);
     let addr = loop {
         if let Ok(ControlResponse::Status { endpoint_addr, .. }) =
@@ -78,55 +157,118 @@ async fn a_running_exec_has_a_start_trace_after_abrupt_daemon_death() -> Result<
     client.state().reload_peers().await?;
     let path = match send_control(
         &client_home,
-        ControlRequest::Exec {
-            peer: "server".into(),
+        if is_shell {
+            ControlRequest::Shell {
+                peer: "server".into(),
+            }
+        } else {
+            ControlRequest::Exec {
+                peer: "server".into(),
+            }
         },
     )
     .await?
     {
-        ControlResponse::Exec { socket } => socket,
+        ControlResponse::Exec { socket } | ControlResponse::Shell { socket } => socket,
         response => bail!("unexpected exec response: {response:?}"),
     };
     let mut stream = UnixStream::connect(path).await?;
     let pid_file = temp.path().join("command.pid");
     let cleanup = CommandCleanup(pid_file.clone());
-    // Pass the path as a positional argument, so no shell escaping is needed.
-    exec::write_client_argv(
-        &mut stream,
-        &[
-            "/bin/sh".into(),
-            "-c".into(),
-            "printf '%s\\n' \"$$\" > \"$1\"; exec sleep 30".into(),
-            "audit-command".into(),
-            pid_file.to_string_lossy().into_owned(),
-        ],
-    )
-    .await?;
+    if is_shell {
+        let quoted = format!("'{}'", pid_file.to_string_lossy().replace('\'', "'\\''"));
+        let input = format!("trap '' HUP; printf '%s\\n' \"$$\" > {quoted}; exec sleep 30\n");
+        shell::write_client_stdin(&mut stream, input.as_bytes()).await?;
+    } else {
+        // Pass the path as a positional argument, so no shell escaping is needed.
+        exec::write_client_argv(
+            &mut stream,
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "trap '' HUP; printf '%s\\n' \"$$\" > \"$1\"; exec sleep 30".into(),
+                "audit-command".into(),
+                pid_file.to_string_lossy().into_owned(),
+            ],
+        )
+        .await?;
+    }
     let deadline = Instant::now() + Duration::from_secs(5);
-    let session = loop {
+    let (session, pid) = loop {
         let records =
             audit::read(server_home.root(), None, Some(&client.id().to_string()))?.records;
-        if pid_file.exists()
+        let pid = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| {
+                text.ends_with('\n')
+                    .then(|| text.trim().parse::<i32>().ok())
+                    .flatten()
+            })
+            .filter(|pid| *pid > 1);
+        if let Some(pid) = pid
             && let Some(start) = records.iter().find_map(|record| match record {
-                Record::ExecStart(call) => Some(call),
+                Record::ExecStart(call) | Record::ShellStart(call) => Some(call),
                 _ => None,
             })
         {
-            break start.session_id.clone();
+            break (start.session_id.clone(), pid);
         }
         if Instant::now() >= deadline {
-            bail!("running command never wrote its audit start");
+            bail!("running command did not publish its PID and audit start");
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
-    server.start_kill()?;
-    server.wait().await?;
+    anyhow::ensure!(
+        child_running(pid)?,
+        "owned child exited before daemon SIGKILL"
+    );
+    server
+        .start_kill()
+        .context("send SIGKILL to running daemon")?;
+    server.wait().await.context("wait for killed daemon")?;
+    if check_cleanup {
+        #[cfg(target_os = "macos")]
+        {
+            server = server_command(&server_home).spawn()?;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while send_control(&server_home, ControlRequest::Status)
+                .await
+                .is_err()
+            {
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "replacement daemon never became ready"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let gone = loop {
+            let running = child_running(pid).context("observe owned child after daemon death")?;
+            if !running {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        anyhow::ensure!(
+            gone,
+            "owned child {pid} remained running after daemon crash cleanup"
+        );
+        #[cfg(target_os = "macos")]
+        {
+            server.start_kill()?;
+            server.wait().await?;
+        }
+    }
     let records = audit::read(server_home.root(), None, Some(&client.id().to_string()))?.records;
     assert_eq!(
         records
             .iter()
             .filter(
-                |record| matches!(record, Record::ExecStart(call) if call.session_id == session)
+                |record| matches!(record, Record::ExecStart(call) | Record::ShellStart(call) if call.session_id == session)
             )
             .count(),
         1
@@ -134,9 +276,84 @@ async fn a_running_exec_has_a_start_trace_after_abrupt_daemon_death() -> Result<
     assert!(
         !records
             .iter()
-            .any(|record| matches!(record, Record::ExecEnd(call) if call.session_id == session))
+            .any(|record| matches!(record, Record::ExecEnd(call) | Record::ShellEnd(call) if call.session_id == session))
     );
     drop(cleanup);
     client.shutdown().await?;
     Ok(())
+}
+
+#[tokio::test]
+async fn unwritable_child_storage_keeps_exec_control_and_echo_available() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let server_home = FabricHome::new(temp.path().join("server"));
+    let client_home = FabricHome::new(temp.path().join("client"));
+    std::fs::create_dir_all(server_home.root())?;
+    let children_dir = server_home.root().join("children");
+    std::fs::create_dir(&children_dir)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&children_dir, std::fs::Permissions::from_mode(0o500))?;
+    struct RestorePermissions(PathBuf);
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let _restore = RestorePermissions(children_dir.clone());
+    anyhow::ensure!(
+        std::fs::write(children_dir.join("probe"), b"unwritable").is_err(),
+        "fixture must run without permission-bypass capabilities"
+    );
+    let server = FabricNode::start(server_home.clone()).await?;
+    let client = FabricNode::start(client_home.clone()).await?;
+    let mut book = PeerBook::load(&server_home)?;
+    book.add_with_allow(
+        client.id(),
+        Some("client".into()),
+        Some(client.addr()),
+        Some(vec!["exec".into(), "echo".into()]),
+    );
+    book.save(&server_home)?;
+    server.state().reload_peers().await?;
+    let mut book = PeerBook::load(&client_home)?;
+    book.add(server.id(), Some("server".into()), Some(server.addr()));
+    book.save(&client_home)?;
+    client.state().reload_peers().await?;
+    assert!(matches!(
+        send_control(&server_home, ControlRequest::Status).await?,
+        ControlResponse::Status { .. }
+    ));
+    client.ping("server").await?;
+    let socket = client.dial("server", exec::EXEC_PROTOCOL).await?;
+    let mut stream = UnixStream::connect(socket).await?;
+    let marker = temp.path().join("recovery-command-ran");
+    exec::write_client_argv(
+        &mut stream,
+        &[
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf ran > \"$1\"".into(),
+            "storage-fault".into(),
+            marker.to_string_lossy().into_owned(),
+        ],
+    )
+    .await?;
+    let reply = tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(frame) = exec::read_server_frame(&mut stream).await? {
+            match frame {
+                exec::ServerFrame::Error(message) => bail!("recovery exec failed: {message}"),
+                exec::ServerFrame::Exit(code) => {
+                    anyhow::ensure!(code == 0);
+                    return Ok::<_, anyhow::Error>(());
+                }
+                _ => {}
+            }
+        }
+        bail!("recovery exec did not return an exit status");
+    })
+    .await?;
+    assert_eq!(std::fs::read(&marker)?, b"ran");
+    client.shutdown().await?;
+    server.shutdown().await?;
+    reply
 }

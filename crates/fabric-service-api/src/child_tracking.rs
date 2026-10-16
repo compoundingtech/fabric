@@ -12,7 +12,20 @@ use std::{
 };
 
 #[derive(Debug, Clone, Default)]
-pub struct Children(Arc<Tracked>);
+pub struct Children {
+    tracked: Arc<Tracked>,
+    owner: Option<Arc<dyn Owner>>,
+    session: String,
+}
+
+/// Optional daemon-owned storage boundary. Called on a native thread while the
+/// child is gated before exec. An error prevents the command from running.
+pub trait Owner: std::fmt::Debug + Send + Sync {
+    fn before_exec(&self, pid: u32, session: &str) -> std::io::Result<Box<dyn Record>>;
+}
+
+/// Keeps a durable ownership record until the managed child is released.
+pub trait Record: std::fmt::Debug + Send {}
 #[derive(Debug, Default)]
 struct Tracked {
     spawning: AtomicUsize,
@@ -20,6 +33,26 @@ struct Tracked {
 }
 tokio::task_local! { static OWNER: Children; }
 impl Children {
+    pub fn with_owner(mut self, owner: Arc<dyn Owner>, session: String) -> Self {
+        self.owner = Some(owner);
+        self.session = session;
+        self
+    }
+    pub fn with_session(&self, session: impl ToString) -> Self {
+        Self {
+            session: session.to_string(),
+            ..self.clone()
+        }
+    }
+    pub(crate) fn has_owner(&self) -> bool {
+        self.owner.is_some()
+    }
+    pub(crate) fn record(&self, pid: u32) -> std::io::Result<Option<Box<dyn Record>>> {
+        self.owner
+            .as_ref()
+            .map(|owner| owner.before_exec(pid, &self.session))
+            .transpose()
+    }
     pub fn current() -> Option<Self> {
         OWNER.try_with(Clone::clone).ok()
     }
@@ -27,27 +60,27 @@ impl Children {
         OWNER.scope(self.clone(), work).await
     }
     pub fn register(&self, pid: u32) {
-        self.0.pids.lock().unwrap().insert(pid);
+        self.tracked.pids.lock().unwrap().insert(pid);
     }
     pub fn begin_spawn(&self) -> Spawn {
-        self.0.spawning.fetch_add(1, Ordering::SeqCst);
+        self.tracked.spawning.fetch_add(1, Ordering::SeqCst);
         Spawn(self.clone())
     }
     /// PID reuse can conservatively delay completion; it cannot claim a live
     /// owned child has ended. Only ESRCH counts as proof that a PID is gone.
     pub fn complete(&self) -> bool {
-        let mut pids = self.0.pids.lock().unwrap();
+        let mut pids = self.tracked.pids.lock().unwrap();
         pids.retain(|pid| {
             let result = unsafe { libc::kill(*pid as libc::pid_t, 0) };
             result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
         });
-        pids.is_empty() && self.0.spawning.load(Ordering::SeqCst) == 0
+        pids.is_empty() && self.tracked.spawning.load(Ordering::SeqCst) == 0
     }
 }
 pub struct Spawn(Children);
 impl Drop for Spawn {
     fn drop(&mut self) {
-        self.0.0.spawning.fetch_sub(1, Ordering::SeqCst);
+        self.0.tracked.spawning.fetch_sub(1, Ordering::SeqCst);
     }
 }
 /// Register a child created outside the asynchronous spawn helper (a PTY).

@@ -266,3 +266,35 @@ A partial or complete Hello, a lost Hello reply, a policy refusal, or a second
 replacement is outside this recovery. Established sessions continue to use the
 existing durable resume protocol. This does not change mux direction preference
 or retry an application request.
+
+
+## A daemon exits while an exec or shell is running
+
+Owned commands start in their own process group. Orderly cancellation and
+shutdown end that group. On Linux the direct child also receives SIGKILL when
+its spawning daemon thread dies. The spawn workers remain alive for the
+process lifetime; retiring an idle runtime worker cannot end a healthy child.
+The signal follows the kernel's [parent-death inheritance and credential
+rules](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html).
+
+Before user code executes, the parent attempts to sync a record under `children/` in
+the state root containing the PID, kernel start identity and session identifier.
+One-shot calls use their admission identifier; durable sessions use their tunnel
+session ID. After a crash, startup signals only records whose PID and kernel start
+identity still match, then removes completed or stale entries. Linux records
+also include the boot identity. On macOS this startup sweep provides cleanup
+because the kernel has no parent-death signal.
+
+Ownership storage failures never disable exec or shell: an open, sweep or
+commit error, a full storage queue, or a commit that exceeds 250 ms allows the
+command to run without a confirmed durable record. One warning per minute names
+the cause. Process groups and Linux parent-death protection still apply; on
+macOS a crash in this state can leave a child behind. Repair storage and restart
+to retry the startup sweep. A timed-out write may still leave a record for that
+sweep. Storage uses bounded workers and queues; the existing 20-second spawn
+limit still applies to starting the process, and cancellation or an expired
+spawn cannot release user code. Service children
+close the daemon lease descriptor before waiting for commit, so a pre-exec
+child cannot pin a crashed daemon's lease. Cleanup does not
+invent an audit end event or turn an unconfirmed runtime cancellation receipt
+into observed completion.

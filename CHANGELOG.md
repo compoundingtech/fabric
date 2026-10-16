@@ -22,6 +22,10 @@ Deprecated, Fixed or Security.
   closes a fresh tunnel request whose Hello was never sent. The daemon reopens
   that unserved stream once on the canonical connection, preserving its local
   socket, buffered input and admission deadline (#321).
+- Owned exec and shell children terminate when their Linux daemon dies.
+  Synced child identity records let startup clean up a crashed daemon's
+  matching children on macOS; orderly cleanup ends the process group. Storage
+  errors warn and keep exec/shell available, with bounded record waits (#325).
 
 ## [0.9.1] - 2026-10-16
 
