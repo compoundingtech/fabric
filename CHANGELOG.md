@@ -16,6 +16,8 @@ Deprecated, Fixed or Security.
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-10-17
+
 ### Fixed
 
 - A preferred duplicate connection arriving after mux admission no longer
