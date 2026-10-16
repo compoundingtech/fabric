@@ -1,4 +1,4 @@
-> Status: 1.0. What is stable, provisional and internal is defined in [docs/stability.md](docs/stability.md); anything that page does not name is internal.
+> Status: 0.9 preview of 1.0. The CLI, `--json` output, error codes and the direct exposure wire are being held steady for 1.0 as described in [docs/stability.md](docs/stability.md), but until 1.0.0 that page is a plan, not a promise; on-disk formats and the CLI can still change.
 
 # fabric
 
