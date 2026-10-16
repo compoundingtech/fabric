@@ -88,18 +88,26 @@ the caller must inspect the result before claiming complete retirement.
 
 ## Revisions, persistence, and lost replies
 
+Shutdown allows up to three seconds for in-flight policy/config writes to drain,
+then continues endpoint and child cleanup even if storage remains stalled. A
+drain failure is reported after cleanup.
+
 A mutation is serialized with accepted static reloads. Its expected revision
 must match the current policy revision. A committed record or static-input
 change advances that revision; a rejected transaction does not. An unchanged
-owner record is a no-op and retains the current revision, with a durable
-request receipt.
+owner record is a no-op and returns the current revision without storing a
+receipt. A no-op request ID has no retention or replay guarantee; read current
+state and revision before issuing a later mutation.
 
 The daemon validates the final candidate, including sync selectors, then holds
 the shared admission-policy generation through the durable commit and
 publication. Persistence uses a private same-directory temporary file, file
 fsync, rename, and directory fsync on the blocking pool. A success means both
 state and effective policy are installed. A pre-rename failure leaves the old
-policy and receipt history intact. If rename succeeds but durability is
+policy and receipt history intact for runtime transactions. Any failed static
+reload, including a composition conflict or a pre-rename storage failure, closes
+new admissions and leaves existing work alone. A successful repair/reload then
+revokes work no longer permitted. If rename succeeds but durability is
 uncertain, `runtime_commit_indeterminate` closes network admissions and cancels
 old work. Repair the storage problem, let quarantined work end, and explicitly
 reload to reconcile the file. A malformed or unreadable file also keeps the
@@ -113,10 +121,14 @@ if access was withdrawn later. Different contents under a retained ID return
 `request_id_conflict`. On a lost reply, query `cancellation` or repeat the exact
 request; do not invent a new request ID for an uncertain outcome.
 
-Receipts have 1,024 reserved slots and are retained for at least 24 hours.
-Expired receipts are pruned by a subsequent mutation; new mutations are refused
-while all slots remain unexpired. After retention, reconcile current state and
-revision before deciding on a new operation.
+The store permits at most 1,024 owner/NodeID records in total. Receipts are
+retained for at least 24 hours in a pool of 1,024 slots. Ordinary mutations may
+use 960 slots; the remaining 64 are reserved for batches containing only
+`remove_peer` or `set_grants` that remove services without adding any. Pure
+no-ops consume no slot, even when the pool is full. Expired receipts are pruned
+by a subsequent changed mutation. When the applicable capacity is full, that
+mutation is refused before commit. After retention, reconcile current state
+and revision before deciding on a new operation.
 
 ## Replies and cancellation completion
 
@@ -170,3 +182,9 @@ can end that operation without cancelling unrelated services.
 Rotation expiry, policy watches, pairing permits and join exchanges are later
 slices of [the approved design](runtime-peers.md). They are not implemented by
 these requests.
+
+Runtime mode accepts exact grant strings only: unlike the normal static loader,
+it rejects `:` aliases, `*`, whitespace in grants, and grants on `dial_only`
+records. Migrate those inputs before enabling the mode. A shell that ignores HUP
+may use the existing two-second grace before SIGKILL; its cancellation can report
+`cancellation_timeout` before subsequent observation proves late completion.

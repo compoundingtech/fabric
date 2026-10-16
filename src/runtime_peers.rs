@@ -22,6 +22,8 @@ pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 pub const PAGE_SIZE: usize = 256;
 const RECEIPT_SECONDS: u64 = 24 * 60 * 60;
 const MAX_RECEIPTS: usize = 1024;
+const WITHDRAWAL_RECEIPTS: usize = 64;
+const MAX_RECORDS: usize = 1024;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -379,6 +381,8 @@ pub(crate) struct Prepared {
     stored: Stored,
     pub book: PeerBook,
     pub replay: bool,
+    pub no_op: Option<MutationReply>,
+    expected_revision: u64,
 }
 
 fn now() -> u64 {
@@ -505,6 +509,9 @@ impl RuntimePeers {
     fn validate_stored(&self) -> Result<()> {
         if self.stored.format != 1 {
             return Err(unavailable("unsupported runtime policy format"));
+        }
+        if self.stored.records.len() > MAX_RECORDS {
+            return Err(unavailable("too many runtime owner/node records"));
         }
         let mut records = BTreeSet::new();
         for record in &self.stored.records {
@@ -689,6 +696,8 @@ impl RuntimePeers {
                 stored: self.stored.clone(),
                 book: self.compose(&self.stored)?.0,
                 replay: true,
+                no_op: None,
+                expected_revision: self.stored.revision,
             });
         }
         if tx.expected_revision != self.stored.revision {
@@ -704,13 +713,6 @@ impl RuntimePeers {
         let mut next = self.stored.clone();
         next.receipts
             .retain(|r| now().saturating_sub(r.created) < RECEIPT_SECONDS);
-        if next.receipts.len() >= MAX_RECEIPTS {
-            return Err(FabricError::new(
-                ErrorCode::RuntimeReceiptCapacity,
-                "unexpired runtime receipt capacity is full",
-            )
-            .into());
-        }
         let mut removals = Vec::new();
         for op in &tx.operations {
             let id = op.node_id();
@@ -800,11 +802,18 @@ impl RuntimePeers {
         }
         next.records
             .sort_by(|a, b| (&a.owner, a.peer.id).cmp(&(&b.owner, b.peer.id)));
+        if next.records.len() > MAX_RECORDS {
+            return Err(invalid(
+                "runtime policy permits at most 1024 owner/node records",
+            ));
+        }
         let (book, views) = self.compose(&next)?;
         for removal in &mut removals {
             removal.effective_trust_removed = !views.iter().any(|p| p.node_id == removal.node_id);
         }
-        if serde_json::to_vec(&next.records)? != serde_json::to_vec(&self.stored.records)? {
+        let changed =
+            serde_json::to_vec(&next.records)? != serde_json::to_vec(&self.stored.records)?;
+        if changed {
             next.revision = next
                 .revision
                 .checked_add(1)
@@ -817,6 +826,49 @@ impl RuntimePeers {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+        if !changed {
+            return Ok(Prepared {
+                stored: next,
+                book,
+                replay: false,
+                no_op: Some(MutationReply {
+                    request_id: tx.request_id.clone(),
+                    committed_revision: self.stored.revision,
+                    current_revision: self.stored.revision,
+                    affected: views
+                        .into_iter()
+                        .filter(|p| affected.contains(&p.node_id))
+                        .collect(),
+                    removals,
+                    cancellation: Cancellation::empty(),
+                }),
+                expected_revision: self.stored.revision,
+            });
+        }
+        // Reserve the last slots for strict owner-scoped withdrawals. A batch
+        // containing additions or replacements cannot consume this reserve.
+        let withdrawal_only = tx.operations.iter().all(|op| match op {
+            Operation::RemovePeer { .. } => true,
+            Operation::SetGrants { node_id, grants } => self
+                .stored
+                .records
+                .iter()
+                .find(|r| r.owner == tx.owner && r.peer.id == *node_id)
+                .is_some_and(|record| grants.iter().all(|grant| record.peer.allow.contains(grant))),
+            Operation::AddPeer { .. } => false,
+        });
+        let limit = if withdrawal_only {
+            MAX_RECEIPTS
+        } else {
+            MAX_RECEIPTS - WITHDRAWAL_RECEIPTS
+        };
+        if next.receipts.len() >= limit {
+            return Err(FabricError::new(
+                ErrorCode::RuntimeReceiptCapacity,
+                "unexpired runtime receipt capacity is full for this mutation",
+            )
+            .into());
+        }
         next.receipts.push(Receipt {
             request_id: tx.request_id.clone(),
             digest,
@@ -830,6 +882,8 @@ impl RuntimePeers {
             stored: next,
             book,
             replay: false,
+            no_op: None,
+            expected_revision: self.stored.revision,
         })
     }
     fn ownership_error(&self, stored: &Stored, id: EndpointId) -> anyhow::Error {
@@ -857,6 +911,17 @@ impl RuntimePeers {
         request_id: &str,
         cancellation: Cancellation,
     ) -> Result<MutationReply> {
+        self.ensure_available()?;
+        if self.stored.revision != next.expected_revision {
+            return Err(FabricError::new(
+                ErrorCode::PolicyRevisionConflict,
+                "policy revision changed during preparation",
+            )
+            .into());
+        }
+        if let Some(reply) = next.no_op {
+            return Ok(reply);
+        }
         if !next.replay {
             // Completion records can advance while validation runs off-thread.
             // Preserve that metadata when committing a later policy candidate.
@@ -1554,7 +1619,7 @@ mod tests {
     fn receipt_capacity_refuses_before_commit_and_prunes_only_expired_slots() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut store = open(&dir);
-        store.stored.receipts = (0..MAX_RECEIPTS)
+        store.stored.receipts = (0..MAX_RECEIPTS - WITHDRAWAL_RECEIPTS)
             .map(|i| Receipt {
                 request_id: format!("prior-{i}"),
                 digest: "prior".into(),
@@ -1572,7 +1637,126 @@ mod tests {
         );
         store.stored.receipts[0].created = now() - RECEIPT_SECONDS - 1;
         assert!(store.prepare(&request).is_ok());
+        assert_eq!(
+            store.stored.receipts.len(),
+            MAX_RECEIPTS - WITHDRAWAL_RECEIPTS
+        );
+        Ok(())
+    }
+    #[test]
+    fn receipt_reserve_keeps_withdrawals_available_and_no_ops_use_no_slot() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut store = open(&dir);
+        commit(
+            &mut store,
+            &tx(
+                "a",
+                "install",
+                0,
+                vec![add(1, "node"), grants(1, &["echo", "exec"])],
+            ),
+        )?;
+        let template = store.stored.receipts[0].clone();
+        store.stored.receipts = (0..MAX_RECEIPTS - WITHDRAWAL_RECEIPTS)
+            .map(|index| Receipt {
+                request_id: format!("retained-{index}"),
+                ..template.clone()
+            })
+            .collect();
+        store.persist(&store.stored)?;
+        let mut store = open(&dir);
+        let error = store
+            .prepare(&tx("a", "add", 1, vec![add(2, "other")]))
+            .err()
+            .unwrap();
+        assert_eq!(
+            crate::error::code_of(&error),
+            ErrorCode::RuntimeReceiptCapacity
+        );
+        let withdrawn = commit(
+            &mut store,
+            &tx("a", "narrow", 1, vec![grants(1, &["echo"])]),
+        )?;
+        assert_eq!(withdrawn.committed_revision, 2);
+        assert!(store.compose(&store.stored)?.0.may(&id(1), "exec").is_err());
+        commit(
+            &mut store,
+            &tx(
+                "a",
+                "remove",
+                2,
+                vec![Operation::RemovePeer { node_id: id(1) }],
+            ),
+        )?;
+        assert!(store.compose(&store.stored)?.0.peers().is_empty());
+        assert_eq!(
+            store.stored.receipts.len(),
+            MAX_RECEIPTS - WITHDRAWAL_RECEIPTS + 2
+        );
+        // Even a completely full pool cannot be enlarged with no-op receipts.
+        while store.stored.receipts.len() < MAX_RECEIPTS {
+            let index = store.stored.receipts.len();
+            store.stored.receipts.push(Receipt {
+                request_id: format!("retained-{index}"),
+                ..template.clone()
+            });
+        }
+        let before = fs::read(&store.path)?;
+        for index in 0..128 {
+            let reply = commit(
+                &mut store,
+                &tx(
+                    "a",
+                    &format!("no-op-{index}"),
+                    3,
+                    vec![Operation::RemovePeer { node_id: id(1) }],
+                ),
+            )?;
+            assert_eq!(reply.committed_revision, 3);
+            assert!(store.receipt(&format!("no-op-{index}")).is_err());
+        }
         assert_eq!(store.stored.receipts.len(), MAX_RECEIPTS);
+        assert_eq!(fs::read(&store.path)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn record_capacity_is_bounded_and_prepared_revision_is_rechecked() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut store = open(&dir);
+        let first = store.prepare(&tx("a", "first", 0, vec![add(1, "one")]))?;
+        let stale = store.prepare(&tx("a", "stale", 0, vec![add(2, "two")]))?;
+        store.commit(first, "first", Cancellation::empty())?;
+        let error = store
+            .commit(stale, "stale", Cancellation::empty())
+            .unwrap_err();
+        assert_eq!(
+            crate::error::code_of(&error),
+            ErrorCode::PolicyRevisionConflict
+        );
+        let template = store.stored.records[0].clone();
+        store.stored.records = (0..MAX_RECORDS)
+            .map(|index| Record {
+                owner: format!("owner-{index}"),
+                ..template.clone()
+            })
+            .collect();
+        assert!(
+            store
+                .prepare(&tx("a", "overflow", 1, vec![add(2, "two")]))
+                .is_err()
+        );
+        let removed = commit(
+            &mut store,
+            &tx(
+                "owner-0",
+                "remove",
+                1,
+                vec![Operation::RemovePeer { node_id: id(1) }],
+            ),
+        )?;
+        assert_eq!(removed.committed_revision, 2);
+        assert_eq!(store.stored.records.len(), MAX_RECORDS - 1);
         Ok(())
     }
 }

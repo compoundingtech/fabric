@@ -161,11 +161,12 @@ impl Grants for BookGrants {
                 reason: crate::error::ErrorCode::RuntimeStateUnavailable
                     .reason("policy commit in progress; retry this request"),
             })?;
-            requirements.record(permission);
-            return book.may(&self.peer, permission).map_err(|denied| Denial {
+            book.may(&self.peer, permission).map_err(|denied| Denial {
                 no_grants: matches!(denied, Denied::NoGrants { .. }),
                 reason: denied.reason(),
-            });
+            })?;
+            requirements.record(permission);
+            return Ok(());
         }
         self.book
             .may(&self.peer, permission)
@@ -238,6 +239,12 @@ mod tests {
             BookGrants::new(book.clone(), id, "git").with_live(policy.clone(), two.requirements());
         assert!(first.may("git/one/read").is_ok());
         assert!(second.may("git/two/read").is_ok());
+        assert!(second.may("git/denied/read").is_err());
+        assert_eq!(
+            admissions.revoke(&book),
+            0,
+            "a denied operation must not become an admission requirement"
+        );
         let guard = policy.write().await;
         assert!(
             first

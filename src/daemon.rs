@@ -3499,21 +3499,24 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
     }
     let sync_ipc_listener = IpcListener::bind(&sync_ipc_path)?;
 
-    tokio::select! {
-        result = run_control_socket(control_listener, state.clone()) => result?,
-        result = run_sync_ipc_socket(sync_ipc_listener, state.clone()) => result?,
-        result = run_iroh_accept_loop(state.clone()) => result?,
-        result = run_network_rehome_loop(state.clone()) => result?,
-        result = run_endpoint_presence_loop(state.clone()) => result?,
-        result = run_endpoint_health_poll_loop(state.clone()) => result?,
-        result = run_endpoint_rss_observe_loop(state.clone()) => result?,
-        result = run_peer_health_loop(state.clone()) => result?,
-        result = run_endpoint_snapshot_loop(state.clone()) => result?,
-        _ = state.cancel.cancelled() => {}
-    }
+    let result = tokio::select! {
+        result = run_control_socket(control_listener, state.clone()) => result,
+        result = run_sync_ipc_socket(sync_ipc_listener, state.clone()) => result,
+        result = run_iroh_accept_loop(state.clone()) => result,
+        result = run_network_rehome_loop(state.clone()) => result,
+        result = run_endpoint_presence_loop(state.clone()) => result,
+        result = run_endpoint_health_poll_loop(state.clone()) => result,
+        result = run_endpoint_rss_observe_loop(state.clone()) => result,
+        result = run_peer_health_loop(state.clone()) => result,
+        result = run_endpoint_snapshot_loop(state.clone()) => result,
+        _ = state.cancel.cancelled() => Ok(())
+    };
 
     state.cancel.cancel();
-    state.drain_policy_commits().await?;
+    let drain_result = state.drain_policy_commits().await;
+    if let Err(error) = &drain_result {
+        warn!(error = %error, "policy/config drain failed during shutdown; continuing endpoint and child cleanup");
+    }
     close_endpoint_bounded(&state.current_endpoint(), "daemon shutdown").await;
     stop_exec_children(&state).await;
     let _ = fs::remove_file(control_path);
@@ -3544,7 +3547,7 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
         state.telemetry.flush(Duration::from_secs(1)),
         state.audit.drain(Duration::from_secs(1)),
     );
-    Ok(())
+    result.and(drain_result)
 }
 
 /// How long a stopping daemon waits for the exec children it killed to be gone.
