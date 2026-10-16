@@ -16,6 +16,10 @@ Deprecated, Fixed or Security.
 
 ## [Unreleased]
 
+### Added
+
+- **Provisional:** opt-in `--runtime-peers` control API persists owner-scoped exact grants, atomic replacement batches, policy revisions and durable request/cancellation receipts without editing static peer input (#312).
+
 ## [0.9.0] - 2026-10-16
 
 A preview of 1.0. The code is 0.2.41 plus the fixes below. 1.0 comes from this

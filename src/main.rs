@@ -191,6 +191,9 @@ enum Commands {
     },
     /// Start the local fabric daemon.
     Up {
+        /// Keep owner-scoped runtime peers and grants in daemon-owned state.
+        #[arg(long)]
+        runtime_peers: bool,
         /// Run in the foreground instead of spawning a background daemon.
         #[arg(long)]
         foreground: bool,
@@ -403,6 +406,8 @@ enum Commands {
     #[command(hide = true)]
     Daemon {
         #[arg(long)]
+        runtime_peers: bool,
+        #[arg(long)]
         allow_shell: bool,
         #[arg(long)]
         allow_exec: bool,
@@ -417,11 +422,15 @@ enum Commands {
     #[command(hide = true)]
     RestartDetacher {
         #[arg(long)]
+        runtime_peers: bool,
+        #[arg(long)]
         allow_shell: bool,
     },
     /// Internal restart worker.
     #[command(hide = true)]
     RestartHelper {
+        #[arg(long)]
+        runtime_peers: bool,
         #[arg(long)]
         allow_shell: bool,
     },
@@ -946,6 +955,7 @@ async fn run(cli: Cli) -> Result<()> {
                     let _ = send_control(&home, ControlRequest::ReloadPeers).await;
                 }
                 Commands::Up {
+                    runtime_peers,
                     foreground,
                     allow_shell,
                     allow_exec,
@@ -959,6 +969,7 @@ async fn run(cli: Cli) -> Result<()> {
                         server_session_max_total,
                         server_session_max_per_peer,
                         server_session_detached_ttl_secs,
+                        runtime_peers,
                     );
                     if foreground {
                         init_daemon_tracing(&home)?;
@@ -1404,6 +1415,7 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 },
                 Commands::Daemon {
+                    runtime_peers,
                     allow_shell,
                     allow_exec,
                     server_session_max_total,
@@ -1418,6 +1430,7 @@ async fn run(cli: Cli) -> Result<()> {
                             server_session_max_total,
                             server_session_max_per_peer,
                             server_session_detached_ttl_secs,
+                            runtime_peers,
                         ),
                     )
                     .await
@@ -1426,11 +1439,17 @@ async fn run(cli: Cli) -> Result<()> {
                         std::process::exit(1);
                     }
                 }
-                Commands::RestartDetacher { allow_shell } => {
-                    run_restart_detacher(&home, allow_shell)?;
+                Commands::RestartDetacher {
+                    allow_shell,
+                    runtime_peers,
+                } => {
+                    run_restart_detacher(&home, allow_shell, runtime_peers)?;
                 }
-                Commands::RestartHelper { allow_shell } => {
-                    run_restart_helper(&home, allow_shell).await?;
+                Commands::RestartHelper {
+                    allow_shell,
+                    runtime_peers,
+                } => {
+                    run_restart_helper(&home, allow_shell, runtime_peers).await?;
                 }
             }
         }
@@ -2889,8 +2908,10 @@ fn daemon_options(
     server_session_max_total: Option<usize>,
     server_session_max_per_peer: Option<usize>,
     server_session_detached_ttl_secs: Option<u64>,
+    runtime_peers: bool,
 ) -> DaemonOptions {
     DaemonOptions {
+        runtime_peers,
         allow_shell,
         allow_exec,
         server_session_max_total,
@@ -2899,7 +2920,7 @@ fn daemon_options(
     }
 }
 
-fn run_restart_detacher(home: &FabricHome, _allow_shell: bool) -> Result<()> {
+fn run_restart_detacher(home: &FabricHome, _allow_shell: bool, runtime_peers: bool) -> Result<()> {
     println!(
         "restart detacher started: version={}",
         fabric::version_string()
@@ -2907,6 +2928,9 @@ fn run_restart_detacher(home: &FabricHome, _allow_shell: bool) -> Result<()> {
     let exe = std::env::current_exe()?;
     let mut command = ProcessCommand::new(exe);
     command.arg("--home").arg(home.root()).arg("restart-helper");
+    if runtime_peers {
+        command.arg("--runtime-peers");
+    }
     let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
@@ -2916,7 +2940,11 @@ fn run_restart_detacher(home: &FabricHome, _allow_shell: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run_restart_helper(home: &FabricHome, _allow_shell: bool) -> Result<()> {
+async fn run_restart_helper(
+    home: &FabricHome,
+    _allow_shell: bool,
+    runtime_peers: bool,
+) -> Result<()> {
     println!(
         "restart helper started: version={}",
         fabric::version_string()
@@ -2932,7 +2960,14 @@ async fn run_restart_helper(home: &FabricHome, _allow_shell: bool) -> Result<()>
         println!("daemon did not report down before restart; continuing: {error:#}");
     }
 
-    let start_result = spawn_daemon(home, DaemonOptions::default()).await;
+    let start_result = spawn_daemon(
+        home,
+        DaemonOptions {
+            runtime_peers,
+            ..DaemonOptions::default()
+        },
+    )
+    .await;
     if let Err(error) = &start_result {
         println!("daemon start failed; checking final state: {error:#}");
     }
@@ -3426,6 +3461,9 @@ async fn spawn_daemon(home: &FabricHome, options: DaemonOptions) -> Result<()> {
     let exe = std::env::current_exe()?;
     let mut command = ProcessCommand::new(exe);
     command.arg("--home").arg(home.root()).arg("daemon");
+    if options.runtime_peers {
+        command.arg("--runtime-peers");
+    }
     if let Some(max_total) = options.server_session_max_total {
         command
             .arg("--server-session-max-total")

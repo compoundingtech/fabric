@@ -20,6 +20,9 @@ pub enum ControlRequest {
     Status,
     ReachabilityStatus,
     ReloadPeers,
+    RuntimePeers {
+        request: crate::runtime_peers::Request,
+    },
     /// Wait for cached peer transitions without polling the network.
     PeerEvents {
         #[serde(default)]
@@ -167,6 +170,9 @@ pub struct DialRestoreFailure {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlResponse {
+    RuntimePeers {
+        reply: crate::runtime_peers::Reply,
+    },
     PeerEvents {
         #[serde(flatten)]
         batch: crate::presence::PeerEvents,
@@ -595,6 +601,145 @@ mod tests {
                 );
             }
             other => panic!("wrong variant: {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod runtime_peer_schema_tests {
+    use super::*;
+    use crate::{
+        error::{ErrorCode, FabricError},
+        runtime_peers::*,
+    };
+
+    #[test]
+    fn runtime_peer_control_golden_preserves_sources_receipts_and_error_classes() {
+        let node_id = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let sources = vec![
+            Source::Static {
+                path: "/config/peers.toml".into(),
+            },
+            Source::Runtime {
+                owner: "controller-b".into(),
+            },
+        ];
+        let peer = EffectivePeer {
+            node_id,
+            name: Some("laptop".into()),
+            direction: Direction::InboundOnly,
+            trust_sources: sources.clone(),
+            direction_sources: sources.clone(),
+            services: BTreeMap::from([("work/0".into(), sources)]),
+        };
+        let request = ControlRequest::RuntimePeers {
+            request: Request::Batch {
+                transaction: Transaction {
+                    owner: "controller-a".into(),
+                    request_id: "replace-17".into(),
+                    expected_revision: 6,
+                    operations: vec![Operation::RemovePeer { node_id }],
+                },
+            },
+        };
+        let list = ControlResponse::RuntimePeers {
+            reply: Reply {
+                snapshot: Some(Snapshot {
+                    instance: "instance-a".into(),
+                    policy_revision: 9,
+                    static_digest: "digest-a".into(),
+                    peers: vec![peer.clone()],
+                    next_cursor: None,
+                    fault: None,
+                }),
+                mutation: None,
+                affected: vec![],
+                error: None,
+            },
+        };
+        let mutation = ControlResponse::RuntimePeers {
+            reply: Reply {
+                snapshot: None,
+                mutation: Some(MutationReply {
+                    request_id: "replace-17".into(),
+                    committed_revision: 7,
+                    current_revision: 9,
+                    affected: vec![peer.clone()],
+                    removals: vec![Removal {
+                        node_id,
+                        owner_record_removed: true,
+                        effective_trust_removed: false,
+                    }],
+                    cancellation: Cancellation::empty(),
+                }),
+                affected: vec![peer],
+                error: None,
+            },
+        };
+        let mut restarted = match &mutation {
+            ControlResponse::RuntimePeers { reply } => reply.clone(),
+            _ => unreachable!(),
+        };
+        restarted.mutation.as_mut().unwrap().cancellation = Cancellation {
+            state: CancellationState::TimedOut,
+            admissions: vec![17],
+            remaining_admissions: vec![17],
+            restart_evidence: Some(RestartEvidence {
+                daemon_instance_changed: true,
+                child_exit_observed: false,
+            }),
+            ..Cancellation::default()
+        };
+        restarted.error = Some(PolicyError::of(
+            &FabricError::new(
+                ErrorCode::CancellationTimeout,
+                "daemon restarted; child exit was not observed",
+            )
+            .into(),
+        ));
+        let restarted = ControlResponse::RuntimePeers { reply: restarted };
+        let errors: Vec<_> = [
+            ErrorCode::RuntimePeersDisabled,
+            ErrorCode::PeerManagedStatically,
+            ErrorCode::PeerOwnedElsewhere,
+            ErrorCode::PolicyRevisionConflict,
+            ErrorCode::RuntimeStateUnavailable,
+            ErrorCode::RuntimeCommitIndeterminate,
+            ErrorCode::RuntimeReceiptCapacity,
+            ErrorCode::RequestIdConflict,
+            ErrorCode::CancellationTimeout,
+        ]
+        .into_iter()
+        .map(|code| ControlResponse::RuntimePeers {
+            reply: Reply {
+                snapshot: None,
+                mutation: None,
+                affected: vec![],
+                error: Some(PolicyError::of(
+                    &FabricError::new(code, "example failure").into(),
+                )),
+            },
+        })
+        .collect();
+        let value = serde_json::json!({ "request": request, "list_reply": list, "mutation_reply": mutation, "restart_reply": restarted, "coded_errors": errors });
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden/json/runtime_peer_control.json");
+        if std::env::var_os("UPDATE_GOLDEN").is_some() {
+            std::fs::write(
+                &path,
+                format!("{}\n", serde_json::to_string_pretty(&value).unwrap()),
+            )
+            .unwrap();
+        }
+        let expected: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value, expected);
+        let _: ControlRequest = serde_json::from_value(value["request"].clone()).unwrap();
+        for key in ["list_reply", "mutation_reply", "restart_reply"] {
+            let _: ControlResponse = serde_json::from_value(value[key].clone()).unwrap();
+        }
+        for error in value["coded_errors"].as_array().unwrap() {
+            let _: ControlResponse = serde_json::from_value(error.clone()).unwrap();
         }
     }
 }

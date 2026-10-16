@@ -2181,3 +2181,11 @@ no bytes. While the outer shell is still up and the inner program has died, the
 terminal stays as that program left it: nothing reaches the client to act on,
 and the reset belongs to the program that set the modes; `reset` at the remote
 prompt, or leaving the shell, puts it back.
+
+### Runtime peers and exact grants (provisional)
+
+`fabric up --runtime-peers` enables daemon-owned, owner-scoped peer and exact
+grant mutations on the control socket. Static peer input remains read-only;
+mutation replies report any access still granted by static or other-owner
+records. See the [runtime peer API](docs/runtime-peer-api.md) for transactions,
+revisions, durable request replay and cancellation completion.

@@ -343,6 +343,26 @@ impl<'de> Deserialize<'de> for PeerBook {
 }
 
 impl PeerBook {
+    /// Runtime mode never runs write-on-load migrations or replaces static symlinks.
+    pub(crate) fn parse_read_only(raw: &str) -> Result<Self> {
+        let stored: StoredPeerBook = toml::from_str(raw)?;
+        if stored.format != Some(PEER_FILE_FORMAT) {
+            bail!("migrate static peers.toml to format 2 before enabling --runtime-peers");
+        }
+        let (book, _, _) = Self::from_stored(stored)?;
+        book.validate()?;
+        Ok(book)
+    }
+
+    pub(crate) fn with_effective_peers(&self, peers: Vec<Peer>) -> Result<Self> {
+        let book = Self {
+            peers,
+            git_remotes: self.git_remotes.clone(),
+        };
+        book.validate()?;
+        Ok(book)
+    }
+
     pub fn load(home: &FabricHome) -> Result<Self> {
         if let Some((path, book, migrated, removed_grants)) = Self::load_existing(home)? {
             if migrated || path != home.peers_path() {
