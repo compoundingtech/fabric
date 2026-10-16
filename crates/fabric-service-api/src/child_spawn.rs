@@ -90,7 +90,19 @@ pub async fn spawn(label: &str, command: Command) -> io::Result<Child> {
 async fn spawn_within(label: &str, mut command: Command, limit: Duration) -> io::Result<Child> {
     let began = Instant::now();
     let in_flight = InFlight::begin(label);
-    let mut start = tokio::task::spawn_blocking(move || command.spawn());
+    let children = crate::child_tracking::Children::current();
+    let spawning = children.as_ref().map(|children| children.begin_spawn());
+    let mut start = tokio::task::spawn_blocking(move || {
+        let _spawning = spawning;
+        if children.is_some() {
+            command.kill_on_drop(true);
+        }
+        let child = command.spawn()?;
+        if let (Some(children), Some(pid)) = (children, child.id()) {
+            children.register(pid);
+        }
+        Ok(child)
+    });
     let result = tokio::time::timeout(limit, &mut start).await;
     let took = began.elapsed();
     if took >= SLOW_SPAWN {

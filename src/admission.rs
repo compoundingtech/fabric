@@ -55,6 +55,9 @@ struct Entry {
     peer: EndpointId,
     grant: Grant,
     revoked: CancellationToken,
+    done: CancellationToken,
+    children: fabric_service_api::child_tracking::Children,
+    requirements: Requirements,
 }
 
 impl Admissions {
@@ -63,6 +66,9 @@ impl Admissions {
     /// first, it is either revoked by that reload or refused by the new book.
     pub fn admit(self: &Arc<Self>, peer: EndpointId, grant: Grant) -> Admission {
         let revoked = CancellationToken::new();
+        let done = CancellationToken::new();
+        let children = fabric_service_api::child_tracking::Children::default();
+        let requirements = Requirements::default();
         let mut live = self.live.lock().unwrap();
         let id = live.next;
         live.next += 1;
@@ -72,6 +78,9 @@ impl Admissions {
                 peer,
                 grant: grant.clone(),
                 revoked: revoked.clone(),
+                done: done.clone(),
+                children: children.clone(),
+                requirements: requirements.clone(),
             },
         );
         Admission {
@@ -79,8 +88,30 @@ impl Admissions {
             peer,
             grant,
             revoked,
+            done,
+            children,
+            requirements,
             admissions: self.clone(),
         }
+    }
+
+    pub(crate) fn select_withdrawn(&self, book: &PeerBook) -> Vec<Revocation> {
+        self.live
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                !entry.grant.permitted(book, &entry.peer)
+                    || !entry.requirements.permitted(book, &entry.peer)
+            })
+            .map(|(id, entry)| Revocation {
+                id: *id,
+                revoked: entry.revoked.clone(),
+                done: entry.done.clone(),
+                children: entry.children.clone(),
+            })
+            .collect()
     }
 
     /// Revoke every admission `book` no longer gives. Returns how many.
@@ -88,7 +119,10 @@ impl Admissions {
         let live = self.live.lock().unwrap();
         let mut revoked = 0;
         for entry in live.entries.values() {
-            if !entry.revoked.is_cancelled() && !entry.grant.permitted(book, &entry.peer) {
+            if !entry.revoked.is_cancelled()
+                && (!entry.grant.permitted(book, &entry.peer)
+                    || !entry.requirements.permitted(book, &entry.peer))
+            {
                 entry.revoked.cancel();
                 revoked += 1;
             }
@@ -102,6 +136,48 @@ impl Admissions {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Requirements(Arc<Mutex<Vec<String>>>);
+impl Requirements {
+    pub fn first_withdrawn(&self, book: &PeerBook, peer: &EndpointId) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|service| book.may(peer, service).is_err())
+            .cloned()
+    }
+    pub fn record(&self, service: &str) {
+        let mut services = self.0.lock().unwrap();
+        if !services.iter().any(|s| s == service) {
+            services.push(service.into());
+        }
+    }
+    fn permitted(&self, book: &PeerBook, peer: &EndpointId) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|service| book.may(peer, service).is_ok())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Revocation {
+    pub id: u64,
+    revoked: CancellationToken,
+    done: CancellationToken,
+    children: fabric_service_api::child_tracking::Children,
+}
+impl Revocation {
+    pub fn cancel(&self) {
+        self.revoked.cancel();
+    }
+    pub fn complete(&self) -> bool {
+        self.done.is_cancelled() && self.children.complete()
+    }
+}
+
 /// One live admission. Dropping it forgets the record.
 #[derive(Debug)]
 pub struct Admission {
@@ -109,10 +185,21 @@ pub struct Admission {
     peer: EndpointId,
     grant: Grant,
     revoked: CancellationToken,
+    done: CancellationToken,
+    children: fabric_service_api::child_tracking::Children,
+    requirements: Requirements,
     admissions: Arc<Admissions>,
 }
 
 impl Admission {
+    pub(crate) fn requirements(&self) -> Requirements {
+        self.requirements.clone()
+    }
+
+    pub(crate) fn children(&self) -> fabric_service_api::child_tracking::Children {
+        self.children.clone()
+    }
+
     pub fn peer(&self) -> EndpointId {
         self.peer
     }
@@ -129,6 +216,7 @@ impl Admission {
 
 impl Drop for Admission {
     fn drop(&mut self) {
+        self.done.cancel();
         self.admissions
             .live
             .lock()

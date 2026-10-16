@@ -2,7 +2,8 @@
 
 All notable changes to fabric are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); fabric is pre-1.0 and
-EXPERIMENTAL, so on-disk formats and the CLI may change without notice.
+EXPERIMENTAL, so on-disk formats and the CLI may change without notice. The
+0.9 releases are previews of 1.0.
 
 From 1.0.0, [docs/stability.md](docs/stability.md) governs what a release may
 change. Patch releases only fix bugs. A minor release may add commands, flags,
@@ -15,7 +16,28 @@ Deprecated, Fixed or Security.
 
 ## [Unreleased]
 
+### Added
+
+- Exec and shell audit JSONL records identify the authenticated caller, local
+  label, exec argv, session, outcome, exit status, duration and payload counts.
+  Shell events retain no keystrokes. A dedicated bounded writer fails open,
+  reports loss summaries, rotates private files, and exposes its running loss
+  counter in `status --json` and `fabric audit`; the reader supports time and
+  peer filters and a documented JSON shape (#315).
+
+- **Provisional:** opt-in `--runtime-peers` control API persists owner-scoped exact grants, atomic replacement batches, policy revisions and durable request/cancellation receipts without editing static peer input (#312).
+
+## [0.9.0] - 2026-10-16
+
+A preview of 1.0. The code is 0.2.41 plus the fixes below. 1.0 comes from this
+line; the contract it will hold is drafted in [docs/stability.md](docs/stability.md).
+
 ### Changed
+
+- Built-in exec and shell one-shot calls now wait up to 10 seconds for the
+  shared local peer and daemon dial capacity, preserving independent sockets
+  and one-accept cleanup. A full or expired queue logs
+  `fabric:session_limit_reached`; exec also receives a framed error.
 
 - Through a generic dial listener, an exposure's exec child-limit refusal now
   waits for capacity up to the queue timeout (default 10 seconds) before the
@@ -27,6 +49,12 @@ Deprecated, Fixed or Security.
 
 ### Fixed
 
+- Daemon validation logs and stderr write through bounded background queues,
+  counting dropped records when the sink stalls. Telemetry coalesces pending
+  snapshots and performs serialization and file writes outside the counters
+  mutex, so a stalled diagnostic disk does not block runtime workers (#314).
+
+- Concurrent exec and shell commands use independent one-shot local sockets, preventing one command from unlinking another command's socket. Unused sockets expire after 30 seconds and stale one-shot sockets are removed at startup (#316).
 - A failed Unix dial is never persisted, overlong socket paths report `fabric:invalid_argument` and the maximum home length, and failed saved Unix or TCP listeners are skipped at startup and reported by status in `dial_restore_failures` (#297).
 - `fabric down` waits up to 15 seconds for lease release through endpoint and child cleanup, so immediate `down && up` succeeds or reports `fabric:daemon_stop_timeout` (fault, exit 69) while still stopping (#298).
 

@@ -109,6 +109,15 @@ error_codes! {
     SessionExpired => "session_expired", Fault;
     SpawnFailed => "spawn_failed", Fault;
     Internal => "internal", Fault;
+    RuntimePeersDisabled => "runtime_peers_disabled", Refusal;
+    PeerManagedStatically => "peer_managed_statically", Refusal;
+    PeerOwnedElsewhere => "peer_owned_elsewhere", Refusal;
+    PolicyRevisionConflict => "policy_revision_conflict", Fault;
+    RuntimeStateUnavailable => "runtime_state_unavailable", Fault;
+    RuntimeCommitIndeterminate => "runtime_commit_indeterminate", Fault;
+    RuntimeReceiptCapacity => "runtime_receipt_capacity", Fault;
+    RequestIdConflict => "request_id_conflict", Usage;
+    CancellationTimeout => "cancellation_timeout", Fault;
     InvalidArgument => "invalid_argument", Usage;
 }
 

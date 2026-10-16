@@ -34,6 +34,15 @@ Each code has a class, and the class says what a caller should do:
 | `session_expired` | fault | 69 | A resume named a session the peer no longer holds. Start a new session; do not replay the old one. |
 | `spawn_failed` | fault | 69 | The command behind an exec service or `fabric exec` could not be started. |
 | `internal` | fault | 1 | Any failure not yet given a more specific code. |
+| `runtime_peers_disabled` | refusal | 77 | The daemon was not started with `--runtime-peers`. |
+| `peer_managed_statically` | refusal | 77 | This owner has no runtime record; static access is preserved. Inspect the effective-access sources. |
+| `peer_owned_elsewhere` | refusal | 77 | This owner has no record for the node; another owner's access is preserved. |
+| `policy_revision_conflict` | fault | 69 | The expected policy revision or list cursor is stale. Fetch a fresh snapshot and reconcile. |
+| `runtime_state_unavailable` | fault | 69 | Runtime policy could not be read or committed. A faulted policy closes new network admissions; repair the file and explicitly reload. A narrow synchronous grant check can also return this transiently while a commit holds the policy barrier. |
+| `runtime_commit_indeterminate` | fault | 69 | Rename succeeded but commit durability could not be confirmed. Admissions are quarantined. Resolve the durable request ID after repair and reload; do not invent a new request ID. |
+| `runtime_receipt_capacity` | fault | 69 | The applicable retained receipt capacity is full: 960 ordinary slots, 64 more for withdrawal-only mutations. No-ops use no slot. Wait for retention expiry or reconcile through an existing receipt. |
+| `request_id_conflict` | usage | 2 | A retained request ID was reused with different contents. |
+| `cancellation_timeout` | fault | 69 | Policy committed, but selected work did not finish within two seconds. The receipt lists remaining admissions and sessions; policy is not rolled back. |
 | `invalid_argument` | usage | 2 | Fabric rejected an argument's value. |
 <!-- /codes -->
 

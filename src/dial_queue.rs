@@ -1,4 +1,4 @@
-//! Bounded admission shared by every generic dial listener to one peer.
+//! Bounded admission shared by generic listeners and one-shot service calls to one peer.
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, Weak},

@@ -15,6 +15,8 @@ use std::{
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, bail};
@@ -64,6 +66,8 @@ use crate::{
     tunnel,
 };
 
+mod runtime_control;
+
 const BUILTIN_ECHO_ALPN: &[u8] = b"fabric/echo/0";
 const SYNC_ALPN: &[u8] = b"fabric/sync/1";
 const ECHO_SERVICE: &str = "echo";
@@ -79,6 +83,8 @@ const INCOMING_FAILURE_MAX_BACKOFF: Duration = Duration::from_secs(5);
 const DIAL_FAILURE_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const DIAL_FAILURE_MAX_BACKOFF: Duration = Duration::from_secs(15);
 const DIAL_LISTENER_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+/// A CLI that disappears before connecting must not leave a listener behind.
+const ONE_SHOT_DIAL_WAIT: Duration = Duration::from_secs(30);
 /// Bound a stalled peer while it holds an inbound sync entry guard. Progressing
 /// transfers can run longer than this interval.
 const INBOUND_SYNC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -391,7 +397,9 @@ struct ServiceProbe {
 
 #[derive(Debug)]
 struct AllowListHook {
-    allowed: Arc<RwLock<HashSet<EndpointId>>>,
+    policy: Arc<RwLock<PeerBook>>,
+    services: Services,
+    audit: crate::audit::Audit,
 }
 
 impl EndpointHooks for AllowListHook {
@@ -400,9 +408,31 @@ impl EndpointHooks for AllowListHook {
             return AfterHandshakeOutcome::Accept;
         }
 
-        if self.allowed.read().await.contains(&conn.remote_id()) {
+        let policy = self.policy.read().await;
+        if policy.accepts_inbound(&conn.remote_id()) {
             AfterHandshakeOutcome::Accept
         } else {
+            // The handshake identifies the peer before any argv or mux request
+            // is read. A mux target is unknown here and stays null in the audit.
+            let peer = conn.remote_id().to_string();
+            let service = self
+                .services
+                .find(conn.alpn())
+                .map(|(service, _)| service.name())
+                .filter(|name| matches!(*name, "exec" | "shell"))
+                .map(str::to_string);
+            self.audit
+                .call(
+                    peer.clone(),
+                    policy
+                        .peers()
+                        .iter()
+                        .find(|entry| entry.id == conn.remote_id())
+                        .and_then(|entry| entry.name.clone()),
+                    service,
+                    crate::audit::Kind::Exec,
+                )
+                .refused(ErrorCode::PeerNotInAllowList);
             AfterHandshakeOutcome::Reject {
                 error_code: VarInt::from_u32(403),
                 reason: ErrorCode::PeerNotInAllowList
@@ -415,15 +445,19 @@ impl EndpointHooks for AllowListHook {
 
 #[derive(Debug)]
 pub struct DaemonState {
-    config_write: std::sync::Mutex<()>,
+    config_write: Arc<std::sync::Mutex<()>>,
     home: FabricHome,
     endpoint_tx: watch::Sender<CurrentEndpoint>,
     endpoint_recycle: Mutex<()>,
     last_endpoint_recycle: Mutex<Option<Instant>>,
-    peer_book: RwLock<PeerBook>,
-    allowed: Arc<RwLock<HashSet<EndpointId>>>,
+    peer_book: Arc<RwLock<PeerBook>>,
+    policy_update: Mutex<()>,
+    runtime_peers: Option<Arc<std::sync::Mutex<crate::runtime_peers::RuntimePeers>>>,
+    policy_quarantine: Mutex<Option<runtime_control::Revocations>>,
+    pending_policy_revocations: Arc<std::sync::Mutex<Vec<Arc<runtime_control::Revocations>>>>,
     exposures: RwLock<HashMap<Vec<u8>, Exposure>>,
     dial_sockets: Mutex<HashMap<(String, String), DialSocket>>,
+    one_shot_dials: Mutex<Vec<JoinHandle<()>>>,
     dial_restore_failures: Mutex<Vec<DialRestoreFailure>>,
     active_dial_listeners: Arc<AtomicUsize>,
     tcp_dials: Mutex<HashMap<(String, String, String), TcpDial>>,
@@ -452,6 +486,7 @@ pub struct DaemonState {
     /// Durable loss/resume counters. Survives a restart, unlike the log lines
     /// that were previously the only record.
     telemetry: Arc<TelemetryStore>,
+    audit: crate::audit::Audit,
     /// The last path the liveness probe saw for each peer, keyed by peer label.
     ///
     /// A session-loss notice fires when the transport is already gone, so asking
@@ -495,6 +530,7 @@ pub(crate) struct CurrentEndpoint {
 pub struct DaemonOptions {
     pub allow_shell: bool,
     pub allow_exec: bool,
+    pub runtime_peers: bool,
     pub server_session_max_total: Option<usize>,
     pub server_session_max_per_peer: Option<usize>,
     pub server_session_detached_ttl_secs: Option<u64>,
@@ -554,6 +590,73 @@ impl Drop for DialSocket {
             task.abort();
         }
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Own only the local rendezvous path, never the accepted command session.
+struct OneShotDialSocket {
+    path: PathBuf,
+    deadline: tokio::time::Instant,
+}
+
+impl Drop for OneShotDialSocket {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+async fn one_shot_dial_expired(socket: &Option<OneShotDialSocket>) {
+    match socket {
+        Some(socket) => tokio::time::sleep_until(socket.deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn sweep_one_shot_dials(home: &FabricHome) {
+    let dir = home.root().join("dials");
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                warn!(path = %dir.display(), %error, "failed to scan stale one-shot dial sockets");
+            }
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    warn!(path = %dir.display(), %error, "failed to read stale one-shot dial entry");
+                }
+                continue;
+            }
+        };
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Only the private one-shot namespace. Persisted/shared sockets and
+        // unrelated files are left to their existing owners.
+        if let Some(nonce) = name
+            .strip_prefix("once-")
+            .and_then(|s| s.strip_suffix(".sock"))
+            && nonce.len() == 16
+            && nonce.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            let result = entry.file_type().and_then(|kind| {
+                if kind.is_socket() {
+                    fs::remove_file(&path)
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(error) = result
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(path = %path.display(), %error, "failed to remove stale one-shot dial socket");
+            }
+        }
     }
 }
 
@@ -794,15 +897,20 @@ fn resolve_server_session_settings(
 
 async fn build_daemon_endpoint(
     home: &FabricHome,
-    allowed: Arc<RwLock<HashSet<EndpointId>>>,
+    policy: Arc<RwLock<PeerBook>>,
     services: &Services,
     exposures: &HashMap<Vec<u8>, Exposure>,
+    audit: crate::audit::Audit,
 ) -> Result<Endpoint> {
     let secret_key = load_or_create_identity(home)?;
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .alpns(accepted_alpns(services, exposures))
-        .hooks(AllowListHook { allowed })
+        .hooks(AllowListHook {
+            policy,
+            services: services.clone(),
+            audit,
+        })
         .bind()
         .await?;
     let _ = tokio::time::timeout(ENDPOINT_ONLINE_TIMEOUT, endpoint.online()).await;
@@ -865,6 +973,9 @@ fn resolve_log_retention_days(raw: Option<&str>) -> Option<usize> {
     }
 }
 
+static VALIDATION_WRITER: std::sync::OnceLock<fabric_config::background_writer::BackgroundWriter> =
+    std::sync::OnceLock::new();
+
 pub fn init_daemon_tracing(home: &FabricHome) -> Result<()> {
     home.prepare()?;
     let retention =
@@ -878,14 +989,18 @@ pub fn init_daemon_tracing(home: &FabricHome) -> Result<()> {
     let appender = builder
         .build(home.validation_log_dir())
         .context("failed to build the validation log appender")?;
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_env_filter(validation_log_filter())
-        .with_target(true)
-        .with_writer(appender)
-        .finish();
+    let writer = fabric_config::background_writer::BackgroundWriter::spawn(
+        "fabric-validation",
+        appender,
+        4096,
+        4 * 1024 * 1024,
+    )
+    .context("failed to start validation log writer")?;
+    let subscriber_writer = writer.clone();
+    let subscriber = validation_subscriber(move || subscriber_writer.clone());
 
     if tracing::subscriber::set_global_default(subscriber).is_ok() {
+        let _ = VALIDATION_WRITER.set(writer);
         info!(
             target: VALIDATION_LOG_TARGET,
             event = "diagnostic_logging_init",
@@ -896,6 +1011,18 @@ pub fn init_daemon_tracing(home: &FabricHome) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validation_subscriber<W>(writer: W) -> impl tracing::Subscriber + Send + Sync
+where
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(validation_log_filter())
+        .with_target(true)
+        .with_writer(writer)
+        .finish()
 }
 
 fn validation_log_filter() -> EnvFilter {
@@ -1067,11 +1194,31 @@ impl DaemonState {
         options: DaemonOptions,
         services: Services,
     ) -> Result<Arc<Self>> {
+        Self::new_with_audit(home, cancel, options, services, None).await
+    }
+
+    async fn new_with_audit(
+        home: FabricHome,
+        cancel: CancellationToken,
+        options: DaemonOptions,
+        services: Services,
+        audit: Option<crate::audit::Audit>,
+    ) -> Result<Arc<Self>> {
         home.prepare()?;
+        sweep_one_shot_dials(&home);
         let config = FabricConfig::load(&home)?;
         let (tunnel_session_limits, tunnel_session_detached_ttl) =
             resolve_server_session_settings(&config, options)?;
-        let peer_book = PeerBook::load(&home)?;
+        let (runtime_peers, peer_book) = if options.runtime_peers {
+            let runtime_home = home.clone();
+            let (runtime, book) = tokio::task::spawn_blocking(move || {
+                crate::runtime_peers::RuntimePeers::open(&runtime_home)
+            })
+            .await?;
+            (Some(Arc::new(std::sync::Mutex::new(runtime))), book)
+        } else {
+            (None, PeerBook::load(&home)?)
+        };
         let sync_book = SyncBook::load(&home)?;
         for (sync, selectors) in sync_book.unknown_explicit_selectors(&peer_book) {
             warn!(
@@ -1081,8 +1228,16 @@ impl DaemonState {
             );
         }
         let exposures = load_persisted_exposures(&home, &services)?;
-        let allowed = Arc::new(RwLock::new(peer_book.trusted_ids()));
-        let endpoint = build_daemon_endpoint(&home, allowed.clone(), &services, &exposures).await?;
+        let audit = audit.unwrap_or_else(|| crate::audit::Audit::start(home.root()));
+        let peer_book = Arc::new(RwLock::new(peer_book));
+        let endpoint = build_daemon_endpoint(
+            &home,
+            peer_book.clone(),
+            &services,
+            &exposures,
+            audit.clone(),
+        )
+        .await?;
         let generation = next_endpoint_generation(&home, 0)?;
         let (endpoint_tx, _) = watch::channel(CurrentEndpoint {
             generation,
@@ -1092,20 +1247,31 @@ impl DaemonState {
         let tunnel_sessions =
             tunnel::ServerSessionStore::new(tunnel_session_limits, tunnel_session_detached_ttl);
         tunnel::spawn_server_session_reaper(tunnel_sessions.clone(), cancel.clone());
-        let telemetry = Arc::new(TelemetryStore::load(home.telemetry_path()));
+        let telemetry_path = home.telemetry_path();
+        let telemetry = Arc::new(
+            tokio::task::spawn_blocking(move || TelemetryStore::load(telemetry_path)).await?,
+        );
         let local_id = endpoint_tx.borrow().endpoint.id();
         let (opened_mux_tx, opened_mux_rx) = mpsc::unbounded_channel();
+        let peer_connections = Arc::new(mux::PeerConnections::new(local_id, opened_mux_tx));
+        if runtime_peers.is_some() {
+            peer_connections.use_runtime_policy(peer_book.clone());
+        }
 
         Ok(Arc::new(Self {
-            config_write: std::sync::Mutex::new(()),
+            config_write: Arc::new(std::sync::Mutex::new(())),
             home,
             endpoint_tx,
             endpoint_recycle: Mutex::new(()),
             last_endpoint_recycle: Mutex::new(None),
-            peer_book: RwLock::new(peer_book),
-            allowed,
+            peer_book,
+            policy_update: Mutex::new(()),
+            runtime_peers,
+            policy_quarantine: Mutex::new(None),
+            pending_policy_revocations: Arc::new(std::sync::Mutex::new(Vec::new())),
             exposures: RwLock::new(exposures),
             dial_sockets: Mutex::new(HashMap::new()),
+            one_shot_dials: Mutex::new(Vec::new()),
             dial_restore_failures: Mutex::new(Vec::new()),
             active_dial_listeners: Arc::new(AtomicUsize::new(0)),
             tcp_dials: Mutex::new(HashMap::new()),
@@ -1132,11 +1298,12 @@ impl DaemonState {
             incoming_slots: Arc::new(Semaphore::new(MAX_INCOMING_HANDLERS)),
             dial_slots: Arc::new(Semaphore::new(MAX_DIAL_HANDLERS)),
             mux_stream_slots: Arc::new(Semaphore::new(MAX_INCOMING_HANDLERS)),
-            peer_connections: Arc::new(mux::PeerConnections::new(local_id, opened_mux_tx)),
+            peer_connections,
             opened_mux_connections: Mutex::new(Some(opened_mux_rx)),
             services,
             cancel,
             telemetry,
+            audit,
             last_probe_transport: Arc::new(StdRwLock::new(HashMap::new())),
             sync_ipc_nonce: fresh_sync_ipc_nonce(),
             sync_companion: Mutex::new(None),
@@ -1282,21 +1449,29 @@ impl DaemonState {
     }
 
     pub async fn reload_peers(&self) -> Result<()> {
-        let peer_book = match PeerBook::load(&self.home) {
+        if self.runtime_peers.is_some() {
+            return self.reload_runtime_peers().await;
+        }
+        let _policy = self.policy_update.lock().await;
+        if self.cancel.is_cancelled() {
+            return Err(FabricError::new(ErrorCode::DaemonNotRunning, "daemon is stopping").into());
+        }
+        let home = self.home.clone();
+        let peer_book = match tokio::task::spawn_blocking(move || PeerBook::load(&home)).await? {
             Ok(peer_book) => peer_book,
             Err(error) => {
                 // A bad format or a failed security migration must not leave
                 // the old, possibly wider policy live after a reload request.
                 *self.peer_book.write().await = PeerBook::default();
-                *self.allowed.write().await = HashSet::new();
                 return Err(error);
             }
         };
-        SyncBook::load(&self.home)?.validate_against(&peer_book)?;
-        let trusted_ids = peer_book.trusted_ids();
+        let home = self.home.clone();
+        let candidate = peer_book.clone();
+        tokio::task::spawn_blocking(move || SyncBook::load(&home)?.validate_against(&candidate))
+            .await??;
         let installed = peer_book.clone();
         *self.peer_book.write().await = peer_book;
-        *self.allowed.write().await = trusted_ids;
         // Only here, after a book was accepted and installed. A reload that
         // failed above ended nothing: a load failure closes the book to new
         // connections, a rejected book leaves the old one in force, and neither
@@ -1328,17 +1503,52 @@ impl DaemonState {
         }
     }
 
-    fn update_config(&self, update: impl FnOnce(&mut FabricConfig)) -> Result<()> {
-        // A daemon can serve independent control requests on different threads.
-        // Serialize the complete read-modify-write, not only the final rename.
-        let _guard = self.config_write.lock().unwrap();
-        let mut config = FabricConfig::load(&self.home)?;
-        let before = toml::to_string(&config)?;
-        update(&mut config);
-        if toml::to_string(&config)? != before {
-            config.save(&self.home)?;
-        }
-        Ok(())
+    async fn update_config(&self, update: runtime_control::ConfigUpdate) -> Result<()> {
+        let write = self.config_write.clone();
+        let home = self.home.clone();
+        let cancel = self.cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = write.lock().unwrap_or_else(|poison| poison.into_inner());
+            if cancel.is_cancelled() {
+                return Err(
+                    FabricError::new(ErrorCode::DaemonNotRunning, "daemon is stopping").into(),
+                );
+            }
+            let mut config = FabricConfig::load(&home)?;
+            let before = toml::to_string(&config)?;
+            update.apply(&mut config);
+            if toml::to_string(&config)? != before {
+                config.save(&home)?;
+            }
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn audit_context(
+        &self,
+        peer: EndpointId,
+        alpn: &[u8],
+        exposed_exec: bool,
+    ) -> Option<crate::audit::Call> {
+        let (service, kind) = if exposed_exec {
+            (
+                String::from_utf8_lossy(alpn).into_owned(),
+                crate::audit::Kind::Exec,
+            )
+        } else {
+            let (service, _) = self.services.find(alpn)?;
+            match service.name() {
+                "exec" => ("exec".to_string(), crate::audit::Kind::Exec),
+                "shell" => ("shell".to_string(), crate::audit::Kind::Shell),
+                _ => return None,
+            }
+        };
+        let identity = self.peer_identity(peer).await;
+        Some(
+            self.audit
+                .call(peer.to_string(), identity.name, Some(service), kind),
+        )
     }
 
     async fn peer_identity(&self, id: EndpointId) -> PeerIdentity {
@@ -1377,13 +1587,10 @@ impl DaemonState {
         }
 
         if persist {
-            self.update_config(|config| {
-                config.upsert_expose(PersistedExpose::socket(
-                    protocol.to_string(),
-                    socket.clone(),
-                    peer_header,
-                ));
-            })?;
+            self.update_config(runtime_control::ConfigUpdate::UpsertExpose(
+                PersistedExpose::socket(protocol.to_string(), socket.clone(), peer_header),
+            ))
+            .await?;
         }
 
         let mut exposures = self.exposures.write().await;
@@ -1416,9 +1623,10 @@ impl DaemonState {
         validate_tcp_addr(&addr)?;
 
         if persist {
-            self.update_config(|config| {
-                config.upsert_expose(PersistedExpose::tcp(protocol.to_string(), addr.clone()));
-            })?;
+            self.update_config(runtime_control::ConfigUpdate::UpsertExpose(
+                PersistedExpose::tcp(protocol.to_string(), addr.clone()),
+            ))
+            .await?;
         }
 
         let mut exposures = self.exposures.write().await;
@@ -1457,13 +1665,10 @@ impl DaemonState {
         }
 
         if persist {
-            self.update_config(|config| {
-                config.upsert_expose(PersistedExpose::exec(
-                    protocol.to_string(),
-                    argv.clone(),
-                    max_children,
-                ));
-            })?;
+            self.update_config(runtime_control::ConfigUpdate::UpsertExpose(
+                PersistedExpose::exec(protocol.to_string(), argv.clone(), max_children),
+            ))
+            .await?;
         }
 
         let mut exposures = self.exposures.write().await;
@@ -1504,9 +1709,10 @@ impl DaemonState {
             bail!("{protocol:?} is reserved for fabric's built-in protocols");
         }
 
-        self.update_config(|config| {
-            config.remove_expose(protocol);
-        })?;
+        self.update_config(runtime_control::ConfigUpdate::RemoveExpose(
+            protocol.to_string(),
+        ))
+        .await?;
 
         let mut exposures = self.exposures.write().await;
         exposures.remove(&alpn);
@@ -1622,15 +1828,19 @@ impl DaemonState {
         Ok(path)
     }
 
-    fn persist_unix_dial(&self, peer: &str, protocol: &str, options: DialOptions) -> Result<()> {
-        self.update_config(|config| {
-            config.upsert_dial(PersistedDial {
-                peer: peer.into(),
-                protocol: protocol.into(),
-                tcp: None,
-                options,
-            });
-        })
+    async fn persist_unix_dial(
+        &self,
+        peer: &str,
+        protocol: &str,
+        options: DialOptions,
+    ) -> Result<()> {
+        self.update_config(runtime_control::ConfigUpdate::UpsertDial(PersistedDial {
+            peer: peer.into(),
+            protocol: protocol.into(),
+            tcp: None,
+            options,
+        }))
+        .await
     }
 
     async fn clear_dial_restore_failure(&self, peer: &str, protocol: &str, tcp: Option<&str>) {
@@ -1641,8 +1851,8 @@ impl DaemonState {
 
     /// A local socket that reaches `peer`'s `name` service with the newest
     /// protocol the service speaks: a fresh socket per command unless the
-    /// service shares one. The socket is named after the service's oldest
-    /// protocol, as it was before a service spoke two.
+    /// service shares one. Exec and shell rendezvous sockets accept once and
+    /// expire if the command never connects.
     async fn dial_service(&self, peer: &str, name: &str) -> Result<PathBuf> {
         let service = self
             .services
@@ -1706,15 +1916,17 @@ impl DaemonState {
         peer: EndpointId,
         send: SendStream,
         recv: RecvStream,
+        admission: &Admission,
     ) -> PeerStream {
         let grants = match service.access() {
             Access::AllowList => None,
             Access::Grants => {
                 let book = self.peer_book.read().await.clone();
-                Some(
-                    Arc::new(services::BookGrants::new(book, peer, service.name()))
-                        as Arc<dyn fabric_service_api::Grants>,
-                )
+                let mut grants = services::BookGrants::new(book, peer, service.name());
+                if self.runtime_peers.is_some() {
+                    grants = grants.with_live(self.peer_book.clone(), admission.requirements());
+                }
+                Some(Arc::new(grants) as Arc<dyn fabric_service_api::Grants>)
             }
         };
         PeerStream {
@@ -1747,14 +1959,13 @@ impl DaemonState {
         let mut tcp_dials = self.tcp_dials.lock().await;
         if let Some(existing) = tcp_dials.get_mut(&key) {
             let addr = existing.addr.clone();
-            self.update_config(|config| {
-                config.upsert_dial(PersistedDial {
-                    peer: peer_addr.id.to_string(),
-                    protocol: protocol.into(),
-                    tcp: Some(addr.clone()),
-                    options,
-                })
-            })?;
+            self.update_config(runtime_control::ConfigUpdate::UpsertDial(PersistedDial {
+                peer: peer_addr.id.to_string(),
+                protocol: protocol.into(),
+                tcp: Some(addr.clone()),
+                options,
+            }))
+            .await?;
             existing.peer_addr = peer_addr;
             existing.dial_state.update(options);
             self.clear_dial_restore_failure(&key.0, protocol, Some(&addr))
@@ -1766,14 +1977,13 @@ impl DaemonState {
             .with_context(|| format!("failed to bind tcp dial listener {bind}"))?;
         let addr = listener.local_addr()?.to_string();
         let listener_cancel = self.cancel.child_token();
-        self.update_config(|config| {
-            config.upsert_dial(PersistedDial {
-                peer: peer_addr.id.to_string(),
-                protocol: protocol.into(),
-                tcp: Some(addr.clone()),
-                options,
-            });
-        })?;
+        self.update_config(runtime_control::ConfigUpdate::UpsertDial(PersistedDial {
+            peer: peer_addr.id.to_string(),
+            protocol: protocol.into(),
+            tcp: Some(addr.clone()),
+            options,
+        }))
+        .await?;
         let dial_state = Arc::new(crate::dial_state::DialListenerState::new(options));
         tcp_dials.insert(
             key,
@@ -1809,9 +2019,11 @@ impl DaemonState {
 
     pub async fn undial(&self, peer: &str, protocol: &str) -> Result<()> {
         let id = self.peer_book.read().await.resolve(peer)?.id.to_string();
-        self.update_config(|config| {
-            config.remove_dial(&id, protocol);
-        })?;
+        self.update_config(runtime_control::ConfigUpdate::RemoveDial {
+            peer: id.clone(),
+            protocol: protocol.to_string(),
+        })
+        .await?;
         let removed = self
             .dial_sockets
             .lock()
@@ -1875,6 +2087,12 @@ impl DaemonState {
         }
         let peer_addr = self.peer_book.read().await.resolve(peer)?;
         let key = (peer_addr.id.to_string(), protocol.to_string());
+        let one_shot = !reuse_existing
+            && !persist
+            && self
+                .services
+                .find(&alpn)
+                .is_some_and(|(service, _)| matches!(service.name(), "exec" | "shell"));
 
         let mut sockets = self.dial_sockets.lock().await;
         if let Some(existing) = sockets.get(&key)
@@ -1887,30 +2105,35 @@ impl DaemonState {
                 .is_some_and(|task| !task.is_finished())
         {
             if persist {
-                self.persist_unix_dial(&peer_addr.id.to_string(), protocol, options)?;
+                self.persist_unix_dial(&peer_addr.id.to_string(), protocol, options)
+                    .await?;
                 existing.dial_state.update(options);
             }
             return Ok(existing.path.clone());
         }
 
-        let socket_path = self.home.dial_socket_path(peer_addr.id, protocol);
+        let socket_path = if one_shot {
+            self.home
+                .root()
+                .join("dials")
+                .join(format!("once-{:016x}.sock", rand::random::<u64>()))
+        } else {
+            self.home.dial_socket_path(peer_addr.id, protocol)
+        };
         validate_dial_socket_path(&self.home, &socket_path)?;
-        if let Some(existing) = sockets.remove(&key) {
-            // Shell and exec deliberately replace their deterministic socket
-            // path for each command. Stop and join the previous accept loop
-            // before binding its replacement so its unlinked listener FD
-            // cannot accumulate for the daemon's lifetime. Accepted sessions
-            // have their own daemon-scoped lifetime and continue below.
+        if !one_shot && let Some(existing) = sockets.remove(&key) {
             existing.stop().await;
         }
-        if socket_path.exists() {
+        if !one_shot && socket_path.exists() {
             fs::remove_file(&socket_path)
                 .with_context(|| format!("failed to remove stale {}", socket_path.display()))?;
         }
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("failed to bind {}", socket_path.display()))?;
         if persist
-            && let Err(error) = self.persist_unix_dial(&peer_addr.id.to_string(), protocol, options)
+            && let Err(error) = self
+                .persist_unix_dial(&peer_addr.id.to_string(), protocol, options)
+                .await
         {
             drop(listener);
             let _ = fs::remove_file(&socket_path);
@@ -1918,6 +2141,10 @@ impl DaemonState {
         }
         let listener_cancel = CancellationToken::new();
         let lease = DialListenerLease::new(self.active_dial_listeners.clone());
+        let one_shot_socket = one_shot.then(|| OneShotDialSocket {
+            path: socket_path.clone(),
+            deadline: tokio::time::Instant::now() + ONE_SHOT_DIAL_WAIT,
+        });
 
         let dial_state = Arc::new(crate::dial_state::DialListenerState::new(options));
         // A service's one-shot protocol is one raw stream per local connection.
@@ -1942,6 +2169,7 @@ impl DaemonState {
                     lease,
                     self.client_attaches.clone(),
                     self.connection_recorder(),
+                    one_shot_socket,
                 ))
             }
             Some((service, _)) => tokio::spawn(run_raw_dial_socket(
@@ -1957,6 +2185,7 @@ impl DaemonState {
                 self.dial_slots.clone(),
                 self.peer_connections.clone(),
                 lease,
+                one_shot_socket,
             )),
             None => tokio::spawn(run_dial_socket(
                 listener,
@@ -1976,6 +2205,14 @@ impl DaemonState {
                 dial_state.clone(),
             )),
         };
+        if one_shot {
+            // Reap completed handles on the next call; shutdown joins every
+            // outstanding accept loop after signalling daemon cancellation.
+            let mut tasks = self.one_shot_dials.lock().await;
+            tasks.retain(|task| !task.is_finished());
+            tasks.push(listener_task);
+            return Ok(socket_path);
+        }
         sockets.insert(
             key,
             DialSocket {
@@ -2029,6 +2266,7 @@ impl DaemonState {
             // peer grant exists. They are not machine-wide policy gates.
             allow_shell: peer_book.grants_service("shell"),
             allow_exec: peer_book.grants_service("exec"),
+            audit: Some(self.audit.status()),
         })
     }
 
@@ -2086,6 +2324,7 @@ impl DaemonState {
             dial_sockets,
             allow_shell: peer_book.grants_service("shell"),
             allow_exec: peer_book.grants_service("exec"),
+            audit: Some(self.audit.status()),
             peers,
             connection_telemetry: telemetry.peers,
             connection_telemetry_window: telemetry.window,
@@ -2115,52 +2354,68 @@ impl DaemonState {
     }
 
     async fn schedule_restart(&self, _requested_allow_shell: Option<bool>) -> Result<RestartPlan> {
-        // Check before opening the log or spawning either helper. A native
-        // service must remain the process owner for the whole restart.
-        crate::service::ensure_unsupervised_restart(&self.home)?;
+        let home = self.home.clone();
+        let runtime_peers = self.runtime_peers.is_some();
         let allow_shell = self.peer_book.read().await.grants_service("shell");
-        self.home.prepare()?;
-        let log_path = self.home.restart_log_path();
-        let mut log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .with_context(|| format!("failed to open {}", log_path.display()))?;
-        writeln!(
-            log,
-            "fabric restart requested: version={} allow_shell={allow_shell}",
-            crate::version_string()
-        )?;
-        let err = log.try_clone()?;
-        let exe = std::env::current_exe()?;
-        let mut command = ProcessCommand::new(exe);
-        command
-            .arg("--home")
-            .arg(self.home.root())
-            .arg("restart-detacher");
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(err));
+        let write = self.config_write.clone();
+        let cancel = self.cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = write.lock().unwrap_or_else(|poison| poison.into_inner());
+            if cancel.is_cancelled() {
+                return Err(
+                    FabricError::new(ErrorCode::DaemonNotRunning, "daemon is stopping").into(),
+                );
+            }
+            // Check before opening the log or spawning either helper. A native
+            // service must remain the process owner for the whole restart.
+            crate::service::ensure_unsupervised_restart(&home)?;
+            home.prepare()?;
+            let log_path = home.restart_log_path();
+            let mut log = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .with_context(|| format!("failed to open {}", log_path.display()))?;
+            writeln!(
+                log,
+                "fabric restart requested: version={} allow_shell={allow_shell}",
+                crate::version_string()
+            )?;
+            let err = log.try_clone()?;
+            let exe = std::env::current_exe()?;
+            let mut command = ProcessCommand::new(exe);
+            command
+                .arg("--home")
+                .arg(home.root())
+                .arg("restart-detacher");
+            if runtime_peers {
+                command.arg("--runtime-peers");
+            }
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(log))
+                .stderr(Stdio::from(err));
 
-        #[cfg(unix)]
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+            #[cfg(unix)]
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
 
-        command
-            .spawn()
-            .with_context(|| "failed to spawn restart detacher")?;
+            command
+                .spawn()
+                .with_context(|| "failed to spawn restart detacher")?;
 
-        Ok(RestartPlan {
-            log: log_path,
-            allow_shell,
+            Ok(RestartPlan {
+                log: log_path,
+                allow_shell,
+            })
         })
+        .await?
     }
 
     /// The peers this machine may dial, probe and announce to. An inbound-only
@@ -2852,9 +3107,14 @@ impl DaemonState {
         let started = Instant::now();
         let rss_before_bytes = current_rss_bytes();
         let exposures = self.exposures.read().await;
-        let new_endpoint =
-            build_daemon_endpoint(&self.home, self.allowed.clone(), &self.services, &exposures)
-                .await?;
+        let new_endpoint = build_daemon_endpoint(
+            &self.home,
+            self.peer_book.clone(),
+            &self.services,
+            &exposures,
+            self.audit.clone(),
+        )
+        .await?;
         drop(exposures);
 
         if new_endpoint.id() != old.endpoint.id() {
@@ -2972,8 +3232,17 @@ impl FabricNode {
         options: DaemonOptions,
         services: Services,
     ) -> Result<Self> {
+        Self::start_with_audit(home, options, services, None).await
+    }
+
+    async fn start_with_audit(
+        home: FabricHome,
+        options: DaemonOptions,
+        services: Services,
+        audit: Option<crate::audit::Audit>,
+    ) -> Result<Self> {
         let cancel = CancellationToken::new();
-        let state = DaemonState::new(home, cancel, options, services).await?;
+        let state = DaemonState::new_with_audit(home, cancel, options, services, audit).await?;
 
         spawn_outgoing_mux_accepts(&state).await?;
         for dial in FabricConfig::load(&state.home)?.dials() {
@@ -3129,14 +3398,29 @@ pub async fn run_daemon(home: FabricHome, allow_shell: bool) -> Result<()> {
 
 pub async fn run_daemon_with_options(home: FabricHome, options: DaemonOptions) -> Result<()> {
     let _lease = DaemonLease::acquire(&home)?;
-    init_daemon_tracing(&home)?;
+    let logging_home = home.clone();
+    let _stderr = tokio::task::spawn_blocking(move || {
+        init_daemon_tracing(&logging_home)?;
+        Ok::<_, anyhow::Error>(fabric_config::log::init_daemon_stderr()?)
+    })
+    .await??;
     // For the life of the daemon: if its runtime ever stops running, say why and
     // end the process so the service manager starts a fresh one.
     let _stall = crate::stall::Watchdog::start(crate::stall::StallConfig::from_env());
-    FabricNode::start_with_daemon_options(home, options)
-        .await?
-        .wait()
-        .await
+    let result = match FabricNode::start_with_daemon_options(home, options).await {
+        Ok(node) => node.wait().await,
+        Err(error) => Err(error),
+    };
+    let validation = async {
+        if let Some(writer) = VALIDATION_WRITER.get() {
+            let _ = writer.drain(Duration::from_millis(500)).await;
+        }
+    };
+    let _ = tokio::join!(
+        validation,
+        fabric_config::log::drain_daemon_stderr(Duration::from_millis(500))
+    );
+    result
 }
 
 struct DaemonLease {
@@ -3251,20 +3535,24 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
     }
     let sync_ipc_listener = IpcListener::bind(&sync_ipc_path)?;
 
-    tokio::select! {
-        result = run_control_socket(control_listener, state.clone()) => result?,
-        result = run_sync_ipc_socket(sync_ipc_listener, state.clone()) => result?,
-        result = run_iroh_accept_loop(state.clone()) => result?,
-        result = run_network_rehome_loop(state.clone()) => result?,
-        result = run_endpoint_presence_loop(state.clone()) => result?,
-        result = run_endpoint_health_poll_loop(state.clone()) => result?,
-        result = run_endpoint_rss_observe_loop(state.clone()) => result?,
-        result = run_peer_health_loop(state.clone()) => result?,
-        result = run_endpoint_snapshot_loop(state.clone()) => result?,
-        _ = state.cancel.cancelled() => {}
-    }
+    let result = tokio::select! {
+        result = run_control_socket(control_listener, state.clone()) => result,
+        result = run_sync_ipc_socket(sync_ipc_listener, state.clone()) => result,
+        result = run_iroh_accept_loop(state.clone()) => result,
+        result = run_network_rehome_loop(state.clone()) => result,
+        result = run_endpoint_presence_loop(state.clone()) => result,
+        result = run_endpoint_health_poll_loop(state.clone()) => result,
+        result = run_endpoint_rss_observe_loop(state.clone()) => result,
+        result = run_peer_health_loop(state.clone()) => result,
+        result = run_endpoint_snapshot_loop(state.clone()) => result,
+        _ = state.cancel.cancelled() => Ok(())
+    };
 
     state.cancel.cancel();
+    let drain_result = state.drain_policy_commits().await;
+    if let Err(error) = &drain_result {
+        warn!(error = %error, "policy/config drain failed during shutdown; continuing endpoint and child cleanup");
+    }
     close_endpoint_bounded(&state.current_endpoint(), "daemon shutdown").await;
     stop_exec_children(&state).await;
     let _ = fs::remove_file(control_path);
@@ -3279,7 +3567,23 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
     for socket in dial_sockets {
         socket.stop().await;
     }
-    Ok(())
+    let tasks = std::mem::take(&mut *state.one_shot_dials.lock().await);
+    for mut task in tasks {
+        if tokio::time::timeout(DIAL_LISTENER_STOP_TIMEOUT, &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+    // Preserve the latest counters when possible, without making a stalled
+    // filesystem hold the lease or the async runtime indefinitely.
+    let _ = tokio::join!(
+        state.telemetry.flush(Duration::from_secs(1)),
+        state.audit.drain(Duration::from_secs(1)),
+    );
+    result.and(drain_result)
 }
 
 /// How long a stopping daemon waits for the exec children it killed to be gone.
@@ -4097,10 +4401,22 @@ async fn run_control_socket(listener: UnixListener, state: Arc<DaemonState>) -> 
 }
 
 async fn handle_control_stream(stream: UnixStream, state: Arc<DaemonState>) {
-    let mut reader = BufReader::new(stream);
+    let limit = if state.runtime_peers.is_some() {
+        (crate::runtime_peers::MAX_REQUEST_BYTES + 1) as u64
+    } else {
+        u64::MAX
+    };
+    let mut reader = BufReader::new(stream).take(limit);
     let mut line = String::new();
     let response = match async {
         reader.read_line(&mut line).await?;
+        if state.runtime_peers.is_some() && line.len() > crate::runtime_peers::MAX_REQUEST_BYTES {
+            return Err(FabricError::new(
+                ErrorCode::InvalidArgument,
+                "control request exceeds 1 MiB",
+            )
+            .into());
+        }
         let request: ControlRequest = serde_json::from_str(&line)?;
         process_control_request(request, state).await
     }
@@ -4110,7 +4426,7 @@ async fn handle_control_stream(stream: UnixStream, state: Arc<DaemonState>) {
         Err(error) => ControlResponse::error(&error),
     };
 
-    let mut stream = reader.into_inner();
+    let mut stream = reader.into_inner().into_inner();
     if let Ok(mut raw) = serde_json::to_vec(&response) {
         raw.push(b'\n');
         let _ = stream.write_all(&raw).await;
@@ -4123,6 +4439,9 @@ async fn process_control_request(
     state: Arc<DaemonState>,
 ) -> Result<ControlResponse> {
     let response = match request {
+        ControlRequest::RuntimePeers { request } => ControlResponse::RuntimePeers {
+            reply: state.runtime_peer_request(request).await,
+        },
         ControlRequest::Status => state.status_response().await?,
         ControlRequest::ReachabilityStatus => state.reachability_status_response().await?,
         ControlRequest::PeerEvents {
@@ -4568,7 +4887,11 @@ fn grant_for_alpn(services: &Services, alpn: &[u8]) -> Grant {
 /// connection carries exactly one admission, so this ends that and nothing
 /// else. The reason is the sentence a fresh connection would be refused with,
 /// so a client reads it as a refusal rather than a network fault.
-fn close_when_revoked(connection: &Connection, admission: &Admission) {
+fn close_when_revoked(
+    connection: &Connection,
+    admission: &Admission,
+    policy: Arc<RwLock<PeerBook>>,
+) {
     let reason = match admission.grant() {
         Grant::Trust => ErrorCode::PeerNotInAllowList
             .reason("node is not in fabric allow-list (access revoked)"),
@@ -4577,6 +4900,8 @@ fn close_when_revoked(connection: &Connection, admission: &Admission) {
         )),
     };
     let revoked = admission.revoked();
+    let requirements = admission.requirements();
+    let peer = admission.peer();
     let weak = connection.weak_handle();
     let closed = weak.closed();
     tokio::spawn(async move {
@@ -4584,6 +4909,14 @@ fn close_when_revoked(connection: &Connection, admission: &Admission) {
             _ = closed => {}
             _ = revoked.cancelled() => {
                 if let Some(connection) = weak.upgrade() {
+                    let policy = policy.read().await;
+                    let reason = if let Some(service) = requirements.first_withdrawn(&policy, &peer) {
+                        if policy.accepts_inbound(&peer) {
+                            ErrorCode::PeerNotPermittedForService.reason(&format!("permission {service:?} for this active operation was revoked"))
+                        } else {
+                            ErrorCode::PeerNotInAllowList.reason("node is not in fabric allow-list (access revoked)")
+                        }
+                    } else { reason };
                     connection.close(VarInt::from_u32(403), reason.as_bytes());
                 }
             }
@@ -4598,13 +4931,15 @@ async fn until_revoked(
     work: impl std::future::Future<Output = Result<()>>,
 ) -> Result<()> {
     let revoked = admission.revoked();
-    tokio::select! {
-        result = work => result,
-        _ = revoked.cancelled() => {
-            debug!(peer = %admission.peer(), "ended one-shot work whose access a reload took away");
-            Ok(())
+    admission.children().scope(async {
+        tokio::select! {
+            result = work => result,
+            _ = revoked.cancelled() => {
+                debug!(peer = %admission.peer(), "ended one-shot work whose access a reload took away");
+                Ok(())
+            }
         }
-    }
+    }).await
 }
 
 /// Refuse a connection from a peer that is trusted but not permitted here.
@@ -4662,12 +4997,20 @@ async fn process_incoming_iroh(
         connection.remote_id(),
         grant_for_alpn(&state.services, &alpn),
     );
-    close_when_revoked(&connection, &admission);
+    close_when_revoked(&connection, &admission, state.peer_book.clone());
 
     let service = state
         .services
         .find(&alpn)
         .map(|(service, protocol)| (service.clone(), protocol));
+
+    let audit = state
+        .audit_context(
+            connection.remote_id(),
+            &alpn,
+            matches!(&exposure, Some(Exposure::Exec { .. })),
+        )
+        .await;
 
     // ONE GATE for ordinary services: echo, sync, every service that leaves
     // the decision to its grant, and every generic exposure. A service that
@@ -4675,11 +5018,13 @@ async fn process_incoming_iroh(
     // handshake already proved that the peer is trusted.
     //
     // Trusted and permitted are two different questions. `AllowListHook`
-    // answered the first at handshake; this answers the second, and it needs
-    // the ALPN, which the hook cannot see.
+    // answered the first at handshake; this gate applies the service grant.
     if !matches!(&service, Some((service, _)) if service.access() == Access::Grants) {
         let name = service_name_for_alpn(&state.services, &alpn);
         if let Err(denied) = state.may(&connection.remote_id(), &name).await {
+            if let Some(audit) = &audit {
+                audit.refused(denied.code());
+            }
             deny_connection(&connection, &name, &denied).await;
             return Ok(());
         }
@@ -4692,7 +5037,7 @@ async fn process_incoming_iroh(
     }
     if let Some((service, protocol)) = service {
         log_connection_paths(protocol.accept_event, &connection);
-        handle_service_connection(connection, service, protocol, state, admission).await?;
+        handle_service_connection(connection, service, protocol, state, admission, audit).await?;
         return Ok(());
     }
     if alpn == SYNC_ALPN {
@@ -4706,20 +5051,26 @@ async fn process_incoming_iroh(
     };
     log_connection_paths("tunnel_accept", &connection);
     if state.tunnel_blocked.load(Ordering::SeqCst) {
+        if let Some(audit) = &audit {
+            audit.refused_uncoded();
+        }
         connection.close(0u32.into(), b"fabric tunnel blocked");
         return Ok(());
     }
     let identity = state.peer_identity(admission.peer()).await;
     let (send, recv) = connection.accept_bi().await?;
-    tunnel::serve_connection(
-        connection,
-        send,
-        recv,
-        admission,
-        exposure.to_server_target(&identity),
-        None,
-        state.tunnel_sessions.clone(),
-        state.tunnel_drop_rx(),
+    crate::audit::scope(
+        audit,
+        tunnel::serve_connection(
+            connection,
+            send,
+            recv,
+            admission,
+            exposure.to_server_target(&identity),
+            None,
+            state.tunnel_sessions.clone(),
+            state.tunnel_drop_rx(),
+        ),
     )
     .await?;
     Ok(())
@@ -4732,24 +5083,30 @@ async fn handle_service_connection(
     protocol: &'static services::Protocol,
     state: Arc<DaemonState>,
     admission: Admission,
+    audit: Option<crate::audit::Call>,
 ) -> Result<()> {
     let peer = connection.remote_id();
     let (send, recv) = connection.accept_bi().await?;
     if protocol.resumable {
-        return tunnel::serve_connection(
-            connection,
-            send,
-            recv,
-            admission,
-            tunnel::ServerTarget::Service(tunnel::ServiceTarget(service)),
-            None,
-            state.tunnel_sessions.clone(),
-            state.tunnel_drop_rx(),
+        return crate::audit::scope(
+            audit,
+            tunnel::serve_connection(
+                connection,
+                send,
+                recv,
+                admission,
+                tunnel::ServerTarget::Service(tunnel::ServiceTarget(service)),
+                None,
+                state.tunnel_sessions.clone(),
+                state.tunnel_drop_rx(),
+            ),
         )
         .await;
     }
-    let stream = state.service_stream(&service, peer, send, recv).await;
-    until_revoked(&admission, service.serve(stream)).await?;
+    let stream = state
+        .service_stream(&service, peer, send, recv, &admission)
+        .await;
+    crate::audit::scope(audit, until_revoked(&admission, service.serve(stream))).await?;
     connection.closed().await;
     Ok(())
 }
@@ -4844,13 +5201,36 @@ async fn refuse_streams_while_dial_only(connection: &Connection, state: &Arc<Dae
         else {
             continue;
         };
+        let exposure = state
+            .exposures
+            .read()
+            .await
+            .get(header.protocol.as_bytes())
+            .cloned();
+        let audit = state
+            .audit_context(
+                peer,
+                header.protocol.as_bytes(),
+                matches!(exposure, Some(Exposure::Exec { .. })),
+            )
+            .await;
         let reason = match state.may(&peer, &header.protocol).await {
-            Err(denied) => denied.reason(),
+            Err(denied) => {
+                if let Some(audit) = &audit {
+                    audit.refused(denied.code());
+                }
+                denied.reason()
+            }
             // Cleared between the check above and here; refuse this one anyway.
-            Ok(()) => ErrorCode::PeerNotPermittedForService.reason(&format!(
-                "peer not permitted for service {:?}",
-                header.protocol
-            )),
+            Ok(()) => {
+                if let Some(audit) = &audit {
+                    audit.refused(ErrorCode::PeerNotPermittedForService);
+                }
+                ErrorCode::PeerNotPermittedForService.reason(&format!(
+                    "peer not permitted for service {:?}",
+                    header.protocol
+                ))
+            }
         };
         let _ = tokio::time::timeout(
             Duration::from_secs(1),
@@ -4898,6 +5278,13 @@ async fn handle_mux_stream(
         .services
         .find(alpn)
         .map(|(service, protocol)| (service.clone(), protocol));
+    let audit = state
+        .audit_context(
+            connection.remote_id(),
+            alpn,
+            matches!(&exposure, Some(Exposure::Exec { .. })),
+        )
+        .await;
     // Recorded before the grant is checked; see `Admissions::admit`. One
     // stream is one admission: revoking it ends this stream, not the shared
     // connection the peer's other streams ride on.
@@ -4908,11 +5295,17 @@ async fn handle_mux_stream(
     if !matches!(&service, Some((service, _)) if service.access() == Access::Grants) {
         let name = service_name_for_alpn(&state.services, alpn);
         if let Err(denied) = state.may(&connection.remote_id(), &name).await {
+            if let Some(audit) = &audit {
+                audit.refused(denied.code());
+            }
             mux::write_denied(&mut send, &denied.reason()).await?;
             return Ok(());
         }
     }
     if state.tunnel_blocked.load(Ordering::SeqCst) && exposure.is_some() {
+        if let Some(audit) = &audit {
+            audit.refused_uncoded();
+        }
         mux::write_denied(&mut send, mux::TEMPORARY_TUNNEL_BLOCK).await?;
         return Ok(());
     }
@@ -4930,35 +5323,43 @@ async fn handle_mux_stream(
     } else if let Some((service, protocol)) = service {
         let peer = connection.remote_id();
         if protocol.resumable {
-            tunnel::serve_connection(
-                connection,
-                send,
-                recv,
-                admission,
-                tunnel::ServerTarget::Service(tunnel::ServiceTarget(service)),
-                Some(state.peer_connections.clone()),
-                state.tunnel_sessions.clone(),
-                state.tunnel_drop_rx(),
+            crate::audit::scope(
+                audit,
+                tunnel::serve_connection(
+                    connection,
+                    send,
+                    recv,
+                    admission,
+                    tunnel::ServerTarget::Service(tunnel::ServiceTarget(service)),
+                    Some(state.peer_connections.clone()),
+                    state.tunnel_sessions.clone(),
+                    state.tunnel_drop_rx(),
+                ),
             )
             .await?;
         } else {
-            let stream = state.service_stream(&service, peer, send, recv).await;
-            until_revoked(&admission, service.serve(stream)).await?;
+            let stream = state
+                .service_stream(&service, peer, send, recv, &admission)
+                .await;
+            crate::audit::scope(audit, until_revoked(&admission, service.serve(stream))).await?;
         }
     } else if alpn == SYNC_ALPN {
         let peer = connection.remote_id();
         until_revoked(&admission, handle_sync_stream(peer, send, recv, state)).await?;
     } else if let Some(exposure) = exposure {
         let identity = state.peer_identity(admission.peer()).await;
-        tunnel::serve_connection(
-            connection,
-            send,
-            recv,
-            admission,
-            exposure.to_server_target(&identity),
-            Some(state.peer_connections.clone()),
-            state.tunnel_sessions.clone(),
-            state.tunnel_drop_rx(),
+        crate::audit::scope(
+            audit,
+            tunnel::serve_connection(
+                connection,
+                send,
+                recv,
+                admission,
+                exposure.to_server_target(&identity),
+                Some(state.peer_connections.clone()),
+                state.tunnel_sessions.clone(),
+                state.tunnel_drop_rx(),
+            ),
         )
         .await?;
     }
@@ -5465,14 +5866,14 @@ async fn run_dial_socket(
     dial_state: Arc<crate::dial_state::DialListenerState>,
 ) {
     let backoff_key = BackoffKey::dial(&peer, &alpn);
-    let queue = match peer
-        .parse::<EndpointId>()
-        .map_err(anyhow::Error::from)
-        .or_else(|_| {
-            PeerBook::load(&home)
-                .and_then(|book| book.resolve(&peer))
-                .map(|addr| addr.id)
-        }) {
+    let queue_peer = match peer.parse::<EndpointId>() {
+        Ok(id) => Ok(id),
+        Err(_) => peer_connections
+            .resolve_peer(&home, &peer)
+            .await
+            .map(|addr| addr.id),
+    };
+    let queue = match queue_peer {
         Ok(id) => peer_connections.dial_queue(id),
         Err(error) => {
             warn!(%peer, %error, "dial listener could not resolve its peer");
@@ -5556,6 +5957,75 @@ async fn run_dial_socket(
     }
 }
 
+/// A service rendezvous reserves its bounded queue entry before a task is
+/// spawned. Shared service listeners retain their immediate-admission behavior.
+enum ServiceDialReservation {
+    Immediate(OwnedSemaphorePermit),
+    Queued(crate::dial_queue::DialReservation),
+}
+
+enum ServiceDialPermit {
+    Immediate {
+        _permit: OwnedSemaphorePermit,
+    },
+    Queued {
+        _permit: crate::dial_queue::DialPermit,
+    },
+}
+
+impl ServiceDialReservation {
+    fn reserve(
+        slots: &Arc<Semaphore>,
+        queue: Option<&Arc<crate::dial_queue::DialQueue>>,
+    ) -> Result<Self> {
+        if let Some(queue) = queue {
+            return queue
+                .reserve(Duration::from_millis(
+                    crate::config::DEFAULT_DIAL_QUEUE_TIMEOUT_MS,
+                ))
+                .map(Self::Queued);
+        }
+        slots
+            .clone()
+            .try_acquire_owned()
+            .map(Self::Immediate)
+            .map_err(|_| crate::dial_queue::limit_error("dial daemon capacity is full"))
+    }
+
+    async fn acquire(
+        self,
+        slots: Arc<Semaphore>,
+        cancel: &CancellationToken,
+    ) -> Result<Option<ServiceDialPermit>> {
+        match self {
+            Self::Immediate(permit) => Ok(Some(ServiceDialPermit::Immediate { _permit: permit })),
+            Self::Queued(reservation) => Ok(reservation
+                .acquire(slots, cancel)
+                .await?
+                .map(|permit| ServiceDialPermit::Queued { _permit: permit })),
+        }
+    }
+}
+
+async fn refuse_queued_service_dial(
+    local: &mut UnixStream,
+    service: &dyn Service,
+    failures: &FailureBackoff,
+    key: &BackoffKey,
+    error: &anyhow::Error,
+) {
+    let message = crate::dial_queue::diagnostic(error);
+    failures
+        .record_failure_for_diagnostics(key, "dial queue refused connection", &message)
+        .await;
+    // The CLI still expects service frames, never a generic text preface.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(1),
+        write_service_notice(local, service, Notice::Unavailable { error: &message }),
+    )
+    .await;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_resumable_dial_socket(
     listener: UnixListener,
@@ -5574,21 +6044,33 @@ async fn run_resumable_dial_socket(
     _lease: DialListenerLease,
     gauge: Arc<tunnel::ClientAttachGauge>,
     recorder: ConnectionRecorder,
+    one_shot: Option<OneShotDialSocket>,
 ) {
     let backoff_key = BackoffKey::dial(&peer, protocol.alpn);
+    let queue = one_shot
+        .as_ref()
+        .map(|_| peer_connections.dial_queue(peer_addr.id));
     loop {
         tokio::select! {
             biased;
             _ = listener_cancel.cancelled() => break,
             _ = daemon_cancel.cancelled() => break,
+            _ = one_shot_dial_expired(&one_shot) => break,
             accepted = listener.accept() => {
-                let Ok((local, _)) = accepted else {
+                let Ok((mut local, _)) = accepted else {
                     break;
                 };
-                let Ok(permit) = dial_slots.clone().try_acquire_owned() else {
-                    drop(local);
-                    continue;
+                let reservation = match ServiceDialReservation::reserve(&dial_slots, queue.as_ref()) {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        if one_shot.is_some() {
+                            refuse_queued_service_dial(&mut local, service.as_ref(), &dial_failures, &backoff_key, &error).await;
+                            break;
+                        }
+                        continue;
+                    }
                 };
+                let dial_slots = dial_slots.clone();
                 let endpoint_rx = endpoint_rx.clone();
                 let home = home.clone();
                 let peer = peer.clone();
@@ -5602,7 +6084,14 @@ async fn run_resumable_dial_socket(
                 let gauge = gauge.clone();
                 let recorder = recorder.clone();
                 tokio::spawn(async move {
-                    let _permit = permit;
+                    let _permit = match reservation.acquire(dial_slots, &cancel).await {
+                        Ok(Some(permit)) => permit,
+                        Ok(None) => return,
+                        Err(error) => {
+                            refuse_queued_service_dial(&mut local, service.as_ref(), &dial_failures, &backoff_key, &error).await;
+                            return;
+                        }
+                    };
                     let failure = format!("{} dial socket connection failed", service.name());
                     match handle_resumable_dial_socket_connection(
                         local,
@@ -5629,6 +6118,7 @@ async fn run_resumable_dial_socket(
                         }
                     }
                 });
+                if one_shot.is_some() { break; }
             }
         }
     }
@@ -5657,9 +6147,9 @@ async fn handle_resumable_dial_socket_connection(
     let mut attempt = 0usize;
     let mut waiting_since: Option<Instant> = None;
     loop {
-        let current_peer_addr = PeerBook::load(&home)
-            .and_then(|book| book.resolve(&peer))
-            .unwrap_or_else(|_| peer_addr.clone());
+        let current_peer_addr = peer_connections
+            .resolve_peer_or_legacy_hint(&home, &peer, peer_addr.clone())
+            .await?;
         let endpoint = {
             let current = endpoint_rx.borrow();
             current.clone()
@@ -5737,6 +6227,7 @@ async fn handle_resumable_dial_socket_connection(
                     return run_fallback_after_selection(
                         local,
                         endpoint_rx,
+                        peer_connections,
                         home,
                         peer,
                         current_peer_addr,
@@ -5791,6 +6282,7 @@ async fn handle_resumable_dial_socket_connection(
 async fn run_fallback_after_selection(
     mut local: UnixStream,
     mut endpoint_rx: watch::Receiver<CurrentEndpoint>,
+    peer_connections: Arc<mux::PeerConnections>,
     home: FabricHome,
     peer: String,
     peer_addr: EndpointAddr,
@@ -5801,9 +6293,9 @@ async fn run_fallback_after_selection(
 ) -> Result<()> {
     let mut attempt = 0usize;
     loop {
-        let current_peer_addr = PeerBook::load(&home)
-            .and_then(|book| book.resolve(&peer))
-            .unwrap_or_else(|_| peer_addr.clone());
+        let current_peer_addr = peer_connections
+            .resolve_peer_or_legacy_hint(&home, &peer, peer_addr.clone())
+            .await?;
         let endpoint = endpoint_rx.borrow().endpoint.clone();
         let connected = tokio::select! {
             biased;
@@ -6122,14 +6614,14 @@ async fn run_dial_tcp_listener(
     dial_state: Arc<crate::dial_state::DialListenerState>,
 ) {
     let backoff_key = BackoffKey::dial(&peer, &alpn);
-    let queue = match peer
-        .parse::<EndpointId>()
-        .map_err(anyhow::Error::from)
-        .or_else(|_| {
-            PeerBook::load(&home)
-                .and_then(|book| book.resolve(&peer))
-                .map(|addr| addr.id)
-        }) {
+    let queue_peer = match peer.parse::<EndpointId>() {
+        Ok(id) => Ok(id),
+        Err(_) => peer_connections
+            .resolve_peer(&home, &peer)
+            .await
+            .map(|addr| addr.id),
+    };
+    let queue = match queue_peer {
         Ok(id) => peer_connections.dial_queue(id),
         Err(error) => {
             warn!(%peer, %error, "dial listener could not resolve its peer");
@@ -6224,22 +6716,35 @@ async fn run_raw_dial_socket(
     dial_slots: Arc<Semaphore>,
     peer_connections: Arc<mux::PeerConnections>,
     _lease: DialListenerLease,
+    one_shot: Option<OneShotDialSocket>,
 ) {
     let backoff_key = BackoffKey::dial(&peer_addr.id.to_string(), &alpn);
+    let queue = one_shot
+        .as_ref()
+        .map(|_| peer_connections.dial_queue(peer_addr.id));
     loop {
         tokio::select! {
             biased;
             _ = listener_cancel.cancelled() => break,
             _ = daemon_cancel.cancelled() => break,
+            _ = one_shot_dial_expired(&one_shot) => break,
             accepted = listener.accept() => {
-                let Ok((local, _)) = accepted else {
+                let Ok((mut local, _)) = accepted else {
                     break;
                 };
-                let Ok(permit) = dial_slots.clone().try_acquire_owned() else {
-                    drop(local);
-                    continue;
+                let reservation = match ServiceDialReservation::reserve(&dial_slots, queue.as_ref()) {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        if one_shot.is_some() {
+                            refuse_queued_service_dial(&mut local, service.as_ref(), &dial_failures, &backoff_key, &error).await;
+                            break;
+                        }
+                        continue;
+                    }
                 };
-                let endpoint = endpoint_rx.borrow().clone();
+                let dial_slots = dial_slots.clone();
+                let endpoint_rx = endpoint_rx.clone();
+                let cancel = daemon_cancel.clone();
                 let peer = peer.clone();
                 let peer_addr = peer_addr.clone();
                 let alpn = alpn.clone();
@@ -6248,7 +6753,15 @@ async fn run_raw_dial_socket(
                 let backoff_key = backoff_key.clone();
                 let peer_connections = peer_connections.clone();
                 tokio::spawn(async move {
-                    let _permit = permit;
+                    let _permit = match reservation.acquire(dial_slots, &cancel).await {
+                        Ok(Some(permit)) => permit,
+                        Ok(None) => return,
+                        Err(error) => {
+                            refuse_queued_service_dial(&mut local, service.as_ref(), &dial_failures, &backoff_key, &error).await;
+                            return;
+                        }
+                    };
+                    let endpoint = endpoint_rx.borrow().clone();
                     match handle_raw_dial_socket_connection(
                         local,
                         endpoint,
@@ -6269,6 +6782,7 @@ async fn run_raw_dial_socket(
                         }
                     }
                 });
+                if one_shot.is_some() { break; }
             }
         }
     }
@@ -7710,7 +8224,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_exec_and_shell_dials_keep_one_listener_per_path() -> Result<()> {
+    async fn replaced_dials_stop_old_listeners_and_reusable_dials_keep_their_task() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = FabricHome::new(temp.path());
         let peer_a = iroh::SecretKey::generate().public();
@@ -7723,10 +8237,10 @@ mod tests {
         let node = FabricNode::start(home.clone()).await?;
         let state = node.state();
         let cases = [
-            ("peer-a", exec::EXEC_PROTOCOL, exec::EXEC_ALPN),
-            ("peer-a", shell::SHELL_PROTOCOL, shell::RESUMABLE_SHELL_ALPN),
-            ("peer-b", exec::EXEC_PROTOCOL, exec::EXEC_ALPN),
-            ("peer-b", shell::SHELL_PROTOCOL, shell::RESUMABLE_SHELL_ALPN),
+            ("peer-a", "test/replaced/1", b"test/replaced/1".as_slice()),
+            ("peer-a", "test/replaced/2", b"test/replaced/2".as_slice()),
+            ("peer-b", "test/replaced/1", b"test/replaced/1".as_slice()),
+            ("peer-b", "test/replaced/2", b"test/replaced/2".as_slice()),
         ];
 
         // More replacements than the production macOS soft FD limit. The old
@@ -7820,7 +8334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacing_exec_listener_preserves_accepted_session() -> Result<()> {
+    async fn one_shot_exec_listener_cleanup_preserves_accepted_session() -> Result<()> {
         let server_dir = tempfile::tempdir()?;
         let client_dir = tempfile::tempdir()?;
         let server_home = FabricHome::new(server_dir.path());
@@ -7839,14 +8353,7 @@ mod tests {
         trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
 
         let state = client.state();
-        let socket = state
-            .dial_alpn(
-                "server",
-                exec::EXEC_PROTOCOL,
-                exec::EXEC_ALPN.to_vec(),
-                false,
-            )
-            .await?;
+        let socket = state.dial_service("server", "exec").await?;
         let mut first = UnixStream::connect(&socket).await?;
         let release = server_dir.path().join("release-exec");
         let argv = vec![
@@ -7874,25 +8381,20 @@ mod tests {
         .await??;
         assert_eq!(ready, b"ready");
 
-        let replacement = state
-            .dial_alpn(
-                "server",
-                exec::EXEC_PROTOCOL,
-                exec::EXEC_ALPN.to_vec(),
-                false,
-            )
-            .await?;
-        assert_eq!(replacement, socket);
+        let replacement = state.dial_service("server", "exec").await?;
+        assert_ne!(replacement, socket);
+        assert!(
+            !socket.exists(),
+            "first accept left its rendezvous path behind"
+        );
+        assert!(UnixStream::connect(&socket).await.is_err());
         assert_eq!(state.active_dial_listeners.load(Ordering::SeqCst), 1);
 
         fs::write(&release, b"go")?;
         let (stdout, exit) =
             tokio::time::timeout(Duration::from_secs(10), collect_exec(&mut first)).await??;
         assert_eq!(stdout, b"done");
-        assert_eq!(
-            exit, 0,
-            "accepted exec did not survive listener replacement"
-        );
+        assert_eq!(exit, 0, "accepted exec did not survive listener cleanup");
 
         let mut second = UnixStream::connect(&replacement).await?;
         exec::write_client_argv(
@@ -7912,6 +8414,774 @@ mod tests {
         server.shutdown().await?;
         client.shutdown().await?;
         assert_eq!(state.active_dial_listeners.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit_denial_precedes_invalid_argv_and_records_the_policy_code() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let server_home = FabricHome::new(temp.path().join("server"));
+        let client_home = FabricHome::new(temp.path().join("client"));
+        let server = FabricNode::start(server_home.clone()).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer_allowing(
+            &server_home,
+            &server,
+            client.id(),
+            "client",
+            client.addr(),
+            &["echo"],
+        )
+        .await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+        let path = client.state().dial_service("server", "exec").await?;
+        let mut stream = UnixStream::connect(path).await?;
+        // This is an invalid argv frame (far above the decoder's size bound).
+        // Decoding it before the policy gate would fail instead of refusing.
+        let _ = stream
+            .write_all(b"\x01\xff\xff\xff\xffdenied-input-sentinel-2194")
+            .await;
+        let (message, exit) = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut message = String::new();
+            loop {
+                match exec::read_server_frame(&mut stream).await? {
+                    Some(exec::ServerFrame::Error(error)) => message = error,
+                    Some(exec::ServerFrame::Exit(code)) => {
+                        break Ok::<_, anyhow::Error>((message, code));
+                    }
+                    Some(_) => {}
+                    None => bail!("denied exec closed without a refusal"),
+                }
+            }
+        })
+        .await??;
+        assert_eq!(exit, exec::EXIT_EXEC_DISABLED);
+        assert!(message.contains("fabric:peer_not_permitted_for_service"));
+        assert!(server.state().audit.drain(Duration::from_secs(3)).await);
+        let records =
+            crate::audit::read(server_home.root(), None, Some(&client.id().to_string()))?.records;
+        let calls: Vec<_> = records
+            .iter()
+            .filter_map(|record| record.call())
+            .filter(|record| record.service.as_deref() == Some("exec"))
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].argv.is_none());
+        assert_eq!(calls[0].name.as_deref(), Some("client"));
+        assert_eq!(calls[0].outcome, Some(crate::audit::Outcome::Refused));
+        assert_eq!(
+            calls[0].code.as_deref(),
+            Some("fabric:peer_not_permitted_for_service")
+        );
+        assert!(!serde_json::to_string(&records)?.contains("denied-input-sentinel-2194"));
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit_exposure_resume_counts_unique_payload_and_records_child_cap_refusal()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let server_home = FabricHome::new(temp.path().join("server"));
+        let client_home = FabricHome::new(temp.path().join("client"));
+        let server = FabricNode::start(server_home.clone()).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer_allowing(
+            &server_home,
+            &server,
+            client.id(),
+            "client",
+            client.addr(),
+            &["echo", "audit/stdio"],
+        )
+        .await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+        let script = temp.path().join("stdio.sh");
+        fs::write(
+            &script,
+            b"cat; printf audit-output-sentinel-7314 >&2; exit 7\n",
+        )?;
+        server
+            .expose_exec_ephemeral(
+                "audit/stdio",
+                vec!["/bin/sh".into(), script.to_string_lossy().into_owned()],
+                1,
+            )
+            .await?;
+        let path = client
+            .state()
+            .dial_with_options(
+                "server",
+                "audit/stdio",
+                DialOptions {
+                    queue_timeout_ms: 0,
+                    ..DialOptions::default()
+                },
+            )
+            .await?;
+        let mut first = UnixStream::connect(&path).await?;
+        let payload = b"audit-stdin-sentinel-3541";
+        first.write_all(payload).await?;
+        let mut response = vec![0; payload.len()];
+        tokio::time::timeout(Duration::from_secs(5), first.read_exact(&mut response)).await??;
+        assert_eq!(response, payload);
+
+        let mut excess = UnixStream::connect(&path).await?;
+        let _ = excess.write_all(b"refused-stdin-sentinel-9613").await;
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), excess.read_to_end(&mut response)).await??;
+        assert!(response.is_empty());
+        // Hold the cap refusal to a stable connection, then exercise resume
+        // of the admitted process with no new call during the debug drop.
+        client.state().drop_tunnel_connections();
+        first.write_all(b"after-resume").await?;
+        let mut resumed = [0; 12];
+        tokio::time::timeout(Duration::from_secs(10), first.read_exact(&mut resumed)).await??;
+        assert_eq!(&resumed, b"after-resume");
+
+        first.shutdown().await?;
+        tokio::time::timeout(Duration::from_secs(5), first.read_to_end(&mut response)).await??;
+        assert!(server.state().audit.drain(Duration::from_secs(5)).await);
+        let records =
+            crate::audit::read(server_home.root(), None, Some(&client.id().to_string()))?.records;
+        let selected: Vec<_> = records
+            .iter()
+            .filter(|record| {
+                record
+                    .call()
+                    .is_some_and(|call| call.service.as_deref() == Some("audit/stdio"))
+            })
+            .collect();
+        let starts: Vec<_> = selected
+            .iter()
+            .filter_map(|record| match record {
+                crate::audit::Record::ExecStart(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        let ends: Vec<_> = selected
+            .iter()
+            .filter_map(|record| match record {
+                crate::audit::Record::ExecEnd(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        let refused: Vec<_> = selected
+            .iter()
+            .filter_map(|record| match record {
+                crate::audit::Record::Refused(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 1, "resume started another process");
+        assert_eq!(ends.len(), 1);
+        assert_eq!(refused.len(), 1);
+        assert_eq!(starts[0].session_id, ends[0].session_id);
+        match ends[0].outcome {
+            Some(crate::audit::Outcome::Ok) => assert_eq!(ends[0].exit_status, Some(7)),
+            Some(crate::audit::Outcome::Cancelled) => {
+                // Transport EOF can reap the session before child.wait wins
+                // the race. kill() has reaped it, so retain that actual status.
+                assert!(matches!(ends[0].exit_status, Some(7) | Some(137)));
+            }
+            ref outcome => panic!("unexpected exposed command outcome: {outcome:?}"),
+        }
+        assert_eq!(
+            ends[0].bytes_in,
+            (payload.len() + b"after-resume".len()) as u64
+        );
+        assert_eq!(
+            ends[0].bytes_out,
+            (payload.len() + b"after-resume".len() + b"audit-output-sentinel-7314".len()) as u64
+        );
+        assert!(refused[0].argv.is_none());
+        assert_eq!(
+            refused[0].code.as_deref(),
+            Some("fabric:session_limit_reached")
+        );
+        let text = serde_json::to_string(&records)?;
+        for secret in [
+            "audit-stdin-sentinel-3541",
+            "audit-output-sentinel-7314",
+            "refused-stdin-sentinel-9613",
+        ] {
+            assert!(!text.contains(secret));
+        }
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit_shell_resume_keeps_one_start_and_end_without_keystrokes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let server_home = FabricHome::new(temp.path().join("server"));
+        let client_home = FabricHome::new(temp.path().join("client"));
+        let server = start_shell_server(server_home.clone()).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+        let state = client.state();
+        let path = state
+            .dial_alpn(
+                "server",
+                shell::SHELL_PROTOCOL,
+                shell::RESUMABLE_SHELL_ALPN.to_vec(),
+                false,
+            )
+            .await?;
+        let mut stream = UnixStream::connect(path).await?;
+        let first = b"AUDIT_MARK=private-6942; printf '%s-%s\n' before drop\n";
+        shell::write_client_stdin(&mut stream, first).await?;
+        read_shell_marker(&mut stream, b"before-drop").await?;
+        // Seeing the synced start before reconnect also proves that a live,
+        // unfinished shell has an audit trace; it does not await process exit.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let records =
+                crate::audit::read(server_home.root(), None, Some(&client.id().to_string()))?
+                    .records;
+            if records
+                .iter()
+                .any(|record| matches!(record, crate::audit::Record::ShellStart(_)))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "running shell never wrote its start"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        state.drop_tunnel_connections();
+        let second = b"printf '%s-%s\n' $AUDIT_MARK survived\n";
+        shell::write_client_stdin(&mut stream, second).await?;
+        read_shell_marker(&mut stream, b"private-6942-survived").await?;
+        shell::write_client_stdin(&mut stream, b"exit 9\n").await?;
+        let code = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match shell::read_server_frame(&mut stream).await? {
+                    Some(shell::ServerFrame::Exit(code)) => return Ok::<_, anyhow::Error>(code),
+                    Some(shell::ServerFrame::Error(error)) => bail!("{error}"),
+                    Some(_) => {}
+                    None => bail!("shell closed without exit"),
+                }
+            }
+        })
+        .await??;
+        assert_eq!(code, 9);
+        assert!(server.state().audit.drain(Duration::from_secs(3)).await);
+        let records =
+            crate::audit::read(server_home.root(), None, Some(&client.id().to_string()))?.records;
+        let starts: Vec<_> = records
+            .iter()
+            .filter_map(|record| match record {
+                crate::audit::Record::ShellStart(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        let ends: Vec<_> = records
+            .iter()
+            .filter_map(|record| match record {
+                crate::audit::Record::ShellEnd(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(ends.len(), 1);
+        assert_eq!(starts[0].session_id, ends[0].session_id);
+        assert_eq!(ends[0].exit_status, Some(9));
+        assert_eq!(
+            ends[0].bytes_in,
+            (first.len() + second.len() + b"exit 9\n".len()) as u64
+        );
+        assert!(ends[0].bytes_out > 0);
+        assert!(starts[0].argv.is_none() && ends[0].argv.is_none());
+        let text = serde_json::to_string(&records)?;
+        assert!(!text.contains("private-6942") && !text.contains("AUDIT_MARK"));
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit_stalled_writer_leaves_same_daemon_exec_and_echo_responsive() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let server_home = FabricHome::new(temp.path().join("server"));
+        let client_home = FabricHome::new(temp.path().join("client"));
+        let armed = Arc::new(AtomicBool::new(false));
+        let sink_armed = armed.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let audit = crate::audit::Audit::with_sink(1, 65536, move |_| {
+            if sink_armed.swap(false, Ordering::AcqRel) {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }
+            Ok(())
+        });
+        let server = FabricNode::start_with_audit(
+            server_home.clone(),
+            DaemonOptions::default(),
+            services::builtin(&server_home),
+            Some(audit.clone()),
+        )
+        .await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+        client.ping("server").await?;
+        assert!(audit.drain(Duration::from_secs(2)).await);
+        let release = std::thread::spawn(move || {
+            entered_rx.recv().unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+            release_tx.send(()).unwrap();
+        });
+        armed.store(true, Ordering::Release);
+        let began = Instant::now();
+        let path = client.state().dial_service("server", "exec").await?;
+        let mut stream = UnixStream::connect(path).await?;
+        exec::write_client_argv(
+            &mut stream,
+            &["/bin/sh".into(), "-c".into(), "printf ready".into()],
+        )
+        .await?;
+        let (output, code) =
+            tokio::time::timeout(Duration::from_secs(1), collect_exec(&mut stream)).await??;
+        assert_eq!(output, b"ready");
+        assert_eq!(code, 0);
+        // The writer still holds the first start. One queued end fills the
+        // queue; another real call must fail open and surface both losses.
+        let path = client.state().dial_service("server", "exec").await?;
+        let mut second = UnixStream::connect(path).await?;
+        exec::write_client_argv(
+            &mut second,
+            &["/bin/sh".into(), "-c".into(), "printf second".into()],
+        )
+        .await?;
+        let (output, code) =
+            tokio::time::timeout(Duration::from_secs(1), collect_exec(&mut second)).await??;
+        assert_eq!(output, b"second");
+        assert_eq!(code, 0);
+        match server.state().status_response().await? {
+            ControlResponse::Status {
+                audit: Some(status),
+                ..
+            } => {
+                assert_eq!(status.dropped_records, 2);
+                assert_eq!(status.queued_records, 2);
+            }
+            response => panic!("missing live audit loss counter: {response:?}"),
+        }
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_millis(500), client.ping("server")).await??;
+        }
+        assert!(began.elapsed() < Duration::from_secs(2));
+        assert!(!audit.drain(Duration::from_millis(20)).await);
+        assert!(audit.status().queued_records > 0);
+        tokio::task::spawn_blocking(move || release.join().unwrap()).await?;
+        assert!(audit.drain(Duration::from_secs(2)).await);
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// The sink blocks for three real seconds while the single runtime thread
+    /// serves echo. Installing the sink directly makes the elapsed assertion fail.
+    #[tokio::test]
+    async fn blocked_validation_writer_does_not_delay_same_daemon_echo() -> Result<()> {
+        use std::io::Write;
+        struct SlowSink {
+            entered: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+            first: bool,
+        }
+        impl Write for SlowSink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.first {
+                    self.first = false;
+                    self.entered.send(()).unwrap();
+                    self.release.recv().unwrap();
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let temp = tempfile::tempdir()?;
+        let server_home = FabricHome::new(temp.path().join("server"));
+        let client_home = FabricHome::new(temp.path().join("client"));
+        let server = FabricNode::start(server_home.clone()).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+        client.ping("server").await?;
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::sync_channel(1);
+        let release = std::thread::spawn(move || {
+            entered_rx.recv().unwrap();
+            blocked_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+            release_tx.send(()).unwrap();
+        });
+        let writer = fabric_config::background_writer::BackgroundWriter::spawn(
+            "test-validation",
+            SlowSink {
+                entered: entered_tx,
+                release: release_rx,
+                first: true,
+            },
+            16,
+            4096,
+        )?;
+        let subscriber_writer = writer.clone();
+        let subscriber = validation_subscriber(move || subscriber_writer.clone());
+        let began = Instant::now();
+        tracing::subscriber::with_default(subscriber, || tracing::info!("injected slow log sink"));
+        tokio::task::spawn_blocking(move || blocked_rx.recv().unwrap()).await?;
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_millis(500), client.ping("server")).await??;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "log write stalled echo for {:?}",
+            began.elapsed()
+        );
+        assert!(!writer.drain(Duration::from_millis(20)).await);
+        tokio::task::spawn_blocking(move || release.join().unwrap()).await?;
+        assert!(writer.drain(Duration::from_secs(1)).await);
+        server.shutdown().await?;
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_shot_queue_uses_default_deadline_and_releases_cancelled_reservations() -> Result<()>
+    {
+        let queues = crate::dial_queue::DialQueues::default();
+        let queue = queues.peer(iroh::SecretKey::generate().public());
+        let slots = Arc::new(Semaphore::new(0));
+        let cancel = CancellationToken::new();
+        let reservation = ServiceDialReservation::reserve(&slots, Some(&queue))?;
+        let waiting = tokio::spawn({
+            let slots = slots.clone();
+            let cancel = cancel.clone();
+            async move { reservation.acquire(slots, &cancel).await }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(
+            crate::config::DEFAULT_DIAL_QUEUE_TIMEOUT_MS - 1,
+        ))
+        .await;
+        assert!(!waiting.is_finished());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let error = match waiting.await? {
+            Err(error) => error,
+            Ok(_) => bail!("full daemon capacity did not expire"),
+        };
+        assert_eq!(
+            fabric_config::error::code_of(&error),
+            ErrorCode::SessionLimitReached
+        );
+        let reservation = ServiceDialReservation::reserve(&slots, Some(&queue))?;
+        cancel.cancel();
+        assert!(reservation.acquire(slots.clone(), &cancel).await?.is_none());
+        slots.add_permits(1);
+        let reservation = ServiceDialReservation::reserve(&slots, Some(&queue))?;
+        let active = reservation
+            .acquire(slots.clone(), &CancellationToken::new())
+            .await?;
+        assert!(active.is_some());
+        drop(active);
+        assert_eq!(slots.available_permits(), 1);
+        Ok(())
+    }
+
+    /// Removing a one-shot rendezvous after accept must not discard a call
+    /// waiting for the same daemon budget used by generic dial listeners.
+    #[tokio::test]
+    async fn one_shot_exec_and_shell_wait_for_capacity_without_sharing_sockets() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let server_home = FabricHome::new(temp.path().join("server"));
+        let client_home = FabricHome::new(temp.path().join("client"));
+        let server = FabricNode::start(server_home.clone()).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+        let state = client.state();
+        let held = state
+            .dial_slots
+            .clone()
+            .acquire_many_owned(state.dial_slots.available_permits() as u32)
+            .await?;
+        let mut paths = HashSet::new();
+        let mut calls = tokio::task::JoinSet::new();
+        for index in 0..4 {
+            let service = if index % 2 == 0 { "exec" } else { "shell" };
+            let path = state.dial_service("server", service).await?;
+            assert!(paths.insert(path.clone()), "calls shared a rendezvous");
+            let mut stream = UnixStream::connect(&path).await?;
+            calls.spawn(async move {
+                let expected = format!("queued{index}");
+                let command = format!("printf '{expected}'; exit {index}");
+                let (output, code) = if service == "exec" {
+                    exec::write_client_argv(&mut stream, &["/bin/sh".into(), "-c".into(), command])
+                        .await?;
+                    collect_exec(&mut stream).await?
+                } else {
+                    shell::write_client_stdin(&mut stream, format!("{command}\n").as_bytes())
+                        .await?;
+                    let mut output = Vec::new();
+                    let code = loop {
+                        match shell::read_server_frame(&mut stream).await? {
+                            Some(shell::ServerFrame::Output(bytes)) => output.extend(bytes),
+                            Some(shell::ServerFrame::Exit(code)) => break code,
+                            Some(shell::ServerFrame::Error(error)) => bail!("{error}"),
+                            Some(shell::ServerFrame::Status(_)) => {}
+                            None => bail!("queued shell closed without exit status"),
+                        }
+                    };
+                    (output, code)
+                };
+                assert_eq!(code, index);
+                assert!(String::from_utf8_lossy(&output).contains(&expected));
+                Ok::<_, anyhow::Error>(())
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.active_dial_listeners.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(paths.iter().all(|path| !path.exists()));
+        assert!(state.dial_sockets.lock().await.is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), calls.join_next())
+                .await
+                .is_err(),
+            "one-shot call ended while daemon capacity was still occupied"
+        );
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while let Some(result) = calls.join_next().await {
+                result??;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        server.shutdown().await?;
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    /// All calls obtain their rendezvous before any connects. Reusing the
+    /// deterministic peer/protocol path fails the uniqueness check, even when
+    /// scheduling happens to hide the original connect/unlink race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_shot_concurrent_exec_and_shell_calls_keep_their_own_output() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let client_home = FabricHome::new(temp.path().join("client"));
+        let client = FabricNode::start(client_home.clone()).await?;
+        let state = client.state();
+        // Exercise rendezvous isolation above the unrelated 32-handler and
+        // 16-session defaults, without changing either production limit.
+        state.dial_slots.add_permits(64);
+        let mut servers = Vec::new();
+        for label in ["peer-a", "peer-b"] {
+            let home = FabricHome::new(temp.path().join(label));
+            let server = FabricNode::start_with_daemon_options(
+                home.clone(),
+                DaemonOptions {
+                    server_session_max_total: Some(128),
+                    server_session_max_per_peer: Some(128),
+                    ..DaemonOptions::default()
+                },
+            )
+            .await?;
+            trust_test_peer(&home, &server, client.id(), "client", client.addr()).await?;
+            trust_test_peer(&client_home, &client, server.id(), label, server.addr()).await?;
+            servers.push(server);
+        }
+        for _ in 0..2 {
+            for service in ["exec", "shell"] {
+                for mixed in [false, true] {
+                    let barrier = Arc::new(tokio::sync::Barrier::new(50));
+                    let mut calls = tokio::task::JoinSet::new();
+                    for index in 0..50 {
+                        let state = state.clone();
+                        let barrier = barrier.clone();
+                        calls.spawn(async move {
+                            let peer = if mixed && index % 2 == 1 {
+                                "peer-b"
+                            } else {
+                                "peer-a"
+                            };
+                            let path = state.dial_service(peer, service).await?;
+                            barrier.wait().await;
+                            let mut stream = UnixStream::connect(&path).await?;
+                            let command = format!("printf 'out%03d' {index}; exit {}", index % 7);
+                            let (output, code) = if service == "exec" {
+                                exec::write_client_argv(
+                                    &mut stream,
+                                    &["/bin/sh".into(), "-c".into(), command],
+                                )
+                                .await?;
+                                collect_exec(&mut stream).await?
+                            } else {
+                                shell::write_client_stdin(
+                                    &mut stream,
+                                    format!("{command}\n").as_bytes(),
+                                )
+                                .await?;
+                                let mut output = Vec::new();
+                                let code = loop {
+                                    match shell::read_server_frame(&mut stream).await? {
+                                        Some(shell::ServerFrame::Output(bytes)) => {
+                                            output.extend(bytes)
+                                        }
+                                        Some(shell::ServerFrame::Exit(code)) => break code,
+                                        Some(shell::ServerFrame::Error(error)) => bail!("{error}"),
+                                        Some(shell::ServerFrame::Status(_)) => {}
+                                        None => bail!("shell closed without exit status"),
+                                    }
+                                };
+                                (output, code)
+                            };
+                            assert_eq!(code, index % 7);
+                            let expected = format!("out{index:03}");
+                            if service == "exec" {
+                                assert_eq!(output, expected.as_bytes());
+                            } else {
+                                assert!(
+                                    String::from_utf8_lossy(&output).contains(&expected),
+                                    "shell output: {:?}",
+                                    String::from_utf8_lossy(&output)
+                                );
+                            }
+                            Ok::<_, anyhow::Error>(path)
+                        });
+                    }
+                    let paths = tokio::time::timeout(Duration::from_secs(30), async {
+                        let mut paths = HashSet::new();
+                        while let Some(result) = calls.join_next().await {
+                            paths.insert(result??);
+                        }
+                        Ok::<_, anyhow::Error>(paths)
+                    })
+                    .await??;
+                    assert_eq!(paths.len(), 50, "commands shared a rendezvous path");
+                    assert!(paths.iter().all(|path| !path.exists()));
+                    assert!(state.dial_sockets.lock().await.is_empty());
+                    assert_eq!(state.active_dial_listeners.load(Ordering::SeqCst), 0);
+                    assert_eq!(fs::read_dir(client_home.root().join("dials"))?.count(), 0);
+                }
+            }
+        }
+        for server in servers {
+            server.shutdown().await?;
+        }
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_shot_unused_sockets_expire_and_shutdown_removes_pending_ones() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = FabricHome::new(temp.path());
+        let mut peers = PeerBook::default();
+        peers.add(
+            iroh::SecretKey::generate().public(),
+            Some("peer".into()),
+            None,
+        );
+        peers.save(&home)?;
+        let node = FabricNode::start(home.clone()).await?;
+        let state = node.state();
+        for service in ["exec", "shell"] {
+            let socket = state.dial_service("peer", service).await?;
+            assert!(socket.exists());
+            tokio::time::pause();
+            tokio::time::advance(ONE_SHOT_DIAL_WAIT + Duration::from_millis(1)).await;
+            // Join the accept task rather than race its cleanup after advance.
+            let tasks = std::mem::take(&mut *state.one_shot_dials.lock().await);
+            for task in tasks {
+                task.await?;
+            }
+            tokio::time::resume();
+            assert!(!socket.exists());
+            assert!(UnixStream::connect(&socket).await.is_err());
+            assert_eq!(state.active_dial_listeners.load(Ordering::SeqCst), 0);
+        }
+        let exec = state.dial_service("peer", "exec").await?;
+        let shell = state.dial_service("peer", "shell").await?;
+        node.shutdown().await?;
+        assert!(!exec.exists() && !shell.exists());
+        assert_eq!(state.active_dial_listeners.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_shot_service_dials_preserve_shared_git_and_persisted_exec_dials() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = FabricHome::new(temp.path());
+        let mut peers = PeerBook::default();
+        peers.add(
+            iroh::SecretKey::generate().public(),
+            Some("peer".into()),
+            None,
+        );
+        peers.save(&home)?;
+        let node = FabricNode::start(home).await?;
+        let state = node.state();
+        let git = state.dial_service("peer", "git").await?;
+        assert_eq!(state.dial_service("peer", "git").await?, git);
+        let persisted = state.dial("peer", exec::EXEC_PROTOCOL).await?;
+        assert_eq!(state.dial("peer", exec::EXEC_PROTOCOL).await?, persisted);
+        let command = state.dial_service("peer", "exec").await?;
+        assert_ne!(command, persisted);
+        assert!(git.exists() && persisted.exists() && command.exists());
+        assert_eq!(state.dial_sockets.lock().await.len(), 2);
+        node.shutdown().await?;
+        assert!(!git.exists() && !persisted.exists() && !command.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn one_shot_startup_sweep_preserves_shared_dials_and_other_files() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = FabricHome::new(temp.path());
+        home.prepare()?;
+        let dir = home.root().join("dials");
+        let stale = dir.join("once-0123456789abcdef.sock");
+        let shared = dir.join("12345678-0123456789abcdef.sock");
+        let other = dir.join("once-not-a-nonce.sock");
+        let regular = dir.join("once-fedcba9876543210.sock");
+        let directory = dir.join("once-aaaaaaaaaaaaaaaa.sock");
+        fs::create_dir(&directory)?;
+        // std sockets do not require a Tokio runtime for this startup test.
+        let _stale = std::os::unix::net::UnixListener::bind(&stale)?;
+        let _shared = std::os::unix::net::UnixListener::bind(&shared)?;
+        let _other = std::os::unix::net::UnixListener::bind(&other)?;
+        fs::write(&regular, b"keep")?;
+        sweep_one_shot_dials(&home);
+        assert!(!stale.exists());
+        assert!(shared.exists() && other.exists() && regular.exists() && directory.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn one_shot_startup_sweep_tolerates_missing_or_unreadable_directory() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = FabricHome::new(temp.path());
+        sweep_one_shot_dials(&home); // No dials directory yet.
+        let dir = home.root().join("dials");
+        fs::write(&dir, b"not a directory")?;
+        sweep_one_shot_dials(&home); // Deterministic read_dir error on both OSes.
+        assert_eq!(fs::read(&dir)?, b"not a directory");
         Ok(())
     }
 
@@ -10965,20 +12235,31 @@ mod tests {
             Duration::from_secs(5 * 60),
             Duration::from_secs(4 * 60 * 60),
         ] {
-            let mut online = tokio::net::TcpStream::connect(&addr).await?;
-            online.write_all(b"x").await?;
+            let mut online = tokio::net::TcpStream::connect(&addr)
+                .await
+                .with_context(|| format!("outage={outage:?}: initial readiness connect"))?;
+            online
+                .write_all(b"x")
+                .await
+                .with_context(|| format!("outage={outage:?}: initial readiness write"))?;
             let mut byte = [0u8; 1];
-            tokio::time::timeout(Duration::from_secs(3), online.read_exact(&mut byte)).await??;
+            tokio::time::timeout(Duration::from_secs(3), online.read_exact(&mut byte))
+                .await
+                .with_context(|| format!("outage={outage:?}: initial readiness read timed out"))?
+                .with_context(|| format!("outage={outage:?}: initial readiness read"))?;
             drop(online);
             let peer = a.id();
-            a.shutdown().await?;
+            a.shutdown()
+                .await
+                .with_context(|| format!("outage={outage:?}: stop peer before outage"))?;
             let state = b.state();
             tokio::time::timeout(Duration::from_secs(3), async {
                 while !state.peer_connections.presence.offline(peer) {
                     tokio::task::yield_now().await;
                 }
             })
-            .await?;
+            .await
+            .with_context(|| format!("outage={outage:?}: wait for offline presence"))?;
             let failures_before = state
                 .telemetry
                 .peer("server")
@@ -11004,7 +12285,9 @@ mod tests {
                 "absence was counted as a failure"
             );
             let returned = Instant::now();
-            a = FabricNode::start(a_home.clone()).await?;
+            a = FabricNode::start(a_home.clone())
+                .await
+                .with_context(|| format!("outage={outage:?}: restart peer"))?;
             tokio::time::timeout(Duration::from_secs(3), async {
                 loop {
                     if !state.peer_connections.presence.offline(peer) {
@@ -11012,13 +12295,22 @@ mod tests {
                     }
                     tokio::task::yield_now().await;
                 }
-                let mut live = tokio::net::TcpStream::connect(&addr).await?;
-                live.write_all(b"y").await?;
-                live.read_exact(&mut byte).await?;
+                let mut live = tokio::net::TcpStream::connect(&addr)
+                    .await
+                    .with_context(|| format!("outage={outage:?}: post-return connect"))?;
+                live.write_all(b"y")
+                    .await
+                    .with_context(|| format!("outage={outage:?}: post-return write"))?;
+                live.read_exact(&mut byte)
+                    .await
+                    .with_context(|| format!("outage={outage:?}: post-return read"))?;
                 assert_eq!(byte, *b"y");
                 Ok::<_, anyhow::Error>(())
             })
-            .await??;
+            .await
+            .with_context(|| {
+                format!("outage={outage:?}: wait for online presence and return reply")
+            })??;
             assert!(returned.elapsed() < Duration::from_secs(5));
             println!(
                 "outage={outage:?} virtual; real return tunnel={:?}",

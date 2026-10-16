@@ -3757,6 +3757,7 @@ mod supervisor_failure_tests {
                     exposed_protocols: Vec::new(),
                     dial_sockets: Vec::new(),
                     allow_shell: false,
+                    audit: None,
                     allow_exec: false,
                     peers: Vec::new(),
                     connection_telemetry: Default::default(),

@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use fabric_service_api::audit;
 use fabric_service_api::{BoxFuture, Bridge, Notice, PeerStream, Protocol, Service};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::{
@@ -234,8 +235,19 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let mut audit = audit::shell_start();
+    let counts = audit.as_ref().map(|audit| audit.counts());
     let pty_system = native_pty_system();
-    let pair = pty_system.openpty(PtySize::default())?;
+    let pair = pty_system.openpty(PtySize::default()).map_err(|error| {
+        if let Some(audit) = audit.take() {
+            audit.finish(
+                audit::Outcome::SpawnFailed,
+                None,
+                Some(fabric_config::error::ErrorCode::SpawnFailed.as_str()),
+            );
+        }
+        error
+    })?;
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let mut command = CommandBuilder::new(shell);
     // Markers so a user's shell rc can tell it's inside a fabric shell (which runs
@@ -243,24 +255,43 @@ where
     // FABRIC_PEER is the connecting peer's NodeID — who opened this shell.
     command.env("FABRIC_SHELL", "1");
     command.env("FABRIC_PEER", peer);
-    let mut child = pair.slave.spawn_command(command)?;
+    let mut child = pair.slave.spawn_command(command).map_err(|error| {
+        if let Some(audit) = audit.take() {
+            audit.finish(
+                audit::Outcome::SpawnFailed,
+                None,
+                Some(fabric_config::error::ErrorCode::SpawnFailed.as_str()),
+            );
+        }
+        error
+    })?;
+    if let Some(pid) = child.process_id() {
+        fabric_service_api::child_tracking::register(pid);
+    }
     let reaped = Arc::new(AtomicBool::new(false));
     let hang_up = HangUpOnDrop {
         pid: child.process_id().map(|pid| pid as libc::pid_t),
         reaped: reaped.clone(),
     };
     let mut reader = pair.master.try_clone_reader()?;
-    let mut writer = pair.master.take_writer()?;
+    let mut writer = audit::CountWriter {
+        inner: pair.master.take_writer()?,
+        counts: counts.clone(),
+    };
     let master = pair.master;
     drop(pair.slave);
 
     let (output_tx, mut output_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let reader_counts = counts.clone();
     let reader_task = tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 8192];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    if let Some(counts) = &reader_counts {
+                        counts.add_out(n);
+                    }
                     if output_tx.send(buf[..n].to_vec()).is_err() {
                         break;
                     }
@@ -291,6 +322,7 @@ where
     let mut stdin_done = false;
     let mut output_done = false;
     let mut exit_code = None;
+    let mut audit_exit_status = None;
     let mut cancelled = false;
 
     let result: Result<()> = async {
@@ -330,6 +362,14 @@ where
                 status = &mut wait_task, if exit_code.is_none() => {
                     let status = status.context("shell wait task failed")??;
                     let code = status.exit_code().min(i32::MAX as u32) as i32;
+                    // portable-pty replaces a signal exit with code 1 and a
+                    // localized signal name. Do not invent a numeric status.
+                    audit_exit_status = status.signal().is_none().then_some(code);
+                    if let Some(audit) = &audit
+                        && let Some(status) = audit_exit_status
+                    {
+                        audit.observe_exit(status);
+                    }
                     exit_code = Some(code);
                     let _ = input_tx.send(None);
                 }
@@ -348,7 +388,12 @@ where
     if exit_code.is_none() {
         drop(hang_up);
         let _ = input_tx.send(None);
-        let _ = wait_task.await;
+        if let Ok(Ok(status)) = wait_task.await
+            && status.signal().is_none()
+            && let Some(audit) = &audit
+        {
+            audit.observe_exit(status.exit_code().min(i32::MAX as u32) as i32);
+        }
     }
     drop(input_tx);
     let _ = reader_task.await;
@@ -357,6 +402,9 @@ where
     if cancelled {
         Ok(())
     } else if let Some(code) = exit_code {
+        if let Some(audit) = audit.take() {
+            audit.finish(audit::Outcome::Ok, audit_exit_status, None);
+        }
         write_server_frame(send, ServerFrame::Exit(code)).await
     } else {
         Ok(())

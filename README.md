@@ -1,4 +1,4 @@
-> Status: EXPERIMENTAL. Early spike / prototype -- the CLI, APIs, and on-disk formats will change without notice; no stability or security guarantees yet; not production-ready. Use at your own risk.
+> Status: 0.9 preview of 1.0. The CLI, `--json` output, error codes and the direct exposure wire are being held steady for 1.0 as described in [docs/stability.md](docs/stability.md), but until 1.0.0 that page is a plan, not a promise; on-disk formats and the CLI can still change.
 
 # fabric
 
@@ -840,6 +840,34 @@ next redundant health probe for that peer.
 A peer is listed on probe evidence alone, so a healthy peer that has never
 dropped a session still shows its paths.
 
+Daemon diagnostics use dedicated writer threads. Validation output has a queue
+of 4,096 records plus one being written, bounded to 4 MiB including that record;
+stderr has 1,024 queued records plus one, bounded to 1 MiB. Producers drop a
+record when either bound is full, when it exceeds the byte bound, or when a
+write fails. The writer reports the accumulated dropped-record count when the
+sink recovers. CLI output remains synchronous.
+
+Connection telemetry replaces one pending snapshot with the latest counters;
+serialization, writing and atomic rename run on a separate thread, outside the
+in-memory counters mutex. Failed writes retry the latest snapshot. Shutdown
+allows up to one second for telemetry and another half-second for diagnostics;
+a stalled disk does not extend these waits. Abrupt exit can lose queued log
+records, pending loss summaries and telemetry updates that have not reached
+disk. These files provide best-effort diagnostics rather than durable auditing.
+
+### Exec and shell audit history
+
+`fabric audit [--since 1h] [--peer laptop] [--json]` reads local audit events,
+including when the daemon is stopped. It records authenticated callers, local
+labels, exec argv, process outcomes and payload counts. It records shell start
+and end, without keystrokes or output content. `status --json` and `audit --json`
+show the running audit loss counter; an unavailable counter is null. Audit
+writes fail open through their own bounded writer queue.
+
+See [audit storage, retention and detection gaps](docs/audit.md). The file is
+0600, rotates at 10 MiB or 24 hours, and retains up to ten rotated segments,
+with segments older than 30 days pruned when the writer opens or rotates.
+
 ### Fabric deletes its own old logs
 
 The daemon writes one validation log per day to `<home>/logs/` and **keeps the
@@ -1171,6 +1199,14 @@ admitted are never retried as new sessions. Different dialing daemons have
 separate queues; contention at the exposing daemon's total cap still waits
 within each caller's deadline. Applications can reuse connections or retry a
 refusal after that deadline.
+Built-in exec and shell calls use this same local peer and daemon budget,
+with a fixed 10-second capacity wait. Each call keeps its own one-shot socket;
+accepting it removes the rendezvous path while the accepted connection waits.
+Exec reports an expired or full queue in its framed error response; shell
+closes the connection, and both log `fabric:session_limit_reached`. This local
+wait does not add remote admission retries to built-in services. The
+`--queue-timeout` setting applies to generic dial listeners.
+
 `status --json` always reports `dials[].last_error` with the latest failure's
 `code`, `class` and UTC `at` timestamp. It is listener history for this daemon
 run, and remains after a later successful connection; it does not establish
@@ -2173,3 +2209,11 @@ no bytes. While the outer shell is still up and the inner program has died, the
 terminal stays as that program left it: nothing reaches the client to act on,
 and the reset belongs to the program that set the modes; `reset` at the remote
 prompt, or leaving the shell, puts it back.
+
+### Runtime peers and exact grants (provisional)
+
+`fabric up --runtime-peers` enables daemon-owned, owner-scoped peer and exact
+grant mutations on the control socket. Static peer input remains read-only;
+mutation replies report any access still granted by static or other-owner
+records. See the [runtime peer API](docs/runtime-peer-api.md) for transactions,
+revisions, durable request replay and cancellation completion.

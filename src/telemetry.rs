@@ -27,7 +27,7 @@
 use fabric_config::log_eprintln as eprintln;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -232,20 +232,17 @@ struct Inner {
 
 /// Durable per-peer connection counters.
 ///
-/// Every recorded event writes the file under the lock, rather than batching
-/// behind a flush timer. A loss is rare and is exactly the incident these
-/// counters exist to record, so a flush window would lose the one event that
-/// mattered. Probes are not rare, and they pay the same write: at the default
-/// 20 second interval that is a few kilobytes per peer per probe, alongside the
-/// log line the same probe already writes, so it adds no new order of
-/// magnitude.
+/// Every event updates memory and replaces one pending snapshot. A dedicated
+/// thread serializes and writes it outside the counters mutex. Graceful shutdown
+/// gives the latest snapshot a bounded flush; abrupt death or a stalled disk can
+/// lose pending counters. Disk failure must never stall a working session.
 ///
 /// The file cannot grow without bound. Peers come from the peer book, paths come
 /// from a fixed set, and latency is bucketed rather than sampled, so the size is
 /// a product of three bounded things and not of uptime.
 #[derive(Debug)]
 pub struct TelemetryStore {
-    path: Option<PathBuf>,
+    persistence: Option<TelemetryPersistence>,
     inner: Mutex<Inner>,
 }
 
@@ -324,7 +321,7 @@ impl TelemetryStore {
             }
         };
         Self {
-            path: Some(path),
+            persistence: TelemetryPersistence::start(path).ok(),
             inner: Mutex::new(Inner {
                 window,
                 peers,
@@ -337,7 +334,7 @@ impl TelemetryStore {
     /// with no writable home.
     pub fn ephemeral() -> Self {
         Self {
-            path: None,
+            persistence: None,
             inner: Mutex::new(Inner {
                 window: TelemetryWindow::started_now(None),
                 ..Inner::default()
@@ -464,10 +461,9 @@ impl TelemetryStore {
         inner.peers.get(peer).cloned()
     }
 
-    /// Write the current counts. Failure is reported and never propagated: a
-    /// full disk must not take down a shell session that is otherwise fine.
+    /// Replace the pending snapshot; serialization and I/O happen on the worker.
     fn persist_locked(&self, inner: &Inner) {
-        let Some(path) = self.path.as_ref() else {
+        let Some(persistence) = &self.persistence else {
             return;
         };
         let snapshot = TelemetrySnapshot {
@@ -475,12 +471,105 @@ impl TelemetryStore {
             window: inner.window.clone(),
             peers: inner.peers.clone(),
         };
-        if let Err(error) = write_snapshot(path, &snapshot) {
-            eprintln!(
-                "fabric: failed to persist telemetry to {}: {error:#}",
-                path.display()
-            );
+        let mut pending = persistence
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pending.requested += 1;
+        pending.latest = Some((pending.requested, snapshot));
+        drop(pending);
+        let _ = persistence.wake.try_send(());
+    }
+
+    pub async fn flush(&self, bound: Duration) -> bool {
+        let Some(persistence) = &self.persistence else {
+            return true;
+        };
+        let target = persistence
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .requested;
+        tokio::time::timeout(bound, async {
+            while persistence
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .persisted
+                < target
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    #[cfg(test)]
+    fn flush_for_test(&self) {
+        let Some(persistence) = &self.persistence else {
+            return;
+        };
+        let target = persistence.pending.lock().unwrap().requested;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while persistence.pending.lock().unwrap().persisted < target {
+            assert!(Instant::now() < deadline, "telemetry did not reach disk");
+            std::thread::sleep(Duration::from_millis(5));
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PendingTelemetry {
+    requested: u64,
+    persisted: u64,
+    latest: Option<(u64, TelemetrySnapshot)>,
+}
+
+#[derive(Debug)]
+struct TelemetryPersistence {
+    pending: Arc<Mutex<PendingTelemetry>>,
+    wake: mpsc::SyncSender<()>,
+}
+
+impl TelemetryPersistence {
+    fn start(path: PathBuf) -> std::io::Result<Self> {
+        Self::with_sink(move |snapshot| write_snapshot(&path, snapshot))
+    }
+
+    fn with_sink(
+        mut sink: impl FnMut(&TelemetrySnapshot) -> Result<()> + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let pending = Arc::new(Mutex::new(PendingTelemetry::default()));
+        let worker_pending = pending.clone();
+        let (wake, receiver) = mpsc::sync_channel(1);
+        std::thread::Builder::new().name("fabric-telemetry".into()).spawn(move || {
+            loop {
+                let disconnected = matches!(receiver.recv_timeout(Duration::from_secs(1)),
+                    Err(mpsc::RecvTimeoutError::Disconnected));
+                let next = worker_pending.lock().unwrap_or_else(|e| e.into_inner()).latest.take();
+                let Some((revision, snapshot)) = next else {
+                    if disconnected { break; }
+                    continue;
+                };
+                // No in-memory telemetry mutex is held across serialization or disk I/O.
+                let result = sink(&snapshot);
+                let mut pending = worker_pending.lock().unwrap_or_else(|e| e.into_inner());
+                match result {
+                    Ok(()) => pending.persisted = revision,
+                    Err(error) => {
+                        if pending.latest.is_none() { pending.latest = Some((revision, snapshot)); }
+                        drop(pending);
+                        eprintln!("fabric: failed to persist telemetry: {error:#}; retrying latest snapshot");
+                        if disconnected { break; }
+                    }
+                }
+            }
+        }).map_err(|error| {
+            eprintln!("fabric: telemetry writer could not start: {error}; counters remain in memory");
+            error
+        })?;
+        Ok(Self { pending, wake })
     }
 }
 
@@ -515,6 +604,61 @@ fn write_snapshot(path: &Path, snapshot: &TelemetrySnapshot) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn blocked_telemetry_writer_keeps_status_live_and_coalesces_latest_snapshot() {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+        let output = snapshots.clone();
+        let mut first = true;
+        let persistence = TelemetryPersistence::with_sink(move |snapshot| {
+            if first {
+                first = false;
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }
+            output.lock().unwrap().push(snapshot.clone());
+            Ok(())
+        })
+        .unwrap();
+        let mut store = TelemetryStore::ephemeral();
+        store.persistence = Some(persistence);
+        store.record_probe("server", true, Some("direct"), None);
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+            .await
+            .unwrap();
+        for _ in 0..1000 {
+            store.record_probe("server", true, Some("direct"), None);
+        }
+        assert_eq!(store.snapshot().peers["server"].probes_reachable, 1001);
+        assert!(!store.flush(Duration::from_millis(20)).await);
+        release_tx.send(()).unwrap();
+        assert!(store.flush(Duration::from_secs(2)).await);
+        let snapshots = snapshots.lock().unwrap();
+        assert_eq!(snapshots.len(), 2, "pending snapshots were not coalesced");
+        assert_eq!(
+            snapshots.last().unwrap().peers["server"].probes_reachable,
+            1001
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_telemetry_write_retries_latest_snapshot_without_a_new_event() {
+        let mut first = true;
+        let persistence = TelemetryPersistence::with_sink(move |_| {
+            if first {
+                first = false;
+                anyhow::bail!("injected disk failure");
+            }
+            Ok(())
+        })
+        .unwrap();
+        let mut store = TelemetryStore::ephemeral();
+        store.persistence = Some(persistence);
+        store.record_probe("server", true, Some("direct"), None);
+        assert!(store.flush(Duration::from_secs(3)).await);
+    }
 
     fn at(base: Instant, millis: u64) -> Instant {
         base + Duration::from_millis(millis)
@@ -647,6 +791,7 @@ mod tests {
                 Some(Duration::from_millis(64)),
             );
             window = store.snapshot().window;
+            store.flush_for_test();
         }
 
         let reloaded = TelemetryStore::load(&path);
@@ -686,6 +831,7 @@ mod tests {
         {
             let store = TelemetryStore::load(&path);
             store.record_loss("desktop", Some("direct"), 1, Instant::now());
+            store.flush_for_test();
         }
 
         // The session this loss belonged to died with the old process, so a
@@ -699,6 +845,7 @@ mod tests {
             peer.reconnect.samples, 0,
             "a duration measured across a restart would be fiction"
         );
+        reloaded.flush_for_test();
     }
 
     /// Changing the bucket bounds MUST bump the snapshot version.
@@ -746,6 +893,7 @@ mod tests {
         );
         let mut snapshot = store.snapshot();
         snapshot.version = SNAPSHOT_VERSION + 1;
+        store.flush_for_test();
         std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
 
         let reloaded = TelemetryStore::load(&path);
@@ -766,6 +914,7 @@ mod tests {
             reloaded.peer("desktop").unwrap().probe_latency["relay"].samples,
             1
         );
+        reloaded.flush_for_test();
     }
 
     #[test]
@@ -775,6 +924,7 @@ mod tests {
         {
             let store = TelemetryStore::load(&path);
             store.record_probe("vps", true, Some("direct"), Some(Duration::from_millis(64)));
+            store.flush_for_test();
         }
         let reloaded = TelemetryStore::load(&path);
         assert_eq!(
@@ -800,6 +950,7 @@ mod tests {
         assert!(snapshot.window.started_unix_seconds.is_some());
         store.record_loss("desktop", Some("direct"), 1, Instant::now());
         assert_eq!(store.peer("desktop").unwrap().losses, 1);
+        store.flush_for_test();
     }
 
     #[test]
@@ -814,6 +965,7 @@ mod tests {
             .as_object_mut()
             .expect("snapshot is an object")
             .remove("window");
+        store.flush_for_test();
         std::fs::write(&path, serde_json::to_vec(&encoded).unwrap()).unwrap();
 
         let reloaded = TelemetryStore::load(&path);
@@ -962,6 +1114,7 @@ mod tests {
                 );
             }
         }
+        store.flush_for_test();
         let after_probes = std::fs::metadata(&path).expect("written").len();
 
         for round in 0..500u64 {
@@ -970,6 +1123,7 @@ mod tests {
                 store.record_resume(peer, Some("relay"), Instant::now());
             }
         }
+        store.flush_for_test();
         let after_losses = std::fs::metadata(&path).expect("written").len();
 
         assert!(

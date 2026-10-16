@@ -3,7 +3,7 @@ use std::{
     fs::{self, OpenOptions},
     path::PathBuf,
     process::{Command as ProcessCommand, Stdio},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result, bail};
@@ -82,6 +82,15 @@ enum Commands {
     Addr,
     /// Show daemon state and echo-ping reachability for trusted peers.
     Status,
+    /// Read retained exec/shell audit events and the running daemon's loss count.
+    Audit {
+        /// Keep events from this duration ago (for example 30m, 1h, or 2d).
+        #[arg(long)]
+        since: Option<String>,
+        /// Filter by caller NodeID or the local name recorded for that call.
+        #[arg(long)]
+        peer: Option<String>,
+    },
     /// List trusted peers and their service grants.
     Peers,
     /// Share Git repositories with exact per-peer read and write grants.
@@ -191,6 +200,9 @@ enum Commands {
     },
     /// Start the local fabric daemon.
     Up {
+        /// Keep owner-scoped runtime peers and grants in daemon-owned state.
+        #[arg(long)]
+        runtime_peers: bool,
         /// Run in the foreground instead of spawning a background daemon.
         #[arg(long)]
         foreground: bool,
@@ -406,6 +418,8 @@ enum Commands {
     #[command(hide = true)]
     Daemon {
         #[arg(long)]
+        runtime_peers: bool,
+        #[arg(long)]
         allow_shell: bool,
         #[arg(long)]
         allow_exec: bool,
@@ -420,11 +434,15 @@ enum Commands {
     #[command(hide = true)]
     RestartDetacher {
         #[arg(long)]
+        runtime_peers: bool,
+        #[arg(long)]
         allow_shell: bool,
     },
     /// Internal restart worker.
     #[command(hide = true)]
     RestartHelper {
+        #[arg(long)]
+        runtime_peers: bool,
         #[arg(long)]
         allow_shell: bool,
     },
@@ -624,6 +642,39 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                     response => bail!("unexpected daemon response: {response:?}"),
                 },
+                Commands::Audit { since, peer } => {
+                    let since = since
+                        .as_deref()
+                        .map(parse_audit_duration)
+                        .transpose()?
+                        .map(|duration| {
+                            SystemTime::now().checked_sub(duration).ok_or_else(|| {
+                                FabricError::new(
+                                    ErrorCode::InvalidArgument,
+                                    "audit duration is too large",
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    let records = fabric::audit::read(home.root(), since, peer.as_deref())?;
+                    let audit = match tokio::time::timeout(
+                        Duration::from_millis(500),
+                        send_control(&home, ControlRequest::Status),
+                    )
+                    .await
+                    {
+                        Ok(Ok(ControlResponse::Status { audit, .. })) => audit,
+                        _ => None,
+                    };
+                    if json {
+                        print_json(
+                            &serde_json::json!({ "records": records.records, "audit": audit,
+                            "malformed_records": records.malformed_records }),
+                        )?;
+                    } else {
+                        print_audit(&records, audit.as_ref())?;
+                    }
+                }
                 Commands::Status => {
                     match send_control(&home, ControlRequest::ReachabilityStatus).await? {
                         ControlResponse::ReachabilityStatus {
@@ -642,6 +693,7 @@ async fn run(cli: Cli) -> Result<()> {
                             max_dial_handlers,
                             dial_restore_failures,
                             dials,
+                            audit,
                         } => {
                             let sync_runtime = match send_control(
                                 &home,
@@ -667,6 +719,7 @@ async fn run(cli: Cli) -> Result<()> {
                                     &sync_runtime,
                                     &dial_restore_failures,
                                     &dials,
+                                    audit.as_ref(),
                                 ))?;
                                 return Ok(());
                             }
@@ -951,6 +1004,7 @@ async fn run(cli: Cli) -> Result<()> {
                     let _ = send_control(&home, ControlRequest::ReloadPeers).await;
                 }
                 Commands::Up {
+                    runtime_peers,
                     foreground,
                     allow_shell,
                     allow_exec,
@@ -964,6 +1018,7 @@ async fn run(cli: Cli) -> Result<()> {
                         server_session_max_total,
                         server_session_max_per_peer,
                         server_session_detached_ttl_secs,
+                        runtime_peers,
                     );
                     if foreground {
                         init_daemon_tracing(&home)?;
@@ -1411,6 +1466,7 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 },
                 Commands::Daemon {
+                    runtime_peers,
                     allow_shell,
                     allow_exec,
                     server_session_max_total,
@@ -1425,6 +1481,7 @@ async fn run(cli: Cli) -> Result<()> {
                             server_session_max_total,
                             server_session_max_per_peer,
                             server_session_detached_ttl_secs,
+                            runtime_peers,
                         ),
                     )
                     .await
@@ -1433,11 +1490,17 @@ async fn run(cli: Cli) -> Result<()> {
                         std::process::exit(1);
                     }
                 }
-                Commands::RestartDetacher { allow_shell } => {
-                    run_restart_detacher(&home, allow_shell)?;
+                Commands::RestartDetacher {
+                    allow_shell,
+                    runtime_peers,
+                } => {
+                    run_restart_detacher(&home, allow_shell, runtime_peers)?;
                 }
-                Commands::RestartHelper { allow_shell } => {
-                    run_restart_helper(&home, allow_shell).await?;
+                Commands::RestartHelper {
+                    allow_shell,
+                    runtime_peers,
+                } => {
+                    run_restart_helper(&home, allow_shell, runtime_peers).await?;
                 }
             }
         }
@@ -2393,6 +2456,54 @@ fn peers_json(peers: &[fabric::config::Peer]) -> serde_json::Value {
     serde_json::json!({ "peers": peers })
 }
 
+fn parse_audit_duration(value: &str) -> Result<Duration> {
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
+        (number, 0.001)
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1.0)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60.0)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 3600.0)
+    } else if let Some(number) = value.strip_suffix('d') {
+        (number, 86400.0)
+    } else {
+        (value, 1.0)
+    };
+    let invalid = || {
+        FabricError::new(
+            ErrorCode::InvalidArgument,
+            "audit --since must be a nonnegative duration such as 30m, 1h, or 2d",
+        )
+    };
+    let number: f64 = number.parse().map_err(|_| invalid())?;
+    Duration::try_from_secs_f64(number * multiplier).map_err(|_| invalid().into())
+}
+
+fn print_audit(
+    records: &fabric::audit::AuditRead,
+    audit: Option<&fabric::audit::AuditStatus>,
+) -> Result<()> {
+    match audit {
+        Some(audit) => println!(
+            "audit loss\tdropped={} queued={} since={}",
+            audit.dropped_records, audit.queued_records, audit.since
+        ),
+        None => println!("audit loss\tunknown (daemon unavailable or older reply)"),
+    }
+    for record in &records.records {
+        // JSON lines retain argv boundaries without printing shell keystrokes.
+        println!("{}", serde_json::to_string(record)?);
+    }
+    if records.malformed_records != 0 {
+        eprintln!(
+            "fabric: skipped {} malformed audit records",
+            records.malformed_records
+        );
+    }
+    Ok(())
+}
+
 /// `fabric status --json`. Connection telemetry is left out on purpose: it is
 /// not part of the stable surface, and `telemetry.json` carries it.
 #[allow(clippy::too_many_arguments)]
@@ -2407,6 +2518,7 @@ fn status_json(
     sync_runtime: &SyncRuntimeStatus,
     dial_restore_failures: &[fabric::control::DialRestoreFailure],
     dials: &[fabric::control::DialStatus],
+    audit: Option<&fabric::audit::AuditStatus>,
 ) -> serde_json::Value {
     let peers: Vec<_> = peers
         .iter()
@@ -2432,6 +2544,7 @@ fn status_json(
         "dial_sockets": dial_sockets,
         "dials": dials,
         "dial_restore_failures": dial_restore_failures,
+        "audit": audit,
         "dial_handlers": { "active": dial_handlers.0, "max": dial_handlers.1 },
         "sync_runtime": { "owner": sync_runtime.owner, "companion": sync_runtime.companion },
         "peers": peers,
@@ -2898,8 +3011,10 @@ fn daemon_options(
     server_session_max_total: Option<usize>,
     server_session_max_per_peer: Option<usize>,
     server_session_detached_ttl_secs: Option<u64>,
+    runtime_peers: bool,
 ) -> DaemonOptions {
     DaemonOptions {
+        runtime_peers,
         allow_shell,
         allow_exec,
         server_session_max_total,
@@ -2908,7 +3023,7 @@ fn daemon_options(
     }
 }
 
-fn run_restart_detacher(home: &FabricHome, _allow_shell: bool) -> Result<()> {
+fn run_restart_detacher(home: &FabricHome, _allow_shell: bool, runtime_peers: bool) -> Result<()> {
     println!(
         "restart detacher started: version={}",
         fabric::version_string()
@@ -2916,6 +3031,9 @@ fn run_restart_detacher(home: &FabricHome, _allow_shell: bool) -> Result<()> {
     let exe = std::env::current_exe()?;
     let mut command = ProcessCommand::new(exe);
     command.arg("--home").arg(home.root()).arg("restart-helper");
+    if runtime_peers {
+        command.arg("--runtime-peers");
+    }
     let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
@@ -2925,7 +3043,11 @@ fn run_restart_detacher(home: &FabricHome, _allow_shell: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run_restart_helper(home: &FabricHome, _allow_shell: bool) -> Result<()> {
+async fn run_restart_helper(
+    home: &FabricHome,
+    _allow_shell: bool,
+    runtime_peers: bool,
+) -> Result<()> {
     println!(
         "restart helper started: version={}",
         fabric::version_string()
@@ -2941,7 +3063,14 @@ async fn run_restart_helper(home: &FabricHome, _allow_shell: bool) -> Result<()>
         println!("daemon did not report down before restart; continuing: {error:#}");
     }
 
-    let start_result = spawn_daemon(home, DaemonOptions::default()).await;
+    let start_result = spawn_daemon(
+        home,
+        DaemonOptions {
+            runtime_peers,
+            ..DaemonOptions::default()
+        },
+    )
+    .await;
     if let Err(error) = &start_result {
         println!("daemon start failed; checking final state: {error:#}");
     }
@@ -3435,6 +3564,9 @@ async fn spawn_daemon(home: &FabricHome, options: DaemonOptions) -> Result<()> {
     let exe = std::env::current_exe()?;
     let mut command = ProcessCommand::new(exe);
     command.arg("--home").arg(home.root()).arg("daemon");
+    if options.runtime_peers {
+        command.arg("--runtime-peers");
+    }
     if let Some(max_total) = options.server_session_max_total {
         command
             .arg("--server-session-max-total")

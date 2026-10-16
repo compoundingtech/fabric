@@ -1,3 +1,5 @@
+#[doc(hidden)]
+pub mod audit;
 use anyhow::Result;
 use iroh::{
     Endpoint, EndpointAddr,
@@ -19,6 +21,7 @@ pub mod join;
 pub mod macos_app;
 pub mod mux;
 pub mod pathwatch;
+pub mod runtime_peers;
 pub mod service;
 pub mod services;
 pub mod stall;
