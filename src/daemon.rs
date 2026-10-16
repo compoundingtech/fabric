@@ -5529,39 +5529,25 @@ fn current_rss_bytes_impl() -> Option<u64> {
     None
 }
 
-fn connection_path_summary(
-    connection: &Connection,
-) -> (usize, usize, usize, usize, String, String) {
+fn connection_path_summary(connection: &Connection) -> (usize, usize, usize, usize) {
     let paths = connection.paths();
     let mut total = 0usize;
     let mut selected = 0usize;
     let mut ip = 0usize;
     let mut relay = 0usize;
-    let mut local_addrs = BTreeSet::new();
-    let mut remote_addrs = BTreeSet::new();
 
     for path in paths.iter() {
         total += 1;
         selected += usize::from(path.is_selected());
         ip += usize::from(path.is_ip());
         relay += usize::from(path.is_relay());
-        local_addrs.insert(format!("{:?}", path.local_addr()));
-        remote_addrs.insert(path.remote_addr().to_string());
     }
 
-    (
-        total,
-        selected,
-        ip,
-        relay,
-        local_addrs.into_iter().collect::<Vec<_>>().join(","),
-        remote_addrs.into_iter().collect::<Vec<_>>().join(","),
-    )
+    (total, selected, ip, relay)
 }
 
 fn log_connection_paths(event: &'static str, connection: &Connection) {
-    let (paths_total, paths_selected, paths_ip, paths_relay, path_local_addrs, path_remote_addrs) =
-        connection_path_summary(connection);
+    let (paths_total, paths_selected, paths_ip, paths_relay) = connection_path_summary(connection);
     info!(
         target: VALIDATION_LOG_TARGET,
         event,
@@ -5570,8 +5556,6 @@ fn log_connection_paths(event: &'static str, connection: &Connection) {
         paths_selected,
         paths_ip,
         paths_relay,
-        path_local_addrs = %path_local_addrs,
-        path_remote_addrs = %path_remote_addrs,
         "connection path snapshot"
     );
 }
@@ -5582,12 +5566,14 @@ fn sync_accept_is_info_sample(sequence: usize) -> bool {
 
 fn log_sync_connection_paths(connection: &Connection) {
     let sequence = SYNC_ACCEPT_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let info_sample = sync_accept_is_info_sample(sequence);
+    log_sync_connection_paths_sample(connection, sync_accept_is_info_sample(sequence));
+}
+
+fn log_sync_connection_paths_sample(connection: &Connection, info_sample: bool) {
     if !info_sample && !tracing::enabled!(target: VALIDATION_LOG_TARGET, tracing::Level::DEBUG) {
         return;
     }
-    let (paths_total, paths_selected, paths_ip, paths_relay, path_local_addrs, path_remote_addrs) =
-        connection_path_summary(connection);
+    let (paths_total, paths_selected, paths_ip, paths_relay) = connection_path_summary(connection);
     if info_sample {
         info!(
             target: VALIDATION_LOG_TARGET,
@@ -5597,8 +5583,6 @@ fn log_sync_connection_paths(connection: &Connection) {
             paths_selected,
             paths_ip,
             paths_relay,
-            path_local_addrs = %path_local_addrs,
-            path_remote_addrs = %path_remote_addrs,
             sample_every = SYNC_ACCEPT_INFO_SAMPLE_EVERY,
             "connection path snapshot"
         );
@@ -5611,8 +5595,6 @@ fn log_sync_connection_paths(connection: &Connection) {
             paths_selected,
             paths_ip,
             paths_relay,
-            path_local_addrs = %path_local_addrs,
-            path_remote_addrs = %path_remote_addrs,
             "connection path snapshot"
         );
     }

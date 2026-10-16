@@ -198,7 +198,7 @@ pub fn log_paths(
 ) {
     let observed = observe_paths(connection);
 
-    // Per-path lines: the granular record for correlation.
+    // Addresses stay in the local JSON evidence, never in tracing records.
     for path in &observed.paths {
         info!(
             target: PATHWATCH_TARGET,
@@ -207,8 +207,6 @@ pub fn log_paths(
             path_id = %path.id,
             selected = path.selected,
             class = path.class,
-            remote_addr = %path.remote,
-            local_addr = %path.local,
             rtt_ms = path.rtt.as_secs_f64() * 1000.0,
         );
     }
@@ -221,7 +219,7 @@ pub fn log_paths(
         event = "pathwatch_snapshot",
         peer = %peer_label,
         path_count = observed.paths.len(),
-        selected = observed.selected.as_deref().unwrap_or("none"),
+        selected = observed.paths.iter().find(|path| path.selected).map(|path| path.class).unwrap_or("none"),
         selected_changed,
         min_path_rtt_ms = observed
             .min_rtt
