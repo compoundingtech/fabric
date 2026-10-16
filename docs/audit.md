@@ -76,7 +76,8 @@ summary itself as a new loss.
 
 `status --json` and `audit --json` expose the current daemon's `audit` object:
 `dropped_records`, `queued_records` and the counter window's RFC3339 `since`
-time. Counters restart with the daemon. Null means that a live counter could
+time. `queued_records` includes a record currently being written as well as
+waiting records. Counters restart with the daemon. Null means that a live counter could
 not be obtained, not that no records were lost. Retained loss summaries cover
 older gaps.
 

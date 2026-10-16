@@ -1138,6 +1138,10 @@ mod tests {
         assert_eq!(end.bytes_out, output.len() as u64);
         let failed = records[3].call().unwrap();
         assert_eq!(failed.outcome, Some(Outcome::SpawnFailed));
+        assert!(
+            failed.exit_status.is_none(),
+            "a failed spawn has no child exit status"
+        );
         assert_eq!(failed.code.as_deref(), Some("fabric:spawn_failed"));
         let paths = audit_paths(root.path())?;
         assert_eq!(paths.len(), 4, "each real event must exercise rotation");

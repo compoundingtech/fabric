@@ -293,7 +293,7 @@ where
         if let Some(audit) = audit.take() {
             audit.finish(
                 audit::Outcome::SpawnFailed,
-                Some(EXIT_SPAWN_FAILED),
+                None,
                 Some(ErrorCode::SpawnFailed.as_str()),
             );
         }
@@ -341,7 +341,7 @@ where
             if let Some(audit) = audit.take() {
                 audit.finish(
                     audit::Outcome::SpawnFailed,
-                    Some(EXIT_SPAWN_FAILED),
+                    None,
                     Some(ErrorCode::SpawnFailed.as_str()),
                 );
             }
