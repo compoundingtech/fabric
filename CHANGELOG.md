@@ -16,7 +16,7 @@ Deprecated, Fixed or Security.
 
 ## [Unreleased]
 
-## [0.9.2] - 2026-10-17
+## [0.9.2] - 2026-10-16
 
 ### Fixed
 
