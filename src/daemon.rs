@@ -943,6 +943,9 @@ fn resolve_log_retention_days(raw: Option<&str>) -> Option<usize> {
     }
 }
 
+static VALIDATION_WRITER: std::sync::OnceLock<fabric_config::background_writer::BackgroundWriter> =
+    std::sync::OnceLock::new();
+
 pub fn init_daemon_tracing(home: &FabricHome) -> Result<()> {
     home.prepare()?;
     let retention =
@@ -956,14 +959,18 @@ pub fn init_daemon_tracing(home: &FabricHome) -> Result<()> {
     let appender = builder
         .build(home.validation_log_dir())
         .context("failed to build the validation log appender")?;
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_env_filter(validation_log_filter())
-        .with_target(true)
-        .with_writer(appender)
-        .finish();
+    let writer = fabric_config::background_writer::BackgroundWriter::spawn(
+        "fabric-validation",
+        appender,
+        4096,
+        4 * 1024 * 1024,
+    )
+    .context("failed to start validation log writer")?;
+    let subscriber_writer = writer.clone();
+    let subscriber = validation_subscriber(move || subscriber_writer.clone());
 
     if tracing::subscriber::set_global_default(subscriber).is_ok() {
+        let _ = VALIDATION_WRITER.set(writer);
         info!(
             target: VALIDATION_LOG_TARGET,
             event = "diagnostic_logging_init",
@@ -974,6 +981,18 @@ pub fn init_daemon_tracing(home: &FabricHome) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validation_subscriber<W>(writer: W) -> impl tracing::Subscriber + Send + Sync
+where
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(validation_log_filter())
+        .with_target(true)
+        .with_writer(writer)
+        .finish()
 }
 
 fn validation_log_filter() -> EnvFilter {
@@ -1181,7 +1200,10 @@ impl DaemonState {
         let tunnel_sessions =
             tunnel::ServerSessionStore::new(tunnel_session_limits, tunnel_session_detached_ttl);
         tunnel::spawn_server_session_reaper(tunnel_sessions.clone(), cancel.clone());
-        let telemetry = Arc::new(TelemetryStore::load(home.telemetry_path()));
+        let telemetry_path = home.telemetry_path();
+        let telemetry = Arc::new(
+            tokio::task::spawn_blocking(move || TelemetryStore::load(telemetry_path)).await?,
+        );
         let local_id = endpoint_tx.borrow().endpoint.id();
         let (opened_mux_tx, opened_mux_rx) = mpsc::unbounded_channel();
         let peer_connections = Arc::new(mux::PeerConnections::new(local_id, opened_mux_tx));
@@ -3254,14 +3276,29 @@ pub async fn run_daemon(home: FabricHome, allow_shell: bool) -> Result<()> {
 
 pub async fn run_daemon_with_options(home: FabricHome, options: DaemonOptions) -> Result<()> {
     let _lease = DaemonLease::acquire(&home)?;
-    init_daemon_tracing(&home)?;
+    let logging_home = home.clone();
+    let _stderr = tokio::task::spawn_blocking(move || {
+        init_daemon_tracing(&logging_home)?;
+        Ok::<_, anyhow::Error>(fabric_config::log::init_daemon_stderr()?)
+    })
+    .await??;
     // For the life of the daemon: if its runtime ever stops running, say why and
     // end the process so the service manager starts a fresh one.
     let _stall = crate::stall::Watchdog::start(crate::stall::StallConfig::from_env());
-    FabricNode::start_with_daemon_options(home, options)
-        .await?
-        .wait()
-        .await
+    let result = match FabricNode::start_with_daemon_options(home, options).await {
+        Ok(node) => node.wait().await,
+        Err(error) => Err(error),
+    };
+    let validation = async {
+        if let Some(writer) = VALIDATION_WRITER.get() {
+            let _ = writer.drain(Duration::from_millis(500)).await;
+        }
+    };
+    let _ = tokio::join!(
+        validation,
+        fabric_config::log::drain_daemon_stderr(Duration::from_millis(500))
+    );
+    result
 }
 
 struct DaemonLease {
@@ -3415,6 +3452,9 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
             let _ = task.await;
         }
     }
+    // Preserve the latest counters when possible, without making a stalled
+    // filesystem hold the lease or the async runtime indefinitely.
+    let _ = state.telemetry.flush(Duration::from_secs(1)).await;
     Ok(())
 }
 
@@ -8160,6 +8200,77 @@ mod tests {
         server.shutdown().await?;
         client.shutdown().await?;
         assert_eq!(state.active_dial_listeners.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    /// The sink blocks for three real seconds while the single runtime thread
+    /// serves echo. Installing the sink directly makes the elapsed assertion fail.
+    #[tokio::test]
+    async fn blocked_validation_writer_does_not_delay_same_daemon_echo() -> Result<()> {
+        use std::io::Write;
+        struct SlowSink {
+            entered: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+            first: bool,
+        }
+        impl Write for SlowSink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.first {
+                    self.first = false;
+                    self.entered.send(()).unwrap();
+                    self.release.recv().unwrap();
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let temp = tempfile::tempdir()?;
+        let server_home = FabricHome::new(temp.path().join("server"));
+        let client_home = FabricHome::new(temp.path().join("client"));
+        let server = FabricNode::start(server_home.clone()).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+        client.ping("server").await?;
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::sync_channel(1);
+        let release = std::thread::spawn(move || {
+            entered_rx.recv().unwrap();
+            blocked_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+            release_tx.send(()).unwrap();
+        });
+        let writer = fabric_config::background_writer::BackgroundWriter::spawn(
+            "test-validation",
+            SlowSink {
+                entered: entered_tx,
+                release: release_rx,
+                first: true,
+            },
+            16,
+            4096,
+        )?;
+        let subscriber_writer = writer.clone();
+        let subscriber = validation_subscriber(move || subscriber_writer.clone());
+        let began = Instant::now();
+        tracing::subscriber::with_default(subscriber, || tracing::info!("injected slow log sink"));
+        tokio::task::spawn_blocking(move || blocked_rx.recv().unwrap()).await?;
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_millis(500), client.ping("server")).await??;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "log write stalled echo for {:?}",
+            began.elapsed()
+        );
+        assert!(!writer.drain(Duration::from_millis(20)).await);
+        tokio::task::spawn_blocking(move || release.join().unwrap()).await?;
+        assert!(writer.drain(Duration::from_secs(1)).await);
+        server.shutdown().await?;
+        client.shutdown().await?;
         Ok(())
     }
 
