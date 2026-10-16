@@ -254,3 +254,15 @@ started both a watcher pass and an explicit reload. Both were valid inbound
 transactions, while the test required exactly one. The test now uses one
 trigger for each exact expected count. See [known-flaky-tests.md](known-flaky-tests.md)
 for the measured retirement record.
+
+## Duplicate connection during the first tunnel attach
+
+Two authenticated connections can briefly coexist while peers select the same
+canonical connection. If replacement interrupts a fresh tunnel before any Hello
+byte is accepted by the transport, the daemon can reopen the unserved stream
+once, keeping the same local socket, session ID, buffered input and admission
+deadline. No service could have received this session's Hello at that point.
+A partial or complete Hello, a lost Hello reply, a policy refusal, or a second
+replacement is outside this recovery. Established sessions continue to use the
+existing durable resume protocol. This does not change mux direction preference
+or retry an application request.

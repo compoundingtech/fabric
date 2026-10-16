@@ -4,6 +4,41 @@ use super::*;
 
 #[tokio::test]
 async fn preferred_duplicate_between_ready_and_hello_keeps_the_first_local_request() -> Result<()> {
+    forced_ready_replacement(false, false).await
+}
+
+#[tokio::test]
+async fn reverse_simultaneous_traffic_converges_after_ready_replacement() -> Result<()> {
+    forced_ready_replacement(true, false).await
+}
+
+#[tokio::test]
+async fn an_established_session_survives_a_preferred_duplicate_during_reconnect() -> Result<()> {
+    forced_ready_replacement(false, true).await
+}
+
+fn start_client(
+    local: UnixStream,
+    state: &Arc<DaemonState>,
+    home: FabricHome,
+    initial: mux::MuxStream,
+    cancel: CancellationToken,
+) -> JoinHandle<Result<()>> {
+    tokio::spawn(tunnel::run_client_connection_with_initial(
+        local,
+        state.endpoint_rx(),
+        state.peer_connections.clone(),
+        home,
+        "server".into(),
+        b"work/0".to_vec(),
+        cancel,
+        state.tunnel_drop_tx.subscribe(),
+        None,
+        initial,
+    ))
+}
+
+async fn forced_ready_replacement(reverse_traffic: bool, interrupted_resume: bool) -> Result<()> {
     let first_dir = tempfile::tempdir()?;
     let second_dir = tempfile::tempdir()?;
     let first_home = FabricHome::new(first_dir.path());
@@ -29,7 +64,16 @@ async fn preferred_duplicate_between_ready_and_hello_keeps_the_first_local_reque
     book.save(&server_home)?;
     server.state().reload_peers().await?;
     let mut book = PeerBook::load(&client_home)?;
-    book.add(server.id(), Some("server".into()), Some(server.addr()));
+    if reverse_traffic {
+        book.add_with_allow(
+            server.id(),
+            Some("server".into()),
+            Some(server.addr()),
+            Some(vec!["echo".into()]),
+        );
+    } else {
+        book.add(server.id(), Some("server".into()), Some(server.addr()));
+    }
     book.save(&client_home)?;
     client.state().reload_peers().await?;
 
@@ -65,7 +109,8 @@ async fn preferred_duplicate_between_ready_and_hello_keeps_the_first_local_reque
         )
         .await?;
     assert_eq!(initial.connection.side(), Side::Client);
-    let old_id = initial.connection.stable_id();
+    let mut failed_connection = initial.connection.clone();
+    let mut old_id = initial.connection.stable_id();
     assert_eq!(
         accepts.load(Ordering::SeqCst),
         0,
@@ -77,6 +122,52 @@ async fn preferred_duplicate_between_ready_and_hello_keeps_the_first_local_reque
         started.elapsed()
     );
 
+    let (mut application, local) = UnixStream::pair()?;
+    let mut local = Some(local);
+    let mut initial = Some(initial);
+    let cancel = CancellationToken::new();
+    let mut attached = None;
+    if interrupted_resume {
+        attached = Some(start_client(
+            local.take().unwrap(),
+            &client_state,
+            client_home.clone(),
+            initial.take().unwrap(),
+            cancel.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            application.write_all(b"already-attached").await?;
+            let mut got = [0; 16];
+            application.read_exact(&mut got).await?;
+            anyhow::ensure!(&got == b"already-attached");
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        assert_eq!(accepts.load(Ordering::SeqCst), 1);
+        server_state.tunnel_blocked.store(true, Ordering::SeqCst);
+        client_state.drop_tunnel_connections();
+        // Wait for a real reconnect, while the temporary admission block
+        // prevents it completing. Then interrupt that connection as well.
+        failed_connection = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(connection) =
+                    client_state.peer_connections.connection(server.id()).await
+                {
+                    if connection.stable_id() != old_id
+                        && server_state.tunnel_sessions.stats().await.active_attaches == 0
+                    {
+                        break connection;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("established session did not begin reconnecting")?;
+        assert_eq!(failed_connection.side(), Side::Client);
+        old_id = failed_connection.stable_id();
+    }
+
     // This real reverse QUIC connection is preferred at both ends. Exchange
     // the existing generation frame, then register it with the same admission
     // entry point used by the daemon. No tunnel Hello has been sent yet.
@@ -86,33 +177,19 @@ async fn preferred_duplicate_between_ready_and_hello_keeps_the_first_local_reque
         .connect(client.addr(), mux::MUX_ALPN)
         .await?;
     assert_eq!(duplicate.side(), Side::Client);
-    let exchange: Result<u64> = async {
-        let (mut send, mut recv) = duplicate.open_bi().await?;
-        send.write_u64(reverse_endpoint.generation).await?;
-        send.finish()?;
-        Ok(recv.read_u64().await?)
-    }
-    .await;
-    let reverse_serving = match exchange {
-        Ok(client_generation) => {
-            server_state
-                .peer_connections
-                .register_incoming(&duplicate, reverse_endpoint.generation, client_generation)
-                .await;
-            Some(tokio::spawn(handle_mux_connection(
-                duplicate.clone(),
-                server_state.clone(),
-                false,
-            )))
-        }
-        // A valid fix may retain the admitted connection and reject the new
-        // duplicate. The request must work whichever connection is retained.
-        Err(error) if duplicate.close_reason().is_some() => {
-            std::eprintln!("reverse generation exchange ended: {error:#}");
-            None
-        }
-        Err(error) => return Err(error),
-    };
+    let (mut send, mut recv) = duplicate.open_bi().await?;
+    send.write_u64(reverse_endpoint.generation).await?;
+    send.finish()?;
+    let client_generation = recv.read_u64().await?;
+    server_state
+        .peer_connections
+        .register_incoming(&duplicate, reverse_endpoint.generation, client_generation)
+        .await;
+    let reverse_serving = tokio::spawn(handle_mux_connection(
+        duplicate.clone(),
+        server_state.clone(),
+        false,
+    ));
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let changed = client_state
@@ -120,7 +197,7 @@ async fn preferred_duplicate_between_ready_and_hello_keeps_the_first_local_reque
                 .connection(server.id())
                 .await
                 .is_some_and(|connection| connection.stable_id() != old_id);
-            if changed || duplicate.close_reason().is_some() {
+            if changed && failed_connection.close_reason().is_some() {
                 break;
             }
             tokio::task::yield_now().await;
@@ -133,46 +210,101 @@ async fn preferred_duplicate_between_ready_and_hello_keeps_the_first_local_reque
         .connection(server.id())
         .await
         .context("canonical connection missing")?;
-    assert_eq!(accepts.load(Ordering::SeqCst), 0);
-    assert_eq!(server_state.tunnel_sessions.stats().await.total_sessions, 0);
+    assert_eq!(
+        failed_connection.close_reason(),
+        Some(iroh::endpoint::ConnectionError::LocallyClosed)
+    );
+    assert_ne!(canonical.stable_id(), old_id);
+    assert_eq!(duplicate.close_reason(), None);
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        usize::from(interrupted_resume)
+    );
+    assert_eq!(
+        server_state.tunnel_sessions.stats().await.total_sessions,
+        usize::from(interrupted_resume)
+    );
     std::eprintln!(
-        "phase=preferred_duplicate_decided elapsed={:?} old_connection={old_id} canonical_connection={} old_close={:?} duplicate_close={:?} hello_started=false target_accepts=0",
+        "phase=preferred_duplicate_decided elapsed={:?} old_connection={old_id} canonical_connection={} old_close={:?} duplicate_close={:?} session_had_attached={interrupted_resume}",
         started.elapsed(),
         canonical.stable_id(),
-        initial.connection.close_reason(),
+        failed_connection.close_reason(),
         duplicate.close_reason()
     );
 
-    let (mut application, local) = UnixStream::pair()?;
-    let cancel = CancellationToken::new();
-    let attached = tokio::spawn(tunnel::run_client_connection_with_initial(
-        local,
-        client_state.endpoint_rx(),
-        client_state.peer_connections.clone(),
-        client_home,
-        "server".into(),
-        b"work/0".to_vec(),
-        cancel.clone(),
-        client_state.tunnel_drop_tx.subscribe(),
-        None,
-        initial,
-    ));
+    server_state.tunnel_blocked.store(false, Ordering::SeqCst);
+    let attached = attached.unwrap_or_else(|| {
+        start_client(
+            local.take().unwrap(),
+            &client_state,
+            client_home,
+            initial.take().unwrap(),
+            cancel.clone(),
+        )
+    });
     let payload = b"first-request-no-application-retry";
-    let request: Result<()> = tokio::time::timeout(Duration::from_secs(3), async {
-        application.write_all(payload).await?;
-        let mut got = vec![0; payload.len()];
-        application.read_exact(&mut got).await?;
-        anyhow::ensure!(got == payload, "payload changed or replayed");
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let local_barrier = barrier.clone();
+    let request = async {
+        local_barrier.wait().await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            application.write_all(payload).await?;
+            let mut got = vec![0; payload.len()];
+            application.read_exact(&mut got).await?;
+            anyhow::ensure!(got == payload, "payload changed or replayed");
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("first local request exceeded its bound")
+        .and_then(|result| result)
+    };
+    let reverse = async {
+        barrier.wait().await;
+        if reverse_traffic {
+            let endpoint = server_state.endpoint_handle();
+            let mut echo = server_state
+                .peer_connections
+                .open_stream(
+                    &endpoint.endpoint,
+                    endpoint.generation,
+                    &client.addr(),
+                    std::str::from_utf8(BUILTIN_ECHO_ALPN)?,
+                    mux::StreamActivity::Application,
+                )
+                .await?;
+            let bytes = b"reverse-simultaneous";
+            echo.send.write_all(bytes).await?;
+            let mut got = vec![0; bytes.len()];
+            echo.recv.read_exact(&mut got).await?;
+            anyhow::ensure!(got == bytes, "reverse stream payload changed");
+            echo.send.finish()?;
+        }
         Ok::<_, anyhow::Error>(())
-    })
-    .await
-    .context("first local request exceeded its bound")
-    .and_then(|result| result);
+    };
+    let (request, reverse) = tokio::join!(
+        request,
+        tokio::time::timeout(Duration::from_secs(3), reverse)
+    );
+    let reverse = reverse
+        .context("reverse request exceeded its bound")
+        .and_then(|result| result);
     std::eprintln!(
         "phase=first_local_reply elapsed={:?} result={request:?} target_accepts={}",
         started.elapsed(),
         accepts.load(Ordering::SeqCst)
     );
+    let converged = if reverse_traffic {
+        let at_client = client_state.peer_connections.connection(server.id()).await;
+        let at_server = server_state.peer_connections.connection(client.id()).await;
+        at_client.is_some_and(|connection| {
+            connection.side() == Side::Server && connection.stable_id() == canonical.stable_id()
+        }) && at_server.is_some_and(|connection| {
+            connection.side() == Side::Client && connection.stable_id() == duplicate.stable_id()
+        }) && client_state.peer_connections.peer_count().await == 1
+            && server_state.peer_connections.peer_count().await == 1
+    } else {
+        true
+    };
     cancel.cancel();
     drop(application);
     let attach_result = tokio::time::timeout(Duration::from_secs(3), attached).await;
@@ -181,9 +313,15 @@ async fn preferred_duplicate_between_ready_and_hello_keeps_the_first_local_reque
     server.shutdown().await?;
     copying.abort();
     let _ = copying.await;
-    if let Some(serving) = reverse_serving {
-        tokio::time::timeout(Duration::from_secs(3), serving).await???;
-    }
+    tokio::time::timeout(Duration::from_secs(3), reverse_serving).await???;
+    assert!(
+        converged,
+        "reverse traffic did not converge on the same preferred connection"
+    );
+    assert!(
+        reverse.is_ok(),
+        "reverse simultaneous request failed: {reverse:?}"
+    );
     assert!(
         request.is_ok(),
         "a preferred duplicate after mux Ready ended the first local request: {request:?}; attach={attach_result:?}"

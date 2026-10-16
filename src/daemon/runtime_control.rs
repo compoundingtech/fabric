@@ -697,7 +697,9 @@ mod tests {
         let port = client
             .dial_tcp("server", "work/0", "127.0.0.1:0".into())
             .await?;
-        round_trip(&mut tokio::net::TcpStream::connect(&port).await?, b"before").await?;
+        round_trip(&mut tokio::net::TcpStream::connect(&port).await?, b"before")
+            .await
+            .context("runtime grant: readiness read before restart")?;
         let refused_port = client
             .dial_tcp("server", "other/0", "127.0.0.1:0".into())
             .await?;
@@ -731,7 +733,9 @@ mod tests {
             .dial_tcp("server", "work/0", "127.0.0.1:0".into())
             .await?;
         let mut live = tokio::net::TcpStream::connect(&port).await?;
-        round_trip(&mut live, b"after").await?;
+        round_trip(&mut live, b"after")
+            .await
+            .context("runtime grant: readiness read after restart")?;
         let installed = mutate(&home, "withdraw", 2, vec![grant(&client, &[])]).await?;
         assert!(server.state().may(&client.id(), "work/0").await.is_err());
         let done = cancellation(&home, "withdraw").await?;
