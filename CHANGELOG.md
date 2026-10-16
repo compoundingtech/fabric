@@ -24,6 +24,10 @@ Deprecated, Fixed or Security.
   client; default streams and streams that already carried output receive no
   extra bytes (#302).
 
+## [0.9.1] - 2026-10-16
+
+### Added
+
 - Exec and shell audit JSONL records identify the authenticated caller, local
   label, exec argv, session, outcome, exit status, duration and payload counts.
   Shell events retain no keystrokes. A dedicated bounded writer fails open,
@@ -34,6 +38,13 @@ Deprecated, Fixed or Security.
   refusal coalescing have explicit metadata (#315).
 
 - **Provisional:** opt-in `--runtime-peers` control API persists owner-scoped exact grants, atomic replacement batches, policy revisions and durable request/cancellation receipts without editing static peer input (#312).
+
+### Fixed
+
+- Daemon validation logs and stderr write through bounded background queues,
+  counting dropped records when the sink stalls. Telemetry coalesces pending
+  snapshots and performs serialization and file writes outside the counters
+  mutex, so a stalled diagnostic disk does not block runtime workers (#314).
 
 ## [0.9.0] - 2026-10-16
 
@@ -57,10 +68,6 @@ line; the contract it will hold is drafted in [docs/stability.md](docs/stability
 
 ### Fixed
 
-- Daemon validation logs and stderr write through bounded background queues,
-  counting dropped records when the sink stalls. Telemetry coalesces pending
-  snapshots and performs serialization and file writes outside the counters
-  mutex, so a stalled diagnostic disk does not block runtime workers (#314).
 
 - Concurrent exec and shell commands use independent one-shot local sockets, preventing one command from unlinking another command's socket. Unused sockets expire after 30 seconds and stale one-shot sockets are removed at startup (#316).
 - A failed Unix dial is never persisted, overlong socket paths report `fabric:invalid_argument` and the maximum home length, and failed saved Unix or TCP listeners are skipped at startup and reported by status in `dial_restore_failures` (#297).
