@@ -855,6 +855,19 @@ a stalled disk does not extend these waits. Abrupt exit can lose queued log
 records, pending loss summaries and telemetry updates that have not reached
 disk. These files provide best-effort diagnostics rather than durable auditing.
 
+### Exec and shell audit history
+
+`fabric audit [--since 1h] [--peer laptop] [--json]` reads local audit events,
+including when the daemon is stopped. It records authenticated callers, local
+labels, exec argv, process outcomes and payload counts. It records shell start
+and end, without keystrokes or output content. `status --json` and `audit --json`
+show the running audit loss counter; an unavailable counter is null. Audit
+writes fail open through their own bounded writer queue.
+
+See [audit storage, retention and detection gaps](docs/audit.md). The file is
+0600, rotates at 10 MiB or 24 hours, and retains up to ten rotated segments,
+with segments older than 30 days pruned when the writer opens or rotates.
+
 ### Fabric deletes its own old logs
 
 The daemon writes one validation log per day to `<home>/logs/` and **keeps the

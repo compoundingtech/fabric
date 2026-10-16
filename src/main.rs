@@ -87,7 +87,7 @@ enum Commands {
         /// Keep events from this duration ago (for example 30m, 1h, or 2d).
         #[arg(long)]
         since: Option<String>,
-        /// Filter by NodeID, current local name, or a recorded historical name.
+        /// Filter by caller NodeID or the local name recorded for that call.
         #[arg(long)]
         peer: Option<String>,
     },
@@ -644,10 +644,6 @@ async fn run(cli: Cli) -> Result<()> {
                         .map(|duration| SystemTime::now().checked_sub(duration)
                             .ok_or_else(|| FabricError::new(ErrorCode::InvalidArgument, "audit duration is too large")))
                         .transpose()?;
-                    let peer = peer.map(|peer| {
-                        PeerBook::load(&home).ok().and_then(|book| book.resolve(&peer).ok())
-                            .map(|addr| addr.id.to_string()).unwrap_or(peer)
-                    });
                     let records = fabric::audit::read(home.root(), since, peer.as_deref())?;
                     let audit = match tokio::time::timeout(Duration::from_millis(500), send_control(&home, ControlRequest::Status)).await {
                         Ok(Ok(ControlResponse::Status { audit, .. })) => audit,

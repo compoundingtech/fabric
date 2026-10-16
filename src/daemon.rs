@@ -8352,6 +8352,252 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn audit_denial_precedes_invalid_argv_and_records_the_policy_code() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let server_home = FabricHome::new(temp.path().join("server"));
+        let client_home = FabricHome::new(temp.path().join("client"));
+        let server = FabricNode::start(server_home.clone()).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer_allowing(
+            &server_home,
+            &server,
+            client.id(),
+            "client",
+            client.addr(),
+            &["echo"],
+        )
+        .await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+        let path = client.state().dial_service("server", "exec").await?;
+        let mut stream = UnixStream::connect(path).await?;
+        // This is an invalid argv frame (far above the decoder's size bound).
+        // Decoding it before the policy gate would fail instead of refusing.
+        let _ = stream
+            .write_all(b"\x01\xff\xff\xff\xffdenied-input-sentinel-2194")
+            .await;
+        let (message, exit) = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut message = String::new();
+            loop {
+                match exec::read_server_frame(&mut stream).await? {
+                    Some(exec::ServerFrame::Error(error)) => message = error,
+                    Some(exec::ServerFrame::Exit(code)) => {
+                        break Ok::<_, anyhow::Error>((message, code));
+                    }
+                    Some(_) => {}
+                    None => bail!("denied exec closed without a refusal"),
+                }
+            }
+        })
+        .await??;
+        assert_eq!(exit, exec::EXIT_EXEC_DISABLED);
+        assert!(message.contains("fabric:peer_not_permitted_for_service"));
+        assert!(server.state().audit.drain(Duration::from_secs(3)).await);
+        let records =
+            crate::audit::read(server_home.root(), None, Some(&client.id().to_string()))?.records;
+        let calls: Vec<_> = records
+            .iter()
+            .filter_map(|record| record.call())
+            .filter(|record| record.service.as_deref() == Some("exec"))
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].argv.is_none());
+        assert_eq!(calls[0].name.as_deref(), Some("client"));
+        assert_eq!(calls[0].outcome, Some(crate::audit::Outcome::Refused));
+        assert_eq!(
+            calls[0].code.as_deref(),
+            Some("fabric:peer_not_permitted_for_service")
+        );
+        assert!(!serde_json::to_string(&records)?.contains("denied-input-sentinel-2194"));
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit_exposure_resume_counts_unique_payload_and_records_child_cap_refusal()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let server_home = FabricHome::new(temp.path().join("server"));
+        let client_home = FabricHome::new(temp.path().join("client"));
+        let server = FabricNode::start(server_home.clone()).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer_allowing(
+            &server_home,
+            &server,
+            client.id(),
+            "client",
+            client.addr(),
+            &["echo", "audit/stdio"],
+        )
+        .await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+        let script = temp.path().join("stdio.sh");
+        fs::write(
+            &script,
+            b"cat; printf audit-output-sentinel-7314 >&2; exit 7\n",
+        )?;
+        server
+            .expose_exec_ephemeral(
+                "audit/stdio",
+                vec!["/bin/sh".into(), script.to_string_lossy().into_owned()],
+                1,
+            )
+            .await?;
+        let path = client
+            .state()
+            .dial_with_options(
+                "server",
+                "audit/stdio",
+                DialOptions {
+                    queue_timeout_ms: 0,
+                },
+            )
+            .await?;
+        let mut first = UnixStream::connect(&path).await?;
+        let payload = b"audit-stdin-sentinel-3541";
+        first.write_all(payload).await?;
+        let mut response = vec![0; payload.len()];
+        tokio::time::timeout(Duration::from_secs(5), first.read_exact(&mut response)).await??;
+        assert_eq!(response, payload);
+
+        let mut excess = UnixStream::connect(&path).await?;
+        let _ = excess.write_all(b"refused-stdin-sentinel-9613").await;
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), excess.read_to_end(&mut response)).await??;
+        assert!(response.is_empty());
+        // Hold the cap refusal to a stable connection, then exercise resume
+        // of the admitted process with no new call during the debug drop.
+        client.state().drop_tunnel_connections();
+        first.write_all(b"after-resume").await?;
+        let mut resumed = [0; 12];
+        tokio::time::timeout(Duration::from_secs(10), first.read_exact(&mut resumed)).await??;
+        assert_eq!(&resumed, b"after-resume");
+
+        first.shutdown().await?;
+        tokio::time::timeout(Duration::from_secs(5), first.read_to_end(&mut response)).await??;
+        assert!(server.state().audit.drain(Duration::from_secs(5)).await);
+        let records =
+            crate::audit::read(server_home.root(), None, Some(&client.id().to_string()))?.records;
+        let selected: Vec<_> = records
+            .iter()
+            .filter(|record| {
+                record
+                    .call()
+                    .is_some_and(|call| call.service.as_deref() == Some("audit/stdio"))
+            })
+            .collect();
+        let starts: Vec<_> = selected
+            .iter()
+            .filter_map(|record| match record {
+                crate::audit::Record::ExecStart(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        let ends: Vec<_> = selected
+            .iter()
+            .filter_map(|record| match record {
+                crate::audit::Record::ExecEnd(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        let refused: Vec<_> = selected
+            .iter()
+            .filter_map(|record| match record {
+                crate::audit::Record::Refused(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 1, "resume started another process");
+        assert_eq!(ends.len(), 1);
+        assert_eq!(refused.len(), 1);
+        assert_eq!(starts[0].session_id, ends[0].session_id);
+        assert_eq!(ends[0].exit_status, Some(7));
+        assert_eq!(
+            ends[0].bytes_in,
+            (payload.len() + b"after-resume".len()) as u64
+        );
+        assert_eq!(
+            ends[0].bytes_out,
+            (payload.len() + b"after-resume".len() + b"audit-output-sentinel-7314".len()) as u64
+        );
+        assert!(refused[0].argv.is_none());
+        assert_eq!(
+            refused[0].code.as_deref(),
+            Some("fabric:session_limit_reached")
+        );
+        let text = serde_json::to_string(&records)?;
+        for secret in [
+            "audit-stdin-sentinel-3541",
+            "audit-output-sentinel-7314",
+            "refused-stdin-sentinel-9613",
+        ] {
+            assert!(!text.contains(secret));
+        }
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit_stalled_writer_leaves_same_daemon_exec_and_echo_responsive() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let server_home = FabricHome::new(temp.path().join("server"));
+        let client_home = FabricHome::new(temp.path().join("client"));
+        let armed = Arc::new(AtomicBool::new(false));
+        let sink_armed = armed.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let audit = crate::audit::Audit::with_sink(16, 65536, move |_| {
+            if sink_armed.swap(false, Ordering::AcqRel) {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }
+            Ok(())
+        });
+        let server = FabricNode::start_with_audit(
+            server_home.clone(),
+            DaemonOptions::default(),
+            services::builtin(&server_home),
+            Some(audit.clone()),
+        )
+        .await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_test_peer(&server_home, &server, client.id(), "client", client.addr()).await?;
+        trust_test_peer(&client_home, &client, server.id(), "server", server.addr()).await?;
+        client.ping("server").await?;
+        assert!(audit.drain(Duration::from_secs(2)).await);
+        let release = std::thread::spawn(move || {
+            entered_rx.recv().unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+            release_tx.send(()).unwrap();
+        });
+        armed.store(true, Ordering::Release);
+        let began = Instant::now();
+        let path = client.state().dial_service("server", "exec").await?;
+        let mut stream = UnixStream::connect(path).await?;
+        exec::write_client_argv(
+            &mut stream,
+            &["/bin/sh".into(), "-c".into(), "printf ready".into()],
+        )
+        .await?;
+        let (output, code) =
+            tokio::time::timeout(Duration::from_secs(1), collect_exec(&mut stream)).await??;
+        assert_eq!(output, b"ready");
+        assert_eq!(code, 0);
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_millis(500), client.ping("server")).await??;
+        }
+        assert!(began.elapsed() < Duration::from_secs(2));
+        assert!(!audit.drain(Duration::from_millis(20)).await);
+        assert!(audit.status().queued_records > 0);
+        tokio::task::spawn_blocking(move || release.join().unwrap()).await?;
+        assert!(audit.drain(Duration::from_secs(2)).await);
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
     /// The sink blocks for three real seconds while the single runtime thread
     /// serves echo. Installing the sink directly makes the elapsed assertion fail.
     #[tokio::test]

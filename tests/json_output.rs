@@ -164,6 +164,11 @@ async fn every_json_command_prints_one_stable_object() -> Result<()> {
     let server = FabricNode::start(server_home.clone()).await?;
     let client = FabricNode::start(client_home.clone()).await?;
 
+    // Before either trust install can announce to the other node and produce
+    // a legitimate handshake refusal, the audit store is empty.
+    let audit = fabric(&client_home, &["audit", "--json"]).await?;
+    Normaliser { replacements: Vec::new() }.check("audit_empty", ok(&audit)?)?;
+
     let mut server_book = PeerBook::load(&server_home)?;
     server_book.add_with_allow(
         client.id(),
@@ -234,10 +239,6 @@ async fn every_json_command_prints_one_stable_object() -> Result<()> {
     assert_eq!(status_value["peers"][0]["reachable"], true);
     status_value["endpoint_addr"] = "<ENDPOINT_ADDR>".into();
     normaliser.check("status", &serde_json::to_string(&status_value)?)?;
-
-    // The audit counter remains available even before any process ran.
-    let audit = fabric(&client_home, &["audit", "--json"]).await?;
-    normaliser.check("audit_empty", ok(&audit)?)?;
 
     // expose / dial / unexpose
     let socket = drop_dir.path().join("web.sock");

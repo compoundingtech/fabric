@@ -200,7 +200,7 @@ impl Audit {
         })
     }
 
-    fn with_sink(
+    pub(crate) fn with_sink(
         entries: usize,
         max_bytes: usize,
         mut sink: impl FnMut(&Record) -> Result<()> + Send + 'static,
@@ -706,6 +706,7 @@ impl AuditFiles {
             return Ok(());
         }
         let path = self.root.join(AUDIT_FILE);
+        let existed = path.try_exists()?;
         let mut options = OpenOptions::new();
         options.create(true).append(true);
         #[cfg(unix)]
@@ -729,6 +730,16 @@ impl AuditFiles {
         self.opened = metadata.created().unwrap_or_else(|_| SystemTime::now());
         self.bytes = metadata.len();
         self.file = Some(file);
+        if !existed {
+            self.file
+                .as_ref()
+                .expect("audit file opened")
+                .sync_all()
+                .context("sync new audit file")?;
+            File::open(&self.root)?
+                .sync_all()
+                .context("sync audit directory")?;
+        }
         self.prune()?;
         Ok(())
     }
@@ -781,6 +792,9 @@ impl AuditFiles {
             self.boundary = false;
         }
         file.write_all(encoded)?;
+        // Completion means the append was synced, not merely buffered in the
+        // process or kernel. Only this dedicated thread waits for storage.
+        file.sync_all().context("sync audit record")?;
         self.bytes += encoded.len() as u64;
         Ok(())
     }

@@ -17,6 +17,13 @@ Deprecated, Fixed or Security.
 
 ### Added
 
+- Exec and shell audit JSONL records identify the authenticated caller, local
+  label, exec argv, session, outcome, exit status, duration and payload counts.
+  Shell events retain no keystrokes. A dedicated bounded writer fails open,
+  reports loss summaries, rotates private files, and exposes its running loss
+  counter in `status --json` and `fabric audit`; the reader supports time and
+  peer filters and a documented JSON shape (#315).
+
 - **Provisional:** opt-in `--runtime-peers` control API persists owner-scoped exact grants, atomic replacement batches, policy revisions and durable request/cancellation receipts without editing static peer input (#312).
 
 ### Changed
