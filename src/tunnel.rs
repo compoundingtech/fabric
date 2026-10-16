@@ -2525,10 +2525,11 @@ async fn spawn_exec_session(
                         // kill() also waits/reaps. Its cached status can name
                         // a natural exit that raced session cleanup, or the
                         // signal we sent; retain either observed fact.
-                        if let Some(audit) = &audit
-                            && let Ok(Some(status)) = child.try_wait()
-                        {
-                            audit.observe_exit(crate::audit::exit_status(status));
+                        if let Some(audit) = audit.take() {
+                            if let Ok(Some(status)) = child.try_wait() {
+                                audit.observe_exit(crate::audit::exit_status(status));
+                            }
+                            finish_cancelled_exec_audit(audit, output_done, error_done);
                         }
                         eprintln!("fabric: exec {label:?} session {session_id} killed after tunnel session expiry");
                         return;
@@ -2571,15 +2572,11 @@ async fn spawn_exec_session(
                 _ = async { tokio::join!(output_done.wait(), error_done.wait()); } => false,
                 _ = kill_wait.cancelled() => true,
             };
-            audit.finish(
-                if cancelled || wait_failed {
-                    crate::audit::Outcome::Cancelled
-                } else {
-                    crate::audit::Outcome::Ok
-                },
-                status,
-                None,
-            );
+            if cancelled || wait_failed {
+                finish_cancelled_exec_audit(audit, output_done, error_done);
+            } else {
+                audit.finish(crate::audit::Outcome::Ok, status, None);
+            }
         }
     });
 
@@ -2590,6 +2587,23 @@ async fn spawn_exec_session(
         Box::new(stdin),
         Some(SessionCleanup { kill, done }),
     ))
+}
+
+/// The process is already reaped. Let buffered pipe observations finish before
+/// recording its end, without holding the session cleanup handle or child cap.
+/// A descendant retaining a pipe cannot hold the audit call indefinitely.
+fn finish_cancelled_exec_audit(
+    audit: crate::audit::CallGuard,
+    output_done: Arc<crate::audit::Drain>,
+    error_done: Arc<crate::audit::Drain>,
+) {
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_millis(200), async {
+            tokio::join!(output_done.wait(), error_done.wait());
+        })
+        .await;
+        audit.finish(crate::audit::Outcome::Cancelled, None, None);
+    });
 }
 
 async fn log_child_stderr(

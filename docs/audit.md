@@ -20,7 +20,9 @@ Labels are historical snapshots: use the NodeID to follow a peer across
 renames. Global loss records remain visible under a peer filter because a lost
 record cannot reliably be attributed to a peer. Malformed and partial lines
 are skipped and counted in `malformed_records`; a concurrent append may leave
-a temporary partial tail. The reader holds file descriptors across rotation
+a temporary partial tail. After reopening, the writer separates a partial old
+line from the next event so that the new event remains readable. The reader
+holds file descriptors across rotation
 and rescans for newly named segments, without stopping the writer.
 
 ## Recorded facts
@@ -53,7 +55,9 @@ excluded. Exec
 output includes stdout and stderr; built-in exec has null stdin and counts
 zero input bytes. Completion includes output processing. A descendant holding
 an exec-exposure pipe open can delay the end until it closes or the session is
-cancelled; built-in exec retains its existing bounded post-exit drain.
+cancelled; built-in exec retains its existing bounded post-exit drain. A
+cancelled exposure gets up to 200 ms for buffered pipe observations in a
+separate audit task, without delaying child cleanup or retaining its cap.
 
 No environment map, shell keystrokes, stdin content or stdout/stderr content is
 stored. Exec argv is recorded verbatim, so keep secrets out of command arguments.

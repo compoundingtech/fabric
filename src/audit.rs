@@ -1,7 +1,7 @@
 //! Best-effort process audit. Only the dedicated writer opens or writes files.
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, BufRead, BufReader, Read, Seek, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -713,13 +713,13 @@ impl AuditFiles {
         let path = self.root.join(AUDIT_FILE);
         let existed = path.try_exists()?;
         let mut options = OpenOptions::new();
-        options.create(true).append(true);
+        options.create(true).read(true).append(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
-        let file = options
+        let mut file = options
             .open(&path)
             .with_context(|| format!("open {}", path.display()))?;
         let metadata = file.metadata()?;
@@ -731,6 +731,14 @@ impl AuditFiles {
         {
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        // A crash may leave a partial final JSON line. Keep that malformed
+        // tail visible to the reader without joining the next valid event to it.
+        if metadata.len() != 0 {
+            file.seek(io::SeekFrom::End(-1))?;
+            let mut last = [0];
+            file.read_exact(&mut last)?;
+            self.boundary |= last[0] != b'\n';
         }
         self.opened = metadata.created().unwrap_or_else(|_| SystemTime::now());
         self.bytes = metadata.len();
@@ -1350,6 +1358,21 @@ mod tests {
         aged.append(&call("peer-a", "laptop", "a"))?;
         aged.append(&call("peer-a", "laptop", "b"))?;
         assert_eq!(audit_paths(aged_root.path())?.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_after_a_partial_append_preserves_the_next_event() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join(AUDIT_FILE), b"{\"event\":\"exec_start\"")?;
+        let audit = Audit::start(root.path());
+        audit.record(call("peer-a", "laptop", "after-crash"));
+        assert!(audit.drain(Duration::from_secs(2)).await);
+        assert_eq!(audit.status().dropped_records, 0);
+        let output = read(root.path(), None, None)?;
+        assert_eq!(output.malformed_records, 1);
+        assert_eq!(output.records.len(), 1);
+        assert_eq!(output.records[0].call().unwrap().session_id, "after-crash");
         Ok(())
     }
 
