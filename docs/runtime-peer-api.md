@@ -152,7 +152,9 @@ its selected handlers, tunnel cleanup, and owned children to end. A separate
 monitor targets completion within **two seconds** of the success reply, without
 holding the policy writer behind an uncooperative service. A missed bound
 returns `cancellation_timeout` on receipt queries together with the committed
-receipt and remaining IDs; it never rolls back policy. Completion persistence
+receipt and remaining IDs; it never rolls back policy. A recorded timeout stays
+visible after work ends or the daemon restarts; its remaining-ID lists become
+empty when completion is confirmed. Completion persistence
 failure retains the durable pending receipt and is logged. Restart ends old
 work and resolves pending receipts with `restart_ended_work=true`.
 

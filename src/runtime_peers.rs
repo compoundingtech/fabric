@@ -455,10 +455,12 @@ impl RuntimePeers {
             store.stored.static_digest = store.static_input.digest.clone();
             for receipt in &mut store.stored.receipts {
                 if receipt.cancellation.state != CancellationState::Complete {
-                    receipt.cancellation.state = CancellationState::Complete;
+                    if receipt.cancellation.state == CancellationState::Pending {
+                        receipt.cancellation.state = CancellationState::Complete;
+                    }
                     receipt.cancellation.remaining_admissions.clear();
                     receipt.cancellation.remaining_sessions.clear();
-                    receipt.cancellation.restart_ended_work = restarted;
+                    receipt.cancellation.restart_ended_work |= restarted;
                     changed = true;
                 }
             }
@@ -1367,11 +1369,24 @@ mod tests {
                 ..Cancellation::default()
             },
         )?;
-        let store = open(&dir);
+        let mut store = open(&dir);
         let receipt = store.receipt("pending")?;
         assert_eq!(receipt.cancellation.state, CancellationState::Complete);
         assert!(receipt.cancellation.restart_ended_work);
         assert!(receipt.cancellation.remaining_admissions.is_empty());
+        store.update_cancellation(
+            "pending",
+            Cancellation {
+                state: CancellationState::TimedOut,
+                admissions: vec![8],
+                remaining_admissions: vec![8],
+                ..Cancellation::default()
+            },
+        )?;
+        let late = open(&dir).receipt("pending")?;
+        assert_eq!(late.cancellation.state, CancellationState::TimedOut);
+        assert!(late.cancellation.remaining_admissions.is_empty());
+        assert!(late.cancellation.restart_ended_work);
         Ok(())
     }
     #[test]
