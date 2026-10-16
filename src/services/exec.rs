@@ -279,11 +279,23 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let mut audit = crate::audit::exec_attempt();
+    let counts = audit.as_ref().map(|audit| audit.counts());
     let argv = match read_argv(recv).await? {
         Some(argv) => argv,
         None => return Ok(()),
     };
+    if let Some(audit) = &audit {
+        audit.start_exec(&argv);
+    }
     if argv.is_empty() {
+        if let Some(audit) = audit.take() {
+            audit.finish(
+                crate::audit::Outcome::SpawnFailed,
+                Some(EXIT_SPAWN_FAILED),
+                Some(ErrorCode::SpawnFailed),
+            );
+        }
         write_server_frame(send, ServerFrame::Error("empty command".to_string())).await?;
         return write_server_frame(send, ServerFrame::Exit(EXIT_SPAWN_FAILED)).await;
     }
@@ -325,6 +337,13 @@ where
     {
         Ok(child) => child,
         Err(error) => {
+            if let Some(audit) = audit.take() {
+                audit.finish(
+                    crate::audit::Outcome::SpawnFailed,
+                    Some(EXIT_SPAWN_FAILED),
+                    Some(ErrorCode::SpawnFailed),
+                );
+            }
             write_server_frame(
                 send,
                 ServerFrame::Error(
@@ -374,11 +393,17 @@ where
             },
             result = stdout.read(&mut out_buf), if !out_done => match result? {
                 0 => out_done = true,
-                n => write_server_frame(send, ServerFrame::Stdout(out_buf[..n].to_vec())).await?,
+                n => {
+                    if let Some(counts) = &counts { counts.add_out(n); }
+                    write_server_frame(send, ServerFrame::Stdout(out_buf[..n].to_vec())).await?;
+                },
             },
             result = stderr.read(&mut err_buf), if !err_done => match result? {
                 0 => err_done = true,
-                n => write_server_frame(send, ServerFrame::Stderr(err_buf[..n].to_vec())).await?,
+                n => {
+                    if let Some(counts) = &counts { counts.add_out(n); }
+                    write_server_frame(send, ServerFrame::Stderr(err_buf[..n].to_vec())).await?;
+                },
             },
             result = child.wait() => status = Some(result.context("exec wait failed")?),
         }
@@ -403,16 +428,29 @@ where
         tokio::select! {
             result = stdout.read(&mut out_buf), if !out_done => match result? {
                 0 => out_done = true,
-                n => write_server_frame(send, ServerFrame::Stdout(out_buf[..n].to_vec())).await?,
+                n => {
+                    if let Some(counts) = &counts { counts.add_out(n); }
+                    write_server_frame(send, ServerFrame::Stdout(out_buf[..n].to_vec())).await?;
+                },
             },
             result = stderr.read(&mut err_buf), if !err_done => match result? {
                 0 => err_done = true,
-                n => write_server_frame(send, ServerFrame::Stderr(err_buf[..n].to_vec())).await?,
+                n => {
+                    if let Some(counts) = &counts { counts.add_out(n); }
+                    write_server_frame(send, ServerFrame::Stderr(err_buf[..n].to_vec())).await?;
+                },
             },
             _ = tokio::time::sleep_until(drain_until) => break,
         }
     }
 
+    if let Some(audit) = audit.take() {
+        audit.finish(
+            crate::audit::Outcome::Ok,
+            Some(crate::audit::exit_status(status)),
+            None,
+        );
+    }
     // `code()` is None when the child was killed by a signal; report 1 there.
     write_server_frame(send, ServerFrame::Exit(status.code().unwrap_or(1))).await
 }

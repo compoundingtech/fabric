@@ -73,6 +73,7 @@ impl Normaliser {
             Value::String(text) => {
                 match key {
                     // The only keys whose strings are not ours to compare.
+                    Some("since") => *text = "<AUDIT_SINCE>".into(),
                     Some("transport") => *text = "<TRANSPORT>".into(),
                     Some("address") => *text = "<HOST:PORT>".into(),
                     // A dial socket is named after a hash of the peer and
@@ -234,6 +235,10 @@ async fn every_json_command_prints_one_stable_object() -> Result<()> {
     status_value["endpoint_addr"] = "<ENDPOINT_ADDR>".into();
     normaliser.check("status", &serde_json::to_string(&status_value)?)?;
 
+    // The audit counter remains available even before any process ran.
+    let audit = fabric(&client_home, &["audit", "--json"]).await?;
+    normaliser.check("audit_empty", ok(&audit)?)?;
+
     // expose / dial / unexpose
     let socket = drop_dir.path().join("web.sock");
     let expose = fabric(
@@ -376,5 +381,29 @@ async fn a_failing_json_command_prints_only_an_error_object() -> Result<()> {
     }
 
     node.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn audit_json_reads_offline_records_and_keeps_global_loss_visible_under_peer_filter() -> Result<()> {
+    let dir = TempDir::new()?;
+    let home = FabricHome::new(dir.path());
+    home.prepare()?;
+    let record = serde_json::json!({ "event": "exec_end", "time": "2026-10-16T00:00:00Z", "peer": "peer-a",
+        "name": "laptop", "service": "exec", "argv": ["true"], "session_id": "session-1", "outcome": "ok",
+        "code": null, "exit_status": 7, "duration_millis": 12, "bytes_in": 0, "bytes_out": 5 });
+    let loss = serde_json::json!({ "event": "audit_loss", "time": "2026-10-16T00:00:02Z", "count": 2,
+        "first_time": "2026-10-16T00:00:00Z", "last_time": "2026-10-16T00:00:01Z" });
+    fs::write(home.root().join("audit.jsonl"), format!("{record}\n{loss}\n{{\"event\":"))?;
+    let normaliser = Normaliser { replacements: Vec::new() };
+    let audit = fabric(&home, &["audit", "--peer", "laptop", "--json"]).await?;
+    normaliser.check("audit", ok(&audit)?)?;
+    let other = fabric(&home, &["audit", "--peer", "peer-b", "--json"]).await?;
+    let other: Value = serde_json::from_str(ok(&other)?)?;
+    assert_eq!(other["records"].as_array().unwrap().len(), 1);
+    assert_eq!(other["records"][0]["event"], "audit_loss");
+    let recent = fabric(&home, &["audit", "--since", "0s", "--json"]).await?;
+    let recent: Value = serde_json::from_str(ok(&recent)?)?;
+    assert!(recent["records"].as_array().unwrap().is_empty());
     Ok(())
 }
