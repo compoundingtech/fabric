@@ -37,7 +37,8 @@ nothing tells you to look.
 | A machine's address changes mid-session, as a laptop moving between networks does | The session survives without restarting the process, and the machine keeps its identity. Proven for one kind of tunnel. | Not separately measured | `generic_tunnel_survives_client_endpoint_recycle_without_process_restart`. **`NOT PROVEN` for TCP tunnels specifically.** |
 | A local network change (a VPN coming up, a Wi-Fi switch, an interface change) leaves the connection to a peer on a path that no longer answers | After the debounced notice the daemon asks each peer connection it still holds to answer one echo within 3 s and resets only the one that does not; the next request redials with fresh path selection. A connection that still answers is kept, and the endpoint is not rebuilt. One reset per peer per minute. | Reset 3.2 s after the change. Before this check: 64.6 s (the QUIC path-idle timeout, measured 2026-09-11) or the 60 s peer-probe backstop, whichever came first. | `a_network_change_resets_a_held_connection_that_stopped_answering_without_a_recycle`, `a_vpn_coming_up_keeps_a_held_connection_that_still_answers` |
 | A consumer opens one short TCP connection per request through a dial listener, so every request is a tunnel session that ends within a second | Each clean end is the session finishing, not the transport failing, so it no longer counts toward replacing the shared peer connection. Before the fix every third one replaced the connection. | On a real two-machine pair before the fix, the shared connection was replaced every few seconds and never lived longer than that; after the fix, one connection held on both sides with no counted failures. | `one_request_tcp_sessions_leave_the_shared_connection_alone` |
-| New streams opened back to back through one dial listener, with no pause: 27 to 31 in a row on a two-daemon local pair | After about 31 the next one is refused: its local connection closes before the service greets it. A stream that has just closed is still winding down for about a second, and a dialing process serves 32 at once. With 300 ms between streams, 60 in a row and then 1,000 over a release soak all succeed. A person or device attaching a terminal opens a few a minute; a client that opens a stream per request at tens a second should reuse a stream or retry. NOT FIXED: the wind-down time is not shortened, and the refusal carries no reason. | Seen in `socket_expose_survives_idle_slow_concurrent_and_abrupt_streams` while writing it | `FABRIC_SOAK_PAUSE_MS=0` reproduces it |
+| New generic streams opened back to back through one dial listener, with no pause | Generic Unix/TCP dials queue at shared local limits and retry remote cap refusals before admission. Above the bounded queue or its 10-second deadline, the local socket closes and the daemon logs `fabric:session_limit_reached`. This does not shorten the existing wind-down. | 400 unpaced short Unix sessions (4 workers × 100) passed in a 4.01 s soak on a local pair, 2026-10-14; before queueing, the recorded refusal occurred after 27 to 31 streams. | `socket_expose_survives_idle_slow_concurrent_and_abrupt_streams`, `FABRIC_SOAK_PAUSE_MS=0 FABRIC_SOAK_ROUNDS=100` |
+| Twenty fresh HTTP connections at once through a generic TCP dial listener | Connections wait for a peer slot instead of failing above the remote cap. Only a pre-admission session-cap refusal is retried; no application request is replayed. | 200/200 first bytes in 161 ms over 10 batches × 20, versus 160/200 in the broken-code regression; 64/64 at a custom per-peer cap of 2 in 442 ms, and 64/64 from two dialers competing at a total cap of 2 in 798 ms. Local pair, 2026-10-14. | `tcp_dial_serves_all_two_hundred_fanout_requests`, `tcp_dial_queues_sixty_four_connections_above_a_custom_server_cap`, `tcp_dial_queues_competing_dialers_at_the_total_server_cap` |
 | A configured peer stays offline | Its failed connection attempt stays isolated. Healthy peer streams still open. Failed probes retain no connection. | Under 250 ms in the regression test. A matched measurement on a real machine found no attributable cost (below). | `offline_peer_cost_is_bounded_and_healthy_peer_stays_fast` |
 | Five minutes or four hours offline | Cached requests fail locally; the returning peer announces from its new address. | 0.64 s / 0.48 s after startup, virtual absence | `a_peer_returns_after_minutes_and_hours_without_errors_or_a_helper` |
 | Both daemons restart | Persisted exposure and Unix/TCP dial listeners return automatically. | Same Unix path and allocated TCP port | `registered_dials_and_default_exposure_survive_both_daemon_restarts` |
@@ -79,15 +80,32 @@ An evicted detached session cannot resume, even before its retention period
 ends. Each session can retain up to 4 MiB of outgoing unacknowledged data,
 alongside transport and service memory; raising the cap increases that budget.
 
-**NOT FIXED:** a dial listener does not queue connections above the remote cap.
-The refusal carries `fabric:session_limit_reached` in the dialing daemon's log,
-but the local client sees EOF. The per-peer cap counts sessions across listeners
-and protocols, so limiting each listener to 16 connections separately does not
-prevent a refusal. Limit aggregate concurrency to the same peer, reuse streams,
-or retry. The separate local dial-handler limit and short-session wind-down
-described in the table can also refuse a connection before remote admission.
-This documents the current behavior; it does not claim a new benchmark or fix
-for [#304](https://github.com/compoundingtech/fabric/issues/304).
+Generic Unix and TCP dial listeners share 16 active slots and a bound of 144
+outstanding local connections per peer (16 active plus 128 waiting). Waiting
+for the daemon's global dial-handler budget uses the same 10-second deadline.
+`fabric dial --queue-timeout SECONDS` changes this deadline (0 for immediate refusal, otherwise minimum 0.001 s),
+persists with the listener, and survives a daemon restart. Repeating the dial
+updates the timeout for new connections, leaving existing deadlines intact.
+If the exposing daemon has a smaller cap, or its total cap is occupied by
+other peers, an initial `session_limit_reached` reply is retried within that
+deadline. This includes the exposure's exec child limit: through a generic
+dial listener, a child-limit refusal waits up to the queue timeout (default
+10 seconds) before the local client sees EOF. `--queue-timeout 0` restores
+immediate refusal, disabling local waiting and remote capacity retries.
+Each dialing daemon queues independently; there is no cross-daemon
+fairness guarantee. Policy denials and service failures are not retried, and a
+session that was admitted is never restarted as a new request.
+
+Built-in exec and shell one-shot calls share the same local budget and fixed
+10-second wait, preserving each call's independent socket and one-accept
+cleanup. This does not retry remote service refusals. Queue expiry or overflow
+produces a framed exec error, or closes shell, and logs the capacity code.
+
+**NOT FIXED:** a full queue or expired deadline still closes the local socket
+without a reason on the data path; `fabric:session_limit_reached` is in the daemon's log. The
+short-session wind-down is also unchanged. The table records the local replay
+of [#304](https://github.com/compoundingtech/fabric/issues/304); it does not
+claim a new two-machine or forced-relay measurement.
 
 ## What you see while it is broken
 

@@ -1094,6 +1094,12 @@ written to the fabric daemon log with the tunnel session id. Exec exposures
 default to at most 32 active children per exposure; use `--max-children` to set
 a different per-exposure cap.
 
+Through a generic dial listener, an exposure's child-limit refusal now waits
+up to the dial's queue timeout (default 10 seconds) before the local client sees
+EOF; it cannot start an extra child. Set `fabric dial --queue-timeout 0` to
+restore immediate refusal. Zero disables local capacity waiting and remote
+capacity retries, while ordinary connections with available capacity work.
+
 Exposes are persisted by default to `<home>/config.toml` and are restored when
 the daemon starts. `fabric add` writes the separate authoritative `peers.toml`,
 which holds every peer's grants. Use `--ephemeral` for short-lived test exposes
@@ -1113,6 +1119,7 @@ Stop accepting a protocol and remove its persisted config entry.
 ```sh
 fabric dial <peer> <protocol>
 fabric dial <peer> <protocol> --tcp <local-host:port>
+fabric dial <peer> <protocol> --tcp <local-host:port> --queue-timeout 10
 ```
 
 Create and print a local Unix socket path. Connections to that socket are
@@ -1150,10 +1157,27 @@ Detached sessions can be evicted to admit new ones before their 900-second
 retention period ends; evicted sessions cannot resume. Raising the caps allows
 more live sessions but increases the possible memory use.
 
-Currently, connections above the remote cap are refused with
-`fabric:session_limit_reached` in the dialing daemon's log; the local client sees
-EOF. The dial listener does not yet queue them. Applications opening many short
-connections should bound concurrency, reuse connections, or retry refusals.
+Generic dial listeners share a queue per peer, across Unix/TCP listeners and
+protocols. Each dialing daemon allows 16 active sessions per peer and bounds
+outstanding connections to 144 (16 active plus 128 waiting). New connections
+wait for local capacity; a remote session-cap refusal before admission is
+retried within the same 10-second deadline. Set `--queue-timeout` in seconds
+(0 for immediate refusal, otherwise at least 0.001); it is saved with the dial and restored on daemon startup.
+Repeating a dial updates the listener's timeout for new connections. Waiting
+connections keep their original deadline. A full queue or an expired deadline
+reports `fabric:session_limit_reached` in the dialing daemon's log; the local
+client's socket closes. Other remote refusals fail immediately, and requests already
+admitted are never retried as new sessions. Different dialing daemons have
+separate queues; contention at the exposing daemon's total cap still waits
+within each caller's deadline. Applications can reuse connections or retry a
+refusal after that deadline.
+Built-in exec and shell calls use this same local peer and daemon budget,
+with a fixed 10-second capacity wait. Each call keeps its own one-shot socket;
+accepting it removes the rendezvous path while the accepted connection waits.
+Exec reports an expired or full queue in its framed error response; shell
+closes the connection, and both log `fabric:session_limit_reached`. This local
+wait does not add remote admission retries to built-in services. The
+`--queue-timeout` setting applies to generic dial listeners.
 See [the session-limit failure mode](docs/failure-modes.md#session-limits).
 
 ```sh
