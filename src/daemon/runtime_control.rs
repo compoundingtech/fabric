@@ -497,6 +497,22 @@ impl DaemonState {
                     crate::error::code_of(&error) == ErrorCode::RuntimeCommitIndeterminate;
                 self.quarantine_runtime_policy(&mut published, &error, indeterminate)
                     .await;
+                if !indeterminate {
+                    // Validation succeeded: honor exactly this candidate's
+                    // withdrawals even though its durable revision failed.
+                    self.signal_runtime_revocations(&selected).await;
+                    let mut quarantine = self.policy_quarantine.lock().await;
+                    if let Some(quarantine) = quarantine.as_mut() {
+                        quarantine
+                            .admissions
+                            .extend(selected.admissions.iter().cloned());
+                        quarantine
+                            .sessions
+                            .extend(selected.sessions.iter().cloned());
+                    }
+                    drop(quarantine);
+                    self.monitor_runtime_revocations(runtime, None, selected);
+                }
                 return Err(error);
             }
         }
@@ -1340,7 +1356,7 @@ mod tests {
     }
 
     // Exercise actual existing traffic, not only the quarantined snapshot.
-    async fn failed_static_reload_preserves_work(kind: &str) -> Result<()> {
+    async fn failed_static_reload_handles_candidate_withdrawals(kind: &str) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let _serial = SERIAL.lock().await;
         let dir = tempfile::tempdir()?;
@@ -1353,7 +1369,7 @@ mod tests {
             client.id(),
             Some("client".into()),
             Some(client.addr()),
-            Some(vec!["work/0".into()]),
+            Some(vec!["work/0".into(), "other/0".into()]),
         );
         if kind == "git" {
             static_book.share_git_remote("repo", dir.path().join("repo.git"))?;
@@ -1379,17 +1395,28 @@ mod tests {
             .await?;
         }
         let (echo, task) = echo_server().await?;
-        server.expose_tcp("work/0", echo).await?;
+        server.expose_tcp("work/0", echo.clone()).await?;
+        server.expose_tcp("other/0", echo).await?;
         let port = client
             .dial_tcp("server", "work/0", "127.0.0.1:0".into())
             .await?;
         let mut live = tokio::net::TcpStream::connect(port).await?;
         round_trip(&mut live, b"before-bad-reload").await?;
+        let other_port = client
+            .dial_tcp("server", "other/0", "127.0.0.1:0".into())
+            .await?;
+        let mut other = tokio::net::TcpStream::connect(other_port).await?;
+        round_trip(&mut other, b"unrelated-before-reload").await?;
         let original_static = fs::read(home.peers_path())?;
         let state = server.state();
         let admitted = state.admissions.admit(
             client.id(),
             crate::admission::Grant::Service("work/0".into()),
+        );
+        let withdrawn = admitted.revoked();
+        let unrelated = state.admissions.admit(
+            client.id(),
+            crate::admission::Grant::Service("other/0".into()),
         );
         if kind == "malformed" {
             fs::write(home.peers_path(), "format = [")?;
@@ -1401,7 +1428,7 @@ mod tests {
                 client.id(),
                 Some("client".into()),
                 Some(client.addr()),
-                Some(vec![]),
+                Some(vec!["other/0".into()]),
             );
             static_book.save(&home)?;
         }
@@ -1432,10 +1459,29 @@ mod tests {
                 .is_some()
         );
         assert!(
-            !admitted.revoked().is_cancelled(),
-            "invalid static edit cancelled accepted work"
+            !unrelated.revoked().is_cancelled(),
+            "failed persist cancelled unrelated work"
         );
-        round_trip(&mut live, b"still-running-after-fault").await?;
+        round_trip(&mut other, b"unrelated-after-fault").await?;
+        if kind == "read-only" {
+            assert!(
+                withdrawn.is_cancelled(),
+                "valid static withdrawal remained live after persist failed"
+            );
+            let mut byte = [0];
+            let ended = tokio::time::timeout(Duration::from_secs(3), live.read(&mut byte)).await?;
+            assert!(
+                matches!(ended, Ok(0) | Err(_)),
+                "withdrawn traffic remained live"
+            );
+        } else {
+            assert!(
+                !withdrawn.is_cancelled(),
+                "invalid static edit cancelled accepted work"
+            );
+            round_trip(&mut live, b"still-running-after-fault").await?;
+        }
+        drop(admitted);
         // New logical streams are refused on the already existing connection.
         assert!(
             client
@@ -1450,17 +1496,40 @@ mod tests {
             static_book.share_git_remote("repo", dir.path().join("repo.git"))?;
             static_book.save(&home)?;
         }
+        if kind == "read-only" {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if state
+                        .policy_quarantine
+                        .lock()
+                        .await
+                        .as_ref()
+                        .unwrap()
+                        .status(false)
+                        .await
+                        .state
+                        == CancellationState::Complete
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+        }
         state.reload_peers().await?;
         if kind == "read-only" {
             assert!(
-                admitted.revoked().is_cancelled(),
+                withdrawn.is_cancelled(),
                 "successful repair must apply the withdrawal"
             );
         } else {
-            assert!(!admitted.revoked().is_cancelled());
+            assert!(!withdrawn.is_cancelled());
             round_trip(&mut live, b"running-after-repair").await?;
         }
-        drop(admitted);
+        assert!(!unrelated.revoked().is_cancelled());
+        round_trip(&mut other, b"unrelated-after-repair").await?;
+        drop(unrelated);
         client.shutdown().await?;
         server.shutdown().await?;
         task.abort();
@@ -1468,19 +1537,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn static_reload_with_read_only_state_closes_new_admissions_but_preserves_work()
-    -> Result<()> {
-        failed_static_reload_preserves_work("read-only").await
+    async fn static_reload_with_read_only_state_revokes_only_candidate_withdrawals() -> Result<()> {
+        failed_static_reload_handles_candidate_withdrawals("read-only").await
     }
     #[tokio::test]
     async fn static_reload_with_runtime_git_conflict_fails_closed_and_preserves_work() -> Result<()>
     {
-        failed_static_reload_preserves_work("git").await
+        failed_static_reload_handles_candidate_withdrawals("git").await
     }
     #[tokio::test]
     async fn malformed_static_reload_preserves_work_and_repairs_without_cancelling_it() -> Result<()>
     {
-        failed_static_reload_preserves_work("malformed").await
+        failed_static_reload_handles_candidate_withdrawals("malformed").await
     }
 
     #[tokio::test]
