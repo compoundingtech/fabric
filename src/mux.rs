@@ -368,6 +368,9 @@ pub struct PeerConnections {
     /// dial block every other peer in the map. This keeps one small entry per
     /// peer used during the process lifetime; the fleet peer set is bounded.
     peer_gates: Mutex<HashMap<EndpointId, Arc<Mutex<()>>>>,
+    /// Outgoing generic tunnel admission is shared across every listener to
+    /// this peer, independently of connection generation and protocol.
+    dial_queues: crate::dial_queue::DialQueues,
     legacy_notices: Mutex<HashSet<(EndpointId, u64)>>,
     legacy_fallbacks: Mutex<HashMap<(EndpointId, u64), LegacyFallback>>,
     opened_tx: mpsc::UnboundedSender<Connection>,
@@ -382,6 +385,7 @@ impl PeerConnections {
             local_id,
             conns: Mutex::new(HashMap::new()),
             peer_gates: Mutex::new(HashMap::new()),
+            dial_queues: crate::dial_queue::DialQueues::default(),
             legacy_notices: Mutex::new(HashSet::new()),
             legacy_fallbacks: Mutex::new(HashMap::new()),
             opened_tx,
@@ -396,6 +400,10 @@ impl PeerConnections {
     pub(crate) fn connect_attempts(&self) -> usize {
         self.mux_connect_attempts
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn dial_queue(&self, peer: EndpointId) -> Arc<crate::dial_queue::DialQueue> {
+        self.dial_queues.peer(peer)
     }
 
     async fn peer_gate(&self, peer: EndpointId) -> Arc<Mutex<()>> {

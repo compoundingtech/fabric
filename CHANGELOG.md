@@ -17,6 +17,16 @@ Deprecated, Fixed or Security.
 
 ### Changed
 
+- Built-in exec and shell one-shot calls now wait up to 10 seconds for the
+  shared local peer and daemon dial capacity, preserving independent sockets
+  and one-accept cleanup. A full or expired queue logs
+  `fabric:session_limit_reached`; exec also receives a framed error.
+
+- Through a generic dial listener, an exposure's exec child-limit refusal now
+  waits for capacity up to the queue timeout (default 10 seconds) before the
+  local client sees EOF. `--queue-timeout 0` restores immediate refusal and
+  disables local capacity waiting and remote capacity retries. Existing
+  admitted requests are not replayed and no child starts above the limit.
 - README documents the existing server session limits and the current EOF behavior of refused dial sessions (#306).
 - README and the JSON contract distinguish echo status samples from exact-service probes without requiring broader grants (#311).
 
@@ -25,6 +35,14 @@ Deprecated, Fixed or Security.
 - Concurrent exec and shell commands use independent one-shot local sockets, preventing one command from unlinking another command's socket. Unused sockets expire after 30 seconds and stale one-shot sockets are removed at startup (#316).
 - A failed Unix dial is never persisted, overlong socket paths report `fabric:invalid_argument` and the maximum home length, and failed saved Unix or TCP listeners are skipped at startup and reported by status in `dial_restore_failures` (#297).
 - `fabric down` waits up to 15 seconds for lease release through endpoint and child cleanup, so immediate `down && up` succeeds or reports `fabric:daemon_stop_timeout` (fault, exit 69) while still stopping (#298).
+
+- Generic Unix and TCP dial listeners queue new connections at shared per-peer
+  and daemon-wide session limits. A bounded queue waits up to 10 seconds by
+  default (`--queue-timeout`, persisted with the listener) and
+  retries only a remote session-cap refusal before admission, preserving the
+  request's bytes and session identity. Queue overflow or timeout logs the
+  existing `fabric:session_limit_reached` code; local refusal reporting remains
+  unchanged. No wire format or server cap changes.
 
 ## [0.2.41] - 2026-10-13
 
