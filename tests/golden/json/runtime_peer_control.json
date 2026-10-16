@@ -258,7 +258,7 @@
           "admissions": [],
           "remaining_admissions": [],
           "remaining_sessions": [],
-          "restart_ended_work": false,
+          "restart_evidence": null,
           "sessions": [],
           "state": "complete"
         },
@@ -289,6 +289,122 @@
       ],
       "owner": "controller-a",
       "request_id": "replace-17"
+    },
+    "type": "runtime_peers"
+  },
+  "restart_reply": {
+    "reply": {
+      "affected": [
+        {
+          "direction": "inbound_only",
+          "direction_sources": [
+            {
+              "kind": "static",
+              "path": "/config/peers.toml"
+            },
+            {
+              "kind": "runtime",
+              "owner": "controller-b"
+            }
+          ],
+          "name": "laptop",
+          "node_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+          "services": {
+            "work/0": [
+              {
+                "kind": "static",
+                "path": "/config/peers.toml"
+              },
+              {
+                "kind": "runtime",
+                "owner": "controller-b"
+              }
+            ]
+          },
+          "trust_sources": [
+            {
+              "kind": "static",
+              "path": "/config/peers.toml"
+            },
+            {
+              "kind": "runtime",
+              "owner": "controller-b"
+            }
+          ]
+        }
+      ],
+      "error": {
+        "class": "fault",
+        "code": "cancellation_timeout",
+        "message": "daemon restarted; child exit was not observed"
+      },
+      "mutation": {
+        "affected": [
+          {
+            "direction": "inbound_only",
+            "direction_sources": [
+              {
+                "kind": "static",
+                "path": "/config/peers.toml"
+              },
+              {
+                "kind": "runtime",
+                "owner": "controller-b"
+              }
+            ],
+            "name": "laptop",
+            "node_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+            "services": {
+              "work/0": [
+                {
+                  "kind": "static",
+                  "path": "/config/peers.toml"
+                },
+                {
+                  "kind": "runtime",
+                  "owner": "controller-b"
+                }
+              ]
+            },
+            "trust_sources": [
+              {
+                "kind": "static",
+                "path": "/config/peers.toml"
+              },
+              {
+                "kind": "runtime",
+                "owner": "controller-b"
+              }
+            ]
+          }
+        ],
+        "cancellation": {
+          "admissions": [
+            17
+          ],
+          "remaining_admissions": [
+            17
+          ],
+          "remaining_sessions": [],
+          "restart_evidence": {
+            "child_exit_observed": false,
+            "daemon_instance_changed": true
+          },
+          "sessions": [],
+          "state": "timed_out"
+        },
+        "committed_revision": 7,
+        "current_revision": 9,
+        "removals": [
+          {
+            "effective_trust_removed": false,
+            "node_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+            "owner_record_removed": true
+          }
+        ],
+        "request_id": "replace-17"
+      },
+      "snapshot": null
     },
     "type": "runtime_peers"
   }

@@ -33,7 +33,7 @@ impl Revocations {
             remaining_sessions: sessions.clone(),
             admissions,
             sessions,
-            restart_ended_work: false,
+            restart_evidence: None,
         }
     }
     async fn status(&self, timed_out: bool) -> Cancellation {
@@ -271,10 +271,19 @@ impl DaemonState {
         };
         match result {
             Ok(mut reply) => {
-                if reply.mutation.as_ref().is_some_and(|receipt| {
-                    receipt.cancellation.state == CancellationState::TimedOut
-                }) {
-                    reply.error = Some(PolicyError::of(&FabricError::new(ErrorCode::CancellationTimeout, "policy committed, but selected work did not finish within two seconds; inspect remaining IDs").into()));
+                if let Some(receipt) = reply
+                    .mutation
+                    .as_ref()
+                    .filter(|receipt| receipt.cancellation.state == CancellationState::TimedOut)
+                {
+                    let message = if receipt.cancellation.restart_evidence.is_some() {
+                        "policy committed, but the daemon instance changed and child exit was not observed; inspect remaining IDs and restart_evidence"
+                    } else {
+                        "policy committed, but selected work did not finish within two seconds; inspect remaining IDs"
+                    };
+                    reply.error = Some(PolicyError::of(
+                        &FabricError::new(ErrorCode::CancellationTimeout, message).into(),
+                    ));
                 }
                 reply
             }
@@ -770,6 +779,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_reports_unconfirmed_completion_as_a_fault_with_evidence() -> Result<()> {
+        let _serial = SERIAL.lock().await;
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let (mut store, _) = runtime_peers::RuntimePeers::open(&home);
+        let transaction = Transaction {
+            owner: "controller".into(),
+            request_id: "before-restart".into(),
+            expected_revision: 0,
+            operations: vec![Operation::AddPeer {
+                node_id: iroh::SecretKey::from_bytes(&[81; 32]).public(),
+                name: Some("phone".into()),
+                direction: Some(Direction::InboundOnly),
+                addr: None,
+            }],
+        };
+        let prepared = store.prepare(&transaction)?;
+        store.commit(
+            prepared,
+            &transaction.request_id,
+            Cancellation {
+                admissions: vec![17],
+                remaining_admissions: vec![17],
+                sessions: vec!["old-session".into()],
+                remaining_sessions: vec!["old-session".into()],
+                ..Cancellation::default()
+            },
+        )?;
+        drop(store);
+        let server = FabricNode::start_with_daemon_options(home.clone(), options()).await?;
+        for _ in 0..2 {
+            let reply = request(
+                &home,
+                Request::Cancellation {
+                    request_id: transaction.request_id.clone(),
+                },
+            )
+            .await?;
+            let error = reply.error.unwrap();
+            assert_eq!(error.code, "cancellation_timeout");
+            assert!(error.message.contains("child exit was not observed"));
+            let cancellation = reply.mutation.unwrap().cancellation;
+            assert_eq!(cancellation.state, CancellationState::TimedOut);
+            assert_eq!(cancellation.remaining_admissions, [17]);
+            assert_eq!(cancellation.remaining_sessions, ["old-session"]);
+            let evidence = cancellation.restart_evidence.unwrap();
+            assert!(evidence.daemon_instance_changed);
+            assert!(!evidence.child_exit_observed);
+            server.state().reload_peers().await?;
+        }
+        server.shutdown().await
+    }
+
+    #[tokio::test]
     async fn withdrawal_ends_detached_exec_and_its_child_but_preserves_other_work() -> Result<()> {
         let _serial = SERIAL.lock().await;
         let dir = tempfile::tempdir()?;
@@ -1002,7 +1065,7 @@ mod tests {
         let receipt = reply.mutation.unwrap();
         assert_eq!(receipt.committed_revision, 2);
         assert_eq!(receipt.cancellation.state, CancellationState::Complete);
-        assert!(!receipt.cancellation.restart_ended_work);
+        assert!(receipt.cancellation.restart_evidence.is_none());
         client.shutdown().await?;
         server.shutdown().await?;
         task.abort();

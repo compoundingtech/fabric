@@ -154,9 +154,13 @@ holding the policy writer behind an uncooperative service. A missed bound
 returns `cancellation_timeout` on receipt queries together with the committed
 receipt and remaining IDs; it never rolls back policy. A recorded timeout stays
 visible after work ends or the daemon restarts; its remaining-ID lists become
-empty when completion is confirmed. Completion persistence
-failure retains the durable pending receipt and is logged. Restart ends old
-work and resolves pending receipts with `restart_ended_work=true`.
+empty when completion is confirmed. Completion persistence failure retains the
+previous durable receipt and is logged. Restart resolves unconfirmed receipts
+as `timed_out` / `cancellation_timeout`, preserving their remaining IDs and
+`restart_evidence: {daemon_instance_changed: true, child_exit_observed: false}`.
+A later reload cannot turn that missing child-exit observation into completion.
+Receipts that already observed actual completion retain it. Cross-crash child
+cleanup is separate work in [#325](https://github.com/compoundingtech/fabric/issues/325).
 
 The synchronous narrow-grant interface (for example Git repository grants)
 fails closed with a transient `runtime_state_unavailable` while the durable

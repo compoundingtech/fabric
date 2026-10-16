@@ -681,6 +681,28 @@ mod runtime_peer_schema_tests {
                 error: None,
             },
         };
+        let mut restarted = match &mutation {
+            ControlResponse::RuntimePeers { reply } => reply.clone(),
+            _ => unreachable!(),
+        };
+        restarted.mutation.as_mut().unwrap().cancellation = Cancellation {
+            state: CancellationState::TimedOut,
+            admissions: vec![17],
+            remaining_admissions: vec![17],
+            restart_evidence: Some(RestartEvidence {
+                daemon_instance_changed: true,
+                child_exit_observed: false,
+            }),
+            ..Cancellation::default()
+        };
+        restarted.error = Some(PolicyError::of(
+            &FabricError::new(
+                ErrorCode::CancellationTimeout,
+                "daemon restarted; child exit was not observed",
+            )
+            .into(),
+        ));
+        let restarted = ControlResponse::RuntimePeers { reply: restarted };
         let errors: Vec<_> = [
             ErrorCode::RuntimePeersDisabled,
             ErrorCode::PeerManagedStatically,
@@ -704,7 +726,7 @@ mod runtime_peer_schema_tests {
             },
         })
         .collect();
-        let value = serde_json::json!({ "request": request, "list_reply": list, "mutation_reply": mutation, "coded_errors": errors });
+        let value = serde_json::json!({ "request": request, "list_reply": list, "mutation_reply": mutation, "restart_reply": restarted, "coded_errors": errors });
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/golden/json/runtime_peer_control.json");
         if std::env::var_os("UPDATE_GOLDEN").is_some() {
@@ -718,7 +740,7 @@ mod runtime_peer_schema_tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(value, expected);
         let _: ControlRequest = serde_json::from_value(value["request"].clone()).unwrap();
-        for key in ["list_reply", "mutation_reply"] {
+        for key in ["list_reply", "mutation_reply", "restart_reply"] {
             let _: ControlResponse = serde_json::from_value(value[key].clone()).unwrap();
         }
         for error in value["coded_errors"].as_array().unwrap() {
