@@ -1,8 +1,8 @@
 # Exec and shell audit history
 
 Fabric records incoming built-in exec and shell calls and commands started by
-exec exposures in `<home>/audit.jsonl`. One dedicated thread serializes and
-appends JSON lines; runtime workers enqueue metadata without waiting for disk.
+exec exposures in `<home>/audit.jsonl`. Runtime workers bound and encode metadata, then enqueue the encoded bytes
+without waiting for disk. One dedicated thread appends and syncs JSON lines.
 Completed appends are synced by that writer thread; new-file creation and
 rotation sync their directory entry too. Audit failure does not refuse a call
 or change its transport behavior.
@@ -10,10 +10,16 @@ or change its transport behavior.
 ```sh
 fabric audit
 fabric audit --since 1h --peer laptop
-fabric audit --peer <NodeID> --json
+fabric audit --peer <NodeID> --limit 1000 --json
 ```
 
-The reader works with the daemon stopped. `--since` accepts a nonnegative
+The reader works with the daemon stopped. By default it returns the newest
+10,000 matching records, ordered by event time; `--limit N` accepts 1 through
+100,000. Retained matching lines are also bounded to 16 MiB of encoded data.
+When either bound omits matching history, JSON reports `truncated: true` and
+`limit` gives the selected record cap; human output warns on stderr. Filtering
+happens before the bounds. The JSON response borrows the retained records
+without cloning them into a second JSON tree. `--since` accepts a nonnegative
 number with `ms`, `s`, `m`, `h`, or `d`; a bare number means seconds. `--peer`
 matches the authenticated NodeID or the local label captured for each call.
 Labels are historical snapshots: use the NodeID to follow a peer across
@@ -31,9 +37,20 @@ Exec records a start before process spawn and one end after completion; a
 spawn failure has its own end outcome. Shell records one start and one end for
 the process/session, including across transport reattachments. Refused calls
 are recorded before reading denied argv: `argv` is null and the existing
-refusal code is retained. A handshake refusal can precede the mux target, so
-its service and session identity are unavailable; the service stays null and
-the record uses a fresh audit correlation ID.
+refusal code is retained. Handshake refusals are recorded only when the ALPN
+identifies built-in exec or shell, with a fresh audit correlation ID. Unknown
+mux targets and unrelated ALPNs are omitted without reading denied input.
+Pre-auth refusals are coalesced to at most one record per (NodeID, service) per
+second. The next emitted record for that pair includes `suppressed_refusals`.
+To bound changing-key floods, at most 64 pre-auth records are admitted per
+one-second window and at most 64 can be queued or in progress. The coalescer
+keeps at most 128 pairs, expiring inactive pairs after two seconds; suppression
+counts for uncached or expired pairs appear as `other_refusals_suppressed` on
+the next emitted pre-auth record, independently of its caller. These optional
+fields are omitted when zero. Pending suppression counts can be lost on crash;
+coalescing is distinct from writer loss in `audit.dropped_records`.
+An exec/shell or exec-exposure session takeover attempt is recorded as refused
+before any additional input is read.
 A dial waiting for capacity can retry before attachment; each server-side
 refusal is an attempt and remains visible under the same tunnel session ID,
 even if a later attempt starts the command.
@@ -44,7 +61,9 @@ duration and byte counts. An admitted durable session uses its tunnel session
 ID. Exec and shell start/end events share the same ID. `ok` means the command
 ran, including a nonzero exit; `spawn_failed` means it could not start, and
 `cancelled` covers a call ended by disconnect, revocation or shutdown. A status
-that was not observed remains null. Exec signal exits use 128 plus the signal. Shell signal exits have null status
+that was not observed remains null. A cancelled end can appear without a start
+when input is invalid or the client disconnects during setup; event-pairing
+readers must tolerate missing starts as well as missing ends. Exec signal exits use 128 plus the signal. Shell signal exits have null status
 because the PTY API supplies a signal description without its number; the
 existing shell wire reply still uses that API's fallback code.
 
@@ -55,24 +74,36 @@ excluded. Exec
 output includes stdout and stderr; built-in exec has null stdin and counts
 zero input bytes. Completion includes output processing. A descendant holding
 an exec-exposure pipe open can delay the end until it closes or the session is
-cancelled; built-in exec retains its existing bounded post-exit drain. A
+cancelled. The exec-exposure `cleanup_done` guard stays held until output
+pipes drain, so a descendant retaining stdout can delay cleanup completion
+until the session closes; cleanup waiters close the session before waiting.
+Built-in exec retains its existing bounded post-exit drain. A
 cancelled exposure gets up to 200 ms for buffered pipe observations in a
 separate audit task, without delaying child cleanup or retaining its cap.
 
 No environment map, shell keystrokes, stdin content or stdout/stderr content is
-stored. Exec argv is recorded verbatim, so keep secrets out of command arguments.
+stored. Exec argv is capped at 64 KiB of encoded JSON, retaining a prefix
+of elements and, if necessary, a prefix of the final element. A shortened
+snapshot has `truncated: true` and `original_argc` with the original element
+count; the actual executed argv is untouched. Newline and JSON controls are
+escaped, as are DEL, C1, Unicode line separators and bidi controls in both file
+and CLI output. Decoding JSON recovers the retained argv. Keep secrets out of
+command arguments even when the snapshot might be truncated.
 The exact JSON shapes are in [json-output.md](json-output.md).
 
 ## Rotation and visible gaps
 
 New files are 0600; opening an existing active file enforces that mode. Active
 files rotate at 10 MiB or 24 hours from file creation (from open time on a
-filesystem without creation times). At most ten rotated segments are retained.
+filesystem without creation times). Normally ten rotated segments are retained.
 Segments whose last write is older than 30 days are pruned when the writer
-opens or rotates. Inactive files can remain until the next audit activity.
+opens or rotates. Pruning is best effort: one cleanup warning per open does not
+stop appends, and unremovable segments may exceed retention. Inactive files
+can remain until the next audit activity.
 
 The audit queue allows 4,096 waiting records and one in progress, with a 16 MiB
-record-storage budget including the in-progress record. Encoded records are
+encoded-byte budget including the in-progress record; queued data is stored
+as encoded bytes, without per-argv-element queue amplification. Encoded records are
 limited to 8 MiB. Overflow, oversized records and failed writes count as lost
 records. On recovery the writer appends an `audit_loss` record with the count
 and first/last drop times. It retries a failed summary without counting the

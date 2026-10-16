@@ -2242,6 +2242,9 @@ async fn serve_connection_inner(
         }
     };
     if session.peer_id() != peer_id {
+        if let Some(audit) = crate::audit::current() {
+            audit.refused(ErrorCode::PeerNotPermittedForService);
+        }
         if is_new_session {
             sessions.remove_session(&session).await;
         }

@@ -18,6 +18,9 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 const MAX_QUEUED_RECORDS: usize = 4096;
 const MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ENCODED_RECORD_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ARGV_BYTES: usize = 64 * 1024;
+pub const DEFAULT_READ_LIMIT: usize = 10_000;
+const MAX_READ_BYTES: usize = 16 * 1024 * 1024;
 const AUDIT_FILE: &str = "audit.jsonl";
 
 fn timestamp(time: SystemTime) -> String {
@@ -42,6 +45,14 @@ pub struct CallRecord {
     pub name: Option<String>,
     pub service: Option<String>,
     pub argv: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_argc: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub suppressed_refusals: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub other_refusals_suppressed: u64,
     pub session_id: String,
     pub outcome: Option<Outcome>,
     pub code: Option<String>,
@@ -79,21 +90,110 @@ impl Record {
         }
     }
 
-    fn memory_bytes(&self) -> usize {
-        let Some(call) = self.call() else {
-            return std::mem::size_of::<Self>() + 128;
+    fn bound_argv(&mut self) {
+        let call = match self {
+            Self::ExecStart(call)
+            | Self::ExecEnd(call)
+            | Self::ShellStart(call)
+            | Self::ShellEnd(call)
+            | Self::Refused(call) => call,
+            Self::AuditLoss { .. } => return,
         };
-        std::mem::size_of::<Self>()
-            + call.time.capacity()
-            + call.peer.capacity()
-            + call.name.as_ref().map_or(0, String::capacity)
-            + call.service.as_ref().map_or(0, String::capacity)
-            + call.session_id.capacity()
-            + call.code.as_ref().map_or(0, String::capacity)
-            + call.argv.as_ref().map_or(0, |argv| {
-                argv.capacity() * std::mem::size_of::<String>()
-                    + argv.iter().map(String::capacity).sum::<usize>()
-            })
+        if let Some(argv) = &call.argv {
+            let (bounded, truncated) = bounded_argv(argv);
+            if truncated {
+                call.original_argc = Some(call.original_argc.unwrap_or(argv.len()));
+                call.truncated = true;
+                call.argv = Some(bounded);
+            }
+        }
+    }
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+fn unsafe_character(c: char) -> bool {
+    matches!(c, '\u{7f}'..='\u{9f}' | '\u{2028}' | '\u{2029}' | '\u{061c}'
+        | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// The file and terminal share an encoder: JSON controls, Unicode separators
+/// and bidi formatting controls cannot create apparent lines or reorder text.
+pub fn encode(value: &impl Serialize) -> Result<Vec<u8>> {
+    use std::fmt::Write as _;
+    let json = serde_json::to_string(value)?;
+    let mut escaped = String::with_capacity(json.len());
+    for c in json.chars() {
+        if unsafe_character(c) {
+            write!(&mut escaped, "\\u{:04x}", c as u32)?;
+        } else {
+            escaped.push(c);
+        }
+    }
+    Ok(escaped.into_bytes())
+}
+
+fn encoded_character_bytes(c: char) -> usize {
+    if unsafe_character(c) {
+        6
+    } else {
+        match c {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+            '\u{0}'..='\u{1f}' => 6,
+            _ => c.len_utf8(),
+        }
+    }
+}
+
+/// Copy at most 64 KiB of encoded argv, even for millions of empty elements.
+/// The command's argv itself is untouched; only the audit snapshot is bounded.
+fn bounded_argv(argv: &[String]) -> (Vec<String>, bool) {
+    let mut out = Vec::new();
+    let mut used = 2; // []
+    for arg in argv {
+        let overhead = 2 + usize::from(!out.is_empty());
+        if used + overhead > MAX_ARGV_BYTES {
+            return (out, true);
+        }
+        used += overhead;
+        let mut end = 0;
+        for (offset, c) in arg.char_indices() {
+            let bytes = encoded_character_bytes(c);
+            if used + bytes > MAX_ARGV_BYTES {
+                out.push(arg[..end].to_owned());
+                return (out, true);
+            }
+            used += bytes;
+            end = offset + c.len_utf8();
+        }
+        out.push(arg.clone());
+    }
+    (out, false)
+}
+
+#[derive(Debug)]
+struct RefusalWindow {
+    last: Instant,
+    seen: Instant,
+    suppressed: u64,
+}
+#[derive(Debug)]
+struct PreauthRefusals {
+    pairs: std::collections::HashMap<(String, String), RefusalWindow>,
+    window: Instant,
+    emitted: usize,
+    other_suppressed: u64,
+}
+impl Default for PreauthRefusals {
+    fn default() -> Self {
+        Self {
+            pairs: Default::default(),
+            window: Instant::now(),
+            emitted: 0,
+            other_suppressed: 0,
+        }
     }
 }
 
@@ -124,6 +224,8 @@ struct Shared {
     records: AtomicUsize,
     summarizing: AtomicBool,
     active_calls: AtomicUsize,
+    preauth_records: AtomicUsize,
+    preauth: Mutex<PreauthRefusals>,
 }
 
 impl Shared {
@@ -186,26 +288,38 @@ impl Default for Options {
 /// Clones share bounded admission and loss accounting. Drop never joins disk I/O.
 #[derive(Debug, Clone)]
 pub struct Audit {
-    sender: mpsc::SyncSender<(Record, usize)>,
+    sender: mpsc::SyncSender<(Box<[u8]>, bool)>,
     shared: Arc<Shared>,
     since: String,
     max_bytes: usize,
+    preauth_limit: usize,
 }
 
 impl Audit {
     pub fn start(root: &Path) -> Self {
         let mut files = AuditFiles::new(root.to_path_buf(), Options::default());
-        Self::with_sink(MAX_QUEUED_RECORDS, MAX_QUEUED_BYTES, move |record| {
-            files.append(record)
+        Self::with_encoded_sink(MAX_QUEUED_RECORDS, MAX_QUEUED_BYTES, move |encoded| {
+            files.append_encoded(encoded)
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn with_sink(
         entries: usize,
         max_bytes: usize,
         mut sink: impl FnMut(&Record) -> Result<()> + Send + 'static,
     ) -> Self {
-        let (sender, receiver) = mpsc::sync_channel::<(Record, usize)>(entries);
+        Self::with_encoded_sink(entries, max_bytes, move |encoded| {
+            sink(&serde_json::from_slice(encoded)?)
+        })
+    }
+
+    fn with_encoded_sink(
+        entries: usize,
+        max_bytes: usize,
+        mut sink: impl FnMut(&[u8]) -> Result<()> + Send + 'static,
+    ) -> Self {
+        let (sender, receiver) = mpsc::sync_channel::<(Box<[u8]>, bool)>(entries);
         let shared = Arc::new(Shared::default());
         let worker = shared.clone();
         let spawned = std::thread::Builder::new()
@@ -215,12 +329,13 @@ impl Audit {
                 loop {
                     let mut consumed = None;
                     let disconnected = match receiver.recv_timeout(Duration::from_secs(1)) {
-                        Ok((record, bytes)) => {
+                        Ok((record, preauth)) => {
+                            let bytes = record.len();
                             if let Err(error) = sink(&record) {
                                 worker.lose();
                                 audit_write_warning(&mut warning, &error);
                             }
-                            consumed = Some(bytes);
+                            consumed = Some((bytes, preauth));
                             false
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => true,
@@ -240,13 +355,16 @@ impl Audit {
                             first_time: timestamp(loss.first),
                             last_time: timestamp(loss.last),
                         };
-                        if let Err(error) = sink(&record) {
+                        if let Err(error) = encode(&record).and_then(|encoded| sink(&encoded)) {
                             worker.restore_loss(loss);
                             audit_write_warning(&mut warning, &error);
                         }
                     }
                     worker.summarizing.store(false, Ordering::Release);
-                    if let Some(bytes) = consumed {
+                    if let Some((bytes, preauth)) = consumed {
+                        if preauth {
+                            worker.preauth_records.fetch_sub(1, Ordering::Release);
+                        }
                         worker.bytes.fetch_sub(bytes, Ordering::Release);
                         worker.records.fetch_sub(1, Ordering::Release);
                     }
@@ -265,11 +383,25 @@ impl Audit {
             shared,
             since: timestamp(SystemTime::now()),
             max_bytes,
+            preauth_limit: (entries / 4).clamp(1, 64),
         }
     }
 
-    pub fn record(&self, record: Record) {
-        let bytes = record.memory_bytes();
+    pub fn record(&self, mut record: Record) {
+        record.bound_argv();
+        if !self.enqueue(record, false) {
+            self.shared.lose();
+        }
+    }
+
+    fn enqueue(&self, record: Record, preauth: bool) -> bool {
+        let Ok(encoded) = encode(&record) else {
+            return false;
+        };
+        let bytes = encoded.len();
+        if bytes >= MAX_ENCODED_RECORD_BYTES {
+            return false;
+        }
         if self
             .shared
             .bytes
@@ -279,14 +411,102 @@ impl Audit {
             })
             .is_err()
         {
-            self.shared.lose();
-            return;
+            return false;
         }
         self.shared.records.fetch_add(1, Ordering::Release);
-        if self.sender.try_send((record, bytes)).is_err() {
+        if preauth {
+            self.shared.preauth_records.fetch_add(1, Ordering::Release);
+        }
+        if self
+            .sender
+            .try_send((encoded.into_boxed_slice(), preauth))
+            .is_err()
+        {
             self.shared.bytes.fetch_sub(bytes, Ordering::Release);
             self.shared.records.fetch_sub(1, Ordering::Release);
-            self.shared.lose();
+            if preauth {
+                self.shared.preauth_records.fetch_sub(1, Ordering::Release);
+            }
+            return false;
+        }
+        true
+    }
+
+    /// Unknown mux targets and unrelated ALPNs are deliberately not audited.
+    /// Bound distinct-key floods as well as repeated refusals for one key.
+    pub(crate) fn preauth_refused(&self, peer: String, name: Option<String>, service: &str) {
+        if !matches!(service, "exec" | "shell") {
+            return;
+        }
+        let mut state = self
+            .shared
+            .preauth
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if now.duration_since(state.window) >= Duration::from_secs(1) {
+            state.window = now;
+            state.emitted = 0;
+            let mut expired = 0;
+            state.pairs.retain(|_, pair| {
+                if now.duration_since(pair.seen) < Duration::from_secs(2) {
+                    true
+                } else {
+                    expired += pair.suppressed;
+                    false
+                }
+            });
+            state.other_suppressed += expired;
+        }
+        let key = (peer.clone(), service.to_owned());
+        let blocked = state.emitted >= 64
+            || self.shared.preauth_records.load(Ordering::Acquire) >= self.preauth_limit;
+        if let Some(pair) = state.pairs.get_mut(&key) {
+            pair.seen = now;
+            if blocked || now.duration_since(pair.last) < Duration::from_secs(1) {
+                pair.suppressed += 1;
+                return;
+            }
+        } else if blocked || state.pairs.len() >= 128 {
+            state.other_suppressed += 1;
+            return;
+        }
+        let suppressed = state.pairs.get(&key).map_or(0, |pair| pair.suppressed);
+        let call = self.call(
+            peer,
+            name,
+            Some(service.into()),
+            if service == "shell" {
+                Kind::Shell
+            } else {
+                Kind::Exec
+            },
+        );
+        let mut record = call
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record
+            .clone();
+        record.outcome = Some(Outcome::Refused);
+        record.code = Some("fabric:peer_not_in_allow_list".into());
+        record.suppressed_refusals = suppressed;
+        record.other_refusals_suppressed = state.other_suppressed;
+        if self.enqueue(Record::Refused(record), true) {
+            state.emitted += 1;
+            state.other_suppressed = 0;
+            state.pairs.insert(
+                key,
+                RefusalWindow {
+                    last: now,
+                    seen: now,
+                    suppressed: 0,
+                },
+            );
+        } else if let Some(pair) = state.pairs.get_mut(&key) {
+            pair.suppressed += 1;
+        } else {
+            state.other_suppressed += 1;
         }
     }
 
@@ -373,6 +593,10 @@ impl Audit {
                     name,
                     service,
                     argv: None,
+                    truncated: false,
+                    original_argc: None,
+                    suppressed_refusals: 0,
+                    other_refusals_suppressed: 0,
                     session_id: format!("{:032x}", rand::random::<u128>()),
                     outcome: None,
                     code: None,
@@ -428,7 +652,12 @@ impl Call {
         }
         state.started = true;
         state.began = Instant::now();
-        state.record.argv = argv.map(<[String]>::to_vec);
+        if let Some(argv) = argv {
+            let (bounded, truncated) = bounded_argv(argv);
+            state.record.argv = Some(bounded);
+            state.record.truncated = truncated;
+            state.record.original_argc = truncated.then_some(argv.len());
+        }
         state.record.time = timestamp(SystemTime::now());
         let record = match state.kind {
             Kind::Exec => Record::ExecStart(state.record.clone()),
@@ -753,12 +982,22 @@ impl AuditFiles {
                 .sync_all()
                 .context("sync audit directory")?;
         }
-        self.prune()?;
+        if let Err(error) = self.prune() {
+            fabric_config::log_eprintln!(
+                "fabric: audit retention cleanup failed: {error:#}; appending continues"
+            );
+        }
         Ok(())
     }
 
+    #[cfg(test)]
     fn append(&mut self, record: &Record) -> Result<()> {
-        let mut encoded = serde_json::to_vec(record)?;
+        let encoded = encode(record)?;
+        self.append_encoded(&encoded)
+    }
+
+    fn append_encoded(&mut self, encoded: &[u8]) -> Result<()> {
+        let mut encoded = encoded.to_vec();
         anyhow::ensure!(
             encoded.len() < MAX_ENCODED_RECORD_BYTES,
             "audit record exceeds encoded size bound"
@@ -796,7 +1035,6 @@ impl AuditFiles {
                 .context("rotate audit log")?;
             self.boundary = false;
             self.open()?;
-            self.prune()?;
         }
         let file = self.file.as_mut().expect("audit file opened");
         if self.boundary {
@@ -899,13 +1137,29 @@ fn readable_files(root: &Path) -> Result<Vec<File>> {
 pub struct AuditRead {
     pub records: Vec<Record>,
     pub malformed_records: u64,
+    pub truncated: bool,
+    pub limit: usize,
 }
 
 pub fn read(root: &Path, since: Option<SystemTime>, peer: Option<&str>) -> Result<AuditRead> {
+    read_with_limit(root, since, peer, DEFAULT_READ_LIMIT)
+}
+
+pub fn read_with_limit(
+    root: &Path,
+    since: Option<SystemTime>,
+    peer: Option<&str>,
+    limit: usize,
+) -> Result<AuditRead> {
     let mut result = AuditRead {
         records: Vec::new(),
         malformed_records: 0,
+        truncated: false,
+        limit,
     };
+    let mut newest = std::collections::BTreeMap::new();
+    let mut retained_bytes = 0;
+    let mut sequence = 0u64;
     for file in readable_files(root)? {
         let mut reader = BufReader::new(file);
         loop {
@@ -954,9 +1208,18 @@ pub fn read(root: &Path, since: Option<SystemTime>, peer: Option<&str>) -> Resul
             {
                 continue;
             }
-            result.records.push(record);
+            sequence += 1;
+            newest.insert((time.unwrap_or(UNIX_EPOCH), sequence), (record, bytes));
+            retained_bytes += bytes;
+            while newest.len() > limit || retained_bytes > MAX_READ_BYTES {
+                if let Some((_, (_, bytes))) = newest.pop_first() {
+                    retained_bytes -= bytes;
+                }
+                result.truncated = true;
+            }
         }
     }
+    result.records = newest.into_values().map(|(record, _)| record).collect();
     Ok(result)
 }
 
@@ -971,6 +1234,10 @@ mod tests {
             name: Some(name.into()),
             service: Some("exec".into()),
             argv: Some(vec!["true".into()]),
+            truncated: false,
+            original_argc: None,
+            suppressed_refusals: 0,
+            other_refusals_suppressed: 0,
             session_id: session.into(),
             outcome: Some(Outcome::Ok),
             code: None,
@@ -1165,6 +1432,236 @@ mod tests {
         ] {
             assert!(!text.contains(secret), "audit retained process content");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preauth_flood_preserves_real_calls_and_reports_suppression() -> Result<()> {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let records = output.clone();
+        let mut first = true;
+        let audit = Audit::with_sink(16, 65536, move |record| {
+            if first {
+                first = false;
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }
+            records.lock().unwrap().push(record.clone());
+            Ok(())
+        });
+        audit.preauth_refused("untrusted".into(), None, "exec");
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap()).await?;
+        for n in 0..20_000 {
+            audit.preauth_refused("untrusted".into(), None, "exec");
+            audit.preauth_refused(format!("rotating-key-{n}"), None, "shell");
+            audit.preauth_refused(format!("unrelated-{n}"), None, "sync");
+        }
+        assert!(audit.shared.preauth_records.load(Ordering::Acquire) <= 4);
+        assert!(audit.shared.preauth.lock().unwrap().pairs.len() <= 128);
+        let call = audit.call("trusted".into(), None, Some("exec".into()), Kind::Exec);
+        scope(Some(call), async {
+            let guard = exec_attempt().unwrap();
+            guard.start_exec(&["true".into()]);
+            guard.finish(Outcome::Ok, Some(0), None);
+        })
+        .await;
+        assert_eq!(audit.status().dropped_records, 0);
+        release_tx.send(())?;
+        assert!(audit.drain(Duration::from_secs(3)).await);
+        // Advance only the coalescing clock to keep this test independent of
+        // wall-clock scheduling, without weakening the once-per-second rule.
+        {
+            let mut state = audit.shared.preauth.lock().unwrap();
+            state.window -= Duration::from_secs(1);
+            state
+                .pairs
+                .get_mut(&("untrusted".into(), "exec".into()))
+                .unwrap()
+                .last -= Duration::from_secs(3);
+        }
+        audit.preauth_refused("untrusted".into(), None, "exec");
+        assert!(audit.drain(Duration::from_secs(3)).await);
+        let records = output.lock().unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| matches!(r, Record::ExecStart(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| matches!(r, Record::ExecEnd(_)))
+                .count(),
+            1
+        );
+        let last = records.last().unwrap().call().unwrap();
+        assert_eq!(last.suppressed_refusals, 20_000);
+        assert_eq!(last.other_refusals_suppressed, 19_997);
+        assert!(last.argv.is_none());
+        assert_eq!(audit.status().dropped_records, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn separator_heavy_argv_is_truncated_without_losing_call_or_amplifying_queue()
+    -> Result<()> {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let records = output.clone();
+        let mut first = true;
+        let audit = Audit::with_sink(16, 256 * 1024, move |record| {
+            if first {
+                first = false;
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }
+            records.lock().unwrap().push(record.clone());
+            Ok(())
+        });
+        let raw = vec![0u8; 1024 * 1024];
+        let argv: Vec<String> = raw
+            .split(|b| *b == 0)
+            .map(|s| String::from_utf8(s.to_vec()).unwrap())
+            .collect();
+        let call = audit.call("trusted".into(), None, Some("exec".into()), Kind::Exec);
+        scope(Some(call), async {
+            let guard = exec_attempt().unwrap();
+            guard.start_exec(&argv);
+            tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+                .await
+                .unwrap();
+            guard.finish(Outcome::Ok, Some(0), None);
+        })
+        .await;
+        let queued_bytes = audit.shared.bytes.load(Ordering::Acquire);
+        assert!(queued_bytes < 2 * (MAX_ARGV_BYTES + 1024));
+        assert_eq!(audit.status().dropped_records, 0);
+        release_tx.send(())?;
+        assert!(audit.drain(Duration::from_secs(3)).await);
+        let records = output.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            queued_bytes,
+            records
+                .iter()
+                .map(|r| encode(r).unwrap().len())
+                .sum::<usize>()
+        );
+        for record in records.iter() {
+            let call = record.call().unwrap();
+            assert!(call.truncated);
+            assert_eq!(call.original_argc, Some(argv.len()));
+            assert!(encode(&call.argv).unwrap().len() <= MAX_ARGV_BYTES);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn encoder_escapes_line_and_terminal_controls_and_bounds_large_elements() -> Result<()> {
+        let argv =
+            vec!["newline\n\u{2028}\u{2029}\u{85}\u{7f}\u{9f}\u{202e}\u{2066}\0".to_string()];
+        let mut record = call("peer", "name", "session");
+        if let Record::ExecEnd(call) = &mut record {
+            call.argv = Some(argv.clone());
+        }
+        let encoded = encode(&record)?;
+        let text = String::from_utf8(encoded.clone())?;
+        assert!(!text.chars().any(|c| c.is_control() || unsafe_character(c)));
+        for escape in [
+            "\\n", "\\u2028", "\\u2029", "\\u0085", "\\u007f", "\\u009f", "\\u202e", "\\u2066",
+            "\\u0000",
+        ] {
+            assert!(text.contains(escape), "missing {escape}");
+        }
+        let decoded: Record = serde_json::from_slice(&encoded)?;
+        assert_eq!(decoded.call().unwrap().argv.as_ref(), Some(&argv));
+        let (bounded, truncated) = bounded_argv(&["\u{2028}".repeat(MAX_ARGV_BYTES)]);
+        assert!(truncated);
+        assert!(encode(&bounded)?.len() <= MAX_ARGV_BYTES);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unremovable_stale_segment_does_not_block_appends() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+            }
+        }
+        let root = tempfile::tempdir()?;
+        let stale = root.path().join("audit.0001.0001.0001.jsonl");
+        fs::write(&stale, b"old\n")?;
+        fs::write(root.path().join(AUDIT_FILE), b"")?;
+        let _restore = Restore(root.path().to_owned());
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o500))?;
+        assert!(
+            fs::remove_file(&stale).is_err(),
+            "fixture must deny pruning"
+        );
+        let mut files = AuditFiles::new(
+            root.path().to_owned(),
+            Options {
+                retained: 0,
+                ..Options::default()
+            },
+        );
+        files.append(&call("peer", "name", "one"))?;
+        files.append(&call("peer", "name", "two"))?;
+        assert!(stale.exists());
+        let records = read(root.path(), None, Some("peer"))?;
+        assert_eq!(records.records.len(), 2);
+        assert_eq!(records.malformed_records, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn reader_retains_newest_matches_with_explicit_record_and_byte_bounds() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut file = File::create(root.path().join(AUDIT_FILE))?;
+        // Input order intentionally differs from event time.
+        for seconds in [4, 1, 3, 2] {
+            let mut record = call("peer", "name", &seconds.to_string());
+            if let Record::ExecEnd(call) = &mut record {
+                call.time = format!("2026-10-16T00:00:0{seconds}Z");
+            }
+            file.write_all(&encode(&record)?)?;
+            file.write_all(b"\n")?;
+        }
+        let result = read_with_limit(root.path(), None, None, 2)?;
+        assert!(result.truncated);
+        assert_eq!(result.limit, 2);
+        assert_eq!(
+            result
+                .records
+                .iter()
+                .map(|r| r.call().unwrap().session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["3", "4"]
+        );
+        let all = read_with_limit(root.path(), None, None, 4)?;
+        assert!(!all.truncated);
+        assert_eq!(all.records.len(), 4);
+        drop(file);
+        let mut file = File::create(root.path().join(AUDIT_FILE))?;
+        for seconds in 1..=4 {
+            let mut record = call("peer", "name", &seconds.to_string());
+            if let Record::ExecEnd(call) = &mut record {
+                call.argv = Some(vec!["x".repeat(5 * 1024 * 1024)]);
+            }
+            file.write_all(&encode(&record)?)?;
+            file.write_all(b"\n")?;
+        }
+        let bounded = read(root.path(), None, None)?;
+        assert!(bounded.truncated);
+        assert_eq!(bounded.records.len(), 3);
         Ok(())
     }
 

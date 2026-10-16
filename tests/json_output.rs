@@ -167,7 +167,10 @@ async fn every_json_command_prints_one_stable_object() -> Result<()> {
     // Before either trust install can announce to the other node and produce
     // a legitimate handshake refusal, the audit store is empty.
     let audit = fabric(&client_home, &["audit", "--json"]).await?;
-    Normaliser { replacements: Vec::new() }.check("audit_empty", ok(&audit)?)?;
+    Normaliser {
+        replacements: Vec::new(),
+    }
+    .check("audit_empty", ok(&audit)?)?;
 
     let mut server_book = PeerBook::load(&server_home)?;
     server_book.add_with_allow(
@@ -386,7 +389,8 @@ async fn a_failing_json_command_prints_only_an_error_object() -> Result<()> {
 }
 
 #[tokio::test]
-async fn audit_json_reads_offline_records_and_keeps_global_loss_visible_under_peer_filter() -> Result<()> {
+async fn audit_json_reads_offline_records_and_keeps_global_loss_visible_under_peer_filter()
+-> Result<()> {
     let dir = TempDir::new()?;
     let home = FabricHome::new(dir.path());
     home.prepare()?;
@@ -395,8 +399,13 @@ async fn audit_json_reads_offline_records_and_keeps_global_loss_visible_under_pe
         "code": null, "exit_status": 7, "duration_millis": 12, "bytes_in": 0, "bytes_out": 5 });
     let loss = serde_json::json!({ "event": "audit_loss", "time": "2026-10-16T00:00:02Z", "count": 2,
         "first_time": "2026-10-16T00:00:00Z", "last_time": "2026-10-16T00:00:01Z" });
-    fs::write(home.root().join("audit.jsonl"), format!("{record}\n{loss}\n{{\"event\":"))?;
-    let normaliser = Normaliser { replacements: Vec::new() };
+    fs::write(
+        home.root().join("audit.jsonl"),
+        format!("{record}\n{loss}\n{{\"event\":"),
+    )?;
+    let normaliser = Normaliser {
+        replacements: Vec::new(),
+    };
     let audit = fabric(&home, &["audit", "--peer", "laptop", "--json"]).await?;
     normaliser.check("audit", ok(&audit)?)?;
     let other = fabric(&home, &["audit", "--peer", "peer-b", "--json"]).await?;
@@ -406,5 +415,54 @@ async fn audit_json_reads_offline_records_and_keeps_global_loss_visible_under_pe
     let recent = fabric(&home, &["audit", "--since", "0s", "--json"]).await?;
     let recent: Value = serde_json::from_str(ok(&recent)?)?;
     assert!(recent["records"].as_array().unwrap().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn audit_cli_bounds_history_and_escapes_unicode_controls_in_both_outputs() -> Result<()> {
+    let dir = TempDir::new()?;
+    let home = FabricHome::new(dir.path());
+    home.prepare()?;
+    let argv = [
+        "line\n\u{2028}\u{2029}\u{85}\u{7f}\u{9f}\u{202e}\u{2066}\0",
+        "",
+    ];
+    let mut lines = String::new();
+    for seconds in [4, 1, 3, 2] {
+        let record = serde_json::json!({"event":"exec_end", "time":format!("2026-10-16T00:00:0{seconds}Z"),
+            "peer":"peer-a", "name":"laptop", "service":"exec", "argv":argv,
+            "session_id":seconds.to_string(), "outcome":"ok", "code":null,
+            "exit_status":0, "duration_millis":1, "bytes_in":0, "bytes_out":0});
+        lines.push_str(&record.to_string());
+        lines.push('\n');
+    }
+    fs::write(home.root().join("audit.jsonl"), lines)?;
+    let json = fabric(&home, &["audit", "--limit", "2", "--json"]).await?;
+    let text = ok(&json)?;
+    let response: Value = serde_json::from_str(text)?;
+    assert_eq!(response["limit"], 2);
+    assert_eq!(response["truncated"], true);
+    assert_eq!(response["records"][0]["session_id"], "3");
+    assert_eq!(response["records"][1]["session_id"], "4");
+    assert_eq!(response["records"][0]["argv"], serde_json::json!(argv));
+    let human = fabric(&home, &["audit", "--limit", "2"]).await?;
+    let human_text = ok(&human)?;
+    assert_eq!(human_text.lines().count(), 3); // loss header + two records
+    assert!(human.stderr.contains("truncated"));
+    for output in [text, human_text] {
+        assert!(!output.chars().any(|c| matches!(
+            c,
+            '\u{2028}'
+                | '\u{2029}'
+                | '\u{85}'
+                | '\u{7f}'
+                | '\u{9f}'
+                | '\u{202e}'
+                | '\u{2066}'
+                | '\0'
+        )));
+        assert!(output.contains("\\u2028"));
+        assert!(output.contains("\\u202e"));
+    }
     Ok(())
 }

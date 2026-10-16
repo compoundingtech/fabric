@@ -273,9 +273,27 @@ where
         pid: child.process_id().map(|pid| pid as libc::pid_t),
         reaped: reaped.clone(),
     };
-    let mut reader = pair.master.try_clone_reader()?;
+    let mut reader = pair.master.try_clone_reader().map_err(|error| {
+        if let Some(audit) = audit.take() {
+            audit.finish(
+                audit::Outcome::SpawnFailed,
+                None,
+                Some(fabric_config::error::ErrorCode::SpawnFailed.as_str()),
+            );
+        }
+        error
+    })?;
     let mut writer = audit::CountWriter {
-        inner: pair.master.take_writer()?,
+        inner: pair.master.take_writer().map_err(|error| {
+            if let Some(audit) = audit.take() {
+                audit.finish(
+                    audit::Outcome::SpawnFailed,
+                    None,
+                    Some(fabric_config::error::ErrorCode::SpawnFailed.as_str()),
+                );
+            }
+            error
+        })?,
         counts: counts.clone(),
     };
     let master = pair.master;
