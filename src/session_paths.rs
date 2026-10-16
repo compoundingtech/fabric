@@ -434,6 +434,42 @@ mod tests {
     }
 
     #[test]
+    fn session_attach_resume_and_close_json_matches_the_contract() {
+        let presence = Arc::new(Presence::default());
+        presence.online(peer(), 7, Some("direct".into()), "connected");
+        let registry = SessionPaths::new(presence.clone());
+        let session =
+            registry.session("session-example".into(), peer(), SessionDirection::Outbound);
+        let first = session.begin_observation(direct(4000));
+        session.detach(first, direct(4000));
+        let relay = ObservedPath {
+            path: SessionPath::from_selected(
+                8,
+                [("relay", "https://relay.example.invalid/".into())],
+            ),
+            ids: vec!["relay-path".into()],
+        };
+        session.begin_observation(relay.clone());
+        session.close_with_path(Some(relay));
+        let mut batch = presence.batch(None, 0);
+        batch.instance = "<DAEMON>".into();
+        for event in &mut batch.events {
+            event.observed_at_unix_ms = 0;
+            event.peer_id = "node-example".into();
+            if let Some(session) = &mut event.session {
+                session.peer_id = "node-example".into();
+            }
+        }
+        let actual =
+            serde_json::to_value(crate::control::ControlResponse::PeerEvents { batch }).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/golden/json/session_path_events.json"
+        ))
+        .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn no_selected_path_is_unknown_and_mixed_selection_names_every_remote() {
         let unknown = SessionPath::from_selected(7, Vec::<(&str, String)>::new());
         assert!(unknown.class.is_none());

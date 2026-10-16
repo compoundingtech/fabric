@@ -1,0 +1,128 @@
+{
+  "type": "peer_events",
+  "instance": "<DAEMON>",
+  "cursor": 4,
+  "reset": true,
+  "events": [
+    {
+      "sequence": 1,
+      "peer_id": "node-example",
+      "online": true,
+      "path": "direct",
+      "cause": "connected",
+      "observed_at_unix_ms": 0
+    },
+    {
+      "sequence": 2,
+      "peer_id": "node-example",
+      "online": true,
+      "path": "direct",
+      "cause": "session_attached",
+      "observed_at_unix_ms": 0,
+      "session": {
+        "session_id": "session-example",
+        "peer_id": "node-example",
+        "direction": "outbound",
+        "attached": true,
+        "attach_count": 1,
+        "active_attaches": 1,
+        "path_at_attach": {
+          "connection_id": 7,
+          "class": "direct",
+          "remote_addr": "127.0.0.1:4000",
+          "remote_addrs": [
+            "127.0.0.1:4000"
+          ]
+        },
+        "current_path": {
+          "connection_id": 7,
+          "class": "direct",
+          "remote_addr": "127.0.0.1:4000",
+          "remote_addrs": [
+            "127.0.0.1:4000"
+          ]
+        },
+        "path_at_close": null,
+        "path_changes": 0,
+        "missed_path_events": 0
+      }
+    },
+    {
+      "sequence": 3,
+      "peer_id": "node-example",
+      "online": true,
+      "path": "relay",
+      "cause": "session_attached",
+      "observed_at_unix_ms": 0,
+      "session": {
+        "session_id": "session-example",
+        "peer_id": "node-example",
+        "direction": "outbound",
+        "attached": true,
+        "attach_count": 2,
+        "active_attaches": 1,
+        "path_at_attach": {
+          "connection_id": 8,
+          "class": "relay",
+          "remote_addr": "https://relay.example.invalid/",
+          "remote_addrs": [
+            "https://relay.example.invalid/"
+          ]
+        },
+        "current_path": {
+          "connection_id": 8,
+          "class": "relay",
+          "remote_addr": "https://relay.example.invalid/",
+          "remote_addrs": [
+            "https://relay.example.invalid/"
+          ]
+        },
+        "path_at_close": null,
+        "path_changes": 1,
+        "missed_path_events": 0
+      }
+    },
+    {
+      "sequence": 4,
+      "peer_id": "node-example",
+      "online": true,
+      "path": "relay",
+      "cause": "session_closed",
+      "observed_at_unix_ms": 0,
+      "session": {
+        "session_id": "session-example",
+        "peer_id": "node-example",
+        "direction": "outbound",
+        "attached": false,
+        "attach_count": 2,
+        "active_attaches": 0,
+        "path_at_attach": {
+          "connection_id": 8,
+          "class": "relay",
+          "remote_addr": "https://relay.example.invalid/",
+          "remote_addrs": [
+            "https://relay.example.invalid/"
+          ]
+        },
+        "current_path": {
+          "connection_id": 8,
+          "class": "relay",
+          "remote_addr": "https://relay.example.invalid/",
+          "remote_addrs": [
+            "https://relay.example.invalid/"
+          ]
+        },
+        "path_at_close": {
+          "connection_id": 8,
+          "class": "relay",
+          "remote_addr": "https://relay.example.invalid/",
+          "remote_addrs": [
+            "https://relay.example.invalid/"
+          ]
+        },
+        "path_changes": 1,
+        "missed_path_events": 0
+      }
+    }
+  ]
+}
