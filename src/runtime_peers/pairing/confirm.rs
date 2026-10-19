@@ -331,6 +331,15 @@ impl RuntimePeers {
             committed_at: timestamp,
             outcome,
         });
+        // Request IDs become reusable at the retention boundary. Remove the
+        // obsolete identity in this same candidate, after the selected attempt
+        // has been completed, so pruning cannot invalidate its vector index.
+        next.pairing.retain(|attempt| {
+            attempt
+                .status
+                .terminal_at
+                .is_none_or(|ended| timestamp < ended.saturating_add(RECEIPT_SECONDS))
+        });
     }
 
     pub(super) fn reject_pairing_at(
@@ -1073,5 +1082,70 @@ mod tests {
             .unwrap()
             .policy_revision = 2;
         assert!(store.validate_stored().is_err());
+    }
+
+    #[test]
+    fn completion_request_id_reuse_at_retention_boundary_prunes_atomically() {
+        for reject in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = open(&dir);
+            let t = now();
+            let original = pending(&mut store, "old-receipt", t);
+            let old_rejection = RejectRequest {
+                owner: original.owner.clone(),
+                attempt_id: original.attempt_id.clone(),
+                expected_node_id: original.expected_node_id,
+                expected_attempt_revision: original.expected_attempt_revision,
+                request_id: "reusable".into(),
+            };
+            store.reject_pairing_at(&old_rejection, t).unwrap();
+            let boundary = t + RECEIPT_SECONDS;
+            let mut request = pending(&mut store, "new-receipt", boundary - 1);
+            request.request_id = "reusable".into();
+            assert_eq!(store.stored.pairing.len(), 2);
+            assert!(
+                store
+                    .stored
+                    .pairing
+                    .iter()
+                    .any(|attempt| { attempt.status.attempt_id == original.attempt_id })
+            );
+            let reply = if reject {
+                store
+                    .reject_pairing_at(
+                        &RejectRequest {
+                            owner: request.owner.clone(),
+                            attempt_id: request.attempt_id.clone(),
+                            expected_node_id: request.expected_node_id,
+                            expected_attempt_revision: request.expected_attempt_revision,
+                            request_id: request.request_id.clone(),
+                        },
+                        boundary,
+                    )
+                    .unwrap()
+            } else {
+                let prepared = store
+                    .prepare_pairing_confirmation_at(&request, boundary)
+                    .unwrap();
+                store
+                    .commit_pairing_confirmation_at(prepared, boundary)
+                    .unwrap()
+            };
+            let receipt = reply.status.unwrap().completion.unwrap();
+            assert_eq!(receipt.request_id, "reusable");
+            assert_eq!(receipt.attempt_id, request.attempt_id);
+            assert_eq!(store.stored.pairing.len(), 1);
+            store.validate_stored().unwrap();
+            let restarted = open(&dir);
+            assert_eq!(restarted.stored.pairing.len(), 1);
+            assert_eq!(
+                restarted.stored.pairing[0].status.completion.as_ref(),
+                Some(&receipt)
+            );
+            assert_eq!(
+                restarted.snapshot(None).unwrap().peers.len(),
+                usize::from(!reject)
+            );
+        }
     }
 }
