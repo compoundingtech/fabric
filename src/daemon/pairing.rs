@@ -1125,6 +1125,7 @@ mod tests {
     }
     #[tokio::test]
     async fn joining_control_sanitizes_bound_gateway_error_replies() -> Result<()> {
+        use crate::runtime_peers::pairing::Status;
         let joining_dir = tempfile::tempdir()?;
         let joining_home = FabricHome::new(joining_dir.path());
         let joining = gateway(joining_home.clone()).await?;
