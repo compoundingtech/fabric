@@ -34,6 +34,10 @@ Deprecated, Fixed or Security.
   one transaction with a final commit-time deadline check. Explicit rejection
   records a receipt without access. Historical retries report current access
   and never reinstall grants withdrawn after confirmation.
+- **Provisional:** joining consumers can perform pinned-gateway restricted pairing
+  operations through `pairing_remote` on their existing daemon control socket.
+  The bridge uses that daemon's identity, bounded frames/concurrency/deadlines,
+  and no temporary ordinary peer trust or implicit retries.
 
 ## [0.9.2] - 2026-10-16
 

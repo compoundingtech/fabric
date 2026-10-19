@@ -62,6 +62,36 @@ runtime-state error classes. Uncertain commit outcomes quarantine admissions,
 exactly as runtime policy commits do. Owner remains attribution rather than
 authentication.
 
+### Joining-side daemon bridge
+
+A joining consumer uses its running runtime-enabled daemon, rather than creating
+a second identity or temporarily trusting the gateway:
+
+```json
+{"type":"pairing_remote","gateway":"<invitation-pinned NodeID>","addr":null,"request":{"operation":"present","attempt_id":"<attempt>","secret":"<creation secret>"}}
+```
+
+`gateway` is mandatory. Optional `addr` uses the existing EndpointAddr JSON hint;
+its `id` must equal `gateway`. The endpoint authenticates the pinned NodeID even
+when addresses are supplied. No allow-list entry is required or installed.
+`request` is an existing restricted network request: `present`, `status`, `send`,
+or `receive`. The response is `{"type":"pairing","reply":{...}}`, matching owner
+control replies. Only a reply bound to the requested attempt and this daemon's
+existing NodeID is returned.
+
+Each call makes one restricted connection using the daemon's current endpoint,
+with at most 32 outbound operations and one 30-second deadline covering connect,
+request, and completion. Encoded requests use the same frame bound as the network
+protocol; replies are bounded to 1 MiB before allocation. The request stream is
+half-closed after its frame; the gateway releases its attempt lease before
+closing, so a subsequent call can reconnect safely. Serialize calls for the same
+attempt. No retry is implicit: on `timeout` or `unreachable`, reconcile using
+`status` or the exchange's sequence/digest/ack replay semantics. An uncertain
+transport outcome is never admission evidence. Disabled runtime mode returns
+`runtime_peers_disabled`, and a mismatched address ID returns `invalid_argument`.
+Network refusal or malformed/unbound replies return `unreachable` without
+reflecting untrusted reply content or permit secrets into error text.
+
 ### Restricted presentation and status
 
 Runtime mode advertises `fabric/pair/1`. Only that negotiated ALPN bypasses the

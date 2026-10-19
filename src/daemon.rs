@@ -4459,6 +4459,13 @@ async fn process_control_request(
         ControlRequest::Pairing { request } => ControlResponse::Pairing {
             reply: state.pairing_request(request).await,
         },
+        ControlRequest::PairingRemote {
+            gateway,
+            addr,
+            request,
+        } => ControlResponse::Pairing {
+            reply: pairing::remote(&state, gateway, addr, request).await,
+        },
         ControlRequest::Status => state.status_response().await?,
         ControlRequest::ReachabilityStatus => state.reachability_status_response().await?,
         ControlRequest::PeerEvents {

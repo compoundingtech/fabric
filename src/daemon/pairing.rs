@@ -34,6 +34,7 @@ struct Rates {
 #[derive(Debug)]
 pub(super) struct Gate {
     connections: Arc<Semaphore>,
+    remote_connections: Semaphore,
     attempts: StdMutex<BTreeSet<String>>,
     rates: StdMutex<Rates>,
 }
@@ -41,6 +42,7 @@ impl Default for Gate {
     fn default() -> Self {
         Self {
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            remote_connections: Semaphore::new(MAX_CONNECTIONS),
             attempts: StdMutex::new(BTreeSet::new()),
             rates: StdMutex::new(Rates {
                 global: Bucket {
@@ -170,17 +172,144 @@ pub(super) async fn expire_loop(state: Arc<DaemonState>) {
     }
 }
 
+/// One joining-side operation uses this daemon's existing authenticated identity.
+pub(super) async fn remote(
+    state: &DaemonState,
+    gateway: EndpointId,
+    addr: Option<EndpointAddr>,
+    request: NetworkRequest,
+) -> Reply {
+    let result = async {
+        if state.runtime_peers.is_none() {
+            return Err(FabricError::new(
+                ErrorCode::RuntimePeersDisabled,
+                "pairing requires --runtime-peers",
+            )
+            .into());
+        }
+        if state.cancel.is_cancelled() {
+            return Err(FabricError::new(ErrorCode::DaemonNotRunning, "daemon is stopping").into());
+        }
+        if addr.as_ref().is_some_and(|addr| addr.id != gateway) {
+            return Err(FabricError::new(
+                ErrorCode::InvalidArgument,
+                "pairing address does not match pinned gateway NodeID",
+            )
+            .into());
+        }
+        let _slot = state
+            .pairing_gate
+            .remote_connections
+            .try_acquire()
+            .map_err(|_| {
+                FabricError::new(
+                    ErrorCode::ServiceUnavailable,
+                    "outbound pairing connection limit reached",
+                )
+            })?;
+        let attempt = match &request {
+            NetworkRequest::Present { attempt_id, .. }
+            | NetworkRequest::Status { attempt_id }
+            | NetworkRequest::Send { attempt_id, .. }
+            | NetworkRequest::Receive { attempt_id, .. } => attempt_id,
+        };
+        let bytes = serde_json::to_vec(&request)?;
+        if bytes.len() > MAX_REQUEST {
+            return Err(FabricError::new(
+                ErrorCode::InvalidArgument,
+                "encoded pairing request exceeds frame limit",
+            )
+            .into());
+        }
+        let endpoint = state.current_endpoint();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let connection = tokio::time::timeout_at(
+            deadline,
+            endpoint.connect(
+                addr.unwrap_or_else(|| EndpointAddr::new(gateway)),
+                crate::runtime_peers::pairing::PAIR_ALPN,
+            ),
+        )
+        .await
+        .map_err(|_| FabricError::new(ErrorCode::Timeout, "pairing connect timed out"))?
+        .map_err(|_| {
+            FabricError::new(
+                ErrorCode::Unreachable,
+                "pinned pairing gateway could not be reached",
+            )
+        })?;
+        let operation = async {
+            let (mut send, mut recv) = connection.open_bi().await?;
+            send.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
+            send.write_all(&bytes).await?;
+            // EOF lets the gateway release its attempt lease before closing.
+            send.finish()?;
+            let mut length = [0; 4];
+            recv.read_exact(&mut length).await?;
+            let length = u32::from_be_bytes(length) as usize;
+            anyhow::ensure!(
+                length > 0 && length <= crate::runtime_peers::MAX_REQUEST_BYTES,
+                "invalid pairing reply frame"
+            );
+            let mut bytes = vec![0; length];
+            recv.read_exact(&mut bytes).await?;
+            let reply: Reply = serde_json::from_slice(&bytes)?;
+            let status = reply.status.as_ref().context("missing pairing status")?;
+            anyhow::ensure!(
+                reply.secret.is_none()
+                    && status.attempt_id == *attempt
+                    && status.bound_node_id == Some(endpoint.id()),
+                "unbound pairing reply"
+            );
+            // The next local RPC may reconnect only after the old lease is gone.
+            let _ = connection.closed().await;
+            Ok::<_, anyhow::Error>(reply)
+        };
+        let result = tokio::time::timeout_at(deadline, operation)
+            .await
+            .map_err(|_| {
+                FabricError::new(
+                    ErrorCode::Timeout,
+                    "pairing RPC timed out; reconcile attempt before retrying",
+                )
+            })
+            .and_then(|result| {
+                result.map_err(|_| {
+                    FabricError::new(
+                        ErrorCode::Unreachable,
+                        "restricted pairing RPC failed; reconcile attempt before retrying",
+                    )
+                })
+            });
+        connection.close(VarInt::from_u32(0), b"pairing RPC ended");
+        result.map_err(Into::into)
+    }
+    .await;
+    result.unwrap_or_else(|error: anyhow::Error| Reply {
+        status: None,
+        secret: None,
+        exchange: None,
+        access: vec![],
+        error: Some(crate::runtime_peers::PolicyError::of(&error)),
+    })
+}
+
 async fn serve_requests(connection: &Connection, state: &DaemonState) -> Result<()> {
     let (mut send, mut recv) = tokio::time::timeout(IDLE, connection.accept_bi()).await??;
     let mut lease: Option<AttemptLease<'_>> = None;
     let mut deadline = tokio::time::Instant::now() + Duration::from_secs(600);
     loop {
         let mut length = [0u8; 4];
-        tokio::time::timeout_at(
-            deadline.min(tokio::time::Instant::now() + IDLE),
-            recv.read_exact(&mut length),
-        )
-        .await??;
+        let wait = deadline.min(tokio::time::Instant::now() + IDLE);
+        if tokio::time::timeout_at(wait, recv.read(&mut length[..1]))
+            .await??
+            .is_none()
+        {
+            send.finish()?;
+            let _ = tokio::time::timeout(IDLE, send.stopped()).await;
+            return Ok(());
+        }
+        tokio::time::timeout_at(wait, recv.read_exact(&mut length[1..])).await??;
         // Only a fixed header precedes rate permission; no attacker-sized allocation.
         if !state
             .pairing_gate
@@ -764,6 +893,233 @@ mod tests {
         }
         client.close().await;
         restarted.shutdown().await?;
+        Ok(())
+    }
+    async fn remote_request(
+        home: &FabricHome,
+        target: &FabricNode,
+        request: NetworkRequest,
+    ) -> Result<Reply> {
+        match send_control(
+            home,
+            ControlRequest::PairingRemote {
+                gateway: target.id(),
+                addr: Some(target.addr()),
+                request,
+            },
+        )
+        .await?
+        {
+            ControlResponse::Pairing { reply } => Ok(reply),
+            other => bail!("unexpected joining reply: {other:?}"),
+        }
+    }
+    async fn control_ready(home: &FabricHome) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !home.control_socket_path().exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn joining_control_uses_existing_daemon_identity_without_temporary_trust() -> Result<()> {
+        use crate::runtime_peers::{
+            Direction,
+            pairing::{ConfirmRequest, Payload, Policy, Request},
+        };
+        let owner_dir = tempfile::tempdir()?;
+        let joining_dir = tempfile::tempdir()?;
+        let owner_home = FabricHome::new(owner_dir.path());
+        let joining_home = FabricHome::new(joining_dir.path());
+        let owner = gateway(owner_home.clone()).await?;
+        let joining = gateway(joining_home.clone()).await?;
+        control_ready(&owner_home).await?;
+        control_ready(&joining_home).await?;
+        let original_id = joining.id();
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            + 600;
+        let issued = owner_request(
+            &owner_home,
+            Request::Issue {
+                owner: "fleet".into(),
+                creation_id: "daemon-join".into(),
+                deadline,
+                policy: Policy {
+                    grants: vec!["echo".into()],
+                    name: None,
+                    direction: Direction::InboundOnly,
+                },
+            },
+        )
+        .await?;
+        assert!(issued.error.is_none());
+        let attempt_id = issued.status.unwrap().attempt_id;
+        let pending = remote_request(
+            &joining_home,
+            &owner,
+            NetworkRequest::Present {
+                attempt_id: attempt_id.clone(),
+                secret: issued.secret.unwrap(),
+            },
+        )
+        .await?;
+        assert!(pending.error.is_none(), "{:?}", pending.error);
+        let pending = pending.status.unwrap();
+        assert_eq!(pending.bound_node_id, Some(original_id));
+        assert!(owner.state().peer_book.read().await.peers().is_empty());
+        assert!(joining.state().peer_book.read().await.peers().is_empty());
+        let proof = b"opaque member-key proof".to_vec();
+        let sent = remote_request(
+            &joining_home,
+            &owner,
+            NetworkRequest::Send {
+                attempt_id: attempt_id.clone(),
+                sequence: 1,
+                digest: blake3::hash(&proof).to_hex().to_string(),
+                payload: Payload::new(proof.clone()),
+            },
+        )
+        .await?;
+        assert!(sent.error.is_none(), "{:?}", sent.error);
+        let received = owner_request(
+            &owner_home,
+            Request::PairReceive {
+                owner: "fleet".into(),
+                attempt_id: attempt_id.clone(),
+                ack: None,
+            },
+        )
+        .await?;
+        assert_eq!(
+            received
+                .exchange
+                .unwrap()
+                .message
+                .unwrap()
+                .payload
+                .as_bytes(),
+            proof
+        );
+        let challenge = b"opaque challenge".to_vec();
+        let sent = owner_request(
+            &owner_home,
+            Request::PairSend {
+                owner: "fleet".into(),
+                attempt_id: attempt_id.clone(),
+                sequence: 1,
+                digest: blake3::hash(&challenge).to_hex().to_string(),
+                payload: Payload::new(challenge.clone()),
+            },
+        )
+        .await?;
+        assert!(sent.error.is_none());
+        let received = remote_request(
+            &joining_home,
+            &owner,
+            NetworkRequest::Receive {
+                attempt_id: attempt_id.clone(),
+                ack: None,
+            },
+        )
+        .await?;
+        assert!(received.error.is_none(), "{:?}", received.error);
+        assert_eq!(
+            received
+                .exchange
+                .unwrap()
+                .message
+                .unwrap()
+                .payload
+                .as_bytes(),
+            challenge
+        );
+        let confirmed = owner_request(
+            &owner_home,
+            Request::Confirm {
+                confirmation: ConfirmRequest {
+                    owner: "fleet".into(),
+                    attempt_id,
+                    expected_node_id: original_id,
+                    expected_attempt_revision: pending.attempt_revision,
+                    expected_policy_revision: 0,
+                    request_id: "admit-existing-identity".into(),
+                },
+            },
+        )
+        .await?;
+        assert!(confirmed.error.is_none(), "{:?}", confirmed.error);
+        assert!(joining.state().peer_book.read().await.peers().is_empty());
+        assert_eq!(joining.id(), original_id);
+        let echo = joining
+            .state()
+            .current_endpoint()
+            .connect(owner.addr(), BUILTIN_ECHO_ALPN)
+            .await?;
+        let (mut send, mut recv) = echo.open_bi().await?;
+        send.write_all(b"same-id").await?;
+        let mut proof = [0; 7];
+        tokio::time::timeout(Duration::from_secs(3), recv.read_exact(&mut proof)).await??;
+        assert_eq!(&proof, b"same-id");
+        joining.shutdown().await?;
+        owner.shutdown().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn joining_control_requires_opt_in_and_authenticates_pinned_gateway() -> Result<()> {
+        use crate::runtime_peers::pairing::Secret;
+        let owner_dir = tempfile::tempdir()?;
+        let joining_dir = tempfile::tempdir()?;
+        let owner = gateway(FabricHome::new(owner_dir.path())).await?;
+        let joining_home = FabricHome::new(joining_dir.path());
+        let disabled = FabricNode::start(joining_home.clone()).await?;
+        control_ready(&joining_home).await?;
+        let request = NetworkRequest::Status {
+            attempt_id: "unknown".into(),
+        };
+        let reply = remote_request(&joining_home, &owner, request).await?;
+        assert_eq!(reply.error.unwrap().code, "runtime_peers_disabled");
+        disabled.shutdown().await?;
+        let joining = gateway(joining_home.clone()).await?;
+        control_ready(&joining_home).await?;
+        let request = ControlRequest::PairingRemote {
+            gateway: joining.id(),
+            addr: Some(owner.addr()),
+            request: NetworkRequest::Present {
+                attempt_id: "unknown".into(),
+                secret: Secret::new("never-log-this"),
+            },
+        };
+        assert!(!format!("{request:?}").contains("never-log-this"));
+        let ControlResponse::Pairing { reply } = send_control(&joining_home, request).await? else {
+            bail!("missing pairing reply");
+        };
+        assert_eq!(reply.error.unwrap().code, "invalid_argument");
+        let mut spoofed = owner.addr();
+        spoofed.id = node(99);
+        let ControlResponse::Pairing { reply } = send_control(
+            &joining_home,
+            ControlRequest::PairingRemote {
+                gateway: spoofed.id,
+                addr: Some(spoofed),
+                request: NetworkRequest::Status {
+                    attempt_id: "unknown".into(),
+                },
+            },
+        )
+        .await?
+        else {
+            bail!("missing pairing reply");
+        };
+        let error = reply.error.unwrap();
+        assert!(matches!(error.code.as_str(), "unreachable" | "timeout"));
+        assert!(joining.state().peer_book.read().await.peers().is_empty());
+        assert!(owner.state().peer_book.read().await.peers().is_empty());
+        joining.shutdown().await?;
+        owner.shutdown().await?;
         Ok(())
     }
 }
