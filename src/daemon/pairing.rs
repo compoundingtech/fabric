@@ -257,6 +257,7 @@ pub(super) async fn remote(
             let status = reply.status.as_ref().context("missing pairing status")?;
             anyhow::ensure!(
                 reply.secret.is_none()
+                    && reply.error.is_none()
                     && status.attempt_id == *attempt
                     && status.bound_node_id == Some(endpoint.id()),
                 "unbound pairing reply"
@@ -1120,6 +1121,94 @@ mod tests {
         assert!(owner.state().peer_book.read().await.peers().is_empty());
         joining.shutdown().await?;
         owner.shutdown().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn joining_control_sanitizes_bound_gateway_error_replies() -> Result<()> {
+        let joining_dir = tempfile::tempdir()?;
+        let joining_home = FabricHome::new(joining_dir.path());
+        let joining = gateway(joining_home.clone()).await?;
+        control_ready(&joining_home).await?;
+        let malicious = Endpoint::builder(presets::N0)
+            .alpns(vec![crate::runtime_peers::pairing::PAIR_ALPN.to_vec()])
+            .bind()
+            .await?;
+        let server = tokio::spawn({
+            let malicious = malicious.clone();
+            async move {
+                let connection = malicious
+                    .accept()
+                    .await
+                    .context("missing connection")?
+                    .await?;
+                let (mut send, mut recv) = connection.accept_bi().await?;
+                let mut length = [0; 4];
+                recv.read_exact(&mut length).await?;
+                let length = u32::from_be_bytes(length) as usize;
+                anyhow::ensure!(length <= MAX_REQUEST, "oversized request");
+                let mut bytes = vec![0; length];
+                recv.read_exact(&mut bytes).await?;
+                let NetworkRequest::Status { attempt_id } = serde_json::from_slice(&bytes)? else {
+                    bail!("expected status request");
+                };
+                let reply = Reply {
+                    status: Some(Status {
+                        attempt_id,
+                        creation_id: "malicious".into(),
+                        state: State::Pending,
+                        attempt_revision: 2,
+                        deadline: u64::MAX,
+                        policy_digest: "unused".into(),
+                        terminal_at: None,
+                        bound_node_id: Some(connection.remote_id()),
+                        terminal_reason: None,
+                        completion: None,
+                    }),
+                    secret: None,
+                    exchange: None,
+                    access: vec![],
+                    error: Some(crate::runtime_peers::PolicyError {
+                        code: "injected-code".into(),
+                        class: "injected-class".into(),
+                        message: "injected-secret-message".into(),
+                    }),
+                };
+                let bytes = serde_json::to_vec(&reply)?;
+                send.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
+                send.write_all(&bytes).await?;
+                send.finish()?;
+                let _ = tokio::time::timeout(Duration::from_secs(3), send.stopped()).await;
+                connection.close(VarInt::from_u32(0), b"fixture ended");
+                Ok::<_, anyhow::Error>(())
+            }
+        });
+        let ControlResponse::Pairing { reply } = send_control(
+            &joining_home,
+            ControlRequest::PairingRemote {
+                gateway: malicious.id(),
+                addr: Some(malicious.addr()),
+                request: NetworkRequest::Status {
+                    attempt_id: "bound-attempt".into(),
+                },
+            },
+        )
+        .await?
+        else {
+            bail!("missing pairing reply");
+        };
+        let encoded = serde_json::to_string(&reply)?;
+        assert!(!encoded.contains("injected-"));
+        assert!(reply.status.is_none());
+        let error = reply.error.context("missing sanitized error")?;
+        assert_eq!(error.code, "unreachable");
+        assert_eq!(error.class, "fault");
+        assert_eq!(
+            error.message,
+            "restricted pairing RPC failed; reconcile attempt before retrying"
+        );
+        tokio::time::timeout(Duration::from_secs(3), server).await???;
+        malicious.close().await;
+        joining.shutdown().await?;
         Ok(())
     }
 }

@@ -38,6 +38,7 @@ Deprecated, Fixed or Security.
   operations through `pairing_remote` on their existing daemon control socket.
   The bridge uses that daemon's identity, bounded frames/concurrency/deadlines,
   and no temporary ordinary peer trust or implicit retries.
+  Remote error-bearing replies are rejected without reflecting gateway error text.
 
 ## [0.9.2] - 2026-10-16
 
