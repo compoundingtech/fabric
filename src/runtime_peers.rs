@@ -17,6 +17,7 @@ use crate::{
     error::{ErrorCode, FabricError},
 };
 
+mod exchange;
 pub mod pairing;
 
 pub const MAX_OPERATIONS: usize = 128;
@@ -381,6 +382,7 @@ pub(crate) struct RuntimePeers {
     static_input: StaticInput,
     fault: Option<String>,
     pairing_clock: (u64, std::time::Instant),
+    exchanges: BTreeMap<String, exchange::Exchange>,
     #[cfg(test)]
     fail_directory_sync: bool,
 }
@@ -440,6 +442,7 @@ impl RuntimePeers {
             static_input: placeholder,
             fault: None,
             pairing_clock: (now(), std::time::Instant::now()),
+            exchanges: BTreeMap::new(),
             #[cfg(test)]
             fail_directory_sync: false,
         };
@@ -554,6 +557,9 @@ impl RuntimePeers {
             return Err(unavailable(error));
         }
         loaded.instance = self.instance.clone();
+        loaded.pairing_clock = self.pairing_clock;
+        loaded.exchanges = std::mem::take(&mut self.exchanges);
+        loaded.prune_exchanges();
         *self = loaded;
         Ok(book)
     }
@@ -578,6 +584,7 @@ impl RuntimePeers {
             static_input: input,
             fault: None,
             pairing_clock: self.pairing_clock,
+            exchanges: BTreeMap::new(),
             #[cfg(test)]
             fail_directory_sync: false,
         };

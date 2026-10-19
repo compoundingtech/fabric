@@ -1,4 +1,5 @@
 //! Restricted pairing state: neither issuing nor presenting a permit grants access.
+pub use super::exchange::{ExchangeReply, Message, MessageDirection, Payload};
 use super::*;
 
 pub const PAIR_ALPN: &[u8] = b"fabric/pair/1";
@@ -6,8 +7,23 @@ pub const PAIR_ALPN: &[u8] = b"fabric/pair/1";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NetworkRequest {
-    Present { attempt_id: String, secret: Secret },
-    Status { attempt_id: String },
+    Present {
+        attempt_id: String,
+        secret: Secret,
+    },
+    Status {
+        attempt_id: String,
+    },
+    Send {
+        attempt_id: String,
+        sequence: u64,
+        digest: String,
+        payload: Payload,
+    },
+    Receive {
+        attempt_id: String,
+        ack: Option<u64>,
+    },
 }
 
 const MAX_PERMITS: usize = 64;
@@ -58,6 +74,18 @@ pub enum Request {
         owner: String,
         creation_id: String,
     },
+    PairSend {
+        owner: String,
+        attempt_id: String,
+        sequence: u64,
+        digest: String,
+        payload: Payload,
+    },
+    PairReceive {
+        owner: String,
+        attempt_id: String,
+        ack: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,14 +132,16 @@ pub struct Reply {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret: Option<Secret>,
     pub error: Option<PolicyError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exchange: Option<ExchangeReply>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Attempt {
-    owner: String,
+    pub(super) owner: String,
     policy: Policy,
-    status: Status,
+    pub(super) status: Status,
     salt: Option<String>,
     secret_hash: Option<String>,
 }
@@ -123,7 +153,7 @@ impl Attempt {
             self.terminate(State::Expired, self.status.deadline);
         }
     }
-    fn terminate(&mut self, state: State, timestamp: u64) {
+    pub(super) fn terminate(&mut self, state: State, timestamp: u64) {
         self.status.state = state;
         self.status.attempt_revision += 1;
         self.status.terminal_at = Some(timestamp);
@@ -189,7 +219,8 @@ pub(super) fn validate(attempts: &[Attempt]) -> Result<()> {
                     (State::Expired, "expired")
                         | (State::Rejected, "cancelled")
                         | (State::Rejected, "exchange_lost")
-                ) || (reason == "exchange_lost" && !bound)
+                        | (State::Rejected, "exchange_limit")
+                ) || (matches!(reason.as_str(), "exchange_lost" | "exchange_limit") && !bound)
             })
         {
             return Err(unavailable("invalid pairing attempt history"));
@@ -269,10 +300,42 @@ impl RuntimePeers {
         timestamp: u64,
     ) -> Result<Reply> {
         self.ensure_available()?;
+        self.prepare_exchange_io(timestamp)?;
+        let request = match request {
+            NetworkRequest::Send {
+                attempt_id,
+                sequence,
+                digest,
+                payload,
+            } => {
+                return self.exchange_request(
+                    None,
+                    Some(node),
+                    &attempt_id,
+                    super::exchange::Operation::Send {
+                        sequence,
+                        digest,
+                        payload,
+                    },
+                    timestamp,
+                );
+            }
+            NetworkRequest::Receive { attempt_id, ack } => {
+                return self.exchange_request(
+                    None,
+                    Some(node),
+                    &attempt_id,
+                    super::exchange::Operation::Receive { ack },
+                    timestamp,
+                );
+            }
+            other => other,
+        };
         let refused = || invalid("pairing request refused");
         let (attempt_id, secret) = match &request {
             NetworkRequest::Present { attempt_id, secret } => (attempt_id, Some(secret)),
             NetworkRequest::Status { attempt_id } => (attempt_id, None),
+            NetworkRequest::Send { .. } | NetworkRequest::Receive { .. } => unreachable!(),
         };
         let index = self
             .stored
@@ -330,6 +393,7 @@ impl RuntimePeers {
             status: Some(result?),
             secret: None,
             error: None,
+            exchange: None,
         })
     }
 
@@ -339,12 +403,49 @@ impl RuntimePeers {
     }
     fn pairing_request_at(&mut self, request: Request, timestamp: u64) -> Result<Reply> {
         self.ensure_available()?;
+        self.prepare_exchange_io(timestamp)?;
+        let request = match request {
+            Request::PairSend {
+                owner,
+                attempt_id,
+                sequence,
+                digest,
+                payload,
+            } => {
+                return self.exchange_request(
+                    Some(&owner),
+                    None,
+                    &attempt_id,
+                    super::exchange::Operation::Send {
+                        sequence,
+                        digest,
+                        payload,
+                    },
+                    timestamp,
+                );
+            }
+            Request::PairReceive {
+                owner,
+                attempt_id,
+                ack,
+            } => {
+                return self.exchange_request(
+                    Some(&owner),
+                    None,
+                    &attempt_id,
+                    super::exchange::Operation::Receive { ack },
+                    timestamp,
+                );
+            }
+            other => other,
+        };
         let (owner, creation_id) = match &request {
             Request::Issue {
                 owner, creation_id, ..
             }
             | Request::Query { owner, creation_id }
             | Request::Cancel { owner, creation_id } => (owner, creation_id),
+            Request::PairSend { .. } | Request::PairReceive { .. } => unreachable!(),
         };
         validate_token(owner, "owner")?;
         validate_token(creation_id, "creation_id")?;
@@ -438,6 +539,7 @@ impl RuntimePeers {
                 }
                 index
             }
+            Request::PairSend { .. } | Request::PairReceive { .. } => unreachable!(),
         };
         let status = next.pairing[index].status.clone();
         self.commit_pairing(next)?;
@@ -445,10 +547,43 @@ impl RuntimePeers {
             status: Some(status),
             secret,
             error: None,
+            exchange: None,
         })
     }
 
-    fn commit_pairing(&mut self, next: Stored) -> Result<()> {
+    /// Proactive cleanup under the same daemon commit barrier as pairing IO.
+    /// An idle sweep does not advance durable highwater or write the state file.
+    pub(crate) fn pairing_expire(&mut self) -> Result<()> {
+        let timestamp = observe_clock(&mut self.pairing_clock, now(), std::time::Instant::now())
+            .max(self.stored.pairing_last_seen);
+        // Quarantine must not extend transcript lifetime. Keep only rejection
+        // tombstones and budgets until a healthy commit can close the attempt.
+        self.erase_expired_exchange_payloads(timestamp);
+        self.ensure_available()?;
+        let mut next = self.stored.clone();
+        recover(&mut next, timestamp, false);
+        next.pairing.retain(|attempt| {
+            attempt
+                .status
+                .terminal_at
+                .is_none_or(|ended| timestamp < ended.saturating_add(RECEIPT_SECONDS))
+        });
+        // Erase expired payloads even if persisting their terminal state fails.
+        self.exchanges.retain(|id, _| {
+            next.pairing.iter().any(|attempt| {
+                &attempt.status.attempt_id == id && attempt.status.state == State::Pending
+            })
+        });
+        if next.pairing != self.stored.pairing {
+            next.pairing_last_seen = timestamp;
+            self.commit_pairing(next)?;
+        } else {
+            self.prune_exchanges();
+        }
+        Ok(())
+    }
+
+    pub(super) fn commit_pairing(&mut self, next: Stored) -> Result<()> {
         // Same atomic file and sequencer as runtime grants; never compose pairing into policy.
         if next.pairing != self.stored.pairing
             || next.pairing_last_seen != self.stored.pairing_last_seen
@@ -461,6 +596,7 @@ impl RuntimePeers {
             }
             self.stored = next;
         }
+        self.prune_exchanges();
         Ok(())
     }
 }
@@ -1034,5 +1170,710 @@ mod tests {
             t + 600,
         ));
         assert!(store.snapshot(None).unwrap().peers.is_empty());
+    }
+
+    fn pending_exchange(store: &mut RuntimePeers, id: &str, t: u64) -> Status {
+        let issued = store.pairing_request_at(issue(id, t + 600), t).unwrap();
+        let status = issued.status.unwrap();
+        store
+            .pairing_network_request_at(node(1), presentation(&status, &issued.secret.unwrap()), t)
+            .unwrap()
+            .status
+            .unwrap()
+    }
+
+    fn exchange_send(
+        store: &mut RuntimePeers,
+        status: &Status,
+        owner: bool,
+        sequence: u64,
+        bytes: Vec<u8>,
+        t: u64,
+    ) -> Result<Reply> {
+        let digest = blake3::hash(&bytes).to_hex().to_string();
+        let payload = Payload::new(bytes);
+        if owner {
+            store.pairing_request_at(
+                Request::PairSend {
+                    owner: "fleet".into(),
+                    attempt_id: status.attempt_id.clone(),
+                    sequence,
+                    digest,
+                    payload,
+                },
+                t,
+            )
+        } else {
+            store.pairing_network_request_at(
+                node(1),
+                NetworkRequest::Send {
+                    attempt_id: status.attempt_id.clone(),
+                    sequence,
+                    digest,
+                    payload,
+                },
+                t,
+            )
+        }
+    }
+
+    fn exchange_receive(
+        store: &mut RuntimePeers,
+        status: &Status,
+        owner: bool,
+        ack: Option<u64>,
+        t: u64,
+    ) -> Result<Reply> {
+        if owner {
+            store.pairing_request_at(
+                Request::PairReceive {
+                    owner: "fleet".into(),
+                    attempt_id: status.attempt_id.clone(),
+                    ack,
+                },
+                t,
+            )
+        } else {
+            store.pairing_network_request_at(
+                node(1),
+                NetworkRequest::Receive {
+                    attempt_id: status.attempt_id.clone(),
+                    ack,
+                },
+                t,
+            )
+        }
+    }
+
+    #[test]
+    fn opaque_exchange_is_bidirectional_replayed_acknowledged_and_memory_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(&dir);
+        let t = now();
+        let status = pending_exchange(&mut store, "opaque", t);
+        assert!(
+            exchange_receive(&mut store, &status, true, None, t)
+                .unwrap()
+                .exchange
+                .unwrap()
+                .message
+                .is_none()
+        );
+        let bytes = vec![0, 255, 42, 128, 0];
+        let sent = exchange_send(&mut store, &status, false, 1, bytes.clone(), t)
+            .unwrap()
+            .exchange
+            .unwrap();
+        assert_eq!(
+            (sent.sent_sequence, sent.total_bytes, sent.total_messages),
+            (Some(1), 5, 1)
+        );
+        let first = exchange_receive(&mut store, &status, true, None, t)
+            .unwrap()
+            .exchange
+            .unwrap()
+            .message
+            .unwrap();
+        assert_eq!(first.direction, MessageDirection::NodeToOwner);
+        assert_eq!(first.payload.as_bytes(), bytes);
+        assert_eq!(first.digest, blake3::hash(&bytes).to_hex().to_string());
+        assert_eq!(
+            exchange_receive(&mut store, &status, true, None, t)
+                .unwrap()
+                .exchange
+                .unwrap()
+                .message
+                .unwrap(),
+            first
+        );
+        exchange_send(
+            &mut store,
+            &status,
+            true,
+            1,
+            b"owner-opaque-private".to_vec(),
+            t,
+        )
+        .unwrap();
+        let reverse = exchange_receive(&mut store, &status, false, None, t)
+            .unwrap()
+            .exchange
+            .unwrap()
+            .message
+            .unwrap();
+        assert_eq!(reverse.direction, MessageDirection::OwnerToNode);
+        assert_eq!(reverse.payload.as_bytes(), b"owner-opaque-private");
+        assert!(
+            exchange_receive(&mut store, &status, true, Some(1), t)
+                .unwrap()
+                .exchange
+                .unwrap()
+                .message
+                .is_none()
+        );
+        assert!(
+            exchange_receive(&mut store, &status, true, Some(1), t)
+                .unwrap()
+                .exchange
+                .unwrap()
+                .message
+                .is_none()
+        );
+        let duplicate = exchange_send(&mut store, &status, false, 1, bytes, t)
+            .unwrap()
+            .exchange
+            .unwrap();
+        assert_eq!((duplicate.total_bytes, duplicate.total_messages), (25, 2));
+        assert!(
+            exchange_receive(&mut store, &status, true, None, t)
+                .unwrap()
+                .exchange
+                .unwrap()
+                .message
+                .is_none()
+        );
+        let disk = fs::read_to_string(&store.path).unwrap();
+        assert!(!disk.contains("owner-opaque-private"));
+        assert!(!disk.contains(&reverse.digest));
+        assert!(!disk.contains("total_bytes"));
+        assert!(!format!("{:?}", reverse.payload).contains("owner-opaque-private"));
+        let encoded = serde_json::to_value(&reverse.payload).unwrap();
+        assert!(encoded.is_array());
+        assert_eq!(
+            serde_json::from_value::<Payload>(encoded).unwrap(),
+            reverse.payload
+        );
+        assert!(store.snapshot(None).unwrap().peers.is_empty());
+        assert!(store.access_for(&[node(1)]).is_empty());
+        assert_eq!(store.stored.revision, 0);
+    }
+
+    #[test]
+    fn exchange_rejects_digest_conflicts_gaps_and_unseen_acks_without_spending_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(&dir);
+        let t = now();
+        let status = pending_exchange(&mut store, "ordering", t);
+        for sequence in [0, 2, u64::MAX] {
+            assert!(exchange_send(&mut store, &status, false, sequence, vec![1], t).is_err());
+        }
+        for digest in [
+            "invalid".to_owned(),
+            blake3::hash(&[2]).to_hex().to_string(),
+        ] {
+            assert!(
+                store
+                    .pairing_network_request_at(
+                        node(1),
+                        NetworkRequest::Send {
+                            attempt_id: status.attempt_id.clone(),
+                            sequence: 1,
+                            digest,
+                            payload: Payload::new(vec![1]),
+                        },
+                        t
+                    )
+                    .is_err()
+            );
+        }
+        exchange_send(&mut store, &status, false, 1, vec![1], t).unwrap();
+        exchange_send(&mut store, &status, false, 2, vec![2], t).unwrap();
+        for ack in [0, 1, 2, u64::MAX] {
+            assert!(exchange_receive(&mut store, &status, true, Some(ack), t).is_err());
+        }
+        assert!(exchange_send(&mut store, &status, false, 1, vec![9], t).is_err());
+        assert!(exchange_send(&mut store, &status, false, 4, vec![4], t).is_err());
+        let received = exchange_receive(&mut store, &status, true, None, t)
+            .unwrap()
+            .exchange
+            .unwrap();
+        assert_eq!((received.total_bytes, received.total_messages), (2, 2));
+        assert_eq!(received.message.unwrap().sequence, 1);
+        assert!(exchange_receive(&mut store, &status, true, Some(2), t).is_err());
+        assert_eq!(
+            exchange_receive(&mut store, &status, true, Some(1), t)
+                .unwrap()
+                .exchange
+                .unwrap()
+                .message
+                .unwrap()
+                .sequence,
+            2
+        );
+        assert!(
+            exchange_receive(&mut store, &status, true, Some(2), t)
+                .unwrap()
+                .exchange
+                .unwrap()
+                .message
+                .is_none()
+        );
+        assert!(exchange_send(&mut store, &status, false, 1, vec![9], t).is_err());
+        assert_eq!(
+            exchange_send(&mut store, &status, false, 1, vec![1], t)
+                .unwrap()
+                .exchange
+                .unwrap()
+                .total_messages,
+            2
+        );
+    }
+
+    #[test]
+    fn exchange_enforces_payload_shared_byte_and_direction_message_bounds_durably() {
+        // Queued and acknowledged bytes both consume the lifetime budget.
+        for acknowledge in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = open(&dir);
+            let t = now();
+            let status = pending_exchange(&mut store, "bytes", t);
+            for sequence in 1..=8 {
+                for owner in [false, true] {
+                    exchange_send(&mut store, &status, owner, sequence, vec![42; 65536], t)
+                        .unwrap();
+                    if acknowledge {
+                        exchange_receive(&mut store, &status, !owner, None, t).unwrap();
+                        exchange_receive(&mut store, &status, !owner, Some(sequence), t).unwrap();
+                    }
+                }
+            }
+            let at_limit = exchange_send(&mut store, &status, false, 8, vec![42; 65536], t)
+                .unwrap()
+                .exchange
+                .unwrap();
+            assert_eq!(
+                (at_limit.total_bytes, at_limit.total_messages),
+                (1048576, 16)
+            );
+            let rejected = exchange_send(&mut store, &status, false, 9, vec![0], t).unwrap();
+            assert_exchange_limit(&mut store, &status, rejected, &dir, t);
+        }
+        for owner in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = open(&dir);
+            let t = now();
+            let status = pending_exchange(&mut store, "count", t);
+            for sequence in 1..=16 {
+                exchange_send(&mut store, &status, owner, sequence, vec![], t).unwrap();
+            }
+            // The other direction can still use all sixteen messages.
+            for sequence in 1..=16 {
+                exchange_send(&mut store, &status, !owner, sequence, vec![], t).unwrap();
+            }
+            assert_eq!(
+                exchange_send(&mut store, &status, owner, 16, vec![], t)
+                    .unwrap()
+                    .exchange
+                    .unwrap()
+                    .total_messages,
+                32
+            );
+            let rejected = exchange_send(&mut store, &status, owner, 17, vec![], t).unwrap();
+            assert_exchange_limit(&mut store, &status, rejected, &dir, t);
+        }
+        for owner in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = open(&dir);
+            let t = now();
+            let status = pending_exchange(&mut store, "oversize", t);
+            exchange_send(&mut store, &status, !owner, 1, vec![1], t).unwrap();
+            let rejected = exchange_send(&mut store, &status, owner, 1, vec![1; 65537], t).unwrap();
+            assert_exchange_limit(&mut store, &status, rejected, &dir, t);
+        }
+    }
+
+    fn assert_exchange_limit(
+        store: &mut RuntimePeers,
+        status: &Status,
+        reply: Reply,
+        dir: &tempfile::TempDir,
+        t: u64,
+    ) {
+        let rejected = reply.status.unwrap();
+        assert_eq!(rejected.state, State::Rejected);
+        assert_eq!(rejected.terminal_reason.as_deref(), Some("exchange_limit"));
+        assert!(reply.exchange.is_none());
+        assert!(store.exchanges.is_empty());
+        assert!(store.stored.pairing[0].secret_hash.is_none());
+        assert!(store.stored.pairing[0].salt.is_none());
+        assert!(
+            exchange_receive(store, status, true, None, t)
+                .unwrap()
+                .exchange
+                .is_none()
+        );
+        assert!(
+            exchange_receive(store, status, false, None, t)
+                .unwrap()
+                .exchange
+                .is_none()
+        );
+        assert!(store.snapshot(None).unwrap().peers.is_empty());
+        assert_eq!(
+            open(dir)
+                .pairing_request_at(query(&status.creation_id), t)
+                .unwrap()
+                .status
+                .unwrap()
+                .terminal_reason
+                .as_deref(),
+            Some("exchange_limit")
+        );
+    }
+
+    #[test]
+    fn exchange_requires_creating_owner_bound_node_and_verified_pending_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(&dir);
+        let t = now();
+        let issued = store
+            .pairing_request_at(issue("unbound", t + 600), t)
+            .unwrap()
+            .status
+            .unwrap();
+        assert!(
+            exchange_send(&mut store, &issued, true, 1, vec![1], t)
+                .unwrap()
+                .exchange
+                .is_none()
+        );
+        assert!(exchange_receive(&mut store, &issued, false, None, t).is_err());
+        assert!(store.exchanges.is_empty());
+        let status = pending_exchange(&mut store, "bound", t);
+        let other = pending_exchange(&mut store, "other", t);
+        exchange_send(&mut store, &status, false, 1, vec![42], t).unwrap();
+        for attempt_id in [&status.attempt_id, &"unknown".to_owned()] {
+            for request in [
+                Request::PairReceive {
+                    owner: "intruder".into(),
+                    attempt_id: attempt_id.clone(),
+                    ack: None,
+                },
+                Request::PairSend {
+                    owner: "intruder".into(),
+                    attempt_id: attempt_id.clone(),
+                    sequence: 1,
+                    digest: blake3::hash(&[1]).to_hex().to_string(),
+                    payload: Payload::new(vec![1]),
+                },
+            ] {
+                assert!(store.pairing_request_at(request, t).is_err());
+            }
+            for request in [
+                NetworkRequest::Receive {
+                    attempt_id: attempt_id.clone(),
+                    ack: None,
+                },
+                NetworkRequest::Send {
+                    attempt_id: attempt_id.clone(),
+                    sequence: 1,
+                    digest: blake3::hash(&[1]).to_hex().to_string(),
+                    payload: Payload::new(vec![1]),
+                },
+            ] {
+                assert!(
+                    store
+                        .pairing_network_request_at(node(2), request, t)
+                        .is_err()
+                );
+            }
+        }
+        assert!(
+            exchange_receive(&mut store, &other, true, None, t)
+                .unwrap()
+                .exchange
+                .unwrap()
+                .message
+                .is_none()
+        );
+        assert_eq!(
+            exchange_receive(&mut store, &status, true, None, t)
+                .unwrap()
+                .exchange
+                .unwrap()
+                .message
+                .unwrap()
+                .payload
+                .as_bytes(),
+            &[42]
+        );
+    }
+
+    #[test]
+    fn exchange_reconnect_and_live_reconcile_preserve_buffers_and_lifetime_budgets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(&dir);
+        let t = now();
+        let issued = store
+            .pairing_request_at(issue("resume", t + 600), t)
+            .unwrap();
+        let status = issued.status.unwrap();
+        let present = presentation(&status, &issued.secret.unwrap());
+        store
+            .pairing_network_request_at(node(1), present.clone(), t)
+            .unwrap();
+        for sequence in 1..=16 {
+            exchange_send(&mut store, &status, false, sequence, vec![7], t).unwrap();
+        }
+        exchange_receive(&mut store, &status, true, None, t).unwrap();
+        exchange_receive(&mut store, &status, true, Some(1), t).unwrap();
+        store
+            .pairing_network_request_at(node(1), present, t)
+            .unwrap();
+        store.reconcile(&FabricHome::new(dir.path())).unwrap();
+        let resumed = exchange_receive(&mut store, &status, true, None, t)
+            .unwrap()
+            .exchange
+            .unwrap();
+        assert_eq!(resumed.message.unwrap().sequence, 2);
+        assert_eq!((resumed.total_bytes, resumed.total_messages), (16, 16));
+        assert_eq!(
+            exchange_send(&mut store, &status, false, 1, vec![7], t)
+                .unwrap()
+                .exchange
+                .unwrap()
+                .total_messages,
+            16
+        );
+        let rejected = exchange_send(&mut store, &status, false, 17, vec![7], t).unwrap();
+        assert_exchange_limit(&mut store, &status, rejected, &dir, t);
+    }
+
+    #[test]
+    fn exchange_terminal_transitions_erase_traffic_and_restart_rejects_pending() {
+        for cancel in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = open(&dir);
+            let t = now();
+            let status = pending_exchange(&mut store, "terminal", t);
+            exchange_send(&mut store, &status, false, 1, vec![42], t).unwrap();
+            exchange_send(&mut store, &status, true, 1, vec![43], t).unwrap();
+            let time = if cancel {
+                store
+                    .pairing_request_at(
+                        Request::Cancel {
+                            owner: "fleet".into(),
+                            creation_id: status.creation_id.clone(),
+                        },
+                        t,
+                    )
+                    .unwrap();
+                t
+            } else {
+                t + 600
+            };
+            let reply = exchange_receive(&mut store, &status, true, None, time).unwrap();
+            assert!(reply.exchange.is_none());
+            assert!(store.exchanges.is_empty());
+            assert!(
+                exchange_receive(&mut store, &status, false, None, time)
+                    .unwrap()
+                    .exchange
+                    .is_none()
+            );
+            assert!(
+                exchange_send(&mut store, &status, true, 2, vec![44], time)
+                    .unwrap()
+                    .exchange
+                    .is_none()
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(&dir);
+        let t = now();
+        let status = pending_exchange(&mut store, "restart", t);
+        exchange_send(&mut store, &status, false, 1, vec![42], t).unwrap();
+        drop(store);
+        let mut restarted = open(&dir);
+        assert!(restarted.exchanges.is_empty());
+        let reply = exchange_receive(&mut restarted, &status, false, None, t).unwrap();
+        assert!(reply.exchange.is_none());
+        assert_eq!(
+            reply.status.unwrap().terminal_reason.as_deref(),
+            Some("exchange_lost")
+        );
+        assert_eq!(
+            open(&dir)
+                .pairing_request_at(query("restart"), t)
+                .unwrap()
+                .status
+                .unwrap()
+                .terminal_reason
+                .as_deref(),
+            Some("exchange_lost")
+        );
+    }
+
+    #[test]
+    fn refused_exchange_io_also_prunes_expired_buffers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(&dir);
+        let t = now();
+        let status = pending_exchange(&mut store, "expiry", t);
+        exchange_send(&mut store, &status, false, 1, vec![42], t).unwrap();
+        assert!(
+            store
+                .pairing_network_request_at(
+                    node(2),
+                    NetworkRequest::Receive {
+                        attempt_id: "unknown".into(),
+                        ack: None,
+                    },
+                    t + 600
+                )
+                .is_err()
+        );
+        assert!(store.exchanges.is_empty());
+        assert_eq!(store.stored.pairing[0].status.state, State::Expired);
+    }
+
+    #[test]
+    fn exchange_direction_limit_applies_without_exhausting_other_direction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(&dir);
+        let t = now();
+        let status = pending_exchange(&mut store, "direction-count", t);
+        for sequence in 1..=16 {
+            exchange_send(&mut store, &status, false, sequence, vec![], t).unwrap();
+        }
+        let rejected = exchange_send(&mut store, &status, false, 17, vec![], t).unwrap();
+        assert_exchange_limit(&mut store, &status, rejected, &dir, t);
+    }
+
+    #[test]
+    fn exchange_uses_effective_monotonic_expiry_for_both_surfaces() {
+        for owner in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = open(&dir);
+            let t = now();
+            let status = pending_exchange(&mut store, "clock", t);
+            exchange_send(&mut store, &status, false, 1, vec![42], t).unwrap();
+            store.pairing_clock = (t + 600, std::time::Instant::now());
+            let reply = if owner {
+                store.pairing_request(Request::PairReceive {
+                    owner: "fleet".into(),
+                    attempt_id: status.attempt_id,
+                    ack: None,
+                })
+            } else {
+                store.pairing_network_request(
+                    node(1),
+                    NetworkRequest::Receive {
+                        attempt_id: status.attempt_id,
+                        ack: None,
+                    },
+                )
+            }
+            .unwrap();
+            assert!(reply.exchange.is_none());
+            assert_eq!(reply.status.unwrap().state, State::Expired);
+            assert!(store.exchanges.is_empty());
+        }
+    }
+
+    #[test]
+    fn uncertain_limit_rejection_cannot_reset_budget_after_live_reconcile() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(&dir);
+        let t = now();
+        let status = pending_exchange(&mut store, "limit-fault", t);
+        exchange_send(&mut store, &status, false, 1, vec![42], t).unwrap();
+        let path = store.path.clone();
+        store.path = dir.path().join("missing/runtime-peers.toml");
+        assert!(exchange_send(&mut store, &status, false, 2, vec![42; 65537], t).is_err());
+        assert!(store.fault().is_some());
+        store.path = path;
+        store.reconcile(&FabricHome::new(dir.path())).unwrap();
+        let rejected = exchange_receive(&mut store, &status, true, None, t).unwrap();
+        assert_exchange_limit(&mut store, &status, rejected, &dir, t);
+    }
+
+    #[test]
+    fn live_reconcile_prunes_buffers_when_pending_binding_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(&dir);
+        let t = now();
+        let status = pending_exchange(&mut store, "changed-binding", t);
+        exchange_send(&mut store, &status, false, 1, vec![42], t).unwrap();
+        let mut changed = store.stored.clone();
+        changed.pairing[0].status.bound_node_id = Some(node(2));
+        store.persist(&changed).unwrap();
+        store.reconcile(&FabricHome::new(dir.path())).unwrap();
+        assert!(store.exchanges.is_empty());
+        assert!(exchange_receive(&mut store, &status, false, None, t).is_err());
+        let reply = store
+            .pairing_network_request_at(
+                node(2),
+                NetworkRequest::Receive {
+                    attempt_id: status.attempt_id,
+                    ack: None,
+                },
+                t,
+            )
+            .unwrap();
+        assert!(reply.exchange.unwrap().message.is_none());
+    }
+
+    #[test]
+    fn proactive_pairing_expiry_erases_idle_queues_without_writing_idle_ticks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(&dir);
+        let t = now();
+        let status = pending_exchange(&mut store, "idle-expiry", t);
+        exchange_send(&mut store, &status, false, 1, vec![42], t).unwrap();
+        exchange_send(&mut store, &status, true, 1, vec![43], t).unwrap();
+        let disk = fs::read_to_string(&store.path).unwrap();
+        let highwater = store.stored.pairing_last_seen;
+        // A needless persist would fail this otherwise idle tick.
+        store.fail_directory_sync = true;
+        store.pairing_expire().unwrap();
+        assert!(store.fault().is_none());
+        assert_eq!(store.stored.pairing_last_seen, highwater);
+        assert_eq!(fs::read_to_string(&store.path).unwrap(), disk);
+        assert_eq!(store.exchanges.len(), 1);
+        store.fail_directory_sync = false;
+        store.pairing_clock = (t + 600, std::time::Instant::now());
+        store.pairing_expire().unwrap();
+        assert!(store.exchanges.is_empty());
+        assert_eq!(store.stored.pairing[0].status.state, State::Expired);
+        assert!(store.stored.pairing[0].secret_hash.is_none());
+        assert_eq!(store.stored.pairing_last_seen, t + 600);
+        assert_eq!(open(&dir).stored.pairing[0].status.state, State::Expired);
+        store.pairing_clock = (t + 600 + RECEIPT_SECONDS, std::time::Instant::now());
+        store.pairing_expire().unwrap();
+        assert!(store.stored.pairing.is_empty());
+    }
+
+    #[test]
+    fn durable_exchange_limit_receipt_reopens_without_fault_and_requires_bound_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(&dir);
+        let t = now();
+        let status = pending_exchange(&mut store, "restart-limit", t);
+        let rejected = exchange_send(&mut store, &status, false, 1, vec![42; 65537], t).unwrap();
+        assert_eq!(
+            rejected.status.unwrap().terminal_reason.as_deref(),
+            Some("exchange_limit")
+        );
+        drop(store);
+        let (mut restarted, _) = RuntimePeers::open(&FabricHome::new(dir.path()));
+        assert!(restarted.fault().is_none());
+        assert!(restarted.snapshot(None).unwrap().peers.is_empty());
+        let reply = exchange_receive(&mut restarted, &status, false, None, t).unwrap();
+        assert!(reply.exchange.is_none());
+        assert_eq!(
+            reply.status.unwrap().terminal_reason.as_deref(),
+            Some("exchange_limit")
+        );
+        assert!(restarted.exchanges.is_empty());
+        let mut history = restarted.stored.pairing.clone();
+        validate(&history).unwrap();
+        history[0].status.bound_node_id = None;
+        history[0].status.attempt_revision = 2;
+        assert!(validate(&history).is_err());
+        history[0].status.bound_node_id = Some(node(1));
+        history[0].status.attempt_revision = 3;
+        history[0].status.state = State::Expired;
+        assert!(validate(&history).is_err());
     }
 }

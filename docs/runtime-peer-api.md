@@ -27,8 +27,8 @@ source includes the configured file path.
 The local control request `{"type":"pairing","request":{...}}` supports
 `issue`, `query`, and `cancel`. These operations require `--runtime-peers`.
 They create no ordinary trust record, grant, or service listener. Runtime mode
-also enables the restricted pairing ALPN below; join exchange and atomic
-confirmation are not implemented.
+also enables the restricted pairing ALPN and opaque join exchange below.
+Atomic confirmation is not implemented.
 
 `issue` takes `owner`, `creation_id`, an absolute Unix-seconds `deadline` within
 the next 600 seconds, and `policy`: exact `grants` (at most 128), optional `name`,
@@ -71,7 +71,8 @@ invitation as the authenticated destination, not discover or substitute another
 NodeID. Iroh authenticates both transport identities.
 
 One bidirectional stream carries bounded JSON frames, each prefixed by a
-four-byte big-endian byte length (maximum request length 4,096 bytes):
+four-byte big-endian byte length (maximum encoded request length 266,240 bytes,
+allowing JSON byte-array encoding for a 64 KiB payload):
 
 ```json
 {"operation":"present","attempt_id":"<attempt>","secret":"<creation secret>"}
@@ -99,8 +100,42 @@ shorten to the permit deadline once the attempt is known.
 Pairing sockets are never routed to an ordinary service. Cancellation and expiry
 erase eligibility and hashes while retaining the bound identity's terminal
 status. Restart durably rejects pending attempts with `exchange_lost`, before
-accepting connections; an unbound issued permit can survive restart. No transcript
-or byte exchange is available on this restricted path.
+accepting connections; an unbound issued permit can survive restart.
+
+### Opaque bounded join exchange
+
+Only a pending bound node and the creating owner may exchange bytes. The local
+control operations are `pair_send` and `pair_receive`; the restricted network
+operations are `send` and `receive`. Each selects `attempt_id`. Local operations
+also select `owner`. Send takes `sequence` (starting at 1 in each direction),
+`digest` (BLAKE3 lowercase hex of the payload), and `payload` (a JSON byte array).
+Receive takes optional `ack`: the sequence of a previously delivered message.
+Receives are nonblocking; no message returns `message: null` rather than holding
+the policy writer open.
+
+Replies add `exchange` with `sent_sequence`, `message`, `total_bytes`, and
+`total_messages`. A message carries `direction` (`node_to_owner` or
+`owner_to_node`), `sequence`, `digest`, and opaque `payload`. The surrounding
+status binds the message to the attempt and authenticated NodeID. Fabric never
+interprets admission signatures or chooses policy from payload bytes.
+
+An exact send retry is budget-neutral; the same sequence with different
+bytes/digest or a skipped sequence is refused. Receive replays an unacknowledged
+message until its delivered sequence is acknowledged. Duplicate acknowledgments
+are idempotent; an unsent or undelivered message cannot be acknowledged.
+Acknowledged payload storage is freed, while bounded sequence/digest history
+remains to recognize send retries.
+
+Each payload is at most 64 KiB. Both directions share a cumulative 1 MiB byte
+budget, including queued data, and 32 messages total (at most 16 per direction).
+Reconnect resumes the same memory-only queues and counters, without replenishing
+budgets. Exceeding a payload/count/byte bound durably rejects the attempt with
+`exchange_limit` and discards its queues. Cancellation, expiry, and other
+terminal transitions also erase queues. A one-second maintenance sweep clears
+expired idle queues without waiting for a caller; every exchange operation
+checks the deadline before accepting bytes. Idle ticks perform no fsync.
+Restart rejects pending exchanges with `exchange_lost`; no transcript is written
+to runtime state or logs.
 
 ## Requests
 

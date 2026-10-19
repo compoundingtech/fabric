@@ -6,7 +6,8 @@ use std::collections::{BTreeSet, HashMap};
 use tokio::sync::Semaphore;
 
 const MAX_CONNECTIONS: usize = 32;
-const MAX_REQUEST: usize = 4096;
+// JSON byte arrays require at most four encoded bytes per payload byte.
+const MAX_REQUEST: usize = 4 * 64 * 1024 + 4096;
 const MAX_RATE_NODES: usize = 1024;
 const IDLE: Duration = Duration::from_secs(10);
 
@@ -131,6 +132,42 @@ pub(super) async fn serve(connection: Connection, state: Arc<DaemonState>) -> Re
     connection.close(VarInt::from_u32(0), b"pairing connection ended");
     result
 }
+pub(super) async fn expire_loop(state: Arc<DaemonState>) {
+    if state.runtime_peers.is_none() {
+        state.cancel.cancelled().await;
+        return;
+    }
+    let mut ticks = tokio::time::interval(Duration::from_secs(1));
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticks.tick().await;
+    let mut fault_reported = false;
+    loop {
+        tokio::select! {
+            _ = state.cancel.cancelled() => return,
+            _ = ticks.tick() => {}
+        }
+        // Once started, publication/quarantine completes even during shutdown.
+        let reply = state
+            .commit_pairing(|runtime| {
+                runtime.pairing_expire()?;
+                Ok(Reply {
+                    status: None,
+                    secret: None,
+                    exchange: None,
+                    error: None,
+                })
+            })
+            .await;
+        if let Some(error) = reply.error {
+            if !fault_reported && !state.cancel.is_cancelled() {
+                warn!(code = %error.code, "pairing expiry reconciliation failed");
+            }
+            fault_reported = true;
+        } else {
+            fault_reported = false;
+        }
+    }
+}
 
 async fn serve_requests(connection: &Connection, state: &DaemonState) -> Result<()> {
     let (mut send, mut recv) = tokio::time::timeout(IDLE, connection.accept_bi()).await??;
@@ -154,7 +191,7 @@ async fn serve_requests(connection: &Connection, state: &DaemonState) -> Result<
         if length == 0 || length > MAX_REQUEST {
             return Err(refused());
         }
-        let mut bytes = [0u8; MAX_REQUEST];
+        let mut bytes = vec![0u8; length];
         tokio::time::timeout_at(
             deadline.min(tokio::time::Instant::now() + IDLE),
             recv.read_exact(&mut bytes[..length]),
@@ -163,9 +200,10 @@ async fn serve_requests(connection: &Connection, state: &DaemonState) -> Result<
         let request: NetworkRequest =
             serde_json::from_slice(&bytes[..length]).map_err(|_| refused())?;
         let attempt = match &request {
-            NetworkRequest::Present { attempt_id, .. } | NetworkRequest::Status { attempt_id } => {
-                attempt_id
-            }
+            NetworkRequest::Present { attempt_id, .. }
+            | NetworkRequest::Status { attempt_id }
+            | NetworkRequest::Send { attempt_id, .. }
+            | NetworkRequest::Receive { attempt_id, .. } => attempt_id,
         };
         if let Some(lease) = &lease {
             if &lease.attempt != attempt {
@@ -450,6 +488,137 @@ mod tests {
             }
         })
         .await?;
+        assert!(state.peer_book.read().await.peers().is_empty());
+        client.close().await;
+        gateway.shutdown().await?;
+        Ok(())
+    }
+    async fn owner_request(
+        home: &FabricHome,
+        request: crate::runtime_peers::pairing::Request,
+    ) -> Result<Reply> {
+        match send_control(home, ControlRequest::Pairing { request }).await? {
+            ControlResponse::Pairing { reply } => Ok(reply),
+            other => bail!("unexpected owner reply: {other:?}"),
+        }
+    }
+    #[tokio::test]
+    async fn real_pairing_exchanges_opaque_bytes_with_owner_control_without_grants() -> Result<()> {
+        use crate::runtime_peers::pairing::{PAIR_ALPN, Payload, Policy, Request};
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let gateway = gateway(home.clone()).await?;
+        let state = gateway.state();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !home.control_socket_path().exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            + 600;
+        let issued = owner_request(
+            &home,
+            Request::Issue {
+                owner: "admission".into(),
+                creation_id: "opaque".into(),
+                deadline,
+                policy: Policy {
+                    grants: vec![],
+                    name: None,
+                    direction: crate::runtime_peers::Direction::InboundOnly,
+                },
+            },
+        )
+        .await?;
+        assert!(issued.error.is_none());
+        let attempt_id = issued.status.unwrap().attempt_id;
+        let client = client().await?;
+        let connection = client.connect(gateway.addr(), PAIR_ALPN).await?;
+        let (mut send, mut recv) = connection.open_bi().await?;
+        assert_eq!(
+            rpc(
+                &mut send,
+                &mut recv,
+                NetworkRequest::Present {
+                    attempt_id: attempt_id.clone(),
+                    secret: issued.secret.unwrap(),
+                }
+            )
+            .await?
+            .status
+            .unwrap()
+            .state,
+            State::Pending
+        );
+        let payload = vec![255u8; 64 * 1024];
+        let digest = blake3::hash(&payload).to_hex().to_string();
+        let sent = rpc(
+            &mut send,
+            &mut recv,
+            NetworkRequest::Send {
+                attempt_id: attempt_id.clone(),
+                sequence: 1,
+                digest: digest.clone(),
+                payload: Payload::new(payload.clone()),
+            },
+        )
+        .await?;
+        assert!(sent.error.is_none());
+        assert_eq!(sent.exchange.unwrap().total_bytes, payload.len() as u64);
+        for _ in 0..2 {
+            let received = owner_request(
+                &home,
+                Request::PairReceive {
+                    owner: "admission".into(),
+                    attempt_id: attempt_id.clone(),
+                    ack: None,
+                },
+            )
+            .await?;
+            let message = received.exchange.unwrap().message.unwrap();
+            assert_eq!(message.sequence, 1);
+            assert_eq!(message.digest, digest);
+            assert_eq!(message.payload.as_bytes(), payload);
+        }
+        let acked = owner_request(
+            &home,
+            Request::PairReceive {
+                owner: "admission".into(),
+                attempt_id: attempt_id.clone(),
+                ack: Some(1),
+            },
+        )
+        .await?;
+        assert!(acked.exchange.unwrap().message.is_none());
+        let response = b"opaque signed-admission-shaped response".to_vec();
+        for _ in 0..2 {
+            let reply = owner_request(
+                &home,
+                Request::PairSend {
+                    owner: "admission".into(),
+                    attempt_id: attempt_id.clone(),
+                    sequence: 1,
+                    digest: blake3::hash(&response).to_hex().to_string(),
+                    payload: Payload::new(response.clone()),
+                },
+            )
+            .await?;
+            assert_eq!(reply.exchange.unwrap().total_messages, 2);
+        }
+        let received = rpc(
+            &mut send,
+            &mut recv,
+            NetworkRequest::Receive {
+                attempt_id,
+                ack: None,
+            },
+        )
+        .await?;
+        let message = received.exchange.unwrap().message.unwrap();
+        assert_eq!(message.payload.as_bytes(), response);
         assert!(state.peer_book.read().await.peers().is_empty());
         client.close().await;
         gateway.shutdown().await?;

@@ -25,7 +25,11 @@ Deprecated, Fixed or Security.
   for authenticated one-time permit presentation and bound-node attempt status.
   Pending identities receive no ordinary service access. Connection and rate
   limits bound untrusted work; restart rejects unfinished attempts durably.
-  Join exchange and atomic confirmation are not enabled.
+  Atomic confirmation is not enabled.
+- **Provisional:** pending nodes and permit owners can exchange opaque bounded
+  admission messages through `send`/`receive` and `pair_send`/`pair_receive`.
+  Sequence/digest replay, acknowledgments, shared byte/message budgets, and
+  memory-only queues preserve limits across reconnect without granting access.
 
 ## [0.9.2] - 2026-10-16
 

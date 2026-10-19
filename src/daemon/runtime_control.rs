@@ -240,7 +240,7 @@ impl DaemonState {
             .await
     }
 
-    async fn commit_pairing(
+    pub(super) async fn commit_pairing(
         &self,
         operation: impl FnOnce(
             &mut runtime_peers::RuntimePeers,
@@ -287,6 +287,7 @@ impl DaemonState {
         result.unwrap_or_else(|error| Reply {
             status: None,
             secret: None,
+            exchange: None,
             error: Some(PolicyError::of(&error)),
         })
     }
