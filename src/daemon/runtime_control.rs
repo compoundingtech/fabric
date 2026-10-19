@@ -227,8 +227,15 @@ impl DaemonState {
         &self,
         request: runtime_peers::pairing::Request,
     ) -> runtime_peers::pairing::Reply {
-        self.commit_pairing(move |runtime| runtime.pairing_request(request))
-            .await
+        match request {
+            runtime_peers::pairing::Request::Confirm { confirmation } => {
+                self.confirm_pairing(confirmation).await
+            }
+            request => {
+                self.commit_pairing(move |runtime| runtime.pairing_request(request))
+                    .await
+            }
+        }
     }
 
     pub(crate) async fn pairing_network_request(
@@ -238,6 +245,99 @@ impl DaemonState {
     ) -> runtime_peers::pairing::Reply {
         self.commit_pairing(move |runtime| runtime.pairing_network_request(node, request))
             .await
+    }
+
+    async fn confirm_pairing(
+        &self,
+        confirmation: runtime_peers::pairing::ConfirmRequest,
+    ) -> runtime_peers::pairing::Reply {
+        use runtime_peers::pairing::Reply;
+        let owner = confirmation.owner.clone();
+        let attempt_id = confirmation.attempt_id.clone();
+        let result = async {
+            let runtime = self.runtime_peers.as_ref().ok_or_else(|| {
+                FabricError::new(
+                    ErrorCode::RuntimePeersDisabled,
+                    "pairing requires --runtime-peers",
+                )
+            })?;
+            let _serial = self.policy_update.lock().await;
+            if self.cancel.is_cancelled() {
+                return Err(
+                    FabricError::new(ErrorCode::DaemonNotRunning, "daemon is stopping").into(),
+                );
+            }
+            let home = self.home.clone();
+            let preparing = runtime.clone();
+            let prepared = tokio::task::spawn_blocking(move || {
+                let prepared = preparing
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .prepare_pairing_confirmation(&confirmation)?;
+                if !prepared.replay {
+                    SyncBook::load(&home)?.validate_against(&prepared.book)?;
+                }
+                Ok::<_, anyhow::Error>(prepared)
+            })
+            .await??;
+            // Deadline, binding and revisions are checked again inside final commit,
+            // after all preparation and while every ordinary admission is barred.
+            let mut published = self.peer_book.write().await;
+            let book = prepared.book.clone();
+            let committing = runtime.clone();
+            let reply = tokio::task::spawn_blocking(move || {
+                committing
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .commit_pairing_confirmation(prepared)
+            })
+            .await
+            .unwrap_or_else(|error| {
+                Err(FabricError::new(
+                    ErrorCode::RuntimeCommitIndeterminate,
+                    format!("pairing confirmation worker failed: {error}"),
+                )
+                .into())
+            });
+            match reply {
+                Ok(reply) => {
+                    *published = book;
+                    self.peer_connections.presence.retry_now();
+                    Ok(reply)
+                }
+                Err(error) => {
+                    if crate::error::code_of(&error) == ErrorCode::RuntimeCommitIndeterminate {
+                        self.quarantine_runtime_policy(&mut published, &error, true)
+                            .await;
+                    }
+                    Err(error)
+                }
+            }
+        }
+        .await;
+        match result {
+            Ok(reply) => reply,
+            Err(error) => {
+                let mut reply = if let Some(runtime) = &self.runtime_peers {
+                    with_runtime(runtime.clone(), move |runtime| {
+                        runtime.pairing_attempt_reply(&owner, &attempt_id)
+                    })
+                    .await
+                    .ok()
+                } else {
+                    None
+                }
+                .unwrap_or(Reply {
+                    status: None,
+                    secret: None,
+                    exchange: None,
+                    access: vec![],
+                    error: None,
+                });
+                reply.error = Some(PolicyError::of(&error));
+                reply
+            }
+        }
     }
 
     pub(super) async fn commit_pairing(
@@ -288,6 +388,7 @@ impl DaemonState {
             status: None,
             secret: None,
             exchange: None,
+            access: vec![],
             error: Some(PolicyError::of(&error)),
         })
     }

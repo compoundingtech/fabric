@@ -25,11 +25,15 @@ Deprecated, Fixed or Security.
   for authenticated one-time permit presentation and bound-node attempt status.
   Pending identities receive no ordinary service access. Connection and rate
   limits bound untrusted work; restart rejects unfinished attempts durably.
-  Atomic confirmation is not enabled.
 - **Provisional:** pending nodes and permit owners can exchange opaque bounded
   admission messages through `send`/`receive` and `pair_send`/`pair_receive`.
   Sequence/digest replay, acknowledgments, shared byte/message budgets, and
   memory-only queues preserve limits across reconnect without granting access.
+- **Provisional:** permit owners can atomically confirm a verified pending
+  identity, installing exact peer/grants and a durable completion receipt in
+  one transaction with a final commit-time deadline check. Explicit rejection
+  records a receipt without access. Historical retries report current access
+  and never reinstall grants withdrawn after confirmation.
 
 ## [0.9.2] - 2026-10-16
 

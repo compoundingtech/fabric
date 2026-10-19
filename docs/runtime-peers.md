@@ -394,5 +394,8 @@ Implementation gates, after the tag and design approval:
   stale listeners after restart, duplex half-close, typed error classes,
   capability negotiation, and explicit event reset handling in the client.
 
-These are acceptance requirements, not results. Current source and the 1.0.0
-release do not implement the proposed runtime state, pairing path, or client.
+These are acceptance requirements, not a claim that every gate has passed.
+The implemented opt-in runtime policy and pairing control/transport contract is
+documented in [runtime-peer-api.md](runtime-peer-api.md). Policy watches,
+rotation overlap, and the separate typed client remain design work rather than
+released interfaces.

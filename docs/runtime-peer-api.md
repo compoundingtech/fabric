@@ -25,10 +25,10 @@ source includes the configured file path.
 ## Pairing permits
 
 The local control request `{"type":"pairing","request":{...}}` supports
-`issue`, `query`, and `cancel`. These operations require `--runtime-peers`.
-They create no ordinary trust record, grant, or service listener. Runtime mode
-also enables the restricted pairing ALPN and opaque join exchange below.
-Atomic confirmation is not implemented.
+`issue`, `query`, `cancel`, `confirm`, and `reject`, plus the exchange operations
+below. These operations require `--runtime-peers`. Issue/presentation/exchange
+create no ordinary trust record, grant, or service listener. Only atomic
+confirmation installs the immutable permit policy.
 
 `issue` takes `owner`, `creation_id`, an absolute Unix-seconds `deadline` within
 the next 600 seconds, and `policy`: exact `grants` (at most 128), optional `name`,
@@ -46,9 +46,9 @@ creation ID is refused. After a lost creation reply, query by creation ID,
 cancel the inaccessible permit, and issue a new creation ID.
 
 Status includes `attempt_id`, `creation_id`, `state` (`issued`, `pending`,
-`expired`, `rejected`), `attempt_revision`, original `deadline`, `policy_digest`,
-`terminal_at`, `bound_node_id`, and `terminal_reason`. Cancel is idempotent and
-never renews a deadline. Expiry is
+`confirmed`, `expired`, `rejected`), `attempt_revision`, original `deadline`,
+`policy_digest`, `terminal_at`, `bound_node_id`, `terminal_reason`, and optional
+durable `completion`. Cancel is idempotent and never renews a deadline. Expiry is
 reconciled durably on startup and permit operations. Live deadline observations
 use a monotonic clock that reanchors on forward wall-clock jumps; startup
 expires outstanding permits conservatively if UTC falls below the last durable
@@ -136,6 +136,46 @@ expired idle queues without waiting for a caller; every exchange operation
 checks the deadline before accepting bytes. Idle ticks perform no fsync.
 Restart rejects pending exchanges with `exchange_lost`; no transcript is written
 to runtime state or logs.
+
+### Atomic confirmation and completion receipts
+
+The creating owner verifies its own admission protocol and bound NodeID before
+calling local control `confirm`. Fabric does not validate membership signatures.
+The request contains `owner`, `attempt_id`, `expected_node_id`,
+`expected_attempt_revision`, `expected_policy_revision`, and `request_id`.
+All selectors are checked in the serialized transaction that installs the
+immutable exact peer/grants and confirmed receipt. There is no separate
+validate/install call. Existing creating-owner records and conflicting source
+labels/directions are refused rather than overwritten.
+
+Preparation, including sync configuration validation, precedes the admission
+barrier. Commit rechecks binding, revisions, pending state, and the original
+deadline after preparation under that barrier. Starting before expiry does not
+reserve success: a commit reaching the barrier at or after expiry is refused
+without installing grants. A commit accepted before expiry may finish fsync
+and reply later. The receipt and peer/grants share one file commit and policy
+publication completes before a success reply or any new-policy admission.
+
+Local `reject` takes `owner`, `attempt_id`, `expected_node_id`,
+`expected_attempt_revision`, and `request_id`. It atomically records rejection
+and erases pending eligibility, hashes, and transcript queues, installing no
+access. Its exact retry returns the retained receipt. Reused request IDs with
+different contents are refused.
+
+Completion records contain `request_id`, `attempt_id`, `node_id`,
+`policy_digest`, `policy_revision`, `committed_at`, and `outcome`. Confirmation
+advances the policy revision and attempt revision; rejection never installs a
+policy generation. The pairing receipt pool is reserved on permit creation,
+independently of ordinary mutation receipts.
+
+Every reply can report current effective `access` with source provenance.
+Retry/query returns the historical completion plus current access, never
+reinstalls historical grants. In particular, retrying confirmation after a
+later owner removal or daemon restart cannot restore withdrawn access. Bound
+nodes can read confirmed/rejected status on the restricted path, but terminal
+attempts cannot exchange more bytes. Confirmed receipts and their installed
+policy survive restart; pending attempts instead become `exchange_lost`.
+Unknown or retention-expired attempts cannot be confirmed as new permits.
 
 ## Requests
 

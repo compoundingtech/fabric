@@ -268,6 +268,7 @@ impl RuntimePeers {
         let status = attempt.status.clone();
         if status.state != pairing::State::Pending {
             return Ok(pairing::Reply {
+                access: self.access_for(status.bound_node_id.as_slice()),
                 status: Some(status),
                 secret: None,
                 error: None,
@@ -285,6 +286,7 @@ impl RuntimePeers {
         let result = exchange.apply(owner.is_some(), operation);
         match result {
             Ok(exchange) => Ok(pairing::Reply {
+                access: self.access_for(status.bound_node_id.as_slice()),
                 status: Some(status),
                 secret: None,
                 error: None,
@@ -305,6 +307,7 @@ impl RuntimePeers {
                     return Err(error);
                 }
                 Ok(pairing::Reply {
+                    access: self.access_for(status.bound_node_id.as_slice()),
                     status: Some(status),
                     secret: None,
                     error: None,

@@ -547,6 +547,17 @@ impl RuntimePeers {
             }
         }
         pairing::validate(&self.stored.pairing)?;
+        if self.stored.pairing.iter().any(|attempt| {
+            attempt
+                .status
+                .completion
+                .as_ref()
+                .is_some_and(|receipt| receipt.policy_revision > self.stored.revision)
+        }) {
+            return Err(unavailable(
+                "pairing completion revision exceeds current policy",
+            ));
+        }
         Ok(())
     }
     /// Caller must first drain quarantined work before reconciling an uncertain commit.
