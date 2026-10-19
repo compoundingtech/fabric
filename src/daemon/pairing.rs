@@ -123,15 +123,10 @@ fn refused() -> anyhow::Error {
 }
 
 pub(super) async fn serve(connection: Connection, state: Arc<DaemonState>) -> Result<()> {
-    let result = async {
-        tokio::select! {
-            _ = state.cancel.cancelled() => Ok(()),
-            _ = connection.closed() => Ok(()),
-            result = tokio::time::timeout(Duration::from_secs(600), serve_requests(&connection, &state)) => {
-                result.map_err(|_| refused())?
-            }
-        }
-    }.await;
+    // Socket closure must not cancel a durable commit's quarantine/publication.
+    // Framing waits and the connection itself are bounded separately. The incoming
+    // handler retains its global incoming-slot permit until this operation ends.
+    let result = serve_requests(&connection, &state).await;
     // Never copy tokens, input JSON, or attempt IDs into close reasons or logs.
     connection.close(VarInt::from_u32(0), b"pairing connection ended");
     result
@@ -391,6 +386,73 @@ mod tests {
         assert!(enabled.state().peer_book.read().await.peers().is_empty());
         client.close().await;
         enabled.shutdown().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn disconnected_presenter_cannot_abandon_indeterminate_commit_quarantine() -> Result<()> {
+        use crate::runtime_peers::pairing::{PAIR_ALPN, Policy, Request};
+        let dir = tempfile::tempdir()?;
+        let gateway = gateway(FabricHome::new(dir.path())).await?;
+        let state = gateway.state();
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            + 600;
+        let issued = state
+            .pairing_request(Request::Issue {
+                owner: "test".into(),
+                creation_id: "disconnect".into(),
+                deadline,
+                policy: Policy {
+                    grants: vec![],
+                    name: None,
+                    direction: crate::runtime_peers::Direction::Normal,
+                },
+            })
+            .await;
+        assert!(issued.error.is_none());
+        let client = client().await?;
+        let connection = client.connect(gateway.addr(), PAIR_ALPN).await?;
+        let (mut send, _recv) = connection.open_bi().await?;
+        let runtime = state.runtime_peers.as_ref().unwrap().clone();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let mut runtime = runtime.lock().unwrap_or_else(|poison| poison.into_inner());
+            runtime.fail_directory_sync_for_test();
+            let _ = entered.send(());
+            let _ = blocked.recv();
+        });
+        ready.await?;
+        let bytes = serde_json::to_vec(&NetworkRequest::Present {
+            attempt_id: issued.status.unwrap().attempt_id,
+            secret: issued.secret.unwrap(),
+        })?;
+        send.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
+        send.write_all(&bytes).await?;
+        // Commit has acquired the admission barrier, but persistence is held off-thread.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while state.peer_book.try_read().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        connection.close(VarInt::from_u32(0), b"caller disconnected");
+        // Give the old disconnect-select path a chance to abandon its commit future.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        release.send(())?;
+        blocker.await?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while state.policy_quarantine.lock().await.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(state.peer_book.read().await.peers().is_empty());
+        client.close().await;
+        gateway.shutdown().await?;
         Ok(())
     }
 }
