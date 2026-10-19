@@ -4415,6 +4415,9 @@ async fn process_control_request(
         ControlRequest::RuntimePeers { request } => ControlResponse::RuntimePeers {
             reply: state.runtime_peer_request(request).await,
         },
+        ControlRequest::Pairing { request } => ControlResponse::Pairing {
+            reply: state.pairing_request(request).await,
+        },
         ControlRequest::Status => state.status_response().await?,
         ControlRequest::ReachabilityStatus => state.reachability_status_response().await?,
         ControlRequest::PeerEvents {

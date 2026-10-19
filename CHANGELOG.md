@@ -16,6 +16,13 @@ Deprecated, Fixed or Security.
 
 ## [Unreleased]
 
+### Added
+
+- **Provisional:** opt-in pairing permit issue/query/cancel control requests,
+  with private durable state, immutable exact policy, bounded lifetime and
+  reserved terminal receipt capacity. Permits grant no service access; no
+  network pairing transport or confirmation is enabled by these operations.
+
 ## [0.9.2] - 2026-10-16
 
 ### Fixed

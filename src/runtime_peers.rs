@@ -17,6 +17,8 @@ use crate::{
     error::{ErrorCode, FabricError},
 };
 
+pub mod pairing;
+
 pub const MAX_OPERATIONS: usize = 128;
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 pub const PAGE_SIZE: usize = 256;
@@ -311,6 +313,10 @@ struct Stored {
     static_digest: String,
     records: Vec<Record>,
     receipts: Vec<Receipt>,
+    #[serde(default)]
+    pairing: Vec<pairing::Attempt>,
+    #[serde(default)]
+    pairing_last_seen: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -374,6 +380,7 @@ pub(crate) struct RuntimePeers {
     stored: Stored,
     static_input: StaticInput,
     fault: Option<String>,
+    pairing_clock: (u64, std::time::Instant),
     #[cfg(test)]
     fail_directory_sync: bool,
 }
@@ -427,9 +434,12 @@ impl RuntimePeers {
                 static_digest: String::new(),
                 records: vec![],
                 receipts: vec![],
+                pairing: vec![],
+                pairing_last_seen: 0,
             },
             static_input: placeholder,
             fault: None,
+            pairing_clock: (now(), std::time::Instant::now()),
             #[cfg(test)]
             fail_directory_sync: false,
         };
@@ -491,6 +501,7 @@ impl RuntimePeers {
                     changed = true;
                 }
             }
+            changed |= pairing::recover(&mut store.stored, now());
             let book = store.compose(&store.stored)?.0;
             if changed {
                 store.persist(&store.stored)?;
@@ -532,6 +543,7 @@ impl RuntimePeers {
                 return Err(unavailable("invalid runtime receipt history"));
             }
         }
+        pairing::validate(&self.stored.pairing)?;
         Ok(())
     }
     /// Caller must first drain quarantined work before reconciling an uncertain commit.
@@ -565,6 +577,7 @@ impl RuntimePeers {
             stored: self.stored.clone(),
             static_input: input,
             fault: None,
+            pairing_clock: self.pairing_clock,
             #[cfg(test)]
             fail_directory_sync: false,
         };

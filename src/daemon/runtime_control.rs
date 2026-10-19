@@ -223,6 +223,56 @@ impl DaemonState {
         *self.policy_quarantine.lock().await = Some(selected);
     }
 
+    pub(crate) async fn pairing_request(
+        &self,
+        request: runtime_peers::pairing::Request,
+    ) -> runtime_peers::pairing::Reply {
+        use runtime_peers::pairing::Reply;
+        let result = async {
+            let runtime = self.runtime_peers.as_ref().ok_or_else(|| {
+                FabricError::new(
+                    ErrorCode::RuntimePeersDisabled,
+                    "pairing requires --runtime-peers",
+                )
+            })?;
+            let _serial = self.policy_update.lock().await;
+            if self.cancel.is_cancelled() {
+                return Err(
+                    FabricError::new(ErrorCode::DaemonNotRunning, "daemon is stopping").into(),
+                );
+            }
+            let mut published = self.peer_book.write().await;
+            let runtime = runtime.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                runtime
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .pairing_request(request)
+            })
+            .await
+            .unwrap_or_else(|error| {
+                Err(FabricError::new(
+                    ErrorCode::RuntimeCommitIndeterminate,
+                    format!("pairing commit worker failed: {error}"),
+                )
+                .into())
+            });
+            if let Err(error) = &result {
+                if crate::error::code_of(error) == ErrorCode::RuntimeCommitIndeterminate {
+                    self.quarantine_runtime_policy(&mut published, error, true)
+                        .await;
+                }
+            }
+            result
+        }
+        .await;
+        result.unwrap_or_else(|error| Reply {
+            status: None,
+            secret: None,
+            error: Some(PolicyError::of(&error)),
+        })
+    }
+
     pub(crate) async fn runtime_peer_request(&self, request: Request) -> Reply {
         let Some(runtime) = &self.runtime_peers else {
             return Reply {
