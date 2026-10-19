@@ -227,6 +227,27 @@ impl DaemonState {
         &self,
         request: runtime_peers::pairing::Request,
     ) -> runtime_peers::pairing::Reply {
+        self.commit_pairing(move |runtime| runtime.pairing_request(request))
+            .await
+    }
+
+    pub(crate) async fn pairing_network_request(
+        &self,
+        node: EndpointId,
+        request: runtime_peers::pairing::NetworkRequest,
+    ) -> runtime_peers::pairing::Reply {
+        self.commit_pairing(move |runtime| runtime.pairing_network_request(node, request))
+            .await
+    }
+
+    async fn commit_pairing(
+        &self,
+        operation: impl FnOnce(
+            &mut runtime_peers::RuntimePeers,
+        ) -> Result<runtime_peers::pairing::Reply>
+        + Send
+        + 'static,
+    ) -> runtime_peers::pairing::Reply {
         use runtime_peers::pairing::Reply;
         let result = async {
             let runtime = self.runtime_peers.as_ref().ok_or_else(|| {
@@ -244,10 +265,7 @@ impl DaemonState {
             let mut published = self.peer_book.write().await;
             let runtime = runtime.clone();
             let result = tokio::task::spawn_blocking(move || {
-                runtime
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .pairing_request(request)
+                operation(&mut runtime.lock().unwrap_or_else(|poison| poison.into_inner()))
             })
             .await
             .unwrap_or_else(|error| {

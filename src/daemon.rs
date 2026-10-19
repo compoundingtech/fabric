@@ -66,6 +66,7 @@ use crate::{
     tunnel,
 };
 
+mod pairing;
 mod runtime_control;
 
 #[cfg(test)]
@@ -403,12 +404,28 @@ struct AllowListHook {
     policy: Arc<RwLock<PeerBook>>,
     services: Services,
     audit: crate::audit::Audit,
+    pairing_gate: Option<Arc<pairing::Gate>>,
 }
 
 impl EndpointHooks for AllowListHook {
     async fn after_handshake(&self, conn: &Connection) -> AfterHandshakeOutcome {
         if conn.side() == Side::Client {
             return AfterHandshakeOutcome::Accept;
+        }
+        // This exception is negotiated-ALPN scoped, never a standing peer grant.
+        if conn.alpn() == crate::runtime_peers::pairing::PAIR_ALPN {
+            return if self
+                .pairing_gate
+                .as_ref()
+                .is_some_and(|gate| gate.admit(conn))
+            {
+                AfterHandshakeOutcome::Accept
+            } else {
+                AfterHandshakeOutcome::Reject {
+                    error_code: VarInt::from_u32(403),
+                    reason: b"pairing unavailable".to_vec(),
+                }
+            };
         }
 
         let policy = self.policy.read().await;
@@ -453,6 +470,7 @@ pub struct DaemonState {
     peer_book: Arc<RwLock<PeerBook>>,
     policy_update: Mutex<()>,
     runtime_peers: Option<Arc<std::sync::Mutex<crate::runtime_peers::RuntimePeers>>>,
+    pairing_gate: Arc<pairing::Gate>,
     policy_quarantine: Mutex<Option<runtime_control::Revocations>>,
     pending_policy_revocations: Arc<std::sync::Mutex<Vec<Arc<runtime_control::Revocations>>>>,
     exposures: RwLock<HashMap<Vec<u8>, Exposure>>,
@@ -901,15 +919,17 @@ async fn build_daemon_endpoint(
     services: &Services,
     exposures: &HashMap<Vec<u8>, Exposure>,
     audit: crate::audit::Audit,
+    pairing_gate: Option<Arc<pairing::Gate>>,
 ) -> Result<Endpoint> {
     let secret_key = load_or_create_identity(home)?;
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
-        .alpns(accepted_alpns(services, exposures))
+        .alpns(accepted_alpns(services, exposures, pairing_gate.is_some()))
         .hooks(AllowListHook {
             policy,
             services: services.clone(),
             audit,
+            pairing_gate,
         })
         .bind()
         .await?;
@@ -1235,12 +1255,14 @@ impl DaemonState {
         let exposures = load_persisted_exposures(&home, &services)?;
         let audit = audit.unwrap_or_else(|| crate::audit::Audit::start(home.root()));
         let peer_book = Arc::new(RwLock::new(peer_book));
+        let pairing_gate = Arc::new(pairing::Gate::default());
         let endpoint = build_daemon_endpoint(
             &home,
             peer_book.clone(),
             &services,
             &exposures,
             audit.clone(),
+            options.runtime_peers.then(|| pairing_gate.clone()),
         )
         .await?;
         let generation = next_endpoint_generation(&home, 0)?;
@@ -1272,6 +1294,7 @@ impl DaemonState {
             peer_book,
             policy_update: Mutex::new(()),
             runtime_peers,
+            pairing_gate,
             policy_quarantine: Mutex::new(None),
             pending_policy_revocations: Arc::new(std::sync::Mutex::new(Vec::new())),
             exposures: RwLock::new(exposures),
@@ -1606,8 +1629,11 @@ impl DaemonState {
                 peer_header,
             },
         );
-        self.current_endpoint()
-            .set_alpns(accepted_alpns(&self.services, &exposures));
+        self.current_endpoint().set_alpns(accepted_alpns(
+            &self.services,
+            &exposures,
+            self.runtime_peers.is_some(),
+        ));
         Ok(())
     }
 
@@ -1636,8 +1662,11 @@ impl DaemonState {
 
         let mut exposures = self.exposures.write().await;
         exposures.insert(alpn, Exposure::Tcp { addr });
-        self.current_endpoint()
-            .set_alpns(accepted_alpns(&self.services, &exposures));
+        self.current_endpoint().set_alpns(accepted_alpns(
+            &self.services,
+            &exposures,
+            self.runtime_peers.is_some(),
+        ));
         Ok(())
     }
 
@@ -1684,8 +1713,11 @@ impl DaemonState {
                 limit: tunnel::ExecLimit::new(max_children),
             },
         );
-        self.current_endpoint()
-            .set_alpns(accepted_alpns(&self.services, &exposures));
+        self.current_endpoint().set_alpns(accepted_alpns(
+            &self.services,
+            &exposures,
+            self.runtime_peers.is_some(),
+        ));
         Ok(())
     }
 
@@ -1721,8 +1753,11 @@ impl DaemonState {
 
         let mut exposures = self.exposures.write().await;
         exposures.remove(&alpn);
-        self.current_endpoint()
-            .set_alpns(accepted_alpns(&self.services, &exposures));
+        self.current_endpoint().set_alpns(accepted_alpns(
+            &self.services,
+            &exposures,
+            self.runtime_peers.is_some(),
+        ));
         Ok(())
     }
 
@@ -3082,6 +3117,9 @@ impl DaemonState {
             &self.services,
             &exposures,
             self.audit.clone(),
+            self.runtime_peers
+                .as_ref()
+                .map(|_| self.pairing_gate.clone()),
         )
         .await?;
         drop(exposures);
@@ -4962,6 +5000,11 @@ async fn process_incoming_iroh(
 
     let connection = handshake_and_identify(accepting, identity).await?;
 
+    if alpn == crate::runtime_peers::pairing::PAIR_ALPN {
+        // Pairing never enters mux, service dispatch, or ordinary admissions.
+        return pairing::serve(connection, state).await;
+    }
+
     if alpn == mux::MUX_ALPN {
         log_connection_paths("mux_accept", &connection);
         handle_mux_connection(connection, state, true).await?;
@@ -5512,8 +5555,15 @@ async fn handle_sync_ipc_request(mut stream: UnixStream, state: Arc<DaemonState>
     }
 }
 
-fn accepted_alpns(services: &Services, exposures: &HashMap<Vec<u8>, Exposure>) -> Vec<Vec<u8>> {
+fn accepted_alpns(
+    services: &Services,
+    exposures: &HashMap<Vec<u8>, Exposure>,
+    pairing_enabled: bool,
+) -> Vec<Vec<u8>> {
     let mut alpns = Vec::with_capacity(exposures.len() + 8);
+    if pairing_enabled {
+        alpns.push(crate::runtime_peers::pairing::PAIR_ALPN.to_vec());
+    }
     if mux::MUX_ENABLED {
         alpns.push(mux::MUX_ALPN.to_vec());
     }
@@ -5526,7 +5576,9 @@ fn accepted_alpns(services: &Services, exposures: &HashMap<Vec<u8>, Exposure>) -
 
 /// A protocol nobody may expose: the base network's own, or a service's.
 fn matches_reserved_alpn(services: &Services, alpn: &[u8]) -> bool {
-    is_base_network_alpn(alpn) || services.find(alpn).is_some()
+    alpn == crate::runtime_peers::pairing::PAIR_ALPN
+        || is_base_network_alpn(alpn)
+        || services.find(alpn).is_some()
 }
 
 /// What an entry's peer selector resolves to against `peers.toml` right now.
@@ -7202,6 +7254,7 @@ mod tests {
         let alpns = accepted_alpns(
             &services::builtin(&FabricHome::new(dir.path())),
             &HashMap::new(),
+            false,
         );
 
         assert!(alpns.iter().any(|alpn| alpn == mux::MUX_ALPN));

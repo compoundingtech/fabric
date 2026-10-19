@@ -501,7 +501,7 @@ impl RuntimePeers {
                     changed = true;
                 }
             }
-            changed |= pairing::recover(&mut store.stored, now());
+            changed |= pairing::recover(&mut store.stored, now(), restarted);
             let book = store.compose(&store.stored)?.0;
             if changed {
                 store.persist(&store.stored)?;

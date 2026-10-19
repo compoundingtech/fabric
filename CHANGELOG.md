@@ -20,8 +20,12 @@ Deprecated, Fixed or Security.
 
 - **Provisional:** opt-in pairing permit issue/query/cancel control requests,
   with private durable state, immutable exact policy, bounded lifetime and
-  reserved terminal receipt capacity. Permits grant no service access; no
-  network pairing transport or confirmation is enabled by these operations.
+  reserved terminal receipt capacity. Permits grant no service access.
+- **Provisional:** runtime mode accepts the restricted `fabric/pair/1` protocol
+  for authenticated one-time permit presentation and bound-node attempt status.
+  Pending identities receive no ordinary service access. Connection and rate
+  limits bound untrusted work; restart rejects unfinished attempts durably.
+  Join exchange and atomic confirmation are not enabled.
 
 ## [0.9.2] - 2026-10-16
 

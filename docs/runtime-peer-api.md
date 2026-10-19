@@ -26,9 +26,9 @@ source includes the configured file path.
 
 The local control request `{"type":"pairing","request":{...}}` supports
 `issue`, `query`, and `cancel`. These operations require `--runtime-peers`.
-They create no ordinary trust record, grant, listener, or network pairing path.
-The restricted pairing transport, join exchange, and atomic confirmation are
-not implemented by this permit-control surface.
+They create no ordinary trust record, grant, or service listener. Runtime mode
+also enables the restricted pairing ALPN below; join exchange and atomic
+confirmation are not implemented.
 
 `issue` takes `owner`, `creation_id`, an absolute Unix-seconds `deadline` within
 the next 600 seconds, and `policy`: exact `grants` (at most 128), optional `name`,
@@ -45,9 +45,10 @@ attempt without another secret; a different policy/deadline with the same
 creation ID is refused. After a lost creation reply, query by creation ID,
 cancel the inaccessible permit, and issue a new creation ID.
 
-Status includes `attempt_id`, `creation_id`, `state` (`issued`, `expired`,
-`rejected`), `attempt_revision`, original `deadline`, `policy_digest`, and
-`terminal_at`. Cancel is idempotent and never renews a deadline. Expiry is
+Status includes `attempt_id`, `creation_id`, `state` (`issued`, `pending`,
+`expired`, `rejected`), `attempt_revision`, original `deadline`, `policy_digest`,
+`terminal_at`, `bound_node_id`, and `terminal_reason`. Cancel is idempotent and
+never renews a deadline. Expiry is
 reconciled durably on startup and permit operations. Live deadline observations
 use a monotonic clock that reanchors on forward wall-clock jumps; startup
 expires outstanding permits conservatively if UTC falls below the last durable
@@ -60,6 +61,46 @@ Invalid requests use `invalid_argument`; persistence errors use the existing
 runtime-state error classes. Uncertain commit outcomes quarantine admissions,
 exactly as runtime policy commits do. Owner remains attribution rather than
 authentication.
+
+### Restricted presentation and status
+
+Runtime mode advertises `fabric/pair/1`. Only that negotiated ALPN bypasses the
+ordinary peer allow-list; no pending identity is added to mux, built-in services,
+or direct exposures. Joining clients must use the gateway NodeID from their
+invitation as the authenticated destination, not discover or substitute another
+NodeID. Iroh authenticates both transport identities.
+
+One bidirectional stream carries bounded JSON frames, each prefixed by a
+four-byte big-endian byte length (maximum request length 4,096 bytes):
+
+```json
+{"operation":"present","attempt_id":"<attempt>","secret":"<creation secret>"}
+{"operation":"status","attempt_id":"<attempt>"}
+```
+
+Replies are length-prefixed pairing reply objects, without the local-control
+`type` envelope and without a secret. The first valid presentation durably binds
+the permit to the connection's authenticated NodeID and changes it to `pending`
+at attempt revision 2. The identical node/token can replay that attempt without
+extending its deadline; another NodeID cannot take its binding. Status requests
+are accepted only for the authenticated bound node, including retained terminal
+status. Unknown, wrong-node, wrong-token and malformed requests close with a
+generic reason and expose no attempt status.
+
+There are at most 32 accepted pairing connections and one active connection per
+attempt. Validation is globally token-bucket limited to one request per second
+with burst 10, and per NodeID to one per six seconds with burst 3. These limits
+apply to valid and invalid requests, including status; identity rotation cannot
+bypass the global bucket. The bounded per-node rate book holds at most 1,024
+entries. Rate permission precedes body parsing/allocation. Idle framing waits
+are limited to 10 seconds; connections last no longer than 600 seconds and
+shorten to the permit deadline once the attempt is known.
+
+Pairing sockets are never routed to an ordinary service. Cancellation and expiry
+erase eligibility and hashes while retaining the bound identity's terminal
+status. Restart durably rejects pending attempts with `exchange_lost`, before
+accepting connections; an unbound issued permit can survive restart. No transcript
+or byte exchange is available on this restricted path.
 
 ## Requests
 

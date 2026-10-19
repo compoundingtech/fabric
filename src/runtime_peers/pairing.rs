@@ -1,5 +1,14 @@
-//! Permit control only: issuing a permit never creates a peer or grants access.
+//! Restricted pairing state: neither issuing nor presenting a permit grants access.
 use super::*;
+
+pub const PAIR_ALPN: &[u8] = b"fabric/pair/1";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum NetworkRequest {
+    Present { attempt_id: String, secret: Secret },
+    Status { attempt_id: String },
+}
 
 const MAX_PERMITS: usize = 64;
 const MAX_ATTEMPTS: usize = 1024;
@@ -55,6 +64,7 @@ pub enum Request {
 #[serde(rename_all = "snake_case")]
 pub enum State {
     Issued,
+    Pending,
     Expired,
     Rejected,
 }
@@ -68,12 +78,21 @@ pub struct Status {
     pub deadline: u64,
     pub policy_digest: String,
     pub terminal_at: Option<u64>,
+    #[serde(default)]
+    pub bound_node_id: Option<EndpointId>,
+    #[serde(default)]
+    pub terminal_reason: Option<String>,
 }
 
-/// Serialized only in the first successful creation reply, never Debug output.
+/// Plaintext is returned only at creation; Debug always redacts it.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Secret(String);
+impl Secret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
 impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("[REDACTED]")
@@ -98,7 +117,9 @@ pub(super) struct Attempt {
 }
 impl Attempt {
     fn expire(&mut self, timestamp: u64) {
-        if self.status.state == State::Issued && timestamp >= self.status.deadline {
+        if matches!(self.status.state, State::Issued | State::Pending)
+            && timestamp >= self.status.deadline
+        {
             self.terminate(State::Expired, self.status.deadline);
         }
     }
@@ -106,6 +127,13 @@ impl Attempt {
         self.status.state = state;
         self.status.attempt_revision += 1;
         self.status.terminal_at = Some(timestamp);
+        self.status.terminal_reason = Some(
+            match self.status.state {
+                State::Expired => "expired",
+                _ => "cancelled",
+            }
+            .into(),
+        );
         self.salt = None;
         self.secret_hash = None;
     }
@@ -123,15 +151,46 @@ pub(super) fn validate(attempts: &[Attempt]) -> Result<()> {
         validate_token(&attempt.status.creation_id, "creation_id")?;
         attempt.policy.validate()?;
         let status = &attempt.status;
-        let active = status.state == State::Issued;
+        validate_token(&status.attempt_id, "attempt_id")?;
+        let active = matches!(status.state, State::Issued | State::Pending);
+        let bound = status.bound_node_id.is_some();
+        let revision = match status.state {
+            State::Issued if !bound => 1,
+            State::Pending if bound => 2,
+            State::Expired | State::Rejected => {
+                if bound {
+                    3
+                } else {
+                    2
+                }
+            }
+            _ => return Err(unavailable("invalid pairing attempt binding")),
+        };
         issued += usize::from(active);
         if !creations.insert((&attempt.owner, &status.creation_id))
             || !ids.insert(&status.attempt_id)
             || status.policy_digest != digest(&attempt.policy)?
-            || status.attempt_revision != if active { 1 } else { 2 }
+            || status.attempt_revision != revision
             || active != status.terminal_at.is_none()
             || active != attempt.salt.is_some()
             || active != attempt.secret_hash.is_some()
+            || attempt.salt.as_ref().is_some_and(|salt| {
+                blake3::Hash::from_hex(salt).is_err()
+            })
+            || attempt.secret_hash.as_ref().is_some_and(|hash| {
+                blake3::Hash::from_hex(hash).is_err()
+            })
+            || (active && status.terminal_reason.is_some())
+            // Earlier permit-only receipts had no reason or bound identity.
+            || (!active && bound && status.terminal_reason.is_none())
+            || status.terminal_reason.as_ref().is_some_and(|reason| {
+                !matches!(
+                    (&status.state, reason.as_str()),
+                    (State::Expired, "expired")
+                        | (State::Rejected, "cancelled")
+                        | (State::Rejected, "exchange_lost")
+                ) || (reason == "exchange_lost" && !bound)
+            })
         {
             return Err(unavailable("invalid pairing attempt history"));
         }
@@ -151,18 +210,22 @@ fn random_token() -> String {
         .to_hex()
         .to_string()
 }
-fn secret_hash(salt: &str, secret: &str) -> String {
+fn secret_hash(salt: &str, secret: &str) -> blake3::Hash {
     let mut hash = blake3::Hasher::new();
     hash.update(salt.as_bytes());
     hash.update(secret.as_bytes());
-    hash.finalize().to_hex().to_string()
+    hash.finalize()
 }
 
-pub(super) fn recover(stored: &mut Stored, timestamp: u64) -> bool {
+pub(super) fn recover(stored: &mut Stored, timestamp: u64, restarted: bool) -> bool {
     let backwards = timestamp < stored.pairing_last_seen;
     let mut changed = false;
     for attempt in &mut stored.pairing {
-        if attempt.status.state == State::Issued
+        if restarted && attempt.status.state == State::Pending {
+            attempt.terminate(State::Rejected, timestamp);
+            attempt.status.terminal_reason = Some("exchange_lost".into());
+            changed = true;
+        } else if matches!(attempt.status.state, State::Issued | State::Pending)
             && (backwards || timestamp >= attempt.status.deadline)
         {
             attempt.terminate(State::Expired, attempt.status.deadline);
@@ -189,6 +252,87 @@ fn observe_clock(
 }
 
 impl RuntimePeers {
+    /// Restricted to the authenticated transport identity; never returns a secret.
+    pub fn pairing_network_request(
+        &mut self,
+        node: EndpointId,
+        request: NetworkRequest,
+    ) -> Result<Reply> {
+        let timestamp = observe_clock(&mut self.pairing_clock, now(), std::time::Instant::now());
+        self.pairing_network_request_at(node, request, timestamp)
+    }
+
+    fn pairing_network_request_at(
+        &mut self,
+        node: EndpointId,
+        request: NetworkRequest,
+        timestamp: u64,
+    ) -> Result<Reply> {
+        self.ensure_available()?;
+        let refused = || invalid("pairing request refused");
+        let (attempt_id, secret) = match &request {
+            NetworkRequest::Present { attempt_id, secret } => (attempt_id, Some(secret)),
+            NetworkRequest::Status { attempt_id } => (attempt_id, None),
+        };
+        let index = self
+            .stored
+            .pairing
+            .iter()
+            .position(|attempt| {
+                &attempt.status.attempt_id == attempt_id
+                    && attempt
+                        .status
+                        .terminal_at
+                        .is_none_or(|ended| timestamp < ended.saturating_add(RECEIPT_SECONDS))
+            })
+            .ok_or_else(refused)?;
+        let attempt = &self.stored.pairing[index];
+        if attempt
+            .status
+            .bound_node_id
+            .is_some_and(|bound| bound != node)
+        {
+            return Err(refused());
+        }
+        if let Some(secret) = secret {
+            let (Some(salt), Some(expected)) = (&attempt.salt, &attempt.secret_hash) else {
+                return Err(refused());
+            };
+            let actual = secret_hash(salt, &secret.0);
+            // Hash equality is constant-time, unlike comparing serialized hex strings.
+            if blake3::Hash::from_hex(expected).map_err(|_| refused())? != actual {
+                return Err(refused());
+            }
+        } else if attempt.status.bound_node_id != Some(node) {
+            return Err(refused());
+        }
+
+        let mut next = self.stored.clone();
+        next.pairing_last_seen = timestamp.max(next.pairing_last_seen);
+        let attempt = &mut next.pairing[index];
+        attempt.expire(timestamp);
+        let result = if secret.is_some() {
+            match attempt.status.state {
+                State::Issued => {
+                    attempt.status.state = State::Pending;
+                    attempt.status.bound_node_id = Some(node);
+                    attempt.status.attempt_revision = 2;
+                    Ok(attempt.status.clone())
+                }
+                State::Pending => Ok(attempt.status.clone()),
+                State::Expired | State::Rejected => Err(refused()),
+            }
+        } else {
+            Ok(attempt.status.clone())
+        };
+        self.commit_pairing(next)?;
+        Ok(Reply {
+            status: Some(result?),
+            secret: None,
+            error: None,
+        })
+    }
+
     pub(crate) fn pairing_request(&mut self, request: Request) -> Result<Reply> {
         let timestamp = observe_clock(&mut self.pairing_clock, now(), std::time::Instant::now());
         self.pairing_request_at(request, timestamp)
@@ -248,7 +392,7 @@ impl RuntimePeers {
                         || next
                             .pairing
                             .iter()
-                            .filter(|a| a.status.state == State::Issued)
+                            .filter(|a| matches!(a.status.state, State::Issued | State::Pending))
                             .count()
                             >= MAX_PERMITS
                     {
@@ -258,7 +402,7 @@ impl RuntimePeers {
                     }
                     let plaintext = random_token();
                     let salt = random_token();
-                    let hash = secret_hash(&salt, &plaintext);
+                    let hash = secret_hash(&salt, &plaintext).to_hex().to_string();
                     let status = Status {
                         attempt_id: random_token(),
                         creation_id,
@@ -267,6 +411,8 @@ impl RuntimePeers {
                         deadline,
                         policy_digest: digest(&policy)?,
                         terminal_at: None,
+                        bound_node_id: None,
+                        terminal_reason: None,
                     };
                     next.pairing.push(Attempt {
                         owner,
@@ -284,14 +430,26 @@ impl RuntimePeers {
             }
             Request::Cancel { .. } => {
                 let index = index.ok_or_else(|| invalid("unknown or expired creation_id"))?;
-                if next.pairing[index].status.state == State::Issued {
+                if matches!(
+                    next.pairing[index].status.state,
+                    State::Issued | State::Pending
+                ) {
                     next.pairing[index].terminate(State::Rejected, timestamp);
                 }
                 index
             }
         };
         let status = next.pairing[index].status.clone();
-        // Same atomic file and sequencer as runtime grants; permits are never composed into policy.
+        self.commit_pairing(next)?;
+        Ok(Reply {
+            status: Some(status),
+            secret,
+            error: None,
+        })
+    }
+
+    fn commit_pairing(&mut self, next: Stored) -> Result<()> {
+        // Same atomic file and sequencer as runtime grants; never compose pairing into policy.
         if next.pairing != self.stored.pairing
             || next.pairing_last_seen != self.stored.pairing_last_seen
         {
@@ -303,11 +461,7 @@ impl RuntimePeers {
             }
             self.stored = next;
         }
-        Ok(Reply {
-            status: Some(status),
-            secret,
-            error: None,
-        })
+        Ok(())
     }
 }
 
@@ -471,9 +625,9 @@ mod tests {
         let mut store = open(&dir);
         store.pairing_request_at(issue("one", 700), 100).unwrap();
         let mut expired = store.stored.clone();
-        assert!(recover(&mut expired, 700));
+        assert!(recover(&mut expired, 700, true));
         assert_eq!(expired.pairing[0].status.state, State::Expired);
-        assert!(recover(&mut store.stored, 99));
+        assert!(recover(&mut store.stored, 99, true));
         assert_eq!(store.stored.pairing[0].status.state, State::Expired);
         assert!(store.stored.pairing[0].secret_hash.is_none());
     }
@@ -552,5 +706,333 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
         value["request"]["policy"]["wildcard"] = true.into();
         assert!(serde_json::from_value::<ControlRequest>(value).is_err());
+    }
+    fn node(seed: u8) -> EndpointId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn presentation(status: &Status, secret: &Secret) -> NetworkRequest {
+        NetworkRequest::Present {
+            attempt_id: status.attempt_id.clone(),
+            secret: secret.clone(),
+        }
+    }
+
+    fn restricted_status(status: &Status) -> NetworkRequest {
+        NetworkRequest::Status {
+            attempt_id: status.attempt_id.clone(),
+        }
+    }
+
+    fn assert_refused(result: Result<Reply>) {
+        let error = result.unwrap_err();
+        assert_eq!(crate::error::code_of(&error), ErrorCode::InvalidArgument);
+        assert_eq!(error.to_string(), "pairing request refused");
+    }
+
+    #[test]
+    fn presentation_binds_once_without_policy_or_secret_disclosure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(&dir);
+        let t = now();
+        let issued = store
+            .pairing_request_at(issue("binding", t + 600), t)
+            .unwrap();
+        let status = issued.status.unwrap();
+        let secret = issued.secret.unwrap();
+        for id in [node(1), node(2)] {
+            assert_refused(store.pairing_network_request_at(id, restricted_status(&status), t));
+            assert_refused(store.pairing_network_request_at(
+                id,
+                presentation(&status, &Secret::new("wrong")),
+                t,
+            ));
+        }
+        assert_eq!(store.stored.pairing[0].status, status);
+        let reply = store
+            .pairing_network_request_at(node(1), presentation(&status, &secret), t)
+            .unwrap();
+        assert!(reply.secret.is_none());
+        let pending = reply.status.unwrap();
+        assert_eq!(pending.state, State::Pending);
+        assert_eq!(pending.attempt_revision, 2);
+        assert_eq!(pending.bound_node_id, Some(node(1)));
+        assert_eq!(pending.deadline, status.deadline);
+        assert_eq!(pending.policy_digest, status.policy_digest);
+        assert_eq!(
+            store
+                .pairing_network_request_at(node(1), presentation(&status, &secret), t,)
+                .unwrap()
+                .status
+                .unwrap(),
+            pending
+        );
+        assert_refused(store.pairing_network_request_at(
+            node(2),
+            presentation(&status, &secret),
+            t,
+        ));
+        assert_refused(store.pairing_network_request_at(
+            node(1),
+            presentation(&status, &Secret::new("wrong")),
+            t,
+        ));
+        assert_refused(store.pairing_network_request_at(node(2), restricted_status(&status), t));
+        assert!(store.stored.pairing[0].secret_hash.is_some());
+        validate(&store.stored.pairing).unwrap();
+        assert!(store.snapshot(None).unwrap().peers.is_empty());
+        assert!(store.access_for(&[node(1)]).is_empty());
+        assert_eq!(store.stored.revision, 0);
+        assert!(!fs::read_to_string(&store.path).unwrap().contains(&secret.0));
+    }
+
+    #[test]
+    fn racing_identities_have_exactly_one_durable_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(&dir);
+        let t = now();
+        let issued = store.pairing_request_at(issue("race", t + 600), t).unwrap();
+        let status = issued.status.unwrap();
+        let request = presentation(&status, &issued.secret.unwrap());
+        let shared = std::sync::Arc::new(parking_lot::Mutex::new(store));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = [node(1), node(2)]
+            .into_iter()
+            .map(|id| {
+                let shared = shared.clone();
+                let barrier = barrier.clone();
+                let request = request.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let result = shared.lock().pairing_network_request_at(id, request, t);
+                    (id, result)
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(outcomes.iter().filter(|(_, r)| r.is_ok()).count(), 1);
+        let winner = outcomes.iter().find(|(_, r)| r.is_ok()).unwrap().0;
+        let restarted = open(&dir);
+        assert_eq!(
+            restarted.stored.pairing[0].status.bound_node_id,
+            Some(winner)
+        );
+        assert_eq!(restarted.stored.pairing[0].status.state, State::Rejected);
+        assert!(restarted.snapshot(None).unwrap().peers.is_empty());
+    }
+
+    #[test]
+    fn restart_rejects_pending_but_live_reconcile_preserves_lost_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(&dir);
+        let t = now();
+        let issued = store.pairing_request_at(issue("lost", t + 600), t).unwrap();
+        let status = issued.status.unwrap();
+        let request = presentation(&status, &issued.secret.unwrap());
+        store.fail_directory_sync = true;
+        let error = store
+            .pairing_network_request_at(node(1), request.clone(), t)
+            .unwrap_err();
+        assert_eq!(
+            crate::error::code_of(&error),
+            ErrorCode::RuntimeCommitIndeterminate
+        );
+        assert!(store.fault().is_some());
+        store.reconcile(&FabricHome::new(dir.path())).unwrap();
+        assert_eq!(
+            store
+                .pairing_network_request_at(node(1), request, t)
+                .unwrap()
+                .status
+                .unwrap()
+                .state,
+            State::Pending
+        );
+        let mut restarted = open(&dir);
+        let terminal = restarted
+            .pairing_network_request_at(node(1), restricted_status(&status), t)
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(terminal.state, State::Rejected);
+        assert_eq!(terminal.attempt_revision, 3);
+        assert_eq!(terminal.bound_node_id, Some(node(1)));
+        assert_eq!(terminal.terminal_reason.as_deref(), Some("exchange_lost"));
+        assert!(restarted.stored.pairing[0].secret_hash.is_none());
+        assert!(restarted.stored.pairing[0].salt.is_none());
+        assert_refused(restarted.pairing_network_request_at(
+            node(2),
+            restricted_status(&status),
+            t,
+        ));
+        assert_eq!(open(&dir).stored.pairing[0].status, terminal);
+    }
+
+    #[test]
+    fn pending_expiry_and_cancel_keep_only_restricted_terminal_identity() {
+        for cancel in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = open(&dir);
+            let t = now();
+            let issued = store
+                .pairing_request_at(issue("terminal", t + 600), t)
+                .unwrap();
+            let status = issued.status.unwrap();
+            let request = presentation(&status, &issued.secret.unwrap());
+            store
+                .pairing_network_request_at(node(1), request.clone(), t)
+                .unwrap();
+            let timestamp = if cancel { t } else { t + 600 };
+            if cancel {
+                store
+                    .pairing_request_at(
+                        Request::Cancel {
+                            owner: "fleet".into(),
+                            creation_id: "terminal".into(),
+                        },
+                        timestamp,
+                    )
+                    .unwrap();
+            }
+            let terminal = store
+                .pairing_network_request_at(node(1), restricted_status(&status), timestamp)
+                .unwrap()
+                .status
+                .unwrap();
+            assert_eq!(
+                terminal.state,
+                if cancel {
+                    State::Rejected
+                } else {
+                    State::Expired
+                }
+            );
+            assert_eq!(
+                terminal.terminal_reason.as_deref(),
+                Some(if cancel { "cancelled" } else { "expired" })
+            );
+            assert_eq!(terminal.attempt_revision, 3);
+            assert_eq!(terminal.bound_node_id, Some(node(1)));
+            assert!(store.stored.pairing[0].secret_hash.is_none());
+            assert_refused(store.pairing_network_request_at(node(1), request, timestamp));
+            assert_refused(store.pairing_network_request_at(
+                node(2),
+                restricted_status(&status),
+                timestamp,
+            ));
+            assert_refused(store.pairing_network_request_at(
+                node(1),
+                restricted_status(&status),
+                timestamp + RECEIPT_SECONDS,
+            ));
+            validate(&store.stored.pairing).unwrap();
+            assert!(store.snapshot(None).unwrap().peers.is_empty());
+            assert_eq!(store.stored.revision, 0);
+            assert_eq!(open(&dir).stored.pairing[0].status, terminal);
+        }
+    }
+
+    #[test]
+    fn invalid_pending_and_terminal_histories_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(&dir);
+        let t = now();
+        let issued = store
+            .pairing_request_at(issue("validation", t + 600), t)
+            .unwrap();
+        let status = issued.status.unwrap();
+        store
+            .pairing_network_request_at(node(1), presentation(&status, &issued.secret.unwrap()), t)
+            .unwrap();
+        let pending = store.stored.pairing.clone();
+        for corrupt in 0..5 {
+            let mut attempts = pending.clone();
+            match corrupt {
+                0 => attempts[0].status.bound_node_id = None,
+                1 => attempts[0].status.attempt_revision = 1,
+                2 => attempts[0].secret_hash = None,
+                3 => attempts[0].status.terminal_at = Some(t),
+                _ => attempts[0].status.terminal_reason = Some("exchange_lost".into()),
+            }
+            assert!(validate(&attempts).is_err());
+        }
+        let mut terminal = pending;
+        terminal[0].terminate(State::Rejected, t);
+        validate(&terminal).unwrap();
+        terminal[0].status.attempt_revision = 2;
+        assert!(validate(&terminal).is_err());
+        terminal[0].status.attempt_revision = 3;
+        terminal[0].secret_hash = Some("retained".into());
+        assert!(validate(&terminal).is_err());
+    }
+
+    #[test]
+    fn restricted_network_schema_is_strict_and_redacts_secrets() {
+        let request = NetworkRequest::Present {
+            attempt_id: "attempt".into(),
+            secret: Secret::new("private"),
+        };
+        assert!(!format!("{request:?}").contains("private"));
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["operation"], "present");
+        assert!(matches!(
+            serde_json::from_value::<NetworkRequest>(value).unwrap(),
+            NetworkRequest::Present { .. }
+        ));
+        assert!(
+            serde_json::from_str::<NetworkRequest>(
+                r#"{"operation":"status","attempt_id":"a","secret":"private"}"#,
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn binding_pre_rename_failure_can_retry_and_expired_permit_cannot_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(&dir);
+        let t = now();
+        let issued = store
+            .pairing_request_at(issue("retry-binding", t + 600), t)
+            .unwrap();
+        let status = issued.status.unwrap();
+        let request = presentation(&status, &issued.secret.unwrap());
+        let path = store.path.clone();
+        store.path = dir.path().join("missing/runtime-peers.toml");
+        assert!(
+            store
+                .pairing_network_request_at(node(1), request.clone(), t)
+                .is_err()
+        );
+        assert_eq!(store.stored.pairing[0].status.state, State::Issued);
+        assert!(store.stored.pairing[0].status.bound_node_id.is_none());
+        assert!(store.fault().is_none());
+        store.path = path;
+        let pending = store
+            .pairing_network_request_at(node(2), request, t)
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(pending.bound_node_id, Some(node(2)));
+
+        let issued = store
+            .pairing_request_at(issue("expired-binding", t + 600), t)
+            .unwrap();
+        let status = issued.status.unwrap();
+        assert_refused(store.pairing_network_request_at(
+            node(1),
+            presentation(&status, &issued.secret.unwrap()),
+            t + 600,
+        ));
+        let expired = &store.stored.pairing[1];
+        assert_eq!(expired.status.state, State::Expired);
+        assert_eq!(expired.status.attempt_revision, 2);
+        assert!(expired.status.bound_node_id.is_none());
+        assert!(expired.secret_hash.is_none());
+        assert_refused(store.pairing_network_request_at(
+            node(1),
+            restricted_status(&status),
+            t + 600,
+        ));
+        assert!(store.snapshot(None).unwrap().peers.is_empty());
     }
 }
