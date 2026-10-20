@@ -94,6 +94,7 @@ const ONE_SHOT_DIAL_WAIT: Duration = Duration::from_secs(30);
 const INBOUND_SYNC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_INCOMING_HANDLERS: usize = 32;
+const INCOMING_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DIAL_HANDLERS: usize = 32;
 /// Sync connections can arrive in large coalesced bursts. Keep the default
 /// validation log useful without making one path snapshot per connection a
@@ -494,6 +495,8 @@ pub struct DaemonState {
     incoming_failures: Arc<FailureBackoff>,
     dial_failures: Arc<FailureBackoff>,
     incoming_slots: Arc<Semaphore>,
+    handshake_slots: Arc<Semaphore>,
+    pairing_slots: Arc<Semaphore>,
     dial_slots: Arc<Semaphore>,
     mux_stream_slots: Arc<Semaphore>,
     peer_connections: Arc<mux::PeerConnections>,
@@ -1324,6 +1327,8 @@ impl DaemonState {
                 FAILURE_LOG_INTERVAL,
             ),
             incoming_slots: Arc::new(Semaphore::new(MAX_INCOMING_HANDLERS)),
+            handshake_slots: Arc::new(Semaphore::new(MAX_INCOMING_HANDLERS)),
+            pairing_slots: Arc::new(Semaphore::new(pairing::MAX_CONNECTIONS)),
             dial_slots: Arc::new(Semaphore::new(MAX_DIAL_HANDLERS)),
             mux_stream_slots: Arc::new(Semaphore::new(MAX_INCOMING_HANDLERS)),
             peer_connections,
@@ -4758,19 +4763,13 @@ fn peers_display(peers: &SyncPeers) -> String {
 async fn run_iroh_accept_loop(state: Arc<DaemonState>) -> Result<()> {
     let mut endpoint_rx = state.endpoint_rx();
     loop {
-        // Deliberately no failure gate here. One peer's rejected handshake is not
-        // a reason to stop accepting from everyone else, and a shared gate made
-        // that escalate: the more one peer failed, the longer every healthy peer
-        // waited to be let in. Concurrency is bounded by the permit acquired just
-        // below and held for the handler's life, so a flood of failing
-        // connections is capped by handler slots rather than by a delay. The real
-        // stop conditions are still below: a closed accept stream and
-        // cancellation.
+        // Only pre-dispatch handshakes share this short-lived, timeout-bounded
+        // capacity. Negotiated protocols have independent handler pools.
         let endpoint = endpoint_rx.borrow().clone();
         let permit = tokio::select! {
             _ = state.cancel.cancelled() => break,
-            permit = state.incoming_slots.clone().acquire_owned() => {
-                permit.context("incoming handler semaphore closed")?
+            permit = state.handshake_slots.clone().acquire_owned() => {
+                permit.context("incoming handshake semaphore closed")?
             }
         };
         tokio::select! {
@@ -4798,10 +4797,10 @@ async fn run_iroh_accept_loop(state: Arc<DaemonState>) -> Result<()> {
 async fn handle_incoming_iroh(
     incoming: Incoming,
     state: Arc<DaemonState>,
-    _permit: OwnedSemaphorePermit,
+    permit: OwnedSemaphorePermit,
 ) {
     let mut identity = IncomingIdentity::default();
-    match process_incoming_iroh(incoming, state.clone(), &mut identity).await {
+    match process_incoming_iroh(incoming, state.clone(), &mut identity, permit).await {
         Ok(()) => {
             state
                 .incoming_failures
@@ -4861,7 +4860,9 @@ async fn handshake_and_identify(
     accepting: iroh::endpoint::Accepting,
     identity: &mut IncomingIdentity,
 ) -> Result<Connection> {
-    let connection = accepting.await?;
+    let connection = tokio::time::timeout(INCOMING_HANDSHAKE_TIMEOUT, accepting)
+        .await
+        .context("incoming handshake timed out")??;
     identity.peer = Some(connection.remote_id().to_string());
     Ok(connection)
 }
@@ -4988,10 +4989,24 @@ async fn process_incoming_iroh(
     incoming: Incoming,
     state: Arc<DaemonState>,
     identity: &mut IncomingIdentity,
+    handshake_permit: OwnedSemaphorePermit,
 ) -> Result<()> {
     let mut accepting = incoming.accept()?;
-    let alpn = accepting.alpn().await?;
+    let alpn = tokio::time::timeout(INCOMING_HANDSHAKE_TIMEOUT, accepting.alpn())
+        .await
+        .context("incoming ALPN negotiation timed out")??;
     identity.alpn = Some(String::from_utf8_lossy(&alpn).to_string());
+    // Never queue a saturated protocol behind a handshake slot. In particular,
+    // permit-free pairing must not consume ordinary service handler capacity.
+    let slots = if alpn == crate::runtime_peers::pairing::PAIR_ALPN {
+        &state.pairing_slots
+    } else {
+        &state.incoming_slots
+    };
+    let _handler_permit = slots
+        .clone()
+        .try_acquire_owned()
+        .context("incoming protocol handler capacity exhausted")?;
 
     // A generic exposure that does not exist is refused before the handshake,
     // exactly as before.
@@ -5009,6 +5024,7 @@ async fn process_incoming_iroh(
     };
 
     let connection = handshake_and_identify(accepting, identity).await?;
+    drop(handshake_permit);
 
     if alpn == crate::runtime_peers::pairing::PAIR_ALPN {
         // Pairing never enters mux, service dispatch, or ordinary admissions.
@@ -10122,6 +10138,66 @@ mod tests {
 
         succeeding.close().await;
         failing.close().await;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn saturated_pairing_capacity_preserves_trusted_service_connections() -> Result<()> {
+        use crate::runtime_peers::pairing::PAIR_ALPN;
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let server = FabricNode::start_with_daemon_options(
+            home.clone(),
+            DaemonOptions {
+                runtime_peers: true,
+                ..DaemonOptions::default()
+            },
+        )
+        .await?;
+        let trusted = Endpoint::bind(presets::N0).await?;
+        trust_test_peer(&home, &server, trusted.id(), "trusted", trusted.addr()).await?;
+        let state = server.state();
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..pairing::MAX_CONNECTIONS {
+            let addr = server.addr();
+            tasks.spawn(async move {
+                let endpoint = Endpoint::bind(presets::N0).await?;
+                let connection = endpoint.connect(addr, PAIR_ALPN).await?;
+                Ok::<_, anyhow::Error>((endpoint, connection))
+            });
+        }
+        let mut held = Vec::new();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while let Some(result) = tasks.join_next().await {
+                held.push(result??);
+            }
+            while state.pairing_slots.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        assert_eq!(held.len(), pairing::MAX_CONNECTIONS);
+        assert_eq!(state.incoming_slots.available_permits(), MAX_INCOMING_HANDLERS);
+        // No pairing secret or allow-list entry was needed to occupy every
+        // pairing handler. Trusted work must finish before pairing times out.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let connection = trusted.connect(server.addr(), BUILTIN_ECHO_ALPN).await?;
+            let (mut send, mut recv) = connection.open_bi().await?;
+            send.write_all(b"trusted").await?;
+            send.finish()?;
+            assert_eq!(recv.read_to_end(8).await?, b"trusted");
+            assert_eq!(state.pairing_slots.available_permits(), 0);
+            connection.close(0u32.into(), b"done");
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        for (endpoint, connection) in held {
+            connection.close(0u32.into(), b"done");
+            endpoint.close().await;
+        }
+        trusted.close().await;
         server.shutdown().await?;
         Ok(())
     }
