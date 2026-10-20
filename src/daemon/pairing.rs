@@ -5,7 +5,8 @@ use parking_lot::Mutex as StdMutex;
 use std::collections::{BTreeSet, HashMap};
 use tokio::sync::Semaphore;
 
-const MAX_CONNECTIONS: usize = 32;
+pub(super) const MAX_CONNECTIONS: usize = 32;
+const MAX_CONNECTIONS_PER_NODE: usize = 2;
 // JSON byte arrays require at most four encoded bytes per payload byte.
 const MAX_REQUEST: usize = 4 * 64 * 1024 + 4096;
 const MAX_RATE_NODES: usize = 1024;
@@ -34,6 +35,7 @@ struct Rates {
 #[derive(Debug)]
 pub(super) struct Gate {
     connections: Arc<Semaphore>,
+    nodes: Arc<StdMutex<HashMap<EndpointId, usize>>>,
     attempts: StdMutex<BTreeSet<String>>,
     rates: StdMutex<Rates>,
 }
@@ -41,6 +43,7 @@ impl Default for Gate {
     fn default() -> Self {
         Self {
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            nodes: Arc::new(StdMutex::new(HashMap::new())),
             attempts: StdMutex::new(BTreeSet::new()),
             rates: StdMutex::new(Rates {
                 global: Bucket {
@@ -49,6 +52,21 @@ impl Default for Gate {
                 },
                 nodes: HashMap::new(),
             }),
+        }
+    }
+}
+struct ConnectionLease {
+    nodes: Arc<StdMutex<HashMap<EndpointId, usize>>>,
+    node: EndpointId,
+}
+impl Drop for ConnectionLease {
+    fn drop(&mut self) {
+        let mut nodes = self.nodes.lock();
+        if let Some(count) = nodes.get_mut(&self.node) {
+            *count -= 1;
+            if *count == 0 {
+                nodes.remove(&self.node);
+            }
         }
     }
 }
@@ -62,13 +80,29 @@ impl Drop for AttemptLease<'_> {
     }
 }
 impl Gate {
+    fn connection_lease(&self, node: EndpointId) -> Option<ConnectionLease> {
+        let mut nodes = self.nodes.lock();
+        let count = nodes.entry(node).or_default();
+        if *count >= MAX_CONNECTIONS_PER_NODE {
+            return None;
+        }
+        *count += 1;
+        Some(ConnectionLease {
+            nodes: self.nodes.clone(),
+            node,
+        })
+    }
     pub(super) fn admit(&self, connection: &Connection) -> bool {
         let Ok(slot) = self.connections.clone().try_acquire_owned() else {
+            return false;
+        };
+        let Some(lease) = self.connection_lease(connection.remote_id()) else {
             return false;
         };
         let connection = connection.clone();
         tokio::spawn(async move {
             let _slot = slot;
+            let _lease = lease;
             if tokio::time::timeout(Duration::from_secs(600), connection.closed())
                 .await
                 .is_err()
@@ -125,8 +159,8 @@ fn refused() -> anyhow::Error {
 
 pub(super) async fn serve(connection: Connection, state: Arc<DaemonState>) -> Result<()> {
     // Socket closure must not cancel a durable commit's quarantine/publication.
-    // Framing waits and the connection itself are bounded separately. The incoming
-    // handler retains its global incoming-slot permit until this operation ends.
+    // Framing waits and the connection itself are bounded separately. The handler
+    // retains only its dedicated pairing-slot permit until this operation ends.
     let result = serve_requests(&connection, &state).await;
     // Never copy tokens, input JSON, or attempt IDs into close reasons or logs.
     connection.close(VarInt::from_u32(0), b"pairing connection ended");
@@ -229,8 +263,14 @@ async fn serve_requests(connection: &Connection, state: &DaemonState) -> Result<
             tokio::time::Instant::now() + Duration::from_secs(status.deadline.saturating_sub(wall)),
         );
         let bytes = serde_json::to_vec(&reply)?;
-        send.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
-        send.write_all(&bytes).await?;
+        tokio::time::timeout_at(
+            deadline.min(tokio::time::Instant::now() + IDLE),
+            async {
+                send.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
+                send.write_all(&bytes).await
+            },
+        )
+        .await??;
         if terminal {
             send.finish()?;
             // Keep the final status stream alive until acknowledged, not until a close races it.
@@ -255,6 +295,14 @@ mod tests {
         assert!(gate.connections.try_acquire().is_err());
         drop(permits);
         assert!(gate.connections.try_acquire().is_ok());
+        let first = gate.connection_lease(node(1)).unwrap();
+        let second = gate.connection_lease(node(1)).unwrap();
+        assert!(gate.connection_lease(node(1)).is_none());
+        assert!(gate.connection_lease(node(2)).is_some());
+        drop(first);
+        assert!(gate.connection_lease(node(1)).is_some());
+        drop(second);
+        assert!(gate.nodes.lock().is_empty());
         let lease = gate.lease("one").unwrap();
         assert!(gate.lease("one").is_none());
         drop(lease);

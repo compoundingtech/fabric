@@ -35,6 +35,13 @@ Deprecated, Fixed or Security.
   records a receipt without access. Historical retries report current access
   and never reinstall grants withdrawn after confirmation.
 
+### Security
+
+- Restricted pairing uses a separate 32-handler pool, with at most two active
+  connections per authenticated NodeID. Pairing saturation cannot occupy ordinary
+  service handlers. ALPN negotiation and transport handshakes time out after ten
+  seconds each; existing pairing framing and connection deadlines remain in force.
+
 ## [0.9.2] - 2026-10-16
 
 ### Fixed
