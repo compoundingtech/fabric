@@ -48,15 +48,16 @@ cancel the inaccessible permit, and issue a new creation ID.
 Status includes `attempt_id`, `creation_id`, `state` (`issued`, `pending`,
 `confirmed`, `expired`, `rejected`), `attempt_revision`, original `deadline`,
 `policy_digest`, `terminal_at`, `bound_node_id`, `terminal_reason`, and optional
-durable `completion`. Cancel is idempotent and never renews a deadline. Expiry is
-reconciled durably on startup and permit operations. Live deadline observations
-use a monotonic clock that reanchors on forward wall-clock jumps; startup
-expires outstanding permits conservatively if UTC falls below the last durable
-observation. Terminal transitions erase salt and secret hash.
+durable `completion` on owner control only. Cancel is idempotent and never renews
+a deadline. Reads project expiry without persistence or the admission barrier.
+Live deadline observations use a monotonic clock that survives reconciliation;
+all outstanding permits expire conservatively on daemon restart. Terminal
+transitions erase salt and secret hash.
 
-There are at most 64 outstanding permits and 1,024 retained attempts. Issuance
-reserves its own terminal receipt slot for 24 hours after termination; the
-pairing pool is separate from mutation receipts. Expired lookup is unknown.
+There are at most 64 outstanding permits, 1,024 retained attempts globally and
+128 retained attempts per owner. Issuance reserves its own terminal receipt slot
+for 24 hours after termination; this pool is separate from mutation receipts.
+Expired lookup is unknown.
 Invalid requests use `invalid_argument`; persistence errors use the existing
 runtime-state error classes. Uncertain commit outcomes quarantine admissions,
 exactly as runtime policy commits do. Owner remains attribution rather than
@@ -75,16 +76,18 @@ a second identity or temporarily trusting the gateway:
 its `id` must equal `gateway`. The endpoint authenticates the pinned NodeID even
 when addresses are supplied. No allow-list entry is required or installed.
 `request` is an existing restricted network request: `present`, `status`, `send`,
-or `receive`. The response is `{"type":"pairing","reply":{...}}`, matching owner
-control replies. Only a reply bound to the requested attempt and this daemon's
-existing NodeID is returned.
+or `receive`. The response is `{"type":"pairing","reply":{...}}`. Unlike owner
+control, restricted/bridge replies omit `access` and private completion metadata.
+Only a reply bound to the requested attempt and this daemon's NodeID is returned.
 
 Each call makes one restricted connection using the daemon's current endpoint,
 with at most 32 outbound operations and one 30-second deadline covering connect,
-request, and completion. Encoded requests use the same frame bound as the network
-protocol; replies are bounded to 1 MiB before allocation. The request stream is
-half-closed after its frame; the gateway releases its attempt lease before
-closing, so a subsequent call can reconnect safely. Serialize calls for the same
+request, and completion. On exchange reconnect, a small status frame first
+authenticates the bound attempt on the same stream before the larger send/receive
+frame. Pre-auth present/status frames remain capped at 4 KiB; replies are bounded
+to 1 MiB before allocation. The stream is half-closed after the final request;
+the gateway releases its attempt lease before closing, so a subsequent call can
+reconnect safely. Serialize calls for the same
 attempt. No retry is implicit: on `timeout` or `unreachable`, reconcile using
 `status` or the exchange's sequence/digest/ack replay semantics. An uncertain
 transport outcome is never admission evidence. Disabled runtime mode returns
@@ -101,8 +104,8 @@ invitation as the authenticated destination, not discover or substitute another
 NodeID. Iroh authenticates both transport identities.
 
 One bidirectional stream carries bounded JSON frames, each prefixed by a
-four-byte big-endian byte length (maximum encoded request length 266,240 bytes,
-allowing JSON byte-array encoding for a 64 KiB payload):
+four-byte big-endian byte length (4 KiB before bound-attempt authentication;
+maximum encoded exchange request length 266,240 bytes after authentication):
 
 ```json
 {"operation":"present","attempt_id":"<attempt>","secret":"<creation secret>"}
@@ -110,7 +113,8 @@ allowing JSON byte-array encoding for a 64 KiB payload):
 ```
 
 Replies are length-prefixed pairing reply objects, without the local-control
-`type` envelope and without a secret. The first valid presentation durably binds
+`type` envelope, secret, access provenance, or private completion metadata.
+The first valid presentation durably binds
 the permit to the connection's authenticated NodeID and changes it to `pending`
 at attempt revision 2. The identical node/token can replay that attempt without
 extending its deadline; another NodeID cannot take its binding. Status requests
@@ -119,18 +123,20 @@ status. Unknown, wrong-node, wrong-token and malformed requests close with a
 generic reason and expose no attempt status.
 
 There are at most 32 accepted pairing connections and one active connection per
-attempt. Validation is globally token-bucket limited to one request per second
-with burst 10, and per NodeID to one per six seconds with burst 3. These limits
-apply to valid and invalid requests, including status; identity rotation cannot
-bypass the global bucket. The bounded per-node rate book holds at most 1,024
-entries. Rate permission precedes body parsing/allocation. Idle framing waits
-are limited to 10 seconds; connections last no longer than 600 seconds and
-shorten to the permit deadline once the attempt is known.
+attempt. Unknown identities need global credit before parsing or runtime work:
+one request per second, burst 10, refunded after successful validation. Previously
+validated bound identities use an independent bucket (burst 8, refill one/second)
+selected by a bounded expiring hint that never authorizes an operation. Ordinary
+traffic uses neither pool nor bucket. Pairing availability is best effort under
+attack. First-header waits are limited to three seconds; subsequent idle framing
+waits are ten seconds, and connection lifetime is bounded by the attempt deadline.
+Post-ALPN transport settings allow one bidi stream, zero uni streams and an 8 KiB
+receive window; already-advertised QUIC credits cannot be retracted.
 
 Pairing sockets are never routed to an ordinary service. Cancellation and expiry
 erase eligibility and hashes while retaining the bound identity's terminal
 status. Restart durably rejects pending attempts with `exchange_lost`, before
-accepting connections; an unbound issued permit can survive restart.
+accepting connections; unbound issued permits expire on restart.
 
 ### Opaque bounded join exchange
 

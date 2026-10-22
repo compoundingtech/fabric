@@ -116,6 +116,7 @@ error_codes! {
     RuntimeStateUnavailable => "runtime_state_unavailable", Fault;
     RuntimeCommitIndeterminate => "runtime_commit_indeterminate", Fault;
     RuntimeReceiptCapacity => "runtime_receipt_capacity", Fault;
+    PairingExchangeInactive => "pairing_exchange_inactive", Refusal;
     RequestIdConflict => "request_id_conflict", Usage;
     CancellationTimeout => "cancellation_timeout", Fault;
     InvalidArgument => "invalid_argument", Usage;
