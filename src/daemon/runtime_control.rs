@@ -190,11 +190,14 @@ impl DaemonState {
         *published = PeerBook::default();
         if let Some(runtime) = &self.runtime_peers {
             let fault = format!("{error:#}");
-            let _ = with_runtime(runtime.clone(), move |runtime| {
+            if let Err(record_error) = with_runtime(runtime.clone(), move |runtime| {
                 runtime.set_fault(&anyhow::anyhow!(fault));
                 Ok(())
             })
-            .await;
+            .await
+            {
+                warn!(error = %record_error, cause = %error, "could not record runtime policy fault; admissions remain quarantined until explicit reconciliation");
+            }
         }
         // A failed static edit closes new admissions without destroying work
         // admitted by the last accepted policy. Unknown committed state is the
@@ -227,15 +230,35 @@ impl DaemonState {
         &self,
         request: runtime_peers::pairing::Request,
     ) -> runtime_peers::pairing::Reply {
-        match request {
-            runtime_peers::pairing::Request::Confirm { confirmation } => {
-                self.confirm_pairing(confirmation).await
-            }
-            request => {
-                self.commit_pairing(move |runtime| runtime.pairing_request(request))
-                    .await
+        if let runtime_peers::pairing::Request::Confirm { confirmation } = request {
+            return self.confirm_pairing(confirmation).await;
+        }
+        if matches!(&request, runtime_peers::pairing::Request::Query { .. }) {
+            return self
+                .read_pairing(move |runtime| runtime.pairing_request(request))
+                .await;
+        }
+        if matches!(&request,
+            runtime_peers::pairing::Request::PairSend { .. }
+            | runtime_peers::pairing::Request::PairReceive { .. }
+        ) {
+            let checking = request.clone();
+            match self.read_pairing_result(move |runtime| {
+                runtime.pairing_exchange_owner_read(&checking)
+            }).await {
+                Ok(Some(reply)) => return reply,
+                Ok(None) => {},
+                Err(error) => return runtime_peers::pairing::Reply {
+                    status: None,
+                    secret: None,
+                    exchange: None,
+                    access: vec![],
+                    error: Some(PolicyError::of(&error)),
+                },
             }
         }
+        self.commit_pairing(move |runtime| runtime.pairing_request(request))
+            .await
     }
 
     pub(crate) async fn pairing_network_request(
@@ -243,7 +266,51 @@ impl DaemonState {
         node: EndpointId,
         request: runtime_peers::pairing::NetworkRequest,
     ) -> runtime_peers::pairing::Reply {
-        self.commit_pairing(move |runtime| runtime.pairing_network_request(node, request))
+        if matches!(&request,
+            runtime_peers::pairing::NetworkRequest::Send { .. }
+            | runtime_peers::pairing::NetworkRequest::Receive { .. }
+        ) {
+            let checking = request.clone();
+            match self.read_pairing_result(move |runtime| {
+                runtime.pairing_exchange_network_read(node, &checking)
+            }).await {
+                Ok(Some(reply)) => return reply,
+                Ok(None) => return self.commit_pairing(move |runtime| {
+                    runtime.pairing_network_request(node, request)
+                }).await,
+                Err(error) => return runtime_peers::pairing::Reply {
+                    status: None,
+                    secret: None,
+                    exchange: None,
+                    access: vec![],
+                    error: Some(PolicyError::of(&error)),
+                },
+            }
+        }
+        let checked = self.pairing_network_read(node, &request).await;
+        match checked {
+            Ok(Some(reply)) => reply,
+            Ok(None) => {
+                self.commit_pairing(move |runtime| runtime.pairing_network_request(node, request))
+                    .await
+            }
+            Err(error) => runtime_peers::pairing::Reply {
+                status: None,
+                secret: None,
+                exchange: None,
+                access: vec![],
+                error: Some(PolicyError::of(&error)),
+            },
+        }
+    }
+
+    pub(super) async fn pairing_network_read(
+        &self,
+        node: EndpointId,
+        request: &runtime_peers::pairing::NetworkRequest,
+    ) -> Result<Option<runtime_peers::pairing::Reply>> {
+        let request = request.clone();
+        self.read_pairing_result(move |runtime| runtime.pairing_network_read(node, &request))
             .await
     }
 
@@ -269,7 +336,7 @@ impl DaemonState {
             }
             let home = self.home.clone();
             let preparing = runtime.clone();
-            let prepared = tokio::task::spawn_blocking(move || {
+            let mut prepared = tokio::task::spawn_blocking(move || {
                 let prepared = preparing
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner())
@@ -280,6 +347,10 @@ impl DaemonState {
                 Ok::<_, anyhow::Error>(prepared)
             })
             .await??;
+            // Receipt replay cannot reopen a quarantined policy generation.
+            if let Some(reply) = prepared.replay_reply.take() {
+                return Ok(reply);
+            }
             // Deadline, binding and revisions are checked again inside final commit,
             // after all preparation and while every ordinary admission is barred.
             let mut published = self.peer_book.write().await;
@@ -340,6 +411,48 @@ impl DaemonState {
         }
     }
 
+    pub(super) async fn has_active_pairing_attempts(&self) -> Result<bool> {
+        self.read_pairing_result(|runtime| Ok(runtime.pairing_has_active_attempts())).await
+    }
+
+    pub(super) async fn pairing_expiry_due(&self) -> Result<bool> {
+        self.read_pairing_result(|runtime| Ok(runtime.pairing_expiry_due())).await
+    }
+
+    pub(super) async fn reject_pairing_frame(
+        &self,
+        node: EndpointId,
+        attempt_id: String,
+    ) -> runtime_peers::pairing::Reply {
+        self.commit_pairing(move |runtime| runtime.reject_pairing_frame(node, &attempt_id)).await
+    }
+
+    pub(super) async fn read_pairing_result<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut runtime_peers::RuntimePeers) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let runtime = self.runtime_peers.as_ref().ok_or_else(|| {
+            FabricError::new(ErrorCode::RuntimePeersDisabled, "pairing requires --runtime-peers")
+        })?;
+        with_runtime(runtime.clone(), operation).await
+    }
+
+    async fn read_pairing(
+        &self,
+        operation: impl FnOnce(&mut runtime_peers::RuntimePeers) -> Result<runtime_peers::pairing::Reply>
+            + Send + 'static,
+    ) -> runtime_peers::pairing::Reply {
+        self.read_pairing_result(operation).await.unwrap_or_else(|error| {
+            runtime_peers::pairing::Reply {
+                status: None,
+                secret: None,
+                exchange: None,
+                access: vec![],
+                error: Some(PolicyError::of(&error)),
+            }
+        })
+    }
+
     pub(super) async fn commit_pairing(
         &self,
         operation: impl FnOnce(
@@ -362,7 +475,6 @@ impl DaemonState {
                     FabricError::new(ErrorCode::DaemonNotRunning, "daemon is stopping").into(),
                 );
             }
-            let mut published = self.peer_book.write().await;
             let runtime = runtime.clone();
             let result = tokio::task::spawn_blocking(move || {
                 operation(&mut runtime.lock().unwrap_or_else(|poison| poison.into_inner()))
@@ -377,6 +489,7 @@ impl DaemonState {
             });
             if let Err(error) = &result {
                 if crate::error::code_of(error) == ErrorCode::RuntimeCommitIndeterminate {
+                    let mut published = self.peer_book.write().await;
                     self.quarantine_runtime_policy(&mut published, error, true)
                         .await;
                 }
@@ -576,7 +689,12 @@ impl DaemonState {
             return Err(FabricError::new(ErrorCode::DaemonNotRunning, "daemon is stopping").into());
         }
         let runtime = self.runtime_peers.as_ref().expect("runtime mode").clone();
-        if with_runtime(runtime.clone(), |runtime| Ok(runtime.fault().is_some())).await? {
+        // The fault-record worker can fail independently of quarantine. Reload
+        // must reconcile that quarantine even if the runtime has no fault flag.
+        let quarantined = self.policy_quarantine.lock().await.is_some();
+        if quarantined
+            || with_runtime(runtime.clone(), |runtime| Ok(runtime.fault().is_some())).await?
+        {
             if let Some(selected) = self.policy_quarantine.lock().await.as_ref() {
                 if selected.status(false).await.state != CancellationState::Complete {
                     return Err(FabricError::new(ErrorCode::RuntimeStateUnavailable, "quarantined work has not finished; retry reconciliation after cancellation").into());
@@ -828,6 +946,316 @@ mod tests {
             }
         })
         .await?
+    }
+
+    async fn pending_confirmation(
+        state: &DaemonState,
+        creation_id: &str,
+        peer: EndpointId,
+        name: Option<String>,
+    ) -> Result<runtime_peers::pairing::ConfirmRequest> {
+        use runtime_peers::pairing::{ConfirmRequest, NetworkRequest, Policy, Request as PairRequest};
+        let issued = state.pairing_request(PairRequest::Issue {
+            owner: "controller".into(),
+            creation_id: creation_id.into(),
+            deadline: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?.as_secs() + 600,
+            policy: Policy { grants: vec!["echo".into()], name, direction: Direction::Normal },
+        }).await;
+        assert!(issued.error.is_none(), "{:?}", issued.error);
+        let attempt_id = issued.status.context("issued status")?.attempt_id;
+        let bound = state.pairing_network_request(peer, NetworkRequest::Present {
+            attempt_id: attempt_id.clone(),
+            secret: issued.secret.context("issued secret")?,
+        }).await;
+        assert!(bound.error.is_none(), "{:?}", bound.error);
+        Ok(ConfirmRequest {
+            owner: "controller".into(),
+            attempt_id,
+            expected_node_id: peer,
+            expected_attempt_revision: bound.status.context("bound status")?.attempt_revision,
+            expected_policy_revision: state.runtime_peers.as_ref().unwrap().lock().unwrap().revision(),
+            request_id: format!("confirm-{creation_id}"),
+        })
+    }
+
+    #[tokio::test]
+    async fn concurrent_pairing_confirm_confirm_installs_once() -> Result<()> {
+        use runtime_peers::pairing::Request as PairRequest;
+        let _serial = SERIAL.lock().await;
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let node = FabricNode::start_with_daemon_options(home.clone(), options()).await?;
+        let state = node.state();
+        let peer = iroh::SecretKey::from_bytes(&[81; 32]).public();
+        let confirmation = pending_confirmation(&state, "confirm-race", peer, None).await?;
+        let barrier = state.policy_update.lock().await;
+        let first_state = state.clone();
+        let first_confirmation = confirmation.clone();
+        let first = tokio::spawn(async move {
+            first_state.pairing_request(PairRequest::Confirm { confirmation: first_confirmation }).await
+        });
+        let second_state = state.clone();
+        let second = tokio::spawn(async move {
+            second_state.pairing_request(PairRequest::Confirm { confirmation }).await
+        });
+        drop(barrier);
+        let (first, second) = tokio::join!(first, second);
+        let first = first?;
+        let second = second?;
+        assert!(first.error.is_none(), "{:?}", first.error);
+        assert!(second.error.is_none(), "{:?}", second.error);
+        assert_eq!(first.status, second.status);
+        assert_eq!(first.status.unwrap().completion.unwrap().policy_revision, 1);
+        assert_eq!(first.access.len(), 1, "owner reply lost provenance");
+        assert_eq!(state.runtime_peers.as_ref().unwrap().lock().unwrap().revision(), 1);
+        assert_eq!(state.peer_book.read().await.peers().len(), 1);
+        node.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_pairing_confirm_reject_has_one_terminal_winner() -> Result<()> {
+        use runtime_peers::pairing::{RejectRequest, Request as PairRequest, State};
+        let _serial = SERIAL.lock().await;
+        let dir = tempfile::tempdir()?;
+        let node = FabricNode::start_with_daemon_options(FabricHome::new(dir.path()), options()).await?;
+        let state = node.state();
+        let peer = iroh::SecretKey::from_bytes(&[82; 32]).public();
+        let confirmation = pending_confirmation(&state, "reject-race", peer, None).await?;
+        let rejection = RejectRequest {
+            owner: confirmation.owner.clone(),
+            attempt_id: confirmation.attempt_id.clone(),
+            expected_node_id: peer,
+            expected_attempt_revision: confirmation.expected_attempt_revision,
+            request_id: "reject-race".into(),
+        };
+        let barrier = state.policy_update.lock().await;
+        let confirming = state.clone();
+        let confirm = tokio::spawn(async move {
+            confirming.pairing_request(PairRequest::Confirm { confirmation }).await
+        });
+        let rejecting = state.clone();
+        let reject = tokio::spawn(async move {
+            rejecting.pairing_request(PairRequest::Reject { rejection }).await
+        });
+        drop(barrier);
+        let (confirm, reject) = tokio::join!(confirm, reject);
+        let confirm = confirm?;
+        let reject = reject?;
+        assert_ne!(confirm.error.is_none(), reject.error.is_none());
+        let winner = if confirm.error.is_none() { confirm } else { reject };
+        let confirmed = winner.status.unwrap().state == State::Confirmed;
+        assert_eq!(state.peer_book.read().await.peers().len(), usize::from(confirmed));
+        assert_eq!(state.runtime_peers.as_ref().unwrap().lock().unwrap().revision(), u64::from(confirmed));
+        node.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_pairing_confirm_remove_peer_never_resurrects_revocation() -> Result<()> {
+        use runtime_peers::pairing::Request as PairRequest;
+        let _serial = SERIAL.lock().await;
+        let dir = tempfile::tempdir()?;
+        let node = FabricNode::start_with_daemon_options(FabricHome::new(dir.path()), options()).await?;
+        let state = node.state();
+        let peer = iroh::SecretKey::from_bytes(&[83; 32]).public();
+        let confirmation = pending_confirmation(&state, "remove-race", peer, None).await?;
+        let barrier = state.policy_update.lock().await;
+        let confirming = state.clone();
+        let confirming_request = confirmation.clone();
+        let confirm = tokio::spawn(async move {
+            confirming.pairing_request(PairRequest::Confirm { confirmation: confirming_request }).await
+        });
+        let removing = state.clone();
+        let remove = tokio::spawn(async move {
+            removing.runtime_peer_request(transaction("controller", "remove-race", 1,
+                vec![Operation::RemovePeer { node_id: peer }])).await
+        });
+        drop(barrier);
+        let (confirm, remove) = tokio::join!(confirm, remove);
+        let confirm = confirm?;
+        let remove = remove?;
+        assert!(confirm.error.is_none(), "{:?}", confirm.error);
+        if remove.error.is_some() {
+            // Remove raced before revision 1 existed; retry at the observed
+            // revision so both schedules finish with an actual revocation.
+            let removed = state.runtime_peer_request(transaction("controller", "remove-after-race", 1,
+                vec![Operation::RemovePeer { node_id: peer }])).await;
+            assert!(removed.error.is_none(), "{:?}", removed.error);
+        }
+        assert!(state.peer_book.read().await.peers().is_empty());
+        let durable = fs::read(dir.path().join("runtime-peers.toml"))?;
+        let replay = state.pairing_request(PairRequest::Confirm { confirmation }).await;
+        assert!(replay.error.is_none(), "{:?}", replay.error);
+        assert_eq!(replay.status, confirm.status);
+        assert!(state.peer_book.read().await.peers().is_empty());
+        assert_eq!(fs::read(dir.path().join("runtime-peers.toml"))?, durable);
+        assert_eq!(state.runtime_peers.as_ref().unwrap().lock().unwrap().revision(), 2);
+        node.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn indeterminate_pairing_confirm_quarantines_until_reload_and_replay_cannot_publish() -> Result<()> {
+        use runtime_peers::pairing::{Request as PairRequest, State};
+        let _serial = SERIAL.lock().await;
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let node = FabricNode::start_with_daemon_options(home.clone(), options()).await?;
+        let state = node.state();
+        let peer = iroh::SecretKey::from_bytes(&[84; 32]).public();
+        let confirmation = pending_confirmation(&state, "indeterminate", peer, None).await?;
+        state.runtime_peers.as_ref().unwrap().lock().unwrap().fail_directory_sync_for_test();
+        let failed = state.pairing_request(PairRequest::Confirm { confirmation: confirmation.clone() }).await;
+        assert_eq!(failed.error.unwrap().code, "runtime_commit_indeterminate");
+        assert!(state.peer_book.read().await.peers().is_empty());
+        assert!(state.policy_quarantine.lock().await.is_some());
+        let durable = fs::read(home.root().join("runtime-peers.toml"))?;
+        // Recover the receipt without publishing: this reproduces a quarantine
+        // whose fault-record worker failed, leaving the runtime readable.
+        let (recovered, _) = runtime_peers::RuntimePeers::open(&home);
+        *state.runtime_peers.as_ref().unwrap().lock().unwrap() = recovered;
+        let published = state.peer_book.write().await;
+        let replay = tokio::time::timeout(Duration::from_secs(1),
+            state.pairing_request(PairRequest::Confirm { confirmation: confirmation.clone() })).await?;
+        assert!(replay.error.is_none(), "{:?}", replay.error);
+        assert_eq!(replay.status.as_ref().unwrap().state, State::Confirmed);
+        assert_eq!(replay.access.len(), 1, "owner replay lost provenance");
+        assert!(published.peers().is_empty());
+        drop(published);
+        assert!(state.policy_quarantine.lock().await.is_some());
+        assert_eq!(fs::read(home.root().join("runtime-peers.toml"))?, durable);
+        state.reload_peers().await?;
+        assert!(state.policy_quarantine.lock().await.is_none());
+        assert_eq!(state.peer_book.read().await.peers().len(), 1);
+        let after_reload = state.pairing_request(PairRequest::Confirm { confirmation }).await;
+        assert!(after_reload.error.is_none(), "{:?}", after_reload.error);
+        assert_eq!(after_reload.status, replay.status);
+        assert_eq!(fs::read(home.root().join("runtime-peers.toml"))?, durable);
+        node.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pairing_confirmation_cannot_replace_a_static_source_label() -> Result<()> {
+        use runtime_peers::pairing::Request as PairRequest;
+        let _serial = SERIAL.lock().await;
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let peer = iroh::SecretKey::from_bytes(&[85; 32]).public();
+        let mut book = PeerBook::default();
+        book.add(peer, Some("static-label".into()), None);
+        book.save(&home)?;
+        let original = fs::read(home.peers_path())?;
+        let node = FabricNode::start_with_daemon_options(home.clone(), options()).await?;
+        let state = node.state();
+        let confirmation = pending_confirmation(&state, "static-conflict", peer, Some("permit-label".into())).await?;
+        let durable = fs::read(home.root().join("runtime-peers.toml"))?;
+        let reply = state.pairing_request(PairRequest::Confirm { confirmation }).await;
+        assert!(reply.error.is_some(), "confirmation replaced existing static trust");
+        assert_eq!(fs::read(home.peers_path())?, original);
+        assert_eq!(fs::read(home.root().join("runtime-peers.toml"))?, durable);
+        assert_eq!(state.runtime_peers.as_ref().unwrap().lock().unwrap().revision(), 0);
+        assert_eq!(state.peer_book.read().await.peers().len(), 1);
+        node.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pairing_network_reads_and_invalid_credentials_bypass_admission_barriers() -> Result<()> {
+        use runtime_peers::pairing::{NetworkRequest, Policy, Request as PairRequest};
+        let _serial = SERIAL.lock().await;
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let node = FabricNode::start_with_daemon_options(home.clone(), options()).await?;
+        let state = node.state();
+        let created = state.pairing_request(PairRequest::Issue {
+            owner: "controller".into(),
+            creation_id: "read-barrier".into(),
+            deadline: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?.as_secs() + 600,
+            policy: Policy {
+                grants: vec!["echo".into()],
+                name: None,
+                direction: Direction::Normal,
+            },
+        }).await;
+        let attempt_id = created.status.context("issued status")?.attempt_id;
+        let secret = created.secret.context("issued secret")?;
+        let peer = iroh::SecretKey::from_bytes(&[79; 32]).public();
+        let bound = state.pairing_network_request(peer, NetworkRequest::Present {
+            attempt_id: attempt_id.clone(), secret,
+        }).await;
+        assert!(bound.error.is_none());
+        let before = fs::read(home.root().join("runtime-peers.toml"))?;
+        let _policy = state.policy_update.lock().await;
+        let _publication = state.peer_book.write().await;
+        for (id, expected_error) in [(attempt_id.clone(), false), ("unknown".into(), true)] {
+            let reply = tokio::time::timeout(
+                Duration::from_secs(1),
+                state.pairing_network_request(peer, NetworkRequest::Status { attempt_id: id }),
+            ).await?;
+            assert_eq!(reply.error.is_some(), expected_error);
+        }
+        let sent = tokio::time::timeout(Duration::from_secs(1),
+            state.pairing_network_request(peer, NetworkRequest::Send {
+                attempt_id: attempt_id.clone(),
+                sequence: 1,
+                digest: blake3::hash(&[42]).to_hex().to_string(),
+                payload: runtime_peers::pairing::Payload::new(vec![42]),
+            }),
+        ).await?;
+        assert!(sent.error.is_none(), "{:?}", sent.error);
+        let received = tokio::time::timeout(Duration::from_secs(1),
+            state.pairing_request(PairRequest::PairReceive {
+                owner: "controller".into(),
+                attempt_id: attempt_id.clone(),
+                ack: None,
+            }),
+        ).await?;
+        assert!(received.error.is_none(), "{:?}", received.error);
+        assert!(received.exchange.is_some());
+        let acknowledged = tokio::time::timeout(Duration::from_secs(1),
+            state.pairing_request(PairRequest::PairReceive {
+                owner: "controller".into(),
+                attempt_id,
+                ack: Some(1),
+            }),
+        ).await?;
+        assert!(acknowledged.error.is_none(), "{:?}", acknowledged.error);
+        assert_eq!(before, fs::read(home.root().join("runtime-peers.toml"))?);
+        assert!(state.policy_quarantine.lock().await.is_none());
+        drop(_publication);
+        drop(_policy);
+        node.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pairing_query_bypasses_policy_and_publication_barriers() -> Result<()> {
+        let _serial = SERIAL.lock().await;
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let node = FabricNode::start_with_daemon_options(home, options()).await?;
+        let state = node.state();
+        let _policy = state.policy_update.lock().await;
+        let _publication = state.peer_book.write().await;
+        let reply = tokio::time::timeout(
+            Duration::from_secs(1),
+            state.pairing_request(runtime_peers::pairing::Request::Query {
+                owner: "controller".into(),
+                creation_id: "unknown".into(),
+            }),
+        )
+        .await?;
+        assert!(reply.error.is_some());
+        assert!(reply.status.is_none());
+        assert!(state.policy_quarantine.lock().await.is_none());
+        drop(_publication);
+        drop(_policy);
+        node.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]

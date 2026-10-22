@@ -61,14 +61,11 @@ impl RuntimePeers {
                 .is_none_or(|ended| timestamp < ended.saturating_add(RECEIPT_SECONDS))
         };
         if let Some(prior) = self.stored.pairing.iter().filter(retained).find(|attempt| {
-            attempt
-                .status
-                .completion
-                .as_ref()
-                .is_some_and(|r| r.request_id == request_id)
+            attempt.owner == owner
+                && attempt.status.completion.as_ref()
+                    .is_some_and(|r| r.request_id == request_id)
         }) {
-            if prior.owner != owner
-                || prior.status.attempt_id != attempt_id
+            if prior.status.attempt_id != attempt_id
                 || prior.status.bound_node_id != Some(node)
                 || prior.request_digest.as_deref() != Some(digest)
             {
@@ -104,8 +101,9 @@ impl RuntimePeers {
         Ok((index, replay))
     }
 
-    pub(crate) fn pairing_attempt_reply(&self, owner: &str, attempt_id: &str) -> Result<Reply> {
-        self.pairing_attempt_reply_at(owner, attempt_id, self.pairing_timestamp())
+    pub(crate) fn pairing_attempt_reply(&mut self, owner: &str, attempt_id: &str) -> Result<Reply> {
+        let timestamp = self.pairing_timestamp();
+        self.pairing_attempt_reply_at(owner, attempt_id, timestamp)
     }
 
     fn pairing_attempt_reply_at(
@@ -142,21 +140,13 @@ impl RuntimePeers {
         })
     }
 
-    fn pairing_timestamp(&self) -> u64 {
-        now()
-            .max(
-                self.pairing_clock
-                    .0
-                    .saturating_add(self.pairing_clock.1.elapsed().as_secs()),
-            )
-            .max(self.stored.pairing_last_seen)
-    }
 
     pub(crate) fn prepare_pairing_confirmation(
-        &self,
+        &mut self,
         request: &ConfirmRequest,
     ) -> Result<PreparedConfirmation> {
-        self.prepare_pairing_confirmation_at(request, self.pairing_timestamp())
+        let timestamp = self.pairing_timestamp();
+        self.prepare_pairing_confirmation_at(request, timestamp)
     }
 
     fn prepare_pairing_confirmation_at(
@@ -190,11 +180,12 @@ impl RuntimePeers {
                 )
                 .into());
             }
-            if next.records.iter().any(|record| {
-                record.owner == request.owner && record.peer.id == request.expected_node_id
-            }) {
+            if next.records.iter().any(|record| record.peer.id == request.expected_node_id)
+                || self.static_input.book.peers().iter()
+                    .any(|peer| peer.id == request.expected_node_id)
+            {
                 return Err(invalid(
-                    "pairing cannot overwrite an existing owner/node record",
+                    "pairing cannot confirm an already trusted NodeID",
                 ));
             }
             if next.records.len() >= MAX_RECORDS {
@@ -223,6 +214,11 @@ impl RuntimePeers {
         Ok(PreparedConfirmation {
             book,
             replay,
+            replay_reply: if replay {
+                Some(self.pairing_attempt_reply_at(&request.owner, &request.attempt_id, timestamp)?)
+            } else {
+                None
+            },
             records: next.records,
             request: request.clone(),
             revision: self.stored.revision,
@@ -233,8 +229,7 @@ impl RuntimePeers {
         &mut self,
         prepared: PreparedConfirmation,
     ) -> Result<Reply> {
-        let timestamp = observe_clock(&mut self.pairing_clock, now(), std::time::Instant::now())
-            .max(self.stored.pairing_last_seen);
+        let timestamp = self.pairing_timestamp();
         self.commit_pairing_confirmation_at(prepared, timestamp)
     }
 
@@ -275,7 +270,7 @@ impl RuntimePeers {
         next.pairing_last_seen = timestamp.max(next.pairing_last_seen);
         if timestamp >= attempt.status.deadline {
             next.pairing[index].expire(timestamp);
-            self.commit_pairing(next)?;
+            self.commit_pairing(next, timestamp)?;
             return Err(invalid(
                 "pairing attempt expired before confirmation commit",
             ));
@@ -375,7 +370,7 @@ impl RuntimePeers {
                 digest,
                 timestamp,
             );
-            if let Err(error) = self.commit_pairing(next) {
+            if let Err(error) = self.commit_pairing(next, timestamp) {
                 if self.fault.is_some() {
                     self.exchanges.remove(&request.attempt_id);
                 }
@@ -401,10 +396,19 @@ mod tests {
     }
 
     fn pending(store: &mut RuntimePeers, id: &str, timestamp: u64) -> ConfirmRequest {
+        pending_owned(store, id, timestamp, "fleet")
+    }
+
+    fn pending_owned(
+        store: &mut RuntimePeers,
+        id: &str,
+        timestamp: u64,
+        owner: &str,
+    ) -> ConfirmRequest {
         let issued = store
             .pairing_request_at(
                 Request::Issue {
-                    owner: "fleet".into(),
+                    owner: owner.into(),
                     creation_id: id.into(),
                     deadline: timestamp + 600,
                     policy: Policy {
@@ -433,7 +437,7 @@ mod tests {
         store
             .pairing_request_at(
                 Request::PairSend {
-                    owner: "fleet".into(),
+                    owner: owner.into(),
                     attempt_id: status.attempt_id.clone(),
                     sequence: 1,
                     digest: blake3::hash(&bytes).to_hex().to_string(),
@@ -444,7 +448,7 @@ mod tests {
             .unwrap();
         assert!(!store.exchanges.is_empty());
         ConfirmRequest {
-            owner: "fleet".into(),
+            owner: owner.into(),
             attempt_id: status.attempt_id,
             expected_node_id: node(1),
             expected_attempt_revision: 2,
@@ -810,7 +814,7 @@ mod tests {
 
     #[test]
     fn existing_owner_and_source_conflicts_are_refused() {
-        for conflict in ["owner", "direction", "name"] {
+        for conflict in ["owner", "direction", "name", "already-trusted"] {
             let dir = tempfile::tempdir().unwrap();
             let mut store = open(&dir);
             let t = now();
@@ -848,6 +852,89 @@ mod tests {
             assert!(store.prepare_pairing_confirmation_at(&request, t).is_err());
             assert_eq!(store.stored.pairing[0].status.state, State::Pending);
             assert_eq!(store.stored.records.len(), 1);
+        }
+    }
+
+    #[test]
+    fn static_label_direction_and_already_trusted_records_refuse_confirmation() {
+        for fields in [
+            "name = \"conflicting\"\ninbound_only = true\n",
+            "name = \"paired\"\n",
+            "name = \"paired\"\ninbound_only = true\n",
+            "inbound_only = true\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = open(&dir);
+            let t = now();
+            let mut request = pending(&mut store, "static-conflict", t);
+            fs::write(
+                &store.static_input.path,
+                format!("format = 2\n[[peers]]\nid = \"{}\"\n{fields}allow = [\"residual\"]\n", node(1)),
+            ).unwrap();
+            store.reload_static(StaticInput::load(&FabricHome::new(dir.path())).unwrap()).unwrap();
+            request.expected_policy_revision = store.stored.revision;
+            let disk = fs::read(&store.path).unwrap();
+            let error = store.prepare_pairing_confirmation_at(&request, t).err().unwrap();
+            assert!(error.to_string().contains("already trusted"));
+            assert_eq!(fs::read(&store.path).unwrap(), disk);
+            assert!(store.stored.records.is_empty());
+            assert_eq!(store.stored.pairing[0].status.state, State::Pending);
+            assert!(store.stored.pairing[0].status.completion.is_none());
+        }
+    }
+
+    #[test]
+    fn completion_request_ids_are_scoped_by_owner_and_retained_after_restart() {
+        for first_confirm in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = open(&dir);
+            let t = now();
+            let mut first = pending(&mut store, "first-owner", t);
+            first.request_id = "shared-request".into();
+            let reject = |request: &ConfirmRequest| RejectRequest {
+                owner: request.owner.clone(),
+                attempt_id: request.attempt_id.clone(),
+                expected_node_id: request.expected_node_id,
+                expected_attempt_revision: request.expected_attempt_revision,
+                request_id: request.request_id.clone(),
+            };
+            if first_confirm {
+                confirm(&mut store, &first, t);
+            } else {
+                store.reject_pairing_at(&reject(&first), t).unwrap();
+            }
+            let mut second = pending_owned(&mut store, "second-owner", t, "other");
+            second.request_id = first.request_id.clone();
+            let second_reply = if first_confirm {
+                store.reject_pairing_at(&reject(&second), t).unwrap()
+            } else {
+                confirm(&mut store, &second, t)
+            };
+            let second_receipt = second_reply.status.unwrap().completion.unwrap();
+            store.validate_stored().unwrap();
+            let disk = fs::read(&store.path).unwrap();
+            store = open(&dir);
+            let replay = if first_confirm {
+                store.reject_pairing_at(&reject(&second), t + 1).unwrap()
+            } else {
+                let prepared = store.prepare_pairing_confirmation_at(&second, t + 1).unwrap();
+                assert!(prepared.replay);
+                assert_eq!(prepared.replay_reply.as_ref().unwrap().status.as_ref()
+                    .unwrap().completion.as_ref(), Some(&second_receipt));
+                store.commit_pairing_confirmation_at(prepared, t + 1).unwrap()
+            };
+            assert_eq!(replay.status.unwrap().completion.as_ref(), Some(&second_receipt));
+            assert_eq!(fs::read(&store.path).unwrap(), disk);
+            let first_replay = if first_confirm {
+                confirm(&mut store, &first, t + 1)
+            } else {
+                store.reject_pairing_at(&reject(&first), t + 1).unwrap()
+            };
+            assert_eq!(first_replay.status.unwrap().completion.unwrap().attempt_id, first.attempt_id);
+            let mut wrong_owner = first.clone();
+            wrong_owner.owner = "unrelated".into();
+            let error = store.prepare_pairing_confirmation_at(&wrong_owner, t + 1).err().unwrap();
+            assert_ne!(crate::error::code_of(&error), ErrorCode::RequestIdConflict);
         }
     }
 
@@ -909,6 +996,11 @@ mod tests {
         let mut store = open(&dir);
         let t = now();
         let request = pending(&mut store, "static-residual", t);
+        let receipt = confirm(&mut store, &request, t)
+            .status
+            .unwrap()
+            .completion
+            .unwrap();
         let static_text = format!(
             "format = 2\n[[peers]]\nid = \"{}\"\nname = \"paired\"\ninbound_only = true\nallow = [\"residual\"]\n",
             node(1)
@@ -916,13 +1008,6 @@ mod tests {
         fs::write(&store.static_input.path, &static_text).unwrap();
         let input = StaticInput::load(&FabricHome::new(dir.path())).unwrap();
         store.reload_static(input).unwrap();
-        let mut request = request;
-        request.expected_policy_revision = store.stored.revision;
-        let receipt = confirm(&mut store, &request, t)
-            .status
-            .unwrap()
-            .completion
-            .unwrap();
         remove(&mut store, "remove-runtime");
         for restart in [false, true] {
             if restart {

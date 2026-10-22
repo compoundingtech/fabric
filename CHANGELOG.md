@@ -19,8 +19,13 @@ Deprecated, Fixed or Security.
 ### Added
 
 - **Provisional:** opt-in pairing permit issue/query/cancel control requests,
-  with private durable state, immutable exact policy, bounded lifetime and
-  reserved terminal receipt capacity. Permits grant no service access.
+  with private durable state, immutable exact policy with a versioned digest,
+  bounded lifetime and reserved terminal receipt capacity (1,024 globally,
+  128 retained attempts per owner). Read-only polls never fsync or take the
+  admission barrier; outstanding permits expire conservatively on restart.
+  Runtime state that has never used pairing remains readable by 0.9.2;
+  state that has used pairing is not downgrade-compatible. Permits grant no
+  service access.
 - **Provisional:** runtime mode accepts the restricted `fabric/pair/1` protocol
   for authenticated one-time permit presentation and bound-node attempt status.
   Pending identities receive no ordinary service access. Connection and rate
@@ -29,18 +34,26 @@ Deprecated, Fixed or Security.
   admission messages through `send`/`receive` and `pair_send`/`pair_receive`.
   Sequence/digest replay, acknowledgments, shared byte/message budgets, and
   memory-only queues preserve limits across reconnect without granting access.
+  Exchange polling is nonblocking and memory-only; idle expiry ticks never fsync.
+  Authenticated exchange traffic has an independent rate bucket. Pre-auth frames
+  retain a 4 KiB cap; authenticated over-cap frames reject the associated attempt.
+  Sending to an attempt that cannot exchange returns a coded refusal.
 - **Provisional:** permit owners can atomically confirm a verified pending
   identity, installing exact peer/grants and a durable completion receipt in
   one transaction with a final commit-time deadline check. Explicit rejection
   records a receipt without access. Historical retries report current access
   and never reinstall grants withdrawn after confirmation.
+  Completion IDs are scoped by owner; historical retries never republish policy
+  or reopen quarantine. Confirmation refuses every already-trusted NodeID.
+  Restricted network replies omit effective-access provenance and private
+  completion metadata; owner control retains the full report.
 
 ### Security
 
 - Restricted pairing uses a separate 32-handler pool, with at most two active
-  connections per authenticated NodeID. Pairing saturation cannot occupy ordinary
-  service handlers. ALPN negotiation and transport handshakes time out after ten
-  seconds each; existing pairing framing and connection deadlines remain in force.
+  connections per authenticated NodeID, one bidirectional stream, no unidirectional
+  streams and small receive windows. Only pairing has additional handshake and
+  framing deadlines; ordinary service admission retains its existing behaviour.
 
 ## [0.9.2] - 2026-10-16
 
