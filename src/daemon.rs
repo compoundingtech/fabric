@@ -94,7 +94,6 @@ const ONE_SHOT_DIAL_WAIT: Duration = Duration::from_secs(30);
 const INBOUND_SYNC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_INCOMING_HANDLERS: usize = 32;
-const INCOMING_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DIAL_HANDLERS: usize = 32;
 /// Sync connections can arrive in large coalesced bursts. Keep the default
 /// validation log useful without making one path snapshot per connection a
@@ -247,9 +246,9 @@ impl FailureBackoff {
         })
     }
 
-    /// Drop records that carry no streak and no remaining delay. The live key
-    /// space is bounded by trusted peers times ALPNs, both of which come from
-    /// config, so this needs no cap of its own.
+    /// Drop records that carry no streak and no remaining delay. Ordinary keys
+    /// are bounded by trusted peers times ALPNs; pairing shares one fixed key
+    /// regardless of the remote's freely rotating identity.
     fn prune(states: &mut HashMap<BackoffKey, FailureBackoffState>, now: tokio::time::Instant) {
         states.retain(|_, state| !state.is_idle(now));
     }
@@ -4753,8 +4752,8 @@ fn peers_display(peers: &SyncPeers) -> String {
 async fn run_iroh_accept_loop(state: Arc<DaemonState>) -> Result<()> {
     let mut endpoint_rx = state.endpoint_rx();
     loop {
-        // Only pre-dispatch handshakes share this short-lived, timeout-bounded
-        // capacity. Negotiated protocols have independent handler pools.
+        // Pre-dispatch handshakes have separate capacity from ordinary handlers.
+        // Ordinary negotiation retains the transport's existing timeout policy.
         let endpoint = endpoint_rx.borrow().clone();
         let permit = tokio::select! {
             _ = state.cancel.cancelled() => break,
@@ -4826,6 +4825,11 @@ struct IncomingIdentity {
 
 impl IncomingIdentity {
     fn backoff_key(&self) -> BackoffKey {
+        if self.alpn.as_deref().map(str::as_bytes)
+            == Some(crate::runtime_peers::pairing::PAIR_ALPN)
+        {
+            return BackoffKey::dial("<pairing>", crate::runtime_peers::pairing::PAIR_ALPN);
+        }
         BackoffKey {
             peer: self
                 .peer
@@ -4841,18 +4845,13 @@ impl IncomingIdentity {
 
 /// Complete the handshake and record who it turned out to be.
 ///
-/// The peer id only exists once the handshake completes, so this is the single
-/// seam where an inbound connection stops being anonymous. Every branch below
-/// goes through it, because a diagnostic record keyed on an unknown peer is
-/// shared with every other unknown peer on the same ALPN — which means one
-/// peer's success would clear another's failure record.
+/// Ordinary connections retain the transport's handshake timeout policy.
+/// Pairing completes its separately bounded handshake before dispatch.
 async fn handshake_and_identify(
     accepting: iroh::endpoint::Accepting,
     identity: &mut IncomingIdentity,
 ) -> Result<Connection> {
-    let connection = tokio::time::timeout(INCOMING_HANDSHAKE_TIMEOUT, accepting)
-        .await
-        .context("incoming handshake timed out")??;
+    let connection = accepting.await?;
     identity.peer = Some(connection.remote_id().to_string());
     Ok(connection)
 }
@@ -4982,21 +4981,23 @@ async fn process_incoming_iroh(
     handshake_permit: OwnedSemaphorePermit,
 ) -> Result<()> {
     let mut accepting = incoming.accept()?;
-    let alpn = tokio::time::timeout(INCOMING_HANDSHAKE_TIMEOUT, accepting.alpn())
-        .await
-        .context("incoming ALPN negotiation timed out")??;
+    let alpn = accepting.alpn().await?;
     identity.alpn = Some(String::from_utf8_lossy(&alpn).to_string());
-    // Never queue a saturated protocol behind a handshake slot. In particular,
-    // permit-free pairing must not consume ordinary service handler capacity.
-    let slots = if alpn == crate::runtime_peers::pairing::PAIR_ALPN {
-        &state.pairing_slots
-    } else {
-        &state.incoming_slots
-    };
-    let _handler_permit = slots
-        .clone()
-        .try_acquire_owned()
-        .context("incoming protocol handler capacity exhausted")?;
+    if alpn == crate::runtime_peers::pairing::PAIR_ALPN {
+        // Accepting exposes no transport setters. Its incoming 0.5-RTT handle
+        // does: restrict it immediately after ALPN selection, before awaiting
+        // authentication. Never read data or dispatch work before authentication.
+        let restricted = accepting.into_0rtt();
+        pairing::restrict_transport(&restricted);
+        let _handler_permit = state.pairing_slots.clone().try_acquire_owned()
+            .context("pairing handler capacity exhausted")?;
+        let connection = tokio::time::timeout(
+            Duration::from_secs(3), restricted.handshake_completed(),
+        ).await.context("pairing handshake timed out")??;
+        identity.peer = Some(connection.remote_id().to_string());
+        drop(handshake_permit);
+        return pairing::serve(connection, state).await;
+    }
 
     // A generic exposure that does not exist is refused before the handshake,
     // exactly as before.
@@ -5016,10 +5017,13 @@ async fn process_incoming_iroh(
     let connection = handshake_and_identify(accepting, identity).await?;
     drop(handshake_permit);
 
-    if alpn == crate::runtime_peers::pairing::PAIR_ALPN {
-        // Pairing never enters mux, service dispatch, or ordinary admissions.
-        return pairing::serve(connection, state).await;
-    }
+    // Trusted ordinary work queues after identification; neither an untrusted
+    // handshake nor pairing can reserve this pool.
+    let _handler_permit = tokio::select! {
+        _ = state.cancel.cancelled() => return Ok(()),
+        permit = state.incoming_slots.clone().acquire_owned() =>
+            permit.context("incoming handler semaphore closed")?,
+    };
 
     if alpn == mux::MUX_ALPN {
         log_connection_paths("mux_accept", &connection);
@@ -10130,6 +10134,62 @@ mod tests {
         failing.close().await;
         server.shutdown().await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn flag_off_ordinary_handlers_wait_after_handshake() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let server = FabricNode::start(home.clone()).await?;
+        let trusted = Endpoint::bind(presets::N0).await?;
+        trust_test_peer(&home, &server, trusted.id(), "trusted", trusted.addr()).await?;
+        let state = server.state();
+        assert!(state.runtime_peers.is_none());
+        let slots = state.incoming_slots.clone()
+            .acquire_many_owned(MAX_INCOMING_HANDLERS as u32).await?;
+        let connection = tokio::time::timeout(
+            Duration::from_secs(3), trusted.connect(server.addr(), BUILTIN_ECHO_ALPN),
+        ).await??;
+        let (mut send, mut recv) = connection.open_bi().await?;
+        send.write_all(b"queued").await?;
+        send.finish()?;
+        let mut byte = [0; 1];
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50), recv.read(&mut byte),
+        ).await.is_err(), "ordinary work must queue, not close when slots are busy");
+        assert_eq!(state.handshake_slots.available_permits(), MAX_INCOMING_HANDLERS);
+        drop(slots);
+        assert_eq!(tokio::time::timeout(
+            Duration::from_secs(3), recv.read_to_end(16),
+        ).await??, b"queued");
+        connection.close(0u32.into(), b"done");
+        trusted.close().await;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rotating_pairing_identities_share_one_failure_record() {
+        let backoff = FailureBackoff::new(
+            INCOMING_FAILURE_INITIAL_BACKOFF, INCOMING_FAILURE_MAX_BACKOFF,
+            FAILURE_LOG_INTERVAL,
+        );
+        for seed in 0..64u8 {
+            let identity = IncomingIdentity {
+                alpn: Some(String::from_utf8_lossy(
+                    crate::runtime_peers::pairing::PAIR_ALPN,
+                ).into_owned()),
+                peer: Some(iroh::SecretKey::from_bytes(&[seed; 32]).public().to_string()),
+            };
+            backoff.record_failure_for_diagnostics(
+                &identity.backoff_key(), "test pairing failure", &"refused",
+            ).await;
+        }
+        let records = backoff.states.lock().await;
+        assert_eq!(records.len(), 1);
+        assert!(records.contains_key(&BackoffKey::dial(
+            "<pairing>", crate::runtime_peers::pairing::PAIR_ALPN,
+        )));
     }
 
     #[tokio::test]

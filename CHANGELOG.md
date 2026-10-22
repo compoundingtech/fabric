@@ -19,8 +19,13 @@ Deprecated, Fixed or Security.
 ### Added
 
 - **Provisional:** opt-in pairing permit issue/query/cancel control requests,
-  with private durable state, immutable exact policy, bounded lifetime and
-  reserved terminal receipt capacity. Permits grant no service access.
+  with private durable state, immutable exact policy with a versioned digest,
+  bounded lifetime and reserved terminal receipt capacity (1,024 globally,
+  128 retained attempts per owner). Read-only polls never fsync or take the
+  admission barrier; outstanding permits expire conservatively on restart.
+  Runtime state that has never used pairing remains readable by 0.9.2;
+  state that has used pairing is not downgrade-compatible. Permits grant no
+  service access.
 - **Provisional:** runtime mode accepts the restricted `fabric/pair/1` protocol
   for authenticated one-time permit presentation and bound-node attempt status.
   Pending identities receive no ordinary service access. Connection and rate
@@ -30,9 +35,9 @@ Deprecated, Fixed or Security.
 ### Security
 
 - Restricted pairing uses a separate 32-handler pool, with at most two active
-  connections per authenticated NodeID. Pairing saturation cannot occupy ordinary
-  service handlers. ALPN negotiation and transport handshakes time out after ten
-  seconds each; existing pairing framing and connection deadlines remain in force.
+  connections per authenticated NodeID, one bidirectional stream, no unidirectional
+  streams and small receive windows. Only pairing has additional handshake and
+  framing deadlines; ordinary service admission retains its existing behaviour.
 
 ## [0.9.2] - 2026-10-16
 
