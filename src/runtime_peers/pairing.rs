@@ -305,7 +305,7 @@ fn observe_clock(
 }
 
 impl RuntimePeers {
-    fn pairing_timestamp(&mut self) -> u64 {
+    pub(super) fn pairing_timestamp(&mut self) -> u64 {
         observe_clock(&mut self.pairing_clock, now(), std::time::Instant::now())
     }
 
@@ -821,6 +821,51 @@ mod tests {
         }, 701).unwrap();
         assert_eq!(store.stored.pairing_last_seen, 700);
         assert_eq!(fs::read(&store.path).unwrap(), disk);
+    }
+
+    #[test]
+    fn live_reconcile_preserves_logical_expiry_across_wall_clock_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = FabricHome::new(dir.path());
+        let mut store = open(&dir);
+        // The real wall clock is behind this previously observed clock floor.
+        let t0 = now() + 3600;
+        store.pairing_request_at(issue("expired", t0 + 600), t0).unwrap();
+        store.pairing_clock = (t0 + 600, std::time::Instant::now());
+        assert_eq!(
+            store.pairing_request(query("expired")).unwrap().status.unwrap().state,
+            State::Expired
+        );
+        assert_eq!(store.stored.pairing[0].status.state, State::Issued);
+        store.reconcile(&home).unwrap();
+        assert_eq!(store.stored.pairing[0].status.state, State::Expired);
+        assert!(store.pairing_timestamp() >= t0 + 600);
+        assert_eq!(
+            store.pairing_request(query("expired")).unwrap().status.unwrap().state,
+            State::Expired
+        );
+        assert!(open(&dir).fault().is_none());
+    }
+
+    #[test]
+    fn live_reconcile_cancellation_uses_preserved_floor_and_remains_reloadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = FabricHome::new(dir.path());
+        let mut store = open(&dir);
+        let t0 = now() + 3600;
+        store.pairing_request_at(issue("cancel", t0 + 600), t0).unwrap();
+        store.pairing_clock = (t0 + 590, std::time::Instant::now());
+        store.reconcile(&home).unwrap();
+        assert_eq!(store.stored.pairing[0].status.state, State::Issued);
+        assert!(store.pairing_timestamp() >= t0 + 590);
+        let reply = store.pairing_request(Request::Cancel {
+            owner: "fleet".into(), creation_id: "cancel".into(),
+        }).unwrap();
+        let status = reply.status.unwrap();
+        assert_eq!(status.state, State::Rejected);
+        assert!(status.terminal_at.unwrap() >= t0 + 590);
+        store.validate_stored().unwrap();
+        assert!(open(&dir).fault().is_none());
     }
 
     #[test]
