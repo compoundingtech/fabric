@@ -10160,7 +10160,16 @@ mod tests {
         assert!(tokio::time::timeout(
             Duration::from_millis(50), recv.read(&mut byte),
         ).await.is_err(), "ordinary work must queue, not close when slots are busy");
-        assert_eq!(state.handshake_slots.available_permits(), MAX_INCOMING_HANDLERS);
+        // The accept loop itself reserves one handshake slot while waiting for
+        // the next connection. Acquiring every other slot is the barrier that
+        // proves this identified handler released its handshake permit.
+        let handshake_barrier = tokio::time::timeout(
+            Duration::from_secs(3),
+            state.handshake_slots.clone()
+                .acquire_many_owned((MAX_INCOMING_HANDLERS - 1) as u32),
+        ).await??;
+        assert_eq!(state.incoming_slots.available_permits(), 0);
+        drop(handshake_barrier);
         drop(slots);
         assert_eq!(tokio::time::timeout(
             Duration::from_secs(3), recv.read_to_end(16),
@@ -10197,7 +10206,6 @@ mod tests {
 
     #[tokio::test]
     async fn saturated_pairing_capacity_preserves_trusted_service_connections() -> Result<()> {
-        use crate::runtime_peers::pairing::PAIR_ALPN;
         let dir = tempfile::tempdir()?;
         let home = FabricHome::new(dir.path());
         let server = FabricNode::start_with_daemon_options(
@@ -10211,31 +10219,15 @@ mod tests {
         let trusted = Endpoint::bind(presets::N0).await?;
         trust_test_peer(&home, &server, trusted.id(), "trusted", trusted.addr()).await?;
         let state = server.state();
-        let mut tasks = tokio::task::JoinSet::new();
-        for _ in 0..pairing::MAX_CONNECTIONS {
-            let addr = server.addr();
-            tasks.spawn(async move {
-                let endpoint = Endpoint::bind(presets::N0).await?;
-                let connection = endpoint.connect(addr, PAIR_ALPN).await?;
-                Ok::<_, anyhow::Error>((endpoint, connection))
-            });
-        }
-        let mut held = Vec::new();
-        tokio::time::timeout(Duration::from_secs(8), async {
-            while let Some(result) = tasks.join_next().await {
-                held.push(result??);
-            }
-            while state.pairing_slots.available_permits() != 0 {
-                tokio::task::yield_now().await;
-            }
-            Ok::<_, anyhow::Error>(())
-        })
-        .await??;
-        assert_eq!(held.len(), pairing::MAX_CONNECTIONS);
+        // Deterministically hold both dedicated pairing pools. Wire clients
+        // without credentials intentionally expire after three seconds and
+        // cannot serve as stable capacity leases on slow CI runners.
+        let _connection_capacity = state.pairing_gate.reserve_connection_capacity_for_test();
+        let _handler_capacity = state.pairing_slots.clone()
+            .acquire_many_owned(pairing::MAX_CONNECTIONS as u32).await?;
         assert_eq!(state.incoming_slots.available_permits(), MAX_INCOMING_HANDLERS);
-        // No pairing secret or allow-list entry was needed to occupy every
-        // pairing handler. Trusted work must finish before pairing times out.
-        tokio::time::timeout(Duration::from_secs(1), async {
+        // Trusted work must proceed while both pairing pools remain saturated.
+        tokio::time::timeout(Duration::from_secs(3), async {
             let connection = trusted.connect(server.addr(), BUILTIN_ECHO_ALPN).await?;
             let (mut send, mut recv) = connection.open_bi().await?;
             send.write_all(b"trusted").await?;
@@ -10246,10 +10238,6 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         })
         .await??;
-        for (endpoint, connection) in held {
-            connection.close(0u32.into(), b"done");
-            endpoint.close().await;
-        }
         trusted.close().await;
         server.shutdown().await?;
         Ok(())
