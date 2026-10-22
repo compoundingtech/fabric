@@ -313,10 +313,14 @@ struct Stored {
     static_digest: String,
     records: Vec<Record>,
     receipts: Vec<Receipt>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pairing: Vec<pairing::Attempt>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pairing_last_seen: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone)]
