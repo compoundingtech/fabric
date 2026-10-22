@@ -84,6 +84,10 @@ enum ExchangeError {
     Refused,
     Limit,
 }
+
+pub(super) fn inactive() -> anyhow::Error {
+    FabricError::new(ErrorCode::PairingExchangeInactive, "pairing exchange is not pending").into()
+}
 impl Exchange {
     fn new(owner: String, binding: pairing::Status) -> Self {
         Self {
@@ -95,6 +99,26 @@ impl Exchange {
             total_messages: 0,
             limited: false,
         }
+    }
+    fn needs_terminal(&self, from_owner: bool, operation: &Operation) -> bool {
+        if self.limited {
+            return true;
+        }
+        let Operation::Send { sequence, digest, payload } = operation else {
+            return false;
+        };
+        if payload.as_bytes().len() > MAX_PAYLOAD {
+            return true;
+        }
+        let stream = if from_owner { &self.owner_to_node } else { &self.node_to_owner };
+        if *sequence != stream.digests.len() as u64 + 1
+            || blake3::Hash::from_hex(digest).ok() != Some(blake3::hash(payload.as_bytes()))
+        {
+            return false;
+        }
+        stream.digests.len() >= MAX_DIRECTION_MESSAGES
+            || self.total_messages >= MAX_MESSAGES
+            || self.total_bytes + payload.as_bytes().len() as u64 > MAX_BYTES
     }
     fn erase(&mut self) {
         self.node_to_owner = Stream::default();
@@ -200,6 +224,109 @@ impl Exchange {
 }
 
 impl RuntimePeers {
+    /// Execute transient traffic only; durable expiry/rejection needs the writer lane.
+    fn exchange_read(
+        &mut self,
+        owner: Option<&str>,
+        node: Option<EndpointId>,
+        attempt_id: &str,
+        operation: Operation,
+    ) -> Result<Option<pairing::Reply>> {
+        self.ensure_available()?;
+        let timestamp = self.pairing_timestamp();
+        let attempt = self.stored.pairing.iter().find(|attempt|
+            attempt.status.attempt_id == attempt_id
+                && match (owner, node) {
+                    (Some(owner), None) => attempt.owner == owner,
+                    (None, Some(node)) => attempt.status.bound_node_id == Some(node),
+                    _ => false,
+                }).ok_or_else(|| invalid("pairing exchange request refused"))?;
+        if attempt.status.terminal_at.is_some_and(|ended|
+            timestamp >= ended.saturating_add(RECEIPT_SECONDS))
+        {
+            return Err(invalid("pairing exchange request refused"));
+        }
+        if matches!(attempt.status.state, pairing::State::Issued | pairing::State::Pending)
+            && timestamp >= attempt.status.deadline
+        {
+            self.erase_expired_exchange_payloads(timestamp);
+            return Ok(None);
+        }
+        if attempt.status.state == pairing::State::Pending {
+            let needs_terminal = match self.exchanges.get(attempt_id) {
+                Some(exchange) => exchange.needs_terminal(owner.is_some(), &operation),
+                None => matches!(&operation, Operation::Send { payload, .. }
+                    if payload.as_bytes().len() > MAX_PAYLOAD),
+            };
+            if needs_terminal {
+                return Ok(None);
+            }
+        }
+        if self.stored.pairing.iter().any(|attempt|
+            matches!(attempt.status.state, pairing::State::Issued | pairing::State::Pending)
+                && timestamp >= attempt.status.deadline)
+        {
+            return Ok(None);
+        }
+        self.exchange_request(owner, node, attempt_id, operation, timestamp).map(Some)
+    }
+
+    pub(crate) fn pairing_exchange_network_read(
+        &mut self, node: EndpointId, request: &pairing::NetworkRequest,
+    ) -> Result<Option<pairing::Reply>> {
+        let (attempt_id, operation) = match request {
+            pairing::NetworkRequest::Send { attempt_id, sequence, digest, payload } =>
+                (attempt_id, Operation::Send { sequence: *sequence, digest: digest.clone(), payload: payload.clone() }),
+            pairing::NetworkRequest::Receive { attempt_id, ack } =>
+                (attempt_id, Operation::Receive { ack: *ack }),
+            _ => return Err(invalid("not an exchange operation")),
+        };
+        self.exchange_read(None, Some(node), attempt_id, operation)
+    }
+
+    pub(crate) fn pairing_exchange_owner_read(
+        &mut self, request: &pairing::Request,
+    ) -> Result<Option<pairing::Reply>> {
+        let (owner, attempt_id, operation) = match request {
+            pairing::Request::PairSend { owner, attempt_id, sequence, digest, payload } =>
+                (owner, attempt_id, Operation::Send { sequence: *sequence, digest: digest.clone(), payload: payload.clone() }),
+            pairing::Request::PairReceive { owner, attempt_id, ack } =>
+                (owner, attempt_id, Operation::Receive { ack: *ack }),
+            _ => return Err(invalid("not an exchange operation")),
+        };
+        self.exchange_read(Some(owner), None, attempt_id, operation)
+    }
+
+    pub(crate) fn reject_pairing_frame(
+        &mut self, node: EndpointId, attempt_id: &str,
+    ) -> Result<pairing::Reply> {
+        self.ensure_available()?;
+        let timestamp = self.pairing_timestamp();
+        let index = self.stored.pairing.iter().position(|attempt|
+            attempt.status.attempt_id == attempt_id && attempt.status.bound_node_id == Some(node))
+            .ok_or_else(|| invalid("pairing exchange request refused"))?;
+        if self.stored.pairing[index].status.state == pairing::State::Pending {
+            if let Some(exchange) = self.exchanges.get_mut(attempt_id) {
+                exchange.erase();
+            }
+            let mut next = self.stored.clone();
+            let deadline = next.pairing[index].status.deadline;
+            if timestamp >= deadline {
+                next.pairing[index].terminate(pairing::State::Expired, deadline);
+            } else {
+                next.pairing[index].terminate(pairing::State::Rejected, timestamp);
+                next.pairing[index].status.terminal_reason = Some("exchange_limit".into());
+            }
+            self.commit_pairing(next, timestamp)?;
+        }
+        Ok(pairing::Reply {
+            status: Some(self.stored.pairing[index].status.clone()),
+            secret: None, error: None, exchange: None,
+        })
+    }
+}
+
+impl RuntimePeers {
     pub(super) fn erase_expired_exchange_payloads(&mut self, timestamp: u64) {
         for exchange in self.exchanges.values_mut() {
             if timestamp >= exchange.binding.deadline {
@@ -221,6 +348,13 @@ impl RuntimePeers {
     }
 
     pub(super) fn prepare_exchange_io(&mut self, timestamp: u64) -> Result<()> {
+        self.erase_expired_exchange_payloads(timestamp);
+        if !self.stored.pairing.iter().any(|attempt|
+            matches!(attempt.status.state, pairing::State::Issued | pairing::State::Pending)
+                && timestamp >= attempt.status.deadline)
+        {
+            return Ok(());
+        }
         let mut next = self.stored.clone();
         // Expire all queues, including when the requested operation is refused.
         pairing::recover(
@@ -233,7 +367,7 @@ impl RuntimePeers {
                 &attempt.status.attempt_id == id && attempt.status.state == pairing::State::Pending
             })
         });
-        self.commit_pairing(next)
+        self.commit_pairing(next, timestamp)
     }
 
     pub(super) fn exchange_request(
@@ -244,6 +378,8 @@ impl RuntimePeers {
         operation: Operation,
         timestamp: u64,
     ) -> Result<pairing::Reply> {
+        self.ensure_available()?;
+        self.prepare_exchange_io(timestamp)?;
         let refused = || invalid("pairing exchange request refused");
         let index = self
             .stored
@@ -267,6 +403,9 @@ impl RuntimePeers {
         }
         let status = attempt.status.clone();
         if status.state != pairing::State::Pending {
+            if matches!(operation, Operation::Send { .. }) {
+                return Err(inactive());
+            }
             return Ok(pairing::Reply {
                 status: Some(status),
                 secret: None,
@@ -274,10 +413,6 @@ impl RuntimePeers {
                 exchange: None,
             });
         }
-        let mut next = self.stored.clone();
-        next.pairing_last_seen = timestamp.max(next.pairing_last_seen);
-        self.commit_pairing(next)?;
-        let attempt = &self.stored.pairing[index];
         let exchange = self
             .exchanges
             .entry(attempt_id.into())
@@ -300,7 +435,7 @@ impl RuntimePeers {
                 next.pairing[index].terminate(pairing::State::Rejected, timestamp);
                 next.pairing[index].status.terminal_reason = Some("exchange_limit".into());
                 let status = next.pairing[index].status.clone();
-                if let Err(error) = self.commit_pairing(next) {
+                if let Err(error) = self.commit_pairing(next, timestamp) {
                     self.set_fault(&error);
                     return Err(error);
                 }

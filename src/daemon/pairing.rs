@@ -7,10 +7,23 @@ use tokio::sync::Semaphore;
 
 pub(super) const MAX_CONNECTIONS: usize = 32;
 const MAX_CONNECTIONS_PER_NODE: usize = 2;
+const MAX_PREAUTH_REQUEST: usize = 4096;
 // JSON byte arrays require at most four encoded bytes per payload byte.
 const MAX_REQUEST: usize = 4 * 64 * 1024 + 4096;
+const BOUND_BURST: u32 = 8;
+const BOUND_REFILL_SECONDS: u64 = 1;
 const MAX_RATE_NODES: usize = 1024;
 const IDLE: Duration = Duration::from_secs(10);
+const FIRST_HEADER: Duration = Duration::from_secs(3);
+const RECEIVE_WINDOW: u32 = 8192;
+
+pub(super) fn restrict_transport<T: iroh::endpoint::ConnectionState>(connection: &Connection<T>) {
+    // QUIC cannot retract credits already advertised before ALPN selection.
+    // These setters restrict replenishment at the earliest public API point.
+    connection.set_max_concurrent_bi_streams(VarInt::from_u32(1));
+    connection.set_max_concurrent_uni_streams(VarInt::from_u32(0));
+    connection.set_receive_window(VarInt::from_u32(RECEIVE_WINDOW));
+}
 
 #[derive(Debug)]
 struct Bucket {
@@ -31,6 +44,7 @@ impl Bucket {
 struct Rates {
     global: Bucket,
     nodes: HashMap<EndpointId, Bucket>,
+    bound: HashMap<EndpointId, Bucket>,
 }
 #[derive(Debug)]
 pub(super) struct Gate {
@@ -51,6 +65,7 @@ impl Default for Gate {
                     last: Instant::now(),
                 },
                 nodes: HashMap::new(),
+                bound: HashMap::new(),
             }),
         }
     }
@@ -138,6 +153,31 @@ impl Gate {
         rates.global.tokens -= 1;
         true
     }
+    fn refund(&self) {
+        let mut rates = self.rates.lock();
+        rates.global.tokens = rates.global.tokens.saturating_add(1).min(10);
+    }
+
+    fn bound_rate(&self, node: EndpointId, now: Instant) -> bool {
+        let mut rates = self.rates.lock();
+        if !rates.bound.contains_key(&node) && rates.bound.len() >= MAX_RATE_NODES {
+            rates.bound.retain(|_, bucket|
+                now.duration_since(bucket.last) < Duration::from_secs(60));
+            if rates.bound.len() >= MAX_RATE_NODES {
+                return false;
+            }
+        }
+        let bucket = rates.bound.entry(node).or_insert(Bucket {
+            tokens: BOUND_BURST,
+            last: now,
+        });
+        bucket.refill(now, BOUND_BURST, BOUND_REFILL_SECONDS);
+        if bucket.tokens == 0 {
+            return false;
+        }
+        bucket.tokens -= 1;
+        true
+    }
     fn lease(&self, attempt: &str) -> Option<AttemptLease<'_>> {
         if attempt.is_empty() || attempt.len() > 128 {
             return None;
@@ -151,6 +191,68 @@ impl Gate {
             attempt: attempt.to_owned(),
         })
     }
+}
+
+/// Decode the flat wire object directly. Deserializing the internally tagged
+/// public enum would first buffer every payload byte as serde enum content.
+fn decode_request(bytes: &[u8]) -> Result<NetworkRequest> {
+    use crate::runtime_peers::pairing::{Payload, Secret};
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum Operation {
+        Present,
+        Status,
+        Send,
+        Receive,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Frame {
+        operation: Operation,
+        attempt_id: String,
+        secret: Option<Secret>,
+        sequence: Option<u64>,
+        digest: Option<String>,
+        payload: Option<Payload>,
+        ack: Option<u64>,
+    }
+    let frame: Frame = serde_json::from_slice(bytes).map_err(|_| refused())?;
+    let Frame { operation, attempt_id, secret, sequence, digest, payload, ack } = frame;
+    match operation {
+        Operation::Present
+            if sequence.is_none() && digest.is_none() && payload.is_none() && ack.is_none() =>
+        {
+            Ok(NetworkRequest::Present { attempt_id, secret: secret.ok_or_else(refused)? })
+        }
+        Operation::Status
+            if secret.is_none() && sequence.is_none() && digest.is_none()
+                && payload.is_none() && ack.is_none() =>
+        {
+            Ok(NetworkRequest::Status { attempt_id })
+        }
+        Operation::Send if secret.is_none() && ack.is_none() => Ok(NetworkRequest::Send {
+            attempt_id,
+            sequence: sequence.ok_or_else(refused)?,
+            digest: digest.ok_or_else(refused)?,
+            payload: payload.ok_or_else(refused)?,
+        }),
+        Operation::Receive
+            if secret.is_none() && sequence.is_none() && digest.is_none() && payload.is_none() =>
+        {
+            Ok(NetworkRequest::Receive { attempt_id, ack })
+        }
+        _ => Err(refused()),
+    }
+}
+
+async fn reject_frame(state: &Arc<DaemonState>, node: EndpointId, attempt: &str) {
+    let state = state.clone();
+    let attempt = attempt.to_owned();
+    // A socket close or timeout cannot abandon durable rejection/quarantine.
+    let rejection = tokio::spawn(async move {
+        state.reject_pairing_frame(node, attempt).await
+    });
+    let _ = tokio::time::timeout(FIRST_HEADER, rejection).await;
 }
 
 fn refused() -> anyhow::Error {
@@ -180,6 +282,25 @@ pub(super) async fn expire_loop(state: Arc<DaemonState>) {
             _ = state.cancel.cancelled() => return,
             _ = ticks.tick() => {}
         }
+        // No clock observation or expiry worker is needed for retained receipts.
+        let due = async {
+            if !state.has_active_pairing_attempts().await? {
+                return Ok::<_, anyhow::Error>(false);
+            }
+            state.pairing_expiry_due().await
+        }
+        .await;
+        match due {
+            Ok(false) => continue,
+            Ok(true) => {}
+            Err(_) => {
+                if !fault_reported && !state.cancel.is_cancelled() {
+                    warn!("pairing expiry inspection failed");
+                }
+                fault_reported = true;
+                continue;
+            }
+        }
         // Once started, publication/quarantine completes even during shutdown.
         let reply = state
             .commit_pairing(|runtime| {
@@ -203,10 +324,12 @@ pub(super) async fn expire_loop(state: Arc<DaemonState>) {
     }
 }
 
-async fn serve_requests(connection: &Connection, state: &DaemonState) -> Result<()> {
-    let (mut send, mut recv) = tokio::time::timeout(IDLE, connection.accept_bi()).await??;
+async fn serve_requests(connection: &Connection, state: &Arc<DaemonState>) -> Result<()> {
+    let first_header_deadline = tokio::time::Instant::now() + FIRST_HEADER;
+    let (mut send, mut recv) =
+        tokio::time::timeout_at(first_header_deadline, connection.accept_bi()).await??;
     let mut lease: Option<AttemptLease<'_>> = None;
-    let mut deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    let mut deadline = first_header_deadline;
     loop {
         let mut length = [0u8; 4];
         tokio::time::timeout_at(
@@ -214,15 +337,21 @@ async fn serve_requests(connection: &Connection, state: &DaemonState) -> Result<
             recv.read_exact(&mut length),
         )
         .await??;
-        // Only a fixed header precedes rate permission; no attacker-sized allocation.
-        if !state
-            .pairing_gate
-            .rate(connection.remote_id(), Instant::now())
-        {
+        // A connection must first bind or validate its attempt with a small
+        // present/status frame, including after reconnect. Never allocate from
+        // an unauthenticated large length prefix.
+        let bound = lease.is_some();
+        let charged = !bound
+            && state.pairing_gate.rate(connection.remote_id(), Instant::now());
+        let length = u32::from_be_bytes(length) as usize;
+        let cap = if bound { MAX_REQUEST } else { MAX_PREAUTH_REQUEST };
+        if length == 0 || length > cap {
+            if let Some(lease) = &lease {
+                reject_frame(state, connection.remote_id(), &lease.attempt).await;
+            }
             return Err(refused());
         }
-        let length = u32::from_be_bytes(length) as usize;
-        if length == 0 || length > MAX_REQUEST {
+        if bound && !state.pairing_gate.bound_rate(connection.remote_id(), Instant::now()) {
             return Err(refused());
         }
         let mut bytes = vec![0u8; length];
@@ -231,8 +360,25 @@ async fn serve_requests(connection: &Connection, state: &DaemonState) -> Result<
             recv.read_exact(&mut bytes[..length]),
         )
         .await??;
-        let request: NetworkRequest =
-            serde_json::from_slice(&bytes[..length]).map_err(|_| refused())?;
+        let request = decode_request(&bytes)?;
+        drop(bytes);
+        if matches!(&request, NetworkRequest::Present { .. } | NetworkRequest::Status { .. })
+            && length > MAX_PREAUTH_REQUEST
+        {
+            if let Some(lease) = &lease {
+                reject_frame(state, connection.remote_id(), &lease.attempt).await;
+            }
+            return Err(refused());
+        }
+        let validated = state.pairing_network_read(connection.remote_id(), &request).await?;
+        if charged {
+            state.pairing_gate.refund();
+        } else if !bound && validated.is_none() {
+            return Err(refused());
+        }
+        if !bound && !state.pairing_gate.bound_rate(connection.remote_id(), Instant::now()) {
+            return Err(refused());
+        }
         let attempt = match &request {
             NetworkRequest::Present { attempt_id, .. }
             | NetworkRequest::Status { attempt_id }
@@ -246,9 +392,18 @@ async fn serve_requests(connection: &Connection, state: &DaemonState) -> Result<
         } else {
             lease = Some(state.pairing_gate.lease(attempt).ok_or_else(refused)?);
         }
-        let reply = state
-            .pairing_network_request(connection.remote_id(), request)
-            .await;
+        let reply = if let Some(reply) = validated {
+            reply
+        } else {
+            // A timeout or disconnect must not cancel durable publication and
+            // quarantine after its off-thread worker has persisted a bind.
+            let state = state.clone();
+            let node = connection.remote_id();
+            let commit = tokio::spawn(async move {
+                state.pairing_network_request(node, request).await
+            });
+            tokio::time::timeout(FIRST_HEADER, commit).await??
+        };
         // The restricted path never reports fault internals or any unbound attempt.
         if reply.error.is_some() {
             return Err(refused());
@@ -258,9 +413,8 @@ async fn serve_requests(connection: &Connection, state: &DaemonState) -> Result<
         let wall = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
-        deadline = deadline.min(
-            tokio::time::Instant::now() + Duration::from_secs(status.deadline.saturating_sub(wall)),
-        );
+        deadline = tokio::time::Instant::now()
+            + Duration::from_secs(status.deadline.saturating_sub(wall).min(600));
         let bytes = serde_json::to_vec(&reply)?;
         tokio::time::timeout_at(
             deadline.min(tokio::time::Instant::now() + IDLE),
@@ -339,6 +493,47 @@ mod tests {
         assert!(!gate.rate(node(200), now + Duration::from_secs(7)));
         assert!(gate.rates.lock().nodes.len() <= MAX_RATE_NODES);
     }
+    #[test]
+    fn validated_requests_refund_global_tokens_and_bound_traffic_has_its_own_budget() {
+        let gate = Gate::default();
+        let now = Instant::now();
+        assert!(gate.rate(node(1), now));
+        gate.refund();
+        assert_eq!(gate.rates.lock().global.tokens, 10);
+        for seed in 10..20 {
+            assert!(gate.rate(node(seed), now));
+        }
+        assert!(!gate.rate(node(99), now));
+        for _ in 0..BOUND_BURST {
+            assert!(gate.bound_rate(node(1), now));
+        }
+        assert!(!gate.bound_rate(node(1), now));
+        assert!(gate.bound_rate(node(2), now));
+        assert!(gate.bound_rate(node(1), now + Duration::from_secs(BOUND_REFILL_SECONDS)));
+        assert_eq!(gate.rates.lock().global.tokens, 0);
+        for _ in 0..20 {
+            gate.refund();
+        }
+        assert_eq!(gate.rates.lock().global.tokens, 10);
+    }
+
+    #[tokio::test]
+    async fn pairing_closes_connections_without_a_complete_first_header_in_three_seconds()
+    -> Result<()> {
+        use crate::runtime_peers::pairing::PAIR_ALPN;
+        let dir = tempfile::tempdir()?;
+        let gateway = gateway(FabricHome::new(dir.path())).await?;
+        let client = client().await?;
+        let connection = client.connect(gateway.addr(), PAIR_ALPN).await?;
+        let (mut send, _recv) = connection.open_bi().await?;
+        send.write_all(&[0]).await?;
+        tokio::time::timeout(Duration::from_secs(4), connection.closed()).await?;
+        assert!(gateway.state().pairing_gate.attempts.lock().is_empty());
+        client.close().await;
+        gateway.shutdown().await?;
+        Ok(())
+    }
+
     async fn rpc(
         send: &mut SendStream,
         recv: &mut RecvStream,
@@ -410,6 +605,33 @@ mod tests {
         let status = presented.status.unwrap();
         assert_eq!(status.state, State::Pending);
         assert_eq!(status.bound_node_id, Some(client.id()));
+        // Old transport credits can permit extra streams even after the
+        // post-ALPN limits shrink. None may become a second pairing handler.
+        if let Ok(Ok((mut extra_send, mut extra_recv))) = tokio::time::timeout(
+            Duration::from_millis(50), connection.open_bi(),
+        ).await {
+            let request = serde_json::to_vec(&NetworkRequest::Status {
+                attempt_id: attempt_id.clone(),
+            })?;
+            extra_send.write_all(&(request.len() as u32).to_be_bytes()).await?;
+            extra_send.write_all(&request).await?;
+            let mut header = [0; 4];
+            assert!(tokio::time::timeout(
+                Duration::from_millis(50), extra_recv.read_exact(&mut header),
+            ).await.is_err(), "a second bidi stream was dispatched");
+        }
+        if let Ok(Ok(mut uni)) = tokio::time::timeout(
+            Duration::from_millis(50), connection.open_uni(),
+        ).await {
+            uni.write_all(b"not a pairing request").await?;
+            uni.finish()?;
+        }
+        // Rotating credential-less keys empty only the unvalidated lane.
+        let now = Instant::now();
+        for seed in 20..30 {
+            assert!(state.pairing_gate.rate(node(seed), now));
+        }
+        assert!(!state.pairing_gate.rate(node(31), now));
         let same = rpc(
             &mut send,
             &mut recv,
@@ -464,7 +686,7 @@ mod tests {
         let enabled = gateway(FabricHome::new(dir.path())).await?;
         let connection = client.connect(enabled.addr(), PAIR_ALPN).await?;
         let (mut send, mut recv) = connection.open_bi().await?;
-        send.write_all(&((MAX_REQUEST + 1) as u32).to_be_bytes())
+        send.write_all(&((MAX_PREAUTH_REQUEST + 1) as u32).to_be_bytes())
             .await?;
         let mut byte = [0; 1];
         let result = tokio::time::timeout(Duration::from_secs(3), recv.read(&mut byte)).await?;
@@ -474,6 +696,100 @@ mod tests {
         enabled.shutdown().await?;
         Ok(())
     }
+    #[test]
+    fn flat_decoder_preserves_network_shapes_and_rejects_invalid_fields() -> Result<()> {
+        use crate::runtime_peers::pairing::{Payload, Secret};
+        for request in [
+            NetworkRequest::Present {
+                attempt_id: "attempt".into(),
+                secret: Secret::new("secret"),
+            },
+            NetworkRequest::Status { attempt_id: "attempt".into() },
+            NetworkRequest::Send {
+                attempt_id: "attempt".into(),
+                sequence: 1,
+                digest: "digest".into(),
+                payload: Payload::new(vec![255; 64 * 1024]),
+            },
+            NetworkRequest::Receive { attempt_id: "attempt".into(), ack: Some(1) },
+        ] {
+            let bytes = serde_json::to_vec(&request)?;
+            assert_eq!(serde_json::to_vec(&decode_request(&bytes)?)?, bytes);
+        }
+        for bytes in [
+            br#"{"operation":"send","attempt_id":"a","sequence":1,"digest":"d"}"#.as_slice(),
+            br#"{"operation":"status","attempt_id":"a","payload":[1]}"#,
+            br#"{"operation":"status","attempt_id":"a","unknown":1}"#,
+            br#"{"operation":"status","attempt_id":"a","attempt_id":"b"}"#,
+        ] {
+            assert!(decode_request(bytes).is_err());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bound_oversize_header_rejects_only_associated_attempt_durably() -> Result<()> {
+        use crate::runtime_peers::pairing::{PAIR_ALPN, Policy, Request};
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let gateway = gateway(home.clone()).await?;
+        let state = gateway.state();
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?.as_secs() + 600;
+        let mut permits = Vec::new();
+        for creation_id in ["oversize", "unrelated"] {
+            let reply = state.pairing_request(Request::Issue {
+                owner: "test".into(),
+                creation_id: creation_id.into(),
+                deadline,
+                policy: Policy {
+                    grants: vec![],
+                    name: None,
+                    direction: crate::runtime_peers::Direction::Normal,
+                },
+            }).await;
+            assert!(reply.error.is_none());
+            permits.push(reply);
+        }
+        let client = client().await?;
+        let connection = client.connect(gateway.addr(), PAIR_ALPN).await?;
+        let (mut send, mut recv) = connection.open_bi().await?;
+        let first = permits.remove(0);
+        let status = rpc(&mut send, &mut recv, NetworkRequest::Present {
+            attempt_id: first.status.unwrap().attempt_id,
+            secret: first.secret.unwrap(),
+        }).await?.status.unwrap();
+        assert_eq!(status.state, State::Pending);
+        // The same node can hold another permit; a bad frame must not reject it.
+        let other = client.connect(gateway.addr(), PAIR_ALPN).await?;
+        let (mut other_send, mut other_recv) = other.open_bi().await?;
+        let second = permits.remove(0);
+        assert_eq!(rpc(&mut other_send, &mut other_recv, NetworkRequest::Present {
+            attempt_id: second.status.unwrap().attempt_id,
+            secret: second.secret.unwrap(),
+        }).await?.status.unwrap().state, State::Pending);
+        // Only the header is sent: rejection must precede body allocation/read.
+        send.write_all(&((MAX_REQUEST + 1) as u32).to_be_bytes()).await?;
+        tokio::time::timeout(Duration::from_secs(3), connection.closed()).await?;
+        client.close().await;
+        gateway.shutdown().await?;
+        drop(state);
+        let restarted = self::gateway(home).await?;
+        for (creation_id, expected) in [
+            ("oversize", State::Rejected),
+            ("unrelated", State::Pending),
+        ] {
+            let reply = restarted.state().pairing_request(Request::Query {
+                owner: "test".into(),
+                creation_id: creation_id.into(),
+            }).await;
+            assert!(reply.error.is_none());
+            assert_eq!(reply.status.unwrap().state, expected);
+        }
+        restarted.shutdown().await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn disconnected_presenter_cannot_abandon_indeterminate_commit_quarantine() -> Result<()> {
         use crate::runtime_peers::pairing::{PAIR_ALPN, Policy, Request};
@@ -510,19 +826,24 @@ mod tests {
             let _ = blocked.recv();
         });
         ready.await?;
+        let runtime = state.runtime_peers.as_ref().unwrap();
+        let owners_before_request = Arc::strong_count(runtime);
         let bytes = serde_json::to_vec(&NetworkRequest::Present {
             attempt_id: issued.status.unwrap().attempt_id,
             secret: issued.secret.unwrap(),
         })?;
         send.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
         send.write_all(&bytes).await?;
-        // Commit has acquired the admission barrier, but persistence is held off-thread.
+        // Read-only validation now precedes the admission barrier. Holding the
+        // runtime mutex must not hold that barrier while validation waits.
         tokio::time::timeout(Duration::from_secs(3), async {
-            while state.peer_book.try_read().is_ok() {
+            // The blocked read worker owns a runtime handle only after the
+            // complete request has reached read-only validation.
+            while Arc::strong_count(runtime) <= owners_before_request {
                 tokio::task::yield_now().await;
             }
-        })
-        .await?;
+        }).await?;
+        assert!(state.peer_book.try_read().is_ok());
         connection.close(VarInt::from_u32(0), b"caller disconnected");
         // Give the old disconnect-select path a chance to abandon its commit future.
         for _ in 0..32 {

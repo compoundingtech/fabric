@@ -45,6 +45,13 @@ and bounded transaction/completion receipts. It is private to the daemon
 account and written through a same-directory temporary file, file fsync,
 atomic rename, and directory fsync.
 
+Pairing fields are omitted when the attempt list is empty and the persisted
+pairing clock anchor is zero. A runtime state file that has never used pairing
+therefore remains readable by 0.9.2, including after unrelated runtime-policy
+writes. Once pairing has been used, the file is not downgrade-compatible with
+0.9.2: its strict reader rejects the new fields. Receipt cleanup does not make
+that downgrade safe; the nonzero pairing clock anchor remains.
+
 The configured `peers.toml` is a read-only input, including when it is a
 symlink. Runtime operations never rewrite it, replace the symlink, change
 its target, or run write-on-load migrations. Existing format interpretation
@@ -243,16 +250,46 @@ hash of the secret is stored; plaintext appears only in the creation reply
 and invitation, never in logs, list, watch, or completion receipts. A create
 request also has an idempotency ID so its lost reply can be reconciled.
 
+Pairing queries and read-only validation never write or fsync runtime state,
+take the admission barrier, or acquire the peer-book write lock. They check
+expiry against the in-memory monotonic clock floor; even a poll that observes
+expiry does not durably commit it. Clock observations remain in memory and are
+persisted only with pairing state transitions (issue, bind, terminal, or
+expiry), not as a side effect of polling.
+
+Recovery deliberately uses an issue-time anchor rather than periodic durable
+uptime checkpoints. All outstanding permits expire conservatively on daemon
+restart, even if the wall clock appears to be before their original deadlines.
+The issue-time anchor cannot establish how long a permit was live before a
+crash or how far the clock rolled back during downtime; preserving its
+remaining lifetime would risk extending the 10-minute cap. Issue a fresh
+permit after restart; queries cannot renew the old one.
+
 First valid presentation on the authenticated pairing connection reserves the
 permit to that connection's NodeID and durably creates `pending`. It installs
 no standing trust or grant. A repeat by that same NodeID returns the existing
 attempt; another NodeID cannot take the binding or start a second exchange.
 Invalid tokens, exhausted limits, and expired permits do not create pending
-access records. Permit validation is rate limited before any large allocation:
-64 outstanding permits, 32 active pairing connections, one active connection
-per attempt, and 60 invalid presentations per minute globally with a burst of
-10. Per-NodeID throttling also applies; changing a NodeID does not bypass the
-global limit. These initial limits need tests, not throughput claims.
+access records. Pairing has its own capacity and rate limits: 64 outstanding
+permits, 32 active connections, at most two per NodeID, and one active connection
+per attempt. As soon as the ALPN is known, the connection is configured for one
+bidirectional stream, zero unidirectional streams, and an 8 KiB receive window.
+QUIC cannot retract credits already advertised before ALPN selection; these
+limits constrain subsequent credit replenishment. The first frame header must
+arrive within three seconds. Pairing-only handshake and framing deadlines do not
+change ordinary handshake behaviour or blocking handler-slot acquisition.
+
+Credential-less requests consume the global invalid-request bucket (one per
+second, burst ten); successful validation refunds that token. The bound node's
+authenticated traffic uses a separate small per-node bucket and does not depend
+on global tokens left by rotating attacker keys. Pairing failures share one fixed
+diagnostic/backoff key, rather than growing a map per untrusted identity.
+Pairing availability remains best effort under attack: credential-less connections
+can occupy the dedicated pool. Ordinary traffic does not use that pool or bucket.
+Read-only validation and status never enter the policy commit barrier; only a
+real binding or terminal transition persists. Commit replies are bounded by a
+three-second wait, while an already-started durable commit finishes its policy
+quarantine handling even if the caller disconnects or times out.
 
 A pending NodeID status is insufficient to complete a signed admission. The
 pairing connection therefore carries one logical bidirectional join exchange,
@@ -272,8 +309,27 @@ digest. Retrying the same sequence and digest is idempotent; different bytes
 at the same sequence are refused. Reads can replay an unacknowledged message,
 and sending counts each logical message once. Reconnection by the bound NodeID
 may resume that same exchange before expiry; it does not reset budgets or open
-another exchange. Control long-polls remain bounded by the attempt deadline.
+another exchange. Exchange receive is nonblocking: an empty queue returns an
+empty result immediately; callers poll explicitly rather than holding a control
+long-poll open. The monotonic attempt deadline still bounds all exchange work.
 Exceeding a byte/message bound rejects the attempt and discards its queues.
+
+Sending, receiving and acknowledging exchange messages mutate only memory, never
+fsync runtime policy or take the admission barrier. Only a real binding or
+terminal transition is persisted. Bound-node exchange traffic uses its own small
+rate bucket, independent of rotating credential-less keys' global bucket.
+The expiry timer skips pairing work when no issued or pending attempts exist and
+enters the durable writer only when expiry is due; idle ticks perform no fsync.
+Worst-case payload memory is 64 active attempts × 1 MiB = 64 MiB, plus bounded
+message metadata and request/reply framing.
+
+Before a connection authenticates its bound attempt, present/status framing is
+capped at 4 KiB. A bound node may use the larger encoded exchange-message cap;
+reconnection must first authenticate with a small present/status request. An
+over-cap frame on that authenticated connection rejects only its associated
+attempt. An unauthenticated oversized frame is closed without allocating its
+claimed body or guessing an attempt to reject. Sending to an issued-only or
+terminal attempt returns a distinct coded error, not an empty success.
 
 Fabric transports opaque bytes, such as a handshake or member-key transcript.
 It binds them to the authenticated NodeID, attempt, direction, and sequence;
@@ -295,6 +351,9 @@ pairing path. It grants no further byte exchange or service access.
 Attempt status returns the attempt ID, state (`issued`, `pending`, `confirmed`,
 `expired`, or `rejected`), attempt revision, bound NodeID if any, original
 deadline, immutable permit-policy digest, and terminal receipt when present.
+The permit-policy digest has an explicit format version and hashes a fixed
+encoding of the policy fields, not the serialization layout of the `Policy`
+struct. Adding a struct field must not silently change existing digests.
 The attempt revision advances on binding/state changes; transcript sequences
 are separate. A pending record grants no ordinary protocol, while the bound
 node can read its own status through the restricted pairing protocol. Other
@@ -321,15 +380,21 @@ Repeating a confirmed attempt returns its durable receipt and current effective
 access without installing anything again. In particular, a retry after a later
 revocation must not restore the peer. Rejection and expiry delete the pending
 eligibility record and secret hash, retain a terminal completion receipt, and
-install no access. Pairing receipts last 24 hours and use their own bounded 1,024-slot pool;
+install no access. Pairing receipts last 24 hours and use their own bounded
+1,024-slot pool, with at most 128 retained attempts per owner. Both limits count
+outstanding permits and retained terminal attempts, including cancelled ones;
 capacity is reserved when issuing permits, so completion never depends on
-freeing another attempt's receipt. Expired receipt lookup returns unknown;
-an unknown attempt can never be confirmed as if it were a new permit.
+freeing another attempt's receipt. Issuing is refused at either limit rather
+than evicting unexpired history. Owner attribution is not authentication: the
+per-owner cap limits one owner string, not a hostile process able to choose
+other strings. Expired receipt lookup returns unknown; an unknown attempt can
+never be confirmed as if it were a new permit.
 
 | Lost response or crash boundary | State left behind and recovery |
 | --- | --- |
 | Create fails before durable commit | No permit. Retry the same creation ID. |
 | Permit committed, creation reply lost | An unbound, expiring permit; no access. Query by creation ID. The hash cannot recover the secret: cancel it and issue a fresh permit if the caller lost the secret. |
+| Daemon restarts with an outstanding issued permit | Durably expire the permit regardless of the apparent remaining UTC lifetime; issue-time anchoring cannot rule out rollback across downtime. No access is installed. |
 | Presentation fails before durable pending commit | Permit remains unbound; no access. The same node may present again before expiry. |
 | Pending committed, presentation reply lost | One pending NodeID binding; no access. Presenting the same permit from the same NodeID returns that attempt without consuming another slot or extending expiry. |
 | Transcript send/read reply lost | Replay by sequence/digest or acknowledge the same queued message; no extra bytes counted and no access installed. Restart instead rejects the unfinished exchange. |
