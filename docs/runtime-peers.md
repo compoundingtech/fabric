@@ -272,10 +272,12 @@ attempt; another NodeID cannot take the binding or start a second exchange.
 Invalid tokens, exhausted limits, and expired permits do not create pending
 access records. Pairing has its own capacity and rate limits: 64 outstanding
 permits, 32 active connections, at most two per NodeID, and one active connection
-per attempt. The connection permits one bidirectional stream, no unidirectional
-streams, and a small receive window. The first frame header must arrive within
-three seconds. Pairing-only handshake and framing deadlines do not change the
-ordinary service path's handshake behaviour or blocking handler-slot acquisition.
+per attempt. As soon as the ALPN is known, the connection is configured for one
+bidirectional stream, zero unidirectional streams, and an 8 KiB receive window.
+QUIC cannot retract credits already advertised before ALPN selection; these
+limits constrain subsequent credit replenishment. The first frame header must
+arrive within three seconds. Pairing-only handshake and framing deadlines do not
+change ordinary handshake behaviour or blocking handler-slot acquisition.
 
 Credential-less requests consume the global invalid-request bucket (one per
 second, burst ten); successful validation refunds that token. The bound node's
