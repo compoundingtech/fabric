@@ -12,6 +12,7 @@ const MAX_RATE_NODES: usize = 1024;
 const IDLE: Duration = Duration::from_secs(10);
 const FIRST_HEADER: Duration = Duration::from_secs(3);
 const RECEIVE_WINDOW: u32 = 8192;
+const BOUND_HINT_TTL: Duration = Duration::from_secs(600);
 
 pub(super) fn restrict_transport<T: iroh::endpoint::ConnectionState>(connection: &Connection<T>) {
     // QUIC cannot retract credits already advertised before ALPN selection.
@@ -37,10 +38,15 @@ impl Bucket {
     }
 }
 #[derive(Debug)]
+struct BoundHint {
+    bucket: Bucket,
+    expires: Instant,
+}
+#[derive(Debug)]
 struct Rates {
     global: Bucket,
     nodes: HashMap<EndpointId, Bucket>,
-    bound: HashMap<EndpointId, Bucket>,
+    bound: HashMap<EndpointId, BoundHint>,
 }
 #[derive(Debug)]
 pub(super) struct Gate {
@@ -154,22 +160,43 @@ impl Gate {
         rates.global.tokens = rates.global.tokens.saturating_add(1).min(10);
     }
 
-    fn bound_rate(&self, node: EndpointId, now: Instant) -> bool {
+    /// Only a scheduling hint, never proof of authorization. Every admitted
+    /// request still undergoes the runtime's credential and identity checks.
+    fn reserve_request(&self, node: EndpointId, now: Instant) -> Option<bool> {
         let mut rates = self.rates.lock();
-        if !rates.bound.contains_key(&node) && rates.bound.len() >= MAX_RATE_NODES {
-            rates.bound.retain(|_, bucket|
-                now.duration_since(bucket.last) < Duration::from_secs(60));
-            if rates.bound.len() >= MAX_RATE_NODES {
-                return false;
+        if rates.bound.get(&node).is_some_and(|hint| hint.expires <= now) {
+            rates.bound.remove(&node);
+        }
+        if let Some(hint) = rates.bound.get_mut(&node) {
+            hint.bucket.refill(now, 3, 6);
+            if hint.bucket.tokens == 0 {
+                return None;
             }
+            hint.bucket.tokens -= 1;
+            return Some(false);
         }
-        let bucket = rates.bound.entry(node).or_insert(Bucket { tokens: 3, last: now });
-        bucket.refill(now, 3, 6);
-        if bucket.tokens == 0 {
-            return false;
+        drop(rates);
+        self.rate(node, now).then_some(true)
+    }
+
+    fn remember_bound(&self, node: EndpointId, now: Instant) {
+        let mut rates = self.rates.lock();
+        if let Some(hint) = rates.bound.get_mut(&node) {
+            hint.expires = now + BOUND_HINT_TTL;
+            return;
         }
-        bucket.tokens -= 1;
-        true
+        rates.bound.retain(|_, hint| hint.expires > now);
+        if rates.bound.len() < MAX_RATE_NODES {
+            rates.bound.insert(node, BoundHint {
+                bucket: Bucket { tokens: 3, last: now },
+                expires: now + BOUND_HINT_TTL,
+            });
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn reserve_connection_capacity_for_test(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.connections.clone().try_acquire_many_owned(MAX_CONNECTIONS as u32).unwrap()
     }
     fn lease(&self, attempt: &str) -> Option<AttemptLease<'_>> {
         if attempt.is_empty() || attempt.len() > 128 {
@@ -213,9 +240,12 @@ async fn serve_requests(connection: &Connection, state: &Arc<DaemonState>) -> Re
             recv.read_exact(&mut length),
         )
         .await??;
-        // Reserve the unvalidated lane before reading the bounded body. An
-        // exhausted lane cannot deny an already-bound node its own allowance.
-        let charged = state.pairing_gate.rate(connection.remote_id(), Instant::now());
+        // Refuse unknown identities before parsing or scheduling runtime work
+        // when the global lane is exhausted. Known bound identities reserve
+        // their independent allowance before authorization, not afterwards.
+        let charged = state.pairing_gate
+            .reserve_request(connection.remote_id(), Instant::now())
+            .ok_or_else(refused)?;
         let length = u32::from_be_bytes(length) as usize;
         if length == 0 || length > MAX_REQUEST {
             return Err(refused());
@@ -231,11 +261,6 @@ async fn serve_requests(connection: &Connection, state: &Arc<DaemonState>) -> Re
         let validated = state.pairing_network_read(connection.remote_id(), &request).await?;
         if charged {
             state.pairing_gate.refund();
-        } else if validated.is_none() {
-            return Err(refused());
-        }
-        if !state.pairing_gate.bound_rate(connection.remote_id(), Instant::now()) {
-            return Err(refused());
         }
         let attempt = match &request {
             NetworkRequest::Present { attempt_id, .. } | NetworkRequest::Status { attempt_id } => {
@@ -266,6 +291,9 @@ async fn serve_requests(connection: &Connection, state: &Arc<DaemonState>) -> Re
             return Err(refused());
         }
         let status = reply.status.as_ref().ok_or_else(refused)?;
+        if status.bound_node_id == Some(connection.remote_id()) {
+            state.pairing_gate.remember_bound(connection.remote_id(), Instant::now());
+        }
         let terminal = !matches!(status.state, State::Pending);
         let wall = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -356,23 +384,86 @@ mod tests {
         let now = Instant::now();
         assert!(gate.rate(node(1), now));
         gate.refund();
+        gate.remember_bound(node(1), now);
+        gate.remember_bound(node(2), now);
         assert_eq!(gate.rates.lock().global.tokens, 10);
         for seed in 10..20 {
             assert!(gate.rate(node(seed), now));
         }
-        assert!(!gate.rate(node(99), now));
-        for _ in 0..3 {
-            assert!(gate.bound_rate(node(1), now));
+        assert_eq!(gate.reserve_request(node(99), now), None);
+        for seed in 100..200 {
+            assert_eq!(gate.reserve_request(node(seed), now), None);
         }
-        assert!(!gate.bound_rate(node(1), now));
-        assert!(gate.bound_rate(node(2), now));
-        assert!(gate.bound_rate(node(1), now + Duration::from_secs(6)));
+        assert_eq!(gate.rates.lock().bound.len(), 2);
+        for _ in 0..3 {
+            assert_eq!(gate.reserve_request(node(1), now), Some(false));
+        }
+        assert_eq!(gate.reserve_request(node(1), now), None);
+        assert_eq!(gate.reserve_request(node(2), now), Some(false));
+        assert_eq!(gate.reserve_request(node(1), now + Duration::from_secs(6)), Some(false));
         assert_eq!(gate.rates.lock().global.tokens, 0);
         for _ in 0..20 {
             gate.refund();
         }
         assert_eq!(gate.rates.lock().global.tokens, 10);
     }
+    #[test]
+    fn bound_identity_hints_expire_and_have_a_fixed_capacity() {
+        let gate = Gate::default();
+        let now = Instant::now();
+        for index in 0..=MAX_RATE_NODES {
+            let mut seed = [0; 32];
+            seed[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            gate.remember_bound(iroh::SecretKey::from_bytes(&seed).public(), now);
+        }
+        assert_eq!(gate.rates.lock().bound.len(), MAX_RATE_NODES);
+        // Expired hints no longer grant the independent lane; after the global
+        // refill this reservation must charge the global bucket instead.
+        assert_eq!(gate.reserve_request(
+            iroh::SecretKey::from_bytes(&[0; 32]).public(), now + BOUND_HINT_TTL,
+        ), Some(true));
+        gate.remember_bound(node(250), now + BOUND_HINT_TTL);
+        assert_eq!(gate.rates.lock().bound.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn exhausted_global_lane_refuses_unknown_nodes_without_waiting_for_runtime() -> Result<()> {
+        use crate::runtime_peers::pairing::PAIR_ALPN;
+        let dir = tempfile::tempdir()?;
+        let gateway = gateway(FabricHome::new(dir.path())).await?;
+        let state = gateway.state();
+        let runtime = state.runtime_peers.as_ref().unwrap().clone();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _runtime = runtime.lock().unwrap_or_else(|poison| poison.into_inner());
+            let _ = entered.send(());
+            let _ = blocked.recv();
+        });
+        ready.await?;
+        let client = client().await?;
+        let connection = client.connect(gateway.addr(), PAIR_ALPN).await?;
+        let (mut send, mut recv) = connection.open_bi().await?;
+        let now = Instant::now();
+        for seed in 10..20 {
+            assert!(state.pairing_gate.rate(node(seed), now));
+        }
+        // Start a full refill interval at the barrier, independent of how long
+        // endpoint startup took on the runner.
+        state.pairing_gate.rates.lock().global.last = now;
+        let response = rpc(&mut send, &mut recv, NetworkRequest::Status {
+            attempt_id: "unknown".into(),
+        });
+        let refused = tokio::time::timeout(Duration::from_millis(500), response).await;
+        release.send(())?;
+        blocker.await?;
+        assert!(matches!(refused, Ok(Err(_))),
+            "unknown traffic reached runtime validation despite exhausted admission");
+        client.close().await;
+        gateway.shutdown().await?;
+        Ok(())
+    }
+
 
     #[tokio::test]
     async fn pairing_closes_connections_without_a_complete_first_header_in_three_seconds()
