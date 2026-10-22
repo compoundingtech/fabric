@@ -832,6 +832,8 @@ mod tests {
         store.pairing_request_at(query("rollback-gap"), t0 + 590).unwrap();
         assert_eq!(store.stored.pairing_last_seen, t0);
         let mut recovered: Stored = toml::from_str(&fs::read_to_string(&store.path).unwrap()).unwrap();
+        assert!(!recover(&mut recovered, t0 + 5, false));
+        assert_eq!(recovered.pairing[0].status.state, State::Issued);
         assert!(recover(&mut recovered, t0 + 5, true));
         assert_eq!(recovered.pairing[0].status.state, State::Expired);
         assert!(recovered.pairing[0].salt.is_none());
