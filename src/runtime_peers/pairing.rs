@@ -204,12 +204,14 @@ fn secret_hash(salt: &str, secret: &str) -> String {
     hash.finalize().to_hex().to_string()
 }
 
-pub(super) fn recover(stored: &mut Stored, timestamp: u64) -> bool {
+pub(super) fn recover(stored: &mut Stored, timestamp: u64, restarted: bool) -> bool {
     // No durable wall-clock sample can prove elapsed downtime after rollback.
     // Outstanding credentials are therefore valid for this daemon lifetime only.
     let mut changed = false;
     for attempt in &mut stored.pairing {
-        if attempt.status.state == State::Issued {
+        if attempt.status.state == State::Issued
+            && (restarted || timestamp >= attempt.status.deadline)
+        {
             attempt.terminate(State::Expired, attempt.status.deadline);
             changed = true;
         }
@@ -555,9 +557,9 @@ mod tests {
         let mut store = open(&dir);
         store.pairing_request_at(issue("one", 700), 100).unwrap();
         let mut expired = store.stored.clone();
-        assert!(recover(&mut expired, 700));
+        assert!(recover(&mut expired, 700, true));
         assert_eq!(expired.pairing[0].status.state, State::Expired);
-        assert!(recover(&mut store.stored, 99));
+        assert!(recover(&mut store.stored, 99, true));
         assert_eq!(store.stored.pairing[0].status.state, State::Expired);
         assert!(store.stored.pairing[0].secret_hash.is_none());
     }
@@ -664,12 +666,14 @@ mod tests {
         store.pairing_request_at(query("rollback-gap"), t0 + 590).unwrap();
         assert_eq!(store.stored.pairing_last_seen, t0);
         let mut recovered: Stored = toml::from_str(&fs::read_to_string(&store.path).unwrap()).unwrap();
-        assert!(recover(&mut recovered, t0 + 5));
+        assert!(!recover(&mut recovered, t0 + 5, false));
+        assert_eq!(recovered.pairing[0].status.state, State::Issued);
+        assert!(recover(&mut recovered, t0 + 5, true));
         assert_eq!(recovered.pairing[0].status.state, State::Expired);
         assert!(recovered.pairing[0].salt.is_none());
         assert!(recovered.pairing[0].secret_hash.is_none());
         validate(&recovered.pairing).unwrap();
-        assert!(!recover(&mut recovered, t0 + 6));
+        assert!(!recover(&mut recovered, t0 + 6, true));
     }
 
     #[test]

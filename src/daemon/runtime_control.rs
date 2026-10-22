@@ -735,7 +735,7 @@ mod tests {
             }),
         )
         .await?;
-        assert!(reply.error.is_none());
+        assert!(reply.error.is_some());
         assert!(reply.status.is_none());
         assert!(state.policy_quarantine.lock().await.is_none());
         drop(_publication);
