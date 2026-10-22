@@ -560,7 +560,9 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), disk);
         store.path = path;
         store.reconcile(&home).unwrap();
-        assert_eq!(store.exchanges.len(), 2);
+        // Reconciliation retains the monotonic floor, so due attempts and
+        // their transient queues are already terminal before the next poll.
+        assert!(store.exchanges.is_empty());
         for status in statuses {
             let reply = store
                 .pairing_network_request(

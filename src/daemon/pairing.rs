@@ -862,20 +862,27 @@ mod tests {
         // Only the header is sent: rejection must precede body allocation/read.
         send.write_all(&((MAX_REQUEST + 1) as u32).to_be_bytes()).await?;
         tokio::time::timeout(Duration::from_secs(3), connection.closed()).await?;
+        let unaffected = state.pairing_request(Request::Query {
+            owner: "test".into(),
+            creation_id: "unrelated".into(),
+        }).await;
+        assert_eq!(unaffected.status.unwrap().state, State::Pending);
         client.close().await;
         gateway.shutdown().await?;
         drop(state);
         let restarted = self::gateway(home).await?;
-        for (creation_id, expected) in [
-            ("oversize", State::Rejected),
-            ("unrelated", State::Pending),
+        for (creation_id, reason) in [
+            ("oversize", "exchange_limit"),
+            ("unrelated", "exchange_lost"),
         ] {
             let reply = restarted.state().pairing_request(Request::Query {
                 owner: "test".into(),
                 creation_id: creation_id.into(),
             }).await;
             assert!(reply.error.is_none());
-            assert_eq!(reply.status.unwrap().state, expected);
+            let status = reply.status.unwrap();
+            assert_eq!(status.state, State::Rejected);
+            assert_eq!(status.terminal_reason.as_deref(), Some(reason));
         }
         restarted.shutdown().await?;
         Ok(())
