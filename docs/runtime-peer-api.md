@@ -49,9 +49,8 @@ Status includes `attempt_id`, `creation_id`, `state` (`issued`, `expired`,
 `rejected`), `attempt_revision`, original `deadline`, `policy_digest`, and
 `terminal_at`. Cancel is idempotent and never renews a deadline. Expiry is
 reconciled durably on startup and permit operations. Live deadline observations
-use a monotonic clock that reanchors on forward wall-clock jumps; startup
-expires outstanding permits conservatively if UTC falls below the last durable
-observation. Terminal transitions erase salt and secret hash.
+use a monotonic clock that reanchors on forward wall-clock jumps; all outstanding
+permits expire on restart. Terminal transitions erase salt and secret hash.
 
 There are at most 64 outstanding permits and 1,024 retained attempts. Issuance
 reserves its own terminal receipt slot for 24 hours after termination; the
