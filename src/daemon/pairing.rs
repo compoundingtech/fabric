@@ -115,9 +115,11 @@ impl Gate {
     }
     pub(super) fn admit(&self, connection: &Connection) -> bool {
         let Ok(slot) = self.connections.clone().try_acquire_owned() else {
+            connection.close(VarInt::from_u32(503), b"pairing capacity exhausted");
             return false;
         };
         let Some(lease) = self.connection_lease(connection.remote_id()) else {
+            connection.close(VarInt::from_u32(503), b"pairing capacity exhausted");
             return false;
         };
         let connection = connection.clone();
@@ -350,9 +352,36 @@ pub(super) async fn expire_loop(state: Arc<DaemonState>) {
 }
 
 async fn serve_requests(connection: &Connection, state: &Arc<DaemonState>) -> Result<()> {
-    let first_header_deadline = tokio::time::Instant::now() + FIRST_HEADER;
-    let (mut send, mut recv) =
-        tokio::time::timeout_at(first_header_deadline, connection.accept_bi()).await??;
+    let streams = async {
+        let first_header_deadline = tokio::time::Instant::now() + FIRST_HEADER;
+        let (send, recv) =
+            tokio::time::timeout_at(first_header_deadline, connection.accept_bi()).await??;
+        tokio::select! {
+            biased;
+            Ok(_) = connection.accept_bi() => {
+                connection.close(VarInt::from_u32(400), b"pairing stream limit exceeded");
+                Err(refused())
+            }
+            result = serve_stream(connection, state, send, recv, first_header_deadline) => result,
+        }
+    };
+    tokio::select! {
+        biased;
+        Ok(_) = connection.accept_uni() => {
+            connection.close(VarInt::from_u32(400), b"pairing stream limit exceeded");
+            Err(refused())
+        }
+        result = streams => result,
+    }
+}
+
+async fn serve_stream(
+    connection: &Connection,
+    state: &Arc<DaemonState>,
+    mut send: SendStream,
+    mut recv: RecvStream,
+    first_header_deadline: tokio::time::Instant,
+) -> Result<()> {
     let mut lease: Option<AttemptLease<'_>> = None;
     let mut deadline = first_header_deadline;
     loop {
@@ -393,7 +422,10 @@ async fn serve_requests(connection: &Connection, state: &Arc<DaemonState>) -> Re
             }
             return Err(refused());
         }
-        let validated = state.pairing_network_read(connection.remote_id(), &request).await?;
+        let validated = tokio::time::timeout_at(
+            deadline.min(tokio::time::Instant::now() + IDLE),
+            state.pairing_network_read(connection.remote_id(), &request),
+        ).await??;
         if charged {
             state.pairing_gate.refund();
 
@@ -620,6 +652,136 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn pairing_closes_on_uni_stream_even_before_the_first_bidi() -> Result<()> {
+        rejects_extra_stream(true, false).await?;
+        rejects_extra_stream(true, true).await
+    }
+
+    #[tokio::test]
+    async fn pairing_closes_on_second_bidi_stream() -> Result<()> {
+        rejects_extra_stream(false, true).await
+    }
+
+    async fn rejects_extra_stream(uni: bool, first_bidi: bool) -> Result<()> {
+        use crate::runtime_peers::pairing::PAIR_ALPN;
+        let dir = tempfile::tempdir()?;
+        let gateway = gateway(FabricHome::new(dir.path())).await?;
+        let client = client().await?;
+        let connection = client.connect(gateway.addr(), PAIR_ALPN).await?;
+        let _first = if first_bidi {
+            let (mut send, recv) = connection.open_bi().await?;
+            send.write_all(&[0]).await?;
+            Some((send, recv))
+        } else {
+            None
+        };
+        // Initial transport credit cannot be retracted by the post-ALPN
+        // setters. Exercise that credit, without sending a valid credential.
+        if uni {
+            let mut send = tokio::time::timeout(
+                Duration::from_secs(1), connection.open_uni(),
+            ).await??;
+            send.write_all(&[0]).await?;
+        } else {
+            let (mut send, _recv) = tokio::time::timeout(
+                Duration::from_secs(1), connection.open_bi(),
+            ).await??;
+            send.write_all(&[0]).await?;
+        }
+        let closed = tokio::time::timeout(
+            Duration::from_secs(1), connection.closed(),
+        ).await?;
+        let iroh::endpoint::ConnectionError::ApplicationClosed(close) = closed else {
+            anyhow::bail!("expected stream-limit application close, got {closed}");
+        };
+        assert_eq!(close.error_code.into_inner(), 400);
+        assert!(gateway.state().pairing_gate.attempts.lock().is_empty());
+        client.close().await;
+        gateway.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_mutex_read_cannot_pin_pairing_past_first_header_deadline() -> Result<()> {
+        use crate::runtime_peers::pairing::PAIR_ALPN;
+        let dir = tempfile::tempdir()?;
+        let gateway = gateway(FabricHome::new(dir.path())).await?;
+        let state = gateway.state();
+        let runtime = state.runtime_peers.as_ref().unwrap().clone();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _runtime = runtime.lock().unwrap_or_else(|poison| poison.into_inner());
+            let _ = entered.send(());
+            let _ = blocked.recv();
+        });
+        ready.await?;
+        let client = client().await?;
+        let connection = client.connect(gateway.addr(), PAIR_ALPN).await?;
+        let (mut send, _recv) = connection.open_bi().await?;
+        let request = serde_json::to_vec(&NetworkRequest::Status {
+            attempt_id: "unknown".into(),
+        })?;
+        send.write_all(&(request.len() as u32).to_be_bytes()).await?;
+        send.write_all(&request).await?;
+        let closed = tokio::time::timeout(Duration::from_secs(4), connection.closed()).await;
+        let released_slots = tokio::time::timeout(
+            Duration::from_secs(1),
+            state.pairing_slots.clone().acquire_many_owned(MAX_CONNECTIONS as u32),
+        ).await;
+        // Always release the real blocking worker before asserting the outcome.
+        release.send(())?;
+        blocker.await?;
+        closed?;
+        let _slots = released_slots??;
+        assert!(state.pairing_gate.attempts.lock().is_empty());
+        client.close().await;
+        gateway.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exhausted_pairing_pools_send_explicit_capacity_close() -> Result<()> {
+        use crate::runtime_peers::pairing::PAIR_ALPN;
+        for handler_pool in [false, true] {
+            let dir = tempfile::tempdir()?;
+            let gateway = gateway(FabricHome::new(dir.path())).await?;
+            let state = gateway.state();
+            let _capacity = if handler_pool {
+                state.pairing_slots.clone()
+                    .acquire_many_owned(MAX_CONNECTIONS as u32).await?
+            } else {
+                state.pairing_gate.reserve_connection_capacity_for_test()
+            };
+            let client = client().await?;
+            let closed = match client.connect(gateway.addr(), PAIR_ALPN).await {
+                Ok(connection) => {
+                    let closed = tokio::time::timeout(
+                        Duration::from_secs(3), connection.closed(),
+                    ).await?;
+                    let iroh::endpoint::ConnectionError::ApplicationClosed(close) = closed else {
+                        anyhow::bail!("expected capacity application close, got {closed}");
+                    };
+                    close.error_code.into_inner()
+                }
+                Err(error) => {
+                    let error = anyhow::Error::new(error);
+                    error.chain().find_map(|cause| match cause.downcast_ref() {
+                        Some(iroh::endpoint::ConnectionError::ApplicationClosed(close)) => {
+                            Some(close.error_code.into_inner())
+                        }
+                        _ => None,
+                    }).with_context(|| format!("not an application close: {error:#}"))?
+                }
+            };
+            assert_eq!(closed, 503);
+            client.close().await;
+            gateway.shutdown().await?;
+        }
+        Ok(())
+    }
+
     async fn rpc(
         send: &mut SendStream,
         recv: &mut RecvStream,
@@ -697,27 +859,6 @@ mod tests {
         let status = presented.status.unwrap();
         assert_eq!(status.state, State::Pending);
         assert_eq!(status.bound_node_id, Some(client.id()));
-        // Old transport credits can permit extra streams even after the
-        // post-ALPN limits shrink. None may become a second pairing handler.
-        if let Ok(Ok((mut extra_send, mut extra_recv))) = tokio::time::timeout(
-            Duration::from_millis(50), connection.open_bi(),
-        ).await {
-            let request = serde_json::to_vec(&NetworkRequest::Status {
-                attempt_id: attempt_id.clone(),
-            })?;
-            extra_send.write_all(&(request.len() as u32).to_be_bytes()).await?;
-            extra_send.write_all(&request).await?;
-            let mut header = [0; 4];
-            assert!(tokio::time::timeout(
-                Duration::from_millis(50), extra_recv.read_exact(&mut header),
-            ).await.is_err(), "a second bidi stream was dispatched");
-        }
-        if let Ok(Ok(mut uni)) = tokio::time::timeout(
-            Duration::from_millis(50), connection.open_uni(),
-        ).await {
-            uni.write_all(b"not a pairing request").await?;
-            uni.finish()?;
-        }
         // Rotating credential-less keys empty only the unvalidated lane.
         let now = Instant::now();
         for seed in 20..30 {
