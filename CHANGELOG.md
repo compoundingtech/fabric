@@ -45,8 +45,11 @@ Deprecated, Fixed or Security.
   and never reinstall grants withdrawn after confirmation.
   Completion IDs are scoped by owner; historical retries never republish policy
   or reopen quarantine. Confirmation refuses every already-trusted NodeID.
-  Restricted network replies omit effective-access provenance and private
-  completion metadata; owner control retains the full report.
+  Restricted network replies omit owner creation IDs, effective-access provenance
+  and private completion metadata; owner control retains the full report.
+  Every runtime-state writer refuses quarantine until explicit reload, even
+  when both the commit worker and fault-record worker fail. Lost-reply confirm
+  retries must resend the identical body, including the original policy revision.
 
 ### Security
 

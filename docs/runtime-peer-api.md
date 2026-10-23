@@ -156,6 +156,11 @@ without installing grants. A commit accepted before expiry may finish fsync
 and reply later. The receipt and peer/grants share one file commit and policy
 publication completes before a success reply or any new-policy admission.
 
+After a lost confirmation reply, resend the identical request body, including
+the original `expected_policy_revision`. Refreshing that revision changes the
+request digest: the same retained `request_id` then returns
+`request_id_conflict`, not a replay.
+
 Local `reject` takes `owner`, `attempt_id`, `expected_node_id`,
 `expected_attempt_revision`, and `request_id`. It atomically records rejection
 and erases pending eligibility, hashes, and transcript queues, installing no
@@ -168,7 +173,7 @@ advances the policy revision and attempt revision; rejection never installs a
 policy generation. The pairing receipt pool is reserved on permit creation,
 independently of ordinary mutation receipts.
 
-Every reply can report current effective `access` with source provenance.
+Owner control replies can report current effective `access` with source provenance.
 Retry/query returns the historical completion plus current access, never
 reinstalls historical grants. In particular, retrying confirmation after a
 later owner removal or daemon restart cannot restore withdrawn access. Bound
@@ -176,6 +181,8 @@ nodes can read confirmed/rejected status on the restricted path, but terminal
 attempts cannot exchange more bytes. Confirmed receipts and their installed
 policy survive restart; pending attempts instead become `exchange_lost`.
 Unknown or retention-expired attempts cannot be confirmed as new permits.
+Restricted network status omits `creation_id`, completion metadata, secrets,
+and effective-access provenance; the creating owner retains the full report.
 
 ## Requests
 
@@ -269,6 +276,9 @@ old work. Repair the storage problem, let quarantined work end, and explicitly
 reload to reconcile the file. A malformed or unreadable file also keeps the
 control socket available with network policy closed; the daemon never silently
 falls back to an older applied policy.
+While quarantined, every runtime-state writer, including pairing mutations and
+cancellation completion updates, refuses to write until that reload reconciles
+the durable generation. This holds even if recording the in-memory fault fails.
 
 Check an existing request receipt before comparing revisions. Repeating the
 same request ID and contents returns its original committed revision plus the

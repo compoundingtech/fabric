@@ -638,6 +638,7 @@ mod tests {
         assert!(wire.get("access").is_none(), "restricted replies omit provenance");
         if let Some(status) = wire.get("status").and_then(serde_json::Value::as_object) {
             assert!(!status.contains_key("completion"), "owner completion metadata is private");
+            assert!(!status.contains_key("creation_id"), "owner creation identifier is private");
         }
         Ok(serde_json::from_slice(&bytes)?)
     }

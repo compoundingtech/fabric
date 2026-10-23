@@ -295,6 +295,10 @@ impl RuntimePeers {
             }
             return Err(error);
         }
+        #[cfg(test)]
+        if std::mem::take(&mut self.panic_confirmation_and_fault.0) {
+            panic!("injected confirmation worker failure after persist, before stored update");
+        }
         self.stored = next;
         self.prune_exchanges();
         self.pairing_attempt_reply_at(&request.owner, &request.attempt_id, timestamp)
