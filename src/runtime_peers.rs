@@ -389,6 +389,8 @@ pub(crate) struct RuntimePeers {
     exchanges: BTreeMap<String, exchange::Exchange>,
     #[cfg(test)]
     fail_directory_sync: bool,
+    #[cfg(test)]
+    panic_confirmation_and_fault: (bool, bool),
 }
 pub(crate) struct Prepared {
     stored: Stored,
@@ -453,6 +455,8 @@ impl RuntimePeers {
             exchanges: BTreeMap::new(),
             #[cfg(test)]
             fail_directory_sync: false,
+            #[cfg(test)]
+            panic_confirmation_and_fault: (false, false),
         };
         let result = (|| -> Result<PeerBook> {
             store.static_input = StaticInput::load(home)?;
@@ -556,6 +560,17 @@ impl RuntimePeers {
             }
         }
         pairing::validate(&self.stored.pairing)?;
+        if self.stored.pairing.iter().any(|attempt| {
+            attempt
+                .status
+                .completion
+                .as_ref()
+                .is_some_and(|receipt| receipt.policy_revision > self.stored.revision)
+        }) {
+            return Err(unavailable(
+                "pairing completion revision exceeds current policy",
+            ));
+        }
         Ok(())
     }
     /// Caller must first drain quarantined work before reconciling an uncertain commit.
@@ -598,6 +613,8 @@ impl RuntimePeers {
             exchanges: BTreeMap::new(),
             #[cfg(test)]
             fail_directory_sync: false,
+            #[cfg(test)]
+            panic_confirmation_and_fault: (false, false),
         };
         preview.compose(&preview.stored).map(|result| result.0)
     }
@@ -607,10 +624,19 @@ impl RuntimePeers {
         self.fail_directory_sync = true;
     }
 
+    #[cfg(test)]
+    pub(crate) fn panic_confirmation_and_fault_for_test(&mut self) {
+        self.panic_confirmation_and_fault = (true, true);
+    }
+
     pub fn fault(&self) -> Option<&str> {
         self.fault.as_deref()
     }
     pub fn set_fault(&mut self, error: &anyhow::Error) {
+        #[cfg(test)]
+        if std::mem::take(&mut self.panic_confirmation_and_fault.1) {
+            panic!("injected fault-record worker failure");
+        }
         self.fault = Some(format!("{error:#}"));
     }
     #[cfg(test)]

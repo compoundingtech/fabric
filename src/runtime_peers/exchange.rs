@@ -322,6 +322,7 @@ impl RuntimePeers {
         Ok(pairing::Reply {
             status: Some(self.stored.pairing[index].status.clone()),
             secret: None, error: None, exchange: None,
+            access: self.access_for(self.stored.pairing[index].status.bound_node_id.as_slice()),
         })
     }
 }
@@ -407,6 +408,7 @@ impl RuntimePeers {
                 return Err(inactive());
             }
             return Ok(pairing::Reply {
+                access: self.access_for(status.bound_node_id.as_slice()),
                 status: Some(status),
                 secret: None,
                 error: None,
@@ -420,6 +422,7 @@ impl RuntimePeers {
         let result = exchange.apply(owner.is_some(), operation);
         match result {
             Ok(exchange) => Ok(pairing::Reply {
+                access: self.access_for(status.bound_node_id.as_slice()),
                 status: Some(status),
                 secret: None,
                 error: None,
@@ -440,6 +443,7 @@ impl RuntimePeers {
                     return Err(error);
                 }
                 Ok(pairing::Reply {
+                    access: self.access_for(status.bound_node_id.as_slice()),
                     status: Some(status),
                     secret: None,
                     error: None,
