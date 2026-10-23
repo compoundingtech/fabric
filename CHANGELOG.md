@@ -50,6 +50,13 @@ Deprecated, Fixed or Security.
   Every runtime-state writer refuses quarantine until explicit reload, even
   when both the commit worker and fault-record worker fail. Lost-reply confirm
   retries must resend the identical body, including the original policy revision.
+- **Provisional:** joining consumers can perform pinned-gateway restricted pairing
+  operations through `pairing_remote` on their existing daemon control socket.
+  The bridge uses that daemon's identity, bounded frames/concurrency/deadlines,
+  and no temporary ordinary peer trust or implicit retries.
+  Remote error-bearing replies are rejected without reflecting gateway error text.
+  Each exchange reconnect authenticates a small status frame before larger payloads;
+  bridge replies omit provenance and private completion metadata.
 
 ### Security
 
