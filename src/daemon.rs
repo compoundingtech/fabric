@@ -414,16 +414,14 @@ impl EndpointHooks for AllowListHook {
         }
         // This exception is negotiated-ALPN scoped, never a standing peer grant.
         if conn.alpn() == crate::runtime_peers::pairing::PAIR_ALPN {
-            return if self
-                .pairing_gate
-                .as_ref()
-                .is_some_and(|gate| gate.admit(conn))
-            {
+            // Capacity refusal belongs after handshake_completed(), where a
+            // 503 is an application close rather than a handshake abort.
+            return if self.pairing_gate.is_some() {
                 AfterHandshakeOutcome::Accept
             } else {
                 AfterHandshakeOutcome::Reject {
-                    error_code: VarInt::from_u32(503),
-                    reason: b"pairing capacity exhausted".to_vec(),
+                    error_code: VarInt::from_u32(403),
+                    reason: b"pairing unavailable".to_vec(),
                 }
             };
         }
@@ -496,6 +494,9 @@ pub struct DaemonState {
     incoming_slots: Arc<Semaphore>,
     handshake_slots: Arc<Semaphore>,
     pairing_slots: Arc<Semaphore>,
+    /// Network read permits live inside blocking workers, not socket futures.
+    /// A timed-out read waiting for the runtime mutex still consumes its permit.
+    pairing_read_slots: Arc<Semaphore>,
     dial_slots: Arc<Semaphore>,
     mux_stream_slots: Arc<Semaphore>,
     peer_connections: Arc<mux::PeerConnections>,
@@ -1328,6 +1329,7 @@ impl DaemonState {
             incoming_slots: Arc::new(Semaphore::new(MAX_INCOMING_HANDLERS)),
             handshake_slots: Arc::new(Semaphore::new(MAX_INCOMING_HANDLERS)),
             pairing_slots: Arc::new(Semaphore::new(pairing::MAX_CONNECTIONS)),
+            pairing_read_slots: Arc::new(Semaphore::new(pairing::MAX_CONNECTIONS)),
             dial_slots: Arc::new(Semaphore::new(MAX_DIAL_HANDLERS)),
             mux_stream_slots: Arc::new(Semaphore::new(MAX_INCOMING_HANDLERS)),
             peer_connections,
@@ -4996,14 +4998,20 @@ async fn process_incoming_iroh(
         // authentication. Never read data or dispatch work before authentication.
         let restricted = accepting.into_0rtt();
         pairing::restrict_transport(&restricted);
-        let Ok(_handler_permit) = state.pairing_slots.clone().try_acquire_owned() else {
-            restricted.close(VarInt::from_u32(503), b"pairing capacity exhausted");
-            anyhow::bail!("pairing handler capacity exhausted");
-        };
         let connection = tokio::time::timeout(
             Duration::from_secs(3), restricted.handshake_completed(),
         ).await.context("pairing handshake timed out")??;
         identity.peer = Some(connection.remote_id().to_string());
+        // Authentication must complete before capacity refusal, so the peer
+        // receives an explicit application close rather than a handshake abort.
+        // The bounded handshake permit is still held throughout this phase.
+        let Ok(_handler_permit) = state.pairing_slots.clone().try_acquire_owned() else {
+            connection.close(VarInt::from_u32(503), b"pairing capacity exhausted");
+            anyhow::bail!("pairing handler capacity exhausted");
+        };
+        if !state.pairing_gate.admit(&connection) {
+            anyhow::bail!("pairing connection capacity exhausted");
+        }
         drop(handshake_permit);
         return pairing::serve(connection, state).await;
     }

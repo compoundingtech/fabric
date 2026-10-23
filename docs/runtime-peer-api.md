@@ -112,6 +112,11 @@ validation waits. The first complete request and its runtime-mutex validation
 must fit the same three-second deadline; subsequent validation reads use the
 earlier of the attempt deadline and the ten-second idle deadline. Durable bind
 publication remains independent of socket cancellation.
+Network validation has at most 32 blocking workers. Each worker owns its capacity
+permit through runtime-mutex acquisition and read completion, even if its socket
+deadline expires first. Later requests wait asynchronously for that capacity
+within their existing deadline; repeated socket timeouts cannot accumulate
+unbounded blocking threads behind a stalled filesystem commit.
 
 The diagnostic/status `active_incoming_handlers` counter counts ordinary
 admission slots only. In runtime mode it excludes in-flight handshakes and pairing
