@@ -227,6 +227,85 @@ impl DaemonState {
         &self,
         request: runtime_peers::pairing::Request,
     ) -> runtime_peers::pairing::Reply {
+        if matches!(&request, runtime_peers::pairing::Request::Query { .. }) {
+            return self
+                .read_pairing(move |runtime| runtime.pairing_request(request))
+                .await;
+        }
+        self.commit_pairing(move |runtime| runtime.pairing_request(request))
+            .await
+    }
+
+    pub(crate) async fn pairing_network_request(
+        &self,
+        node: EndpointId,
+        request: runtime_peers::pairing::NetworkRequest,
+    ) -> runtime_peers::pairing::Reply {
+        let checked = self.pairing_network_read(node, &request).await;
+        match checked {
+            Ok(Some(reply)) => reply,
+            Ok(None) => {
+                self.commit_pairing(move |runtime| runtime.pairing_network_request(node, request))
+                    .await
+            }
+            Err(error) => runtime_peers::pairing::Reply {
+                status: None,
+                secret: None,
+                error: Some(PolicyError::of(&error)),
+            },
+        }
+    }
+
+    pub(super) async fn pairing_network_read(
+        &self,
+        node: EndpointId,
+        request: &runtime_peers::pairing::NetworkRequest,
+    ) -> Result<Option<runtime_peers::pairing::Reply>> {
+        // Socket deadlines cannot cancel spawn_blocking after it starts. Reserve
+        // before spawning and move ownership into the worker's access closure,
+        // so even a timed-out worker waiting on the runtime mutex remains counted.
+        // Waiting for capacity is async and cancellation drops only that waiter.
+        let permit = self.pairing_read_slots.clone().acquire_owned().await
+            .context("pairing runtime read semaphore closed")?;
+        let request = request.clone();
+        self.read_pairing_result(move |runtime| {
+            let _permit = permit;
+            runtime.pairing_network_read(node, &request)
+        }).await
+    }
+
+    async fn read_pairing_result<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut runtime_peers::RuntimePeers) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let runtime = self.runtime_peers.as_ref().ok_or_else(|| {
+            FabricError::new(ErrorCode::RuntimePeersDisabled, "pairing requires --runtime-peers")
+        })?;
+        with_runtime(runtime.clone(), operation).await
+    }
+
+    async fn read_pairing(
+        &self,
+        operation: impl FnOnce(&mut runtime_peers::RuntimePeers) -> Result<runtime_peers::pairing::Reply>
+            + Send + 'static,
+    ) -> runtime_peers::pairing::Reply {
+        self.read_pairing_result(operation).await.unwrap_or_else(|error| {
+            runtime_peers::pairing::Reply {
+                status: None,
+                secret: None,
+                error: Some(PolicyError::of(&error)),
+            }
+        })
+    }
+
+    async fn commit_pairing(
+        &self,
+        operation: impl FnOnce(
+            &mut runtime_peers::RuntimePeers,
+        ) -> Result<runtime_peers::pairing::Reply>
+        + Send
+        + 'static,
+    ) -> runtime_peers::pairing::Reply {
         use runtime_peers::pairing::Reply;
         let result = async {
             let runtime = self.runtime_peers.as_ref().ok_or_else(|| {
@@ -235,14 +314,6 @@ impl DaemonState {
                     "pairing requires --runtime-peers",
                 )
             })?;
-            // Polls only observe the in-memory clock and attempt. They neither
-            // serialize with policy writers nor publish or quarantine policy.
-            if matches!(&request, runtime_peers::pairing::Request::Query { .. }) {
-                return with_runtime(runtime.clone(), move |runtime| {
-                    runtime.pairing_request(request)
-                })
-                .await;
-            }
             let _serial = self.policy_update.lock().await;
             if self.cancel.is_cancelled() {
                 return Err(
@@ -251,10 +322,7 @@ impl DaemonState {
             }
             let runtime = runtime.clone();
             let result = tokio::task::spawn_blocking(move || {
-                runtime
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .pairing_request(request)
+                operation(&mut runtime.lock().unwrap_or_else(|poison| poison.into_inner()))
             })
             .await
             .unwrap_or_else(|error| {
@@ -716,6 +784,50 @@ mod tests {
             }
         })
         .await?
+    }
+
+    #[tokio::test]
+    async fn pairing_network_reads_and_invalid_credentials_bypass_admission_barriers() -> Result<()> {
+        use runtime_peers::pairing::{NetworkRequest, Policy, Request as PairRequest};
+        let _serial = SERIAL.lock().await;
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let node = FabricNode::start_with_daemon_options(home.clone(), options()).await?;
+        let state = node.state();
+        let created = state.pairing_request(PairRequest::Issue {
+            owner: "controller".into(),
+            creation_id: "read-barrier".into(),
+            deadline: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?.as_secs() + 600,
+            policy: Policy {
+                grants: vec!["echo".into()],
+                name: None,
+                direction: Direction::Normal,
+            },
+        }).await;
+        let attempt_id = created.status.context("issued status")?.attempt_id;
+        let secret = created.secret.context("issued secret")?;
+        let peer = iroh::SecretKey::from_bytes(&[79; 32]).public();
+        let bound = state.pairing_network_request(peer, NetworkRequest::Present {
+            attempt_id: attempt_id.clone(), secret,
+        }).await;
+        assert!(bound.error.is_none());
+        let before = fs::read(home.root().join("runtime-peers.toml"))?;
+        let _policy = state.policy_update.lock().await;
+        let _publication = state.peer_book.write().await;
+        for (id, expected_error) in [(attempt_id, false), ("unknown".into(), true)] {
+            let reply = tokio::time::timeout(
+                Duration::from_secs(1),
+                state.pairing_network_request(peer, NetworkRequest::Status { attempt_id: id }),
+            ).await?;
+            assert_eq!(reply.error.is_some(), expected_error);
+        }
+        assert_eq!(before, fs::read(home.root().join("runtime-peers.toml"))?);
+        assert!(state.policy_quarantine.lock().await.is_none());
+        drop(_publication);
+        drop(_policy);
+        node.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]

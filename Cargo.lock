@@ -983,6 +983,7 @@ dependencies = [
  "n0-watcher",
  "netwatch",
  "notify",
+ "parking_lot",
  "portable-pty",
  "proptest",
  "rand 0.10.2",

@@ -270,11 +270,26 @@ permit to that connection's NodeID and durably creates `pending`. It installs
 no standing trust or grant. A repeat by that same NodeID returns the existing
 attempt; another NodeID cannot take the binding or start a second exchange.
 Invalid tokens, exhausted limits, and expired permits do not create pending
-access records. Permit validation is rate limited before any large allocation:
-64 outstanding permits, 32 active pairing connections, one active connection
-per attempt, and 60 invalid presentations per minute globally with a burst of
-10. Per-NodeID throttling also applies; changing a NodeID does not bypass the
-global limit. These initial limits need tests, not throughput claims.
+access records. Pairing has its own capacity and rate limits: 64 outstanding
+permits, 32 active connections, at most two per NodeID, and one active connection
+per attempt. As soon as the ALPN is known, the connection is configured for one
+bidirectional stream, zero unidirectional streams, and an 8 KiB receive window.
+QUIC cannot retract credits already advertised before ALPN selection; these
+limits constrain subsequent credit replenishment. The first frame header must
+arrive within three seconds. Pairing-only handshake and framing deadlines do not
+change ordinary handshake behaviour or blocking handler-slot acquisition.
+
+Credential-less requests consume the global invalid-request bucket (one per
+second, burst ten); successful validation refunds that token. The bound node's
+authenticated traffic uses a separate small per-node bucket and does not depend
+on global tokens left by rotating attacker keys. Pairing failures share one fixed
+diagnostic/backoff key, rather than growing a map per untrusted identity.
+Pairing availability remains best effort under attack: credential-less connections
+can occupy the dedicated pool. Ordinary traffic does not use that pool or bucket.
+Read-only validation and status never enter the policy commit barrier; only a
+real binding or terminal transition persists. Commit replies are bounded by a
+three-second wait, while an already-started durable commit finishes its policy
+quarantine handling even if the caller disconnects or times out.
 
 A pending NodeID status is insufficient to complete a signed admission. The
 pairing connection therefore carries one logical bidirectional join exchange,
