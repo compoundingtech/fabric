@@ -309,8 +309,27 @@ digest. Retrying the same sequence and digest is idempotent; different bytes
 at the same sequence are refused. Reads can replay an unacknowledged message,
 and sending counts each logical message once. Reconnection by the bound NodeID
 may resume that same exchange before expiry; it does not reset budgets or open
-another exchange. Control long-polls remain bounded by the attempt deadline.
+another exchange. Exchange receive is nonblocking: an empty queue returns an
+empty result immediately; callers poll explicitly rather than holding a control
+long-poll open. The monotonic attempt deadline still bounds all exchange work.
 Exceeding a byte/message bound rejects the attempt and discards its queues.
+
+Sending, receiving and acknowledging exchange messages mutate only memory, never
+fsync runtime policy or take the admission barrier. Only a real binding or
+terminal transition is persisted. Bound-node exchange traffic uses its own small
+rate bucket, independent of rotating credential-less keys' global bucket.
+The expiry timer skips pairing work when no issued or pending attempts exist and
+enters the durable writer only when expiry is due; idle ticks perform no fsync.
+Worst-case payload memory is 64 active attempts × 1 MiB = 64 MiB, plus bounded
+message metadata and request/reply framing.
+
+Before a connection authenticates its bound attempt, present/status framing is
+capped at 4 KiB. A bound node may use the larger encoded exchange-message cap;
+reconnection must first authenticate with a small present/status request. An
+over-cap frame on that authenticated connection rejects only its associated
+attempt. An unauthenticated oversized frame is closed without allocating its
+claimed body or guessing an attempt to reject. Sending to an issued-only or
+terminal attempt returns a distinct coded error, not an empty success.
 
 Fabric transports opaque bytes, such as a handshake or member-key transcript.
 It binds them to the authenticated NodeID, attempt, direction, and sequence;
