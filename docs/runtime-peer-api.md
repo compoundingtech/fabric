@@ -51,8 +51,8 @@ Status includes `attempt_id`, `creation_id`, `state` (`issued`, `pending`,
 durable `completion` on owner control only. Cancel is idempotent and never renews
 a deadline. Reads project expiry without persistence or the admission barrier.
 Live deadline observations use a monotonic clock that survives reconciliation;
-all outstanding permits expire conservatively on daemon restart. Terminal
-transitions erase salt and secret hash.
+all outstanding permits expire on restart. Terminal transitions erase salt and
+secret hash.
 
 There are at most 64 outstanding permits, 1,024 retained attempts globally and
 128 retained attempts per owner. Issuance reserves its own terminal receipt slot
@@ -133,6 +133,29 @@ waits are ten seconds, and connection lifetime is bounded by the attempt deadlin
 Post-ALPN transport settings allow one bidi stream, zero uni streams and an 8 KiB
 receive window; already-advertised QUIC credits cannot be retracted.
 
+Pairing has its own 32-handler pool, separate from ordinary service handlers,
+and at most two connections per authenticated NodeID. Capacity exhaustion
+explicitly closes with application code 503. While runtime mode is enabled,
+ordinary connections arriving at full ordinary capacity are refused rather than
+waiting after handshake; they cannot accumulate unbounded handshaken waiters or
+make pairing wait for an ordinary handler. With runtime mode disabled, ordinary
+capacity is reserved before accept and retained for the handler's full lifetime,
+unchanged from ordinary admission without pairing.
+
+Transport stream/window limits are reduced immediately after ALPN selection,
+but QUIC cannot retract already advertised initial credit. The handler therefore
+closes immediately with application code 400 if any unidirectional stream or a
+second bidirectional stream appears, including during first-header or runtime
+validation waits. The first complete request and its runtime-mutex validation
+must fit the same three-second deadline; subsequent validation reads use the
+earlier of the attempt deadline and the ten-second idle deadline. Durable bind
+publication remains independent of socket cancellation.
+
+The diagnostic/status `active_incoming_handlers` counter counts ordinary
+admission slots only. In runtime mode it excludes in-flight handshakes and pairing
+handlers. With runtime mode disabled it also includes the accept loop's one
+pre-accept reservation.
+
 Pairing sockets are never routed to an ordinary service. Cancellation and expiry
 erase eligibility and hashes while retaining the bound identity's terminal
 status. Restart durably rejects pending attempts with `exchange_lost`, before
@@ -192,6 +215,11 @@ without installing grants. A commit accepted before expiry may finish fsync
 and reply later. The receipt and peer/grants share one file commit and policy
 publication completes before a success reply or any new-policy admission.
 
+After a lost confirmation reply, resend the identical request body, including
+the original `expected_policy_revision`. Refreshing that revision changes the
+request digest: the same retained `request_id` then returns
+`request_id_conflict`, not a replay.
+
 Local `reject` takes `owner`, `attempt_id`, `expected_node_id`,
 `expected_attempt_revision`, and `request_id`. It atomically records rejection
 and erases pending eligibility, hashes, and transcript queues, installing no
@@ -204,7 +232,7 @@ advances the policy revision and attempt revision; rejection never installs a
 policy generation. The pairing receipt pool is reserved on permit creation,
 independently of ordinary mutation receipts.
 
-Every reply can report current effective `access` with source provenance.
+Owner control replies can report current effective `access` with source provenance.
 Retry/query returns the historical completion plus current access, never
 reinstalls historical grants. In particular, retrying confirmation after a
 later owner removal or daemon restart cannot restore withdrawn access. Bound
@@ -212,6 +240,8 @@ nodes can read confirmed/rejected status on the restricted path, but terminal
 attempts cannot exchange more bytes. Confirmed receipts and their installed
 policy survive restart; pending attempts instead become `exchange_lost`.
 Unknown or retention-expired attempts cannot be confirmed as new permits.
+Restricted network status omits `creation_id`, completion metadata, secrets,
+and effective-access provenance; the creating owner retains the full report.
 
 ## Requests
 
@@ -305,6 +335,9 @@ old work. Repair the storage problem, let quarantined work end, and explicitly
 reload to reconcile the file. A malformed or unreadable file also keeps the
 control socket available with network policy closed; the daemon never silently
 falls back to an older applied policy.
+While quarantined, every runtime-state writer, including pairing mutations and
+cancellation completion updates, refuses to write until that reload reconciles
+the durable generation. This holds even if recording the in-memory fault fails.
 
 Check an existing request receipt before comparing revisions. Repeating the
 same request ID and contents returns its original committed revision plus the

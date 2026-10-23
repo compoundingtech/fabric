@@ -422,8 +422,8 @@ impl EndpointHooks for AllowListHook {
                 AfterHandshakeOutcome::Accept
             } else {
                 AfterHandshakeOutcome::Reject {
-                    error_code: VarInt::from_u32(403),
-                    reason: b"pairing unavailable".to_vec(),
+                    error_code: VarInt::from_u32(503),
+                    reason: b"pairing capacity exhausted".to_vec(),
                 }
             };
         }
@@ -468,10 +468,10 @@ pub struct DaemonState {
     endpoint_recycle: Mutex<()>,
     last_endpoint_recycle: Mutex<Option<Instant>>,
     peer_book: Arc<RwLock<PeerBook>>,
-    policy_update: Mutex<()>,
+    policy_update: Arc<Mutex<()>>,
     runtime_peers: Option<Arc<std::sync::Mutex<crate::runtime_peers::RuntimePeers>>>,
     pairing_gate: Arc<pairing::Gate>,
-    policy_quarantine: Mutex<Option<runtime_control::Revocations>>,
+    policy_quarantine: Arc<Mutex<Option<runtime_control::Revocations>>>,
     pending_policy_revocations: Arc<std::sync::Mutex<Vec<Arc<runtime_control::Revocations>>>>,
     exposures: RwLock<HashMap<Vec<u8>, Exposure>>,
     dial_sockets: Mutex<HashMap<(String, String), DialSocket>>,
@@ -1294,10 +1294,10 @@ impl DaemonState {
             endpoint_recycle: Mutex::new(()),
             last_endpoint_recycle: Mutex::new(None),
             peer_book,
-            policy_update: Mutex::new(()),
+            policy_update: Arc::new(Mutex::new(())),
             runtime_peers,
             pairing_gate,
-            policy_quarantine: Mutex::new(None),
+            policy_quarantine: Arc::new(Mutex::new(None)),
             pending_policy_revocations: Arc::new(std::sync::Mutex::new(Vec::new())),
             exposures: RwLock::new(exposures),
             dial_sockets: Mutex::new(HashMap::new()),
@@ -1356,6 +1356,8 @@ impl DaemonState {
         MAX_DIAL_HANDLERS
     }
 
+    /// Ordinary admission slots in use. In runtime mode this excludes in-flight
+    /// handshakes and pairing handlers; flag-off includes the pre-accept reservation.
     pub fn active_incoming_handlers(&self) -> usize {
         MAX_INCOMING_HANDLERS.saturating_sub(self.incoming_slots.available_permits())
     }
@@ -4762,14 +4764,19 @@ fn peers_display(peers: &SyncPeers) -> String {
 async fn run_iroh_accept_loop(state: Arc<DaemonState>) -> Result<()> {
     let mut endpoint_rx = state.endpoint_rx();
     loop {
-        // Pre-dispatch handshakes have separate capacity from ordinary handlers.
-        // Ordinary negotiation retains the transport's existing timeout policy.
+        // Flag-off admission is unchanged: reserve the ordinary handler before
+        // accept and retain it for the entire handler. Runtime mode uses a
+        // separate handshake pool so pairing never queues behind ordinary work.
         let endpoint = endpoint_rx.borrow().clone();
         let permit = tokio::select! {
             _ = state.cancel.cancelled() => break,
-            permit = state.handshake_slots.clone().acquire_owned() => {
-                permit.context("incoming handshake semaphore closed")?
-            }
+            permit = async {
+                if state.runtime_peers.is_some() {
+                    state.handshake_slots.clone().acquire_owned().await
+                } else {
+                    state.incoming_slots.clone().acquire_owned().await
+                }
+            } => permit.context("incoming admission semaphore closed")?,
         };
         tokio::select! {
             _ = state.cancel.cancelled() => break,
@@ -4999,8 +5006,10 @@ async fn process_incoming_iroh(
         // authentication. Never read data or dispatch work before authentication.
         let restricted = accepting.into_0rtt();
         pairing::restrict_transport(&restricted);
-        let _handler_permit = state.pairing_slots.clone().try_acquire_owned()
-            .context("pairing handler capacity exhausted")?;
+        let Ok(_handler_permit) = state.pairing_slots.clone().try_acquire_owned() else {
+            restricted.close(VarInt::from_u32(503), b"pairing capacity exhausted");
+            anyhow::bail!("pairing handler capacity exhausted");
+        };
         let connection = tokio::time::timeout(
             Duration::from_secs(3), restricted.handshake_completed(),
         ).await.context("pairing handshake timed out")??;
@@ -5025,14 +5034,19 @@ async fn process_incoming_iroh(
     };
 
     let connection = handshake_and_identify(accepting, identity).await?;
-    drop(handshake_permit);
 
-    // Trusted ordinary work queues after identification; neither an untrusted
-    // handshake nor pairing can reserve this pool.
-    let _handler_permit = tokio::select! {
-        _ = state.cancel.cancelled() => return Ok(()),
-        permit = state.incoming_slots.clone().acquire_owned() =>
-            permit.context("incoming handler semaphore closed")?,
+    // In runtime mode never park an ordinary connection behind busy handlers:
+    // doing so would either accumulate waiters or block pairing handshakes.
+    // Flag-off already owns the ordinary permit reserved before accept().
+    let _handler_permit = if state.runtime_peers.is_some() {
+        let Ok(permit) = state.incoming_slots.clone().try_acquire_owned() else {
+            connection.close(VarInt::from_u32(503), b"incoming handler capacity exhausted");
+            return Ok(());
+        };
+        drop(handshake_permit);
+        permit
+    } else {
+        handshake_permit
     };
 
     if alpn == mux::MUX_ALPN {
@@ -10147,7 +10161,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flag_off_ordinary_handlers_wait_after_handshake() -> Result<()> {
+    async fn flag_off_backpressure_reserves_handler_before_accept() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let home = FabricHome::new(dir.path());
         let server = FabricNode::start(home.clone()).await?;
@@ -10155,33 +10169,77 @@ mod tests {
         trust_test_peer(&home, &server, trusted.id(), "trusted", trusted.addr()).await?;
         let state = server.state();
         assert!(state.runtime_peers.is_none());
+        // The accept loop already owns one ordinary slot. Reserve the rest,
+        // then let its one pending accept become a long-lived trusted handler.
         let slots = state.incoming_slots.clone()
-            .acquire_many_owned(MAX_INCOMING_HANDLERS as u32).await?;
+            .acquire_many_owned((MAX_INCOMING_HANDLERS - 1) as u32).await?;
         let connection = tokio::time::timeout(
             Duration::from_secs(3), trusted.connect(server.addr(), BUILTIN_ECHO_ALPN),
         ).await??;
         let (mut send, mut recv) = connection.open_bi().await?;
         send.write_all(b"queued").await?;
-        send.finish()?;
-        let mut byte = [0; 1];
-        assert!(tokio::time::timeout(
-            Duration::from_millis(50), recv.read(&mut byte),
-        ).await.is_err(), "ordinary work must queue, not close when slots are busy");
-        // The accept loop itself reserves one handshake slot while waiting for
-        // the next connection. Acquiring every other slot is the barrier that
-        // proves this identified handler released its handshake permit.
-        let handshake_barrier = tokio::time::timeout(
-            Duration::from_secs(3),
-            state.handshake_slots.clone()
-                .acquire_many_owned((MAX_INCOMING_HANDLERS - 1) as u32),
-        ).await??;
         assert_eq!(state.incoming_slots.available_permits(), 0);
-        drop(handshake_barrier);
+        assert_eq!(state.handshake_slots.available_permits(), MAX_INCOMING_HANDLERS);
+        let next = trusted.connect(server.addr(), BUILTIN_ECHO_ALPN);
+        tokio::pin!(next);
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut next).await.is_err(),
+            "flag-off accepted another handshake with every ordinary slot held");
         drop(slots);
+        let next = tokio::time::timeout(Duration::from_secs(3), next).await??;
+        next.close(0u32.into(), b"done");
+        send.finish()?;
         assert_eq!(tokio::time::timeout(
             Duration::from_secs(3), recv.read_to_end(16),
         ).await??, b"queued");
         connection.close(0u32.into(), b"done");
+        trusted.close().await;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_ordinary_saturation_has_no_waiting_handshaken_connections() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let server = FabricNode::start_with_daemon_options(
+            home.clone(), DaemonOptions {
+                runtime_peers: true,
+                ..DaemonOptions::default()
+            },
+        ).await?;
+        let trusted = Endpoint::bind(presets::N0).await?;
+        trust_test_peer(&home, &server, trusted.id(), "trusted", trusted.addr()).await?;
+        let state = server.state();
+        let _slots = state.incoming_slots.clone()
+            .acquire_many_owned(MAX_INCOMING_HANDLERS as u32).await?;
+        let mut attempts = tokio::task::JoinSet::new();
+        for _ in 0..(MAX_INCOMING_HANDLERS * 2) {
+            let trusted = trusted.clone();
+            let addr = server.addr();
+            attempts.spawn(async move {
+                if let Ok(connection) = trusted.connect(addr, BUILTIN_ECHO_ALPN).await {
+                    tokio::time::timeout(Duration::from_secs(3), connection.closed()).await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(result) = attempts.join_next().await {
+                result??;
+            }
+            Ok::<_, anyhow::Error>(())
+        }).await??;
+        // All ordinary connections were refused, not parked holding handshakes.
+        // Only the loop's pending accept can retain a handshake slot.
+        let _barrier = tokio::time::timeout(
+            Duration::from_secs(3), state.handshake_slots.clone()
+                .acquire_many_owned((MAX_INCOMING_HANDLERS - 1) as u32),
+        ).await??;
+        // Pairing must still be accepted while ordinary capacity remains zero.
+        let pairing = trusted.connect(
+            server.addr(), crate::runtime_peers::pairing::PAIR_ALPN,
+        ).await?;
+        pairing.close(0u32.into(), b"done");
         trusted.close().await;
         server.shutdown().await?;
         Ok(())
@@ -10260,7 +10318,12 @@ mod tests {
     async fn sustained_inbound_failure_stays_bounded() -> Result<()> {
         let server_dir = tempfile::tempdir()?;
         let server_home = FabricHome::new(server_dir.path());
-        let server = FabricNode::start(server_home.clone()).await?;
+        let server = FabricNode::start_with_daemon_options(
+            server_home.clone(), DaemonOptions {
+                runtime_peers: true,
+                ..DaemonOptions::default()
+            },
+        ).await?;
         let state = server.state();
 
         let intruder = Endpoint::bind(iroh::endpoint::presets::N0).await?;
@@ -10274,7 +10337,7 @@ mod tests {
                 connection.close(0u32.into(), b"done");
             }
             peak_in_flight = peak_in_flight.max(
-                MAX_INCOMING_HANDLERS.saturating_sub(state.incoming_slots.available_permits()),
+                MAX_INCOMING_HANDLERS.saturating_sub(state.handshake_slots.available_permits()),
             );
         }
 

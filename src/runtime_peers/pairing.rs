@@ -141,6 +141,7 @@ pub enum State {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
     pub attempt_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub creation_id: String,
     pub state: State,
     pub attempt_revision: u64,
@@ -198,6 +199,7 @@ impl Reply {
         self.secret = None;
         self.access.clear();
         if let Some(status) = &mut self.status {
+            status.creation_id.clear();
             status.completion = None;
         }
         self

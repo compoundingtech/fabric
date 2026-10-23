@@ -45,8 +45,11 @@ Deprecated, Fixed or Security.
   and never reinstall grants withdrawn after confirmation.
   Completion IDs are scoped by owner; historical retries never republish policy
   or reopen quarantine. Confirmation refuses every already-trusted NodeID.
-  Restricted network replies omit effective-access provenance and private
-  completion metadata; owner control retains the full report.
+  Restricted network replies omit owner creation IDs, effective-access provenance
+  and private completion metadata; owner control retains the full report.
+  Every runtime-state writer refuses quarantine until explicit reload, even
+  when both the commit worker and fault-record worker fail. Lost-reply confirm
+  retries must resend the identical body, including the original policy revision.
 - **Provisional:** joining consumers can perform pinned-gateway restricted pairing
   operations through `pairing_remote` on their existing daemon control socket.
   The bridge uses that daemon's identity, bounded frames/concurrency/deadlines,
@@ -59,8 +62,15 @@ Deprecated, Fixed or Security.
 
 - Restricted pairing uses a separate 32-handler pool, with at most two active
   connections per authenticated NodeID, one bidirectional stream, no unidirectional
-  streams and small receive windows. Only pairing has additional handshake and
-  framing deadlines; ordinary service admission retains its existing behaviour.
+  streams and small receive windows. An extra bidi or any uni stream closes the
+  connection immediately, including streams opened with initial transport credit.
+  Capacity exhaustion sends an explicit application close (503). Pairing framing
+  and runtime validation reads have deadlines. With runtime mode disabled,
+  ordinary handlers still reserve capacity before accept for their entire life;
+  with it enabled, saturated ordinary work is refused rather than queued, so
+  pairing never waits behind ordinary handlers.
+- `fabric/pair/1` is reserved and cannot be registered as a direct exposure even
+  when runtime mode is disabled.
 
 ## [0.9.2] - 2026-10-16
 
