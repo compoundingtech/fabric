@@ -300,9 +300,17 @@ impl DaemonState {
         node: EndpointId,
         request: &runtime_peers::pairing::NetworkRequest,
     ) -> Result<Option<runtime_peers::pairing::Reply>> {
+        // Socket deadlines cannot cancel spawn_blocking after it starts. Reserve
+        // before spawning and move ownership into the worker's access closure,
+        // so even a timed-out worker waiting on the runtime mutex remains counted.
+        // Waiting for capacity is async and cancellation drops only that waiter.
+        let permit = self.pairing_read_slots.clone().acquire_owned().await
+            .context("pairing runtime read semaphore closed")?;
         let request = request.clone();
-        self.read_pairing_result(move |runtime| runtime.pairing_network_read(node, &request))
-            .await
+        self.read_pairing_result(move |runtime| {
+            let _permit = permit;
+            runtime.pairing_network_read(node, &request)
+        }).await
     }
 
     pub(super) async fn has_active_pairing_attempts(&self) -> Result<bool> {
