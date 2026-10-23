@@ -923,7 +923,10 @@ mod tests {
             let _ = blocked.recv();
         });
         ready.await?;
-        let owners_before = Arc::strong_count(&runtime);
+        // Runtime Arc owners also include unrelated daemon work. Count only
+        // the dedicated read semaphore: after each caller future is dropped,
+        // its extra owners are the permits retained inside blocking workers.
+        let owners_before = Arc::strong_count(&state.pairing_read_slots);
         let request = NetworkRequest::Status { attempt_id: "unknown".into() };
         let mut observations = Vec::new();
         // The first pool's worth start real blocking workers. Later requests
@@ -936,7 +939,7 @@ mod tests {
             observations.push((
                 expired,
                 state.pairing_read_slots.available_permits(),
-                Arc::strong_count(&runtime),
+                Arc::strong_count(&state.pairing_read_slots),
             ));
         }
         // Retain no assertion failure path that could strand the mutex holder.
@@ -952,7 +955,7 @@ mod tests {
             assert_eq!(available, MAX_CONNECTIONS - workers,
                 "timing out a caller released a live blocking worker's permit");
             assert_eq!(owners, owners_before + workers,
-                "read timeouts spawned more workers than the dedicated bound");
+                "read timeouts retained more worker-owned permits than the dedicated bound");
         }
         drop(recovered);
         assert!(tokio::time::timeout(
