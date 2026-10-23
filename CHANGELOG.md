@@ -36,8 +36,15 @@ Deprecated, Fixed or Security.
 
 - Restricted pairing uses a separate 32-handler pool, with at most two active
   connections per authenticated NodeID, one bidirectional stream, no unidirectional
-  streams and small receive windows. Only pairing has additional handshake and
-  framing deadlines; ordinary service admission retains its existing behaviour.
+  streams and small receive windows. An extra bidi or any uni stream closes the
+  connection immediately, including streams opened with initial transport credit.
+  Capacity exhaustion sends an explicit application close (503). Pairing framing
+  and runtime validation reads have deadlines. With runtime mode disabled,
+  ordinary handlers still reserve capacity before accept for their entire life;
+  with it enabled, saturated ordinary work is refused rather than queued, so
+  pairing never waits behind ordinary handlers.
+- `fabric/pair/1` is reserved and cannot be registered as a direct exposure even
+  when runtime mode is disabled.
 
 ## [0.9.2] - 2026-10-16
 
