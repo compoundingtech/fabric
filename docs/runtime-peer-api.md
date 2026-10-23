@@ -50,9 +50,8 @@ Status includes `attempt_id`, `creation_id`, `state` (`issued`, `pending`,
 `terminal_at`, `bound_node_id`, and `terminal_reason`. Cancel is idempotent and
 never renews a deadline. Expiry is
 reconciled durably on startup and permit operations. Live deadline observations
-use a monotonic clock that reanchors on forward wall-clock jumps; startup
-expires outstanding permits conservatively if UTC falls below the last durable
-observation. Terminal transitions erase salt and secret hash.
+use a monotonic clock that reanchors on forward wall-clock jumps; all outstanding
+permits expire on restart. Terminal transitions erase salt and secret hash.
 
 There are at most 64 outstanding permits and 1,024 retained attempts. Issuance
 reserves its own terminal receipt slot for 24 hours after termination; the
@@ -96,6 +95,29 @@ bypass the global bucket. The bounded per-node rate book holds at most 1,024
 entries. Rate permission precedes body parsing/allocation. Idle framing waits
 are limited to 10 seconds; connections last no longer than 600 seconds and
 shorten to the permit deadline once the attempt is known.
+
+Pairing has its own 32-handler pool, separate from ordinary service handlers,
+and at most two connections per authenticated NodeID. Capacity exhaustion
+explicitly closes with application code 503. While runtime mode is enabled,
+ordinary connections arriving at full ordinary capacity are refused rather than
+waiting after handshake; they cannot accumulate unbounded handshaken waiters or
+make pairing wait for an ordinary handler. With runtime mode disabled, ordinary
+capacity is reserved before accept and retained for the handler's full lifetime,
+unchanged from ordinary admission without pairing.
+
+Transport stream/window limits are reduced immediately after ALPN selection,
+but QUIC cannot retract already advertised initial credit. The handler therefore
+closes immediately with application code 400 if any unidirectional stream or a
+second bidirectional stream appears, including during first-header or runtime
+validation waits. The first complete request and its runtime-mutex validation
+must fit the same three-second deadline; subsequent validation reads use the
+earlier of the attempt deadline and the ten-second idle deadline. Durable bind
+publication remains independent of socket cancellation.
+
+The diagnostic/status `active_incoming_handlers` counter counts ordinary
+admission slots only. In runtime mode it excludes in-flight handshakes and pairing
+handlers. With runtime mode disabled it also includes the accept loop's one
+pre-accept reservation.
 
 Pairing sockets are never routed to an ordinary service. Cancellation and expiry
 erase eligibility and hashes while retaining the bound identity's terminal
