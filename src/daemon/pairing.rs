@@ -909,6 +909,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_network_read_timeouts_keep_blocking_workers_bounded() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let gateway = gateway(FabricHome::new(dir.path())).await?;
+        let state = gateway.state();
+        let runtime = state.runtime_peers.as_ref().unwrap().clone();
+        let blocked_runtime = runtime.clone();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _runtime = blocked_runtime.lock().unwrap_or_else(|poison| poison.into_inner());
+            let _ = entered.send(());
+            let _ = blocked.recv();
+        });
+        ready.await?;
+        let owners_before = Arc::strong_count(&runtime);
+        let request = NetworkRequest::Status { attempt_id: "unknown".into() };
+        let mut observations = Vec::new();
+        // The first pool's worth start real blocking workers. Later requests
+        // time out waiting asynchronously for worker capacity, without spawning.
+        for _ in 0..(MAX_CONNECTIONS * 3) {
+            let expired = tokio::time::timeout(
+                Duration::from_millis(10),
+                state.pairing_network_read(node(1), &request),
+            ).await.is_err();
+            observations.push((
+                expired,
+                state.pairing_read_slots.available_permits(),
+                Arc::strong_count(&runtime),
+            ));
+        }
+        // Retain no assertion failure path that could strand the mutex holder.
+        release.send(())?;
+        blocker.await?;
+        let recovered = tokio::time::timeout(
+            Duration::from_secs(3),
+            state.pairing_read_slots.clone().acquire_many_owned(MAX_CONNECTIONS as u32),
+        ).await??;
+        for (index, (expired, available, owners)) in observations.into_iter().enumerate() {
+            let workers = (index + 1).min(MAX_CONNECTIONS);
+            assert!(expired, "a read escaped the held runtime mutex");
+            assert_eq!(available, MAX_CONNECTIONS - workers,
+                "timing out a caller released a live blocking worker's permit");
+            assert_eq!(owners, owners_before + workers,
+                "read timeouts spawned more workers than the dedicated bound");
+        }
+        drop(recovered);
+        assert!(tokio::time::timeout(
+            Duration::from_secs(3), state.pairing_network_read(node(1), &request),
+        ).await?.is_err(), "unknown status must still be refused after recovery");
+        gateway.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn exhausted_pairing_pools_send_explicit_capacity_close() -> Result<()> {
         use crate::runtime_peers::pairing::PAIR_ALPN;
         for handler_pool in [false, true] {

@@ -64,8 +64,10 @@ Deprecated, Fixed or Security.
   connections per authenticated NodeID, one bidirectional stream, no unidirectional
   streams and small receive windows. An extra bidi or any uni stream closes the
   connection immediately, including streams opened with initial transport credit.
-  Capacity exhaustion sends an explicit application close (503). Pairing framing
-  and runtime validation reads have deadlines. With runtime mode disabled,
+  Capacity exhaustion sends an explicit application close (503) after
+  authentication, not a handshake abort. Pairing framing and runtime validation
+  reads have deadlines. At most 32 network read workers may wait for the runtime
+  mutex, retaining worker capacity even after socket timeouts. With runtime mode disabled,
   ordinary handlers still reserve capacity before accept for their entire life;
   with it enabled, saturated ordinary work is refused rather than queued, so
   pairing never waits behind ordinary handlers.
