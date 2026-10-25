@@ -335,6 +335,7 @@ pub(super) async fn expire_loop(state: Arc<DaemonState>) {
                     status: None,
                     secret: None,
                     exchange: None,
+                    access: vec![],
                     error: None,
                 })
             })
@@ -469,7 +470,7 @@ async fn serve_stream(
             .as_secs();
         deadline = tokio::time::Instant::now()
             + Duration::from_secs(status.deadline.saturating_sub(wall).min(600));
-        let bytes = serde_json::to_vec(&reply)?;
+        let bytes = serde_json::to_vec(&reply.restricted())?;
         tokio::time::timeout_at(
             deadline.min(tokio::time::Instant::now() + IDLE),
             async {
@@ -852,6 +853,12 @@ mod tests {
         anyhow::ensure!(length <= MAX_REQUEST, "oversized reply");
         let mut bytes = vec![0; length];
         recv.read_exact(&mut bytes).await?;
+        let wire: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert!(wire.get("access").is_none(), "restricted replies omit provenance");
+        if let Some(status) = wire.get("status").and_then(serde_json::Value::as_object) {
+            assert!(!status.contains_key("completion"), "owner completion metadata is private");
+            assert!(!status.contains_key("creation_id"), "owner creation identifier is private");
+        }
         Ok(serde_json::from_slice(&bytes)?)
     }
     async fn gateway(home: FabricHome) -> Result<FabricNode> {
@@ -1281,6 +1288,150 @@ mod tests {
         assert!(state.peer_book.read().await.peers().is_empty());
         client.close().await;
         gateway.shutdown().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn atomic_confirmation_publishes_exact_grants_and_retry_never_regrants() -> Result<()> {
+        use crate::runtime_peers::{
+            Direction,
+            pairing::{ConfirmRequest, PAIR_ALPN, Policy, Request},
+        };
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let gateway = gateway(home.clone()).await?;
+        gateway
+            .expose_exec("not-granted", vec!["/bin/cat".into()])
+            .await?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !home.control_socket_path().exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            + 600;
+        let issued = owner_request(
+            &home,
+            Request::Issue {
+                owner: "admission".into(),
+                creation_id: "confirm".into(),
+                deadline,
+                policy: Policy {
+                    grants: vec!["echo".into()],
+                    name: Some("joining".into()),
+                    direction: Direction::InboundOnly,
+                },
+            },
+        )
+        .await?;
+        assert!(issued.error.is_none());
+        let attempt_id = issued.status.unwrap().attempt_id;
+        let client = client().await?;
+        let pairing = client.connect(gateway.addr(), PAIR_ALPN).await?;
+        let (mut send, mut recv) = pairing.open_bi().await?;
+        let pending = rpc(
+            &mut send,
+            &mut recv,
+            NetworkRequest::Present {
+                attempt_id: attempt_id.clone(),
+                secret: issued.secret.unwrap(),
+            },
+        )
+        .await?
+        .status
+        .unwrap();
+        assert_eq!(pending.state, State::Pending);
+        match client.connect(gateway.addr(), BUILTIN_ECHO_ALPN).await {
+            Err(_) => {}
+            Ok(connection) => {
+                tokio::time::timeout(Duration::from_secs(3), connection.closed()).await?;
+            }
+        }
+        let revision = gateway
+            .state()
+            .runtime_peer_request(crate::runtime_peers::Request::List { cursor: None })
+            .await
+            .snapshot
+            .unwrap()
+            .policy_revision;
+        let confirmation = ConfirmRequest {
+            owner: "admission".into(),
+            attempt_id: attempt_id.clone(),
+            expected_node_id: client.id(),
+            expected_attempt_revision: pending.attempt_revision,
+            expected_policy_revision: revision,
+            request_id: "confirm-once".into(),
+        };
+        let confirmed = owner_request(
+            &home,
+            Request::Confirm {
+                confirmation: confirmation.clone(),
+            },
+        )
+        .await?;
+        assert!(confirmed.error.is_none(), "{:?}", confirmed.error);
+        let receipt = confirmed.status.unwrap().completion.unwrap();
+        assert_eq!(confirmed.access.len(), 1);
+        assert!(confirmed.access[0].services.contains_key("echo"));
+        let echo = client.connect(gateway.addr(), BUILTIN_ECHO_ALPN).await?;
+        let (mut echo_send, mut echo_recv) = echo.open_bi().await?;
+        echo_send.write_all(b"proof").await?;
+        let mut bytes = [0; 5];
+        tokio::time::timeout(Duration::from_secs(3), echo_recv.read_exact(&mut bytes)).await??;
+        assert_eq!(&bytes, b"proof");
+        let unrelated = client.connect(gateway.addr(), b"not-granted").await?;
+        tokio::time::timeout(Duration::from_secs(3), unrelated.closed()).await?;
+        let own_status = rpc(&mut send, &mut recv, NetworkRequest::Status { attempt_id }).await?;
+        assert!(own_status.access.is_empty());
+        let own_status = own_status.status.unwrap();
+        assert_eq!(own_status.state, State::Confirmed);
+        assert!(own_status.completion.is_none());
+        let removed = gateway
+            .state()
+            .runtime_peer_request(crate::runtime_peers::Request::RemovePeer {
+                owner: "admission".into(),
+                request_id: "revoke-confirmed".into(),
+                expected_revision: receipt.policy_revision,
+                node_id: client.id(),
+            })
+            .await;
+        assert!(removed.error.is_none(), "{:?}", removed.error);
+        let replay = owner_request(
+            &home,
+            Request::Confirm {
+                confirmation: confirmation.clone(),
+            },
+        )
+        .await?;
+        assert!(replay.error.is_none(), "{:?}", replay.error);
+        assert_eq!(
+            replay.status.unwrap().completion.unwrap().request_id,
+            receipt.request_id
+        );
+        assert!(replay.access.is_empty());
+        assert!(gateway.state().peer_book.read().await.peers().is_empty());
+        gateway.shutdown().await?;
+        let restarted = self::gateway(home.clone()).await?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !home.control_socket_path().exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let replay = owner_request(&home, Request::Confirm { confirmation }).await?;
+        assert!(replay.error.is_none(), "{:?}", replay.error);
+        assert!(replay.access.is_empty());
+        assert!(restarted.state().peer_book.read().await.peers().is_empty());
+        match client.connect(restarted.addr(), BUILTIN_ECHO_ALPN).await {
+            Err(_) => {}
+            Ok(connection) => {
+                tokio::time::timeout(Duration::from_secs(3), connection.closed()).await?;
+            }
+        }
+        client.close().await;
+        restarted.shutdown().await?;
         Ok(())
     }
 }

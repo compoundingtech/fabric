@@ -30,7 +30,6 @@ Deprecated, Fixed or Security.
   for authenticated one-time permit presentation and bound-node attempt status.
   Pending identities receive no ordinary service access. Connection and rate
   limits bound untrusted work; restart rejects unfinished attempts durably.
-  Atomic confirmation is not enabled.
 - **Provisional:** pending nodes and permit owners can exchange opaque bounded
   admission messages through `send`/`receive` and `pair_send`/`pair_receive`.
   Sequence/digest replay, acknowledgments, shared byte/message budgets, and
@@ -39,6 +38,18 @@ Deprecated, Fixed or Security.
   Authenticated exchange traffic has an independent rate bucket. Pre-auth frames
   retain a 4 KiB cap; authenticated over-cap frames reject the associated attempt.
   Sending to an attempt that cannot exchange returns a coded refusal.
+- **Provisional:** permit owners can atomically confirm a verified pending
+  identity, installing exact peer/grants and a durable completion receipt in
+  one transaction with a final commit-time deadline check. Explicit rejection
+  records a receipt without access. Historical retries report current access
+  and never reinstall grants withdrawn after confirmation.
+  Completion IDs are scoped by owner; historical retries never republish policy
+  or reopen quarantine. Confirmation refuses every already-trusted NodeID.
+  Restricted network replies omit owner creation IDs, effective-access provenance
+  and private completion metadata; owner control retains the full report.
+  Every runtime-state writer refuses quarantine until explicit reload, even
+  when both the commit worker and fault-record worker fail. Lost-reply confirm
+  retries must resend the identical body, including the original policy revision.
 
 ### Security
 

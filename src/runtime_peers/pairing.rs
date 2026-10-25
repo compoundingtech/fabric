@@ -2,6 +2,16 @@
 pub use super::exchange::{ExchangeReply, Message, MessageDirection, Payload};
 use super::*;
 
+mod confirm;
+pub(crate) struct PreparedConfirmation {
+    pub book: PeerBook,
+    pub replay: bool,
+    pub replay_reply: Option<Reply>,
+    records: Vec<Record>,
+    request: ConfirmRequest,
+    revision: u64,
+}
+
 pub const PAIR_ALPN: &[u8] = b"fabric/pair/1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +69,27 @@ impl Policy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmRequest {
+    pub owner: String,
+    pub attempt_id: String,
+    pub expected_node_id: EndpointId,
+    pub expected_attempt_revision: u64,
+    pub expected_policy_revision: u64,
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RejectRequest {
+    pub owner: String,
+    pub attempt_id: String,
+    pub expected_node_id: EndpointId,
+    pub expected_attempt_revision: u64,
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Issue {
@@ -87,6 +118,14 @@ pub enum Request {
         attempt_id: String,
         ack: Option<u64>,
     },
+    Confirm {
+        #[serde(flatten)]
+        confirmation: ConfirmRequest,
+    },
+    Reject {
+        #[serde(flatten)]
+        rejection: RejectRequest,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +133,7 @@ pub enum Request {
 pub enum State {
     Issued,
     Pending,
+    Confirmed,
     Expired,
     Rejected,
 }
@@ -101,6 +141,7 @@ pub enum State {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
     pub attempt_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub creation_id: String,
     pub state: State,
     pub attempt_revision: u64,
@@ -111,6 +152,20 @@ pub struct Status {
     pub bound_node_id: Option<EndpointId>,
     #[serde(default)]
     pub terminal_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<Completion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Completion {
+    pub request_id: String,
+    pub attempt_id: String,
+    pub node_id: EndpointId,
+    pub policy_digest: String,
+    pub policy_revision: u64,
+    pub committed_at: u64,
+    pub outcome: State,
 }
 
 /// Plaintext is returned only at creation; Debug always redacts it.
@@ -135,6 +190,20 @@ pub struct Reply {
     pub error: Option<PolicyError>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exchange: Option<ExchangeReply>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access: Vec<EffectivePeer>,
+}
+impl Reply {
+    /// The restricted transport must not disclose owner policy provenance.
+    pub fn restricted(mut self) -> Self {
+        self.secret = None;
+        self.access.clear();
+        if let Some(status) = &mut self.status {
+            status.creation_id.clear();
+            status.completion = None;
+        }
+        self
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +215,8 @@ pub(super) struct Attempt {
     pub(super) status: Status,
     salt: Option<String>,
     secret_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_digest: Option<String>,
 }
 impl std::fmt::Debug for Attempt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -187,6 +258,7 @@ impl Attempt {
         self.status.terminal_reason = Some(
             match self.status.state {
                 State::Expired => "expired",
+                State::Confirmed => "confirmed",
                 _ => "cancelled",
             }
             .into(),
@@ -202,6 +274,7 @@ pub(super) fn validate(attempts: &[Attempt]) -> Result<()> {
     }
     let mut creations = BTreeSet::new();
     let mut ids = BTreeSet::new();
+    let mut completion_ids = BTreeSet::new();
     let mut owners = BTreeMap::new();
     let mut issued = 0;
     for attempt in attempts {
@@ -226,6 +299,7 @@ pub(super) fn validate(attempts: &[Attempt]) -> Result<()> {
             let revision = match status.state {
                 State::Issued if !bound => 1,
                 State::Pending if bound => 2,
+                State::Confirmed if bound => 3,
                 State::Expired | State::Rejected => if bound { 3 } else { 2 },
                 _ => return Err(unavailable("invalid pairing attempt binding")),
             };
@@ -233,7 +307,7 @@ pub(super) fn validate(attempts: &[Attempt]) -> Result<()> {
             match (&status.state, status.terminal_at) {
                 (State::Issued | State::Pending, None) => {}
                 (State::Expired, Some(ended)) if ended == status.deadline => {}
-                (State::Rejected, Some(ended))
+                (State::Rejected | State::Confirmed, Some(ended))
                     if ended >= attempt.issued_at && ended < status.deadline => {}
                 _ => return Err(unavailable("invalid terminal time for pairing state")),
             }
@@ -254,10 +328,18 @@ pub(super) fn validate(attempts: &[Attempt]) -> Result<()> {
                             | (State::Rejected, "cancelled")
                             | (State::Rejected, "exchange_lost")
                             | (State::Rejected, "exchange_limit")
+                            | (State::Rejected, "rejected")
+                            | (State::Confirmed, "confirmed")
                     ) || (matches!(reason.as_str(), "exchange_lost" | "exchange_limit") && !bound)
                 })
             {
                 return Err(unavailable("invalid pairing attempt history"));
+            }
+            confirm::validate_completion(attempt)?;
+            if let Some(receipt) = &status.completion {
+                if !completion_ids.insert((&attempt.owner, &receipt.request_id)) {
+                    return Err(unavailable("duplicate pairing completion request_id for owner"));
+                }
             }
             Ok(())
         })();
@@ -404,6 +486,7 @@ impl RuntimePeers {
             secret: None,
             error: None,
             exchange: None,
+            access: self.access_for(&[node]),
         }))
     }
 
@@ -449,7 +532,8 @@ impl RuntimePeers {
         attempt.status.attempt_revision = 2;
         let status = attempt.status.clone();
         self.commit_pairing(next, timestamp)?;
-        Ok(Reply { status: Some(status), secret: None, error: None, exchange: None })
+        Ok(Reply { status: Some(status), secret: None, error: None, exchange: None,
+            access: self.access_for(&[node]) })
     }
 
     /// Read-only projection: even logical expiry never writes durable state.
@@ -469,7 +553,8 @@ impl RuntimePeers {
         if status.terminal_at.is_some_and(|ended| timestamp >= ended.saturating_add(RECEIPT_SECONDS)) {
             return Err(invalid("unknown or expired creation_id"));
         }
-        Ok(Reply { status: Some(status), secret: None, error: None, exchange: None })
+        let access = status.bound_node_id.map_or_else(Vec::new, |node| self.access_for(&[node]));
+        Ok(Reply { status: Some(status), secret: None, error: None, exchange: None, access })
     }
 
     pub(crate) fn pairing_request(&mut self, request: Request) -> Result<Reply> {
@@ -518,6 +603,12 @@ impl RuntimePeers {
                     timestamp,
                 );
             }
+            Request::Confirm { .. } => {
+                return Err(invalid("confirmation requires atomic policy publication"));
+            }
+            Request::Reject { rejection } => {
+                return self.reject_pairing_at(&rejection, timestamp);
+            }
             other => other,
         };
         let (owner, creation_id) = match &request {
@@ -526,7 +617,10 @@ impl RuntimePeers {
             }
             | Request::Query { owner, creation_id }
             | Request::Cancel { owner, creation_id } => (owner, creation_id),
-            Request::PairSend { .. } | Request::PairReceive { .. } => unreachable!(),
+            Request::PairSend { .. }
+            | Request::PairReceive { .. }
+            | Request::Confirm { .. }
+            | Request::Reject { .. } => unreachable!(),
         };
         validate_token(owner, "owner")?;
         validate_token(creation_id, "creation_id")?;
@@ -596,6 +690,7 @@ impl RuntimePeers {
                         terminal_at: None,
                         bound_node_id: None,
                         terminal_reason: None,
+                        completion: None,
                     };
                     next.pairing.push(Attempt {
                         owner,
@@ -604,6 +699,7 @@ impl RuntimePeers {
                         status,
                         salt: Some(salt),
                         secret_hash: Some(hash),
+                        request_digest: None,
                     });
                     secret = Some(Secret(plaintext));
                     next.pairing.len() - 1
@@ -622,15 +718,22 @@ impl RuntimePeers {
                 }
                 index
             }
-            Request::PairSend { .. } | Request::PairReceive { .. } => unreachable!(),
+            Request::PairSend { .. }
+            | Request::PairReceive { .. }
+            | Request::Confirm { .. }
+            | Request::Reject { .. } => unreachable!(),
         };
         let status = next.pairing[index].status.clone();
+        let access = status
+            .bound_node_id
+            .map_or_else(Vec::new, |node| self.access_for(&[node]));
         self.commit_pairing(next, timestamp)?;
         Ok(Reply {
             status: Some(status),
             secret,
             error: None,
             exchange: None,
+            access,
         })
     }
 

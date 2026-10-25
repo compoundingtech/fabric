@@ -364,8 +364,24 @@ expected_policy_revision, request_id)` checks the creating owner attribution,
 immutable binding, pending state, deadline, and single-use condition in the
 **same serialized transaction** that installs the peer/grants and writes the
 confirmed completion receipt. There is no separate validate-then-install RPC.
-An existing owner record or source conflict is refused rather than overwritten
-by pairing. Competing confirmations cannot both install policy.
+Confirmation conservatively refuses any NodeID already present in effective
+static or runtime trust, even under another owner or without a label. Pairing
+never augments or renames pre-existing trust; use an explicit runtime policy
+transaction to change an existing peer. Competing confirmations cannot both
+install policy. Completion request IDs are scoped by creating owner, so another
+owner's retained ID neither conflicts with nor reveals its completion.
+
+A newly confirmed normal-direction NodeID immediately participates in existing
+wildcard sync selectors (`peers = "*"`), including outbound sync targeting.
+Inbound-only direction still excludes outbound work. This is the existing sync
+selector policy, not a grant inferred from exchange payloads.
+
+The restricted network reply contains no `access` field or full provenance, and
+no completion request ID or policy revision. The owner control path alone
+returns complete source paths, owner labels and effective-access provenance.
+Historical confirm replay returns the retained outcome without republishing the
+peer book or retrying presence; in particular, replay cannot reopen quarantined
+admissions. An explicit successful recovery/reload, not replay, clears quarantine.
 
 Preparation does not reserve success. The final deadline check occurs at the
 commit linearization point under the admission barrier, after preparation;
@@ -459,5 +475,8 @@ Implementation gates, after the tag and design approval:
   stale listeners after restart, duplex half-close, typed error classes,
   capability negotiation, and explicit event reset handling in the client.
 
-These are acceptance requirements, not results. Current source and the 1.0.0
-release do not implement the proposed runtime state, pairing path, or client.
+These are acceptance requirements, not a claim that every gate has passed.
+The implemented opt-in runtime policy and pairing control/transport contract is
+documented in [runtime-peer-api.md](runtime-peer-api.md). Policy watches,
+rotation overlap, and the separate typed client remain design work rather than
+released interfaces.
