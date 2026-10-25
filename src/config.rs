@@ -276,6 +276,14 @@ const ROLLBACK_MIRROR_COMMENT: &str = "\
 pub struct PeerBook {
     peers: Vec<Peer>,
     git_remotes: Vec<GitRemote>,
+    expiry: Option<std::sync::Arc<TimedPeers>>,
+}
+
+#[derive(Debug)]
+struct TimedPeers {
+    clock: (u64, std::time::Instant),
+    generations: Vec<(u64, Vec<Peer>)>,
+    observed: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -317,6 +325,7 @@ impl Default for PeerBook {
         Self {
             peers: Vec::new(),
             git_remotes: Vec::new(),
+            expiry: None,
         }
     }
 }
@@ -358,6 +367,7 @@ impl PeerBook {
         let book = Self {
             peers,
             git_remotes: self.git_remotes.clone(),
+            expiry: None,
         };
         book.validate()?;
         Ok(book)
@@ -465,6 +475,7 @@ impl PeerBook {
             Self {
                 peers: stored.peers,
                 git_remotes: stored.git_remotes,
+                expiry: None,
             },
             migrated,
             removed_grants,
@@ -571,6 +582,7 @@ impl PeerBook {
         let before_book = Self {
             peers: before.peers.clone(),
             git_remotes: before.git_remotes.clone(),
+            expiry: None,
         };
         before_book.validate()?;
         let mut document: DocumentMut = existing
@@ -632,12 +644,76 @@ impl PeerBook {
         config.save(home)
     }
 
+    pub(crate) fn into_effective_peers(self) -> Vec<Peer> {
+        self.peers
+    }
+
+    /// Prevalidated immutable generations keep expiry checks allocation-free
+    /// and independent of the policy writer and filesystem.
+    pub(crate) fn with_expiry_generations(
+        mut self,
+        clock: (u64, std::time::Instant),
+        generations: Vec<(u64, Vec<Peer>)>,
+        observed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        if !generations.is_empty() {
+            self.expiry = Some(std::sync::Arc::new(TimedPeers {
+                clock,
+                generations,
+                observed,
+            }));
+        }
+        self
+    }
+
+    pub(crate) fn expiry_lateness(&self, deadline: u64) -> std::time::Duration {
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .saturating_sub(std::time::Duration::from_secs(deadline));
+        let Some(expiry) = &self.expiry else { return wall; };
+        let monotonic = expiry.clock.1.elapsed().saturating_sub(
+            std::time::Duration::from_secs(deadline.saturating_sub(expiry.clock.0)),
+        );
+        let observed = std::time::Duration::from_secs(
+            expiry.observed.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(deadline),
+        );
+        wall.max(monotonic).max(observed)
+    }
+
+    fn expiry_index(&self) -> usize {
+        let Some(expiry) = &self.expiry else { return 0; };
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_secs();
+        let timestamp = wall.max(expiry.clock.0.saturating_add(expiry.clock.1.elapsed().as_secs()));
+        let timestamp = expiry.observed.fetch_max(timestamp, std::sync::atomic::Ordering::Relaxed).max(timestamp);
+        expiry.generations.partition_point(|(deadline, _)| *deadline <= timestamp)
+    }
+
+    pub(crate) fn expired_generation(&self) -> Option<u64> {
+        let index = self.expiry_index();
+        (index > 0).then(|| self.expiry.as_ref().unwrap().generations[index - 1].0)
+    }
+
+    pub(crate) fn same_expiry_policy(&self, other: &Self) -> bool {
+        match (&self.expiry, &other.expiry) {
+            (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
     pub fn peers(&self) -> &[Peer] {
+        let index = self.expiry_index();
+        if index > 0 {
+            return &self.expiry.as_ref().unwrap().generations[index - 1].1;
+        }
         &self.peers
     }
 
     pub fn grants_service(&self, service: &str) -> bool {
-        self.peers
+        self.peers()
             .iter()
             .any(|peer| peer.allow.iter().any(|grant| grant == service))
     }
@@ -746,7 +822,7 @@ impl PeerBook {
     ///
     /// This peer grant is the complete policy for the service.
     pub fn may(&self, id: &EndpointId, service: &str) -> Result<(), Denied> {
-        let Some(peer) = self.peers.iter().find(|peer| peer.id == *id) else {
+        let Some(peer) = self.peers().iter().find(|peer| peer.id == *id) else {
             return Err(Denied::NotTrusted);
         };
         // Before the allow list is read, so nothing written there matters.
@@ -769,7 +845,7 @@ impl PeerBook {
     /// The peers let in as inbound connections: every peer but a dial-only one,
     /// which this machine dials and which never gets to dial it.
     pub fn trusted_ids(&self) -> HashSet<EndpointId> {
-        self.peers
+        self.peers()
             .iter()
             .filter(|peer| !peer.dial_only)
             .map(|peer| peer.id)
@@ -778,14 +854,14 @@ impl PeerBook {
 
     /// Is `id` a peer that may connect to this machine at all?
     pub fn accepts_inbound(&self, id: &EndpointId) -> bool {
-        self.peers
+        self.peers()
             .iter()
             .any(|peer| peer.id == *id && !peer.dial_only)
     }
 
     /// Is `id` a peer this machine dials and never lets in?
     pub fn is_dial_only(&self, id: &EndpointId) -> bool {
-        self.peers
+        self.peers()
             .iter()
             .any(|peer| peer.id == *id && peer.dial_only)
     }
@@ -793,7 +869,7 @@ impl PeerBook {
     /// Does this peer list grants that a dial-only flag overrides? A file in
     /// that state is safe and contradicts itself; `fabric doctor` says so.
     pub fn ignored_grants(&self, id: &EndpointId) -> bool {
-        self.peers
+        self.peers()
             .iter()
             .any(|peer| peer.id == *id && peer.dial_only && !peer.allow.is_empty())
     }
@@ -846,7 +922,7 @@ impl PeerBook {
 
     /// Is `id` a peer that only connects here, and that this machine never dials?
     pub fn is_inbound_only(&self, id: &EndpointId) -> bool {
-        self.peers
+        self.peers()
             .iter()
             .any(|peer| peer.id == *id && peer.inbound_only)
     }
@@ -854,7 +930,7 @@ impl PeerBook {
     /// The peers this machine may dial, probe and announce to: every peer but
     /// an inbound-only one.
     pub fn dialable_peers(&self) -> impl Iterator<Item = &Peer> {
-        self.peers.iter().filter(|peer| !peer.inbound_only)
+        self.peers().iter().filter(|peer| !peer.inbound_only)
     }
 
     /// Refuse to mix the two directions. `peer` is a name or a NodeID; an
@@ -962,7 +1038,7 @@ impl PeerBook {
         }
 
         let matches: Vec<&Peer> = self
-            .peers
+            .peers()
             .iter()
             .filter(|entry| entry.name.as_deref() == Some(peer))
             .collect();
@@ -999,7 +1075,7 @@ impl PeerBook {
     }
 
     fn addr_for_id(&self, id: EndpointId) -> EndpointAddr {
-        self.peers
+        self.peers()
             .iter()
             .find(|entry| entry.id == id)
             .and_then(|entry| entry.addr.clone())
@@ -1709,6 +1785,7 @@ impl FabricConfig {
         PeerBook {
             peers: self.peers.clone(),
             git_remotes: Vec::new(),
+            expiry: None,
         }
         .validate()?;
 

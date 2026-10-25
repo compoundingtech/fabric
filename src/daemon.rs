@@ -466,6 +466,7 @@ pub struct DaemonState {
     endpoint_recycle: Mutex<()>,
     last_endpoint_recycle: Mutex<Option<Instant>>,
     peer_book: Arc<RwLock<PeerBook>>,
+    expiry_policy: tokio::sync::watch::Sender<PeerBook>,
     policy_update: Arc<Mutex<()>>,
     runtime_peers: Option<Arc<std::sync::Mutex<crate::runtime_peers::RuntimePeers>>>,
     pairing_gate: Arc<pairing::Gate>,
@@ -1288,6 +1289,7 @@ impl DaemonState {
             peer_connections.use_runtime_policy(peer_book.clone());
         }
 
+        let (expiry_policy, _) = tokio::sync::watch::channel(peer_book.read().await.clone());
         Ok(Arc::new(Self {
             config_write: Arc::new(std::sync::Mutex::new(())),
             home,
@@ -1295,6 +1297,7 @@ impl DaemonState {
             endpoint_recycle: Mutex::new(()),
             last_endpoint_recycle: Mutex::new(None),
             peer_book,
+            expiry_policy,
             policy_update: Arc::new(Mutex::new(())),
             runtime_peers,
             pairing_gate,
@@ -3556,6 +3559,7 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
     // Cancellation stops future sweeps but never drops an in-flight durable commit.
     // The existing policy drain owns its shutdown barrier.
     let _pairing_expiry = tokio::spawn(pairing::expire_loop(state.clone()));
+    let _runtime_peer_expiry = tokio::spawn(runtime_control::runtime_peer_expiry_loop(state.clone()));
 
     let result = tokio::select! {
         result = run_control_socket(control_listener, state.clone()) => result,

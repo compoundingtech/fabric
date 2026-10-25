@@ -18,6 +18,15 @@ Deprecated, Fixed or Security.
 
 ### Added
 
+- **Provisional:** runtime peer records support immutable `expires_at` deadlines
+  within the next 600 seconds. Existing atomic batches can install a prepared
+  next NodeID's exact grants and schedule the old owner record's retirement.
+  Timed policy generations close expired access independently of blocked disk
+  writers, preserving static/other-owner grants; automatic removal reuses
+  admission/session cancellation, connection retirement and durable completion
+  receipts. Expiry reserves receipt capacity, survives restart, and fails closed
+  on detected clock rollback. Runtime state that has used expiry cannot be
+  downgraded to strict readers lacking these fields.
 - **Provisional:** opt-in pairing permit issue/query/cancel control requests,
   with private durable state, immutable exact policy with a versioned digest,
   bounded lifetime and reserved terminal receipt capacity (1,024 globally,

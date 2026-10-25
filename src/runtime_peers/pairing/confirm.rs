@@ -206,6 +206,8 @@ impl RuntimePeers {
             next.records.push(Record {
                 owner: request.owner.clone(),
                 peer,
+                expires_at: None,
+                expiry_request_id: None,
             });
             next.records
                 .sort_by(|a, b| (&a.owner, a.peer.id).cmp(&(&b.owner, b.peer.id)));
@@ -1132,6 +1134,8 @@ mod tests {
         for index in 0..MAX_RECORDS {
             store.stored.records.push(Record {
                 owner: format!("owner-{index}"),
+                expires_at: None,
+                expiry_request_id: None,
                 peer: Peer {
                     id: node(2),
                     name: None,
