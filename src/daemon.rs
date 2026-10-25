@@ -3553,6 +3553,9 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
             .with_context(|| format!("failed to remove stale {}", sync_ipc_path.display()))?;
     }
     let sync_ipc_listener = IpcListener::bind(&sync_ipc_path)?;
+    // Cancellation stops future sweeps but never drops an in-flight durable commit.
+    // The existing policy drain owns its shutdown barrier.
+    let _pairing_expiry = tokio::spawn(pairing::expire_loop(state.clone()));
 
     let result = tokio::select! {
         result = run_control_socket(control_listener, state.clone()) => result,

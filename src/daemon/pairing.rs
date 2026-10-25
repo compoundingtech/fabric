@@ -7,7 +7,11 @@ use tokio::sync::Semaphore;
 
 pub(super) const MAX_CONNECTIONS: usize = 32;
 const MAX_CONNECTIONS_PER_NODE: usize = 2;
-const MAX_REQUEST: usize = 4096;
+const MAX_PREAUTH_REQUEST: usize = 4096;
+// JSON byte arrays require at most four encoded bytes per payload byte.
+const MAX_REQUEST: usize = 4 * 64 * 1024 + 4096;
+const BOUND_BURST: u32 = 8;
+const BOUND_REFILL_SECONDS: u64 = 1;
 const MAX_RATE_NODES: usize = 1024;
 const IDLE: Duration = Duration::from_secs(10);
 const FIRST_HEADER: Duration = Duration::from_secs(3);
@@ -170,7 +174,7 @@ impl Gate {
             rates.bound.remove(&node);
         }
         if let Some(hint) = rates.bound.get_mut(&node) {
-            hint.bucket.refill(now, 3, 6);
+            hint.bucket.refill(now, BOUND_BURST, BOUND_REFILL_SECONDS);
             if hint.bucket.tokens == 0 {
                 return None;
             }
@@ -190,7 +194,7 @@ impl Gate {
         rates.bound.retain(|_, hint| hint.expires > now);
         if rates.bound.len() < MAX_RATE_NODES {
             rates.bound.insert(node, BoundHint {
-                bucket: Bucket { tokens: 3, last: now },
+                bucket: Bucket { tokens: BOUND_BURST, last: now },
                 expires: now + BOUND_HINT_TTL,
             });
         }
@@ -215,6 +219,68 @@ impl Gate {
     }
 }
 
+/// Decode the flat wire object directly. Deserializing the internally tagged
+/// public enum would first buffer every payload byte as serde enum content.
+fn decode_request(bytes: &[u8]) -> Result<NetworkRequest> {
+    use crate::runtime_peers::pairing::{Payload, Secret};
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum Operation {
+        Present,
+        Status,
+        Send,
+        Receive,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Frame {
+        operation: Operation,
+        attempt_id: String,
+        secret: Option<Secret>,
+        sequence: Option<u64>,
+        digest: Option<String>,
+        payload: Option<Payload>,
+        ack: Option<u64>,
+    }
+    let frame: Frame = serde_json::from_slice(bytes).map_err(|_| refused())?;
+    let Frame { operation, attempt_id, secret, sequence, digest, payload, ack } = frame;
+    match operation {
+        Operation::Present
+            if sequence.is_none() && digest.is_none() && payload.is_none() && ack.is_none() =>
+        {
+            Ok(NetworkRequest::Present { attempt_id, secret: secret.ok_or_else(refused)? })
+        }
+        Operation::Status
+            if secret.is_none() && sequence.is_none() && digest.is_none()
+                && payload.is_none() && ack.is_none() =>
+        {
+            Ok(NetworkRequest::Status { attempt_id })
+        }
+        Operation::Send if secret.is_none() && ack.is_none() => Ok(NetworkRequest::Send {
+            attempt_id,
+            sequence: sequence.ok_or_else(refused)?,
+            digest: digest.ok_or_else(refused)?,
+            payload: payload.ok_or_else(refused)?,
+        }),
+        Operation::Receive
+            if secret.is_none() && sequence.is_none() && digest.is_none() && payload.is_none() =>
+        {
+            Ok(NetworkRequest::Receive { attempt_id, ack })
+        }
+        _ => Err(refused()),
+    }
+}
+
+async fn reject_frame(state: &Arc<DaemonState>, node: EndpointId, attempt: &str) {
+    let state = state.clone();
+    let attempt = attempt.to_owned();
+    // A socket close or timeout cannot abandon durable rejection/quarantine.
+    let rejection = tokio::spawn(async move {
+        state.reject_pairing_frame(node, attempt).await
+    });
+    let _ = tokio::time::timeout(FIRST_HEADER, rejection).await;
+}
+
 fn refused() -> anyhow::Error {
     FabricError::new(ErrorCode::InvalidArgument, "pairing request refused").into()
 }
@@ -227,6 +293,61 @@ pub(super) async fn serve(connection: Connection, state: Arc<DaemonState>) -> Re
     // Never copy tokens, input JSON, or attempt IDs into close reasons or logs.
     connection.close(VarInt::from_u32(0), b"pairing connection ended");
     result
+}
+pub(super) async fn expire_loop(state: Arc<DaemonState>) {
+    if state.runtime_peers.is_none() {
+        state.cancel.cancelled().await;
+        return;
+    }
+    let mut ticks = tokio::time::interval(Duration::from_secs(1));
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticks.tick().await;
+    let mut fault_reported = false;
+    loop {
+        tokio::select! {
+            _ = state.cancel.cancelled() => return,
+            _ = ticks.tick() => {}
+        }
+        // No clock observation or expiry worker is needed for retained receipts.
+        let due = async {
+            if !state.has_active_pairing_attempts().await? {
+                return Ok::<_, anyhow::Error>(false);
+            }
+            state.pairing_expiry_due().await
+        }
+        .await;
+        match due {
+            Ok(false) => continue,
+            Ok(true) => {}
+            Err(_) => {
+                if !fault_reported && !state.cancel.is_cancelled() {
+                    warn!("pairing expiry inspection failed");
+                }
+                fault_reported = true;
+                continue;
+            }
+        }
+        // Once started, publication/quarantine completes even during shutdown.
+        let reply = state
+            .commit_pairing(|runtime| {
+                runtime.pairing_expire()?;
+                Ok(Reply {
+                    status: None,
+                    secret: None,
+                    exchange: None,
+                    error: None,
+                })
+            })
+            .await;
+        if let Some(error) = reply.error {
+            if !fault_reported && !state.cancel.is_cancelled() {
+                warn!(code = %error.code, "pairing expiry reconciliation failed");
+            }
+            fault_reported = true;
+        } else {
+            fault_reported = false;
+        }
+    }
 }
 
 async fn serve_requests(connection: &Connection, state: &Arc<DaemonState>) -> Result<()> {
@@ -269,35 +390,50 @@ async fn serve_stream(
             recv.read_exact(&mut length),
         )
         .await??;
-        // Refuse unknown identities before parsing or scheduling runtime work
-        // when the global lane is exhausted. Known bound identities reserve
-        // their independent allowance before authorization, not afterwards.
+        // Reconnect authenticates a small frame before using the larger cap.
+        let bound = lease.is_some();
+        let length = u32::from_be_bytes(length) as usize;
+        let cap = if bound { MAX_REQUEST } else { MAX_PREAUTH_REQUEST };
+        if length == 0 || length > cap {
+            if let Some(lease) = &lease {
+                reject_frame(state, connection.remote_id(), &lease.attempt).await;
+            }
+            return Err(refused());
+        }
+        // Unknown identities need global credit before parsing or runtime work;
+        // known bound identities reserve their independent token first.
         let charged = state.pairing_gate
             .reserve_request(connection.remote_id(), Instant::now())
             .ok_or_else(refused)?;
-        let length = u32::from_be_bytes(length) as usize;
-        if length == 0 || length > MAX_REQUEST {
-            return Err(refused());
-        }
-        let mut bytes = [0u8; MAX_REQUEST];
+        let mut bytes = vec![0u8; length];
         tokio::time::timeout_at(
             deadline.min(tokio::time::Instant::now() + IDLE),
             recv.read_exact(&mut bytes[..length]),
         )
         .await??;
-        let request: NetworkRequest =
-            serde_json::from_slice(&bytes[..length]).map_err(|_| refused())?;
+        let request = decode_request(&bytes)?;
+        drop(bytes);
+        if matches!(&request, NetworkRequest::Present { .. } | NetworkRequest::Status { .. })
+            && length > MAX_PREAUTH_REQUEST
+        {
+            if let Some(lease) = &lease {
+                reject_frame(state, connection.remote_id(), &lease.attempt).await;
+            }
+            return Err(refused());
+        }
         let validated = tokio::time::timeout_at(
             deadline.min(tokio::time::Instant::now() + IDLE),
             state.pairing_network_read(connection.remote_id(), &request),
         ).await??;
         if charged {
             state.pairing_gate.refund();
+
         }
         let attempt = match &request {
-            NetworkRequest::Present { attempt_id, .. } | NetworkRequest::Status { attempt_id } => {
-                attempt_id
-            }
+            NetworkRequest::Present { attempt_id, .. }
+            | NetworkRequest::Status { attempt_id }
+            | NetworkRequest::Send { attempt_id, .. }
+            | NetworkRequest::Receive { attempt_id, .. } => attempt_id,
         };
         if let Some(lease) = &lease {
             if &lease.attempt != attempt {
@@ -306,8 +442,9 @@ async fn serve_stream(
         } else {
             lease = Some(state.pairing_gate.lease(attempt).ok_or_else(refused)?);
         }
-        let reply = if let Some(reply) = validated {
-            reply
+        let exchange = matches!(&request, NetworkRequest::Send { .. } | NetworkRequest::Receive { .. });
+        let reply = if !exchange && validated.is_some() {
+            validated.expect("checked read-only reply")
         } else {
             // A timeout or disconnect must not cancel durable publication and
             // quarantine after its off-thread worker has persisted a bind.
@@ -427,12 +564,12 @@ mod tests {
             assert_eq!(gate.reserve_request(node(seed), now), None);
         }
         assert_eq!(gate.rates.lock().bound.len(), 2);
-        for _ in 0..3 {
+        for _ in 0..BOUND_BURST {
             assert_eq!(gate.reserve_request(node(1), now), Some(false));
         }
         assert_eq!(gate.reserve_request(node(1), now), None);
         assert_eq!(gate.reserve_request(node(2), now), Some(false));
-        assert_eq!(gate.reserve_request(node(1), now + Duration::from_secs(6)), Some(false));
+        assert_eq!(gate.reserve_request(node(1), now + Duration::from_secs(BOUND_REFILL_SECONDS)), Some(false));
         assert_eq!(gate.rates.lock().global.tokens, 0);
         for _ in 0..20 {
             gate.refund();
@@ -832,7 +969,7 @@ mod tests {
         let enabled = gateway(FabricHome::new(dir.path())).await?;
         let connection = client.connect(enabled.addr(), PAIR_ALPN).await?;
         let (mut send, mut recv) = connection.open_bi().await?;
-        send.write_all(&((MAX_REQUEST + 1) as u32).to_be_bytes())
+        send.write_all(&((MAX_PREAUTH_REQUEST + 1) as u32).to_be_bytes())
             .await?;
         let mut byte = [0; 1];
         let result = tokio::time::timeout(Duration::from_secs(3), recv.read(&mut byte)).await?;
@@ -842,6 +979,107 @@ mod tests {
         enabled.shutdown().await?;
         Ok(())
     }
+    #[test]
+    fn flat_decoder_preserves_network_shapes_and_rejects_invalid_fields() -> Result<()> {
+        use crate::runtime_peers::pairing::{Payload, Secret};
+        for request in [
+            NetworkRequest::Present {
+                attempt_id: "attempt".into(),
+                secret: Secret::new("secret"),
+            },
+            NetworkRequest::Status { attempt_id: "attempt".into() },
+            NetworkRequest::Send {
+                attempt_id: "attempt".into(),
+                sequence: 1,
+                digest: "digest".into(),
+                payload: Payload::new(vec![255; 64 * 1024]),
+            },
+            NetworkRequest::Receive { attempt_id: "attempt".into(), ack: Some(1) },
+        ] {
+            let bytes = serde_json::to_vec(&request)?;
+            assert_eq!(serde_json::to_vec(&decode_request(&bytes)?)?, bytes);
+        }
+        for bytes in [
+            br#"{"operation":"send","attempt_id":"a","sequence":1,"digest":"d"}"#.as_slice(),
+            br#"{"operation":"status","attempt_id":"a","payload":[1]}"#,
+            br#"{"operation":"status","attempt_id":"a","unknown":1}"#,
+            br#"{"operation":"status","attempt_id":"a","attempt_id":"b"}"#,
+        ] {
+            assert!(decode_request(bytes).is_err());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bound_oversize_header_rejects_only_associated_attempt_durably() -> Result<()> {
+        use crate::runtime_peers::pairing::{PAIR_ALPN, Policy, Request};
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let gateway = gateway(home.clone()).await?;
+        let state = gateway.state();
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?.as_secs() + 600;
+        let mut permits = Vec::new();
+        for creation_id in ["oversize", "unrelated"] {
+            let reply = state.pairing_request(Request::Issue {
+                owner: "test".into(),
+                creation_id: creation_id.into(),
+                deadline,
+                policy: Policy {
+                    grants: vec![],
+                    name: None,
+                    direction: crate::runtime_peers::Direction::Normal,
+                },
+            }).await;
+            assert!(reply.error.is_none());
+            permits.push(reply);
+        }
+        let client = client().await?;
+        let connection = client.connect(gateway.addr(), PAIR_ALPN).await?;
+        let (mut send, mut recv) = connection.open_bi().await?;
+        let first = permits.remove(0);
+        let status = rpc(&mut send, &mut recv, NetworkRequest::Present {
+            attempt_id: first.status.unwrap().attempt_id,
+            secret: first.secret.unwrap(),
+        }).await?.status.unwrap();
+        assert_eq!(status.state, State::Pending);
+        // The same node can hold another permit; a bad frame must not reject it.
+        let other = client.connect(gateway.addr(), PAIR_ALPN).await?;
+        let (mut other_send, mut other_recv) = other.open_bi().await?;
+        let second = permits.remove(0);
+        assert_eq!(rpc(&mut other_send, &mut other_recv, NetworkRequest::Present {
+            attempt_id: second.status.unwrap().attempt_id,
+            secret: second.secret.unwrap(),
+        }).await?.status.unwrap().state, State::Pending);
+        // Only the header is sent: rejection must precede body allocation/read.
+        send.write_all(&((MAX_REQUEST + 1) as u32).to_be_bytes()).await?;
+        tokio::time::timeout(Duration::from_secs(3), connection.closed()).await?;
+        let unaffected = state.pairing_request(Request::Query {
+            owner: "test".into(),
+            creation_id: "unrelated".into(),
+        }).await;
+        assert_eq!(unaffected.status.unwrap().state, State::Pending);
+        client.close().await;
+        gateway.shutdown().await?;
+        drop(state);
+        let restarted = self::gateway(home).await?;
+        for (creation_id, reason) in [
+            ("oversize", "exchange_limit"),
+            ("unrelated", "exchange_lost"),
+        ] {
+            let reply = restarted.state().pairing_request(Request::Query {
+                owner: "test".into(),
+                creation_id: creation_id.into(),
+            }).await;
+            assert!(reply.error.is_none());
+            let status = reply.status.unwrap();
+            assert_eq!(status.state, State::Rejected);
+            assert_eq!(status.terminal_reason.as_deref(), Some(reason));
+        }
+        restarted.shutdown().await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn disconnected_presenter_cannot_abandon_indeterminate_commit_quarantine() -> Result<()> {
         use crate::runtime_peers::pairing::{PAIR_ALPN, Policy, Request};
@@ -909,6 +1147,137 @@ mod tests {
             }
         })
         .await?;
+        assert!(state.peer_book.read().await.peers().is_empty());
+        client.close().await;
+        gateway.shutdown().await?;
+        Ok(())
+    }
+    async fn owner_request(
+        home: &FabricHome,
+        request: crate::runtime_peers::pairing::Request,
+    ) -> Result<Reply> {
+        match send_control(home, ControlRequest::Pairing { request }).await? {
+            ControlResponse::Pairing { reply } => Ok(reply),
+            other => bail!("unexpected owner reply: {other:?}"),
+        }
+    }
+    #[tokio::test]
+    async fn real_pairing_exchanges_opaque_bytes_with_owner_control_without_grants() -> Result<()> {
+        use crate::runtime_peers::pairing::{PAIR_ALPN, Payload, Policy, Request};
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let gateway = gateway(home.clone()).await?;
+        let state = gateway.state();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !home.control_socket_path().exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            + 600;
+        let issued = owner_request(
+            &home,
+            Request::Issue {
+                owner: "admission".into(),
+                creation_id: "opaque".into(),
+                deadline,
+                policy: Policy {
+                    grants: vec![],
+                    name: None,
+                    direction: crate::runtime_peers::Direction::InboundOnly,
+                },
+            },
+        )
+        .await?;
+        assert!(issued.error.is_none());
+        let attempt_id = issued.status.unwrap().attempt_id;
+        let client = client().await?;
+        let connection = client.connect(gateway.addr(), PAIR_ALPN).await?;
+        let (mut send, mut recv) = connection.open_bi().await?;
+        assert_eq!(
+            rpc(
+                &mut send,
+                &mut recv,
+                NetworkRequest::Present {
+                    attempt_id: attempt_id.clone(),
+                    secret: issued.secret.unwrap(),
+                }
+            )
+            .await?
+            .status
+            .unwrap()
+            .state,
+            State::Pending
+        );
+        let payload = vec![255u8; 64 * 1024];
+        let digest = blake3::hash(&payload).to_hex().to_string();
+        let sent = rpc(
+            &mut send,
+            &mut recv,
+            NetworkRequest::Send {
+                attempt_id: attempt_id.clone(),
+                sequence: 1,
+                digest: digest.clone(),
+                payload: Payload::new(payload.clone()),
+            },
+        )
+        .await?;
+        assert!(sent.error.is_none());
+        assert_eq!(sent.exchange.unwrap().total_bytes, payload.len() as u64);
+        for _ in 0..2 {
+            let received = owner_request(
+                &home,
+                Request::PairReceive {
+                    owner: "admission".into(),
+                    attempt_id: attempt_id.clone(),
+                    ack: None,
+                },
+            )
+            .await?;
+            let message = received.exchange.unwrap().message.unwrap();
+            assert_eq!(message.sequence, 1);
+            assert_eq!(message.digest, digest);
+            assert_eq!(message.payload.as_bytes(), payload);
+        }
+        let acked = owner_request(
+            &home,
+            Request::PairReceive {
+                owner: "admission".into(),
+                attempt_id: attempt_id.clone(),
+                ack: Some(1),
+            },
+        )
+        .await?;
+        assert!(acked.exchange.unwrap().message.is_none());
+        let response = b"opaque signed-admission-shaped response".to_vec();
+        for _ in 0..2 {
+            let reply = owner_request(
+                &home,
+                Request::PairSend {
+                    owner: "admission".into(),
+                    attempt_id: attempt_id.clone(),
+                    sequence: 1,
+                    digest: blake3::hash(&response).to_hex().to_string(),
+                    payload: Payload::new(response.clone()),
+                },
+            )
+            .await?;
+            assert_eq!(reply.exchange.unwrap().total_messages, 2);
+        }
+        let received = rpc(
+            &mut send,
+            &mut recv,
+            NetworkRequest::Receive {
+                attempt_id,
+                ack: None,
+            },
+        )
+        .await?;
+        let message = received.exchange.unwrap().message.unwrap();
+        assert_eq!(message.payload.as_bytes(), response);
         assert!(state.peer_book.read().await.peers().is_empty());
         client.close().await;
         gateway.shutdown().await?;

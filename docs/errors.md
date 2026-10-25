@@ -41,6 +41,7 @@ Each code has a class, and the class says what a caller should do:
 | `runtime_state_unavailable` | fault | 69 | Runtime policy could not be read or committed. A faulted policy closes new network admissions; repair the file and explicitly reload. A narrow synchronous grant check can also return this transiently while a commit holds the policy barrier. |
 | `runtime_commit_indeterminate` | fault | 69 | Rename succeeded but commit durability could not be confirmed. Admissions are quarantined. Resolve the durable request ID after repair and reload; do not invent a new request ID. |
 | `runtime_receipt_capacity` | fault | 69 | The applicable retained receipt capacity is full: 960 ordinary slots, 64 more for withdrawal-only mutations. No-ops use no slot. Wait for retention expiry or reconcile through an existing receipt. |
+| `pairing_exchange_inactive` | refusal | 77 | The attempt is not pending and cannot exchange messages. No delivery occurred; reconcile its status rather than assuming an empty success. |
 | `request_id_conflict` | usage | 2 | A retained request ID was reused with different contents. |
 | `cancellation_timeout` | fault | 69 | Policy committed, but selected work did not finish within two seconds. The receipt lists remaining admissions and sessions; policy is not rolled back. |
 | `invalid_argument` | usage | 2 | Fabric rejected an argument's value. |

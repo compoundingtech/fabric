@@ -30,7 +30,15 @@ Deprecated, Fixed or Security.
   for authenticated one-time permit presentation and bound-node attempt status.
   Pending identities receive no ordinary service access. Connection and rate
   limits bound untrusted work; restart rejects unfinished attempts durably.
-  Join exchange and atomic confirmation are not enabled.
+  Atomic confirmation is not enabled.
+- **Provisional:** pending nodes and permit owners can exchange opaque bounded
+  admission messages through `send`/`receive` and `pair_send`/`pair_receive`.
+  Sequence/digest replay, acknowledgments, shared byte/message budgets, and
+  memory-only queues preserve limits across reconnect without granting access.
+  Exchange polling is nonblocking and memory-only; idle expiry ticks never fsync.
+  Authenticated exchange traffic has an independent rate bucket. Pre-auth frames
+  retain a 4 KiB cap; authenticated over-cap frames reject the associated attempt.
+  Sending to an attempt that cannot exchange returns a coded refusal.
 
 ### Security
 
