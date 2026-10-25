@@ -661,15 +661,22 @@ async fn run(cli: Cli) -> Result<()> {
                         }
                         IdentityCommands::Activate { expect_current, expect_next } => {
                             let activated = fabric::identity::activate_with_restart(&home, expect_current, expect_next, || async {
-                                if !fabric::daemon::daemon_lock_available(&home)? {
-                                    send_control(&home, ControlRequest::IdentitySnapshot { current: expect_current, next: expect_next }).await?;
-                                    // Stop before the authoritative rename. Losing the control
-                                    // socket can then only leave the old key prepared, never
-                                    // a renamed home with an old endpoint still serving.
-                                    send_control(&home, ControlRequest::Shutdown).await?;
-                                    wait_for_daemon_stop(&home, Duration::from_secs(15)).await?;
+                                if let Some(lease) = fabric::daemon::try_daemon_lease(&home)? {
+                                    return Ok(lease);
                                 }
-                                Ok(())
+                                send_control(&home, ControlRequest::IdentitySnapshot { current: expect_current, next: expect_next }).await?;
+                                send_control(&home, ControlRequest::Shutdown).await?;
+                                tokio::time::timeout(Duration::from_secs(15), async {
+                                    loop {
+                                        if let Some(lease) = fabric::daemon::try_daemon_lease(&home)? {
+                                            return Ok::<_, anyhow::Error>(lease);
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(20)).await;
+                                    }
+                                }).await.map_err(|_| FabricError::new(
+                                    ErrorCode::DaemonStopTimeout,
+                                    "daemon did not release its identity-swap lease within 15 seconds",
+                                ))?
                             }, || reconcile_identity_daemon(&home, expect_next)).await?;
                             if json { print_json(&serde_json::to_value(&activated)?)?; }
                             else { println!("previous\t{}\nactive\t{}\noutcome\t{}", activated.previous, activated.active, activated.outcome); }
