@@ -16,6 +16,18 @@ Deprecated, Fixed or Security.
 
 ## [Unreleased]
 
+### Added
+
+- **Provisional:** opt-in pairing permit issue/query/cancel control requests,
+  with private durable state, immutable exact policy with a versioned digest,
+  bounded lifetime and reserved terminal receipt capacity (1,024 globally,
+  128 retained attempts per owner). Read-only polls never fsync or take the
+  admission barrier; outstanding permits expire conservatively on restart.
+  Runtime state that has never used pairing remains readable by 0.9.2;
+  state that has used pairing is not downgrade-compatible. Permits grant no
+  service access; no network pairing transport or confirmation is enabled by
+  these operations.
+
 ## [0.9.2] - 2026-10-16
 
 ### Fixed

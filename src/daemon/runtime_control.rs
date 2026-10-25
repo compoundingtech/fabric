@@ -223,6 +223,64 @@ impl DaemonState {
         *self.policy_quarantine.lock().await = Some(selected);
     }
 
+    pub(crate) async fn pairing_request(
+        &self,
+        request: runtime_peers::pairing::Request,
+    ) -> runtime_peers::pairing::Reply {
+        use runtime_peers::pairing::Reply;
+        let result = async {
+            let runtime = self.runtime_peers.as_ref().ok_or_else(|| {
+                FabricError::new(
+                    ErrorCode::RuntimePeersDisabled,
+                    "pairing requires --runtime-peers",
+                )
+            })?;
+            // Polls only observe the in-memory clock and attempt. They neither
+            // serialize with policy writers nor publish or quarantine policy.
+            if matches!(&request, runtime_peers::pairing::Request::Query { .. }) {
+                return with_runtime(runtime.clone(), move |runtime| {
+                    runtime.pairing_request(request)
+                })
+                .await;
+            }
+            let _serial = self.policy_update.lock().await;
+            if self.cancel.is_cancelled() {
+                return Err(
+                    FabricError::new(ErrorCode::DaemonNotRunning, "daemon is stopping").into(),
+                );
+            }
+            let runtime = runtime.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                runtime
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .pairing_request(request)
+            })
+            .await
+            .unwrap_or_else(|error| {
+                Err(FabricError::new(
+                    ErrorCode::RuntimeCommitIndeterminate,
+                    format!("pairing commit worker failed: {error}"),
+                )
+                .into())
+            });
+            if let Err(error) = &result {
+                if crate::error::code_of(error) == ErrorCode::RuntimeCommitIndeterminate {
+                    let mut published = self.peer_book.write().await;
+                    self.quarantine_runtime_policy(&mut published, error, true)
+                        .await;
+                }
+            }
+            result
+        }
+        .await;
+        result.unwrap_or_else(|error| Reply {
+            status: None,
+            secret: None,
+            error: Some(PolicyError::of(&error)),
+        })
+    }
+
     pub(crate) async fn runtime_peer_request(&self, request: Request) -> Reply {
         let Some(runtime) = &self.runtime_peers else {
             return Reply {
@@ -658,6 +716,32 @@ mod tests {
             }
         })
         .await?
+    }
+
+    #[tokio::test]
+    async fn pairing_query_bypasses_policy_and_publication_barriers() -> Result<()> {
+        let _serial = SERIAL.lock().await;
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let node = FabricNode::start_with_daemon_options(home, options()).await?;
+        let state = node.state();
+        let _policy = state.policy_update.lock().await;
+        let _publication = state.peer_book.write().await;
+        let reply = tokio::time::timeout(
+            Duration::from_secs(1),
+            state.pairing_request(runtime_peers::pairing::Request::Query {
+                owner: "controller".into(),
+                creation_id: "unknown".into(),
+            }),
+        )
+        .await?;
+        assert!(reply.error.is_some());
+        assert!(reply.status.is_none());
+        assert!(state.policy_quarantine.lock().await.is_none());
+        drop(_publication);
+        drop(_policy);
+        node.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]

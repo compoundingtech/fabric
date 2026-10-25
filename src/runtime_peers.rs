@@ -17,6 +17,8 @@ use crate::{
     error::{ErrorCode, FabricError},
 };
 
+pub mod pairing;
+
 pub const MAX_OPERATIONS: usize = 128;
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 pub const PAGE_SIZE: usize = 256;
@@ -311,6 +313,14 @@ struct Stored {
     static_digest: String,
     records: Vec<Record>,
     receipts: Vec<Receipt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pairing: Vec<pairing::Attempt>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pairing_last_seen: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone)]
@@ -374,6 +384,7 @@ pub(crate) struct RuntimePeers {
     stored: Stored,
     static_input: StaticInput,
     fault: Option<String>,
+    pairing_clock: (u64, std::time::Instant),
     #[cfg(test)]
     fail_directory_sync: bool,
 }
@@ -409,9 +420,13 @@ fn validate_token(value: &str, field: &str) -> Result<()> {
 impl RuntimePeers {
     /// A bad runtime file keeps control available with all network policy closed.
     pub fn open(home: &FabricHome) -> (Self, PeerBook) {
-        Self::open_with_ended_work(home, true)
+        Self::open_with_ended_work(home, true, (now(), std::time::Instant::now()))
     }
-    fn open_with_ended_work(home: &FabricHome, restarted: bool) -> (Self, PeerBook) {
+    fn open_with_ended_work(
+        home: &FabricHome,
+        restarted: bool,
+        pairing_clock: (u64, std::time::Instant),
+    ) -> (Self, PeerBook) {
         let path = home.root().join("runtime-peers.toml");
         let placeholder = StaticInput {
             book: PeerBook::default(),
@@ -427,9 +442,12 @@ impl RuntimePeers {
                 static_digest: String::new(),
                 records: vec![],
                 receipts: vec![],
+                pairing: vec![],
+                pairing_last_seen: 0,
             },
             static_input: placeholder,
             fault: None,
+            pairing_clock,
             #[cfg(test)]
             fail_directory_sync: false,
         };
@@ -491,6 +509,8 @@ impl RuntimePeers {
                     changed = true;
                 }
             }
+            let timestamp = store.pairing_timestamp();
+            changed |= pairing::recover(&mut store.stored, timestamp, restarted);
             let book = store.compose(&store.stored)?.0;
             if changed {
                 store.persist(&store.stored)?;
@@ -532,11 +552,14 @@ impl RuntimePeers {
                 return Err(unavailable("invalid runtime receipt history"));
             }
         }
+        pairing::validate(&self.stored.pairing)?;
         Ok(())
     }
     /// Caller must first drain quarantined work before reconciling an uncertain commit.
     pub fn reconcile(&mut self, home: &FabricHome) -> Result<PeerBook> {
-        let (mut loaded, book) = Self::open_with_ended_work(home, false);
+        // Reconciliation is still the same daemon lifetime. Carry the original
+        // monotonic anchor into recovery, before it decides whether permits expired.
+        let (mut loaded, book) = Self::open_with_ended_work(home, false, self.pairing_clock);
         if let Some(error) = loaded.fault.take() {
             self.fault = Some(error.clone());
             return Err(unavailable(error));
@@ -565,6 +588,7 @@ impl RuntimePeers {
             stored: self.stored.clone(),
             static_input: input,
             fault: None,
+            pairing_clock: self.pairing_clock,
             #[cfg(test)]
             fail_directory_sync: false,
         };

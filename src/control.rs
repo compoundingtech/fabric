@@ -23,6 +23,9 @@ pub enum ControlRequest {
     RuntimePeers {
         request: crate::runtime_peers::Request,
     },
+    Pairing {
+        request: crate::runtime_peers::pairing::Request,
+    },
     /// Wait for cached peer transitions without polling the network.
     PeerEvents {
         #[serde(default)]
@@ -172,6 +175,9 @@ pub struct DialRestoreFailure {
 pub enum ControlResponse {
     RuntimePeers {
         reply: crate::runtime_peers::Reply,
+    },
+    Pairing {
+        reply: crate::runtime_peers::pairing::Reply,
     },
     PeerEvents {
         #[serde(flatten)]

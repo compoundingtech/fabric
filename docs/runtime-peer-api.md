@@ -22,6 +22,44 @@ of static and runtime sources. Removing one source never suppresses another;
 replies report the access that remains and every source granting it. A static
 source includes the configured file path.
 
+## Pairing permits
+
+The local control request `{"type":"pairing","request":{...}}` supports
+`issue`, `query`, and `cancel`. These operations require `--runtime-peers`.
+They create no ordinary trust record, grant, listener, or network pairing path.
+The restricted pairing transport, join exchange, and atomic confirmation are
+not implemented by this permit-control surface.
+
+`issue` takes `owner`, `creation_id`, an absolute Unix-seconds `deadline` within
+the next 600 seconds, and `policy`: exact `grants` (at most 128), optional `name`,
+and `direction` (default `normal`). Wildcard grants and dial-only policies with
+inbound grants are refused. The policy is immutable, with a digest in status.
+`query` and `cancel` select the creating `owner` and `creation_id`.
+
+Replies use `{"type":"pairing","reply":{"status":...,"error":null}}`.
+Only the first successful issue reply also includes `secret`: a 256-bit random
+bearer token. The private runtime state stores only its salted hash. Debug
+output redacts the secret; status and cancellation never include it.
+Keep the first reply private. Repeating an identical issue returns the same
+attempt without another secret; a different policy/deadline with the same
+creation ID is refused. After a lost creation reply, query by creation ID,
+cancel the inaccessible permit, and issue a new creation ID.
+
+Status includes `attempt_id`, `creation_id`, `state` (`issued`, `expired`,
+`rejected`), `attempt_revision`, original `deadline`, `policy_digest`, and
+`terminal_at`. Cancel is idempotent and never renews a deadline. Expiry is
+reconciled durably on startup and permit operations. Live deadline observations
+use a monotonic clock that reanchors on forward wall-clock jumps; all outstanding
+permits expire on restart. Terminal transitions erase salt and secret hash.
+
+There are at most 64 outstanding permits and 1,024 retained attempts. Issuance
+reserves its own terminal receipt slot for 24 hours after termination; the
+pairing pool is separate from mutation receipts. Expired lookup is unknown.
+Invalid requests use `invalid_argument`; persistence errors use the existing
+runtime-state error classes. Uncertain commit outcomes quarantine admissions,
+exactly as runtime policy commits do. Owner remains attribution rather than
+authentication.
+
 ## Requests
 
 Use the existing newline-delimited JSON control connection: one request and one
