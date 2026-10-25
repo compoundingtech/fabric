@@ -34,8 +34,10 @@ Deprecated, Fixed or Security.
   Timed policy generations close expired access independently of blocked disk
   writers, preserving static/other-owner grants; automatic removal reuses
   admission/session cancellation, connection retirement and durable completion
-  receipts. Expiry reserves receipt capacity, survives restart, and fails closed
-  on detected clock rollback. Runtime state that has used expiry cannot be
+  receipts. Expiry reserves conflict-checked receipt IDs and capacity, fences
+  stale sweep generations, survives restart, and uses a re-anchored progressing
+  monotonic floor across forward wall steps and rollback. Runtime state that
+  has used expiry cannot be
   downgraded to strict readers lacking these fields.
 - **Provisional:** opt-in pairing permit issue/query/cancel control requests,
   with private durable state, immutable exact policy with a versioned digest,

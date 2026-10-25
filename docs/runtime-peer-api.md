@@ -345,6 +345,8 @@ observe automatic removal, residual access, selected work and completion. The
 reserved ID belongs to that scheduling transaction, so a separately re-created
 record cannot replay an earlier expiry receipt. Until cleanup commits, its
 cancellation query returns an unknown receipt, never a premature completion.
+Reservation conflicts with retained receipt IDs return `request_id_conflict`
+before any part of the scheduling batch commits.
 
 Authorization and attach select a prevalidated effective generation at the
 deadline, without disk I/O or waiting for the mutation sequencer. A separate
@@ -355,10 +357,15 @@ Expiry withdrawals are not blocked by stale sync selectors. A blocked writer
 cannot extend expired authorization or live work; residual grants preserve
 still-permitted work. Cancellation monitoring retains its two-second deadline
 and missed-bound evidence even when the automatic receipt is persisted later.
+Sweep selection and signaling share an in-memory publication-generation guard;
+they cannot revoke against a stale snapshot after newer residual grants publish.
+This guard never covers filesystem work.
 
 Running deadline observations combine wall and monotonic time and never move
-backward, including reload reconciliation. Restart removes elapsed records
-durably before accepting traffic. A clock below the persisted last expiry
+backward, including reload reconciliation. Each forward wall observation anchors
+a progressing monotonic floor, so rollback after scheduling cannot extend the
+600-second elapsed bound. Restart removes elapsed records durably before
+accepting traffic. A clock below the persisted last expiry
 observation conservatively expires outstanding records. Arbitrary rollback
 across power loss is not assumed detectable. Cleanup write failures cannot
 restore expired access; uncertain commits use ordinary policy quarantine.

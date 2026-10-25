@@ -181,16 +181,25 @@ reserved `expiry_request_id` used to query automatic cancellation.
 
 Policy generations precompute the effective union at each distinct deadline.
 Their shared wall/monotonic observation never moves backward during one daemon
-lifetime, including reconciliation. Admission, service authorization, outbound
+lifetime, including reconciliation. Every forward observation re-anchors a
+progressing monotonic floor: a later wall rollback cannot freeze the clock or
+extend a newly installed overlap beyond 600 elapsed seconds.
+Admission, service authorization, outbound
 policy lookup and session attach use the applicable generation without waiting
 for a timer, mutation sequencer or disk writer. The deadline sweep independently
 signals the existing admission/session revocation path, including connection
 retirement, while the serialized writer records owner-scoped removal and
 advances policy revision. Still-permitted static and other-owner work survives.
+Selection and signaling hold a separate in-memory generation read guard;
+publication fences it only after durability, never while waiting on disk.
+A sweep cannot cancel work against a superseded policy lacking newer grants.
 The two-second cancellation target is measured from expiry, not a delayed
 cleanup commit; timeout evidence survives through the automatic receipt.
 
 Setting expiry reserves an automatic receipt slot in the existing bounded pool.
+Generated receipt reservations are checked against retained receipts and the
+final candidate before committing any scheduling operation; collision refuses
+the complete batch rather than poisoning automatic cleanup or restart.
 An idle sweep performs no disk writes. Failed cleanup persistence cannot
 reopen expired access; indeterminate outcomes use ordinary quarantine and reload
 reconciliation. Cleanup withdrawals cannot be blocked by stale sync selectors.

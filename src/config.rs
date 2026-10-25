@@ -281,9 +281,53 @@ pub struct PeerBook {
 
 #[derive(Debug)]
 struct TimedPeers {
-    clock: (u64, std::time::Instant),
+    clock: std::sync::Arc<ExpiryClock>,
     generations: Vec<(u64, Vec<Peer>)>,
-    observed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// A forward observation establishes a new progressing monotonic floor, not a
+/// frozen high-water mark. Shared by authorization, cleanup and reconciliation.
+#[derive(Debug)]
+pub(crate) struct ExpiryClock {
+    anchor: std::sync::Mutex<(std::time::Duration, std::time::Instant)>,
+}
+
+impl ExpiryClock {
+    pub(crate) fn new(anchor: (u64, std::time::Instant)) -> Self {
+        Self {
+            anchor: std::sync::Mutex::new((std::time::Duration::from_secs(anchor.0), anchor.1)),
+        }
+    }
+
+    fn observe_at(&self, wall: std::time::Duration, instant: std::time::Instant) -> std::time::Duration {
+        let mut anchor = self.anchor.lock().unwrap_or_else(|poison| poison.into_inner());
+        let floor = anchor.0.saturating_add(instant.saturating_duration_since(anchor.1));
+        if wall > floor {
+            *anchor = (wall, instant);
+            wall
+        } else {
+            floor
+        }
+    }
+
+    fn observed(&self, floor: u64) -> std::time::Duration {
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .max(std::time::Duration::from_secs(floor));
+        self.observe_at(wall, std::time::Instant::now())
+    }
+
+    pub(crate) fn timestamp(&self, floor: u64) -> u64 {
+        self.observed(floor).as_secs()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn elapse_for_test(&self, elapsed: std::time::Duration) {
+        let timestamp = self.observed(0).saturating_add(elapsed);
+        *self.anchor.lock().unwrap_or_else(|poison| poison.into_inner()) =
+            (timestamp, std::time::Instant::now());
+    }
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -652,42 +696,27 @@ impl PeerBook {
     /// and independent of the policy writer and filesystem.
     pub(crate) fn with_expiry_generations(
         mut self,
-        clock: (u64, std::time::Instant),
+        clock: std::sync::Arc<ExpiryClock>,
         generations: Vec<(u64, Vec<Peer>)>,
-        observed: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         if !generations.is_empty() {
             self.expiry = Some(std::sync::Arc::new(TimedPeers {
                 clock,
                 generations,
-                observed,
             }));
         }
         self
     }
 
     pub(crate) fn expiry_lateness(&self, deadline: u64) -> std::time::Duration {
-        let wall = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .saturating_sub(std::time::Duration::from_secs(deadline));
-        let Some(expiry) = &self.expiry else { return wall; };
-        let monotonic = expiry.clock.1.elapsed().saturating_sub(
-            std::time::Duration::from_secs(deadline.saturating_sub(expiry.clock.0)),
-        );
-        let observed = std::time::Duration::from_secs(
-            expiry.observed.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(deadline),
-        );
-        wall.max(monotonic).max(observed)
+        self.expiry.as_ref().map_or(std::time::Duration::ZERO, |expiry| {
+            expiry.clock.observed(0).saturating_sub(std::time::Duration::from_secs(deadline))
+        })
     }
 
     fn expiry_index(&self) -> usize {
         let Some(expiry) = &self.expiry else { return 0; };
-        let wall = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default().as_secs();
-        let timestamp = wall.max(expiry.clock.0.saturating_add(expiry.clock.1.elapsed().as_secs()));
-        let timestamp = expiry.observed.fetch_max(timestamp, std::sync::atomic::Ordering::Relaxed).max(timestamp);
+        let timestamp = expiry.clock.timestamp(0);
         expiry.generations.partition_point(|(deadline, _)| *deadline <= timestamp)
     }
 
@@ -1950,6 +1979,25 @@ fn invalid_argument(message: String) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn expiry_clock_reanchors_forward_steps_before_wall_rollback() {
+        use std::time::{Duration, Instant};
+        let origin = Instant::now();
+        let clock = super::ExpiryClock::new((1_000, origin));
+        assert_eq!(
+            clock.observe_at(Duration::from_secs(4_610), origin + Duration::from_secs(10)),
+            Duration::from_secs(4_610),
+        );
+        assert_eq!(
+            clock.observe_at(Duration::from_secs(1_610), origin + Duration::from_secs(610)),
+            Duration::from_secs(5_210),
+        );
+        assert_eq!(
+            clock.observe_at(Duration::from_secs(1_611), origin + Duration::from_secs(611)),
+            Duration::from_secs(5_211),
+        );
+    }
+
     #[test]
     fn dial_queue_timeout_is_additive_and_rejects_invalid_deadlines() -> anyhow::Result<()> {
         let legacy: super::PersistedDial = toml::from_str("peer = 'example'\nprotocol = 'web'\n")?;
