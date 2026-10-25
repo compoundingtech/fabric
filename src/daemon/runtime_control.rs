@@ -1184,8 +1184,8 @@ mod tests {
             add(&client, "client"), grant(&client, &["work/0"]),
             Operation::SetExpiry { node_id: client.id(), expires_at: deadline_signed },
         ]).await?;
-        let port = client.dial_tcp("server", "work/0", "127.0.0.1:0".into()).await?;
-        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await?;
+        let addr = client.dial_tcp("server", "work/0", "127.0.0.1:0".into()).await?;
+        let mut stream = tokio::net::TcpStream::connect(&addr).await?;
         round_trip(&mut stream, b"live-before-expiry").await?;
         with_runtime(server.state().runtime_peers.as_ref().unwrap().clone(), move |runtime| {
             runtime.advance_expiry_for_test(deadline);
@@ -1338,10 +1338,10 @@ mod tests {
             add(&client, "client"), grant(&client, &["kept/0"]),
         ])).await?;
         assert!(reply.error.is_none());
-        let kept_port = client.dial_tcp("server", "kept/0", "127.0.0.1:0".into()).await?;
-        let withdrawn_port = client.dial_tcp("server", "withdrawn/0", "127.0.0.1:0".into()).await?;
-        let mut kept_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{kept_port}")).await?;
-        let mut withdrawn_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{withdrawn_port}")).await?;
+        let kept_addr = client.dial_tcp("server", "kept/0", "127.0.0.1:0".into()).await?;
+        let withdrawn_addr = client.dial_tcp("server", "withdrawn/0", "127.0.0.1:0".into()).await?;
+        let mut kept_stream = tokio::net::TcpStream::connect(&kept_addr).await?;
+        let mut withdrawn_stream = tokio::net::TcpStream::connect(&withdrawn_addr).await?;
         round_trip(&mut kept_stream, b"new-residual-session").await?;
         round_trip(&mut withdrawn_stream, b"last-expiring-source").await?;
         let kept = state.admissions.admit(client.id(), crate::admission::Grant::Service("kept/0".into()));
