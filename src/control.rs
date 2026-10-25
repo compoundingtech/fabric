@@ -20,6 +20,10 @@ pub enum ControlRequest {
     Status,
     ReachabilityStatus,
     ReloadPeers,
+    IdentitySnapshot {
+        current: iroh::EndpointId,
+        next: iroh::EndpointId,
+    },
     RuntimePeers {
         request: crate::runtime_peers::Request,
     },

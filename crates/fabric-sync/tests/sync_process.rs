@@ -442,12 +442,29 @@ async fn an_incompatible_companion_is_refused_and_named() -> Result<()> {
 /// engine that kept running keeps its state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_running_companion_reattaches_after_the_daemon_restarts() -> Result<()> {
+    companion_restarts_with_identity(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identity_activation_changes_sync_author_and_preserves_sync_history() -> Result<()> {
+    companion_restarts_with_identity(true).await
+}
+
+async fn companion_restarts_with_identity(rotate: bool) -> Result<()> {
     let _guard = SYNC_PROCESS_LOCK.lock().await;
     let mut a = Node::start(Side::New, "bus").await?;
     let b = Node::start(Side::New, "bus").await?;
     pair(&a, &b).await?;
     std::fs::write(a.folder.join("before.txt"), b"before the restart")?;
     assert!(wait_for_file(&b.folder.join("before.txt"), b"before the restart").await);
+    let previous = a.id();
+    let prepared = if rotate { Some(fabric::identity::prepare(&a.home)?) } else { None };
+    if let Some(prepared) = &prepared {
+        let mut peers = PeerBook::load(&b.home)?;
+        peers.add_with_allow(prepared.next, Some("a-next".into()), None, Some(vec!["sync".into()]));
+        peers.save(&b.home)?;
+        b.reload_peers().await?;
+    }
 
     // The shape of every update: the daemon goes down and comes back while the
     // companion keeps running.
@@ -465,6 +482,7 @@ async fn a_running_companion_reattaches_after_the_daemon_restarts() -> Result<()
         .wait_for(Duration::from_secs(30), |phase| !phase.is_active())
         .await
         .context("the companion never noticed the daemon leaving")?;
+    let activation = prepared.as_ref().map(|prepared| fabric::identity::activate(&a.home, prepared.current, prepared.next)).transpose()?;
     let placeholder = std::mem::replace(
         &mut a.daemon,
         Daemon::New(FabricNode::start(a.home.clone()).await?),
@@ -473,8 +491,19 @@ async fn a_running_companion_reattaches_after_the_daemon_restarts() -> Result<()
         Daemon::New(node) => node.shutdown().await?,
         Daemon::Old { .. } => unreachable!("the placeholder is this build"),
     }
-    // b must re-trust a's new address; the identity is the same.
+    if rotate {
+        assert_ne!(a.id(), previous);
+        assert_ne!(
+            fabric_sync::companion::author_from_node_id(&previous.to_string())?,
+            fabric_sync::companion::author_from_node_id(&a.id().to_string())?,
+        );
+        let mut peers = PeerBook::load(&b.home)?;
+        peers.remove(&previous.to_string());
+        peers.save(&b.home)?;
+    }
+    // Address hints and the new public key are published before syncing resumes.
     trust(&b, &a, "a").await?;
+    drop(activation);
 
     companion
         .wait_for(Duration::from_secs(30), |phase| phase.is_active())

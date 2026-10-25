@@ -119,6 +119,9 @@ error_codes! {
     PairingExchangeInactive => "pairing_exchange_inactive", Refusal;
     RequestIdConflict => "request_id_conflict", Usage;
     CancellationTimeout => "cancellation_timeout", Fault;
+    IdentityMismatch => "identity_mismatch", Usage;
+    IdentityBusy => "identity_busy", Fault;
+    RestartFailed => "restart_failed", Fault;
     InvalidArgument => "invalid_argument", Usage;
 }
 
@@ -166,6 +169,7 @@ pub struct FabricError {
     message: String,
     peer: Option<String>,
     service: Option<String>,
+    identity: Option<(String, String)>,
 }
 
 impl FabricError {
@@ -175,6 +179,7 @@ impl FabricError {
             message: message.into(),
             peer: None,
             service: None,
+            identity: None,
         }
     }
 
@@ -187,6 +192,11 @@ impl FabricError {
     /// The service (protocol) the failure concerns.
     pub fn service(mut self, service: impl Into<String>) -> Self {
         self.service = Some(service.into());
+        self
+    }
+
+    pub fn identity(mut self, previous: impl Into<String>, active: impl Into<String>) -> Self {
+        self.identity = Some((previous.into(), active.into()));
         self
     }
 
@@ -355,7 +365,7 @@ pub fn render(error: &anyhow::Error, json: bool) -> Report {
     let found = find(error);
     let message = without_tokens(&format!("{error:#}"));
     let stdout = json.then(|| {
-        json!({
+        let mut object = json!({
             "error": {
                 "code": code.as_str(),
                 "class": code.class().as_str(),
@@ -363,8 +373,12 @@ pub fn render(error: &anyhow::Error, json: bool) -> Report {
                 "peer": found.and_then(FabricError::peer_name),
                 "service": found.and_then(FabricError::service_name),
             }
-        })
-        .to_string()
+        });
+        if let Some((previous, active)) = found.and_then(|error| error.identity.as_ref()) {
+            object["error"]["previous"] = previous.clone().into();
+            object["error"]["active"] = active.clone().into();
+        }
+        object.to_string()
     });
     Report {
         stderr: format!("Error: {}", code.reason(&message)),

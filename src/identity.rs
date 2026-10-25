@@ -1,0 +1,404 @@
+//! Local identity rotation. Only identity.toml is authoritative for the active key.
+use std::{fs::{self, File, OpenOptions}, io::Write, os::{fd::AsRawFd, unix::fs::OpenOptionsExt}, path::{Path, PathBuf}, time::{SystemTime, UNIX_EPOCH}};
+use anyhow::{Context, Result};
+use iroh::EndpointId;
+use serde::Serialize;
+use crate::{config::{FabricHome, generate_identity_file, load_or_create_identity}, error::{ErrorCode, FabricError}};
+
+const RETENTION_SECONDS: u64 = 600;
+
+/// An advisory lock shared by every identity operation, including status.
+pub struct IdentityLock(File);
+impl IdentityLock {
+    pub fn acquire(home: &FabricHome) -> Result<Self> {
+        home.prepare()?;
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(home.root().join("identity.lock"))?;
+        // SAFETY: flock borrows a live descriptor and does not retain pointers.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(FabricError::new(ErrorCode::IdentityBusy, "another identity operation is in progress").into());
+            }
+            return Err(error.into());
+        }
+        Ok(Self(file))
+    }
+}
+impl Drop for IdentityLock {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor remains live until after this call.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN); }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct Status {
+    pub current: EndpointId,
+    pub next: Option<EndpointId>,
+    pub state: &'static str,
+}
+#[derive(Debug, Serialize)]
+pub struct Prepared {
+    pub current: EndpointId,
+    pub next: EndpointId,
+}
+#[derive(Debug, Serialize)]
+pub struct Activated {
+    pub previous: EndpointId,
+    pub active: EndpointId,
+    pub outcome: &'static str,
+}
+fn pending(home: &FabricHome) -> PathBuf { home.root().join("identity.next.toml") }
+fn sync_home(home: &FabricHome) -> Result<()> { File::open(home.root())?.sync_all().context("sync identity directory") }
+fn read_id(path: &Path) -> Result<EndpointId> {
+    #[derive(serde::Deserialize)]
+    struct Key { secret_key: iroh::SecretKey }
+    let key: Key = toml::from_str(&fs::read_to_string(path)?)
+        .map_err(|_| anyhow::anyhow!("invalid identity key file {}", path.display()))?;
+    Ok(key.secret_key.public())
+}
+fn snapshot(home: &FabricHome) -> Result<Status> {
+    let current = read_id(&home.identity_path())?;
+    let next = match read_id(&pending(home)) {
+        Ok(id) => Some(id),
+        Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) => None,
+        Err(error) => return Err(error),
+    };
+    Ok(Status { current, next, state: if next.is_some() { "prepared" } else { "active" } })
+}
+pub fn status(home: &FabricHome) -> Result<Status> {
+    let _lock = IdentityLock::acquire(home)?;
+    load_or_create_identity(home)?;
+    cleanup_retired_locked(home, now())?;
+    snapshot(home)
+}
+pub fn prepare(home: &FabricHome) -> Result<Prepared> {
+    let _lock = IdentityLock::acquire(home)?;
+    cleanup_retired_locked(home, now())?;
+    load_or_create_identity(home)?;
+    File::open(home.identity_path())?.sync_all()?;
+    sync_home(home)?;
+    let state = snapshot(home)?;
+    if let Some(next) = state.next { return Ok(Prepared { current: state.current, next }); }
+    let temporary = home.root().join("identity.next.tmp");
+    // A crash before publication may leave only this unreferenced staging file.
+    match fs::remove_file(&temporary) { Ok(()) => {}, Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}, Err(e) => return Err(e.into()) }
+    let next = generate_identity_file(&temporary)?;
+    File::open(&temporary)?.sync_all()?;
+    fs::rename(&temporary, pending(home))?;
+    sync_home(home)?;
+    Ok(Prepared { current: state.current, next })
+}
+
+/// The lock remains held across the caller's restart barrier. A retry after the
+/// rename never writes a key: it only asks the caller to reconcile the daemon.
+pub struct Activation {
+    pub result: Activated,
+    durability_error: Option<anyhow::Error>,
+    _lock: IdentityLock,
+}
+fn check_guards(home: &FabricHome, current: EndpointId, next: EndpointId) -> Result<bool> {
+    let state = snapshot(home)?;
+    if state.current == next { return Ok(true); }
+    if state.current != current || state.next != Some(next) || current == next {
+        return Err(FabricError::new(ErrorCode::IdentityMismatch, "identity does not match --expect-current and --expect-next; nothing changed").into());
+    }
+    Ok(false)
+}
+pub fn activate(home: &FabricHome, expected_current: EndpointId, expected_next: EndpointId) -> Result<Activation> {
+    let lock = IdentityLock::acquire(home)?;
+    let already = check_guards(home, expected_current, expected_next)?;
+    activate_locked(home, expected_current, expected_next, already, lock)
+}
+fn activate_locked(home: &FabricHome, expected_current: EndpointId, expected_next: EndpointId, already: bool, lock: IdentityLock) -> Result<Activation> {
+    if already {
+        return Ok(Activation { result: Activated { previous: expected_current, active: expected_next, outcome: "already_active" }, durability_error: sync_home(home).err(), _lock: lock });
+    }
+    // Retain the old secret before the only authoritative swap. The retired
+    // copy is never read as a serving key, even after a failed restart.
+    let retired = home.root().join(format!("identity.retired.{}.{}.toml", now().saturating_add(RETENTION_SECONDS), expected_current));
+    match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&retired) {
+        Ok(mut file) => {
+            file.write_all(&fs::read(home.identity_path())?)?;
+            file.sync_all()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            anyhow::ensure!(read_id(&retired)? == expected_current, "retired identity does not match current key");
+        }
+        Err(error) => return Err(error.into()),
+    }
+    // This is intent, not a second identity authority: startup acts on it only
+    // when identity.toml already contains expected_next.
+    let intent = home.root().join("identity.activation");
+    let mut file = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(intent)?;
+    file.write_all(expected_next.to_string().as_bytes())?;
+    file.sync_all()?;
+    sync_home(home)?;
+    fs::rename(pending(home), home.identity_path())?;
+    // Once rename succeeded, the caller must retire the old daemon even when
+    // the directory durability barrier fails.
+    let durability_error = sync_home(home).err();
+    Ok(Activation { result: Activated { previous: expected_current, active: expected_next, outcome: "activated" }, durability_error, _lock: lock })
+}
+fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() }
+fn cleanup_retired_locked(home: &FabricHome, timestamp: u64) -> Result<Option<u64>> {
+    let mut changed = false;
+    let mut next_deadline: Option<u64> = None;
+    for entry in fs::read_dir(home.root())? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix("identity.retired.") else { continue };
+        let Some((expiry, suffix)) = rest.split_once('.') else { continue };
+        let Some(id) = suffix.strip_suffix(".toml") else { continue };
+        if id.parse::<EndpointId>().is_err() { continue }
+        let Ok(deadline) = expiry.parse::<u64>() else { continue };
+        if timestamp >= deadline {
+            fs::remove_file(entry.path())?;
+            changed = true;
+        } else {
+            next_deadline = Some(next_deadline.map_or(deadline, |next| next.min(deadline)));
+        }
+    }
+    if changed { sync_home(home)?; }
+    Ok(next_deadline)
+}
+pub fn cleanup_retired(home: &FabricHome) -> Result<()> {
+    let _lock = IdentityLock::acquire(home)?;
+    cleanup_retired_locked(home, now()).map(|_| ())
+}
+
+/// Run only during exclusive daemon startup, before restoring configuration.
+/// A crash before the rename leaves the old key and does not retire its dials.
+pub fn reconcile_startup(home: &FabricHome) -> Result<()> {
+    let path = home.root().join("identity.activation");
+    let expected = match fs::read_to_string(&path) {
+        Ok(value) => value.parse::<EndpointId>()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if read_id(&home.identity_path())? != expected { return Ok(()); }
+    let mut config = crate::config::FabricConfig::load(home)?;
+    let dials: Vec<_> = config.dials().iter().map(|dial| (dial.peer.clone(), dial.protocol.clone())).collect();
+    for (peer, protocol) in dials { config.remove_dial(&peer, &protocol); }
+    config.save(home)?;
+    File::open(home.config_path())?.sync_all()?;
+    sync_home(home)?;
+    fs::remove_file(path)?;
+    sync_home(home)
+}
+
+pub async fn activate_with_restart<P, PFut, F, Fut>(home: &FabricHome, current: EndpointId, next: EndpointId, preserve: P, restart: F) -> Result<Activated>
+where P: FnOnce() -> PFut, PFut: Future<Output = Result<()>>, F: FnOnce() -> Fut, Fut: Future<Output = Result<()>> {
+    let lock = IdentityLock::acquire(home)?;
+    let already = check_guards(home, current, next)?;
+    if !already { preserve().await?; }
+    let activation = activate_locked(home, current, next, already, lock)?;
+    restart().await.map_err(|error| FabricError::new(
+        ErrorCode::RestartFailed,
+        format!("identity changed; retry the same guarded activation to restart: {error:#}"),
+    ).identity(current.to_string(), next.to_string()))?;
+    if let Some(error) = activation.durability_error {
+        return Err(FabricError::new(ErrorCode::RestartFailed, format!("identity renamed but directory durability could not be confirmed: {error:#}; retry the same activation"))
+            .identity(current.to_string(), next.to_string()).into());
+    }
+    finish_startup_snapshot(home)?;
+    Ok(activation.result)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct RuntimeSnapshot {
+    pub next: EndpointId,
+    pub exposures: Vec<crate::config::PersistedExpose>,
+}
+pub fn write_runtime_snapshot(home: &FabricHome, next: EndpointId, exposures: Vec<crate::config::PersistedExpose>) -> Result<()> {
+    let bytes = serde_json::to_vec(&RuntimeSnapshot { next, exposures })?;
+    let path = home.root().join("identity.exposures");
+    let temporary = home.root().join("identity.exposures.tmp");
+    let mut file = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    fs::rename(temporary, path)?;
+    sync_home(home)
+}
+pub fn inherited_exposures(home: &FabricHome) -> Result<Vec<crate::config::PersistedExpose>> {
+    let path = home.root().join("identity.exposures");
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let snapshot: RuntimeSnapshot = serde_json::from_slice(&bytes)?;
+    if snapshot.next == read_id(&home.identity_path())? { Ok(snapshot.exposures) } else { Ok(Vec::new()) }
+}
+pub fn finish_startup_snapshot(home: &FabricHome) -> Result<()> {
+    match fs::remove_file(home.root().join("identity.exposures")) {
+        Ok(()) => sync_home(home),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Persist the actual launch mode, not the mere presence of an old policy file.
+pub fn record_runtime_mode(home: &FabricHome, enabled: bool) -> Result<()> {
+    let path = home.root().join("identity.runtime-peers");
+    if enabled {
+        let file = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+        file.sync_all()?;
+    } else {
+        match fs::remove_file(path) {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error.into()),
+        }
+    }
+    sync_home(home)
+}
+
+pub async fn retired_key_cleanup(home: FabricHome, cancel: tokio_util::sync::CancellationToken) {
+    loop {
+        if cancel.is_cancelled() { return; }
+        let root = home.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let _lock = IdentityLock::acquire(&root)?;
+            cleanup_retired_locked(&root, now())
+        }).await;
+        let delay = match result {
+            // Every activation restarts the daemon, so a daemon with no retired
+            // keys needs no polling task.
+            Ok(Ok(None)) => return,
+            Ok(Ok(Some(deadline))) => std::time::Duration::from_secs(deadline.saturating_sub(now()).max(1)),
+            Ok(Err(error)) if crate::error::code_of(&error) == ErrorCode::IdentityBusy => std::time::Duration::from_millis(100),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "retired identity cleanup failed");
+                std::time::Duration::from_secs(1)
+            },
+            Err(error) => {
+                tracing::warn!(%error, "retired identity cleanup worker failed");
+                std::time::Duration::from_secs(1)
+            },
+        };
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(delay) => {},
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn prepare_is_durable_private_and_idempotent() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let first = prepare(&home)?;
+        let second = prepare(&home)?;
+        assert_eq!(first.next, second.next);
+        assert_eq!(first.current, second.current);
+        assert_eq!(status(&home)?.state, "prepared");
+        assert_eq!(fs::metadata(pending(&home))?.permissions().mode() & 0o777, 0o600);
+        assert_eq!(load_or_create_identity(&home)?.public(), first.current);
+        Ok(())
+    }
+    #[test]
+    fn activation_swap_crash_recovery_and_lost_reply_do_not_reswap() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let prepared = prepare(&home)?;
+        let activation = activate(&home, prepared.current, prepared.next)?;
+        assert_eq!(activation.result.outcome, "activated");
+        drop(activation); // crash before restart
+        assert_eq!(status(&home)?.current, prepared.next);
+        assert_eq!(status(&home)?.state, "active");
+        let before = fs::read(home.identity_path())?;
+        let retry = activate(&home, prepared.current, prepared.next)?;
+        assert_eq!(retry.result.outcome, "already_active");
+        assert_eq!(fs::read(home.identity_path())?, before);
+        Ok(())
+    }
+    #[test]
+    fn mismatch_changes_nothing_and_operations_are_busy_while_locked() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let prepared = prepare(&home)?;
+        let before = fs::read(home.identity_path())?;
+        let wrong = iroh::SecretKey::generate().public();
+        assert_eq!(crate::error::code_of(&activate(&home, wrong, prepared.next).err().unwrap()), ErrorCode::IdentityMismatch);
+        assert_eq!(fs::read(home.identity_path())?, before);
+        assert_eq!(status(&home)?.next, Some(prepared.next));
+        let _lock = IdentityLock::acquire(&home)?;
+        assert_eq!(crate::error::code_of(&prepare(&home).err().unwrap()), ErrorCode::IdentityBusy);
+        Ok(())
+    }
+    #[test]
+    fn retired_secret_expires_without_touching_active_or_policy() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let prepared = prepare(&home)?;
+        let _activation = activate(&home, prepared.current, prepared.next)?;
+        let active = fs::read(home.identity_path())?;
+        let retired: Vec<_> = fs::read_dir(home.root())?.filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().starts_with("identity.retired.")).collect();
+        assert_eq!(retired.len(), 1);
+        cleanup_retired_locked(&home, now().saturating_add(RETENTION_SECONDS))?;
+        assert!(!retired[0].path().exists());
+        assert_eq!(fs::read(home.identity_path())?, active);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_failure_has_both_ids_and_retry_only_restarts() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let prepared = prepare(&home)?;
+        let error = activate_with_restart(&home, prepared.current, prepared.next, || async { Ok(()) }, || async {
+            anyhow::bail!("injected restart failure")
+        }).await.unwrap_err();
+        assert_eq!(crate::error::code_of(&error), ErrorCode::RestartFailed);
+        let report = crate::error::render(&error, true);
+        let json: serde_json::Value = serde_json::from_str(report.stdout.as_deref().unwrap())?;
+        assert_eq!(json["error"]["previous"], prepared.current.to_string());
+        assert_eq!(json["error"]["active"], prepared.next.to_string());
+        assert_eq!(status(&home)?.current, prepared.next);
+        let active = fs::read(home.identity_path())?;
+        let result = activate_with_restart(&home, prepared.current, prepared.next, || async { anyhow::bail!("retry must not preserve again") }, || async {
+            assert_eq!(load_or_create_identity(&home)?.public(), prepared.next);
+            Ok(())
+        }).await?;
+        assert_eq!(result.outcome, "already_active");
+        assert_eq!(fs::read(home.identity_path())?, active);
+        Ok(())
+    }
+
+    #[test]
+    fn startup_retires_dials_but_preserves_all_other_home_consumers() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let prepared = prepare(&home)?;
+        let peer = iroh::SecretKey::generate().public();
+        let config: crate::config::FabricConfig = toml::from_str(&format!(
+            "[[exposes]]\nprotocol = 'web'\nsocket = '/tmp/web.sock'\n[[dials]]\npeer = '{peer}'\nprotocol = 'web'\n"
+        ))?;
+        config.save(&home)?;
+        let original: toml::Value = toml::from_str(&fs::read_to_string(home.config_path())?)?;
+        let preserved = ["peers.toml", "runtime-peers.toml", "audit.jsonl", "syncs.toml"];
+        for filename in preserved {
+            fs::write(home.root().join(filename), format!("unchanged {filename}"))?;
+        }
+        let activation = activate(&home, prepared.current, prepared.next)?;
+        reconcile_startup(&home)?;
+        assert!(crate::config::FabricConfig::load(&home)?.dials().is_empty());
+        let after: toml::Value = toml::from_str(&fs::read_to_string(home.config_path())?)?;
+        let mut expected = original;
+        expected["dials"] = toml::Value::Array(Vec::new());
+        assert_eq!(after, expected);
+        for filename in preserved {
+            assert_eq!(fs::read_to_string(home.root().join(filename))?, format!("unchanged {filename}"));
+        }
+        assert!(!home.root().join("identity.activation").exists());
+        drop(activation);
+        Ok(())
+    }
+}

@@ -591,6 +591,43 @@ pub fn ensure_unsupervised_restart(home: &FabricHome) -> Result<()> {
     )
 }
 
+/// Restart a native owner without replacing its definition or changing enablement.
+/// Returns false only when the selected home has no native owner.
+pub fn restart_identity_service(home: &FabricHome) -> Result<bool> {
+    if !home.is_default_state_root() {
+        return Ok(false);
+    }
+    match service_enablement() {
+        ServiceEnablement::NotInstalled => return Ok(false),
+        ServiceEnablement::Unknown => bail!("cannot establish native service ownership"),
+        ServiceEnablement::Enabled | ServiceEnablement::PresentNotEnabled => {}
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let companion = match sync_service_enablement() {
+            ServiceEnablement::NotInstalled => false,
+            ServiceEnablement::Unknown => bail!("cannot establish sync service ownership"),
+            _ => true,
+        };
+        let (program, args) = systemd_restart_argv(companion);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = Command::new(program).args(args).output()?;
+        if !output.status.success() {
+            bail!("native restart failed: {}", String::from_utf8_lossy(&output.stderr));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("launchctl").args(["kickstart", "-k", &launchd_service_target()]).output()?;
+        if !output.status.success() {
+            bail!("native restart failed: {}", String::from_utf8_lossy(&output.stderr));
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    bail!("native identity restart is unsupported on this platform");
+    Ok(true)
+}
+
 fn restart_ownership_decision(
     enablement: ServiceEnablement,
     native_restart_command: &str,

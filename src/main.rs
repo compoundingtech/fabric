@@ -71,6 +71,11 @@ enum CaCommands {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Prepare, inspect, or activate this machine's transport identity.
+    Identity {
+        #[command(subcommand)]
+        command: IdentityCommands,
+    },
     /// Manage fabric identity key files.
     Key {
         #[command(subcommand)]
@@ -495,6 +500,21 @@ enum KeyCommands {
 }
 
 #[derive(Debug, Subcommand)]
+enum IdentityCommands {
+    /// Durably prepare a new identity without changing the running daemon.
+    Prepare,
+    /// Inspect the authoritative active and prepared keys.
+    Status,
+    /// Activate only after peers trust the prepared NodeID.
+    Activate {
+        #[arg(long)]
+        expect_current: iroh::EndpointId,
+        #[arg(long)]
+        expect_next: iroh::EndpointId,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum ServiceCommands {
     /// Install and start a user service for the foreground daemon.
     Install {
@@ -627,6 +647,39 @@ async fn run(cli: Cli) -> Result<()> {
             let home = FabricHome::resolve(cli.home)?;
             match command {
                 Commands::Key { .. } => unreachable!("key commands are handled before home setup"),
+                Commands::Identity { command } => {
+                    match command {
+                        IdentityCommands::Prepare => {
+                            let prepared = fabric::identity::prepare(&home)?;
+                            if json { print_json(&serde_json::to_value(&prepared)?)?; }
+                            else { println!("current\t{}\nnext\t{}", prepared.current, prepared.next); }
+                        }
+                        IdentityCommands::Status => {
+                            let status = fabric::identity::status(&home)?;
+                            if json { print_json(&serde_json::to_value(&status)?)?; }
+                            else { println!("current\t{}\nnext\t{}\nstate\t{}", status.current, status.next.map(|id| id.to_string()).unwrap_or_else(|| "-".into()), status.state); }
+                        }
+                        IdentityCommands::Activate { expect_current, expect_next } => {
+                            let activated = fabric::identity::activate_with_restart(&home, expect_current, expect_next, || async {
+                                if !fabric::daemon::daemon_lock_available(&home)? {
+                                    send_control(&home, ControlRequest::IdentitySnapshot { current: expect_current, next: expect_next }).await?;
+                                }
+                                Ok(())
+                            }, || async {
+                                if let Err(error) = reconcile_identity_daemon(&home, expect_next).await {
+                                    // Do not silently leave an old endpoint serving after failure.
+                                    let _ = tokio::time::timeout(Duration::from_secs(5), send_control(&home, ControlRequest::Shutdown)).await;
+                                    wait_for_daemon_stop(&home, Duration::from_secs(15)).await
+                                        .context(format!("restart failed ({error:#}); stopping old daemon also failed"))?;
+                                    return Err(error);
+                                }
+                                Ok(())
+                            }).await?;
+                            if json { print_json(&serde_json::to_value(&activated)?)?; }
+                            else { println!("previous\t{}\nactive\t{}\noutcome\t{}", activated.previous, activated.active, activated.outcome); }
+                        }
+                    }
+                }
                 Commands::Id => {
                     let key = load_or_create_identity(&home)?;
                     if json {
@@ -3059,6 +3112,33 @@ fn run_restart_detacher(home: &FabricHome, _allow_shell: bool, runtime_peers: bo
     Ok(())
 }
 
+/// Reconcile, never roll back, after the authoritative identity rename.
+async fn reconcile_identity_daemon(home: &FabricHome, expected: iroh::EndpointId) -> Result<()> {
+    let expected = expected.to_string();
+    if matches!(send_control(home, ControlRequest::Status).await, Ok(ControlResponse::Status { node_id, .. }) if node_id == expected) {
+        return Ok(());
+    }
+    if service::restart_identity_service(home)? {
+        // The native supervisor owns the replacement, including companion state.
+    } else if fabric::daemon::daemon_lock_available(home)? {
+        // A crash after rename may leave no daemon to accept a Restart request.
+        // Preserve the daemon's opt-in runtime policy mode recorded before swap.
+        let runtime_peers = home.root().join("identity.runtime-peers").exists();
+        spawn_daemon_with_output(home, DaemonOptions { runtime_peers, ..DaemonOptions::default() }, false).await?;
+    } else {
+        send_control(home, ControlRequest::Restart { allow_shell: None }).await?;
+    }
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if matches!(send_control(home, ControlRequest::Status).await, Ok(ControlResponse::Status { node_id, .. }) if node_id == expected) {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }).await.context("new identity did not become live within 30 seconds")??;
+    Ok(())
+}
+
 async fn run_restart_helper(
     home: &FabricHome,
     _allow_shell: bool,
@@ -3566,8 +3646,12 @@ async fn request_shell_socket(home: &FabricHome, peer: &str) -> Result<PathBuf> 
 }
 
 async fn spawn_daemon(home: &FabricHome, options: DaemonOptions) -> Result<()> {
+    spawn_daemon_with_output(home, options, true).await
+}
+
+async fn spawn_daemon_with_output(home: &FabricHome, options: DaemonOptions, announce: bool) -> Result<()> {
     if send_control(home, ControlRequest::Status).await.is_ok() {
-        println!("already running");
+        if announce { println!("already running"); }
         return Ok(());
     }
 
@@ -3607,7 +3691,7 @@ async fn spawn_daemon(home: &FabricHome, options: DaemonOptions) -> Result<()> {
     let started = Instant::now();
     loop {
         if send_control(home, ControlRequest::Status).await.is_ok() {
-            println!("started");
+            if announce { println!("started"); }
             return Ok(());
         }
         if started.elapsed() > Duration::from_secs(10) {
