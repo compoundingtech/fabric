@@ -184,12 +184,14 @@ pub fn reconcile_startup(home: &FabricHome) -> Result<()> {
     sync_home(home)
 }
 
-pub async fn activate_with_restart<P, PFut, F, Fut>(home: &FabricHome, current: EndpointId, next: EndpointId, preserve: P, restart: F) -> Result<Activated>
-where P: FnOnce() -> PFut, PFut: Future<Output = Result<()>>, F: FnOnce() -> Fut, Fut: Future<Output = Result<()>> {
+pub async fn activate_with_restart<P, PFut, G, F, Fut>(home: &FabricHome, current: EndpointId, next: EndpointId, preserve: P, restart: F) -> Result<Activated>
+where P: FnOnce() -> PFut, PFut: Future<Output = Result<G>>, F: FnOnce() -> Fut, Fut: Future<Output = Result<()>> {
     let lock = IdentityLock::acquire(home)?;
     let already = check_guards(home, current, next)?;
-    if !already { preserve().await?; }
+    // A preserved daemon lease excludes concurrent startup through the rename.
+    let startup_guard = if !already { Some(preserve().await?) } else { None };
     let activation = activate_locked(home, current, next, already, lock)?;
+    drop(startup_guard);
     restart().await.map_err(|error| FabricError::new(
         ErrorCode::RestartFailed,
         format!("identity changed; retry the same guarded activation to restart: {error:#}"),
@@ -384,7 +386,7 @@ mod tests {
         let prepared = prepare(&home)?;
         let peer = iroh::SecretKey::generate().public();
         let config: crate::config::FabricConfig = toml::from_str(&format!(
-            "[[exposes]]\nprotocol = 'web'\nsocket = '/tmp/web.sock'\n[[dials]]\npeer = '{peer}'\nprotocol = 'web'\n"
+            "[[exposes]]\nprotocol = 'web'\ntype = 'socket'\nsocket = '/tmp/web.sock'\n[[dials]]\npeer = '{peer}'\nprotocol = 'web'\n"
         ))?;
         config.save(&home)?;
         let original: toml::Value = toml::from_str(&fs::read_to_string(home.config_path())?)?;
@@ -414,13 +416,38 @@ mod tests {
         let prepared = prepare(&home)?;
         let before = fs::read(home.identity_path())?;
         let error = activate_with_restart(&home, prepared.current, prepared.next,
-            || async { anyhow::bail!("old daemon stop barrier failed") },
+            || async { Err::<(), _>(anyhow::anyhow!("old daemon stop barrier failed")) },
             || async { panic!("must not restart or rename after a failed stop barrier") },
         ).await.unwrap_err();
         assert!(error.to_string().contains("stop barrier"));
         assert_eq!(fs::read(home.identity_path())?, before);
         assert_eq!(status(&home)?.state, "prepared");
         assert_eq!(status(&home)?.next, Some(prepared.next));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_lease_spans_rename_and_is_released_before_restart() -> Result<()> {
+        struct Guard { lease: Option<File>, home: FabricHome, next: EndpointId }
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                assert_eq!(read_id(&self.home.identity_path()).unwrap(), self.next);
+                assert!(crate::daemon::try_daemon_lease(&self.home).unwrap().is_none());
+                self.lease.take();
+            }
+        }
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let prepared = prepare(&home)?;
+        activate_with_restart(&home, prepared.current, prepared.next,
+            || async {
+                Ok(Guard { lease: crate::daemon::try_daemon_lease(&home)?, home: home.clone(), next: prepared.next })
+            },
+            || async {
+                assert!(crate::daemon::try_daemon_lease(&home)?.is_some());
+                Ok(())
+            },
+        ).await?;
         Ok(())
     }
 

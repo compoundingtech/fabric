@@ -3482,6 +3482,11 @@ struct DaemonLease {
 }
 
 pub fn daemon_lock_available(home: &FabricHome) -> Result<bool> {
+    Ok(try_daemon_lease(home)?.is_some())
+}
+
+/// Retain the returned file to exclude daemon startup until the identity swap.
+pub fn try_daemon_lease(home: &FabricHome) -> Result<Option<std::fs::File>> {
     let path = home.root().join("run/daemon.lock");
     home.prepare()?;
     let file = OpenOptions::new()
@@ -3493,10 +3498,10 @@ pub fn daemon_lock_available(home: &FabricHome) -> Result<bool> {
     {
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
-            return Ok(false);
+            return Ok(None);
         }
     }
-    Ok(true)
+    Ok(Some(file))
 }
 
 pub fn restart_down_decision(status_ok: bool, lease_available: bool) -> bool {
