@@ -159,9 +159,11 @@ fabric identity status --json
 # {"current":"<new>","next":null,"state":"active"}
 ```
 
-Activation uses one atomic rename, then restarts via the existing native
-supervisor or unsupervised restart helper. Success waits for the live daemon to
-report the new NodeID. Lost-reply retries with the same guards return
+Activation fences exposure changes and stops the old daemon before the single
+atomic rename, then starts the replacement through the existing native supervisor
+or standalone launch path. Success waits for the live daemon to report the new
+NodeID. A failed old-daemon stop leaves the identity prepared. Lost-reply retries
+with the same guards return
 `already_active`; they never swap again. A mismatched guard returns
 `identity_mismatch` without changing the identity. Concurrent identity operations
 return `identity_busy` rather than waiting behind a restart.
@@ -169,15 +171,17 @@ return `identity_busy` rather than waiting behind a restart.
 After a crash, `status` reports either `prepared` (old key plus pending new key)
 or `active` (the rename completed). `restart_failed` is non-zero and includes
 `previous` and `active` in the JSON error. Repeat the same activate command to
-retry only daemon reconciliation; do not restore the old key. A failed restart
-stops the old daemon rather than leaving it serving.
+retry only daemon reconciliation; do not restore the old key. The old daemon
+has already stopped before a post-rename restart can fail.
 
 Static and runtime peer policy, exposure declarations, retained transaction and
 revocation receipts, and the audit log remain in the same home. Tunnel sessions,
 mux connections, queued dials, and persisted dial declarations bound to the old
 local NodeID are retired; consumers explicitly establish new dials. Persisted and
 ephemeral exposures are carried across this restart without making ephemeral ones
-permanent. Sync author identity is the
+permanent: replacement startup consumes the one-start handoff even if the
+activating CLI crashes. Exposure mutations after the snapshot return
+`identity_busy` until shutdown. Sync author identity is the
 NodeID byte-for-byte: the companion stops its old-author engine and starts a
 new-author engine over the existing sync history and files.
 

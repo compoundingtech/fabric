@@ -111,8 +111,11 @@ async fn identity_activation_retires_old_transport_and_dials_preserving_policy_a
     assert!(tokio::time::timeout(Duration::from_millis(200), queued.read(&mut queued_byte)).await.is_err(), "second outgoing dial was not queued behind the one-session cap");
     assert!(!FabricConfig::load(&server_home)?.dials().is_empty());
     send_control(&server_home, ControlRequest::IdentitySnapshot { current: prepared.current, next: prepared.next }).await?;
-    let activation = fabric::identity::activate(&server_home, prepared.current, prepared.next)?;
+    let withdrawal = server.unexpose("tcp-echo").await.unwrap_err();
+    assert_eq!(fabric::error::code_of(&withdrawal), fabric::error::ErrorCode::IdentityBusy);
     server.shutdown().await?;
+    let activation = fabric::identity::activate(&server_home, prepared.current, prepared.next)?;
+    // The original daemon has stopped before the authoritative key rename.
     let mut byte = [0];
     let closed = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut byte)).await?;
     assert!(matches!(closed, Ok(0) | Err(_)), "old tunnel remained usable");
@@ -151,13 +154,13 @@ async fn identity_activation_retires_old_transport_and_dials_preserving_policy_a
     let mut after = [0; 5];
     tokio::time::timeout(LOCAL_IO_TIMEOUT, fresh.read_exact(&mut after)).await??;
     assert_eq!(&after, b"after");
-    fabric::identity::finish_startup_snapshot(&server_home)?;
     drop(activation);
     server.shutdown().await?;
     let server = FabricNode::start_with_daemon_options(server_home.clone(), DaemonOptions { runtime_peers: true, ..DaemonOptions::default() }).await?;
     let ControlResponse::Status { exposed_protocols, .. } = send_control(&server_home, ControlRequest::Status).await? else { bail!("expected ordinary restart status") };
     assert!(exposed_protocols.iter().any(|protocol| protocol == "tcp-echo"));
     assert!(!exposed_protocols.iter().any(|protocol| protocol == "ephemeral-echo"), "activation made an ephemeral exposure permanent");
+    assert!(!server_home.root().join("identity.exposures").exists(), "replacement startup did not consume the one-start handoff");
     server.shutdown().await?;
     client.shutdown().await?;
     service.abort();

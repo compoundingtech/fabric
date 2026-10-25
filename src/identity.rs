@@ -98,9 +98,9 @@ pub struct Activation {
     _lock: IdentityLock,
 }
 fn check_guards(home: &FabricHome, current: EndpointId, next: EndpointId) -> Result<bool> {
-    let state = snapshot(home)?;
-    if state.current == next { return Ok(true); }
-    if state.current != current || state.next != Some(next) || current == next {
+    let active = read_id(&home.identity_path())?;
+    if active == next { return Ok(true); }
+    if active != current || current == next || read_id(&pending(home)).ok() != Some(next) {
         return Err(FabricError::new(ErrorCode::IdentityMismatch, "identity does not match --expect-current and --expect-next; nothing changed").into());
     }
     Ok(false)
@@ -129,11 +129,7 @@ fn activate_locked(home: &FabricHome, expected_current: EndpointId, expected_nex
     }
     // This is intent, not a second identity authority: startup acts on it only
     // when identity.toml already contains expected_next.
-    let intent = home.root().join("identity.activation");
-    let mut file = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(intent)?;
-    file.write_all(expected_next.to_string().as_bytes())?;
-    file.sync_all()?;
-    sync_home(home)?;
+    write_private_atomic(home, "identity.activation", expected_next.to_string().as_bytes())?;
     fs::rename(pending(home), home.identity_path())?;
     // Once rename succeeded, the caller must retire the old daemon even when
     // the directory durability barrier fails.
@@ -202,7 +198,6 @@ where P: FnOnce() -> PFut, PFut: Future<Output = Result<()>>, F: FnOnce() -> Fut
         return Err(FabricError::new(ErrorCode::RestartFailed, format!("identity renamed but directory durability could not be confirmed: {error:#}; retry the same activation"))
             .identity(current.to_string(), next.to_string()).into());
     }
-    finish_startup_snapshot(home)?;
     Ok(activation.result)
 }
 
@@ -213,8 +208,11 @@ pub struct RuntimeSnapshot {
 }
 pub fn write_runtime_snapshot(home: &FabricHome, next: EndpointId, exposures: Vec<crate::config::PersistedExpose>) -> Result<()> {
     let bytes = serde_json::to_vec(&RuntimeSnapshot { next, exposures })?;
-    let path = home.root().join("identity.exposures");
-    let temporary = home.root().join("identity.exposures.tmp");
+    write_private_atomic(home, "identity.exposures", &bytes)
+}
+fn write_private_atomic(home: &FabricHome, name: &str, bytes: &[u8]) -> Result<()> {
+    let path = home.root().join(name);
+    let temporary = path.with_extension("tmp");
     let mut file = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&temporary)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
@@ -232,6 +230,13 @@ pub fn inherited_exposures(home: &FabricHome) -> Result<Vec<crate::config::Persi
     if snapshot.next == read_id(&home.identity_path())? { Ok(snapshot.exposures) } else { Ok(Vec::new()) }
 }
 pub fn finish_startup_snapshot(home: &FabricHome) -> Result<()> {
+    let bytes = match fs::read(home.root().join("identity.exposures")) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let snapshot: RuntimeSnapshot = serde_json::from_slice(&bytes)?;
+    if snapshot.next != read_id(&home.identity_path())? { return Ok(()); }
     match fs::remove_file(home.root().join("identity.exposures")) {
         Ok(()) => sync_home(home),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -399,6 +404,53 @@ mod tests {
         }
         assert!(!home.root().join("identity.activation").exists());
         drop(activation);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_pre_swap_stop_keeps_prepared_identity_and_never_restarts() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let prepared = prepare(&home)?;
+        let before = fs::read(home.identity_path())?;
+        let error = activate_with_restart(&home, prepared.current, prepared.next,
+            || async { anyhow::bail!("old daemon stop barrier failed") },
+            || async { panic!("must not restart or rename after a failed stop barrier") },
+        ).await.unwrap_err();
+        assert!(error.to_string().contains("stop barrier"));
+        assert_eq!(fs::read(home.identity_path())?, before);
+        assert_eq!(status(&home)?.state, "prepared");
+        assert_eq!(status(&home)?.next, Some(prepared.next));
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_pre_rename_intent_staging_does_not_block_prepared_startup() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let prepared = prepare(&home)?;
+        // A crash may interrupt a staging write, but never publishes its bytes.
+        fs::write(home.root().join("identity.tmp"), b"partial")?;
+        reconcile_startup(&home)?;
+        assert_eq!(status(&home)?.current, prepared.current);
+        assert_eq!(status(&home)?.next, Some(prepared.next));
+        drop(activate(&home, prepared.current, prepared.next)?);
+        assert_eq!(fs::read_to_string(home.root().join("identity.activation"))?, prepared.next.to_string());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_runtime_launch_does_not_enable_retained_runtime_policy() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        prepare(&home)?;
+        record_runtime_mode(&home, false)?;
+        fs::write(home.config_path(), "invalid = [")?;
+        let result = crate::daemon::FabricNode::start_with_daemon_options(home.clone(),
+            crate::daemon::DaemonOptions { runtime_peers: true, ..Default::default() },
+        ).await;
+        assert!(result.is_err());
+        assert!(!home.root().join("identity.runtime-peers").exists());
         Ok(())
     }
 }

@@ -663,18 +663,14 @@ async fn run(cli: Cli) -> Result<()> {
                             let activated = fabric::identity::activate_with_restart(&home, expect_current, expect_next, || async {
                                 if !fabric::daemon::daemon_lock_available(&home)? {
                                     send_control(&home, ControlRequest::IdentitySnapshot { current: expect_current, next: expect_next }).await?;
+                                    // Stop before the authoritative rename. Losing the control
+                                    // socket can then only leave the old key prepared, never
+                                    // a renamed home with an old endpoint still serving.
+                                    send_control(&home, ControlRequest::Shutdown).await?;
+                                    wait_for_daemon_stop(&home, Duration::from_secs(15)).await?;
                                 }
                                 Ok(())
-                            }, || async {
-                                if let Err(error) = reconcile_identity_daemon(&home, expect_next).await {
-                                    // Do not silently leave an old endpoint serving after failure.
-                                    let _ = tokio::time::timeout(Duration::from_secs(5), send_control(&home, ControlRequest::Shutdown)).await;
-                                    wait_for_daemon_stop(&home, Duration::from_secs(15)).await
-                                        .context(format!("restart failed ({error:#}); stopping old daemon also failed"))?;
-                                    return Err(error);
-                                }
-                                Ok(())
-                            }).await?;
+                            }, || reconcile_identity_daemon(&home, expect_next)).await?;
                             if json { print_json(&serde_json::to_value(&activated)?)?; }
                             else { println!("previous\t{}\nactive\t{}\noutcome\t{}", activated.previous, activated.active, activated.outcome); }
                         }
@@ -3118,15 +3114,17 @@ async fn reconcile_identity_daemon(home: &FabricHome, expected: iroh::EndpointId
     if matches!(send_control(home, ControlRequest::Status).await, Ok(ControlResponse::Status { node_id, .. }) if node_id == expected) {
         return Ok(());
     }
+    if !fabric::daemon::daemon_lock_available(home)? {
+        send_control(home, ControlRequest::Shutdown).await?;
+        wait_for_daemon_stop(home, Duration::from_secs(15)).await?;
+    }
     if service::restart_identity_service(home)? {
         // The native supervisor owns the replacement, including companion state.
-    } else if fabric::daemon::daemon_lock_available(home)? {
+    } else {
         // A crash after rename may leave no daemon to accept a Restart request.
         // Preserve the daemon's opt-in runtime policy mode recorded before swap.
         let runtime_peers = home.root().join("identity.runtime-peers").exists();
         spawn_daemon_with_output(home, DaemonOptions { runtime_peers, ..DaemonOptions::default() }, false).await?;
-    } else {
-        send_control(home, ControlRequest::Restart { allow_shell: None }).await?;
     }
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
