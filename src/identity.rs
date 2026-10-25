@@ -370,7 +370,7 @@ mod tests {
         assert_eq!(json["error"]["active"], prepared.next.to_string());
         assert_eq!(status(&home)?.current, prepared.next);
         let active = fs::read(home.identity_path())?;
-        let result = activate_with_restart(&home, prepared.current, prepared.next, || async { anyhow::bail!("retry must not preserve again") }, || async {
+        let result = activate_with_restart(&home, prepared.current, prepared.next, || async { Err::<(), _>(anyhow::anyhow!("retry must not preserve again")) }, || async {
             assert_eq!(load_or_create_identity(&home)?.public(), prepared.next);
             Ok(())
         }).await?;
