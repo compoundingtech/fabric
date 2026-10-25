@@ -44,6 +44,9 @@ Each code has a class, and the class says what a caller should do:
 | `pairing_exchange_inactive` | refusal | 77 | The attempt is not pending and cannot exchange messages. No delivery occurred; reconcile its status rather than assuming an empty success. |
 | `request_id_conflict` | usage | 2 | A retained request ID was reused with different contents. |
 | `cancellation_timeout` | fault | 69 | Policy committed, but selected work did not finish within two seconds. The receipt lists remaining admissions and sessions; policy is not rolled back. |
+| `identity_mismatch` | usage | 2 | Active or prepared identity does not match the activation guards; nothing changed. |
+| `identity_busy` | fault | 69 | Another identity operation holds the identity lock. |
+| `restart_failed` | fault | 69 | Identity changed, but the replacement daemon did not become ready. Retry the same guarded activation; never roll back the key. |
 | `invalid_argument` | usage | 2 | Fabric rejected an argument's value. |
 <!-- /codes -->
 
@@ -109,6 +112,9 @@ object, and exits with the status above:
 - `message` is the text for people.
 - `peer` is the peer as the caller named it, and `service` the service, or
   `null` when the failure concerns no single one. Both keys are always present.
+- An identity activation's `restart_failed` additionally carries `previous` and
+  `active` NodeIDs. The rename has happened; retry the same guarded activation
+  to reconcile the daemon, not to replace or roll back the key again.
 - Nothing else is printed on stdout for a failure. Stderr still carries the
   human line; do not parse it when you have the JSON.
 

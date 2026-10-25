@@ -764,7 +764,9 @@ fn load_persisted_exposures(
     services: &Services,
 ) -> Result<HashMap<Vec<u8>, Exposure>> {
     let mut exposures = HashMap::new();
-    for expose in FabricConfig::load(home)?.exposes() {
+    let config = FabricConfig::load(home)?;
+    let inherited = crate::identity::inherited_exposures(home)?;
+    for expose in config.exposes().iter().chain(inherited.iter()) {
         let alpn = validate_protocol(&expose.protocol)?;
         if matches_reserved_alpn(services, &alpn) {
             bail!(
@@ -1229,6 +1231,8 @@ impl DaemonState {
         audit: Option<crate::audit::Audit>,
     ) -> Result<Arc<Self>> {
         home.prepare()?;
+        crate::identity::reconcile_startup(&home)?;
+        crate::identity::record_runtime_mode(&home, options.runtime_peers)?;
         sweep_one_shot_dials(&home);
         let child_root = home.root().to_owned();
         let child_owner = Arc::new(
@@ -3560,6 +3564,7 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
     // The existing policy drain owns its shutdown barrier.
     let _pairing_expiry = tokio::spawn(pairing::expire_loop(state.clone()));
     let _runtime_peer_expiry = tokio::spawn(runtime_control::runtime_peer_expiry_loop(state.clone()));
+    let _retired_keys = tokio::spawn(crate::identity::retired_key_cleanup(state.home.clone(), state.cancel.clone()));
 
     let result = tokio::select! {
         result = run_control_socket(control_listener, state.clone()) => result,
@@ -4478,6 +4483,24 @@ async fn process_control_request(
         } => ControlResponse::Pairing {
             reply: pairing::remote(&state, gateway, addr, request).await,
         },
+        ControlRequest::IdentitySnapshot { current, next } => {
+            if state.id() != current {
+                return Err(FabricError::new(ErrorCode::IdentityMismatch, "running daemon identity does not match activation guard").into());
+            }
+            let exposures = state.exposures.read().await;
+            let mut snapshot = Vec::with_capacity(exposures.len());
+            for (alpn, exposure) in exposures.iter() {
+                let protocol = String::from_utf8(alpn.clone())?;
+                snapshot.push(match exposure {
+                    Exposure::Socket { path, peer_header } => PersistedExpose::socket(protocol, path.clone(), *peer_header),
+                    Exposure::Tcp { addr } => PersistedExpose::tcp(protocol, addr.clone()),
+                    Exposure::Exec { argv, limit } => PersistedExpose::exec(protocol, argv.clone(), limit.max_children()),
+                });
+            }
+            let home = state.home.clone();
+            tokio::task::spawn_blocking(move || crate::identity::write_runtime_snapshot(&home, next, snapshot)).await??;
+            ControlResponse::Ok
+        }
         ControlRequest::Status => state.status_response().await?,
         ControlRequest::ReachabilityStatus => state.reachability_status_response().await?,
         ControlRequest::PeerEvents {
