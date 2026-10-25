@@ -13,7 +13,7 @@ use iroh::{EndpointAddr, EndpointId};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::{FabricHome, Peer, PeerBook},
+    config::{ExpiryClock, FabricHome, Peer, PeerBook},
     error::{ErrorCode, FabricError},
 };
 
@@ -423,7 +423,7 @@ pub(crate) struct RuntimePeers {
     static_input: StaticInput,
     fault: Option<String>,
     pairing_clock: (u64, std::time::Instant),
-    expiry_seen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    expiry_clock: std::sync::Arc<ExpiryClock>,
     exchanges: BTreeMap<String, exchange::Exchange>,
     #[cfg(test)]
     fail_directory_sync: bool,
@@ -462,12 +462,13 @@ fn validate_token(value: &str, field: &str) -> Result<()> {
 impl RuntimePeers {
     /// A bad runtime file keeps control available with all network policy closed.
     pub fn open(home: &FabricHome) -> (Self, PeerBook) {
-        Self::open_with_ended_work(home, true, (now(), std::time::Instant::now()))
+        Self::open_with_ended_work(home, true, (now(), std::time::Instant::now()), None)
     }
     fn open_with_ended_work(
         home: &FabricHome,
         restarted: bool,
         pairing_clock: (u64, std::time::Instant),
+        expiry_clock: Option<std::sync::Arc<ExpiryClock>>,
     ) -> (Self, PeerBook) {
         let path = home.root().join("runtime-peers.toml");
         let placeholder = StaticInput {
@@ -491,7 +492,7 @@ impl RuntimePeers {
             static_input: placeholder,
             fault: None,
             pairing_clock,
-            expiry_seen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(pairing_clock.0)),
+            expiry_clock: expiry_clock.unwrap_or_else(|| std::sync::Arc::new(ExpiryClock::new(pairing_clock))),
             exchanges: BTreeMap::new(),
             #[cfg(test)]
             fail_directory_sync: false,
@@ -561,7 +562,7 @@ impl RuntimePeers {
             if now() < store.stored.expiry_last_seen {
                 let deadline = store.stored.records.iter().filter_map(|record| record.expires_at)
                     .filter_map(|deadline| u64::try_from(deadline).ok()).max().unwrap_or(0);
-                store.expiry_seen.fetch_max(deadline, std::sync::atomic::Ordering::Relaxed);
+                store.expiry_clock.timestamp(deadline);
             }
             loop {
                 let Some(transaction) = store.expired_transactions()?.into_iter().next() else { break; };
@@ -649,14 +650,15 @@ impl RuntimePeers {
     pub fn reconcile(&mut self, home: &FabricHome) -> Result<PeerBook> {
         // Reconciliation is still the same daemon lifetime. Carry the original
         // monotonic anchor into recovery, before it decides whether permits expired.
-        let (mut loaded, book) = Self::open_with_ended_work(home, false, self.pairing_clock);
+        let (mut loaded, book) = Self::open_with_ended_work(
+            home, false, self.pairing_clock, Some(self.expiry_clock.clone()),
+        );
         if let Some(error) = loaded.fault.take() {
             self.fault = Some(error.clone());
             return Err(unavailable(error));
         }
         loaded.instance = self.instance.clone();
         loaded.pairing_clock = self.pairing_clock;
-        loaded.expiry_seen.fetch_max(self.expiry_timestamp(), std::sync::atomic::Ordering::Relaxed);
         loaded.exchanges = std::mem::take(&mut self.exchanges);
         loaded.prune_exchanges();
         *self = loaded;
@@ -683,7 +685,7 @@ impl RuntimePeers {
             static_input: input,
             fault: None,
             pairing_clock: self.pairing_clock,
-            expiry_seen: self.expiry_seen.clone(),
+            expiry_clock: self.expiry_clock.clone(),
             exchanges: BTreeMap::new(),
             #[cfg(test)]
             fail_directory_sync: false,
@@ -735,7 +737,7 @@ impl RuntimePeers {
             self.compose_at(stored, deadline)
                 .map(|(book, _)| (deadline, book.into_effective_peers()))
         }).collect::<Result<Vec<_>>>()?;
-        Ok((book.with_expiry_generations(self.pairing_clock, generations, self.expiry_seen.clone()), views))
+        Ok((book.with_expiry_generations(self.expiry_clock.clone(), generations), views))
     }
 
     fn compose_at(&self, stored: &Stored, timestamp: u64) -> Result<(PeerBook, Vec<EffectivePeer>)> {
@@ -818,14 +820,16 @@ impl RuntimePeers {
 
     #[cfg(test)]
     pub(crate) fn advance_expiry_for_test(&self, timestamp: u64) {
-        self.expiry_seen.fetch_max(timestamp, std::sync::atomic::Ordering::Relaxed);
+        self.expiry_clock.timestamp(timestamp);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn elapse_expiry_for_test(&self, elapsed: std::time::Duration) {
+        self.expiry_clock.elapse_for_test(elapsed);
     }
 
     fn expiry_timestamp(&self) -> u64 {
-        let timestamp = now().max(self.stored.pairing_last_seen).max(self.stored.expiry_last_seen).max(
-            self.pairing_clock.0.saturating_add(self.pairing_clock.1.elapsed().as_secs()),
-        );
-        self.expiry_seen.fetch_max(timestamp, std::sync::atomic::Ordering::Relaxed).max(timestamp)
+        self.expiry_clock.timestamp(self.stored.pairing_last_seen.max(self.stored.expiry_last_seen))
     }
 
     /// Deterministic IDs let a caller find automatic revocation receipts.
@@ -1025,6 +1029,21 @@ impl RuntimePeers {
                 }
             }
         }
+        let mut expiry_ids = BTreeSet::new();
+        for record in &next.records {
+            if let Some(request_id) = &record.expiry_request_id {
+                if !expiry_ids.insert(request_id)
+                    || request_id == &tx.request_id
+                    || next.receipts.iter().any(|receipt| &receipt.request_id == request_id)
+                {
+                    return Err(FabricError::new(
+                        ErrorCode::RequestIdConflict,
+                        "automatic expiry request_id conflicts with a retained or reserved receipt",
+                    ).into());
+                }
+            }
+        }
+        drop(expiry_ids);
         next.records
             .sort_by(|a, b| (&a.owner, a.peer.id).cmp(&(&b.owner, b.peer.id)));
         if next.records.len() > MAX_RECORDS {
@@ -2122,6 +2141,53 @@ mod tests {
         let restarted = open(&dir);
         assert_eq!(restarted.stored.records[0].expires_at, Some(deadline));
         assert_eq!(restarted.stored.records[0].expiry_request_id.as_deref(), Some(reserved.as_str()));
+        Ok(())
+    }
+
+    #[test]
+    fn expiry_reservation_collision_rejects_the_entire_batch_and_remains_restartable() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut store = open(&dir);
+        let deadline = i64::try_from(store.expiry_timestamp() + 600)?;
+        let reserved = RuntimePeers::expiry_request_id("owner", id(1), deadline, "schedule");
+        commit(&mut store, &tx("owner", &reserved, 0, vec![
+            add(1, "one"), grants(1, &["echo"]),
+        ]))?;
+        let before = fs::read(&store.path)?;
+        let error = store.prepare(&tx("owner", "schedule", 1, vec![
+            add(2, "next"), grants(2, &["echo"]),
+            Operation::SetExpiry { node_id: id(1), expires_at: deadline },
+        ])).err().context("colliding expiry reservation was accepted")?;
+        assert_eq!(crate::error::code_of(&error), ErrorCode::RequestIdConflict);
+        assert_eq!(store.revision(), 1);
+        assert_eq!(store.stored.records.len(), 1);
+        assert!(store.stored.records[0].expires_at.is_none());
+        assert_eq!(fs::read(&store.path)?, before);
+        let restarted = open(&dir);
+        assert_eq!(restarted.revision(), 1);
+        assert!(restarted.stored.records[0].expires_at.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn expiry_forward_step_scheduling_survives_rollback_without_extending_lifetime() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut store = open(&dir);
+        store.advance_expiry_for_test(now() + 3_600);
+        let deadline = i64::try_from(store.expiry_timestamp() + 600)?;
+        commit(&mut store, &tx("owner", "schedule", 0, vec![
+            add(1, "one"), grants(1, &["echo"]),
+            Operation::SetExpiry { node_id: id(1), expires_at: deadline },
+        ]))?;
+        let book = store.compose(&store.stored)?.0;
+        assert!(book.may(&id(1), "echo").is_ok());
+        // The real wall clock remains behind the injected forward observation.
+        store.elapse_expiry_for_test(std::time::Duration::from_secs(600));
+        assert!(book.may(&id(1), "echo").is_err());
+        let expired = store.expired_transactions()?.remove(0);
+        let receipt = commit(&mut store, &expired)?;
+        assert!(receipt.removals[0].effective_trust_removed);
+        assert_eq!(receipt.cancellation.state, CancellationState::Complete);
         Ok(())
     }
 

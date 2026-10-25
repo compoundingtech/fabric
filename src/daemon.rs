@@ -466,7 +466,12 @@ pub struct DaemonState {
     endpoint_recycle: Mutex<()>,
     last_endpoint_recycle: Mutex<Option<Instant>>,
     peer_book: Arc<RwLock<PeerBook>>,
-    expiry_policy: tokio::sync::watch::Sender<PeerBook>,
+    expiry_policy: RwLock<PeerBook>,
+    #[cfg(test)]
+    expiry_sweep_pause: std::sync::Mutex<Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>>,
     policy_update: Arc<Mutex<()>>,
     runtime_peers: Option<Arc<std::sync::Mutex<crate::runtime_peers::RuntimePeers>>>,
     pairing_gate: Arc<pairing::Gate>,
@@ -1289,7 +1294,7 @@ impl DaemonState {
             peer_connections.use_runtime_policy(peer_book.clone());
         }
 
-        let (expiry_policy, _) = tokio::sync::watch::channel(peer_book.read().await.clone());
+        let expiry_policy = RwLock::new(peer_book.read().await.clone());
         Ok(Arc::new(Self {
             config_write: Arc::new(std::sync::Mutex::new(())),
             home,
@@ -1298,6 +1303,8 @@ impl DaemonState {
             last_endpoint_recycle: Mutex::new(None),
             peer_book,
             expiry_policy,
+            #[cfg(test)]
+            expiry_sweep_pause: std::sync::Mutex::new(None),
             policy_update: Arc::new(Mutex::new(())),
             runtime_peers,
             pairing_gate,

@@ -36,7 +36,7 @@ pub(super) async fn runtime_peer_expiry_loop(state: Arc<DaemonState>) {
                 _ = writer_state.cancel.cancelled() => return,
                 _ = ticks.tick() => {}
             }
-            if writer_state.expiry_policy.borrow().expired_generation().is_none() {
+            if writer_state.expiry_policy.read().await.expired_generation().is_none() {
                 continue;
             }
             let _serial = writer_state.policy_update.lock().await;
@@ -72,8 +72,7 @@ pub(super) async fn runtime_peer_expiry_loop(state: Arc<DaemonState>) {
             }
         }
     });
-    let mut policies = state.expiry_policy.subscribe();
-    let mut book = policies.borrow_and_update().clone();
+    let mut book = state.expiry_policy.read().await.clone();
     let mut observed_generation = None;
     let mut ticks = tokio::time::interval(Duration::from_millis(50));
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -82,41 +81,7 @@ pub(super) async fn runtime_peer_expiry_loop(state: Arc<DaemonState>) {
             _ = state.cancel.cancelled() => break,
             _ = ticks.tick() => {}
         }
-        if policies.has_changed().unwrap_or(false) {
-            let current = policies.borrow_and_update();
-            if !book.same_expiry_policy(&current) {
-                book = current.clone();
-                observed_generation = None;
-            }
-        }
-        let Some(generation) = book.expired_generation() else { continue; };
-        if observed_generation == Some(generation) {
-            continue;
-        }
-        observed_generation = Some(generation);
-        let mut selected = state.select_runtime_revocations(&book).await;
-        selected.deadline = tokio::time::Instant::now()
-            + Duration::from_secs(2).saturating_sub(book.expiry_lateness(generation));
-        if selected.admissions.is_empty() && selected.sessions.is_empty() {
-            continue;
-        }
-        {
-            let mut pending = pending.lock().unwrap();
-            if pending.admissions.is_empty() && pending.sessions.is_empty() {
-                pending.deadline = selected.deadline;
-                pending.timed_out = selected.timed_out.clone();
-            }
-            pending.admissions.extend(selected.admissions.iter().cloned());
-            pending.sessions.extend(selected.sessions.iter().cloned());
-            pending.admissions.sort_by_key(|entry| entry.id);
-            pending.admissions.dedup_by_key(|entry| entry.id);
-            pending.sessions.sort_by(|a, b| a.id.cmp(&b.id));
-            pending.sessions.dedup_by(|a, b| a.id == b.id);
-        }
-        state.signal_runtime_revocations(&selected).await;
-        state.monitor_runtime_revocations(
-            state.runtime_peers.as_ref().unwrap().clone(), None, selected,
-        );
+        state.enforce_runtime_expiry(&mut book, &mut observed_generation, &pending).await;
     }
     // Do not abort an in-flight durable commit on shutdown.
     let _ = writer.await;
@@ -168,6 +133,64 @@ impl Revocations {
                 CancellationState::Pending
             };
         status
+    }
+}
+
+impl DaemonState {
+    /// This secondary policy lock never covers disk I/O. Holding its read
+    /// generation through selection and signaling fences newer publications,
+    /// without waiting for a writer parked behind the main admission barrier.
+    async fn enforce_runtime_expiry(
+        &self,
+        book: &mut PeerBook,
+        observed_generation: &mut Option<u64>,
+        pending: &std::sync::Mutex<Revocations>,
+    ) {
+        let current = self.expiry_policy.read().await;
+        if !book.same_expiry_policy(&current) {
+            *book = current.clone();
+            *observed_generation = None;
+        }
+        let Some(generation) = book.expired_generation() else { return; };
+        if *observed_generation == Some(generation) {
+            return;
+        }
+        *observed_generation = Some(generation);
+        #[cfg(test)]
+        {
+            let pause = self.expiry_sweep_pause.lock().unwrap().take();
+            if let Some((selected, resume)) = pause {
+                let _ = selected.send(());
+                let _ = resume.await;
+            }
+        }
+        let mut selected = self.select_runtime_revocations(book).await;
+        selected.deadline = tokio::time::Instant::now()
+            + Duration::from_secs(2).saturating_sub(book.expiry_lateness(generation));
+        if selected.admissions.is_empty() && selected.sessions.is_empty() {
+            return;
+        }
+        {
+            let mut pending = pending.lock().unwrap();
+            if pending.admissions.is_empty() && pending.sessions.is_empty() {
+                pending.deadline = selected.deadline;
+                pending.timed_out = selected.timed_out.clone();
+            }
+            pending.admissions.extend(selected.admissions.iter().cloned());
+            pending.sessions.extend(selected.sessions.iter().cloned());
+            pending.admissions.sort_by_key(|entry| entry.id);
+            pending.admissions.dedup_by_key(|entry| entry.id);
+            pending.sessions.sort_by(|a, b| a.id.cmp(&b.id));
+            pending.sessions.dedup_by(|a, b| a.id == b.id);
+        }
+        self.signal_runtime_revocations(&selected).await;
+        self.monitor_runtime_revocations(self.runtime_peers.as_ref().unwrap().clone(), None, selected);
+    }
+
+    async fn publish_runtime_policy(&self, published: &mut PeerBook, book: PeerBook) {
+        let mut expiry = self.expiry_policy.write().await;
+        *published = book;
+        *expiry = published.clone();
     }
 }
 
@@ -515,8 +538,7 @@ impl DaemonState {
             });
             match reply {
                 Ok(reply) => {
-                    *published = book;
-                    self.expiry_policy.send_replace(published.clone());
+                    self.publish_runtime_policy(&mut published, book).await;
                     self.peer_connections.presence.retry_now();
                     Ok(reply)
                 }
@@ -803,7 +825,7 @@ impl DaemonState {
         let mut published = self.peer_book.write().await;
         let mut selected = self.select_runtime_revocations(&prepared.book).await;
         if automatic_expiry {
-            let policy = self.expiry_policy.borrow();
+            let policy = self.expiry_policy.read().await;
             if let Some(generation) = policy.expired_generation() {
                 selected.deadline = tokio::time::Instant::now()
                     + Duration::from_secs(2).saturating_sub(policy.expiry_lateness(generation));
@@ -855,8 +877,7 @@ impl DaemonState {
                 return Err(error);
             }
         };
-        *published = book;
-        self.expiry_policy.send_replace(published.clone());
+        self.publish_runtime_policy(&mut published, book).await;
         self.signal_runtime_revocations(&selected).await;
         drop(published);
         self.monitor_runtime_revocations(runtime, Some(transaction.request_id), selected);
@@ -893,8 +914,7 @@ impl DaemonState {
             let book = result?;
             let mut published = self.peer_book.write().await;
             let selected = self.select_runtime_revocations(&book).await;
-            *published = book;
-            self.expiry_policy.send_replace(published.clone());
+            self.publish_runtime_policy(&mut published, book).await;
             self.signal_runtime_revocations(&selected).await;
             *self.policy_quarantine.lock().await = None;
             drop(published);
@@ -962,8 +982,7 @@ impl DaemonState {
         });
         match result {
             Ok(book) => {
-                *published = book;
-                self.expiry_policy.send_replace(published.clone());
+                self.publish_runtime_policy(&mut published, book).await;
             }
             Err(error) => {
                 let indeterminate =
@@ -1289,6 +1308,117 @@ mod tests {
         assert_eq!(receipt.cancellation.state, CancellationState::TimedOut);
         assert!(receipt.cancellation.remaining_admissions.is_empty());
         assert_eq!(receipt.cancellation.admissions.len(), 1);
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expiry_sweep_refreshes_stale_policy_and_preserves_new_residual_sessions() -> Result<()> {
+        let _serial = SERIAL.lock().await;
+        let server_dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let home = FabricHome::new(server_dir.path());
+        let client_home = FabricHome::new(client_dir.path());
+        let server = FabricNode::start_with_daemon_options(home.clone(), options()).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        let state = server.state();
+        trust_server(&client_home, &client, &server).await?;
+        let (echo, task) = echo_server().await?;
+        server.expose_tcp("kept/0", echo.clone()).await?;
+        server.expose_tcp("withdrawn/0", echo).await?;
+        let deadline = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() + 600;
+        mutate(&home, "expiring", 0, vec![
+            add(&client, "client"), grant(&client, &["kept/0", "withdrawn/0"]),
+            Operation::SetExpiry { node_id: client.id(), expires_at: i64::try_from(deadline)? },
+        ]).await?;
+        // Deterministically pause the sweep with the exact stale generation it
+        // would have cached before a concurrent residual-policy publication.
+        let mut stale = state.expiry_policy.read().await.clone();
+        let reply = request(&home, transaction("residual", "residual", 1, vec![
+            add(&client, "client"), grant(&client, &["kept/0"]),
+        ])).await?;
+        assert!(reply.error.is_none());
+        let kept_port = client.dial_tcp("server", "kept/0", "127.0.0.1:0".into()).await?;
+        let withdrawn_port = client.dial_tcp("server", "withdrawn/0", "127.0.0.1:0".into()).await?;
+        let mut kept_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{kept_port}")).await?;
+        let mut withdrawn_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{withdrawn_port}")).await?;
+        round_trip(&mut kept_stream, b"new-residual-session").await?;
+        round_trip(&mut withdrawn_stream, b"last-expiring-source").await?;
+        let kept = state.admissions.admit(client.id(), crate::admission::Grant::Service("kept/0".into()));
+        let withdrawn = state.admissions.admit(client.id(), crate::admission::Grant::Service("withdrawn/0".into()));
+        let pending = std::sync::Mutex::new(Revocations {
+            admissions: vec![], sessions: vec![],
+            deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+            timed_out: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let policy = state.policy_update.lock().await;
+        let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        *state.expiry_sweep_pause.lock().unwrap() = Some((paused_tx, resume_rx));
+        with_runtime(state.runtime_peers.as_ref().unwrap().clone(), move |runtime| {
+            runtime.advance_expiry_for_test(deadline);
+            Ok(())
+        }).await?;
+        let sweep_state = state.clone();
+        let sweep = tokio::spawn(async move {
+            let mut observed = None;
+            sweep_state.enforce_runtime_expiry(&mut stale, &mut observed, &pending).await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), paused_rx).await??;
+        // A publication cannot pass a sweep paused between refresh and signal.
+        assert!(state.expiry_policy.try_write().is_err());
+        assert!(resume_tx.send(()).is_ok());
+        sweep.await?;
+        tokio::time::timeout(Duration::from_secs(2), withdrawn.revoked().cancelled()).await?;
+        assert!(!kept.revoked().is_cancelled());
+        round_trip(&mut kept_stream, b"still-permitted-after-expiry").await?;
+        let mut byte = [0];
+        let ended = tokio::time::timeout(Duration::from_secs(2), withdrawn_stream.read(&mut byte)).await?;
+        assert!(!matches!(ended, Ok(1..)));
+        drop(withdrawn);
+        drop(kept);
+        drop(policy);
+        client.shutdown().await?;
+        server.shutdown().await?;
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expiry_forward_observation_then_rollback_cancels_live_work_after_600_elapsed_seconds() -> Result<()> {
+        let _serial = SERIAL.lock().await;
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let server = FabricNode::start_with_daemon_options(home.clone(), options()).await?;
+        let state = server.state();
+        let peer = iroh::SecretKey::from_bytes(&[44; 32]).public();
+        let forward = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() + 3_600;
+        with_runtime(state.runtime_peers.as_ref().unwrap().clone(), move |runtime| {
+            runtime.advance_expiry_for_test(forward);
+            Ok(())
+        }).await?;
+        let deadline = i64::try_from(forward + 600)?;
+        mutate(&home, "expiring", 0, vec![
+            Operation::AddPeer { node_id: peer, name: None, direction: None, addr: None },
+            Operation::SetExpiry { node_id: peer, expires_at: deadline },
+        ]).await?;
+        let admission = state.admissions.admit(peer, crate::admission::Grant::Trust);
+        let book = state.peer_book.read().await.clone();
+        let policy = state.policy_update.lock().await;
+        with_runtime(state.runtime_peers.as_ref().unwrap().clone(), |runtime| {
+            runtime.elapse_expiry_for_test(Duration::from_secs(600));
+            Ok(())
+        }).await?;
+        assert!(!book.accepts_inbound(&peer));
+        tokio::time::timeout(Duration::from_secs(2), admission.revoked().cancelled()).await?;
+        drop(admission);
+        drop(policy);
+        let request_id = runtime_peers::RuntimePeers::expiry_request_id(
+            "controller", peer, deadline, "expiring",
+        );
+        let receipt = wait_expiry_receipt(&home, &request_id).await?;
+        assert!(receipt.removals[0].effective_trust_removed);
+        assert!(!receipt.cancellation.admissions.is_empty());
         server.shutdown().await?;
         Ok(())
     }
