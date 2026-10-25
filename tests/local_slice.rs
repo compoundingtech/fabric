@@ -96,14 +96,14 @@ async fn identity_activation_retires_old_transport_and_dials_preserving_policy_a
     let mut stream = TcpStream::connect(&dial).await?;
     stream.write_all(b"before").await?;
     let mut before = [0; 6];
-    tokio::time::timeout(LOCAL_IO_TIMEOUT, stream.read_exact(&mut before)).await??;
+    tokio::time::timeout(LOCAL_IO_TIMEOUT, stream.read_exact(&mut before)).await.context("initial incoming echo timed out")??;
     assert_eq!(&before, b"before");
     // A local declaration bound to the old local identity must not be restored.
     let outgoing_addr = server.dial_tcp("client", "outgoing", "127.0.0.1:0".into()).await?;
     let mut outgoing = TcpStream::connect(&outgoing_addr).await?;
     outgoing.write_all(b"held").await?;
     let mut held = [0; 4];
-    tokio::time::timeout(LOCAL_IO_TIMEOUT, outgoing.read_exact(&mut held)).await??;
+    tokio::time::timeout(LOCAL_IO_TIMEOUT, outgoing.read_exact(&mut held)).await.context("initial outgoing echo timed out")??;
     assert_eq!(&held, b"held");
     let mut queued = TcpStream::connect(&outgoing_addr).await?;
     queued.write_all(b"queued").await?;
@@ -117,15 +117,18 @@ async fn identity_activation_retires_old_transport_and_dials_preserving_policy_a
     let activation = fabric::identity::activate(&server_home, prepared.current, prepared.next)?;
     // The original daemon has stopped before the authoritative key rename.
     let mut byte = [0];
-    let closed = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut byte)).await?;
-    assert!(matches!(closed, Ok(0) | Err(_)), "old tunnel remained usable");
+    // The peer's local listener may retain its socket while retrying the now
+    // retired remote identity; it must not receive data from the old endpoint.
+    let closed = tokio::time::timeout(Duration::from_millis(300), stream.read(&mut byte)).await;
+    assert!(!matches!(closed, Ok(Ok(n)) if n > 0), "old tunnel remained usable");
     for pending in [&mut outgoing, &mut queued] {
-        let closed = tokio::time::timeout(Duration::from_secs(5), pending.read(&mut byte)).await?;
+        let closed = tokio::time::timeout(Duration::from_secs(5), pending.read(&mut byte)).await.context("old outgoing/queued tunnel did not close")?;
         assert!(matches!(closed, Ok(0) | Err(_)), "old outgoing or queued dial survived shutdown");
     }
     // Start through the same fresh-construction path as the restart helper.
     let server = FabricNode::start_with_daemon_options(server_home.clone(), DaemonOptions { runtime_peers: true, ..DaemonOptions::default() }).await?;
     assert_eq!(server.id(), prepared.next);
+    wait_for_status(&server_home).await?;
     assert!(FabricConfig::load(&server_home)?.dials().is_empty());
     assert_eq!(fs::read(server_home.peers_path())?, static_before);
     let response = send_control(&server_home, ControlRequest::RuntimePeers { request: Request::Batch { transaction: revoke } }).await?;
@@ -152,12 +155,12 @@ async fn identity_activation_retires_old_transport_and_dials_preserving_policy_a
     let mut fresh = TcpStream::connect(new_dial).await?;
     fresh.write_all(b"after").await?;
     let mut after = [0; 5];
-    tokio::time::timeout(LOCAL_IO_TIMEOUT, fresh.read_exact(&mut after)).await??;
+    tokio::time::timeout(LOCAL_IO_TIMEOUT, fresh.read_exact(&mut after)).await.context("replacement incoming echo timed out")??;
     assert_eq!(&after, b"after");
     drop(activation);
     server.shutdown().await?;
     let server = FabricNode::start_with_daemon_options(server_home.clone(), DaemonOptions { runtime_peers: true, ..DaemonOptions::default() }).await?;
-    let ControlResponse::Status { exposed_protocols, .. } = send_control(&server_home, ControlRequest::Status).await? else { bail!("expected ordinary restart status") };
+    let ControlResponse::Status { exposed_protocols, .. } = wait_for_status(&server_home).await? else { bail!("expected ordinary restart status") };
     assert!(exposed_protocols.iter().any(|protocol| protocol == "tcp-echo"));
     assert!(!exposed_protocols.iter().any(|protocol| protocol == "ephemeral-echo"), "activation made an ephemeral exposure permanent");
     assert!(!server_home.root().join("identity.exposures").exists(), "replacement startup did not consume the one-start handoff");
