@@ -25,8 +25,28 @@ Deprecated, Fixed or Security.
   admission barrier; outstanding permits expire conservatively on restart.
   Runtime state that has never used pairing remains readable by 0.9.2;
   state that has used pairing is not downgrade-compatible. Permits grant no
-  service access; no network pairing transport or confirmation is enabled by
-  these operations.
+  service access.
+- **Provisional:** runtime mode accepts the restricted `fabric/pair/1` protocol
+  for authenticated one-time permit presentation and bound-node attempt status.
+  Pending identities receive no ordinary service access. Connection and rate
+  limits bound untrusted work; restart rejects unfinished attempts durably.
+  Join exchange and atomic confirmation are not enabled.
+
+### Security
+
+- Restricted pairing uses a separate 32-handler pool, with at most two active
+  connections per authenticated NodeID, one bidirectional stream, no unidirectional
+  streams and small receive windows. An extra bidi or any uni stream closes the
+  connection immediately, including streams opened with initial transport credit.
+  Capacity exhaustion sends an explicit application close (503) after
+  authentication, not a handshake abort. Pairing framing and runtime validation
+  reads have deadlines. At most 32 network read workers may wait for the runtime
+  mutex, retaining worker capacity even after socket timeouts. With runtime mode disabled,
+  ordinary handlers still reserve capacity before accept for their entire life;
+  with it enabled, saturated ordinary work is refused rather than queued, so
+  pairing never waits behind ordinary handlers.
+- `fabric/pair/1` is reserved and cannot be registered as a direct exposure even
+  when runtime mode is disabled.
 
 ## [0.9.2] - 2026-10-16
 
