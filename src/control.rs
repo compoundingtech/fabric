@@ -26,6 +26,12 @@ pub enum ControlRequest {
     Pairing {
         request: crate::runtime_peers::pairing::Request,
     },
+    PairingRemote {
+        gateway: iroh::EndpointId,
+        #[serde(default)]
+        addr: Option<iroh::EndpointAddr>,
+        request: crate::runtime_peers::pairing::NetworkRequest,
+    },
     /// Wait for cached peer transitions without polling the network.
     PeerEvents {
         #[serde(default)]
