@@ -2010,6 +2010,31 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn fresh_record_expiry_accepts_only_the_next_one_through_600_seconds() -> Result<()> {
+        for (offset, accepted) in [(0, false), (1, true), (600, true), (601, false)] {
+            let dir = tempfile::tempdir()?;
+            let mut store = open(&dir);
+            // A forward observation keeps the real clock from moving the boundary.
+            let timestamp = now() + 3_600;
+            store.advance_expiry_for_test(timestamp);
+            commit(&mut store, &tx("owner", "fresh", 0, vec![add(1, "one")]))?;
+            let request = tx("owner", "schedule", 1, vec![
+                Operation::SetExpiry { node_id: id(1), expires_at: i64::try_from(timestamp + offset)? },
+            ]);
+            if accepted {
+                let receipt = commit(&mut store, &request)?;
+                assert_eq!(receipt.committed_revision, 2);
+                assert_eq!(store.stored.records[0].expires_at, Some(i64::try_from(timestamp + offset)?));
+            } else {
+                let error = store.prepare(&request).err().context("out-of-bounds deadline was accepted")?;
+                assert_eq!(crate::error::code_of(&error), ErrorCode::InvalidArgument);
+                assert_eq!(store.revision(), 1);
+                assert!(store.stored.records[0].expires_at.is_none());
+            }
+        }
+        Ok(())
+    }
+    #[test]
     fn expiry_is_bounded_immutable_and_overlap_batch_replays_without_extension() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut store = open(&dir);
@@ -2023,6 +2048,12 @@ mod tests {
         assert_eq!(installed.committed_revision, 2);
         assert_eq!(store.stored.records.iter().find(|record| record.peer.id == id(1)).unwrap().expires_at, Some(deadline));
         assert_eq!(commit(&mut store, &overlap)?.committed_revision, 2);
+        let mut changed_deadline = overlap.clone();
+        if let Operation::SetExpiry { expires_at, .. } = &mut changed_deadline.operations[2] {
+            *expires_at -= 1;
+        }
+        let error = store.prepare(&changed_deadline).err().context("changed deadline replay was accepted")?;
+        assert_eq!(crate::error::code_of(&error), ErrorCode::RequestIdConflict);
         for value in [deadline - 1, deadline + 1, 0, -1, i64::MAX] {
             assert!(store.prepare(&tx("owner", &format!("change-{value}"), 2, vec![
                 Operation::SetExpiry { node_id: id(1), expires_at: value },
