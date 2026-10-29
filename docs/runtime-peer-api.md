@@ -357,6 +357,8 @@ Expiry withdrawals are not blocked by stale sync selectors. A blocked writer
 cannot extend expired authorization or live work; residual grants preserve
 still-permitted work. Cancellation monitoring retains its two-second deadline
 and missed-bound evidence even when the automatic receipt is persisted later.
+Each automatic receipt names only cancelled work for its own expiring NodeID;
+other records expiring in the same sweep retain their own cancellation evidence.
 Sweep selection and signaling share an in-memory publication-generation guard;
 they cannot revoke against a stale snapshot after newer residual grants publish.
 This guard never covers filesystem work.
