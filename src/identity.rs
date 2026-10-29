@@ -99,8 +99,11 @@ pub fn prepare(home: &FabricHome) -> Result<Prepared> {
 /// rename never writes a key: it only asks the caller to reconcile the daemon.
 pub struct Activation {
     pub result: Activated,
-    durability_error: Option<anyhow::Error>,
     _lock: IdentityLock,
+}
+struct Swap {
+    result: Activated,
+    durability_error: Option<anyhow::Error>,
 }
 fn check_guards(home: &FabricHome, current: EndpointId, next: EndpointId) -> Result<bool> {
     let active = read_id(&home.identity_path())?;
@@ -113,11 +116,12 @@ fn check_guards(home: &FabricHome, current: EndpointId, next: EndpointId) -> Res
 pub fn activate(home: &FabricHome, expected_current: EndpointId, expected_next: EndpointId) -> Result<Activation> {
     let lock = IdentityLock::acquire(home)?;
     let already = check_guards(home, expected_current, expected_next)?;
-    activate_locked(home, expected_current, expected_next, already, lock)
+    let swap = activate_locked(home, expected_current, expected_next, already, &lock)?;
+    Ok(Activation { result: swap.result, _lock: lock })
 }
-fn activate_locked(home: &FabricHome, expected_current: EndpointId, expected_next: EndpointId, already: bool, lock: IdentityLock) -> Result<Activation> {
+fn activate_locked(home: &FabricHome, expected_current: EndpointId, expected_next: EndpointId, already: bool, _lock: &IdentityLock) -> Result<Swap> {
     if already {
-        return Ok(Activation { result: Activated { previous: expected_current, active: expected_next, outcome: "already_active" }, durability_error: sync_home(home).err(), _lock: lock });
+        return Ok(Swap { result: Activated { previous: expected_current, active: expected_next, outcome: "already_active" }, durability_error: sync_home(home).err() });
     }
     // Retain the old secret before the only authoritative swap. The retired
     // copy is never read as a serving key, even after a failed restart.
@@ -142,7 +146,7 @@ fn activate_locked(home: &FabricHome, expected_current: EndpointId, expected_nex
     // Once rename succeeded, the caller must retire the old daemon even when
     // the directory durability barrier fails.
     let durability_error = sync_home(home).err();
-    Ok(Activation { result: Activated { previous: expected_current, active: expected_next, outcome: "activated" }, durability_error, _lock: lock })
+    Ok(Swap { result: Activated { previous: expected_current, active: expected_next, outcome: "activated" }, durability_error })
 }
 fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() }
 fn cleanup_retired_locked(home: &FabricHome, timestamp: u64) -> Result<Option<u64>> {
@@ -198,14 +202,24 @@ pub fn reconcile_startup(home: &FabricHome) -> Result<()> {
     sync_home(home)
 }
 
-pub async fn activate_with_restart<P, PFut, G, F, Fut>(home: &FabricHome, current: EndpointId, next: EndpointId, preserve: P, restart: F) -> Result<Activated>
-where P: FnOnce() -> PFut, PFut: Future<Output = Result<G>>, F: FnOnce() -> Fut, Fut: Future<Output = Result<()>> {
+pub async fn activate_with_restart<P, PFut, G, F, Fut, R, RFut>(home: &FabricHome, current: EndpointId, next: EndpointId, preserve: P, restart: F, recover: R) -> Result<Activated>
+where P: FnOnce() -> PFut, PFut: Future<Output = Result<G>>, F: FnOnce() -> Fut, Fut: Future<Output = Result<()>>,
+      R: FnOnce(anyhow::Error) -> RFut, RFut: Future<Output = anyhow::Error> {
     let lock = IdentityLock::acquire(home)?;
     let already = check_guards(home, current, next)?;
     // A preserved daemon lease excludes concurrent startup through the rename.
-    let startup_guard = if !already { Some(preserve().await?) } else { None };
-    let activation = activate_locked(home, current, next, already, lock)?;
+    let startup_guard = if !already {
+        match preserve().await {
+            Ok(guard) => Some(guard),
+            Err(error) => return Err(recover(error).await),
+        }
+    } else { None };
+    let activation = activate_locked(home, current, next, already, &lock);
     drop(startup_guard);
+    let activation = match activation {
+        Ok(activation) => activation,
+        Err(error) => return Err(recover(error).await),
+    };
     restart().await.map_err(|error| FabricError::new(
         ErrorCode::RestartFailed,
         format!("identity changed; retry the same guarded activation to restart: {error:#}"),
@@ -325,6 +339,34 @@ pub async fn retired_key_cleanup(home: FabricHome, cancel: tokio_util::sync::Can
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn pre_rename_recovery_retains_identity_lock_on_stop_and_write_failures() -> Result<()> {
+        for fail_stop in [false, true] {
+            let dir = tempfile::tempdir()?;
+            let home = FabricHome::new(dir.path());
+            let prepared = prepare(&home)?;
+            fs::create_dir(home.root().join("identity.activation"))?;
+            let recovered = std::cell::Cell::new(false);
+            let result = activate_with_restart(&home, prepared.current, prepared.next,
+                || async {
+                    if fail_stop { anyhow::bail!("stop failed"); }
+                    Ok(())
+                },
+                || async { panic!("pre-rename failure must not restart next") },
+                |error| async {
+                    let busy = IdentityLock::acquire(&home).err().context("recovery released identity lock").unwrap();
+                    assert_eq!(crate::error::code_of(&busy), ErrorCode::IdentityBusy);
+                    assert_eq!(read_id(&home.identity_path()).unwrap(), prepared.current);
+                    recovered.set(true);
+                    error
+                },
+            ).await;
+            assert!(result.is_err());
+            assert!(recovered.get());
+        }
+        Ok(())
+    }
+
     use super::*;
     #[test]
     fn prepare_is_durable_private_and_idempotent() -> Result<()> {
@@ -392,7 +434,7 @@ mod tests {
         let prepared = prepare(&home)?;
         let error = activate_with_restart(&home, prepared.current, prepared.next, || async { Ok(()) }, || async {
             anyhow::bail!("injected restart failure")
-        }).await.unwrap_err();
+        }, |error| async { error }).await.unwrap_err();
         assert_eq!(crate::error::code_of(&error), ErrorCode::RestartFailed);
         let report = crate::error::render(&error, true);
         let json: serde_json::Value = serde_json::from_str(report.stdout.as_deref().unwrap())?;
@@ -403,7 +445,7 @@ mod tests {
         let result = activate_with_restart(&home, prepared.current, prepared.next, || async { Err::<(), _>(anyhow::anyhow!("retry must not preserve again")) }, || async {
             assert_eq!(load_or_create_identity(&home)?.public(), prepared.next);
             Ok(())
-        }).await?;
+        }, |error| async { error }).await?;
         assert_eq!(result.outcome, "already_active");
         assert_eq!(fs::read(home.identity_path())?, active);
         Ok(())
@@ -448,6 +490,7 @@ mod tests {
         let error = activate_with_restart(&home, prepared.current, prepared.next,
             || async { Err::<(), _>(anyhow::anyhow!("old daemon stop barrier failed")) },
             || async { panic!("must not restart or rename after a failed stop barrier") },
+            |error| async { error },
         ).await.unwrap_err();
         assert!(error.to_string().contains("stop barrier"));
         assert_eq!(fs::read(home.identity_path())?, before);
@@ -477,6 +520,7 @@ mod tests {
                 assert!(crate::daemon::try_daemon_lease(&home)?.is_some());
                 Ok(())
             },
+            |error| async { error },
         ).await?;
         Ok(())
     }
@@ -539,6 +583,7 @@ mod tests {
                 Ok(())
             },
             || async { panic!("changed pending guard must not restart or rename") },
+            |error| async { error },
         ).await.unwrap_err();
         assert_eq!(crate::error::code_of(&error), ErrorCode::IdentityMismatch);
         assert_eq!(status(&home)?.current, prepared.current);

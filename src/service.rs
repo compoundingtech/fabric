@@ -642,19 +642,31 @@ async fn identity_service_enablement(sync: bool) -> Result<ServiceEnablement> {
         let path = if sync { systemd_sync_user_unit_path() } else { systemd_user_unit_path() };
         let present = path.map(|path| path.exists()).unwrap_or(false);
         let name = if sync { SYNC_SERVICE_NAME } else { SERVICE_NAME };
-        let output = identity_service_output("systemctl", &["--user", "is-enabled", name], Duration::from_secs(5)).await?;
-        Ok(interpret_systemd_is_enabled(present, true, &String::from_utf8_lossy(&output.stdout)))
+        identity_systemd_enablement("systemctl", name, present).await
     }
     #[cfg(target_os = "macos")]
     {
         let path = if sync { launch_sync_agent_path() } else { launch_agent_path() };
         let present = path.map(|path| path.exists()).unwrap_or(false);
         let target = if sync { launchd_sync_service_target() } else { launchd_service_target() };
-        let output = identity_service_output("launchctl", &["print", &target], Duration::from_secs(5)).await?;
-        Ok(interpret_launchd(present, output.status.success()))
+        let loaded = match identity_service_output("launchctl", &["print", &target], Duration::from_secs(5)).await {
+            Ok(output) => output.status.success(),
+            Err(error) if fabric::error::code_of(&error) == fabric::error::ErrorCode::Timeout => return Err(error),
+            Err(_) => false,
+        };
+        Ok(interpret_launchd(present, loaded))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     bail!("native identity restart is unsupported on this platform")
+}
+
+#[cfg(target_os = "linux")]
+async fn identity_systemd_enablement(program: &str, name: &str, present: bool) -> Result<ServiceEnablement> {
+    match identity_service_output(program, &["--user", "is-enabled", name], Duration::from_secs(5)).await {
+        Ok(output) => Ok(interpret_systemd_is_enabled(present, true, &String::from_utf8_lossy(&output.stdout))),
+        Err(error) if fabric::error::code_of(&error) == fabric::error::ErrorCode::Timeout => Err(error),
+        Err(_) => Ok(interpret_systemd_is_enabled(present, false, "")),
+    }
 }
 
 fn restart_ownership_decision(
@@ -1630,6 +1642,14 @@ fn xml_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn identity_missing_native_tool_preserves_uninstalled_ownership() -> anyhow::Result<()> {
+        assert_eq!(super::identity_systemd_enablement("/fabric/no-such-systemctl", "fabric", false).await?, ServiceEnablement::NotInstalled);
+        assert_eq!(super::identity_systemd_enablement("/fabric/no-such-systemctl", "fabric", true).await?, ServiceEnablement::Unknown);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn identity_native_command_timeout_is_bounded_and_coded() -> anyhow::Result<()> {
         let error = super::identity_service_output("/bin/sh", &["-c", "exec sleep 5"], std::time::Duration::from_millis(50)).await.unwrap_err();

@@ -3115,9 +3115,10 @@ async fn identity_live_status(home: &FabricHome) -> Result<Option<ControlRespons
 async fn identity_stop_lease(home: &FabricHome) -> Result<std::fs::File> {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            // Foreground daemons do not own the process lease; also wait for
-            // their serving control socket to disappear before renaming.
-            if identity_live_status(home).await?.is_none() {
+            // Cancellation drops the listening descriptor before endpoint
+            // teardown. The pathname is removed only after endpoint/child
+            // cleanup, so ConnectionRefused alone is not a foreground barrier.
+            if !home.control_socket_path().exists() {
                 if let Some(lease) = fabric::daemon::try_daemon_lease(home)? {
                     return Ok::<_, anyhow::Error>(lease);
                 }
@@ -3130,7 +3131,7 @@ async fn identity_stop_lease(home: &FabricHome) -> Result<std::fs::File> {
 async fn activate_identity(home: &FabricHome, current: iroh::EndpointId, next: iroh::EndpointId) -> Result<fabric::identity::Activated> {
     let snapshot_attempted = std::cell::Cell::new(false);
     let stop_attempted = std::cell::Cell::new(false);
-    let result = fabric::identity::activate_with_restart(home, current, next, || async {
+    fabric::identity::activate_with_restart(home, current, next, || async {
         let live = identity_live_status(home).await?;
         if live.is_none() {
             if let Some(lease) = fabric::daemon::try_daemon_lease(home)? { return Ok(lease); }
@@ -3144,10 +3145,14 @@ async fn activate_identity(home: &FabricHome, current: iroh::EndpointId, next: i
         stop_attempted.set(true);
         identity_control(home, ControlRequest::Shutdown).await?;
         identity_stop_lease(home).await
-    }, || reconcile_identity_daemon(home, next)).await;
-    let Err(error) = result else { return result };
-    if !snapshot_attempted.get() || load_or_create_identity(home)?.public() != current {
-        return Err(error);
+    }, || reconcile_identity_daemon(home, next),
+       |error| recover_identity_activation(home, current, snapshot_attempted.get(), stop_attempted.get(), error),
+    ).await
+}
+
+async fn recover_identity_activation(home: &FabricHome, current: iroh::EndpointId, snapshot_attempted: bool, stop_attempted: bool, error: anyhow::Error) -> anyhow::Error {
+    if !snapshot_attempted || load_or_create_identity(home).map_or(true, |key| key.public() != current) {
+        return error;
     }
     let cleanup = fabric::identity::discard_runtime_snapshot(home);
     // A live old daemon may have fenced exposures before a failed control
@@ -3157,7 +3162,7 @@ async fn activate_identity(home: &FabricHome, current: iroh::EndpointId, next: i
         Ok(None) => Ok(()),
         Err(error) => Err(error),
     };
-    let recovery = if stop_attempted.get() {
+    let recovery = if stop_attempted {
         match reconcile_identity_daemon(home, current).await {
             Ok(()) => "current identity daemon restarted successfully".to_owned(),
             Err(error) => format!("current identity restart failed: {error:#}"),
@@ -3165,11 +3170,11 @@ async fn activate_identity(home: &FabricHome, current: iroh::EndpointId, next: i
     } else {
         "current identity was not stopped".to_owned()
     };
-    Err(error.context(format!(
+    error.context(format!(
         "activation aborted before rename; {recovery}; handoff cleanup: {}; exposure fence: {}; retry the same guarded activation or restart the daemon if the fence remains",
         cleanup.err().map(|e| e.to_string()).unwrap_or_else(|| "removed".into()),
         abort.err().map(|e| e.to_string()).unwrap_or_else(|| "cleared".into()),
-    )))
+    ))
 }
 
 /// Reconcile, never roll back, after the authoritative identity rename.
@@ -3784,6 +3789,24 @@ async fn spawn_daemon_with_output(home: &FabricHome, options: DaemonOptions, ann
 #[cfg(test)]
 mod identity_review_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn identity_foreground_stop_waits_for_teardown_socket_unlink() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        home.prepare()?;
+        let listener = tokio::net::UnixListener::bind(home.control_socket_path())?;
+        drop(listener);
+        // A refused connection during cancellation does not prove endpoint
+        // teardown; the old process still owns this pathname until cleanup.
+        assert!(identity_live_status(&home).await?.is_none());
+        let stop = identity_stop_lease(&home);
+        tokio::pin!(stop);
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut stop).await.is_err());
+        std::fs::remove_file(home.control_socket_path())?;
+        drop(tokio::time::timeout(Duration::from_secs(1), stop).await??);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn identity_control_wait_is_bounded_and_coded() -> Result<()> {
