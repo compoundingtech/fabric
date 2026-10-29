@@ -214,7 +214,7 @@ async fn identity_cli_prepare_activate_retry_crash_recovery_and_status_have_stab
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn identity_foreground_activation_and_failed_swap_recovery_keep_runtime_off() -> Result<()> {
+async fn identity_foreground_activation_failed_swap_and_stale_socket_recovery_keep_runtime_off() -> Result<()> {
     use fabric::{control::{ControlRequest, ControlResponse}, daemon::send_control};
     struct Stop(FabricHome);
     impl Drop for Stop {
@@ -238,7 +238,7 @@ async fn identity_foreground_activation_and_failed_swap_recovery_keep_runtime_of
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }).await.context("foreground daemon readiness")?;
-        assert!(fabric::daemon::daemon_lock_available(&home)?, "test must exercise a foreground daemon without a lease");
+        assert!(!fabric::daemon::daemon_lock_available(&home)?, "foreground must retain its lifetime lease through teardown");
         // A stale ON marker must not override the live daemon's OFF choice.
         fs::write(home.root().join("identity.runtime-peers"), b"stale")?;
         if fail_before_rename { fs::create_dir(home.root().join("identity.activation"))?; }
@@ -265,6 +265,15 @@ async fn identity_foreground_activation_and_failed_swap_recovery_keep_runtime_of
         let ControlResponse::RuntimePeers { reply } = runtime else { bail!("missing runtime reply") };
         assert!(reply.error.is_some(), "activation enabled runtime policy on an OFF daemon");
         assert!(!home.root().join("identity.runtime-peers").exists());
+        ok(&fabric(&home, &["down"]).await?)?;
+        let prepared = fabric::identity::prepare(&home)?;
+        // A crashed process can leave a socket inode but no listener or lease.
+        let stale = tokio::net::UnixListener::bind(home.control_socket_path())?;
+        drop(stale);
+        let current = prepared.current.to_string();
+        let next = prepared.next.to_string();
+        ok(&fabric(&home, &["identity", "activate", "--expect-current", &current, "--expect-next", &next, "--json"]).await?)?;
+        assert_eq!(fabric::identity::status(&home)?.current, prepared.next);
     }
     Ok(())
 }

@@ -632,7 +632,7 @@ async fn identity_service_output(program: &str, args: &[&str], timeout: Duration
     let mut command = tokio::process::Command::new(program);
     command.args(args).kill_on_drop(true);
     tokio::time::timeout(timeout, command.output()).await.map_err(|_| {
-        fabric::error::FabricError::new(fabric::error::ErrorCode::Timeout, format!("{program} timed out during identity restart"))
+        fabric_config::error::FabricError::new(fabric_config::error::ErrorCode::Timeout, format!("{program} timed out during identity restart"))
     })?.with_context(|| format!("run {program} for identity restart"))
 }
 
@@ -651,7 +651,7 @@ async fn identity_service_enablement(sync: bool) -> Result<ServiceEnablement> {
         let target = if sync { launchd_sync_service_target() } else { launchd_service_target() };
         let loaded = match identity_service_output("launchctl", &["print", &target], Duration::from_secs(5)).await {
             Ok(output) => output.status.success(),
-            Err(error) if fabric::error::code_of(&error) == fabric::error::ErrorCode::Timeout => return Err(error),
+            Err(error) if fabric_config::error::code_of(&error) == fabric_config::error::ErrorCode::Timeout => return Err(error),
             Err(_) => false,
         };
         Ok(interpret_launchd(present, loaded))
@@ -664,7 +664,7 @@ async fn identity_service_enablement(sync: bool) -> Result<ServiceEnablement> {
 async fn identity_systemd_enablement(program: &str, name: &str, present: bool) -> Result<ServiceEnablement> {
     match identity_service_output(program, &["--user", "is-enabled", name], Duration::from_secs(5)).await {
         Ok(output) => Ok(interpret_systemd_is_enabled(present, true, &String::from_utf8_lossy(&output.stdout))),
-        Err(error) if fabric::error::code_of(&error) == fabric::error::ErrorCode::Timeout => Err(error),
+        Err(error) if fabric_config::error::code_of(&error) == fabric_config::error::ErrorCode::Timeout => Err(error),
         Err(_) => Ok(interpret_systemd_is_enabled(present, false, "")),
     }
 }
@@ -1653,7 +1653,7 @@ mod tests {
     #[tokio::test]
     async fn identity_native_command_timeout_is_bounded_and_coded() -> anyhow::Result<()> {
         let error = super::identity_service_output("/bin/sh", &["-c", "exec sleep 5"], std::time::Duration::from_millis(50)).await.unwrap_err();
-        assert_eq!(fabric::error::code_of(&error), fabric::error::ErrorCode::Timeout);
+        assert_eq!(fabric_config::error::code_of(&error), fabric_config::error::ErrorCode::Timeout);
         Ok(())
     }
 

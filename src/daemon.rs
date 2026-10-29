@@ -3477,7 +3477,7 @@ pub async fn run_daemon_with_options(home: FabricHome, options: DaemonOptions) -
     result
 }
 
-struct DaemonLease {
+pub struct DaemonLease {
     _file: Arc<std::fs::File>,
 }
 
@@ -3509,7 +3509,7 @@ pub fn restart_down_decision(status_ok: bool, lease_available: bool) -> bool {
 }
 
 impl DaemonLease {
-    fn acquire(home: &FabricHome) -> Result<Self> {
+    pub fn acquire(home: &FabricHome) -> Result<Self> {
         home.prepare()?;
         let path = home.root().join("run/daemon.lock");
         let file = OpenOptions::new()

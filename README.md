@@ -159,6 +159,9 @@ fabric identity status --json
 # {"current":"<new>","next":null,"state":"active"}
 ```
 
+Both foreground and background CLI daemons retain the same per-home lifetime
+lease through endpoint and child teardown; a stale socket alone is not liveness.
+
 Activation fences exposure changes and stops the old daemon before the single
 atomic rename, then asks the existing native supervisor to restart or directly
 spawns a standalone replacement daemon. Success waits for the live daemon to

@@ -1074,6 +1074,7 @@ async fn run(cli: Cli) -> Result<()> {
                         runtime_peers,
                     );
                     if foreground {
+                        let _lease = fabric::daemon::DaemonLease::acquire(&home)?;
                         init_daemon_tracing(&home)?;
                         let node = FabricNode::start_with_daemon_options(home, options).await?;
                         let peers = node.state().peer_reachability().await;
@@ -3115,13 +3116,10 @@ async fn identity_live_status(home: &FabricHome) -> Result<Option<ControlRespons
 async fn identity_stop_lease(home: &FabricHome) -> Result<std::fs::File> {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            // Cancellation drops the listening descriptor before endpoint
-            // teardown. The pathname is removed only after endpoint/child
-            // cleanup, so ConnectionRefused alone is not a foreground barrier.
-            if !home.control_socket_path().exists() {
-                if let Some(lease) = fabric::daemon::try_daemon_lease(home)? {
-                    return Ok::<_, anyhow::Error>(lease);
-                }
+            // Every CLI daemon, foreground or background, retains this lease
+            // through teardown. A leftover pathname after a crash is harmless.
+            if let Some(lease) = fabric::daemon::try_daemon_lease(home)? {
+                return Ok::<_, anyhow::Error>(lease);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -3795,6 +3793,7 @@ mod identity_review_tests {
         let dir = tempfile::tempdir()?;
         let home = FabricHome::new(dir.path());
         let prepared = fabric::identity::prepare(&home)?;
+        let _lease = fabric::daemon::DaemonLease::acquire(&home)?;
         let listener = tokio::net::UnixListener::bind(home.control_socket_path())?;
         drop(listener);
         let activation = activate_identity(&home, prepared.current, prepared.next);
@@ -3806,19 +3805,20 @@ mod identity_review_tests {
     }
 
     #[tokio::test]
-    async fn identity_foreground_stop_waits_for_teardown_socket_unlink() -> Result<()> {
+    async fn identity_foreground_stop_waits_for_lifetime_lease_after_socket_refusal() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let home = FabricHome::new(dir.path());
         home.prepare()?;
+        let lease = fabric::daemon::DaemonLease::acquire(&home)?;
         let listener = tokio::net::UnixListener::bind(home.control_socket_path())?;
         drop(listener);
         // A refused connection during cancellation does not prove endpoint
-        // teardown; the old process still owns this pathname until cleanup.
+        // teardown; the foreground process retains its lifetime lease.
         assert!(identity_live_status(&home).await?.is_none());
         let stop = identity_stop_lease(&home);
         tokio::pin!(stop);
         assert!(tokio::time::timeout(Duration::from_millis(100), &mut stop).await.is_err());
-        std::fs::remove_file(home.control_socket_path())?;
+        drop(lease);
         drop(tokio::time::timeout(Duration::from_secs(1), stop).await??);
         Ok(())
     }
