@@ -62,27 +62,32 @@ fn snapshot(home: &FabricHome) -> Result<Status> {
     let next = match read_id(&pending(home)) {
         Ok(id) => Some(id),
         Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) => None,
-        Err(error) => return Err(error),
+        Err(error) => {
+            tracing::warn!(%error, "ignoring unreadable pending identity; prepare replaces it");
+            None
+        }
     };
     Ok(Status { current, next, state: if next.is_some() { "prepared" } else { "active" } })
 }
 pub fn status(home: &FabricHome) -> Result<Status> {
     let _lock = IdentityLock::acquire(home)?;
     load_or_create_identity(home)?;
-    cleanup_retired_locked(home, now())?;
+    if let Err(error) = cleanup_retired_locked(home, now()) {
+        tracing::warn!(%error, "retired identity cleanup failed");
+    }
     snapshot(home)
 }
 pub fn prepare(home: &FabricHome) -> Result<Prepared> {
     let _lock = IdentityLock::acquire(home)?;
-    cleanup_retired_locked(home, now())?;
+    if let Err(error) = cleanup_retired_locked(home, now()) {
+        tracing::warn!(%error, "retired identity cleanup failed");
+    }
     load_or_create_identity(home)?;
     File::open(home.identity_path())?.sync_all()?;
     sync_home(home)?;
     let state = snapshot(home)?;
     if let Some(next) = state.next { return Ok(Prepared { current: state.current, next }); }
-    let temporary = home.root().join("identity.next.tmp");
-    // A crash before publication may leave only this unreferenced staging file.
-    match fs::remove_file(&temporary) { Ok(()) => {}, Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}, Err(e) => return Err(e.into()) }
+    let temporary = scratch_path(home, "identity.next");
     let next = generate_identity_file(&temporary)?;
     File::open(&temporary)?.sync_all()?;
     fs::rename(&temporary, pending(home))?;
@@ -130,6 +135,9 @@ fn activate_locked(home: &FabricHome, expected_current: EndpointId, expected_nex
     // This is intent, not a second identity authority: startup acts on it only
     // when identity.toml already contains expected_next.
     write_private_atomic(home, "identity.activation", expected_next.to_string().as_bytes())?;
+    if check_guards(home, expected_current, expected_next)? {
+        return Err(FabricError::new(ErrorCode::IdentityMismatch, "active identity changed during preparation; activation aborted before rename").into());
+    }
     fs::rename(pending(home), home.identity_path())?;
     // Once rename succeeded, the caller must retire the old daemon even when
     // the directory durability barrier fails.
@@ -141,7 +149,10 @@ fn cleanup_retired_locked(home: &FabricHome, timestamp: u64) -> Result<Option<u6
     let mut changed = false;
     let mut next_deadline: Option<u64> = None;
     for entry in fs::read_dir(home.root())? {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => { tracing::warn!(%error, "cannot inspect retired identity entry"); continue; }
+        };
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         let Some(rest) = name.strip_prefix("identity.retired.") else { continue };
@@ -150,8 +161,11 @@ fn cleanup_retired_locked(home: &FabricHome, timestamp: u64) -> Result<Option<u6
         if id.parse::<EndpointId>().is_err() { continue }
         let Ok(deadline) = expiry.parse::<u64>() else { continue };
         if timestamp >= deadline {
-            fs::remove_file(entry.path())?;
-            changed = true;
+            match fs::remove_file(entry.path()) {
+                Ok(()) => changed = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(%error, path = %entry.path().display(), "cannot remove retired identity"),
+            }
         } else {
             next_deadline = Some(next_deadline.map_or(deadline, |next| next.min(deadline)));
         }
@@ -212,14 +226,30 @@ pub fn write_runtime_snapshot(home: &FabricHome, next: EndpointId, exposures: Ve
     let bytes = serde_json::to_vec(&RuntimeSnapshot { next, exposures })?;
     write_private_atomic(home, "identity.exposures", &bytes)
 }
+pub fn discard_runtime_snapshot(home: &FabricHome) -> Result<()> {
+    match fs::remove_file(home.root().join("identity.exposures")) {
+        Ok(()) => sync_home(home),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn scratch_path(home: &FabricHome, name: &str) -> PathBuf {
+    home.root().join(format!(".{name}.{}.tmp", iroh::SecretKey::generate().public()))
+}
+
 fn write_private_atomic(home: &FabricHome, name: &str, bytes: &[u8]) -> Result<()> {
     let path = home.root().join(name);
-    let temporary = path.with_extension("tmp");
-    let mut file = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&temporary)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    fs::rename(temporary, path)?;
-    sync_home(home)
+    let temporary = scratch_path(home, name);
+    let result = (|| {
+        let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        sync_home(home)
+    })();
+    if result.is_err() { let _ = fs::remove_file(&temporary); }
+    result
 }
 pub fn inherited_exposures(home: &FabricHome) -> Result<Vec<crate::config::PersistedExpose>> {
     let path = home.root().join("identity.exposures");
@@ -463,6 +493,55 @@ mod tests {
         assert_eq!(status(&home)?.next, Some(prepared.next));
         drop(activate(&home, prepared.current, prepared.next)?);
         assert_eq!(fs::read_to_string(home.root().join("identity.activation"))?, prepared.next.to_string());
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_errors_and_corrupt_pending_do_not_block_status_or_prepare() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let first = prepare(&home)?;
+        fs::create_dir(home.root().join(format!("identity.retired.0.{}.toml", first.current)))?;
+        fs::write(pending(&home), "not a private key")?;
+        let state = status(&home)?;
+        assert_eq!(state.current, first.current);
+        assert_eq!(state.next, None);
+        let replacement = prepare(&home)?;
+        assert_eq!(replacement.current, first.current);
+        assert_ne!(replacement.next, first.next);
+        assert_eq!(prepare(&home)?.next, replacement.next);
+        Ok(())
+    }
+
+    #[test]
+    fn private_scratch_writes_do_not_follow_the_old_shared_symlink() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let prepared = prepare(&home)?;
+        let sentinel = home.root().join("sentinel");
+        fs::write(&sentinel, b"unchanged")?;
+        std::os::unix::fs::symlink(&sentinel, home.root().join("identity.tmp"))?;
+        write_runtime_snapshot(&home, prepared.next, Vec::new())?;
+        drop(activate(&home, prepared.current, prepared.next)?);
+        assert_eq!(fs::read(&sentinel)?, b"unchanged");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn activation_rechecks_pending_guard_after_preservation() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let prepared = prepare(&home)?;
+        let error = activate_with_restart(&home, prepared.current, prepared.next,
+            || async {
+                fs::remove_file(pending(&home))?;
+                generate_identity_file(&pending(&home))?;
+                Ok(())
+            },
+            || async { panic!("changed pending guard must not restart or rename") },
+        ).await.unwrap_err();
+        assert_eq!(crate::error::code_of(&error), ErrorCode::IdentityMismatch);
+        assert_eq!(status(&home)?.current, prepared.current);
         Ok(())
     }
 

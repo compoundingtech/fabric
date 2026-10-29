@@ -1627,7 +1627,7 @@ impl DaemonState {
     async fn mutable_exposures(&self) -> Result<tokio::sync::MutexGuard<'_, bool>> {
         let guard = self.exposure_update.lock().await;
         if *guard {
-            return Err(FabricError::new(ErrorCode::IdentityBusy, "exposure mutations are fenced while identity activation stops this daemon").into());
+            return Err(FabricError::new(ErrorCode::IdentityBusy, "exposure mutations are fenced by identity activation; retry the same guarded activation to recover, or restart this daemon").into());
         }
         Ok(guard)
     }
@@ -4543,6 +4543,15 @@ async fn process_control_request(
             let home = state.home.clone();
             tokio::task::spawn_blocking(move || crate::identity::write_runtime_snapshot(&home, next, snapshot)).await??;
             *handoff = true;
+            ControlResponse::IdentitySnapshot { runtime_peers: state.runtime_peers.is_some() }
+        }
+        ControlRequest::IdentityAbort { current } => {
+            if state.id() != current {
+                return Err(FabricError::new(ErrorCode::IdentityMismatch, "running daemon identity changed; cannot abort its handoff").into());
+            }
+            let mut handoff = state.exposure_update.lock().await;
+            crate::identity::discard_runtime_snapshot(&state.home)?;
+            *handoff = false;
             ControlResponse::Ok
         }
         ControlRequest::Status => state.status_response().await?,

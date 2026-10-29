@@ -214,6 +214,86 @@ async fn identity_cli_prepare_activate_retry_crash_recovery_and_status_have_stab
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identity_foreground_activation_and_failed_swap_recovery_keep_runtime_off() -> Result<()> {
+    use fabric::{control::{ControlRequest, ControlResponse}, daemon::send_control};
+    struct Stop(FabricHome);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            let _ = Command::new(fabric_bin()).arg("--home").arg(self.0.root()).arg("down").output();
+        }
+    }
+    for fail_before_rename in [false, true] {
+        let dir = TempDir::new()?;
+        let home = FabricHome::new(dir.path());
+        let prepared = fabric::identity::prepare(&home)?;
+        let mut foreground = tokio::process::Command::new(fabric_bin())
+            .arg("--home").arg(home.root()).args(["up", "--foreground"])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .kill_on_drop(true).spawn()?;
+        let _stop = Stop(home.clone());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(send_control(&home, ControlRequest::Status).await,
+                    Ok(ControlResponse::Status { node_id, .. }) if node_id == prepared.current.to_string()) { break; }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }).await.context("foreground daemon readiness")?;
+        assert!(fabric::daemon::daemon_lock_available(&home)?, "test must exercise a foreground daemon without a lease");
+        // A stale ON marker must not override the live daemon's OFF choice.
+        fs::write(home.root().join("identity.runtime-peers"), b"stale")?;
+        if fail_before_rename { fs::create_dir(home.root().join("identity.activation"))?; }
+        let current = prepared.current.to_string();
+        let next = prepared.next.to_string();
+        let args = ["identity", "activate", "--expect-current", &current, "--expect-next", &next, "--json"];
+        let activated = fabric(&home, &args).await?;
+        tokio::time::timeout(Duration::from_secs(5), foreground.wait()).await??;
+        if fail_before_rename {
+            assert_ne!(activated.code, Some(0));
+            assert!(activated.stdout.contains("current identity daemon restarted successfully"), "{}", activated.stdout);
+            let state = fabric::identity::status(&home)?;
+            assert_eq!(state.current, prepared.current);
+            assert_eq!(state.next, Some(prepared.next));
+            assert!(!home.root().join("identity.exposures").exists());
+            fs::remove_dir(home.root().join("identity.activation"))?;
+            ok(&fabric(&home, &args).await?)?;
+        } else { ok(&activated)?; }
+        let live = send_control(&home, ControlRequest::Status).await?;
+        assert!(matches!(live, ControlResponse::Status { node_id, .. } if node_id == next));
+        let runtime = send_control(&home, ControlRequest::RuntimePeers {
+            request: fabric::runtime_peers::Request::List { cursor: None },
+        }).await?;
+        let ControlResponse::RuntimePeers { reply } = runtime else { bail!("missing runtime reply") };
+        assert!(reply.error.is_some(), "activation enabled runtime policy on an OFF daemon");
+        assert!(!home.root().join("identity.runtime-peers").exists());
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identity_snapshot_abort_removes_handoff_and_unfences_exposures() -> Result<()> {
+    use fabric::{control::{ControlRequest, ControlResponse}, daemon::send_control};
+    let dir = TempDir::new()?;
+    let home = FabricHome::new(dir.path());
+    let prepared = fabric::identity::prepare(&home)?;
+    let node = FabricNode::start(home.clone()).await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if send_control(&home, ControlRequest::Status).await.is_ok() { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await?;
+    let reply = send_control(&home, ControlRequest::IdentitySnapshot { current: prepared.current, next: prepared.next }).await?;
+    assert!(matches!(reply, ControlResponse::IdentitySnapshot { runtime_peers: false }));
+    let blocked = node.expose_tcp_ephemeral("handoff-check", "127.0.0.1:1".into()).await.unwrap_err();
+    assert_eq!(fabric::error::code_of(&blocked), fabric::error::ErrorCode::IdentityBusy);
+    send_control(&home, ControlRequest::IdentityAbort { current: prepared.current }).await?;
+    assert!(!home.root().join("identity.exposures").exists());
+    node.expose_tcp_ephemeral("handoff-check", "127.0.0.1:1".into()).await?;
+    node.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_json_command_prints_one_stable_object() -> Result<()> {
     let server_dir = TempDir::new()?;
     let client_dir = TempDir::new()?;

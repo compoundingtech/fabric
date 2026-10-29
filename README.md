@@ -160,13 +160,16 @@ fabric identity status --json
 ```
 
 Activation fences exposure changes and stops the old daemon before the single
-atomic rename, then starts the replacement through the existing native supervisor
-or standalone launch path. Success waits for the live daemon to report the new
-NodeID. A failed old-daemon stop leaves the identity prepared. Lost-reply retries
-with the same guards return
-`already_active`; they never swap again. A mismatched guard returns
-`identity_mismatch` without changing the identity. Concurrent identity operations
-return `identity_busy` rather than waiting behind a restart.
+atomic rename, then asks the existing native supervisor to restart or directly
+spawns a standalone replacement daemon. Success waits for the live daemon to
+report the new NodeID. If activation fails after requesting shutdown but before
+rename, it best-effort restarts the current identity and reports whether recovery
+succeeded. The identity remains prepared. Lost-reply retries with the same guards
+return `already_active`; they never swap again, and `previous` echoes the caller's
+`--expect-current`, not a recovered historical value. A mismatched guard returns
+`identity_mismatch` without swapping the identity. The identity lock remains held
+through restart: concurrent `status`, `prepare`, or `activate` returns
+`identity_busy` rather than waiting.
 
 After a crash, `status` reports either `prepared` (old key plus pending new key)
 or `active` (the rename completed). `restart_failed` is non-zero and includes
@@ -180,8 +183,10 @@ mux connections, queued dials, and persisted dial declarations bound to the old
 local NodeID are retired; consumers explicitly establish new dials. Persisted and
 ephemeral exposures are carried across this restart without making ephemeral ones
 permanent: replacement startup consumes the one-start handoff even if the
-activating CLI crashes. Exposure mutations after the snapshot return
-`identity_busy` until shutdown. Sync author identity is the
+activating CLI crashes. An aborted pre-rename activation removes its handoff and
+clears a reachable old daemon's exposure fence. If the CLI itself dies after the
+snapshot, exposure changes return `identity_busy` until the same guarded
+activation is retried or the daemon is restarted. Sync author identity is the
 NodeID byte-for-byte: the companion stops its old-author engine and starts a
 new-author engine over the existing sync history and files.
 

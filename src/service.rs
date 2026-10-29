@@ -593,32 +593,32 @@ pub fn ensure_unsupervised_restart(home: &FabricHome) -> Result<()> {
 
 /// Restart a native owner without replacing its definition or changing enablement.
 /// Returns false only when the selected home has no native owner.
-pub fn restart_identity_service(home: &FabricHome) -> Result<bool> {
+pub async fn restart_identity_service(home: &FabricHome) -> Result<bool> {
     if !home.is_default_state_root() {
         return Ok(false);
     }
-    match service_enablement() {
+    match identity_service_enablement(false).await? {
         ServiceEnablement::NotInstalled => return Ok(false),
         ServiceEnablement::Unknown => bail!("cannot establish native service ownership"),
         ServiceEnablement::Enabled | ServiceEnablement::PresentNotEnabled => {}
     }
     #[cfg(target_os = "linux")]
     {
-        let companion = match sync_service_enablement() {
+        let companion = match identity_service_enablement(true).await? {
             ServiceEnablement::NotInstalled => false,
             ServiceEnablement::Unknown => bail!("cannot establish sync service ownership"),
             _ => true,
         };
         let (program, args) = systemd_restart_argv(companion);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let output = Command::new(program).args(args).output()?;
+        let output = identity_service_output(program, &args, Duration::from_secs(15)).await?;
         if !output.status.success() {
             bail!("native restart failed: {}", String::from_utf8_lossy(&output.stderr));
         }
     }
     #[cfg(target_os = "macos")]
     {
-        let output = Command::new("launchctl").args(["kickstart", "-k", &launchd_service_target()]).output()?;
+        let output = identity_service_output("launchctl", &["kickstart", "-k", &launchd_service_target()], Duration::from_secs(15)).await?;
         if !output.status.success() {
             bail!("native restart failed: {}", String::from_utf8_lossy(&output.stderr));
         }
@@ -626,6 +626,35 @@ pub fn restart_identity_service(home: &FabricHome) -> Result<bool> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     bail!("native identity restart is unsupported on this platform");
     Ok(true)
+}
+
+async fn identity_service_output(program: &str, args: &[&str], timeout: Duration) -> Result<std::process::Output> {
+    let mut command = tokio::process::Command::new(program);
+    command.args(args).kill_on_drop(true);
+    tokio::time::timeout(timeout, command.output()).await.map_err(|_| {
+        fabric::error::FabricError::new(fabric::error::ErrorCode::Timeout, format!("{program} timed out during identity restart"))
+    })?.with_context(|| format!("run {program} for identity restart"))
+}
+
+async fn identity_service_enablement(sync: bool) -> Result<ServiceEnablement> {
+    #[cfg(target_os = "linux")]
+    {
+        let path = if sync { systemd_sync_user_unit_path() } else { systemd_user_unit_path() };
+        let present = path.map(|path| path.exists()).unwrap_or(false);
+        let name = if sync { SYNC_SERVICE_NAME } else { SERVICE_NAME };
+        let output = identity_service_output("systemctl", &["--user", "is-enabled", name], Duration::from_secs(5)).await?;
+        Ok(interpret_systemd_is_enabled(present, true, &String::from_utf8_lossy(&output.stdout)))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let path = if sync { launch_sync_agent_path() } else { launch_agent_path() };
+        let present = path.map(|path| path.exists()).unwrap_or(false);
+        let target = if sync { launchd_sync_service_target() } else { launchd_service_target() };
+        let output = identity_service_output("launchctl", &["print", &target], Duration::from_secs(5)).await?;
+        Ok(interpret_launchd(present, output.status.success()))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    bail!("native identity restart is unsupported on this platform")
 }
 
 fn restart_ownership_decision(
@@ -1601,6 +1630,13 @@ fn xml_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn identity_native_command_timeout_is_bounded_and_coded() -> anyhow::Result<()> {
+        let error = super::identity_service_output("/bin/sh", &["-c", "exec sleep 5"], std::time::Duration::from_millis(50)).await.unwrap_err();
+        assert_eq!(fabric::error::code_of(&error), fabric::error::ErrorCode::Timeout);
+        Ok(())
+    }
+
     use super::{
         ControlSocketState, InstallVerification, ServiceEnablement, control_socket_state,
         interpret_launchd, interpret_systemd_is_enabled, rollback_service_command_result,
