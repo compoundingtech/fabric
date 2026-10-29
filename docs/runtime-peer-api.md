@@ -275,6 +275,8 @@ The `operation` field selects one of:
 | `cancellation` | `request_id` of a retained mutation receipt. |
 
 An owner and request ID each contain 1–128 bytes without control characters.
+The `expiry:` request-ID prefix is system-reserved: owner mutations cannot use
+it, including before a deadline is scheduled or after its receipt is retained.
 A new record starts with no grants and normal direction. An omitted name,
 direction, or address preserves that owner's existing value. `set_grants`
 replaces the entire owner's grant set; `[]` withdraws all services while
@@ -357,6 +359,8 @@ Expiry withdrawals are not blocked by stale sync selectors. A blocked writer
 cannot extend expired authorization or live work; residual grants preserve
 still-permitted work. Cancellation monitoring retains its two-second deadline
 and missed-bound evidence even when the automatic receipt is persisted later.
+Each automatic receipt names only cancelled work for its own expiring NodeID;
+other records expiring in the same sweep retain their own cancellation evidence.
 Sweep selection and signaling share an in-memory publication-generation guard;
 they cannot revoke against a stale snapshot after newer residual grants publish.
 This guard never covers filesystem work.
@@ -416,8 +420,8 @@ request; do not invent a new request ID for an uncertain outcome.
 The store permits at most 1,024 owner/NodeID records in total. Receipts are
 retained for at least 24 hours in a pool of 1,024 slots. Ordinary mutations may
 use 960 slots; the remaining 64 are reserved for batches containing only
-`remove_peer`, `set_expiry`, or `set_grants` that remove services without adding
-any. Installing expiry also reserves a future automatic receipt slot; all
+`remove_peer` or `set_grants` that remove services without adding any.
+Scheduling with `set_expiry` uses ordinary capacity and also reserves a future automatic receipt slot; all
 mutations account for those reservations before committing. Pure no-ops consume
 no slot, even when the pool is full. Expired receipts are pruned by a subsequent
 changed mutation. When the applicable capacity is full, that
