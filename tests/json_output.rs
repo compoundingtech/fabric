@@ -241,7 +241,18 @@ async fn identity_foreground_activation_failed_swap_and_stale_socket_recovery_ke
         assert!(!fabric::daemon::daemon_lock_available(&home)?, "foreground must retain its lifetime lease through teardown");
         // A stale ON marker must not override the live daemon's OFF choice.
         fs::write(home.root().join("identity.runtime-peers"), b"stale")?;
-        if fail_before_rename { fs::create_dir(home.root().join("identity.activation"))?; }
+        let mut blocked_retired_paths = Vec::new();
+        if fail_before_rename {
+            // Fail retaining the old secret, without also making the old
+            // daemon's startup intent unreadable. Cover the bounded command's
+            // possible retirement timestamps rather than racing its clock.
+            let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+            for offset in 0..=30 {
+                let path = home.root().join(format!("identity.retired.{}.{}.toml", timestamp + 600 + offset, prepared.current));
+                fs::create_dir(&path)?;
+                blocked_retired_paths.push(path);
+            }
+        }
         let current = prepared.current.to_string();
         let next = prepared.next.to_string();
         let args = ["identity", "activate", "--expect-current", &current, "--expect-next", &next, "--json"];
@@ -254,7 +265,7 @@ async fn identity_foreground_activation_failed_swap_and_stale_socket_recovery_ke
             assert_eq!(state.current, prepared.current);
             assert_eq!(state.next, Some(prepared.next));
             assert!(!home.root().join("identity.exposures").exists());
-            fs::remove_dir(home.root().join("identity.activation"))?;
+            for path in blocked_retired_paths { fs::remove_dir(path)?; }
             ok(&fabric(&home, &args).await?)?;
         } else { ok(&activated)?; }
         let live = send_control(&home, ControlRequest::Status).await?;
