@@ -16,6 +16,8 @@ Deprecated, Fixed or Security.
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-10-28
+
 ### Added
 
 - `fabric identity prepare|activate|status [--json]` supports in-place consumer

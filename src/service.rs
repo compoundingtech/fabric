@@ -668,7 +668,6 @@ async fn identity_systemd_enablement(program: &str, name: &str, present: bool) -
         Err(_) => Ok(interpret_systemd_is_enabled(present, false, "")),
     }
 }
-
 fn restart_ownership_decision(
     enablement: ServiceEnablement,
     native_restart_command: &str,

@@ -366,7 +366,6 @@ mod tests {
         }
         Ok(())
     }
-
     use super::*;
     #[test]
     fn prepare_is_durable_private_and_idempotent() -> Result<()> {
@@ -589,7 +588,6 @@ mod tests {
         assert_eq!(status(&home)?.current, prepared.current);
         Ok(())
     }
-
     #[tokio::test]
     async fn failed_runtime_launch_does_not_enable_retained_runtime_policy() -> Result<()> {
         let dir = tempfile::tempdir()?;
