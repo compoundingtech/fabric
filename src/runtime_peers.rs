@@ -1093,14 +1093,13 @@ impl RuntimePeers {
         // containing additions or replacements cannot consume this reserve.
         let withdrawal_only = tx.operations.iter().all(|op| match op {
             Operation::RemovePeer { .. } => true,
-            Operation::SetExpiry { .. } => true,
             Operation::SetGrants { node_id, grants } => self
                 .stored
                 .records
                 .iter()
                 .find(|r| r.owner == tx.owner && r.peer.id == *node_id)
                 .is_some_and(|record| grants.iter().all(|grant| record.peer.allow.contains(grant))),
-            Operation::AddPeer { .. } => false,
+            Operation::AddPeer { .. } | Operation::SetExpiry { .. } => false,
         });
         let limit = if withdrawal_only {
             MAX_RECEIPTS
@@ -2192,24 +2191,32 @@ mod tests {
     }
 
     #[test]
-    fn expiry_receipt_capacity_is_reserved_when_the_deadline_is_installed() -> Result<()> {
+    fn expiry_receipt_capacity_accounts_for_reservations_and_preserves_withdrawal_reserve() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut store = open(&dir);
         let deadline = i64::try_from(store.expiry_timestamp() + 600)?;
         commit(&mut store, &tx("owner", "install", 0, vec![
-            add(1, "one"),
+            add(1, "one"), add(2, "two"), add(3, "three"),
             Operation::SetExpiry { node_id: id(1), expires_at: deadline },
         ]))?;
         let template = store.stored.receipts[0].clone();
         store.stored.receipts = (0..MAX_RECEIPTS - 1).map(|index| Receipt {
             request_id: format!("receipt-{index}"), ..template.clone()
         }).collect();
-        assert!(store.prepare(&tx("owner", "ordinary", 1, vec![add(2, "two")])).is_err());
-        store.advance_expiry_for_test(u64::try_from(deadline)?);
-        let expired = store.expired_transactions()?.remove(0);
-        commit(&mut store, &expired)?;
-        assert_eq!(store.stored.receipts.len(), MAX_RECEIPTS);
-        assert!(store.stored.records.is_empty());
+        assert!(store.stored.receipts.len() < MAX_RECEIPTS);
+        assert_eq!(store.stored.receipts.len() + 1, MAX_RECEIPTS);
+        let error = store.prepare(&tx("owner", "remove", 1, vec![
+            Operation::RemovePeer { node_id: id(2) },
+        ])).err().context("withdrawal entered the full receipt pool")?;
+        assert_eq!(crate::error::code_of(&error), ErrorCode::RuntimeReceiptCapacity);
+        store.stored.receipts.truncate(MAX_RECEIPTS - WITHDRAWAL_RECEIPTS - 2);
+        let error = store.prepare(&tx("owner", "schedule", 1, vec![
+            Operation::SetExpiry { node_id: id(2), expires_at: deadline },
+        ])).err().context("expiry scheduling entered the withdrawal reserve")?;
+        assert_eq!(crate::error::code_of(&error), ErrorCode::RuntimeReceiptCapacity);
+        commit(&mut store, &tx("owner", "remove", 1, vec![
+            Operation::RemovePeer { node_id: id(3) },
+        ]))?;
         Ok(())
     }
 }

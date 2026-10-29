@@ -416,8 +416,8 @@ request; do not invent a new request ID for an uncertain outcome.
 The store permits at most 1,024 owner/NodeID records in total. Receipts are
 retained for at least 24 hours in a pool of 1,024 slots. Ordinary mutations may
 use 960 slots; the remaining 64 are reserved for batches containing only
-`remove_peer`, `set_expiry`, or `set_grants` that remove services without adding
-any. Installing expiry also reserves a future automatic receipt slot; all
+`remove_peer` or `set_grants` that remove services without adding any.
+Scheduling with `set_expiry` uses ordinary capacity and also reserves a future automatic receipt slot; all
 mutations account for those reservations before committing. Pure no-ops consume
 no slot, even when the pool is full. Expired receipts are pruned by a subsequent
 changed mutation. When the applicable capacity is full, that
