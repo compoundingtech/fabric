@@ -71,6 +71,11 @@ enum CaCommands {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Prepare, inspect, or activate this machine's transport identity.
+    Identity {
+        #[command(subcommand)]
+        command: IdentityCommands,
+    },
     /// Manage fabric identity key files.
     Key {
         #[command(subcommand)]
@@ -495,6 +500,21 @@ enum KeyCommands {
 }
 
 #[derive(Debug, Subcommand)]
+enum IdentityCommands {
+    /// Durably prepare a new identity without changing the running daemon.
+    Prepare,
+    /// Inspect the authoritative active and prepared keys.
+    Status,
+    /// Activate only after peers trust the prepared NodeID.
+    Activate {
+        #[arg(long)]
+        expect_current: iroh::EndpointId,
+        #[arg(long)]
+        expect_next: iroh::EndpointId,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum ServiceCommands {
     /// Install and start a user service for the foreground daemon.
     Install {
@@ -627,6 +647,25 @@ async fn run(cli: Cli) -> Result<()> {
             let home = FabricHome::resolve(cli.home)?;
             match command {
                 Commands::Key { .. } => unreachable!("key commands are handled before home setup"),
+                Commands::Identity { command } => {
+                    match command {
+                        IdentityCommands::Prepare => {
+                            let prepared = fabric::identity::prepare(&home)?;
+                            if json { print_json(&serde_json::to_value(&prepared)?)?; }
+                            else { println!("current\t{}\nnext\t{}", prepared.current, prepared.next); }
+                        }
+                        IdentityCommands::Status => {
+                            let status = fabric::identity::status(&home)?;
+                            if json { print_json(&serde_json::to_value(&status)?)?; }
+                            else { println!("current\t{}\nnext\t{}\nstate\t{}", status.current, status.next.map(|id| id.to_string()).unwrap_or_else(|| "-".into()), status.state); }
+                        }
+                        IdentityCommands::Activate { expect_current, expect_next } => {
+                            let activated = activate_identity(&home, expect_current, expect_next).await?;
+                            if json { print_json(&serde_json::to_value(&activated)?)?; }
+                            else { println!("previous\t{}\nactive\t{}\noutcome\t{}", activated.previous, activated.active, activated.outcome); }
+                        }
+                    }
+                }
                 Commands::Id => {
                     let key = load_or_create_identity(&home)?;
                     if json {
@@ -1035,6 +1074,7 @@ async fn run(cli: Cli) -> Result<()> {
                         runtime_peers,
                     );
                     if foreground {
+                        let _lease = fabric::daemon::DaemonLease::acquire(&home)?;
                         init_daemon_tracing(&home)?;
                         let node = FabricNode::start_with_daemon_options(home, options).await?;
                         let peers = node.state().peer_reachability().await;
@@ -3059,6 +3099,126 @@ fn run_restart_detacher(home: &FabricHome, _allow_shell: bool, runtime_peers: bo
     Ok(())
 }
 
+async fn identity_control(home: &FabricHome, request: ControlRequest) -> Result<ControlResponse> {
+    tokio::time::timeout(Duration::from_secs(2), send_control(home, request)).await
+        .map_err(|_| FabricError::new(ErrorCode::Timeout, "identity control request timed out; retry the same guarded activation to recover any exposure fence"))?
+}
+
+async fn identity_live_status(home: &FabricHome) -> Result<Option<ControlResponse>> {
+    match identity_control(home, ControlRequest::Status).await {
+        Ok(response @ ControlResponse::Status { .. }) => Ok(Some(response)),
+        Ok(response) => bail!("unexpected identity status response: {response:?}"),
+        Err(error) if fabric::error::code_of(&error) == ErrorCode::DaemonNotRunning => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+async fn identity_stop_lease(home: &FabricHome) -> Result<std::fs::File> {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            // Every CLI daemon, foreground or background, retains this lease
+            // through teardown. A leftover pathname after a crash is harmless.
+            if let Some(lease) = fabric::daemon::try_daemon_lease(home)? {
+                return Ok::<_, anyhow::Error>(lease);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.map_err(|_| FabricError::new(ErrorCode::DaemonStopTimeout, "daemon did not stop within 15 seconds"))?
+}
+
+async fn activate_identity(home: &FabricHome, current: iroh::EndpointId, next: iroh::EndpointId) -> Result<fabric::identity::Activated> {
+    let snapshot_attempted = std::cell::Cell::new(false);
+    let stop_attempted = std::cell::Cell::new(false);
+    fabric::identity::activate_with_restart(home, current, next, || async {
+        let live = identity_live_status(home).await?;
+        if live.is_none() {
+            return identity_stop_lease(home).await;
+        }
+        snapshot_attempted.set(true);
+        let response = identity_control(home, ControlRequest::IdentitySnapshot { current, next }).await?;
+        let ControlResponse::IdentitySnapshot { runtime_peers } = response else {
+            bail!("unexpected identity snapshot response: {response:?}");
+        };
+        fabric::identity::record_runtime_mode(home, runtime_peers)?;
+        stop_attempted.set(true);
+        identity_control(home, ControlRequest::Shutdown).await?;
+        identity_stop_lease(home).await
+    }, || reconcile_identity_daemon(home, next),
+       |error| recover_identity_activation(home, current, snapshot_attempted.get(), stop_attempted.get(), error),
+    ).await
+}
+
+async fn recover_identity_activation(home: &FabricHome, current: iroh::EndpointId, snapshot_attempted: bool, stop_attempted: bool, error: anyhow::Error) -> anyhow::Error {
+    if !snapshot_attempted || load_or_create_identity(home).map_or(true, |key| key.public() != current) {
+        return error;
+    }
+    let cleanup = fabric::identity::discard_runtime_snapshot(home);
+    // A live old daemon may have fenced exposures before a failed control
+    // reply. Clear that fence even when the stop request was never sent.
+    let abort = match identity_live_status(home).await {
+        Ok(Some(_)) => identity_control(home, ControlRequest::IdentityAbort { current }).await.map(|_| ()),
+        Ok(None) => Ok(()),
+        Err(error) => Err(error),
+    };
+    let recovery = if stop_attempted {
+        match reconcile_identity_daemon(home, current).await {
+            Ok(()) => "current identity daemon restarted successfully".to_owned(),
+            Err(error) => format!("current identity restart failed: {error:#}"),
+        }
+    } else {
+        "current identity was not stopped".to_owned()
+    };
+    error.context(format!(
+        "activation aborted before rename; {recovery}; handoff cleanup: {}; exposure fence: {}; retry the same guarded activation or restart the daemon if the fence remains",
+        cleanup.err().map(|e| e.to_string()).unwrap_or_else(|| "removed".into()),
+        abort.err().map(|e| e.to_string()).unwrap_or_else(|| "cleared".into()),
+    ))
+}
+
+/// Reconcile, never roll back, after the authoritative identity rename.
+async fn reconcile_identity_daemon(home: &FabricHome, expected: iroh::EndpointId) -> Result<()> {
+    let expected = expected.to_string();
+    let mut live = identity_live_status(home).await?;
+    if matches!(&live, Some(ControlResponse::Status { node_id, .. }) if node_id == &expected) {
+        return Ok(());
+    }
+    if live.is_none() && !fabric::daemon::daemon_lock_available(home)? {
+        // A supervisor may already be starting the right daemon. Give it a
+        // short readiness window rather than terminating it before it serves.
+        let until = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < until {
+            live = identity_live_status(home).await?;
+            match &live {
+                Some(ControlResponse::Status { node_id, .. }) if node_id == &expected => return Ok(()),
+                Some(_) => break,
+                None => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    }
+    if live.is_some() || !fabric::daemon::daemon_lock_available(home)? {
+        identity_control(home, ControlRequest::Shutdown).await?;
+        drop(identity_stop_lease(home).await?);
+    }
+    if service::restart_identity_service(home).await? {
+        // The native supervisor owns the replacement, including companion state.
+    } else {
+        // A crash after rename may leave no daemon to accept a Restart request.
+        // Preserve the daemon's opt-in runtime policy mode recorded before swap.
+        let runtime_peers = home.root().join("identity.runtime-peers").exists();
+        tokio::time::timeout(Duration::from_secs(15), spawn_daemon_with_output(home, DaemonOptions { runtime_peers, ..DaemonOptions::default() }, false))
+            .await.map_err(|_| FabricError::new(ErrorCode::Timeout, "replacement daemon spawn/readiness timed out"))??;
+    }
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if matches!(identity_control(home, ControlRequest::Status).await, Ok(ControlResponse::Status { node_id, .. }) if node_id == expected) {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }).await.map_err(|_| FabricError::new(ErrorCode::Timeout, "new identity did not become live within 30 seconds"))??;
+    Ok(())
+}
+
 async fn run_restart_helper(
     home: &FabricHome,
     _allow_shell: bool,
@@ -3566,8 +3726,12 @@ async fn request_shell_socket(home: &FabricHome, peer: &str) -> Result<PathBuf> 
 }
 
 async fn spawn_daemon(home: &FabricHome, options: DaemonOptions) -> Result<()> {
+    spawn_daemon_with_output(home, options, true).await
+}
+
+async fn spawn_daemon_with_output(home: &FabricHome, options: DaemonOptions, announce: bool) -> Result<()> {
     if send_control(home, ControlRequest::Status).await.is_ok() {
-        println!("already running");
+        if announce { println!("already running"); }
         return Ok(());
     }
 
@@ -3607,7 +3771,7 @@ async fn spawn_daemon(home: &FabricHome, options: DaemonOptions) -> Result<()> {
     let started = Instant::now();
     loop {
         if send_control(home, ControlRequest::Status).await.is_ok() {
-            println!("started");
+            if announce { println!("started"); }
             return Ok(());
         }
         if started.elapsed() > Duration::from_secs(10) {
@@ -3617,5 +3781,79 @@ async fn spawn_daemon(home: &FabricHome, options: DaemonOptions) -> Result<()> {
             );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(test)]
+mod identity_review_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn identity_activation_waits_for_an_already_stopping_foreground_node() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let prepared = fabric::identity::prepare(&home)?;
+        let _lease = fabric::daemon::DaemonLease::acquire(&home)?;
+        let listener = tokio::net::UnixListener::bind(home.control_socket_path())?;
+        drop(listener);
+        let activation = activate_identity(&home, prepared.current, prepared.next);
+        tokio::pin!(activation);
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut activation).await.is_err());
+        assert_eq!(load_or_create_identity(&home)?.public(), prepared.current);
+        assert!(home.root().join("identity.next.toml").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identity_foreground_stop_waits_for_lifetime_lease_after_socket_refusal() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        home.prepare()?;
+        let lease = fabric::daemon::DaemonLease::acquire(&home)?;
+        let listener = tokio::net::UnixListener::bind(home.control_socket_path())?;
+        drop(listener);
+        // A refused connection during cancellation does not prove endpoint
+        // teardown; the foreground process retains its lifetime lease.
+        assert!(identity_live_status(&home).await?.is_none());
+        let stop = identity_stop_lease(&home);
+        tokio::pin!(stop);
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut stop).await.is_err());
+        drop(lease);
+        drop(tokio::time::timeout(Duration::from_secs(1), stop).await??);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identity_control_wait_is_bounded_and_coded() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        home.prepare()?;
+        let listener = tokio::net::UnixListener::bind(home.control_socket_path())?;
+        let task = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let error = identity_control(&home, ControlRequest::Status).await.unwrap_err();
+        assert_eq!(fabric::error::code_of(&error), ErrorCode::Timeout);
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identity_reconcile_waits_for_fresh_daemon_before_shutdown() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let expected = load_or_create_identity(&home)?.public();
+        let _lease = fabric::daemon::try_daemon_lease(&home)?.context("lease")?;
+        let starting_home = home.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            fabric::daemon::FabricNode::start(starting_home).await
+        });
+        reconcile_identity_daemon(&home, expected).await?;
+        let node = task.await??;
+        assert!(matches!(identity_live_status(&home).await?, Some(ControlResponse::Status { node_id, .. }) if node_id == expected.to_string()));
+        node.shutdown().await?;
+        Ok(())
     }
 }

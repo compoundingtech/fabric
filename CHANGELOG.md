@@ -20,6 +20,20 @@ Deprecated, Fixed or Security.
 
 ### Added
 
+- `fabric identity prepare|activate|status [--json]` supports in-place consumer
+  re-keying without dual-identity serving. Preparation durably stores one private
+  pending key; guarded activation uses a single rename and waits for the
+  service-aware restart to report the new NodeID. Lost-reply retries return
+  `already_active`; `identity_busy`, `identity_mismatch`, and `restart_failed`
+  distinguish contention, stale guards, and retry-only-restart recovery.
+  Peer policy, exposures, receipts/revocation history and audit remain local;
+  old transport sessions, connections and dial declarations are retired.
+  Sync keeps its history but changes its NodeID-derived author. Retired secret
+  keys are deleted after the conservative ten-minute overlap upper bound.
+  Foreground daemons participate in the bounded stop/restart handshake; failed
+  pre-rename swaps best-effort restore the current daemon and discard stale
+  handoffs. Live runtime-policy mode overrides stale markers. Cleanup failures
+  do not block inspection, and preparation replaces corrupt pending keys.
 - **Provisional:** runtime peer records support immutable `expires_at` deadlines
   within the next 600 seconds. Existing atomic batches can install a prepared
   next NodeID's exact grants and schedule the old owner record's retirement.

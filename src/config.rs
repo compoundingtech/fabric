@@ -70,8 +70,8 @@ pub fn load_or_create_identity(home: &FabricHome) -> Result<SecretKey> {
     if path.exists() {
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let file: IdentityFile =
-            toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
+        let file: IdentityFile = toml::from_str(&raw)
+            .map_err(|_| anyhow::anyhow!("invalid identity key file {}", path.display()))?;
         return Ok(file.secret_key);
     }
 

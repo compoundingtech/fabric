@@ -18,6 +18,7 @@ pub mod doctor;
 /// Stable error codes (docs/errors.md), shared with the sync companion.
 pub use fabric_config::error;
 pub mod join;
+pub mod identity;
 pub mod macos_app;
 pub mod mux;
 pub mod pathwatch;

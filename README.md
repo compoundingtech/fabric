@@ -135,6 +135,70 @@ still holds to answer one echo within three seconds and resets only a connection
 that does not, at most once a minute per peer; the endpoint itself is not
 rebuilt for that.
 
+### Re-key this machine in place
+
+Identity rotation is **prepare → publish over the old identity → activate**.
+Fabric never serves two local identities at once.
+
+```sh
+fabric identity prepare --json
+# {"current":"<old>","next":"<new>"}
+```
+
+Preparation durably stores a private 0600 key inside Fabric's home. Repeating it
+returns the same `next`; the running daemon is unchanged. Over the still-working
+old connection, arrange for every peer to trust `next` with the exact existing
+grants and set the old runtime record's immutable expiry (at most ten minutes)
+in one [atomic runtime-peer batch](docs/runtime-peer-api.md).
+Only after peers have installed that batch:
+
+```sh
+fabric identity activate --expect-current <old> --expect-next <new> --json
+# {"previous":"<old>","active":"<new>","outcome":"activated"}
+fabric identity status --json
+# {"current":"<new>","next":null,"state":"active"}
+```
+
+Both foreground and background CLI daemons retain the same per-home lifetime
+lease through endpoint and child teardown; a stale socket alone is not liveness.
+
+Activation fences exposure changes and stops the old daemon before the single
+atomic rename, then asks the existing native supervisor to restart or directly
+spawns a standalone replacement daemon. Success waits for the live daemon to
+report the new NodeID. If activation fails after requesting shutdown but before
+rename, it best-effort restarts the current identity and reports whether recovery
+succeeded. The identity remains prepared. Lost-reply retries with the same guards
+return `already_active`; they never swap again, and `previous` echoes the caller's
+`--expect-current`, not a recovered historical value. A mismatched guard returns
+`identity_mismatch` without swapping the identity. The identity lock remains held
+through restart: concurrent `status`, `prepare`, or `activate` returns
+`identity_busy` rather than waiting.
+
+After a crash, `status` reports either `prepared` (old key plus pending new key)
+or `active` (the rename completed). `restart_failed` is non-zero and includes
+`previous` and `active` in the JSON error. Repeat the same activate command to
+retry only daemon reconciliation; do not restore the old key. The old daemon
+has already stopped before a post-rename restart can fail.
+
+Static and runtime peer policy, exposure declarations, retained transaction and
+revocation receipts, and the audit log remain in the same home. Tunnel sessions,
+mux connections, queued dials, and persisted dial declarations bound to the old
+local NodeID are retired; consumers explicitly establish new dials. Persisted and
+ephemeral exposures are carried across this restart without making ephemeral ones
+permanent: replacement startup consumes the one-start handoff even if the
+activating CLI crashes. An aborted pre-rename activation removes its handoff and
+clears a reachable old daemon's exposure fence. If the CLI itself dies after the
+snapshot, exposure changes return `identity_busy` until the same guarded
+activation is retried or the daemon is restarted. Sync author identity is the
+NodeID byte-for-byte: the companion stops its old-author engine and starts a
+new-author engine over the existing sync history and files.
+
+The old private key is retained only in a non-serving retired file. Because this
+machine cannot observe other machines' expiry records, it uses the conservative
+upper bound: ten minutes after activation. The daemon removes expired retired
+keys while running; identity commands also perform cleanup, and an offline home
+is cleaned on its next daemon start. Retired keys are never loaded for serving.
+
 ### Presence, partitions, and local ownership
 
 Fabric reports connection facts about each trusted peer by canonical NodeID.

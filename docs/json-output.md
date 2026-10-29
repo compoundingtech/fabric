@@ -17,6 +17,9 @@ a new key may be added, so read objects by key and ignore keys you do not know.
 | Command | Object |
 | --- | --- |
 | `id` | `{"id": "<NodeID>"}` |
+| `identity prepare` | `{"current": "<NodeID>", "next": "<NodeID>"}` |
+| `identity activate --expect-current OLD --expect-next NEW` | `{"previous": "<NodeID>", "active": "<NodeID>", "outcome": "activated"}`; lost-reply retries return `"already_active"`; `previous` always echoes OLD |
+| `identity status` | `{"current": "<NodeID>", "next": "<NodeID>" (or null), "state": "prepared" (or "active")}` |
 | `addr` | the daemon's `EndpointAddr` object (`{"id": ..., "addrs": [...]}`), with or without `--json`; it was JSON before the flag existed |
 | `peers` | `{"peers": [{"node", "name" (or null), "allow": [...], "dial_only", "inbound_only", "roaming"}]}` |
 | `probe PEER PROTOCOL` | `{"peer", "peer_id", "protocol", "outcome", "round_trip_micros", "transport", "error", "code", "class"}`; `outcome` is `supported`, `unsupported`, `unreachable` or `timeout`, and the exit status is unchanged |

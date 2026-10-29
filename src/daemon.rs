@@ -478,6 +478,7 @@ pub struct DaemonState {
     policy_quarantine: Arc<Mutex<Option<runtime_control::Revocations>>>,
     pending_policy_revocations: Arc<std::sync::Mutex<Vec<Arc<runtime_control::Revocations>>>>,
     exposures: RwLock<HashMap<Vec<u8>, Exposure>>,
+    exposure_update: Mutex<bool>,
     dial_sockets: Mutex<HashMap<(String, String), DialSocket>>,
     one_shot_dials: Mutex<Vec<JoinHandle<()>>>,
     dial_restore_failures: Mutex<Vec<DialRestoreFailure>>,
@@ -738,25 +739,33 @@ enum Exposure {
         path: PathBuf,
         /// Write the connecting peer's identity to the socket before its bytes.
         peer_header: bool,
+        persist: bool,
     },
     Tcp {
         addr: String,
+        persist: bool,
     },
     Exec {
         argv: Vec<String>,
         limit: Arc<tunnel::ExecLimit>,
+        persist: bool,
     },
 }
 
 impl Exposure {
+    fn persisted(&self) -> bool {
+        match self {
+            Self::Socket { persist, .. } | Self::Tcp { persist, .. } | Self::Exec { persist, .. } => *persist,
+        }
+    }
     fn to_server_target(&self, peer: &PeerIdentity) -> tunnel::ServerTarget {
         match self {
-            Self::Socket { path, peer_header } => tunnel::ServerTarget::UnixSocket {
+            Self::Socket { path, peer_header, .. } => tunnel::ServerTarget::UnixSocket {
                 path: path.clone(),
                 header: peer_header.then(|| peer_header_line(peer)),
             },
-            Self::Tcp { addr } => tunnel::ServerTarget::Tcp { addr: addr.clone() },
-            Self::Exec { argv, limit } => tunnel::ServerTarget::Exec {
+            Self::Tcp { addr, .. } => tunnel::ServerTarget::Tcp { addr: addr.clone() },
+            Self::Exec { argv, limit, .. } => tunnel::ServerTarget::Exec {
                 argv: argv.clone(),
                 limit: limit.clone(),
             },
@@ -769,7 +778,9 @@ fn load_persisted_exposures(
     services: &Services,
 ) -> Result<HashMap<Vec<u8>, Exposure>> {
     let mut exposures = HashMap::new();
-    for expose in FabricConfig::load(home)?.exposes() {
+    let config = FabricConfig::load(home)?;
+    let inherited = crate::identity::inherited_exposures(home)?;
+    for (expose, persist) in config.exposes().iter().map(|entry| (entry, true)).chain(inherited.iter().map(|entry| (entry, false))) {
         let alpn = validate_protocol(&expose.protocol)?;
         if matches_reserved_alpn(services, &alpn) {
             bail!(
@@ -789,11 +800,12 @@ fn load_persisted_exposures(
                 Exposure::Socket {
                     path: socket.clone(),
                     peer_header: *peer_header,
+                    persist,
                 }
             }
             PersistedExposeTarget::Tcp { addr } => {
                 validate_tcp_addr(addr)?;
-                Exposure::Tcp { addr: addr.clone() }
+                Exposure::Tcp { addr: addr.clone(), persist }
             }
             PersistedExposeTarget::Exec { argv, max_children } => {
                 if argv.is_empty() {
@@ -805,6 +817,7 @@ fn load_persisted_exposures(
                 Exposure::Exec {
                     argv: argv.clone(),
                     limit: tunnel::ExecLimit::new(*max_children),
+                    persist,
                 }
             }
         };
@@ -1234,6 +1247,7 @@ impl DaemonState {
         audit: Option<crate::audit::Audit>,
     ) -> Result<Arc<Self>> {
         home.prepare()?;
+        crate::identity::reconcile_startup(&home)?;
         sweep_one_shot_dials(&home);
         let child_root = home.root().to_owned();
         let child_owner = Arc::new(
@@ -1311,6 +1325,7 @@ impl DaemonState {
             policy_quarantine: Arc::new(Mutex::new(None)),
             pending_policy_revocations: Arc::new(std::sync::Mutex::new(Vec::new())),
             exposures: RwLock::new(exposures),
+            exposure_update: Mutex::new(false),
             dial_sockets: Mutex::new(HashMap::new()),
             one_shot_dials: Mutex::new(Vec::new()),
             dial_restore_failures: Mutex::new(Vec::new()),
@@ -1609,6 +1624,14 @@ impl DaemonState {
         PeerIdentity { id, name }
     }
 
+    async fn mutable_exposures(&self) -> Result<tokio::sync::MutexGuard<'_, bool>> {
+        let guard = self.exposure_update.lock().await;
+        if *guard {
+            return Err(FabricError::new(ErrorCode::IdentityBusy, "exposure mutations are fenced by identity activation; retry the same guarded activation to recover, or restart this daemon").into());
+        }
+        Ok(guard)
+    }
+
     pub async fn expose(&self, protocol: &str, socket: PathBuf) -> Result<()> {
         self.expose_socket(protocol, socket, true, false).await
     }
@@ -1624,6 +1647,7 @@ impl DaemonState {
         persist: bool,
         peer_header: bool,
     ) -> Result<()> {
+        let _identity_guard = self.mutable_exposures().await?;
         let alpn = validate_protocol(protocol)?;
         if matches_reserved_alpn(&self.services, &alpn) {
             bail!("{protocol:?} is reserved for fabric's built-in protocols");
@@ -1645,6 +1669,7 @@ impl DaemonState {
             Exposure::Socket {
                 path: socket,
                 peer_header,
+                persist,
             },
         );
         self.current_endpoint().set_alpns(accepted_alpns(
@@ -1665,6 +1690,7 @@ impl DaemonState {
         addr: String,
         persist: bool,
     ) -> Result<()> {
+        let _identity_guard = self.mutable_exposures().await?;
         let alpn = validate_protocol(protocol)?;
         if matches_reserved_alpn(&self.services, &alpn) {
             bail!("{protocol:?} is reserved for fabric's built-in protocols");
@@ -1679,7 +1705,7 @@ impl DaemonState {
         }
 
         let mut exposures = self.exposures.write().await;
-        exposures.insert(alpn, Exposure::Tcp { addr });
+        exposures.insert(alpn, Exposure::Tcp { addr, persist });
         self.current_endpoint().set_alpns(accepted_alpns(
             &self.services,
             &exposures,
@@ -1705,6 +1731,7 @@ impl DaemonState {
         max_children: usize,
         persist: bool,
     ) -> Result<()> {
+        let _identity_guard = self.mutable_exposures().await?;
         let alpn = validate_protocol(protocol)?;
         if matches_reserved_alpn(&self.services, &alpn) {
             bail!("{protocol:?} is reserved for fabric's built-in protocols");
@@ -1729,6 +1756,7 @@ impl DaemonState {
             Exposure::Exec {
                 argv,
                 limit: tunnel::ExecLimit::new(max_children),
+                persist,
             },
         );
         self.current_endpoint().set_alpns(accepted_alpns(
@@ -1759,6 +1787,7 @@ impl DaemonState {
     }
 
     pub async fn unexpose(&self, protocol: &str) -> Result<()> {
+        let _identity_guard = self.mutable_exposures().await?;
         let alpn = validate_protocol(protocol)?;
         if matches_reserved_alpn(&self.services, &alpn) {
             bail!("{protocol:?} is reserved for fabric's built-in protocols");
@@ -3448,11 +3477,16 @@ pub async fn run_daemon_with_options(home: FabricHome, options: DaemonOptions) -
     result
 }
 
-struct DaemonLease {
+pub struct DaemonLease {
     _file: Arc<std::fs::File>,
 }
 
 pub fn daemon_lock_available(home: &FabricHome) -> Result<bool> {
+    Ok(try_daemon_lease(home)?.is_some())
+}
+
+/// Retain the returned file to exclude daemon startup until the identity swap.
+pub fn try_daemon_lease(home: &FabricHome) -> Result<Option<std::fs::File>> {
     let path = home.root().join("run/daemon.lock");
     home.prepare()?;
     let file = OpenOptions::new()
@@ -3464,10 +3498,10 @@ pub fn daemon_lock_available(home: &FabricHome) -> Result<bool> {
     {
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
-            return Ok(false);
+            return Ok(None);
         }
     }
-    Ok(true)
+    Ok(Some(file))
 }
 
 pub fn restart_down_decision(status_ok: bool, lease_available: bool) -> bool {
@@ -3475,7 +3509,7 @@ pub fn restart_down_decision(status_ok: bool, lease_available: bool) -> bool {
 }
 
 impl DaemonLease {
-    fn acquire(home: &FabricHome) -> Result<Self> {
+    pub fn acquire(home: &FabricHome) -> Result<Self> {
         home.prepare()?;
         let path = home.root().join("run/daemon.lock");
         let file = OpenOptions::new()
@@ -3563,10 +3597,15 @@ async fn serve(state: Arc<DaemonState>) -> Result<()> {
             .with_context(|| format!("failed to remove stale {}", sync_ipc_path.display()))?;
     }
     let sync_ipc_listener = IpcListener::bind(&sync_ipc_path)?;
+    // All fallible construction and listener binding precedes this serving-mode
+    // commit. A failed launch must not select stale runtime grants on recovery.
+    crate::identity::finish_startup_snapshot(&state.home)?;
+    crate::identity::record_runtime_mode(&state.home, state.runtime_peers.is_some())?;
     // Cancellation stops future sweeps but never drops an in-flight durable commit.
     // The existing policy drain owns its shutdown barrier.
     let _pairing_expiry = tokio::spawn(pairing::expire_loop(state.clone()));
     let _runtime_peer_expiry = tokio::spawn(runtime_control::runtime_peer_expiry_loop(state.clone()));
+    let _retired_keys = tokio::spawn(crate::identity::retired_key_cleanup(state.home.clone(), state.cancel.clone()));
 
     let result = tokio::select! {
         result = run_control_socket(control_listener, state.clone()) => result,
@@ -4485,6 +4524,36 @@ async fn process_control_request(
         } => ControlResponse::Pairing {
             reply: pairing::remote(&state, gateway, addr, request).await,
         },
+        ControlRequest::IdentitySnapshot { current, next } => {
+            if state.id() != current {
+                return Err(FabricError::new(ErrorCode::IdentityMismatch, "running daemon identity does not match activation guard").into());
+            }
+            let mut handoff = state.exposure_update.lock().await;
+            let exposures = state.exposures.read().await;
+            let mut snapshot = Vec::with_capacity(exposures.len());
+            for (alpn, exposure) in exposures.iter() {
+                if exposure.persisted() { continue; }
+                let protocol = String::from_utf8(alpn.clone())?;
+                snapshot.push(match exposure {
+                    Exposure::Socket { path, peer_header, .. } => PersistedExpose::socket(protocol, path.clone(), *peer_header),
+                    Exposure::Tcp { addr, .. } => PersistedExpose::tcp(protocol, addr.clone()),
+                    Exposure::Exec { argv, limit, .. } => PersistedExpose::exec(protocol, argv.clone(), limit.max_children()),
+                });
+            }
+            let home = state.home.clone();
+            tokio::task::spawn_blocking(move || crate::identity::write_runtime_snapshot(&home, next, snapshot)).await??;
+            *handoff = true;
+            ControlResponse::IdentitySnapshot { runtime_peers: state.runtime_peers.is_some() }
+        }
+        ControlRequest::IdentityAbort { current } => {
+            if state.id() != current {
+                return Err(FabricError::new(ErrorCode::IdentityMismatch, "running daemon identity changed; cannot abort its handoff").into());
+            }
+            let mut handoff = state.exposure_update.lock().await;
+            crate::identity::discard_runtime_snapshot(&state.home)?;
+            *handoff = false;
+            ControlResponse::Ok
+        }
         ControlRequest::Status => state.status_response().await?,
         ControlRequest::ReachabilityStatus => state.reachability_status_response().await?,
         ControlRequest::PeerEvents {

@@ -20,6 +20,13 @@ pub enum ControlRequest {
     Status,
     ReachabilityStatus,
     ReloadPeers,
+    IdentitySnapshot {
+        current: iroh::EndpointId,
+        next: iroh::EndpointId,
+    },
+    IdentityAbort {
+        current: iroh::EndpointId,
+    },
     RuntimePeers {
         request: crate::runtime_peers::Request,
     },
@@ -179,6 +186,9 @@ pub struct DialRestoreFailure {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlResponse {
+    IdentitySnapshot {
+        runtime_peers: bool,
+    },
     RuntimePeers {
         reply: crate::runtime_peers::Reply,
     },

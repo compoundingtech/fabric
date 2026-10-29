@@ -38,6 +38,138 @@ const LOCAL_IO_TIMEOUT: Duration = Duration::from_secs(60);
 const LARGE_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const LOCAL_SLICE_SETTLE: Duration = Duration::from_millis(500);
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identity_activation_retires_old_transport_and_dials_preserving_policy_and_exposures() -> Result<()> {
+    use fabric::runtime_peers::{Operation, Request, Transaction};
+    let _guard = local_slice_guard().await;
+    let server_dir = TempDir::new()?;
+    let client_dir = TempDir::new()?;
+    let server_home = FabricHome::new(server_dir.path());
+    let client_home = FabricHome::new(client_dir.path());
+    server_home.prepare()?;
+    let historical_audit = fabric::audit::Record::AuditLoss {
+        time: "2026-01-01T00:00:00Z".into(), count: 7,
+        first_time: "2026-01-01T00:00:00Z".into(), last_time: "2026-01-01T00:00:00Z".into(),
+    };
+    let mut historical_line = fabric::audit::encode(&historical_audit)?;
+    historical_line.push(b'\n');
+    fs::write(server_home.root().join("audit.jsonl"), historical_line)?;
+    let options = DaemonOptions { runtime_peers: true, ..DaemonOptions::default() };
+    let server = FabricNode::start_with_daemon_options(server_home.clone(), options).await?;
+    let client = FabricNode::start_with_daemon_options(client_home.clone(), DaemonOptions {
+        server_session_max_total: Some(1), server_session_max_per_peer: Some(1), ..DaemonOptions::default()
+    }).await?;
+    trust_peer_allowing(&server_home, &server, client.id(), Some("client"), Some(client.addr()), &["tcp-echo", "echo"]).await?;
+    trust_peer_allowing(&client_home, &client, server.id(), Some("server"), Some(server.addr()), &["echo", "outgoing"]).await?;
+    let (backend, _, service) = spawn_tcp_echo_service().await?;
+    client.expose_tcp("outgoing", backend.clone()).await?;
+    server.expose_tcp("tcp-echo", backend.clone()).await?;
+    server.expose_tcp_ephemeral("ephemeral-echo", backend).await?;
+    let static_before = fs::read(server_home.peers_path())?;
+    let runtime_peer = iroh::SecretKey::generate().public();
+    let revoked_peer = iroh::SecretKey::generate().public();
+    let ControlResponse::RuntimePeers { reply } = send_control(&server_home, ControlRequest::RuntimePeers { request: Request::List { cursor: None } }).await? else { bail!("expected policy revision") };
+    let revision = reply.snapshot.context("initial policy")?.policy_revision;
+    let transaction = Transaction {
+        owner: "identity-proof".into(), request_id: "preserved-receipt".into(), expected_revision: revision,
+        operations: vec![
+            Operation::AddPeer { node_id: runtime_peer, name: Some("runtime".into()), direction: None, addr: None },
+            Operation::SetGrants { node_id: runtime_peer, grants: vec!["echo".into()] },
+            Operation::AddPeer { node_id: revoked_peer, name: None, direction: None, addr: None },
+        ],
+    };
+    let response = send_control(&server_home, ControlRequest::RuntimePeers { request: Request::Batch { transaction: transaction.clone() } }).await?;
+    let ControlResponse::RuntimePeers { reply } = response else { bail!("expected runtime reply") };
+    assert!(reply.error.is_none(), "{:?}", reply.error);
+    let revoke = Transaction {
+        owner: "identity-proof".into(), request_id: "preserved-revocation".into(), expected_revision: revision + 1,
+        operations: vec![Operation::RemovePeer { node_id: revoked_peer }],
+    };
+    let ControlResponse::RuntimePeers { reply } = send_control(&server_home, ControlRequest::RuntimePeers { request: Request::Batch { transaction: revoke.clone() } }).await? else { bail!("expected revoke reply") };
+    assert!(reply.error.is_none(), "{:?}", reply.error);
+    let receipt_before = serde_json::to_value(&reply.mutation)?;
+    let prepared = fabric::identity::prepare(&server_home)?;
+    // Peers publish the new public identity before activation; old stays live.
+    trust_peer_allowing(&client_home, &client, prepared.next, Some("next"), None, &["echo", "outgoing"]).await?;
+    let old_addr = server.addr();
+    let dial = client.dial_tcp("server", "tcp-echo", "127.0.0.1:0".into()).await?;
+    let mut stream = TcpStream::connect(&dial).await?;
+    stream.write_all(b"before").await?;
+    let mut before = [0; 6];
+    tokio::time::timeout(LOCAL_IO_TIMEOUT, stream.read_exact(&mut before)).await.context("initial incoming echo timed out")??;
+    assert_eq!(&before, b"before");
+    // A local declaration bound to the old local identity must not be restored.
+    let outgoing_addr = server.dial_tcp("client", "outgoing", "127.0.0.1:0".into()).await?;
+    let mut outgoing = TcpStream::connect(&outgoing_addr).await?;
+    outgoing.write_all(b"held").await?;
+    let mut held = [0; 4];
+    tokio::time::timeout(LOCAL_IO_TIMEOUT, outgoing.read_exact(&mut held)).await.context("initial outgoing echo timed out")??;
+    assert_eq!(&held, b"held");
+    let mut queued = TcpStream::connect(&outgoing_addr).await?;
+    queued.write_all(b"queued").await?;
+    let mut queued_byte = [0];
+    assert!(tokio::time::timeout(Duration::from_millis(200), queued.read(&mut queued_byte)).await.is_err(), "second outgoing dial was not queued behind the one-session cap");
+    assert!(!FabricConfig::load(&server_home)?.dials().is_empty());
+    send_control(&server_home, ControlRequest::IdentitySnapshot { current: prepared.current, next: prepared.next }).await?;
+    let withdrawal = server.unexpose("tcp-echo").await.unwrap_err();
+    assert_eq!(fabric::error::code_of(&withdrawal), fabric::error::ErrorCode::IdentityBusy);
+    server.shutdown().await?;
+    let activation = fabric::identity::activate(&server_home, prepared.current, prepared.next)?;
+    // The original daemon has stopped before the authoritative key rename.
+    let mut byte = [0];
+    // The peer's local listener may retain its socket while retrying the now
+    // retired remote identity; it must not receive data from the old endpoint.
+    let closed = tokio::time::timeout(Duration::from_millis(300), stream.read(&mut byte)).await;
+    assert!(!matches!(closed, Ok(Ok(n)) if n > 0), "old tunnel remained usable");
+    for pending in [&mut outgoing, &mut queued] {
+        let closed = tokio::time::timeout(Duration::from_secs(5), pending.read(&mut byte)).await.context("old outgoing/queued tunnel did not close")?;
+        assert!(matches!(closed, Ok(0) | Err(_)), "old outgoing or queued dial survived shutdown");
+    }
+    // Start through the same fresh-construction path as the restart helper.
+    let server = FabricNode::start_with_daemon_options(server_home.clone(), DaemonOptions { runtime_peers: true, ..DaemonOptions::default() }).await?;
+    assert_eq!(server.id(), prepared.next);
+    wait_for_status(&server_home).await?;
+    assert!(FabricConfig::load(&server_home)?.dials().is_empty());
+    assert_eq!(fs::read(server_home.peers_path())?, static_before);
+    let response = send_control(&server_home, ControlRequest::RuntimePeers { request: Request::Batch { transaction: revoke } }).await?;
+    let ControlResponse::RuntimePeers { reply } = response else { bail!("expected replay reply") };
+    assert!(reply.error.is_none(), "{:?}", reply.error);
+    assert_eq!(serde_json::to_value(reply.mutation)?, receipt_before);
+    let ControlResponse::RuntimePeers { reply } = send_control(&server_home, ControlRequest::RuntimePeers { request: Request::List { cursor: None } }).await? else { bail!("expected policy snapshot") };
+    let snapshot = reply.snapshot.context("effective policy")?;
+    assert!(snapshot.peers.iter().any(|peer| peer.node_id == runtime_peer && peer.services.contains_key("echo")));
+    assert!(!snapshot.peers.iter().any(|peer| peer.node_id == revoked_peer));
+    let ControlResponse::Status { exposed_protocols, .. } = send_control(&server_home, ControlRequest::Status).await? else { bail!("expected status") };
+    assert!(exposed_protocols.iter().any(|protocol| protocol == "tcp-echo"));
+    assert!(exposed_protocols.iter().any(|protocol| protocol == "ephemeral-echo"));
+    let audit = fabric::audit::read(server_home.root(), None, None)?;
+    assert!(audit.records.iter().any(|record| matches!(record, fabric::audit::Record::AuditLoss { count: 7, .. })));
+    // Address hints for the old public key cannot connect to the replacement.
+    let probe = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(fabric::config::load_or_create_identity(&client_home)?)
+        .bind().await?;
+    assert!(!matches!(tokio::time::timeout(Duration::from_secs(2), probe.connect(old_addr, b"fabric/mux/2")).await, Ok(Ok(_))));
+    probe.close().await;
+    trust_peer_allowing(&client_home, &client, server.id(), Some("next"), Some(server.addr()), &["echo", "outgoing"]).await?;
+    let new_dial = client.dial_tcp("next", "tcp-echo", "127.0.0.1:0".into()).await?;
+    let mut fresh = TcpStream::connect(new_dial).await?;
+    fresh.write_all(b"after").await?;
+    let mut after = [0; 5];
+    tokio::time::timeout(LOCAL_IO_TIMEOUT, fresh.read_exact(&mut after)).await.context("replacement incoming echo timed out")??;
+    assert_eq!(&after, b"after");
+    drop(activation);
+    server.shutdown().await?;
+    let server = FabricNode::start_with_daemon_options(server_home.clone(), DaemonOptions { runtime_peers: true, ..DaemonOptions::default() }).await?;
+    let ControlResponse::Status { exposed_protocols, .. } = wait_for_status(&server_home).await? else { bail!("expected ordinary restart status") };
+    assert!(exposed_protocols.iter().any(|protocol| protocol == "tcp-echo"));
+    assert!(!exposed_protocols.iter().any(|protocol| protocol == "ephemeral-echo"), "activation made an ephemeral exposure permanent");
+    assert!(!server_home.root().join("identity.exposures").exists(), "replacement startup did not consume the one-start handoff");
+    server.shutdown().await?;
+    client.shutdown().await?;
+    service.abort();
+    Ok(())
+}
+
 /// The #304 workload: ten batches of twenty fresh HTTP connections through
 /// one dial listener. A successful bind must not conceal admission failures.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
