@@ -3134,7 +3134,7 @@ async fn activate_identity(home: &FabricHome, current: iroh::EndpointId, next: i
     fabric::identity::activate_with_restart(home, current, next, || async {
         let live = identity_live_status(home).await?;
         if live.is_none() {
-            if let Some(lease) = fabric::daemon::try_daemon_lease(home)? { return Ok(lease); }
+            return identity_stop_lease(home).await;
         }
         snapshot_attempted.set(true);
         let response = identity_control(home, ControlRequest::IdentitySnapshot { current, next }).await?;
@@ -3789,6 +3789,21 @@ async fn spawn_daemon_with_output(home: &FabricHome, options: DaemonOptions, ann
 #[cfg(test)]
 mod identity_review_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn identity_activation_waits_for_an_already_stopping_foreground_node() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let prepared = fabric::identity::prepare(&home)?;
+        let listener = tokio::net::UnixListener::bind(home.control_socket_path())?;
+        drop(listener);
+        let activation = activate_identity(&home, prepared.current, prepared.next);
+        tokio::pin!(activation);
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut activation).await.is_err());
+        assert_eq!(load_or_create_identity(&home)?.public(), prepared.current);
+        assert!(home.root().join("identity.next.toml").exists());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn identity_foreground_stop_waits_for_teardown_socket_unlink() -> Result<()> {
