@@ -800,10 +800,14 @@ impl DaemonState {
             let transaction = transaction.clone();
             let home = self.home.clone();
             tokio::task::spawn_blocking(move || {
-                let prepared = runtime
+                let runtime = runtime
                     .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .prepare(&transaction)?;
+                    .unwrap_or_else(|poison| poison.into_inner());
+                let prepared = if automatic_expiry {
+                    runtime.prepare_expiry(&transaction)?
+                } else {
+                    runtime.prepare(&transaction)?
+                };
                 if !automatic_expiry && !prepared.replay && prepared.no_op.is_none() {
                     SyncBook::load(&home)?.validate_against(&prepared.book)?;
                 }

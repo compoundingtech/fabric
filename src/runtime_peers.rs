@@ -566,7 +566,7 @@ impl RuntimePeers {
             }
             loop {
                 let Some(transaction) = store.expired_transactions()?.into_iter().next() else { break; };
-                let prepared = store.prepare(&transaction)?;
+                let prepared = store.prepare_expiry(&transaction)?;
                 store.commit(prepared, &transaction.request_id, Cancellation::empty())?;
             }
             let book = store.compose(&store.stored)?.0;
@@ -859,9 +859,20 @@ impl RuntimePeers {
         }).collect())
     }
     pub fn prepare(&self, tx: &Transaction) -> Result<Prepared> {
+        self.prepare_transaction(tx, false)
+    }
+
+    pub(crate) fn prepare_expiry(&self, tx: &Transaction) -> Result<Prepared> {
+        self.prepare_transaction(tx, true)
+    }
+
+    fn prepare_transaction(&self, tx: &Transaction, automatic_expiry: bool) -> Result<Prepared> {
         self.ensure_available()?;
         validate_token(&tx.owner, "owner")?;
         validate_token(&tx.request_id, "request_id")?;
+        if tx.request_id.starts_with("expiry:") != automatic_expiry {
+            return Err(invalid("the expiry: request_id prefix is reserved for automatic expiry"));
+        }
         if let Some(record) = self.stored.records.iter().find(|record| {
             record.expiry_request_id.as_deref() == Some(tx.request_id.as_str())
         }) {
@@ -1385,6 +1396,10 @@ mod tests {
     }
     fn commit(store: &mut RuntimePeers, tx: &Transaction) -> Result<MutationReply> {
         let next = store.prepare(tx)?;
+        store.commit(next, &tx.request_id, Cancellation::empty())
+    }
+    fn commit_expiry(store: &mut RuntimePeers, tx: &Transaction) -> Result<MutationReply> {
+        let next = store.prepare_expiry(tx)?;
         store.commit(next, &tx.request_id, Cancellation::empty())
     }
     fn open(dir: &tempfile::TempDir) -> RuntimePeers {
@@ -2073,7 +2088,7 @@ mod tests {
         assert_eq!(fs::read(&store.path)?, unchanged);
         store.advance_expiry_for_test(u64::try_from(deadline)?);
         let expired = store.expired_transactions()?.remove(0);
-        let removed = commit(&mut store, &expired)?;
+        let removed = commit_expiry(&mut store, &expired)?;
         assert!(removed.removals[0].effective_trust_removed);
         assert_eq!(removed.committed_revision, 3);
         let replay = commit(&mut store, &overlap)?;
@@ -2109,7 +2124,7 @@ mod tests {
         assert_eq!(store.revision(), 3);
         assert_eq!(store.stored.records.len(), 2);
         let transaction = store.expired_transactions()?.remove(0);
-        let removed = commit(&mut store, &transaction)?;
+        let removed = commit_expiry(&mut store, &transaction)?;
         assert!(!removed.removals[0].effective_trust_removed);
         assert_eq!(removed.affected[0].services.len(), 2);
         Ok(())
@@ -2175,14 +2190,44 @@ mod tests {
     }
 
     #[test]
+    fn expiry_request_id_prefix_is_system_only_before_and_after_cleanup() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut store = open(&dir);
+        let deadline = i64::try_from(store.expiry_timestamp() + 600)?;
+        let reserved = RuntimePeers::expiry_request_id("owner", id(1), deadline, "schedule");
+        for request_id in ["expiry:", "expiry:arbitrary", reserved.as_str()] {
+            let error = store.prepare(&tx("other", request_id, 0, vec![add(2, "two")]))
+                .err().context("external expiry prefix was accepted")?;
+            assert_eq!(crate::error::code_of(&error), ErrorCode::InvalidArgument);
+        }
+        commit(&mut store, &tx("owner", "schedule", 0, vec![
+            add(1, "one"),
+            Operation::SetExpiry { node_id: id(1), expires_at: deadline },
+        ]))?;
+        store.advance_expiry_for_test(u64::try_from(deadline)?);
+        let expiry = store.expired_transactions()?.remove(0);
+        assert_eq!(expiry.request_id, reserved);
+        assert!(store.prepare(&expiry).is_err());
+        let receipt = commit_expiry(&mut store, &expiry)?;
+        assert_eq!(receipt.committed_revision, 2);
+        assert!(store.prepare(&expiry).is_err());
+        assert_eq!(commit_expiry(&mut store, &expiry)?.committed_revision, 2);
+        assert!(store.stored.records.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn expiry_reservation_collision_rejects_the_entire_batch_and_remains_restartable() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut store = open(&dir);
         let deadline = i64::try_from(store.expiry_timestamp() + 600)?;
         let reserved = RuntimePeers::expiry_request_id("owner", id(1), deadline, "schedule");
-        commit(&mut store, &tx("owner", &reserved, 0, vec![
+        commit(&mut store, &tx("owner", "install", 0, vec![
             add(1, "one"), grants(1, &["echo"]),
         ]))?;
+        // Retained state from before the prefix reservation remains collision-safe.
+        store.stored.receipts[0].request_id = reserved;
+        store.persist(&store.stored)?;
         let before = fs::read(&store.path)?;
         let error = store.prepare(&tx("owner", "schedule", 1, vec![
             add(2, "next"), grants(2, &["echo"]),
@@ -2215,7 +2260,7 @@ mod tests {
         store.elapse_expiry_for_test(std::time::Duration::from_secs(600));
         assert!(book.may(&id(1), "echo").is_err());
         let expired = store.expired_transactions()?.remove(0);
-        let receipt = commit(&mut store, &expired)?;
+        let receipt = commit_expiry(&mut store, &expired)?;
         assert!(receipt.removals[0].effective_trust_removed);
         assert_eq!(receipt.cancellation.state, CancellationState::Complete);
         Ok(())

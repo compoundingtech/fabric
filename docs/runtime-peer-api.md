@@ -275,6 +275,8 @@ The `operation` field selects one of:
 | `cancellation` | `request_id` of a retained mutation receipt. |
 
 An owner and request ID each contain 1–128 bytes without control characters.
+The `expiry:` request-ID prefix is system-reserved: owner mutations cannot use
+it, including before a deadline is scheduled or after its receipt is retained.
 A new record starts with no grants and normal direction. An omitted name,
 direction, or address preserves that owner's existing value. `set_grants`
 replaces the entire owner's grant set; `[]` withdraws all services while
