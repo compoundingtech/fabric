@@ -2,9 +2,9 @@
 
 Status: approved design. Runtime mode, direct peer/grant transactions, revisions,
 and revocation receipts are implemented as a provisional API; see the
-[runtime peer API](runtime-peer-api.md). Rotation expiry, policy watches,
-pairing and the typed client are follow-up slices whose request names and
-limits below remain proposals. The surface remains provisional through at
+[runtime peer API](runtime-peer-api.md). Immutable rotation expiry and pairing
+are implemented; policy watches and the typed client remain follow-up slices.
+The surface remains provisional through at
 least one minor release of real use, with an explicit review before promotion.
 This note covers [#312](https://github.com/compoundingtech/fabric/issues/312)
 and its typed control client, [#310](https://github.com/compoundingtech/fabric/issues/310).
@@ -112,7 +112,7 @@ static or other-owner access to that NodeID is reported by the same rule.
 
 ## Transactions, replacement, and expiry
 
-The proposed typed operations are `add_peer`, `set_grants`, `remove_peer`,
+The typed operations are `add_peer`, `set_grants`, `set_expiry`, `remove_peer`,
 `list`, and `batch`. `set_grants` replaces that owner's entire set; `[]`
 withdraws it. `add_peer` for a new ID starts with zero grants. Renaming an
 existing ID preserves its grants. A batch has one owner, a fresh request ID,
@@ -163,28 +163,55 @@ reinstalling access; the client must reconcile instead of inventing a new ID
 for an uncertain request. No-op mutations return the current revision without
 storing a receipt.
 
-Rotation defaults to immediate replacement. Explicit overlap uses a batch that
-installs the new record and sets an immutable expiry on the old owner's record,
-with a maximum overlap of 10 minutes. Overlap cannot silently extend on retry;
-a further change requires a new explicit transaction. The old ID retains a
-distinct label during overlap. Admission and session attach enforce the expiry
-even if the cleanup timer or disk writer is late. The timer removes the expired
-record and advances policy revision. Admissions and sessions that rely on an
-expiring record also carry its deadline: they recheck the remaining effective
-grants and signal cancellation independently of the persistence queue. A stalled
-cleanup writer cannot extend live work that lost its last grant. The same
-2-second completion target below is measured from the expiry deadline for
-automatic withdrawal; a missed bound is reported. Persistence failure cannot
-keep expired access live. Restart filters expired records before
-admitting traffic and durably records their removal before mutation success.
+Rotation defaults to immediate replacement. Explicit overlap uses the existing
+atomic batch to add the new NodeID, set its exact grants, and `set_expiry` on
+the old owner's record. This changes peer policy only: the rotating machine
+prepares its key, publishes that batch over its still-working old identity, and
+then activates its new identity. Fabric never needs to serve both identities.
+The old ID retains a distinct label during overlap.
 
-Expiry stores an absolute UTC deadline and uses a monotonic deadline while
-running, taking the earlier limit so a backward wall-clock step cannot extend
-access. Recovery needs a trustworthy clock; detected rollback or uncertain
-time closes expiring access and unconfirmed permits instead of renewing them.
-This bound does not assume arbitrary clock rollback can be measured across a
-power loss. Static or other-owner grants have their own provenance and are
-never removed by an overlap expiry.
+`expires_at` is an absolute UTC Unix-seconds signed 64-bit integer, strictly
+in the future and at most 600 seconds away when first set. Negative, zero,
+out-of-range and later deadlines are refused atomically. The deadline is
+immutable for that owner/NodeID record, including through `add_peer` and
+`set_grants`; an identical setter is a no-op and a historical batch retry
+cannot renew or reinstall access. Removing and explicitly re-adding a record
+creates a new record. Runtime source provenance reports `expires_at` and the
+reserved `expiry_request_id` used to query automatic cancellation.
+
+Policy generations precompute the effective union at each distinct deadline.
+Their shared wall/monotonic observation never moves backward during one daemon
+lifetime, including reconciliation. Every forward observation re-anchors a
+progressing monotonic floor: a later wall rollback cannot freeze the clock or
+extend a newly installed overlap beyond 600 elapsed seconds.
+Admission, service authorization, outbound
+policy lookup and session attach use the applicable generation without waiting
+for a timer, mutation sequencer or disk writer. The deadline sweep independently
+signals the existing admission/session revocation path, including connection
+retirement, while the serialized writer records owner-scoped removal and
+advances policy revision. Still-permitted static and other-owner work survives.
+Selection and signaling hold a separate in-memory generation read guard;
+publication fences it only after durability, never while waiting on disk.
+A sweep cannot cancel work against a superseded policy lacking newer grants.
+The two-second cancellation target is measured from expiry, not a delayed
+cleanup commit; timeout evidence survives through the automatic receipt.
+
+Setting expiry reserves an automatic receipt slot in the existing bounded pool.
+Generated receipt reservations are checked against retained receipts and the
+final candidate before committing any scheduling operation; collision refuses
+the complete batch rather than poisoning automatic cleanup or restart.
+An idle sweep performs no disk writes. Failed cleanup persistence cannot
+reopen expired access; indeterminate outcomes use ordinary quarantine and reload
+reconciliation. Cleanup withdrawals cannot be blocked by stale sync selectors.
+Restart filters and durably removes elapsed records before admitting traffic,
+with complete empty cancellation receipts because no work from the new daemon
+was admitted. The persisted expiry clock detects rollback below its last
+observation and conservatively expires outstanding records. This does not claim
+that arbitrary clock rollback across a power loss can be measured.
+
+Expiry fields and the clock anchor are omitted until expiry is used. Existing
+state without expiry remains readable by older strict readers; state that has
+used expiry is not downgrade-compatible with releases lacking this slice.
 
 ## Revision and watch contract
 

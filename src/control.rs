@@ -639,6 +639,8 @@ mod runtime_peer_schema_tests {
             },
             Source::Runtime {
                 owner: "controller-b".into(),
+                expires_at: None,
+                expiry_request_id: None,
             },
         ];
         let peer = EffectivePeer {

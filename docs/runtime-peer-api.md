@@ -269,11 +269,14 @@ The `operation` field selects one of:
 | `list` | Optional `cursor` from the preceding page. |
 | `add_peer` | `owner`, `request_id`, `expected_revision`, `node_id`; optional `name`, `direction`, `addr`. |
 | `set_grants` | `owner`, `request_id`, `expected_revision`, `node_id`, `grants`. |
+| `set_expiry` | `owner`, `request_id`, `expected_revision`, `node_id`, `expires_at`. |
 | `remove_peer` | `owner`, `request_id`, `expected_revision`, `node_id`. |
 | `batch` | `owner`, `request_id`, `expected_revision`, `operations`. |
 | `cancellation` | `request_id` of a retained mutation receipt. |
 
 An owner and request ID each contain 1–128 bytes without control characters.
+The `expiry:` request-ID prefix is system-reserved: owner mutations cannot use
+it, including before a deadline is scheduled or after its receipt is retained.
 A new record starts with no grants and normal direction. An omitted name,
 direction, or address preserves that owner's existing value. `set_grants`
 replaces the entire owner's grant set; `[]` withdraws all services while
@@ -311,6 +314,69 @@ an intermediate identity or unintended dual access:
 
 Static and other-owner records on the old NodeID remain visible and effective;
 the caller must inspect the result before claiming complete retirement.
+
+### Bounded overlap expiry
+
+To publish a prepared replacement over the still-working old identity, use one
+batch with `add_peer` for the next NodeID, `set_grants` for its **exact** grants,
+and `set_expiry` for the old owner's record. For example, replace the immediate
+removal in the example above with:
+
+```json
+{"op":"set_expiry","node_id":"<OLD_NODE_ID>","expires_at":1792887000}
+```
+
+The integer is illustrative: use an absolute UTC Unix-seconds deadline strictly
+after the daemon's current observation and no more than 600 seconds ahead.
+The signed 64-bit wire/storage representation rejects overflow; zero, negative,
+past and over-limit deadlines return `invalid_argument` without committing any
+part of the batch. The old and next NodeIDs must use distinct labels during
+overlap. This grants overlap on the receiving peer only, not dual-identity
+serving by the rotating daemon.
+
+The owner's record starts with no expiry. Once set, `expires_at` cannot be
+cleared, shortened or extended, including by updating grants, re-adding the
+same existing record, or replaying an old request. An identical setter is a
+no-op. Explicit removal and re-addition creates a new record; it is not an
+implicit renewal. Static and other-owner access is never modified.
+
+Runtime entries in `trust_sources`, `direction_sources`, and service provenance
+include `expires_at` and `expiry_request_id` when set. Save `expiry_request_id`
+from the scheduling reply/list before expiry; query it with `cancellation` to
+observe automatic removal, residual access, selected work and completion. The
+reserved ID belongs to that scheduling transaction, so a separately re-created
+record cannot replay an earlier expiry receipt. Until cleanup commits, its
+cancellation query returns an unknown receipt, never a premature completion.
+Reservation conflicts with retained receipt IDs return `request_id_conflict`
+before any part of the scheduling batch commits.
+
+Authorization and attach select a prevalidated effective generation at the
+deadline, without disk I/O or waiting for the mutation sequencer. A separate
+50 ms deadline sweep uses the same admission/session cancellation and connection
+retirement paths as removal. The serialized 100 ms cleanup sweep writes the
+owner-scoped removal and advances the policy revision; idle ticks do not fsync.
+Expiry withdrawals are not blocked by stale sync selectors. A blocked writer
+cannot extend expired authorization or live work; residual grants preserve
+still-permitted work. Cancellation monitoring retains its two-second deadline
+and missed-bound evidence even when the automatic receipt is persisted later.
+Each automatic receipt names only cancelled work for its own expiring NodeID;
+other records expiring in the same sweep retain their own cancellation evidence.
+Sweep selection and signaling share an in-memory publication-generation guard;
+they cannot revoke against a stale snapshot after newer residual grants publish.
+This guard never covers filesystem work.
+
+Running deadline observations combine wall and monotonic time and never move
+backward, including reload reconciliation. Each forward wall observation anchors
+a progressing monotonic floor, so rollback after scheduling cannot extend the
+600-second elapsed bound. Restart removes elapsed records durably before
+accepting traffic. A clock below the persisted last expiry
+observation conservatively expires outstanding records. Arbitrary rollback
+across power loss is not assumed detectable. Cleanup write failures cannot
+restore expired access; uncertain commits use ordinary policy quarantine.
+
+Homes without expiry keep the old representation. Once expiry is used, its
+record fields and retained clock anchor make runtime state incompatible with
+older strict readers lacking this feature.
 
 ## Revisions, persistence, and lost replies
 
@@ -354,9 +420,11 @@ request; do not invent a new request ID for an uncertain outcome.
 The store permits at most 1,024 owner/NodeID records in total. Receipts are
 retained for at least 24 hours in a pool of 1,024 slots. Ordinary mutations may
 use 960 slots; the remaining 64 are reserved for batches containing only
-`remove_peer` or `set_grants` that remove services without adding any. Pure
-no-ops consume no slot, even when the pool is full. Expired receipts are pruned
-by a subsequent changed mutation. When the applicable capacity is full, that
+`remove_peer` or `set_grants` that remove services without adding any.
+Scheduling with `set_expiry` uses ordinary capacity and also reserves a future automatic receipt slot; all
+mutations account for those reservations before committing. Pure no-ops consume
+no slot, even when the pool is full. Expired receipts are pruned by a subsequent
+changed mutation. When the applicable capacity is full, that
 mutation is refused before commit. After retention, reconcile current state
 and revision before deciding on a new operation.
 

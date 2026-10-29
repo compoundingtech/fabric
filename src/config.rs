@@ -276,6 +276,58 @@ const ROLLBACK_MIRROR_COMMENT: &str = "\
 pub struct PeerBook {
     peers: Vec<Peer>,
     git_remotes: Vec<GitRemote>,
+    expiry: Option<std::sync::Arc<TimedPeers>>,
+}
+
+#[derive(Debug)]
+struct TimedPeers {
+    clock: std::sync::Arc<ExpiryClock>,
+    generations: Vec<(u64, Vec<Peer>)>,
+}
+
+/// A forward observation establishes a new progressing monotonic floor, not a
+/// frozen high-water mark. Shared by authorization, cleanup and reconciliation.
+#[derive(Debug)]
+pub(crate) struct ExpiryClock {
+    anchor: std::sync::Mutex<(std::time::Duration, std::time::Instant)>,
+}
+
+impl ExpiryClock {
+    pub(crate) fn new(anchor: (u64, std::time::Instant)) -> Self {
+        Self {
+            anchor: std::sync::Mutex::new((std::time::Duration::from_secs(anchor.0), anchor.1)),
+        }
+    }
+
+    fn observe_at(&self, wall: std::time::Duration, instant: std::time::Instant) -> std::time::Duration {
+        let mut anchor = self.anchor.lock().unwrap_or_else(|poison| poison.into_inner());
+        let floor = anchor.0.saturating_add(instant.saturating_duration_since(anchor.1));
+        if wall > floor {
+            *anchor = (wall, instant);
+            wall
+        } else {
+            floor
+        }
+    }
+
+    fn observed(&self, floor: u64) -> std::time::Duration {
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .max(std::time::Duration::from_secs(floor));
+        self.observe_at(wall, std::time::Instant::now())
+    }
+
+    pub(crate) fn timestamp(&self, floor: u64) -> u64 {
+        self.observed(floor).as_secs()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn elapse_for_test(&self, elapsed: std::time::Duration) {
+        let timestamp = self.observed(0).saturating_add(elapsed);
+        *self.anchor.lock().unwrap_or_else(|poison| poison.into_inner()) =
+            (timestamp, std::time::Instant::now());
+    }
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -317,6 +369,7 @@ impl Default for PeerBook {
         Self {
             peers: Vec::new(),
             git_remotes: Vec::new(),
+            expiry: None,
         }
     }
 }
@@ -358,6 +411,7 @@ impl PeerBook {
         let book = Self {
             peers,
             git_remotes: self.git_remotes.clone(),
+            expiry: None,
         };
         book.validate()?;
         Ok(book)
@@ -465,6 +519,7 @@ impl PeerBook {
             Self {
                 peers: stored.peers,
                 git_remotes: stored.git_remotes,
+                expiry: None,
             },
             migrated,
             removed_grants,
@@ -571,6 +626,7 @@ impl PeerBook {
         let before_book = Self {
             peers: before.peers.clone(),
             git_remotes: before.git_remotes.clone(),
+            expiry: None,
         };
         before_book.validate()?;
         let mut document: DocumentMut = existing
@@ -632,12 +688,61 @@ impl PeerBook {
         config.save(home)
     }
 
+    pub(crate) fn into_effective_peers(self) -> Vec<Peer> {
+        self.peers
+    }
+
+    /// Prevalidated immutable generations keep expiry checks allocation-free
+    /// and independent of the policy writer and filesystem.
+    pub(crate) fn with_expiry_generations(
+        mut self,
+        clock: std::sync::Arc<ExpiryClock>,
+        generations: Vec<(u64, Vec<Peer>)>,
+    ) -> Self {
+        if !generations.is_empty() {
+            self.expiry = Some(std::sync::Arc::new(TimedPeers {
+                clock,
+                generations,
+            }));
+        }
+        self
+    }
+
+    pub(crate) fn expiry_lateness(&self, deadline: u64) -> std::time::Duration {
+        self.expiry.as_ref().map_or(std::time::Duration::ZERO, |expiry| {
+            expiry.clock.observed(0).saturating_sub(std::time::Duration::from_secs(deadline))
+        })
+    }
+
+    fn expiry_index(&self) -> usize {
+        let Some(expiry) = &self.expiry else { return 0; };
+        let timestamp = expiry.clock.timestamp(0);
+        expiry.generations.partition_point(|(deadline, _)| *deadline <= timestamp)
+    }
+
+    pub(crate) fn expired_generation(&self) -> Option<u64> {
+        let index = self.expiry_index();
+        (index > 0).then(|| self.expiry.as_ref().unwrap().generations[index - 1].0)
+    }
+
+    pub(crate) fn same_expiry_policy(&self, other: &Self) -> bool {
+        match (&self.expiry, &other.expiry) {
+            (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
     pub fn peers(&self) -> &[Peer] {
+        let index = self.expiry_index();
+        if index > 0 {
+            return &self.expiry.as_ref().unwrap().generations[index - 1].1;
+        }
         &self.peers
     }
 
     pub fn grants_service(&self, service: &str) -> bool {
-        self.peers
+        self.peers()
             .iter()
             .any(|peer| peer.allow.iter().any(|grant| grant == service))
     }
@@ -746,7 +851,7 @@ impl PeerBook {
     ///
     /// This peer grant is the complete policy for the service.
     pub fn may(&self, id: &EndpointId, service: &str) -> Result<(), Denied> {
-        let Some(peer) = self.peers.iter().find(|peer| peer.id == *id) else {
+        let Some(peer) = self.peers().iter().find(|peer| peer.id == *id) else {
             return Err(Denied::NotTrusted);
         };
         // Before the allow list is read, so nothing written there matters.
@@ -769,7 +874,7 @@ impl PeerBook {
     /// The peers let in as inbound connections: every peer but a dial-only one,
     /// which this machine dials and which never gets to dial it.
     pub fn trusted_ids(&self) -> HashSet<EndpointId> {
-        self.peers
+        self.peers()
             .iter()
             .filter(|peer| !peer.dial_only)
             .map(|peer| peer.id)
@@ -778,14 +883,14 @@ impl PeerBook {
 
     /// Is `id` a peer that may connect to this machine at all?
     pub fn accepts_inbound(&self, id: &EndpointId) -> bool {
-        self.peers
+        self.peers()
             .iter()
             .any(|peer| peer.id == *id && !peer.dial_only)
     }
 
     /// Is `id` a peer this machine dials and never lets in?
     pub fn is_dial_only(&self, id: &EndpointId) -> bool {
-        self.peers
+        self.peers()
             .iter()
             .any(|peer| peer.id == *id && peer.dial_only)
     }
@@ -793,7 +898,7 @@ impl PeerBook {
     /// Does this peer list grants that a dial-only flag overrides? A file in
     /// that state is safe and contradicts itself; `fabric doctor` says so.
     pub fn ignored_grants(&self, id: &EndpointId) -> bool {
-        self.peers
+        self.peers()
             .iter()
             .any(|peer| peer.id == *id && peer.dial_only && !peer.allow.is_empty())
     }
@@ -846,7 +951,7 @@ impl PeerBook {
 
     /// Is `id` a peer that only connects here, and that this machine never dials?
     pub fn is_inbound_only(&self, id: &EndpointId) -> bool {
-        self.peers
+        self.peers()
             .iter()
             .any(|peer| peer.id == *id && peer.inbound_only)
     }
@@ -854,7 +959,7 @@ impl PeerBook {
     /// The peers this machine may dial, probe and announce to: every peer but
     /// an inbound-only one.
     pub fn dialable_peers(&self) -> impl Iterator<Item = &Peer> {
-        self.peers.iter().filter(|peer| !peer.inbound_only)
+        self.peers().iter().filter(|peer| !peer.inbound_only)
     }
 
     /// Refuse to mix the two directions. `peer` is a name or a NodeID; an
@@ -962,7 +1067,7 @@ impl PeerBook {
         }
 
         let matches: Vec<&Peer> = self
-            .peers
+            .peers()
             .iter()
             .filter(|entry| entry.name.as_deref() == Some(peer))
             .collect();
@@ -999,7 +1104,7 @@ impl PeerBook {
     }
 
     fn addr_for_id(&self, id: EndpointId) -> EndpointAddr {
-        self.peers
+        self.peers()
             .iter()
             .find(|entry| entry.id == id)
             .and_then(|entry| entry.addr.clone())
@@ -1709,6 +1814,7 @@ impl FabricConfig {
         PeerBook {
             peers: self.peers.clone(),
             git_remotes: Vec::new(),
+            expiry: None,
         }
         .validate()?;
 
@@ -1873,6 +1979,25 @@ fn invalid_argument(message: String) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn expiry_clock_reanchors_forward_steps_before_wall_rollback() {
+        use std::time::{Duration, Instant};
+        let origin = Instant::now();
+        let clock = super::ExpiryClock::new((1_000, origin));
+        assert_eq!(
+            clock.observe_at(Duration::from_secs(4_610), origin + Duration::from_secs(10)),
+            Duration::from_secs(4_610),
+        );
+        assert_eq!(
+            clock.observe_at(Duration::from_secs(1_610), origin + Duration::from_secs(610)),
+            Duration::from_secs(5_210),
+        );
+        assert_eq!(
+            clock.observe_at(Duration::from_secs(1_611), origin + Duration::from_secs(611)),
+            Duration::from_secs(5_211),
+        );
+    }
+
     #[test]
     fn dial_queue_timeout_is_additive_and_rejects_invalid_deadlines() -> anyhow::Result<()> {
         let legacy: super::PersistedDial = toml::from_str("peer = 'example'\nprotocol = 'web'\n")?;

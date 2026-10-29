@@ -120,6 +120,7 @@ impl Admissions {
             })
             .map(|(id, entry)| Revocation {
                 id: *id,
+                peer: entry.peer,
                 revoked: entry.revoked.clone(),
                 done: entry.done.clone(),
                 children: entry.children.clone(),
@@ -178,6 +179,7 @@ impl Requirements {
 #[derive(Debug, Clone)]
 pub(crate) struct Revocation {
     pub id: u64,
+    pub peer: EndpointId,
     revoked: CancellationToken,
     done: CancellationToken,
     children: fabric_service_api::child_tracking::Children,

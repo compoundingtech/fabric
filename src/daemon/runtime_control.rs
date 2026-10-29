@@ -14,10 +14,86 @@ async fn with_runtime<T: Send + 'static>(
     .await?
 }
 
+/// Deadline enforcement never waits for the mutation sequencer or runtime-file
+/// mutex. The cached policy has allocation-free, monotonic expiry generations.
+pub(super) async fn runtime_peer_expiry_loop(state: Arc<DaemonState>) {
+    let Some(runtime) = state.runtime_peers.clone() else {
+        return;
+    };
+    let pending = Arc::new(std::sync::Mutex::new(Revocations {
+        admissions: vec![],
+        sessions: vec![],
+        deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+        timed_out: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    }));
+    let writer_state = state.clone();
+    let writer_pending = pending.clone();
+    let writer = tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(Duration::from_millis(100));
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = writer_state.cancel.cancelled() => return,
+                _ = ticks.tick() => {}
+            }
+            if writer_state.expiry_policy.read().await.expired_generation().is_none() {
+                continue;
+            }
+            let _serial = writer_state.policy_update.lock().await;
+            if writer_state.ensure_policy_writable().await.is_err() {
+                continue;
+            }
+            loop {
+                let transaction = with_runtime(runtime.clone(), |runtime| {
+                    Ok(runtime.expired_transactions()?.into_iter().next())
+                }).await;
+                let transaction = match transaction {
+                    Ok(Some(transaction)) => transaction,
+                    Ok(None) => break,
+                    Err(error) => {
+                        warn!(%error, "runtime peer expiry inspection failed");
+                        break;
+                    }
+                };
+                let node_id = transaction.operations[0].node_id();
+                let result = writer_state.commit_runtime_transaction_with_revocations(
+                    runtime.clone(), transaction, Some(writer_pending.clone()),
+                ).await;
+                match result {
+                    Ok(receipt) => {
+                        let mut pending = writer_pending.lock().unwrap();
+                        pending.admissions.retain(|entry| entry.peer != node_id || !receipt.cancellation.admissions.contains(&entry.id));
+                        pending.sessions.retain(|entry| entry.peer() != node_id || !receipt.cancellation.sessions.contains(&entry.id));
+                    }
+                    Err(error) => {
+                        warn!(%error, "runtime peer expiry persistence failed; expired access remains closed");
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let mut book = state.expiry_policy.read().await.clone();
+    let mut observed_generation = None;
+    let mut ticks = tokio::time::interval(Duration::from_millis(50));
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = state.cancel.cancelled() => break,
+            _ = ticks.tick() => {}
+        }
+        state.enforce_runtime_expiry(&mut book, &mut observed_generation, &pending).await;
+    }
+    // Do not abort an in-flight durable commit on shutdown.
+    let _ = writer.await;
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct Revocations {
     admissions: Vec<crate::admission::Revocation>,
     sessions: Vec<tunnel::SessionRevocation>,
+    deadline: tokio::time::Instant,
+    timed_out: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Revocations {
     fn pending(&self) -> Cancellation {
@@ -58,6 +134,64 @@ impl Revocations {
                 CancellationState::Pending
             };
         status
+    }
+}
+
+impl DaemonState {
+    /// This secondary policy lock never covers disk I/O. Holding its read
+    /// generation through selection and signaling fences newer publications,
+    /// without waiting for a writer parked behind the main admission barrier.
+    async fn enforce_runtime_expiry(
+        &self,
+        book: &mut PeerBook,
+        observed_generation: &mut Option<u64>,
+        pending: &std::sync::Mutex<Revocations>,
+    ) {
+        let current = self.expiry_policy.read().await;
+        if !book.same_expiry_policy(&current) {
+            *book = current.clone();
+            *observed_generation = None;
+        }
+        let Some(generation) = book.expired_generation() else { return; };
+        if *observed_generation == Some(generation) {
+            return;
+        }
+        *observed_generation = Some(generation);
+        #[cfg(test)]
+        {
+            let pause = self.expiry_sweep_pause.lock().unwrap().take();
+            if let Some((selected, resume)) = pause {
+                let _ = selected.send(());
+                let _ = resume.await;
+            }
+        }
+        let mut selected = self.select_runtime_revocations(book).await;
+        selected.deadline = tokio::time::Instant::now()
+            + Duration::from_secs(2).saturating_sub(book.expiry_lateness(generation));
+        if selected.admissions.is_empty() && selected.sessions.is_empty() {
+            return;
+        }
+        {
+            let mut pending = pending.lock().unwrap();
+            if pending.admissions.is_empty() && pending.sessions.is_empty() {
+                pending.deadline = selected.deadline;
+                pending.timed_out = selected.timed_out.clone();
+            }
+            pending.admissions.extend(selected.admissions.iter().cloned());
+            pending.sessions.extend(selected.sessions.iter().cloned());
+            pending.admissions.sort_by_key(|entry| entry.id);
+            pending.admissions.dedup_by_key(|entry| entry.id);
+            pending.sessions.sort_by(|a, b| a.id.cmp(&b.id));
+            pending.sessions.dedup_by(|a, b| a.id == b.id);
+        }
+        self.signal_runtime_revocations(&selected).await;
+        self.monitor_runtime_revocations(self.runtime_peers.as_ref().unwrap().clone(), None, selected);
+    }
+
+    async fn publish_runtime_policy(&self, published: &mut PeerBook, book: PeerBook) {
+        let mut expiry = self.expiry_policy.write().await;
+        *published = book;
+        *expiry = published.clone();
     }
 }
 
@@ -122,6 +256,8 @@ impl DaemonState {
         Revocations {
             admissions: self.admissions.select_withdrawn(book),
             sessions: self.tunnel_sessions.select_withdrawn(book).await,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+            timed_out: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
     async fn signal_runtime_revocations(&self, selected: &Revocations) {
@@ -146,12 +282,12 @@ impl DaemonState {
         let selected = Arc::new(selected);
         let pending = self.pending_policy_revocations.clone();
         pending.lock().unwrap().push(selected.clone());
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let deadline = selected.deadline;
         let cancel = self.cancel.clone();
         let policy = self.policy_update.clone();
         let quarantine = self.policy_quarantine.clone();
         tokio::spawn(async move {
-            let mut reported_timeout = false;
+            let mut reported_timeout = selected.timed_out.load(std::sync::atomic::Ordering::Relaxed);
             loop {
                 let mut status = selected
                     .status(tokio::time::Instant::now() >= deadline)
@@ -161,6 +297,7 @@ impl DaemonState {
                     status.state == CancellationState::TimedOut && !reported_timeout;
                 if first_timeout {
                     reported_timeout = true;
+                    selected.timed_out.store(true, std::sync::atomic::Ordering::Relaxed);
                     warn!(event = "policy_cancellation_timeout", code = "cancellation_timeout", ?request_id, admissions = ?status.remaining_admissions, sessions = ?status.remaining_sessions, "revocation did not finish within two seconds");
                 }
                 // Keep the missed bound visible even after the remaining
@@ -227,6 +364,8 @@ impl DaemonState {
             Revocations {
                 admissions: vec![],
                 sessions: vec![],
+                deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+                timed_out: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         };
         for previous in self.pending_policy_revocations.lock().unwrap().iter() {
@@ -400,7 +539,7 @@ impl DaemonState {
             });
             match reply {
                 Ok(reply) => {
-                    *published = book;
+                    self.publish_runtime_policy(&mut published, book).await;
                     self.peer_connections.presence.retry_now();
                     Ok(reply)
                 }
@@ -569,6 +708,7 @@ impl DaemonState {
                 .collect::<Vec<_>>(),
             Request::AddPeer { node_id, .. }
             | Request::SetGrants { node_id, .. }
+            | Request::SetExpiry { node_id, .. }
             | Request::RemovePeer { node_id, .. } => vec![*node_id],
             _ => vec![],
         };
@@ -644,17 +784,31 @@ impl DaemonState {
         runtime: Arc<std::sync::Mutex<runtime_peers::RuntimePeers>>,
         transaction: runtime_peers::Transaction,
     ) -> Result<runtime_peers::MutationReply> {
+        self.commit_runtime_transaction_with_revocations(runtime, transaction, None).await
+    }
+
+    async fn commit_runtime_transaction_with_revocations(
+        &self,
+        runtime: Arc<std::sync::Mutex<runtime_peers::RuntimePeers>>,
+        transaction: runtime_peers::Transaction,
+        prior: Option<Arc<std::sync::Mutex<Revocations>>>,
+    ) -> Result<runtime_peers::MutationReply> {
         self.ensure_policy_writable().await?;
+        let automatic_expiry = prior.is_some();
         let prepared = {
             let runtime = runtime.clone();
             let transaction = transaction.clone();
             let home = self.home.clone();
             tokio::task::spawn_blocking(move || {
-                let prepared = runtime
+                let runtime = runtime
                     .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .prepare(&transaction)?;
-                if !prepared.replay && prepared.no_op.is_none() {
+                    .unwrap_or_else(|poison| poison.into_inner());
+                let prepared = if automatic_expiry {
+                    runtime.prepare_expiry(&transaction)?
+                } else {
+                    runtime.prepare(&transaction)?
+                };
+                if !automatic_expiry && !prepared.replay && prepared.no_op.is_none() {
                     SyncBook::load(&home)?.validate_against(&prepared.book)?;
                 }
                 Ok::<_, anyhow::Error>(prepared)
@@ -674,8 +828,37 @@ impl DaemonState {
         // writers are serialized; commit also rechecks the prepared revision.
         // Admissions see one durable, published generation.
         let mut published = self.peer_book.write().await;
-        let selected = self.select_runtime_revocations(&prepared.book).await;
-        let cancellation = selected.pending();
+        let mut selected = self.select_runtime_revocations(&prepared.book).await;
+        if automatic_expiry {
+            let node_id = transaction.operations[0].node_id();
+            selected.admissions.retain(|entry| entry.peer == node_id);
+            selected.sessions.retain(|entry| entry.peer() == node_id);
+            let policy = self.expiry_policy.read().await;
+            if let Some(generation) = policy.expired_generation() {
+                selected.deadline = tokio::time::Instant::now()
+                    + Duration::from_secs(2).saturating_sub(policy.expiry_lateness(generation));
+            }
+        }
+        if let Some(prior) = prior {
+            let prior = prior.lock().unwrap();
+            let node_id = transaction.operations[0].node_id();
+            if prior.admissions.iter().any(|entry| entry.peer == node_id)
+                || prior.sessions.iter().any(|entry| entry.peer() == node_id)
+            {
+                selected.deadline = selected.deadline.min(prior.deadline);
+                selected.timed_out = prior.timed_out.clone();
+            }
+            selected.admissions.extend(prior.admissions.iter().filter(|entry| entry.peer == node_id).cloned());
+            selected.sessions.extend(prior.sessions.iter().filter(|entry| entry.peer() == node_id).cloned());
+            selected.admissions.sort_by_key(|entry| entry.id);
+            selected.admissions.dedup_by_key(|entry| entry.id);
+            selected.sessions.sort_by(|a, b| a.id.cmp(&b.id));
+            selected.sessions.dedup_by(|a, b| a.id == b.id);
+        }
+        let mut cancellation = selected.status(tokio::time::Instant::now() >= selected.deadline).await;
+        if selected.timed_out.load(std::sync::atomic::Ordering::Relaxed) {
+            cancellation.state = CancellationState::TimedOut;
+        }
         let book = prepared.book.clone();
         let receipt = {
             let runtime = runtime.clone();
@@ -705,7 +888,7 @@ impl DaemonState {
                 return Err(error);
             }
         };
-        *published = book;
+        self.publish_runtime_policy(&mut published, book).await;
         self.signal_runtime_revocations(&selected).await;
         drop(published);
         self.monitor_runtime_revocations(runtime, Some(transaction.request_id), selected);
@@ -742,7 +925,7 @@ impl DaemonState {
             let book = result?;
             let mut published = self.peer_book.write().await;
             let selected = self.select_runtime_revocations(&book).await;
-            *published = book;
+            self.publish_runtime_policy(&mut published, book).await;
             self.signal_runtime_revocations(&selected).await;
             *self.policy_quarantine.lock().await = None;
             drop(published);
@@ -809,7 +992,9 @@ impl DaemonState {
             .into())
         });
         match result {
-            Ok(book) => *published = book,
+            Ok(book) => {
+                self.publish_runtime_policy(&mut published, book).await;
+            }
             Err(error) => {
                 let indeterminate =
                     crate::error::code_of(&error) == ErrorCode::RuntimeCommitIndeterminate;
@@ -976,6 +1161,324 @@ mod tests {
             }
         })
         .await?
+    }
+
+    async fn wait_expiry_receipt(home: &FabricHome, request_id: &str) -> Result<runtime_peers::MutationReply> {
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let reply = request(home, Request::Cancellation { request_id: request_id.into() }).await?;
+                if let Some(receipt) = reply.mutation {
+                    if receipt.cancellation.state != CancellationState::Pending {
+                        return Ok::<_, anyhow::Error>(receipt);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await?
+    }
+
+    #[tokio::test]
+    async fn expiry_revokes_mux_stream_and_retains_automatic_cancellation_receipt() -> Result<()> {
+        let _serial = SERIAL.lock().await;
+        let server_dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let home = FabricHome::new(server_dir.path());
+        let client_home = FabricHome::new(client_dir.path());
+        let server = FabricNode::start_with_daemon_options(home.clone(), options()).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        trust_server(&client_home, &client, &server).await?;
+        let (echo, task) = echo_server().await?;
+        server.expose_tcp("work/0", echo).await?;
+        let deadline = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() + 600;
+        let deadline_signed = i64::try_from(deadline)?;
+        mutate(&home, "expiring", 0, vec![
+            add(&client, "client"), grant(&client, &["work/0"]),
+            Operation::SetExpiry { node_id: client.id(), expires_at: deadline_signed },
+        ]).await?;
+        let addr = client.dial_tcp("server", "work/0", "127.0.0.1:0".into()).await?;
+        let mut stream = tokio::net::TcpStream::connect(&addr).await?;
+        round_trip(&mut stream, b"live-before-expiry").await?;
+        with_runtime(server.state().runtime_peers.as_ref().unwrap().clone(), move |runtime| {
+            runtime.advance_expiry_for_test(deadline);
+            Ok(())
+        }).await?;
+        let request_id = runtime_peers::RuntimePeers::expiry_request_id("controller", client.id(), deadline_signed, "expiring");
+        let receipt = wait_expiry_receipt(&home, &request_id).await?;
+        assert_eq!(receipt.committed_revision, 2);
+        assert_eq!(receipt.cancellation.state, CancellationState::Complete);
+        assert!(!receipt.cancellation.admissions.is_empty());
+        assert!(!receipt.cancellation.sessions.is_empty());
+        assert!(receipt.removals[0].effective_trust_removed);
+        assert!(server.state().may(&client.id(), "work/0").await.is_err());
+        let mut byte = [0];
+        let ended = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte)).await?;
+        assert!(!matches!(ended, Ok(1..)));
+        assert!(client.state().open_stream("server", b"work/0").await.is_err());
+        client.shutdown().await?;
+        server.shutdown().await?;
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expiry_cancellation_bypasses_blocked_policy_publication_and_disk_writers() -> Result<()> {
+        let _serial = SERIAL.lock().await;
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let server = FabricNode::start_with_daemon_options(home.clone(), options()).await?;
+        let state = server.state();
+        let peer = iroh::SecretKey::from_bytes(&[42; 32]).public();
+        let deadline = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() + 600;
+        let deadline_signed = i64::try_from(deadline)?;
+        mutate(&home, "expiring", 0, vec![
+            Operation::AddPeer { node_id: peer, name: None, direction: None, addr: None },
+            Operation::SetGrants { node_id: peer, grants: vec!["exec".into(), "echo".into()] },
+            Operation::SetExpiry { node_id: peer, expires_at: deadline_signed },
+        ]).await?;
+        let residual = request(&home, transaction("residual", "residual", 1, vec![
+            Operation::AddPeer { node_id: peer, name: None, direction: None, addr: None },
+            Operation::SetGrants { node_id: peer, grants: vec!["echo".into()] },
+        ])).await?;
+        assert!(residual.error.is_none());
+        let expiring = state.admissions.admit(peer, crate::admission::Grant::Service("exec".into()));
+        let residual = state.admissions.admit(peer, crate::admission::Grant::Service("echo".into()));
+        let connection = state.admissions.admit(peer, crate::admission::Grant::Trust);
+        let book = state.peer_book.read().await.clone();
+        let policy = state.policy_update.lock().await;
+        let publication = state.peer_book.write().await;
+        let runtime = state.runtime_peers.as_ref().unwrap().clone();
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let disk_worker = tokio::task::spawn_blocking(move || {
+            let disk = runtime.lock().unwrap();
+            disk.advance_expiry_for_test(deadline);
+            let _ = locked_tx.send(());
+            let _ = release_rx.recv();
+        });
+        locked_rx.await?;
+        assert!(book.may(&peer, "exec").is_err());
+        assert!(book.may(&peer, "echo").is_ok());
+        tokio::time::timeout(Duration::from_secs(2), expiring.revoked().cancelled()).await?;
+        assert!(!residual.revoked().is_cancelled());
+        assert!(!connection.revoked().is_cancelled());
+        drop(expiring);
+        release_tx.send(())?;
+        disk_worker.await?;
+        drop(publication);
+        drop(policy);
+        let request_id = runtime_peers::RuntimePeers::expiry_request_id("controller", peer, deadline_signed, "expiring");
+        let receipt = wait_expiry_receipt(&home, &request_id).await?;
+        assert!(!receipt.removals[0].effective_trust_removed);
+        assert!(!receipt.cancellation.admissions.is_empty());
+        assert_eq!(receipt.cancellation.state, CancellationState::Complete);
+        drop(residual);
+        drop(connection);
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn simultaneous_expiry_receipts_name_only_their_own_cancelled_work() -> Result<()> {
+        let _serial = SERIAL.lock().await;
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let server = FabricNode::start_with_daemon_options(home.clone(), options()).await?;
+        let state = server.state();
+        let peers = [44, 45].map(|byte| iroh::SecretKey::from_bytes(&[byte; 32]).public());
+        let deadline = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() + 600;
+        let deadline_signed = i64::try_from(deadline)?;
+        let mut operations = Vec::new();
+        for peer in peers {
+            operations.push(Operation::AddPeer { node_id: peer, name: None, direction: None, addr: None });
+            operations.push(Operation::SetExpiry { node_id: peer, expires_at: deadline_signed });
+        }
+        mutate(&home, "expiring-together", 0, operations).await?;
+        let first = state.admissions.admit(peers[0], crate::admission::Grant::Trust);
+        let second = state.admissions.admit(peers[1], crate::admission::Grant::Trust);
+        // Hold cleanup until the sweeper has selected both records' work.
+        let policy = state.policy_update.lock().await;
+        with_runtime(state.runtime_peers.as_ref().unwrap().clone(), move |runtime| {
+            runtime.advance_expiry_for_test(deadline);
+            Ok(())
+        }).await?;
+        tokio::time::timeout(Duration::from_secs(2), first.revoked().cancelled()).await?;
+        tokio::time::timeout(Duration::from_secs(2), second.revoked().cancelled()).await?;
+        let book = state.peer_book.read().await.clone();
+        let selected = state.admissions.select_withdrawn(&book);
+        let ids = peers.map(|peer| selected.iter().find(|entry| entry.peer == peer).unwrap().id);
+        drop(first);
+        drop(second);
+        drop(policy);
+        for (peer, admission_id) in peers.into_iter().zip(ids) {
+            let request_id = runtime_peers::RuntimePeers::expiry_request_id(
+                "controller", peer, deadline_signed, "expiring-together",
+            );
+            let receipt = wait_expiry_receipt(&home, &request_id).await?;
+            assert_eq!(receipt.cancellation.admissions, [admission_id]);
+            assert!(receipt.cancellation.sessions.is_empty());
+            assert_eq!(receipt.cancellation.state, CancellationState::Complete);
+            assert_eq!(receipt.removals.len(), 1);
+            assert_eq!(receipt.removals[0].node_id, peer);
+        }
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expiry_timeout_evidence_survives_a_delayed_cleanup_receipt() -> Result<()> {
+        let _serial = SERIAL.lock().await;
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let server = FabricNode::start_with_daemon_options(home.clone(), options()).await?;
+        let state = server.state();
+        let peer = iroh::SecretKey::from_bytes(&[43; 32]).public();
+        let deadline = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() + 600;
+        let deadline_signed = i64::try_from(deadline)?;
+        mutate(&home, "expiring", 0, vec![
+            Operation::AddPeer { node_id: peer, name: None, direction: None, addr: None },
+            Operation::SetExpiry { node_id: peer, expires_at: deadline_signed },
+        ]).await?;
+        let admission = state.admissions.admit(peer, crate::admission::Grant::Trust);
+        let policy = state.policy_update.lock().await;
+        with_runtime(state.runtime_peers.as_ref().unwrap().clone(), move |runtime| {
+            runtime.advance_expiry_for_test(deadline);
+            Ok(())
+        }).await?;
+        tokio::time::timeout(Duration::from_secs(2), admission.revoked().cancelled()).await?;
+        // Keep the real admission alive past its cancellation bound while the
+        // durable sequencer is blocked. No mock completion or sleeping guess.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if state.pending_policy_revocations.lock().unwrap().iter()
+                    .any(|selected| selected.timed_out.load(std::sync::atomic::Ordering::Relaxed))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await?;
+        drop(admission);
+        drop(policy);
+        let request_id = runtime_peers::RuntimePeers::expiry_request_id(
+            "controller", peer, deadline_signed, "expiring",
+        );
+        let receipt = wait_expiry_receipt(&home, &request_id).await?;
+        assert_eq!(receipt.cancellation.state, CancellationState::TimedOut);
+        assert!(receipt.cancellation.remaining_admissions.is_empty());
+        assert_eq!(receipt.cancellation.admissions.len(), 1);
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expiry_sweep_refreshes_stale_policy_and_preserves_new_residual_sessions() -> Result<()> {
+        let _serial = SERIAL.lock().await;
+        let server_dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let home = FabricHome::new(server_dir.path());
+        let client_home = FabricHome::new(client_dir.path());
+        let server = FabricNode::start_with_daemon_options(home.clone(), options()).await?;
+        let client = FabricNode::start(client_home.clone()).await?;
+        let state = server.state();
+        trust_server(&client_home, &client, &server).await?;
+        let (echo, task) = echo_server().await?;
+        server.expose_tcp("kept/0", echo.clone()).await?;
+        server.expose_tcp("withdrawn/0", echo).await?;
+        let deadline = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() + 600;
+        mutate(&home, "expiring", 0, vec![
+            add(&client, "client"), grant(&client, &["kept/0", "withdrawn/0"]),
+            Operation::SetExpiry { node_id: client.id(), expires_at: i64::try_from(deadline)? },
+        ]).await?;
+        // Deterministically pause the sweep with the exact stale generation it
+        // would have cached before a concurrent residual-policy publication.
+        let mut stale = state.expiry_policy.read().await.clone();
+        let reply = request(&home, transaction("residual", "residual", 1, vec![
+            add(&client, "client"), grant(&client, &["kept/0"]),
+        ])).await?;
+        assert!(reply.error.is_none());
+        let kept_addr = client.dial_tcp("server", "kept/0", "127.0.0.1:0".into()).await?;
+        let withdrawn_addr = client.dial_tcp("server", "withdrawn/0", "127.0.0.1:0".into()).await?;
+        let mut kept_stream = tokio::net::TcpStream::connect(&kept_addr).await?;
+        let mut withdrawn_stream = tokio::net::TcpStream::connect(&withdrawn_addr).await?;
+        round_trip(&mut kept_stream, b"new-residual-session").await?;
+        round_trip(&mut withdrawn_stream, b"last-expiring-source").await?;
+        let kept = state.admissions.admit(client.id(), crate::admission::Grant::Service("kept/0".into()));
+        let withdrawn = state.admissions.admit(client.id(), crate::admission::Grant::Service("withdrawn/0".into()));
+        let pending = std::sync::Mutex::new(Revocations {
+            admissions: vec![], sessions: vec![],
+            deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+            timed_out: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let policy = state.policy_update.lock().await;
+        let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        *state.expiry_sweep_pause.lock().unwrap() = Some((paused_tx, resume_rx));
+        with_runtime(state.runtime_peers.as_ref().unwrap().clone(), move |runtime| {
+            runtime.advance_expiry_for_test(deadline);
+            Ok(())
+        }).await?;
+        let sweep_state = state.clone();
+        let sweep = tokio::spawn(async move {
+            let mut observed = None;
+            sweep_state.enforce_runtime_expiry(&mut stale, &mut observed, &pending).await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), paused_rx).await??;
+        // A publication cannot pass a sweep paused between refresh and signal.
+        assert!(state.expiry_policy.try_write().is_err());
+        assert!(resume_tx.send(()).is_ok());
+        sweep.await?;
+        tokio::time::timeout(Duration::from_secs(2), withdrawn.revoked().cancelled()).await?;
+        assert!(!kept.revoked().is_cancelled());
+        round_trip(&mut kept_stream, b"still-permitted-after-expiry").await?;
+        let mut byte = [0];
+        let ended = tokio::time::timeout(Duration::from_secs(2), withdrawn_stream.read(&mut byte)).await?;
+        assert!(!matches!(ended, Ok(1..)));
+        drop(withdrawn);
+        drop(kept);
+        drop(policy);
+        client.shutdown().await?;
+        server.shutdown().await?;
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expiry_forward_observation_then_rollback_cancels_live_work_after_600_elapsed_seconds() -> Result<()> {
+        let _serial = SERIAL.lock().await;
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let server = FabricNode::start_with_daemon_options(home.clone(), options()).await?;
+        let state = server.state();
+        let peer = iroh::SecretKey::from_bytes(&[44; 32]).public();
+        let forward = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() + 3_600;
+        with_runtime(state.runtime_peers.as_ref().unwrap().clone(), move |runtime| {
+            runtime.advance_expiry_for_test(forward);
+            Ok(())
+        }).await?;
+        let deadline = i64::try_from(forward + 600)?;
+        mutate(&home, "expiring", 0, vec![
+            Operation::AddPeer { node_id: peer, name: None, direction: None, addr: None },
+            Operation::SetExpiry { node_id: peer, expires_at: deadline },
+        ]).await?;
+        let admission = state.admissions.admit(peer, crate::admission::Grant::Trust);
+        let book = state.peer_book.read().await.clone();
+        let policy = state.policy_update.lock().await;
+        with_runtime(state.runtime_peers.as_ref().unwrap().clone(), |runtime| {
+            runtime.elapse_expiry_for_test(Duration::from_secs(600));
+            Ok(())
+        }).await?;
+        assert!(!book.accepts_inbound(&peer));
+        tokio::time::timeout(Duration::from_secs(2), admission.revoked().cancelled()).await?;
+        drop(admission);
+        drop(policy);
+        let request_id = runtime_peers::RuntimePeers::expiry_request_id(
+            "controller", peer, deadline, "expiring",
+        );
+        let receipt = wait_expiry_receipt(&home, &request_id).await?;
+        assert!(receipt.removals[0].effective_trust_removed);
+        assert!(!receipt.cancellation.admissions.is_empty());
+        server.shutdown().await?;
+        Ok(())
     }
 
     async fn pending_confirmation(

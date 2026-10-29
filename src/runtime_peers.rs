@@ -13,7 +13,7 @@ use iroh::{EndpointAddr, EndpointId};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::{FabricHome, Peer, PeerBook},
+    config::{ExpiryClock, FabricHome, Peer, PeerBook},
     error::{ErrorCode, FabricError},
 };
 
@@ -27,6 +27,7 @@ const RECEIPT_SECONDS: u64 = 24 * 60 * 60;
 const MAX_RECEIPTS: usize = 1024;
 const WITHDRAWAL_RECEIPTS: usize = 64;
 const MAX_RECORDS: usize = 1024;
+pub const MAX_EXPIRY_SECONDS: u64 = 600;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -68,6 +69,10 @@ pub enum Operation {
         node_id: EndpointId,
         grants: Vec<String>,
     },
+    SetExpiry {
+        node_id: EndpointId,
+        expires_at: i64,
+    },
     RemovePeer {
         node_id: EndpointId,
     },
@@ -77,6 +82,7 @@ impl Operation {
         match self {
             Self::AddPeer { node_id, .. }
             | Self::SetGrants { node_id, .. }
+            | Self::SetExpiry { node_id, .. }
             | Self::RemovePeer { node_id } => *node_id,
         }
     }
@@ -120,6 +126,13 @@ pub enum Request {
         expected_revision: u64,
         node_id: EndpointId,
         grants: Vec<String>,
+    },
+    SetExpiry {
+        owner: String,
+        request_id: String,
+        expected_revision: u64,
+        node_id: EndpointId,
+        expires_at: i64,
     },
     RemovePeer {
         owner: String,
@@ -166,6 +179,18 @@ impl Request {
                 expected_revision,
                 Operation::SetGrants { node_id, grants },
             ),
+            Self::SetExpiry {
+                owner,
+                request_id,
+                expected_revision,
+                node_id,
+                expires_at,
+            } => (
+                owner,
+                request_id,
+                expected_revision,
+                Operation::SetExpiry { node_id, expires_at },
+            ),
             Self::RemovePeer {
                 owner,
                 request_id,
@@ -192,7 +217,13 @@ impl Request {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Source {
     Static { path: PathBuf },
-    Runtime { owner: String },
+    Runtime {
+        owner: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expiry_request_id: Option<String>,
+    },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EffectivePeer {
@@ -294,6 +325,10 @@ pub struct Reply {
 struct Record {
     owner: String,
     peer: Peer,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expiry_request_id: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -318,6 +353,8 @@ struct Stored {
     pairing: Vec<pairing::Attempt>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pairing_last_seen: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    expiry_last_seen: u64,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -386,6 +423,7 @@ pub(crate) struct RuntimePeers {
     static_input: StaticInput,
     fault: Option<String>,
     pairing_clock: (u64, std::time::Instant),
+    expiry_clock: std::sync::Arc<ExpiryClock>,
     exchanges: BTreeMap<String, exchange::Exchange>,
     #[cfg(test)]
     fail_directory_sync: bool,
@@ -424,12 +462,13 @@ fn validate_token(value: &str, field: &str) -> Result<()> {
 impl RuntimePeers {
     /// A bad runtime file keeps control available with all network policy closed.
     pub fn open(home: &FabricHome) -> (Self, PeerBook) {
-        Self::open_with_ended_work(home, true, (now(), std::time::Instant::now()))
+        Self::open_with_ended_work(home, true, (now(), std::time::Instant::now()), None)
     }
     fn open_with_ended_work(
         home: &FabricHome,
         restarted: bool,
         pairing_clock: (u64, std::time::Instant),
+        expiry_clock: Option<std::sync::Arc<ExpiryClock>>,
     ) -> (Self, PeerBook) {
         let path = home.root().join("runtime-peers.toml");
         let placeholder = StaticInput {
@@ -447,11 +486,13 @@ impl RuntimePeers {
                 records: vec![],
                 receipts: vec![],
                 pairing: vec![],
+                expiry_last_seen: 0,
                 pairing_last_seen: 0,
             },
             static_input: placeholder,
             fault: None,
             pairing_clock,
+            expiry_clock: expiry_clock.unwrap_or_else(|| std::sync::Arc::new(ExpiryClock::new(pairing_clock))),
             exchanges: BTreeMap::new(),
             #[cfg(test)]
             fail_directory_sync: false,
@@ -518,6 +559,16 @@ impl RuntimePeers {
             }
             let timestamp = store.pairing_timestamp();
             changed |= pairing::recover(&mut store.stored, timestamp, restarted);
+            if now() < store.stored.expiry_last_seen {
+                let deadline = store.stored.records.iter().filter_map(|record| record.expires_at)
+                    .filter_map(|deadline| u64::try_from(deadline).ok()).max().unwrap_or(0);
+                store.expiry_clock.timestamp(deadline);
+            }
+            loop {
+                let Some(transaction) = store.expired_transactions()?.into_iter().next() else { break; };
+                let prepared = store.prepare_expiry(&transaction)?;
+                store.commit(prepared, &transaction.request_id, Cancellation::empty())?;
+            }
             let book = store.compose(&store.stored)?.0;
             if changed {
                 store.persist(&store.stored)?;
@@ -543,12 +594,34 @@ impl RuntimePeers {
         let mut records = BTreeSet::new();
         for record in &self.stored.records {
             validate_token(&record.owner, "owner")?;
+            if record.expires_at.is_some_and(|deadline| deadline <= 0) {
+                // Reject impossible timestamps before converting them to a
+                // duration or serializing them through TOML's signed integers.
+                return Err(unavailable("invalid runtime record expires_at"));
+            }
+            if record.expires_at.is_some_and(|deadline| {
+                u64::try_from(deadline).is_ok_and(|deadline| {
+                    deadline.saturating_sub(self.stored.expiry_last_seen) > MAX_EXPIRY_SECONDS
+                })
+            }) {
+                return Err(unavailable("runtime expiry exceeds its persisted 600-second bound"));
+            }
+            if record.expires_at.is_some() != record.expiry_request_id.is_some() {
+                return Err(unavailable("runtime expiry requires its reserved cancellation receipt ID"));
+            }
+            if let Some(request_id) = &record.expiry_request_id {
+                validate_token(request_id, "expiry_request_id")?;
+                if self.stored.receipts.iter().any(|receipt| &receipt.request_id == request_id) {
+                    return Err(unavailable("runtime expiry receipt ID is already committed"));
+                }
+            }
             if !records.insert((record.owner.clone(), record.peer.id)) {
                 return Err(unavailable("duplicate owner/node runtime record"));
             }
         }
-        if self.stored.receipts.len() > MAX_RECEIPTS {
-            return Err(unavailable("too many retained runtime receipts"));
+        let reserved = self.stored.records.iter().filter(|record| record.expires_at.is_some()).count();
+        if self.stored.receipts.len().saturating_add(reserved) > MAX_RECEIPTS {
+            return Err(unavailable("too many retained or reserved runtime receipts"));
         }
         let mut receipts = BTreeSet::new();
         for receipt in &self.stored.receipts {
@@ -577,7 +650,9 @@ impl RuntimePeers {
     pub fn reconcile(&mut self, home: &FabricHome) -> Result<PeerBook> {
         // Reconciliation is still the same daemon lifetime. Carry the original
         // monotonic anchor into recovery, before it decides whether permits expired.
-        let (mut loaded, book) = Self::open_with_ended_work(home, false, self.pairing_clock);
+        let (mut loaded, book) = Self::open_with_ended_work(
+            home, false, self.pairing_clock, Some(self.expiry_clock.clone()),
+        );
         if let Some(error) = loaded.fault.take() {
             self.fault = Some(error.clone());
             return Err(unavailable(error));
@@ -610,6 +685,7 @@ impl RuntimePeers {
             static_input: input,
             fault: None,
             pairing_clock: self.pairing_clock,
+            expiry_clock: self.expiry_clock.clone(),
             exchanges: BTreeMap::new(),
             #[cfg(test)]
             fail_directory_sync: false,
@@ -652,6 +728,19 @@ impl RuntimePeers {
     }
 
     fn compose(&self, stored: &Stored) -> Result<(PeerBook, Vec<EffectivePeer>)> {
+        let timestamp = self.expiry_timestamp();
+        let (book, views) = self.compose_at(stored, timestamp)?;
+        let deadlines: BTreeSet<_> = stored.records.iter()
+            .filter_map(|record| record.expires_at.and_then(|value| u64::try_from(value).ok()))
+            .collect();
+        let generations = deadlines.into_iter().map(|deadline| {
+            self.compose_at(stored, deadline)
+                .map(|(book, _)| (deadline, book.into_effective_peers()))
+        }).collect::<Result<Vec<_>>>()?;
+        Ok((book.with_expiry_generations(self.expiry_clock.clone(), generations), views))
+    }
+
+    fn compose_at(&self, stored: &Stored, timestamp: u64) -> Result<(PeerBook, Vec<EffectivePeer>)> {
         let mut nodes: BTreeMap<EndpointId, Vec<(&Peer, Source)>> = BTreeMap::new();
         for peer in self.static_input.book.peers() {
             nodes.entry(peer.id).or_default().push((
@@ -662,10 +751,17 @@ impl RuntimePeers {
             ));
         }
         for record in &stored.records {
+            if record.expires_at.is_some_and(|deadline| {
+                u64::try_from(deadline).is_ok_and(|deadline| deadline <= timestamp)
+            }) {
+                continue;
+            }
             nodes.entry(record.peer.id).or_default().push((
                 &record.peer,
                 Source::Runtime {
                     owner: record.owner.clone(),
+                    expires_at: record.expires_at,
+                    expiry_request_id: record.expiry_request_id.clone(),
                 },
             ));
         }
@@ -722,10 +818,73 @@ impl RuntimePeers {
         Ok((self.static_input.book.with_effective_peers(peers)?, views))
     }
 
+    #[cfg(test)]
+    pub(crate) fn advance_expiry_for_test(&self, timestamp: u64) {
+        self.expiry_clock.timestamp(timestamp);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn elapse_expiry_for_test(&self, elapsed: std::time::Duration) {
+        self.expiry_clock.elapse_for_test(elapsed);
+    }
+
+    fn expiry_timestamp(&self) -> u64 {
+        self.expiry_clock.timestamp(self.stored.pairing_last_seen.max(self.stored.expiry_last_seen))
+    }
+
+    /// Deterministic IDs let a caller find automatic revocation receipts.
+    pub(crate) fn expiry_request_id(owner: &str, node_id: EndpointId, deadline: i64, request_id: &str) -> String {
+        let mut digest = blake3::Hasher::new();
+        for value in [owner, &node_id.to_string(), &deadline.to_string(), request_id] {
+            digest.update(&(value.len() as u64).to_le_bytes());
+            digest.update(value.as_bytes());
+        }
+        format!("expiry:{}", digest.finalize().to_hex())
+    }
+
+    pub(crate) fn expired_transactions(&self) -> Result<Vec<Transaction>> {
+        self.ensure_available()?;
+        let timestamp = self.expiry_timestamp();
+        Ok(self.stored.records.iter().filter_map(|record| {
+            let deadline = record.expires_at?;
+            if u64::try_from(deadline).ok()? > timestamp {
+                return None;
+            }
+            Some(Transaction {
+                owner: record.owner.clone(),
+                request_id: record.expiry_request_id.clone()?,
+                expected_revision: self.stored.revision,
+                operations: vec![Operation::RemovePeer { node_id: record.peer.id }],
+            })
+        }).collect())
+    }
     pub fn prepare(&self, tx: &Transaction) -> Result<Prepared> {
+        self.prepare_transaction(tx, false)
+    }
+
+    pub(crate) fn prepare_expiry(&self, tx: &Transaction) -> Result<Prepared> {
+        self.prepare_transaction(tx, true)
+    }
+
+    fn prepare_transaction(&self, tx: &Transaction, automatic_expiry: bool) -> Result<Prepared> {
         self.ensure_available()?;
         validate_token(&tx.owner, "owner")?;
         validate_token(&tx.request_id, "request_id")?;
+        if tx.request_id.starts_with("expiry:") != automatic_expiry {
+            return Err(invalid("the expiry: request_id prefix is reserved for automatic expiry"));
+        }
+        if let Some(record) = self.stored.records.iter().find(|record| {
+            record.expiry_request_id.as_deref() == Some(tx.request_id.as_str())
+        }) {
+            let due = record.expires_at.and_then(|deadline| u64::try_from(deadline).ok())
+                .is_some_and(|deadline| deadline <= self.expiry_timestamp());
+            if !due || record.owner != tx.owner || !matches!(
+                tx.operations.as_slice(),
+                [Operation::RemovePeer { node_id }] if *node_id == record.peer.id
+            ) {
+                return Err(invalid("request_id is reserved for automatic expiry"));
+            }
+        }
         let encoded = serde_json::to_vec(tx)?;
         if encoded.len() > MAX_REQUEST_BYTES
             || tx.operations.is_empty()
@@ -824,6 +983,8 @@ impl RuntimePeers {
                         next.records.push(Record {
                             owner: tx.owner.clone(),
                             peer,
+                            expires_at: None,
+                            expiry_request_id: None,
                         });
                     }
                 }
@@ -838,6 +999,28 @@ impl RuntimePeers {
                     grants.sort();
                     grants.dedup();
                     next.records[index].peer.allow = grants;
+                }
+                Operation::SetExpiry { expires_at, .. } => {
+                    let Some(index) = index else {
+                        return Err(self.ownership_error(&next, id));
+                    };
+                    let record = &mut next.records[index];
+                    if let Some(existing) = record.expires_at {
+                        if existing != *expires_at {
+                            return Err(invalid("expires_at is immutable once set"));
+                        }
+                    } else {
+                        let deadline = u64::try_from(*expires_at)
+                            .map_err(|_| invalid("expires_at must be positive Unix seconds"))?;
+                        let timestamp = self.expiry_timestamp();
+                        if deadline <= timestamp
+                            || deadline.saturating_sub(timestamp) > MAX_EXPIRY_SECONDS
+                        {
+                            return Err(invalid("expires_at must be within the next 600 seconds"));
+                        }
+                        record.expires_at = Some(*expires_at);
+                        record.expiry_request_id = Some(Self::expiry_request_id(&tx.owner, id, *expires_at, &tx.request_id));
+                    }
                 }
                 Operation::RemovePeer { .. } => {
                     if index.is_none()
@@ -857,6 +1040,21 @@ impl RuntimePeers {
                 }
             }
         }
+        let mut expiry_ids = BTreeSet::new();
+        for record in &next.records {
+            if let Some(request_id) = &record.expiry_request_id {
+                if !expiry_ids.insert(request_id)
+                    || request_id == &tx.request_id
+                    || next.receipts.iter().any(|receipt| &receipt.request_id == request_id)
+                {
+                    return Err(FabricError::new(
+                        ErrorCode::RequestIdConflict,
+                        "automatic expiry request_id conflicts with a retained or reserved receipt",
+                    ).into());
+                }
+            }
+        }
+        drop(expiry_ids);
         next.records
             .sort_by(|a, b| (&a.owner, a.peer.id).cmp(&(&b.owner, b.peer.id)));
         if next.records.len() > MAX_RECORDS {
@@ -912,14 +1110,15 @@ impl RuntimePeers {
                 .iter()
                 .find(|r| r.owner == tx.owner && r.peer.id == *node_id)
                 .is_some_and(|record| grants.iter().all(|grant| record.peer.allow.contains(grant))),
-            Operation::AddPeer { .. } => false,
+            Operation::AddPeer { .. } | Operation::SetExpiry { .. } => false,
         });
         let limit = if withdrawal_only {
             MAX_RECEIPTS
         } else {
             MAX_RECEIPTS - WITHDRAWAL_RECEIPTS
         };
-        if next.receipts.len() >= limit {
+        let reserved = next.records.iter().filter(|record| record.expires_at.is_some()).count();
+        if next.receipts.len().saturating_add(reserved) >= limit {
             return Err(FabricError::new(
                 ErrorCode::RuntimeReceiptCapacity,
                 "unexpired runtime receipt capacity is full for this mutation",
@@ -980,6 +1179,11 @@ impl RuntimePeers {
             return Ok(reply);
         }
         if !next.replay {
+            if next.stored.records.iter().any(|record| record.expires_at.is_some())
+                || next.stored.expiry_last_seen != 0
+            {
+                next.stored.expiry_last_seen = self.expiry_timestamp();
+            }
             // Completion records can advance while validation runs off-thread.
             // Preserve that metadata when committing a later policy candidate.
             for receipt in &mut next.stored.receipts {
@@ -1194,6 +1398,10 @@ mod tests {
         let next = store.prepare(tx)?;
         store.commit(next, &tx.request_id, Cancellation::empty())
     }
+    fn commit_expiry(store: &mut RuntimePeers, tx: &Transaction) -> Result<MutationReply> {
+        let next = store.prepare_expiry(tx)?;
+        store.commit(next, &tx.request_id, Cancellation::empty())
+    }
     fn open(dir: &tempfile::TempDir) -> RuntimePeers {
         let (store, _) = RuntimePeers::open(&FabricHome::new(dir.path()));
         assert!(store.fault().is_none(), "{:?}", store.fault());
@@ -1358,7 +1566,7 @@ mod tests {
         );
         assert_eq!(
             result.affected[0].services["exec"],
-            vec![Source::Runtime { owner: "b".into() }]
+            vec![Source::Runtime { owner: "b".into(), expires_at: None, expiry_request_id: None }]
         );
         assert_eq!(
             crate::error::code_of(
@@ -1814,6 +2022,277 @@ mod tests {
         )?;
         assert_eq!(removed.committed_revision, 2);
         assert_eq!(store.stored.records.len(), MAX_RECORDS - 1);
+        Ok(())
+    }
+    #[test]
+    fn fresh_record_expiry_accepts_only_the_next_one_through_600_seconds() -> Result<()> {
+        for (offset, accepted) in [(0, false), (1, true), (600, true), (601, false)] {
+            let dir = tempfile::tempdir()?;
+            let mut store = open(&dir);
+            // A forward observation keeps the real clock from moving the boundary.
+            let timestamp = now() + 3_600;
+            store.advance_expiry_for_test(timestamp);
+            commit(&mut store, &tx("owner", "fresh", 0, vec![add(1, "one")]))?;
+            let request = tx("owner", "schedule", 1, vec![
+                Operation::SetExpiry { node_id: id(1), expires_at: i64::try_from(timestamp + offset)? },
+            ]);
+            if accepted {
+                let receipt = commit(&mut store, &request)?;
+                assert_eq!(receipt.committed_revision, 2);
+                assert_eq!(store.stored.records[0].expires_at, Some(i64::try_from(timestamp + offset)?));
+            } else {
+                let error = store.prepare(&request).err().context("out-of-bounds deadline was accepted")?;
+                assert_eq!(crate::error::code_of(&error), ErrorCode::InvalidArgument);
+                assert_eq!(store.revision(), 1);
+                assert!(store.stored.records[0].expires_at.is_none());
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn expiry_is_bounded_immutable_and_overlap_batch_replays_without_extension() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut store = open(&dir);
+        commit(&mut store, &tx("owner", "old", 0, vec![add(1, "old"), grants(1, &["exec", "echo"])]))?;
+        let deadline = i64::try_from(store.expiry_timestamp() + 600)?;
+        let overlap = tx("owner", "overlap", 1, vec![
+            add(2, "next"), grants(2, &["exec", "echo"]),
+            Operation::SetExpiry { node_id: id(1), expires_at: deadline },
+        ]);
+        let installed = commit(&mut store, &overlap)?;
+        assert_eq!(installed.committed_revision, 2);
+        assert_eq!(store.stored.records.iter().find(|record| record.peer.id == id(1)).unwrap().expires_at, Some(deadline));
+        assert_eq!(commit(&mut store, &overlap)?.committed_revision, 2);
+        let mut changed_deadline = overlap.clone();
+        if let Operation::SetExpiry { expires_at, .. } = &mut changed_deadline.operations[2] {
+            *expires_at -= 1;
+        }
+        let error = store.prepare(&changed_deadline).err().context("changed deadline replay was accepted")?;
+        assert_eq!(crate::error::code_of(&error), ErrorCode::RequestIdConflict);
+        for value in [deadline - 1, deadline + 1, 0, -1, i64::MAX] {
+            assert!(store.prepare(&tx("owner", &format!("change-{value}"), 2, vec![
+                Operation::SetExpiry { node_id: id(1), expires_at: value },
+            ])).is_err());
+        }
+        assert!(store.prepare(&tx("other", "wrong-owner", 2, vec![
+            Operation::SetExpiry { node_id: id(1), expires_at: deadline },
+        ])).is_err());
+        assert!(store.prepare(&tx("owner", "too-far", 2, vec![
+            Operation::SetExpiry { node_id: id(2), expires_at: deadline + 10 },
+        ])).is_err());
+        let unchanged = fs::read(&store.path)?;
+        assert!(store.prepare(&tx("owner", "bad-atomic", 2, vec![
+            add(3, "third"),
+            Operation::SetExpiry { node_id: id(1), expires_at: deadline + 1 },
+        ])).is_err());
+        assert_eq!(fs::read(&store.path)?, unchanged);
+        store.advance_expiry_for_test(u64::try_from(deadline)?);
+        let expired = store.expired_transactions()?.remove(0);
+        let removed = commit_expiry(&mut store, &expired)?;
+        assert!(removed.removals[0].effective_trust_removed);
+        assert_eq!(removed.committed_revision, 3);
+        let replay = commit(&mut store, &overlap)?;
+        assert_eq!(replay.committed_revision, 2);
+        assert_eq!(replay.current_revision, 3);
+        assert_eq!(replay.affected.len(), 1);
+        assert_eq!(replay.affected[0].node_id, id(2));
+        assert_eq!(store.stored.records.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn timed_policy_preserves_residual_sources_without_a_cleanup_commit() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut store = open(&dir);
+        store.static_input.book.add_with_allow(
+            id(1), Some("one".into()), None, Some(vec!["static/0".into()]),
+        );
+        commit(&mut store, &tx("expiring", "install", 0, vec![add(1, "one"), grants(1, &["exec"])]))?;
+        commit(&mut store, &tx("residual", "residual", 1, vec![add(1, "one"), grants(1, &["echo"])]))?;
+        let deadline = i64::try_from(store.expiry_timestamp() + 600)?;
+        commit(&mut store, &tx("expiring", "deadline", 2, vec![
+            Operation::SetExpiry { node_id: id(1), expires_at: deadline },
+        ]))?;
+        let book = store.compose(&store.stored)?.0;
+        assert!(book.may(&id(1), "exec").is_ok());
+        assert!(book.may(&id(1), "echo").is_ok());
+        store.advance_expiry_for_test(u64::try_from(deadline)?);
+        assert!(book.may(&id(1), "exec").is_err());
+        assert!(book.may(&id(1), "static/0").is_ok());
+        assert!(book.may(&id(1), "echo").is_ok());
+        assert!(book.accepts_inbound(&id(1)));
+        assert_eq!(store.revision(), 3);
+        assert_eq!(store.stored.records.len(), 2);
+        let transaction = store.expired_transactions()?.remove(0);
+        let removed = commit_expiry(&mut store, &transaction)?;
+        assert!(!removed.removals[0].effective_trust_removed);
+        assert_eq!(removed.affected[0].services.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn restart_expires_elapsed_records_and_clock_rollback_before_admission() -> Result<()> {
+        for rollback in [false, true] {
+            let dir = tempfile::tempdir()?;
+            let mut store = open(&dir);
+            let deadline = i64::try_from(store.expiry_timestamp() + 600)?;
+            commit(&mut store, &tx("owner", "install", 0, vec![
+                add(1, "one"), grants(1, &["echo"]),
+                Operation::SetExpiry { node_id: id(1), expires_at: deadline },
+            ]))?;
+            if rollback {
+                store.stored.expiry_last_seen = u64::try_from(deadline)?;
+            } else {
+                store.stored.records[0].expires_at = Some(i64::try_from(now())? - 1);
+            }
+            let expiry_request_id = store.stored.records[0].expiry_request_id.clone().unwrap();
+            store.persist(&store.stored)?;
+            let (restarted, book) = RuntimePeers::open(&FabricHome::new(dir.path()));
+            assert!(restarted.fault().is_none(), "{:?}", restarted.fault());
+            assert!(book.peers().is_empty());
+            assert_eq!(restarted.revision(), 2);
+            let receipt = restarted.receipt(&expiry_request_id)?;
+            assert_eq!(receipt.cancellation.state, CancellationState::Complete);
+            assert!(receipt.removals[0].effective_trust_removed);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn expiry_wire_rejects_overflow_and_reserves_its_receipt_identifier() -> Result<()> {
+        let encoded = format!(
+            r#"{{"operation":"set_expiry","owner":"owner","request_id":"set","expected_revision":0,"node_id":"{}","expires_at":9223372036854775808}}"#,
+            id(1),
+        );
+        assert!(serde_json::from_str::<Request>(&encoded).is_err());
+        let dir = tempfile::tempdir()?;
+        let mut store = open(&dir);
+        let deadline = i64::try_from(store.expiry_timestamp() + 600)?;
+        for value in [-1, 0, i64::try_from(store.expiry_timestamp())?, i64::MAX] {
+            assert!(store.prepare(&tx("owner", &format!("invalid-{value}"), 0, vec![
+                add(1, "one"), Operation::SetExpiry { node_id: id(1), expires_at: value },
+            ])).is_err());
+        }
+        let receipt = commit(&mut store, &tx("owner", "install", 0, vec![
+            add(1, "one"), Operation::SetExpiry { node_id: id(1), expires_at: deadline },
+        ]))?;
+        let reserved = store.stored.records[0].expiry_request_id.clone().unwrap();
+        assert!(matches!(&receipt.affected[0].trust_sources[0],
+            Source::Runtime { expires_at: Some(value), expiry_request_id: Some(request_id), .. }
+                if *value == deadline && request_id == &reserved));
+        assert!(store.prepare(&tx("owner", &reserved, 1, vec![grants(1, &[])])).is_err());
+        let raw = fs::read_to_string(&store.path)?;
+        assert!(raw.contains("expires_at"));
+        let restarted = open(&dir);
+        assert_eq!(restarted.stored.records[0].expires_at, Some(deadline));
+        assert_eq!(restarted.stored.records[0].expiry_request_id.as_deref(), Some(reserved.as_str()));
+        Ok(())
+    }
+
+    #[test]
+    fn expiry_request_id_prefix_is_system_only_before_and_after_cleanup() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut store = open(&dir);
+        let deadline = i64::try_from(store.expiry_timestamp() + 600)?;
+        let reserved = RuntimePeers::expiry_request_id("owner", id(1), deadline, "schedule");
+        for request_id in ["expiry:", "expiry:arbitrary", reserved.as_str()] {
+            let error = store.prepare(&tx("other", request_id, 0, vec![add(2, "two")]))
+                .err().context("external expiry prefix was accepted")?;
+            assert_eq!(crate::error::code_of(&error), ErrorCode::InvalidArgument);
+        }
+        commit(&mut store, &tx("owner", "schedule", 0, vec![
+            add(1, "one"),
+            Operation::SetExpiry { node_id: id(1), expires_at: deadline },
+        ]))?;
+        store.advance_expiry_for_test(u64::try_from(deadline)?);
+        let expiry = store.expired_transactions()?.remove(0);
+        assert_eq!(expiry.request_id, reserved);
+        assert!(store.prepare(&expiry).is_err());
+        let receipt = commit_expiry(&mut store, &expiry)?;
+        assert_eq!(receipt.committed_revision, 2);
+        assert!(store.prepare(&expiry).is_err());
+        assert_eq!(commit_expiry(&mut store, &expiry)?.committed_revision, 2);
+        assert!(store.stored.records.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn expiry_reservation_collision_rejects_the_entire_batch_and_remains_restartable() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut store = open(&dir);
+        let deadline = i64::try_from(store.expiry_timestamp() + 600)?;
+        let reserved = RuntimePeers::expiry_request_id("owner", id(1), deadline, "schedule");
+        commit(&mut store, &tx("owner", "install", 0, vec![
+            add(1, "one"), grants(1, &["echo"]),
+        ]))?;
+        // Retained state from before the prefix reservation remains collision-safe.
+        store.stored.receipts[0].request_id = reserved;
+        store.persist(&store.stored)?;
+        let before = fs::read(&store.path)?;
+        let error = store.prepare(&tx("owner", "schedule", 1, vec![
+            add(2, "next"), grants(2, &["echo"]),
+            Operation::SetExpiry { node_id: id(1), expires_at: deadline },
+        ])).err().context("colliding expiry reservation was accepted")?;
+        assert_eq!(crate::error::code_of(&error), ErrorCode::RequestIdConflict);
+        assert_eq!(store.revision(), 1);
+        assert_eq!(store.stored.records.len(), 1);
+        assert!(store.stored.records[0].expires_at.is_none());
+        assert_eq!(fs::read(&store.path)?, before);
+        let restarted = open(&dir);
+        assert_eq!(restarted.revision(), 1);
+        assert!(restarted.stored.records[0].expires_at.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn expiry_forward_step_scheduling_survives_rollback_without_extending_lifetime() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut store = open(&dir);
+        store.advance_expiry_for_test(now() + 3_600);
+        let deadline = i64::try_from(store.expiry_timestamp() + 600)?;
+        commit(&mut store, &tx("owner", "schedule", 0, vec![
+            add(1, "one"), grants(1, &["echo"]),
+            Operation::SetExpiry { node_id: id(1), expires_at: deadline },
+        ]))?;
+        let book = store.compose(&store.stored)?.0;
+        assert!(book.may(&id(1), "echo").is_ok());
+        // The real wall clock remains behind the injected forward observation.
+        store.elapse_expiry_for_test(std::time::Duration::from_secs(600));
+        assert!(book.may(&id(1), "echo").is_err());
+        let expired = store.expired_transactions()?.remove(0);
+        let receipt = commit_expiry(&mut store, &expired)?;
+        assert!(receipt.removals[0].effective_trust_removed);
+        assert_eq!(receipt.cancellation.state, CancellationState::Complete);
+        Ok(())
+    }
+
+    #[test]
+    fn expiry_receipt_capacity_accounts_for_reservations_and_preserves_withdrawal_reserve() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut store = open(&dir);
+        let deadline = i64::try_from(store.expiry_timestamp() + 600)?;
+        commit(&mut store, &tx("owner", "install", 0, vec![
+            add(1, "one"), add(2, "two"), add(3, "three"),
+            Operation::SetExpiry { node_id: id(1), expires_at: deadline },
+        ]))?;
+        let template = store.stored.receipts[0].clone();
+        store.stored.receipts = (0..MAX_RECEIPTS - 1).map(|index| Receipt {
+            request_id: format!("receipt-{index}"), ..template.clone()
+        }).collect();
+        assert!(store.stored.receipts.len() < MAX_RECEIPTS);
+        assert_eq!(store.stored.receipts.len() + 1, MAX_RECEIPTS);
+        let error = store.prepare(&tx("owner", "remove", 1, vec![
+            Operation::RemovePeer { node_id: id(2) },
+        ])).err().context("withdrawal entered the full receipt pool")?;
+        assert_eq!(crate::error::code_of(&error), ErrorCode::RuntimeReceiptCapacity);
+        store.stored.receipts.truncate(MAX_RECEIPTS - WITHDRAWAL_RECEIPTS - 2);
+        let error = store.prepare(&tx("owner", "schedule", 1, vec![
+            Operation::SetExpiry { node_id: id(2), expires_at: deadline },
+        ])).err().context("expiry scheduling entered the withdrawal reserve")?;
+        assert_eq!(crate::error::code_of(&error), ErrorCode::RuntimeReceiptCapacity);
+        commit(&mut store, &tx("owner", "remove", 1, vec![
+            Operation::RemovePeer { node_id: id(3) },
+        ]))?;
         Ok(())
     }
 }

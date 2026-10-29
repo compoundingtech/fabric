@@ -2111,6 +2111,9 @@ pub(crate) struct SessionRevocation {
     closed: CancellationToken,
 }
 impl SessionRevocation {
+    pub fn peer(&self) -> EndpointId {
+        self.session.peer_id
+    }
     pub async fn complete(&self) -> bool {
         self.closed.is_cancelled()
             && self.session.local_reader_done.is_cancelled()
