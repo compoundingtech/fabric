@@ -3126,7 +3126,59 @@ async fn identity_stop_lease(home: &FabricHome) -> Result<std::fs::File> {
     }).await.map_err(|_| FabricError::new(ErrorCode::DaemonStopTimeout, "daemon did not stop within 15 seconds"))?
 }
 
+/// Activation must finish its rename/restart or old-key recovery after stopping
+/// the daemon. Discard cancellation signals for this scope, then restore the
+/// caller's dispositions. A caught no-op (not SIG_IGN) resets on exec, so a
+/// replacement daemon does not inherit ignored termination signals.
+struct IdentityActivationSignals {
+    previous: [Option<libc::sigaction>; 3],
+}
+
+impl IdentityActivationSignals {
+    const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+
+    fn install() -> Result<Self> {
+        extern "C" fn finish_activation(_: libc::c_int) {}
+
+        let mut guard = Self { previous: [None, None, None] };
+        // SAFETY: zero initializes the platform sigaction structure; its mask is
+        // initialized below, and the handler neither accesses memory nor calls
+        // anything that could violate async-signal safety.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = finish_activation as *const () as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        // SAFETY: action owns a valid, writable signal set.
+        if unsafe { libc::sigemptyset(&mut action.sa_mask) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        for (index, signal) in Self::SIGNALS.into_iter().enumerate() {
+            let mut previous = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+            // SAFETY: both pointers refer to live correctly sized structures.
+            // sigaction initializes previous on success and retains no pointers.
+            if unsafe { libc::sigaction(signal, &action, previous.as_mut_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            // SAFETY: the successful sigaction call initialized previous.
+            guard.previous[index] = Some(unsafe { previous.assume_init() });
+        }
+        Ok(guard)
+    }
+}
+
+impl Drop for IdentityActivationSignals {
+    fn drop(&mut self) {
+        for (signal, previous) in Self::SIGNALS.into_iter().zip(&self.previous) {
+            if let Some(previous) = previous {
+                // SAFETY: restore exactly the disposition returned by sigaction;
+                // the pointer is valid and no old-action output is requested.
+                unsafe { libc::sigaction(signal, previous, std::ptr::null_mut()); }
+            }
+        }
+    }
+}
+
 async fn activate_identity(home: &FabricHome, current: iroh::EndpointId, next: iroh::EndpointId) -> Result<fabric::identity::Activated> {
+    let _signals = IdentityActivationSignals::install().context("protect identity activation from cancellation signals")?;
     let snapshot_attempted = std::cell::Cell::new(false);
     let stop_attempted = std::cell::Cell::new(false);
     fabric::identity::activate_with_restart(home, current, next, || async {
@@ -3196,7 +3248,14 @@ async fn reconcile_identity_daemon(home: &FabricHome, expected: iroh::EndpointId
         }
     }
     if live.is_some() || !fabric::daemon::daemon_lock_available(home)? {
-        identity_control(home, ControlRequest::Shutdown).await?;
+        match identity_control(home, ControlRequest::Shutdown).await {
+            Ok(_) => {}
+            // A previous Shutdown can have closed the control socket while
+            // teardown still owns the lease. Wait for that teardown, then
+            // restart instead of abandoning pre-rename recovery.
+            Err(error) if fabric::error::code_of(&error) == ErrorCode::DaemonNotRunning => {}
+            Err(error) => return Err(error),
+        }
         drop(identity_stop_lease(home).await?);
     }
     if service::restart_identity_service(home).await? {
@@ -3787,6 +3846,130 @@ async fn spawn_daemon_with_output(home: &FabricHome, options: DaemonOptions, ann
 #[cfg(test)]
 mod identity_review_tests {
     use super::*;
+
+    fn activation_signal_subprocess(signal: libc::c_int) -> Result<()> {
+        for recovery in [false, true] {
+            let output = ProcessCommand::new(std::env::current_exe()?)
+                .args(["--exact", "identity_review_tests::identity_activation_signal_child", "--nocapture"])
+                .env("FABRIC_ACTIVATION_TEST_SIGNAL", signal.to_string())
+                .env("FABRIC_ACTIVATION_TEST_RECOVERY", recovery.to_string())
+                .output()?;
+            assert!(output.status.success(),
+                "activation signal {signal}, recovery={recovery}: {}\nstdout: {}\nstderr: {}",
+                output.status, String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn identity_activation_survives_sigint_through_restart_and_recovery() -> Result<()> {
+        activation_signal_subprocess(libc::SIGINT)
+    }
+
+    #[test]
+    fn identity_activation_survives_sigterm_through_restart_and_recovery() -> Result<()> {
+        activation_signal_subprocess(libc::SIGTERM)
+    }
+
+    #[test]
+    fn identity_activation_survives_sighup_through_restart_and_recovery() -> Result<()> {
+        activation_signal_subprocess(libc::SIGHUP)
+    }
+
+    #[tokio::test]
+    async fn identity_activation_signal_child() -> Result<()> {
+        use std::os::unix::process::ExitStatusExt;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let Ok(signal) = std::env::var("FABRIC_ACTIVATION_TEST_SIGNAL") else { return Ok(()); };
+        let signal: libc::c_int = signal.parse()?;
+        let recovery = std::env::var("FABRIC_ACTIVATION_TEST_RECOVERY")? == "true";
+        assert!(IdentityActivationSignals::SIGNALS.contains(&signal));
+        // SAFETY: only this disposable subprocess is affected. Establish a
+        // terminating disposition so each regression fails without the guard.
+        unsafe { libc::signal(signal, libc::SIG_DFL); }
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let prepared = fabric::identity::prepare(&home)?;
+        let lease = fabric::daemon::DaemonLease::acquire(&home)?;
+        let listener = tokio::net::UnixListener::bind(home.control_socket_path())?;
+        let server_home = home.clone();
+        // Model the control boundary without starting network endpoints. Signals
+        // are delivered synchronously at Shutdown, strictly before the rename,
+        // and again during post-stop reconciliation / pre-rename recovery.
+        let server = tokio::spawn(async move {
+            let mut lease = Some(lease);
+            let mut stopped = false;
+            let mut post_stop_signals = 0;
+            loop {
+                let (stream, _) = listener.accept().await?;
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).await?;
+                let request: ControlRequest = serde_json::from_str(&line)?;
+                let response = match request {
+                    ControlRequest::Status => {
+                        if stopped {
+                            // SAFETY: raise targets only this subprocess and
+                            // uses one of the validated catchable signals.
+                            assert_eq!(unsafe { libc::raise(signal) }, 0);
+                            post_stop_signals += 1;
+                        }
+                        ControlResponse::Status {
+                            node_id: load_or_create_identity(&server_home)?.public().to_string(),
+                            endpoint_addr: serde_json::Value::Null,
+                            exposed_protocols: vec![], dial_sockets: vec![],
+                            allow_shell: false, allow_exec: false, audit: None,
+                        }
+                    }
+                    ControlRequest::IdentitySnapshot { .. } => {
+                        ControlResponse::IdentitySnapshot { runtime_peers: false }
+                    }
+                    ControlRequest::Shutdown => {
+                        assert_eq!(load_or_create_identity(&server_home)?.public(), prepared.current);
+                        drop(lease.take());
+                        stopped = true;
+                        if recovery {
+                            // Force the actual pre-rename error/recovery path.
+                            fs::remove_file(server_home.root().join("identity.next.toml"))?;
+                        }
+                        // SAFETY: same subprocess-local signal delivery as above.
+                        assert_eq!(unsafe { libc::raise(signal) }, 0);
+                        // Exec'd replacement/service children must still obey
+                        // termination; SIG_IGN would incorrectly survive exec.
+                        let child = ProcessCommand::new("sh")
+                            .args(["-c", &format!("kill -{signal} $$; exit 0")])
+                            .status()?;
+                        assert_eq!(child.signal(), Some(signal));
+                        ControlResponse::Ok
+                    }
+                    ControlRequest::IdentityAbort { .. } => ControlResponse::Ok,
+                    request => bail!("unexpected activation request: {request:?}"),
+                };
+                stream.get_mut().write_all(&serde_json::to_vec(&response)?).await?;
+                stream.get_mut().shutdown().await?;
+                if stopped && ((!recovery && post_stop_signals == 1) || (recovery && post_stop_signals == 2)) {
+                    return Ok::<_, anyhow::Error>(());
+                }
+            }
+        });
+        let result = activate_identity(&home, prepared.current, prepared.next).await;
+        if recovery {
+            let error = result.err().context("activation should fail before rename")?;
+            assert!(format!("{error:#}").contains("current identity daemon restarted successfully"));
+            assert_eq!(load_or_create_identity(&home)?.public(), prepared.current);
+        } else {
+            assert_eq!(result?.active, prepared.next);
+            assert_eq!(load_or_create_identity(&home)?.public(), prepared.next);
+        }
+        server.await??;
+        let mut restored = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+        // SAFETY: querying with a null action only writes the live output.
+        assert_eq!(unsafe { libc::sigaction(signal, std::ptr::null(), restored.as_mut_ptr()) }, 0);
+        // SAFETY: the successful query initialized restored.
+        assert_eq!(unsafe { restored.assume_init() }.sa_sigaction, libc::SIG_DFL);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn identity_activation_waits_for_an_already_stopping_foreground_node() -> Result<()> {

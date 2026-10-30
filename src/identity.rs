@@ -53,7 +53,12 @@ fn sync_home(home: &FabricHome) -> Result<()> { File::open(home.root())?.sync_al
 fn read_id(path: &Path) -> Result<EndpointId> {
     #[derive(serde::Deserialize)]
     struct Key { secret_key: iroh::SecretKey }
-    let key: Key = toml::from_str(&fs::read_to_string(path)?)
+    #[cfg(test)]
+    if path.file_name().is_some_and(|name| name == "identity.next.toml") {
+        io_faults::check(io_faults::Operation::ReadPending)?;
+    }
+    let bytes = fs::read(path)?;
+    let key: Key = toml::from_str(std::str::from_utf8(&bytes)?)
         .map_err(|_| anyhow::anyhow!("invalid identity key file {}", path.display()))?;
     Ok(key.secret_key.public())
 }
@@ -62,8 +67,9 @@ fn snapshot(home: &FabricHome) -> Result<Status> {
     let next = match read_id(&pending(home)) {
         Ok(id) => Some(id),
         Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) => None,
+        Err(error) if error.downcast_ref::<std::io::Error>().is_some() => return Err(error),
         Err(error) => {
-            tracing::warn!(%error, "ignoring unreadable pending identity; prepare replaces it");
+            tracing::warn!(%error, "ignoring invalid pending identity; prepare replaces it");
             None
         }
     };
@@ -79,6 +85,7 @@ pub fn status(home: &FabricHome) -> Result<Status> {
 }
 pub fn prepare(home: &FabricHome) -> Result<Prepared> {
     let _lock = IdentityLock::acquire(home)?;
+    cleanup_pending_scratch_locked(home)?;
     if let Err(error) = cleanup_retired_locked(home, now()) {
         tracing::warn!(%error, "retired identity cleanup failed");
     }
@@ -88,11 +95,36 @@ pub fn prepare(home: &FabricHome) -> Result<Prepared> {
     let state = snapshot(home)?;
     if let Some(next) = state.next { return Ok(Prepared { current: state.current, next }); }
     let temporary = scratch_path(home, "identity.next");
-    let next = generate_identity_file(&temporary)?;
-    File::open(&temporary)?.sync_all()?;
-    fs::rename(&temporary, pending(home))?;
-    sync_home(home)?;
-    Ok(Prepared { current: state.current, next })
+    let result = (|| {
+        let next = generate_identity_file(&temporary)?;
+        #[cfg(test)]
+        io_faults::check(io_faults::Operation::SyncPending)?;
+        File::open(&temporary)?.sync_all()?;
+        #[cfg(test)]
+        io_faults::check(io_faults::Operation::RenamePending)?;
+        fs::rename(&temporary, pending(home))?;
+        sync_home(home)?;
+        Ok(Prepared { current: state.current, next })
+    })();
+    if result.is_err() { let _ = fs::remove_file(&temporary); }
+    result
+}
+
+// A previous prepare may have crashed before publishing its private key.
+// The identity lock excludes any live writer of these scratch files.
+fn cleanup_pending_scratch_locked(home: &FabricHome) -> Result<()> {
+    let mut changed = false;
+    for entry in fs::read_dir(home.root())? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(".identity.next.") && name.ends_with(".tmp") {
+            fs::remove_file(entry.path())?;
+            changed = true;
+        }
+    }
+    if changed { sync_home(home)?; }
+    Ok(())
 }
 
 /// The lock remains held across the caller's restart barrier. A retry after the
@@ -338,7 +370,130 @@ pub async fn retired_key_cleanup(home: FabricHome, cancel: tokio_util::sync::Can
 }
 
 #[cfg(test)]
+mod io_faults {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum Operation { ReadPending, SyncPending, RenamePending }
+
+    thread_local! {
+        static FAILURE: std::cell::Cell<Option<(Operation, i32)>> = const { std::cell::Cell::new(None) };
+    }
+
+    pub fn fail_next(operation: Operation, errno: i32) {
+        FAILURE.with(|failure| {
+            assert!(failure.replace(Some((operation, errno))).is_none());
+        });
+    }
+
+    pub fn check(operation: Operation) -> std::io::Result<()> {
+        FAILURE.with(|failure| {
+            if let Some((expected, errno)) = failure.get() {
+                if expected == operation {
+                    failure.set(None);
+                    return Err(std::io::Error::from_raw_os_error(errno));
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    #[test]
+    fn prepare_removes_private_scratch_after_sync_or_rename_failure() -> Result<()> {
+        for operation in [io_faults::Operation::SyncPending, io_faults::Operation::RenamePending] {
+            let dir = tempfile::tempdir()?;
+            let home = FabricHome::new(dir.path());
+            let current = load_or_create_identity(&home)?.public();
+            let active = fs::read(home.identity_path())?;
+            io_faults::fail_next(operation, libc::EIO);
+            let error = prepare(&home).unwrap_err();
+            assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().raw_os_error(), Some(libc::EIO));
+            assert_eq!(fs::read(home.identity_path())?, active);
+            assert!(!pending(&home).exists());
+            for entry in fs::read_dir(home.root())? {
+                assert!(!entry?.file_name().to_string_lossy().starts_with(".identity.next."));
+            }
+            let retry = prepare(&home)?;
+            assert_eq!(retry.current, current);
+            assert_eq!(read_id(&pending(&home))?, retry.next);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_sweeps_crashed_scratch_only_while_locked_even_when_already_prepared() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let prepared = prepare(&home)?;
+        let active = fs::read(home.identity_path())?;
+        let next = fs::read(pending(&home))?;
+        let stale = scratch_path(&home, "identity.next");
+        generate_identity_file(&stale)?;
+        let partial = scratch_path(&home, "identity.next");
+        fs::write(&partial, b"partial secret")?;
+        let unrelated = [".identity.exposures.other.tmp", ".identity.next.other.toml", "identity.next.other.tmp"];
+        for name in unrelated { fs::write(home.root().join(name), b"unchanged")?; }
+        let lock = IdentityLock::acquire(&home)?;
+        assert_eq!(crate::error::code_of(&prepare(&home).unwrap_err()), ErrorCode::IdentityBusy);
+        assert!(stale.exists());
+        assert!(partial.exists());
+        drop(lock);
+        assert_eq!(prepare(&home)?.next, prepared.next);
+        assert!(!stale.exists());
+        assert!(!partial.exists());
+        assert_eq!(fs::read(home.identity_path())?, active);
+        assert_eq!(fs::read(pending(&home))?, next);
+        for name in unrelated { assert_eq!(fs::read(home.root().join(name))?, b"unchanged"); }
+        Ok(())
+    }
+
+    #[test]
+    fn pending_read_io_failure_preserves_valid_key_and_propagates_existing_error_code() -> Result<()> {
+        for errno in [libc::EMFILE, libc::EIO, libc::EACCES] {
+            let dir = tempfile::tempdir()?;
+            let home = FabricHome::new(dir.path());
+            let prepared = prepare(&home)?;
+            let active = fs::read(home.identity_path())?;
+            let next = fs::read(pending(&home))?;
+            for read_status in [false, true] {
+                io_faults::fail_next(io_faults::Operation::ReadPending, errno);
+                let error = if read_status { status(&home).unwrap_err() } else { prepare(&home).unwrap_err() };
+                assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().raw_os_error(), Some(errno));
+                assert_eq!(crate::error::code_of(&error), ErrorCode::Internal);
+                assert_eq!(fs::read(home.identity_path())?, active);
+                assert_eq!(fs::read(pending(&home))?, next);
+            }
+            assert_eq!(prepare(&home)?.next, prepared.next);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_replaces_pending_only_when_absent_or_invalid() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = FabricHome::new(dir.path());
+        let mut prepared = prepare(&home)?;
+        let active = fs::read(home.identity_path())?;
+        for invalid in [b"\xff".as_slice(), b"not a private key", b"secret_key = 'invalid'"] {
+            fs::write(pending(&home), invalid)?;
+            assert_eq!(status(&home)?.next, None);
+            let replacement = prepare(&home)?;
+            assert_eq!(replacement.current, prepared.current);
+            assert_ne!(replacement.next, prepared.next);
+            assert_eq!(read_id(&pending(&home))?, replacement.next);
+            assert_eq!(prepare(&home)?.next, replacement.next);
+            assert_eq!(fs::read(home.identity_path())?, active);
+            prepared = replacement;
+        }
+        fs::remove_file(pending(&home))?;
+        let replacement = prepare(&home)?;
+        assert_eq!(replacement.current, prepared.current);
+        assert_ne!(replacement.next, prepared.next);
+        assert_eq!(read_id(&pending(&home))?, replacement.next);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn pre_rename_recovery_retains_identity_lock_on_stop_and_write_failures() -> Result<()> {
         for fail_stop in [false, true] {

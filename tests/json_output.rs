@@ -290,6 +290,48 @@ async fn identity_foreground_activation_failed_swap_and_stale_socket_recovery_ke
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identity_stop_timeout_recovery_waits_for_teardown_and_restarts_current() -> Result<()> {
+    use fabric::{control::{ControlRequest, ControlResponse}, daemon::{DaemonLease, send_control}};
+    struct Stop(FabricHome);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            let _ = Command::new(fabric_bin()).arg("--home").arg(self.0.root()).arg("down").output();
+        }
+    }
+    let dir = TempDir::new()?;
+    let home = FabricHome::new(dir.path());
+    let prepared = fabric::identity::prepare(&home)?;
+    let lease = DaemonLease::acquire(&home)?;
+    let node = FabricNode::start(home.clone()).await?;
+    let _stop = Stop(home.clone());
+    // Model a daemon which acknowledged Shutdown and stopped listening, but
+    // retains its lifetime lease beyond the activation's 15-second deadline.
+    let teardown = tokio::spawn(async move {
+        node.wait().await?;
+        tokio::time::sleep(Duration::from_secs(18)).await;
+        drop(lease);
+        Ok::<_, anyhow::Error>(())
+    });
+    let output = tokio::time::timeout(Duration::from_secs(45),
+        tokio::process::Command::new(fabric_bin())
+            .arg("--home").arg(home.root())
+            .args(["identity", "activate", "--expect-current", &prepared.current.to_string(),
+                "--expect-next", &prepared.next.to_string(), "--json"])
+            .kill_on_drop(true).output()
+    ).await.context("activation recovery deadline")??;
+    let result: Value = serde_json::from_slice(&output.stdout)?;
+    assert!(!output.status.success());
+    assert_eq!(result["error"]["code"], "daemon_stop_timeout");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("current identity daemon restarted successfully"),
+        "{}", String::from_utf8_lossy(&output.stdout));
+    teardown.await??;
+    assert_eq!(fabric::identity::status(&home)?.next, Some(prepared.next));
+    assert!(matches!(send_control(&home, ControlRequest::Status).await?,
+        ControlResponse::Status { node_id, .. } if node_id == prepared.current.to_string()));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn identity_snapshot_abort_removes_handoff_and_unfences_exposures() -> Result<()> {
     use fabric::{control::{ControlRequest, ControlResponse}, daemon::send_control};
     let dir = TempDir::new()?;
