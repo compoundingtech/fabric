@@ -150,6 +150,9 @@ returns the same `next`; the running daemon is unchanged. Over the still-working
 old connection, arrange for every peer to trust `next` with the exact existing
 grants and set the old runtime record's immutable expiry (at most ten minutes)
 in one [atomic runtime-peer batch](docs/runtime-peer-api.md).
+Preparation removes failed scratch-key writes and sweeps abandoned scratch keys
+under the identity lock. A malformed pending key can be replaced; other pending
+key read failures are errors and leave the key unchanged.
 Only after peers have installed that batch:
 
 ```sh
@@ -173,6 +176,10 @@ return `already_active`; they never swap again, and `previous` echoes the caller
 `identity_mismatch` without swapping the identity. The identity lock remains held
 through restart: concurrent `status`, `prepare`, or `activate` returns
 `identity_busy` rather than waiting.
+Interrupt, terminate, and hangup signals cannot interrupt activation's
+stop/swap/restart recovery window, including when the invoking SSH session drops.
+If teardown has closed the control socket, recovery still waits for its lifetime
+lease before restarting the current identity.
 
 After a crash, `status` reports either `prepared` (old key plus pending new key)
 or `active` (the rename completed). `restart_failed` is non-zero and includes
