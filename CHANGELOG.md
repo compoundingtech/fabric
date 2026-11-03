@@ -16,6 +16,19 @@ Deprecated, Fixed or Security.
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-11-03
+
+### Fixed
+
+- Foreground daemons hold the lifetime lease, preventing identity activation
+  from bypassing daemon teardown; stale control sockets are recovered.
+- Identity activation recovery waits for an already-stopping daemon's lifetime
+  lease even after its control socket closes. Interrupt, terminate, and hangup
+  signals cannot interrupt the stop/swap/restart recovery window.
+- Identity preparation removes failed scratch-key writes and sweeps abandoned
+  scratch keys under its lock. Only malformed pending keys are replaced;
+  pending-key I/O failures are reported without replacing the key.
+
 ## [0.9.3] - 2026-10-28
 
 ### Added
