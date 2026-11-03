@@ -16,6 +16,12 @@ Deprecated, Fixed or Security.
 
 ## [Unreleased]
 
+### Fixed
+
+- Identity preparation removes failed scratch-key writes and sweeps abandoned
+  scratch keys under its lock. Only malformed pending keys are replaced;
+  pending-key I/O failures are reported without replacing the key.
+
 ## [0.9.3] - 2026-10-28
 
 ### Added
