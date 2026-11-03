@@ -16,8 +16,12 @@ Deprecated, Fixed or Security.
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-11-03
+
 ### Fixed
 
+- Foreground daemons hold the lifetime lease, preventing identity activation
+  from bypassing daemon teardown; stale control sockets are recovered.
 - Identity activation recovery waits for an already-stopping daemon's lifetime
   lease even after its control socket closes. Interrupt, terminate, and hangup
   signals cannot interrupt the stop/swap/restart recovery window.
