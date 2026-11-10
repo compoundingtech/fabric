@@ -246,7 +246,16 @@ fn decode_request(bytes: &[u8]) -> Result<NetworkRequest> {
         wait: Option<crate::runtime_peers::pairing::StatusWait>,
     }
     let frame: Frame = serde_json::from_slice(bytes).map_err(|_| refused())?;
-    let Frame { operation, attempt_id, secret, sequence, digest, payload, ack, wait } = frame;
+    let Frame {
+        operation,
+        attempt_id,
+        secret,
+        sequence,
+        digest,
+        payload,
+        ack,
+        wait,
+    } = frame;
     if wait.is_some() && !matches!(operation, Operation::Status) {
         return Err(refused());
     }
@@ -408,7 +417,8 @@ pub(super) async fn remote(
         }
         let endpoint = state.current_endpoint();
         let waiting = matches!(&request, NetworkRequest::Status { wait: Some(_), .. });
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(if waiting { 45 } else { 30 });
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(if waiting { 45 } else { 30 });
         let connection = tokio::time::timeout_at(
             deadline,
             endpoint.connect(
@@ -428,7 +438,10 @@ pub(super) async fn remote(
             let (mut send, mut recv) = connection.open_bi().await?;
             if matches!(&request, NetworkRequest::Send { .. } | NetworkRequest::Receive { .. }) {
                 // Reconnect authenticates a small frame before a large exchange.
-                let prime = serde_json::to_vec(&NetworkRequest::Status { attempt_id: attempt.clone(), wait: None })?;
+                let prime = serde_json::to_vec(&NetworkRequest::Status {
+                    attempt_id: attempt.clone(),
+                    wait: None,
+                })?;
                 send.write_all(&(prime.len() as u32).to_be_bytes()).await?;
                 send.write_all(&prime).await?;
                 let prime = read_remote_reply(&mut recv, attempt, endpoint.id()).await?;
@@ -802,7 +815,14 @@ mod tests {
         // Start a full refill interval at the barrier, independent of how long
         // endpoint startup took on the runner.
         state.pairing_gate.rates.lock().global.last = now;
-        let response = rpc(&mut send, &mut recv, NetworkRequest::Status { attempt_id: "unknown".into(), wait: None });
+        let response = rpc(
+            &mut send,
+            &mut recv,
+            NetworkRequest::Status {
+                attempt_id: "unknown".into(),
+                wait: None,
+            },
+        );
         let refused = tokio::time::timeout(Duration::from_millis(500), response).await;
         release.send(())?;
         blocker.await?;
@@ -937,7 +957,10 @@ mod tests {
         // the dedicated read semaphore: after each caller future is dropped,
         // its extra owners are the permits retained inside blocking workers.
         let owners_before = Arc::strong_count(&state.pairing_read_slots);
-        let request = NetworkRequest::Status { attempt_id: "unknown".into(), wait: None };
+        let request = NetworkRequest::Status {
+            attempt_id: "unknown".into(),
+            wait: None,
+        };
         let mut observations = Vec::new();
         // The first pool's worth start real blocking workers. Later requests
         // time out waiting asynchronously for worker capacity, without spawning.
@@ -1102,7 +1125,10 @@ mod tests {
         let same = rpc(
             &mut send,
             &mut recv,
-            NetworkRequest::Status { attempt_id: attempt_id.clone(), wait: None },
+            NetworkRequest::Status {
+                attempt_id: attempt_id.clone(),
+                wait: None,
+            },
         )
         .await?;
         assert_eq!(same.status.unwrap().bound_node_id, Some(client.id()));
@@ -1130,7 +1156,10 @@ mod tests {
             rpc(
                 &mut other_send,
                 &mut other_recv,
-                NetworkRequest::Status { attempt_id, wait: None }
+                NetworkRequest::Status {
+                    attempt_id,
+                    wait: None
+                }
             )
             .await
             .is_err()
@@ -1255,18 +1284,34 @@ mod tests {
         let joining = gateway(FabricHome::new(joining_dir.path())).await?;
         for mode in ["cap", "expiry", "restart"] {
             let deadline = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?.as_secs()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs()
                 + if mode == "expiry" { 2 } else { 600 };
-            let issued = owner.state().pairing_request(Request::Issue {
-                owner: "test".into(), creation_id: mode.into(), deadline,
-                policy: Policy { grants: vec![], name: None,
-                    direction: crate::runtime_peers::Direction::Normal },
-            }).await;
+            let issued = owner
+                .state()
+                .pairing_request(Request::Issue {
+                    owner: "test".into(),
+                    creation_id: mode.into(),
+                    deadline,
+                    policy: Policy {
+                        grants: vec![],
+                        name: None,
+                        direction: crate::runtime_peers::Direction::Normal,
+                    },
+                })
+                .await;
             assert!(issued.error.is_none(), "{:?}", issued.error);
             let attempt_id = issued.status.unwrap().attempt_id;
-            let pending = remote(&joining.state(), owner.id(), Some(owner.addr()),
-                NetworkRequest::Present { attempt_id: attempt_id.clone(),
-                    secret: issued.secret.unwrap() }).await;
+            let pending = remote(
+                &joining.state(),
+                owner.id(),
+                Some(owner.addr()),
+                NetworkRequest::Present {
+                    attempt_id: attempt_id.clone(),
+                    secret: issued.secret.unwrap(),
+                },
+            )
+            .await;
             assert!(pending.error.is_none(), "{:?}", pending.error);
             let pending = pending.status.unwrap();
             if mode == "restart" {
@@ -1274,9 +1319,18 @@ mod tests {
                 owner = gateway(owner_home.clone()).await?;
             }
             let started = tokio::time::Instant::now();
-            let reply = remote(&joining.state(), owner.id(), Some(owner.addr()),
-                NetworkRequest::Status { attempt_id,
-                    wait: Some(StatusWait { after_revision: pending.attempt_revision }) }).await;
+            let reply = remote(
+                &joining.state(),
+                owner.id(),
+                Some(owner.addr()),
+                NetworkRequest::Status {
+                    attempt_id,
+                    wait: Some(StatusWait {
+                        after_revision: pending.attempt_revision,
+                    }),
+                },
+            )
+            .await;
             assert!(reply.error.is_none(), "{mode}: {:?}", reply.error);
             let status = reply.status.unwrap();
             match mode {
@@ -1329,9 +1383,14 @@ mod tests {
                 attempt_id: "attempt".into(),
                 secret: Secret::new("secret"),
             },
-            NetworkRequest::Status { attempt_id: "attempt".into(), wait: None },
-            NetworkRequest::Status { attempt_id: "attempt".into(),
-                wait: Some(crate::runtime_peers::pairing::StatusWait { after_revision: 1 }) },
+            NetworkRequest::Status {
+                attempt_id: "attempt".into(),
+                wait: None,
+            },
+            NetworkRequest::Status {
+                attempt_id: "attempt".into(),
+                wait: Some(crate::runtime_peers::pairing::StatusWait { after_revision: 1 }),
+            },
             NetworkRequest::Send {
                 attempt_id: "attempt".into(),
                 sequence: 1,
@@ -1723,7 +1782,15 @@ mod tests {
         assert_eq!(&bytes, b"proof");
         let unrelated = client.connect(gateway.addr(), b"not-granted").await?;
         tokio::time::timeout(Duration::from_secs(3), unrelated.closed()).await?;
-        let own_status = rpc(&mut send, &mut recv, NetworkRequest::Status { attempt_id, wait: None }).await?;
+        let own_status = rpc(
+            &mut send,
+            &mut recv,
+            NetworkRequest::Status {
+                attempt_id,
+                wait: None,
+            },
+        )
+        .await?;
         assert!(own_status.access.is_empty());
         let own_status = own_status.status.unwrap();
         assert_eq!(own_status.state, State::Confirmed);
@@ -1977,7 +2044,10 @@ mod tests {
         let joining_home = FabricHome::new(joining_dir.path());
         let disabled = FabricNode::start(joining_home.clone()).await?;
         control_ready(&joining_home).await?;
-        let request = NetworkRequest::Status { attempt_id: "unknown".into(), wait: None };
+        let request = NetworkRequest::Status {
+            attempt_id: "unknown".into(),
+            wait: None,
+        };
         let reply = remote_request(&joining_home, &owner, request).await?;
         assert_eq!(reply.error.unwrap().code, "runtime_peers_disabled");
         disabled.shutdown().await?;
@@ -2003,7 +2073,10 @@ mod tests {
             ControlRequest::PairingRemote {
                 gateway: spoofed.id,
                 addr: Some(spoofed),
-                request: NetworkRequest::Status { attempt_id: "unknown".into(), wait: None },
+                request: NetworkRequest::Status {
+                    attempt_id: "unknown".into(),
+                    wait: None,
+                },
             },
         )
         .await?
