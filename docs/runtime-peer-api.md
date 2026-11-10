@@ -129,7 +129,9 @@ validated bound identities use an independent bucket (burst 8, refill one/second
 selected by a bounded expiring hint that never authorizes an operation. Ordinary
 traffic uses neither pool nor bucket. Pairing availability is best effort under
 attack. First-header waits are limited to three seconds; subsequent idle framing
-waits are ten seconds, and connection lifetime is bounded by the attempt deadline.
+waits are ten seconds. Active-attempt work is bounded by the attempt deadline;
+terminal replies, including retained expired status, have a separate ten-second
+write budget so the original deadline cannot suppress the response.
 Post-ALPN transport settings allow one bidi stream, zero uni streams and an 8 KiB
 receive window; already-advertised QUIC credits cannot be retracted.
 
