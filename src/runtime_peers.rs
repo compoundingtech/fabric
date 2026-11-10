@@ -664,6 +664,8 @@ impl RuntimePeers {
         loaded.pairing_clock = self.pairing_clock;
         loaded.exchanges = std::mem::take(&mut self.exchanges);
         loaded.prune_exchanges();
+        loaded.pairing_changes = self.pairing_changes.clone();
+        loaded.pairing_changes.send_replace(());
         *self = loaded;
         Ok(book)
     }

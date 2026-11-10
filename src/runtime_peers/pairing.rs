@@ -426,6 +426,10 @@ fn observe_clock(
 }
 
 impl RuntimePeers {
+    #[cfg(test)]
+    pub(crate) fn advance_pairing_clock_for_test(&mut self, timestamp: u64) {
+        self.pairing_clock = (timestamp, std::time::Instant::now());
+    }
     pub(super) fn pairing_timestamp(&mut self) -> u64 {
         observe_clock(&mut self.pairing_clock, now(), std::time::Instant::now())
     }

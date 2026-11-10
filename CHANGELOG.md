@@ -23,6 +23,10 @@ Deprecated, Fixed or Security.
   attempt deadline or 30 seconds. Advanced revisions and terminal states return
   immediately; consumers reissue after an unchanged response. Joining-daemon
   `pairing_remote` forwards waits with a 45-second total response deadline.
+  The same absolute bound covers runtime reads and capacity waits; a stalled
+  read returns the last authenticated snapshot. Live reconciliation preserves
+  notifications. Ahead-of-current pending revisions receive the typed
+  `status-wait-revision-ahead` refusal with the current revision.
 
 ### Fixed
 

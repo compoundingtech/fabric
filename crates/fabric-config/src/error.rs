@@ -117,6 +117,7 @@ error_codes! {
     RuntimeCommitIndeterminate => "runtime_commit_indeterminate", Fault;
     RuntimeReceiptCapacity => "runtime_receipt_capacity", Fault;
     PairingExchangeInactive => "pairing_exchange_inactive", Refusal;
+    StatusWaitRevisionAhead => "status-wait-revision-ahead", Refusal;
     RequestIdConflict => "request_id_conflict", Usage;
     CancellationTimeout => "cancellation_timeout", Fault;
     IdentityMismatch => "identity_mismatch", Usage;

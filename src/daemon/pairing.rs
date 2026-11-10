@@ -517,15 +517,27 @@ async fn read_remote_reply(
     );
     let mut bytes = vec![0; length];
     recv.read_exact(&mut bytes).await?;
-    let reply: Reply = serde_json::from_slice(&bytes)?;
+    let mut reply: Reply = serde_json::from_slice(&bytes)?;
     let status = reply.status.as_ref().context("missing pairing status")?;
     anyhow::ensure!(
         reply.secret.is_none()
-            && reply.error.is_none()
+            && reply
+                .error
+                .as_ref()
+                .is_none_or(|error| error.code == "status-wait-revision-ahead")
             && status.attempt_id == attempt
             && status.bound_node_id == Some(node),
         "unbound pairing reply"
     );
+    if reply.error.is_some() {
+        reply.error = Some(crate::runtime_peers::PolicyError::of(
+            &FabricError::new(
+                ErrorCode::StatusWaitRevisionAhead,
+                "status wait revision is ahead of the current attempt_revision",
+            )
+            .into(),
+        ));
+    }
     Ok(reply.restricted())
 }
 
@@ -629,7 +641,8 @@ async fn serve_stream(
         let exchange = matches!(&request, NetworkRequest::Send { .. } | NetworkRequest::Receive { .. });
         let reply = if matches!(&request, NetworkRequest::Status { wait: Some(_), .. }) {
             tokio::select! {
-                result = state.pairing_status_wait(connection.remote_id(), &request) => result?,
+                result = state.pairing_status_wait(connection.remote_id(), &request,
+                    validated.context("missing authenticated status")?) => result?,
                 _ = connection.closed() => return Ok(()),
             }
         } else if !exchange && validated.is_some() {
@@ -645,14 +658,18 @@ async fn serve_stream(
             tokio::time::timeout(FIRST_HEADER, commit).await??
         };
         // The restricted path never reports fault internals or any unbound attempt.
-        if reply.error.is_some() {
+        if reply
+            .error
+            .as_ref()
+            .is_some_and(|error| error.code != "status-wait-revision-ahead")
+        {
             return Err(refused());
         }
         let status = reply.status.as_ref().ok_or_else(refused)?;
         if status.bound_node_id == Some(connection.remote_id()) {
             state.pairing_gate.remember_bound(connection.remote_id(), Instant::now());
         }
-        let terminal = !matches!(status.state, State::Pending);
+        let terminal = reply.error.is_some() || !matches!(status.state, State::Pending);
         let wall = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
@@ -1324,7 +1341,7 @@ mod tests {
                 owner.id(),
                 Some(owner.addr()),
                 NetworkRequest::Status {
-                    attempt_id,
+                    attempt_id: attempt_id.clone(),
                     wait: Some(StatusWait {
                         after_revision: pending.attempt_revision,
                     }),
@@ -1332,7 +1349,22 @@ mod tests {
             )
             .await;
             assert!(reply.error.is_none(), "{mode}: {:?}", reply.error);
-            let status = reply.status.unwrap();
+            let mut status = reply.status.unwrap();
+            if mode == "expiry" && status.state == State::Pending {
+                // A bounded read may return its last authenticated snapshot.
+                status = remote(
+                    &joining.state(),
+                    owner.id(),
+                    Some(owner.addr()),
+                    NetworkRequest::Status {
+                        attempt_id,
+                        wait: None,
+                    },
+                )
+                .await
+                .status
+                .unwrap();
+            }
             match mode {
                 "cap" => {
                     assert_eq!(status, pending);

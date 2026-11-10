@@ -127,15 +127,22 @@ status. Unknown, wrong-node, wrong-token and malformed requests close with a
 generic reason and expose no attempt status.
 
 Omitting `wait` preserves immediate status reads. With
-`wait: {"after_revision": <u64>}`, status returns immediately if
+`wait: {"after_revision": <u64>}`, status returns immediately if the current
 `attempt_revision` is greater than `after_revision` or the attempt is terminal
-(`confirmed`, `expired`, or `rejected`). Otherwise it waits for a revision change
-or terminal transition, bounded by the earlier of the original attempt deadline
-and 30 seconds. The bound returns current status even if its revision is
-unchanged; reissue `status` with the returned revision to keep waiting. Waiting
-uses change notifications, not polling: bind, confirm, reject, cancel, expiry,
-and recovery (`exchange_lost`) are observable. Opaque exchange send/receive
-activity does not wake it. A pending wait is not an idle framing read. Waiting
+(`confirmed`, `expired`, or `rejected`). A pending attempt refuses a revision
+ahead of its current revision with code `status-wait-revision-ahead`; the reply's
+`status.attempt_revision` identifies the current revision. This is not a transition.
+Otherwise it waits for a revision change or terminal transition. One absolute
+deadline, the earlier of the original attempt deadline and 30 seconds, covers
+subscription, read-capacity acquisition, every state read, and notification waits.
+At the bound it returns the last authenticated status snapshot normally, with
+an unchanged revision if no transition was observed, even if a concurrent disk
+operation prevents a fresh read. That snapshot may still be pending at expiry;
+reissue with the returned revision to read projected expiry or keep waiting.
+This notification re-arm is not polling. Bind, confirm, reject, cancel, expiry,
+and recovery (`exchange_lost`) are observable; live reconciliation preserves
+subscriptions. Opaque exchange activity does not wake status. A pending wait is
+not an idle framing read. Waiting
 does not extend the permit deadline or grant access; the same bound-node checks
 and connection limits, including the 600-second connection lifetime, still apply.
 
