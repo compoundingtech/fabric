@@ -302,6 +302,7 @@ impl RuntimePeers {
             panic!("injected confirmation worker failure after persist, before stored update");
         }
         self.stored = next;
+        self.pairing_changes.send_replace(());
         self.prune_exchanges();
         self.pairing_attempt_reply_at(&request.owner, &request.attempt_id, timestamp)
     }

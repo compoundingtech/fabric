@@ -574,6 +574,7 @@ impl RuntimePeers {
             let book = store.compose(&store.stored)?.0;
             if changed {
                 store.persist(&store.stored)?;
+                store.pairing_changes.send_replace(());
             }
             Ok(book)
         })();
