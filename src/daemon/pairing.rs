@@ -1145,37 +1145,54 @@ mod tests {
         let gateway = gateway(FabricHome::new(dir.path())).await?;
         let state = gateway.state();
         let deadline = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?.as_secs() + 5;
-        let issued = state.pairing_request(Request::Issue {
-            owner: "test".into(),
-            creation_id: "retained-terminal".into(),
-            deadline,
-            policy: Policy {
-                grants: vec![],
-                name: None,
-                direction: crate::runtime_peers::Direction::Normal,
-            },
-        }).await;
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            + 5;
+        let issued = state
+            .pairing_request(Request::Issue {
+                owner: "test".into(),
+                creation_id: "retained-terminal".into(),
+                deadline,
+                policy: Policy {
+                    grants: vec![],
+                    name: None,
+                    direction: crate::runtime_peers::Direction::Normal,
+                },
+            })
+            .await;
         assert!(issued.error.is_none(), "{:?}", issued.error);
         let attempt_id = issued.status.context("missing issued status")?.attempt_id;
         // Force the reply to await QUIC flow-control credit instead of fitting
         // entirely in a ready write, which can mask an already-expired timeout.
         let client = Endpoint::builder(presets::N0)
-            .transport_config(iroh::endpoint::QuicTransportConfig::builder()
-                .stream_receive_window(VarInt::from_u32(64))
-                .build())
-            .bind().await?;
+            .transport_config(
+                iroh::endpoint::QuicTransportConfig::builder()
+                    .stream_receive_window(VarInt::from_u32(64))
+                    .build(),
+            )
+            .bind()
+            .await?;
         let connection = client.connect(gateway.addr(), PAIR_ALPN).await?;
         let (mut send, mut recv) = connection.open_bi().await?;
-        let pending = rpc(&mut send, &mut recv, NetworkRequest::Present {
-            attempt_id: attempt_id.clone(),
-            secret: issued.secret.context("missing permit secret")?,
-        }).await?;
-        assert_eq!(pending.status.context("missing pending status")?.state, State::Pending);
-        let cancelled = state.pairing_request(Request::Cancel {
-            owner: "test".into(),
-            creation_id: "retained-terminal".into(),
-        }).await;
+        let pending = rpc(
+            &mut send,
+            &mut recv,
+            NetworkRequest::Present {
+                attempt_id: attempt_id.clone(),
+                secret: issued.secret.context("missing permit secret")?,
+            },
+        )
+        .await?;
+        assert_eq!(
+            pending.status.context("missing pending status")?.state,
+            State::Pending
+        );
+        let cancelled = state
+            .pairing_request(Request::Cancel {
+                owner: "test".into(),
+                creation_id: "retained-terminal".into(),
+            })
+            .await;
         assert!(cancelled.error.is_none(), "{:?}", cancelled.error);
         let retained = cancelled.status.context("missing cancelled status")?;
         assert_eq!(retained.state, State::Rejected);
@@ -1184,16 +1201,27 @@ mod tests {
             while !state.pairing_gate.attempts.lock().is_empty() {
                 tokio::task::yield_now().await;
             }
-        }).await?;
+        })
+        .await?;
         let expired_at = std::time::UNIX_EPOCH + Duration::from_secs(deadline);
-        tokio::time::sleep(expired_at.duration_since(std::time::SystemTime::now())
-            .unwrap_or_default() + Duration::from_millis(50)).await;
+        tokio::time::sleep(
+            expired_at
+                .duration_since(std::time::SystemTime::now())
+                .unwrap_or_default()
+                + Duration::from_millis(50),
+        )
+        .await;
         assert!(std::time::SystemTime::now() >= expired_at);
         let connection = client.connect(gateway.addr(), PAIR_ALPN).await?;
         let (mut send, mut recv) = connection.open_bi().await?;
-        let reply = rpc(&mut send, &mut recv, NetworkRequest::Status {
-            attempt_id: attempt_id.clone(),
-        }).await?;
+        let reply = rpc(
+            &mut send,
+            &mut recv,
+            NetworkRequest::Status {
+                attempt_id: attempt_id.clone(),
+            },
+        )
+        .await?;
         assert!(reply.error.is_none(), "{:?}", reply.error);
         let status = reply.status.context("missing retained terminal status")?;
         assert_eq!(status.attempt_id, attempt_id);
@@ -1203,8 +1231,12 @@ mod tests {
         assert_eq!(status.bound_node_id, Some(client.id()));
         assert_eq!(status.terminal_at, retained.terminal_at);
         let mut trailing = [0; 1];
-        assert!(tokio::time::timeout(Duration::from_secs(3), recv.read(&mut trailing))
-            .await??.is_none(), "terminal reply must finish the stream");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), recv.read(&mut trailing))
+                .await??
+                .is_none(),
+            "terminal reply must finish the stream"
+        );
         client.close().await;
         gateway.shutdown().await?;
         Ok(())
