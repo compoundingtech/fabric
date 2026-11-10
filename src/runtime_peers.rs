@@ -425,6 +425,7 @@ pub(crate) struct RuntimePeers {
     pairing_clock: (u64, std::time::Instant),
     expiry_clock: std::sync::Arc<ExpiryClock>,
     exchanges: BTreeMap<String, exchange::Exchange>,
+    pub(crate) pairing_changes: tokio::sync::watch::Sender<()>,
     #[cfg(test)]
     fail_directory_sync: bool,
     #[cfg(test)]
@@ -494,6 +495,7 @@ impl RuntimePeers {
             pairing_clock,
             expiry_clock: expiry_clock.unwrap_or_else(|| std::sync::Arc::new(ExpiryClock::new(pairing_clock))),
             exchanges: BTreeMap::new(),
+            pairing_changes: tokio::sync::watch::channel(()).0,
             #[cfg(test)]
             fail_directory_sync: false,
             #[cfg(test)]
@@ -687,6 +689,7 @@ impl RuntimePeers {
             pairing_clock: self.pairing_clock,
             expiry_clock: self.expiry_clock.clone(),
             exchanges: BTreeMap::new(),
+            pairing_changes: tokio::sync::watch::channel(()).0,
             #[cfg(test)]
             fail_directory_sync: false,
             #[cfg(test)]

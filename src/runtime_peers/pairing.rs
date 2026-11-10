@@ -23,6 +23,8 @@ pub enum NetworkRequest {
     },
     Status {
         attempt_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait: Option<StatusWait>,
     },
     Send {
         attempt_id: String,
@@ -34,6 +36,12 @@ pub enum NetworkRequest {
         attempt_id: String,
         ack: Option<u64>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusWait {
+    pub after_revision: u64,
 }
 
 const MAX_PERMITS: usize = 64;
@@ -443,7 +451,7 @@ impl RuntimePeers {
         let refused = || invalid("pairing request refused");
         let (attempt_id, secret) = match request {
             NetworkRequest::Present { attempt_id, secret } => (attempt_id, Some(secret)),
-            NetworkRequest::Status { attempt_id }
+            NetworkRequest::Status { attempt_id, .. }
             | NetworkRequest::Send { attempt_id, .. }
             | NetworkRequest::Receive { attempt_id, .. } => (attempt_id, None),
         };
@@ -797,6 +805,7 @@ impl RuntimePeers {
                 return Err(error);
             }
             self.stored = next;
+            self.pairing_changes.send_replace(());
         }
         self.prune_exchanges();
         Ok(())
@@ -1259,6 +1268,7 @@ mod tests {
     fn restricted_status(status: &Status) -> NetworkRequest {
         NetworkRequest::Status {
             attempt_id: status.attempt_id.clone(),
+            wait: None,
         }
     }
 
@@ -2290,7 +2300,7 @@ mod tests {
         store.fail_directory_sync = true;
         assert!(store.pairing_network_read_at(node(1), &request, 101).unwrap().is_none());
         for request in [
-            NetworkRequest::Status { attempt_id: "unknown".into() },
+            NetworkRequest::Status { attempt_id: "unknown".into(), wait: None },
             NetworkRequest::Present { attempt_id: "unknown".into(), secret: Secret::new("wrong") },
             restricted_status(&status),
             presentation(&status, &Secret::new("wrong")),

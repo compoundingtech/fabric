@@ -805,6 +805,7 @@ mod tests {
                     node(1),
                     NetworkRequest::Status {
                         attempt_id: request.attempt_id.clone(),
+                        wait: None,
                     },
                     t + 1,
                 )
