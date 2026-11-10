@@ -16,6 +16,12 @@ Deprecated, Fixed or Security.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Provisional:** restricted pairing terminal replies use an independent
+  ten-second write budget, allowing retained expired status to be returned after
+  the original attempt deadline.
+
 ## [0.9.4] - 2026-11-03
 
 ### Fixed
