@@ -1400,7 +1400,8 @@ mod tests {
                 assert!(reply.error.is_none(), "{:?}", reply.error);
                 assert!(reply.exchange.unwrap().message.is_none());
             } else {
-                let mut read = state.pairing_wait_read.subscribe();
+                let barrier = (mode == "wake").then(|| Arc::new(tokio::sync::Barrier::new(2)));
+                *state.pairing_receive_barrier.lock().unwrap() = barrier.clone();
                 let joining_state = joining.state();
                 let request = NetworkRequest::Receive {
                     attempt_id: attempt.clone(),
@@ -1409,20 +1410,13 @@ mod tests {
                 };
                 let waiter = remote(&joining_state, owner.id(), Some(owner.addr()), request);
                 tokio::pin!(waiter);
-                if mode == "wake" {
+                if let Some(barrier) = &barrier {
                     tokio::select! {
                         reply = &mut waiter => panic!("receive ended before enqueue: {reply:?}"),
-                        result = async {
-                            loop {
-                                if read.borrow_and_update().as_deref() == Some(attempt.as_str()) {
-                                    break;
-                                }
-                                read.changed().await?;
-                            }
-                            Ok::<_, anyhow::Error>(())
-                        } => result?,
+                        _ = barrier.wait() => {}
                     }
                     assert!(enqueue().await.error.is_none());
+                    barrier.wait().await;
                 }
                 let reply = tokio::time::timeout(Duration::from_secs(3), waiter).await?;
                 assert!(reply.error.is_none(), "{:?}", reply.error);

@@ -506,6 +506,8 @@ pub struct DaemonState {
     pairing_read_slots: Arc<Semaphore>,
     #[cfg(test)]
     pairing_wait_read: tokio::sync::watch::Sender<Option<String>>,
+    #[cfg(test)]
+    pairing_receive_barrier: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
     dial_slots: Arc<Semaphore>,
     mux_stream_slots: Arc<Semaphore>,
     peer_connections: Arc<mux::PeerConnections>,
@@ -1359,6 +1361,8 @@ impl DaemonState {
             pairing_read_slots: Arc::new(Semaphore::new(pairing::MAX_CONNECTIONS)),
             #[cfg(test)]
             pairing_wait_read: tokio::sync::watch::channel(None).0,
+            #[cfg(test)]
+            pairing_receive_barrier: std::sync::Mutex::new(None),
             dial_slots: Arc::new(Semaphore::new(MAX_DIAL_HANDLERS)),
             mux_stream_slots: Arc::new(Semaphore::new(MAX_INCOMING_HANDLERS)),
             peer_connections,
