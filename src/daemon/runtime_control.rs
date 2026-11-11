@@ -639,6 +639,14 @@ impl DaemonState {
                     return Ok(reply);
                 }
                 #[cfg(test)]
+                {
+                    let barrier = self.pairing_receive_barrier.lock().unwrap().take();
+                    if let Some(barrier) = barrier {
+                        barrier.wait().await; // First empty read completed.
+                        barrier.wait().await; // Test enqueues before releasing.
+                    }
+                }
+                #[cfg(test)]
                 self.pairing_wait_read.send_replace(
                     reply
                         .status
