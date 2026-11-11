@@ -22,6 +22,10 @@ Deprecated, Fixed or Security.
   `wait: true` to hold an empty exchange read reactively for up to 30 seconds.
   Enqueue-before-read and enqueue-after-registration both return the message;
   ordinary receives remain nonblocking.
+- **Provisional:** held restricted receives end at the earlier of 30 seconds and
+  the permit deadline, react to terminal transitions, and release their lease on
+  disconnect. A concurrent second hold returns the typed `pairing_wait_busy`
+  refusal without consuming a message.
 
 - **Provisional:** restricted pairing `status` accepts optional
   `wait: {after_revision: <u64>}` for notification-driven waits bounded by the

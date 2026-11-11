@@ -463,7 +463,14 @@ pub(super) async fn remote(
         })?;
         let operation = async {
             let (mut send, mut recv) = connection.open_bi().await?;
-            if matches!(&request, NetworkRequest::Send { .. } | NetworkRequest::Receive { .. }) {
+            if matches!(
+                &request,
+                NetworkRequest::Send { .. }
+                    | NetworkRequest::Receive {
+                        wait: None | Some(false),
+                        ..
+                    }
+            ) {
                 // Reconnect authenticates a small frame before a large exchange.
                 let prime = serde_json::to_vec(&NetworkRequest::Status {
                     attempt_id: attempt.clone(),
@@ -551,18 +558,25 @@ async fn read_remote_reply(
             && reply
                 .error
                 .as_ref()
-                .is_none_or(|error| error.code == "status_wait_revision_ahead")
+                .is_none_or(|error| matches!(error.code.as_str(), "status_wait_revision_ahead" | "pairing_wait_busy"))
             && status.attempt_id == attempt
             && status.bound_node_id == Some(node),
         "unbound pairing reply"
     );
-    if reply.error.is_some() {
-        reply.error = Some(crate::runtime_peers::PolicyError::of(
-            &FabricError::new(
+    if let Some(error) = &reply.error {
+        let (code, message) = if error.code == "pairing_wait_busy" {
+            (
+                ErrorCode::PairingWaitBusy,
+                "pairing receive already waiting",
+            )
+        } else {
+            (
                 ErrorCode::StatusWaitRevisionAhead,
                 "status wait revision is ahead of the current attempt_revision",
             )
-            .into(),
+        };
+        reply.error = Some(crate::runtime_peers::PolicyError::of(
+            &FabricError::new(code, message).into(),
         ));
     }
     Ok(reply.restricted())
@@ -665,23 +679,38 @@ async fn serve_stream(
                 ..
             }
         );
+        let mut busy = false;
         if let Some(lease) = &lease {
             if &lease.attempt != attempt {
                 return Err(refused());
             }
         } else {
-            lease = Some(state.pairing_gate.lease(attempt).ok_or_else(refused)?);
+            lease = state.pairing_gate.lease(attempt);
+            if lease.is_none() {
+                if !held {
+                    return Err(refused());
+                }
+                busy = true;
+            }
         }
         let exchange = matches!(&request, NetworkRequest::Send { .. } | NetworkRequest::Receive { .. });
         let waiting = held || matches!(&request, NetworkRequest::Status { wait: Some(_), .. });
-        let reply = if held {
-            state
-                .pairing_receive_wait(
-                    connection.remote_id(),
-                    &request,
-                    validated.context("missing authenticated status")?,
+        let reply = if busy {
+            let mut reply = validated.ok_or_else(refused)?;
+            reply.error = Some(crate::runtime_peers::PolicyError::of(
+                &FabricError::new(
+                    ErrorCode::PairingWaitBusy,
+                    "pairing receive already waiting",
                 )
-                .await?
+                .into(),
+            ));
+            reply
+        } else if held {
+            tokio::select! {
+                result = state.pairing_receive_wait(connection.remote_id(), &request,
+                    validated.context("missing authenticated status")?) => result?,
+                _ = connection.closed() => return Ok(()),
+            }
         } else if waiting {
             tokio::select! {
                 result = state.pairing_status_wait(connection.remote_id(), &request,
@@ -704,7 +733,7 @@ async fn serve_stream(
         if reply
             .error
             .as_ref()
-            .is_some_and(|error| error.code != "status_wait_revision_ahead")
+            .is_some_and(|error| !matches!(error.code.as_str(), "status_wait_revision_ahead" | "pairing_wait_busy"))
         {
             return Err(refused());
         }
@@ -1355,7 +1384,7 @@ mod tests {
                     deadline: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)?
                         .as_secs()
-                        + 600,
+                        + if mode == "expiry" { 2 } else { 600 },
                     policy: Policy {
                         grants: vec![],
                         name: None,
@@ -1376,6 +1405,7 @@ mod tests {
             )
             .await;
             assert!(presented.error.is_none(), "{:?}", presented.error);
+            let pending = presented.status.unwrap();
             let enqueue = || {
                 state.pairing_request(Request::PairSend {
                     owner: "test".into(),
@@ -1388,7 +1418,54 @@ mod tests {
             if mode == "queued" {
                 assert!(enqueue().await.error.is_none());
             }
-            if mode == "ordinary" {
+            if mode == "disconnect" {
+                let mut read = state.pairing_wait_read.subscribe();
+                let connection = joining
+                    .state()
+                    .current_endpoint()
+                    .connect(owner.addr(), crate::runtime_peers::pairing::PAIR_ALPN)
+                    .await?;
+                let (mut send, _recv) = connection.open_bi().await?;
+                let request = serde_json::to_vec(&NetworkRequest::Receive {
+                    attempt_id: attempt.clone(),
+                    ack: None,
+                    wait: Some(true),
+                })?;
+                send.write_all(&(request.len() as u32).to_be_bytes())
+                    .await?;
+                send.write_all(&request).await?;
+                send.finish()?;
+                loop {
+                    if read.borrow_and_update().as_deref() == Some(attempt.as_str()) {
+                        break;
+                    }
+                    read.changed().await?;
+                }
+                connection.close(0u32.into(), b"test disconnect");
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while state.pairing_gate.attempts.lock().contains(&attempt) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await?;
+                assert!(enqueue().await.error.is_none());
+                let reply = remote(
+                    &joining.state(),
+                    owner.id(),
+                    Some(owner.addr()),
+                    NetworkRequest::Receive {
+                        attempt_id: attempt.clone(),
+                        ack: None,
+                        wait: None,
+                    },
+                )
+                .await;
+                assert!(reply.error.is_none(), "{:?}", reply.error);
+                assert_eq!(
+                    reply.exchange.unwrap().message.unwrap().payload.as_bytes(),
+                    &[42]
+                );
+            } else if mode == "ordinary" {
                 let request = NetworkRequest::Receive {
                     attempt_id: attempt.clone(),
                     ack: None,
@@ -1412,7 +1489,7 @@ mod tests {
                 };
                 let waiter = remote(&joining_state, owner.id(), Some(owner.addr()), request);
                 tokio::pin!(waiter);
-                if mode == "wake" {
+                if !matches!(mode, "queued" | "cap" | "expiry") {
                     tokio::select! {
                         reply = &mut waiter => panic!("receive ended before enqueue: {reply:?}"),
                         result = async {
@@ -1425,14 +1502,106 @@ mod tests {
                             Ok::<_, anyhow::Error>(())
                         } => result?,
                     }
-                    assert!(enqueue().await.error.is_none());
+                    match mode {
+                        "busy" => {
+                            let second = remote(
+                                &joining.state(),
+                                owner.id(),
+                                Some(owner.addr()),
+                                NetworkRequest::Receive {
+                                    attempt_id: attempt.clone(),
+                                    ack: None,
+                                    wait: Some(true),
+                                },
+                            )
+                            .await;
+                            assert_eq!(second.error.unwrap().code, "pairing_wait_busy");
+                        }
+                        "cancel" => {
+                            assert!(
+                                state
+                                    .pairing_request(Request::Cancel {
+                                        owner: "test".into(),
+                                        creation_id: mode.into()
+                                    })
+                                    .await
+                                    .error
+                                    .is_none()
+                            );
+                        }
+                        "reject" => {
+                            assert!(
+                                state
+                                    .pairing_request(Request::Reject {
+                                        rejection: crate::runtime_peers::pairing::RejectRequest {
+                                            owner: "test".into(),
+                                            attempt_id: attempt.clone(),
+                                            expected_node_id: joining.id(),
+                                            expected_attempt_revision: pending.attempt_revision,
+                                            request_id: mode.into()
+                                        }
+                                    })
+                                    .await
+                                    .error
+                                    .is_none()
+                            );
+                        }
+                        "confirm" => {
+                            let revision = state
+                                .runtime_peers
+                                .as_ref()
+                                .unwrap()
+                                .lock()
+                                .unwrap()
+                                .revision();
+                            assert!(
+                                state
+                                    .pairing_request(Request::Confirm {
+                                        confirmation:
+                                            crate::runtime_peers::pairing::ConfirmRequest {
+                                                owner: "test".into(),
+                                                attempt_id: attempt.clone(),
+                                                expected_node_id: joining.id(),
+                                                expected_attempt_revision: pending.attempt_revision,
+                                                expected_policy_revision: revision,
+                                                request_id: mode.into()
+                                            }
+                                    })
+                                    .await
+                                    .error
+                                    .is_none()
+                            );
+                        }
+                        _ => {}
+                    }
+                    if matches!(mode, "wake" | "busy") {
+                        assert!(enqueue().await.error.is_none());
+                    }
                 }
-                let reply = tokio::time::timeout(Duration::from_secs(3), waiter).await?;
+                let started = tokio::time::Instant::now();
+                let reply = tokio::time::timeout(Duration::from_secs(35), waiter).await?;
                 assert!(reply.error.is_none(), "{:?}", reply.error);
-                assert_eq!(
-                    reply.exchange.unwrap().message.unwrap().payload.as_bytes(),
-                    &[42]
-                );
+                if mode == "cap" {
+                    assert!(started.elapsed() >= Duration::from_secs(30));
+                    assert_eq!(reply.status.unwrap(), pending);
+                    assert!(reply.exchange.unwrap().message.is_none());
+                } else if mode == "expiry" {
+                    assert!(started.elapsed() < Duration::from_secs(4));
+                    // At the permit bound the last authenticated pending read is valid.
+                    assert!(
+                        reply
+                            .exchange
+                            .is_none_or(|exchange| exchange.message.is_none())
+                    );
+                } else if matches!(mode, "cancel" | "reject" | "confirm") {
+                    assert_ne!(reply.status.unwrap().state, State::Pending);
+                    assert!(started.elapsed() < Duration::from_secs(3));
+                } else {
+                    assert_eq!(
+                        reply.exchange.unwrap().message.unwrap().payload.as_bytes(),
+                        &[42]
+                    );
+                }
             }
             joining.shutdown().await?;
             owner.shutdown().await?;
@@ -1452,6 +1621,23 @@ mod tests {
     #[tokio::test]
     async fn held_receive_leaves_ordinary_receive_immediate() -> Result<()> {
         held_receive_core("ordinary").await
+    }
+
+    #[tokio::test]
+    async fn held_receive_cap_and_permit_bound() -> Result<()> {
+        held_receive_core("cap").await?;
+        held_receive_core("expiry").await
+    }
+    #[tokio::test]
+    async fn held_receive_terminal_transitions() -> Result<()> {
+        for mode in ["confirm", "reject", "cancel", "disconnect"] {
+            held_receive_core(mode).await?;
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn held_receive_second_hold_is_typed_busy() -> Result<()> {
+        held_receive_core("busy").await
     }
 
     #[tokio::test]

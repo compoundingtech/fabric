@@ -118,6 +118,7 @@ error_codes! {
     RuntimeReceiptCapacity => "runtime_receipt_capacity", Fault;
     PairingExchangeInactive => "pairing_exchange_inactive", Refusal;
     StatusWaitRevisionAhead => "status_wait_revision_ahead", Refusal;
+    PairingWaitBusy => "pairing_wait_busy", Refusal;
     RequestIdConflict => "request_id_conflict", Usage;
     CancellationTimeout => "cancellation_timeout", Fault;
     IdentityMismatch => "identity_mismatch", Usage;
