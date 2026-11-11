@@ -35,6 +35,8 @@ pub enum NetworkRequest {
     Receive {
         attempt_id: String,
         ack: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait: Option<bool>,
     },
 }
 
@@ -523,7 +525,7 @@ impl RuntimePeers {
                 return self.exchange_request(None, Some(node), &attempt_id,
                     exchange::Operation::Send { sequence, digest, payload }, timestamp);
             }
-            NetworkRequest::Receive { attempt_id, ack } => {
+            NetworkRequest::Receive { attempt_id, ack, .. } => {
                 return self.exchange_request(None, Some(node), &attempt_id,
                     exchange::Operation::Receive { ack }, timestamp);
             }
@@ -1662,6 +1664,7 @@ mod tests {
                 NetworkRequest::Receive {
                     attempt_id: status.attempt_id.clone(),
                     ack,
+                    wait: None,
                 },
                 t,
             )
@@ -1983,6 +1986,7 @@ mod tests {
                 NetworkRequest::Receive {
                     attempt_id: attempt_id.clone(),
                     ack: None,
+                    wait: None,
                 },
                 NetworkRequest::Send {
                     attempt_id: attempt_id.clone(),
@@ -2135,6 +2139,7 @@ mod tests {
                     NetworkRequest::Receive {
                         attempt_id: "unknown".into(),
                         ack: None,
+                        wait: None,
                     },
                     t + 600
                 )
@@ -2178,6 +2183,7 @@ mod tests {
                     NetworkRequest::Receive {
                         attempt_id: status.attempt_id,
                         ack: None,
+                        wait: None,
                     },
                 )
             }
@@ -2224,6 +2230,7 @@ mod tests {
                 NetworkRequest::Receive {
                     attempt_id: status.attempt_id,
                     ack: None,
+                    wait: None,
                 },
                 t,
             )
@@ -2418,7 +2425,7 @@ mod tests {
         store.pairing_clock = (t + 600, std::time::Instant::now());
         assert!(store.pairing_has_active_attempts());
         assert!(store.pairing_expiry_due());
-        let receive = NetworkRequest::Receive { attempt_id: status.attempt_id, ack: None };
+        let receive = NetworkRequest::Receive { attempt_id: status.attempt_id, ack: None, wait: None };
         assert!(store.pairing_exchange_network_read(node(1), &receive).unwrap().is_none());
         store.pairing_expire().unwrap();
         assert!(!store.pairing_has_active_attempts());
@@ -2471,10 +2478,10 @@ mod tests {
         };
         assert!(store.pairing_exchange_owner_read(&extra).unwrap().is_none());
         assert_eq!(fs::read(&store.path).unwrap(), disk);
-        let receive = NetworkRequest::Receive { attempt_id: status.attempt_id.clone(), ack: None };
+        let receive = NetworkRequest::Receive { attempt_id: status.attempt_id.clone(), ack: None, wait: None };
         assert_eq!(store.pairing_exchange_network_read(node(1), &receive).unwrap()
             .unwrap().exchange.unwrap().message.unwrap().sequence, 1);
-        let ack = NetworkRequest::Receive { attempt_id: status.attempt_id.clone(), ack: Some(1) };
+        let ack = NetworkRequest::Receive { attempt_id: status.attempt_id.clone(), ack: Some(1), wait: None };
         assert!(store.pairing_network_read(node(1), &ack).unwrap().is_some());
         // Authentication preflight must not acknowledge the first message.
         assert_eq!(store.pairing_exchange_network_read(node(1), &receive).unwrap()
