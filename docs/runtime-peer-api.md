@@ -130,7 +130,7 @@ Omitting `wait` preserves immediate status reads. With
 `wait: {"after_revision": <u64>}`, status returns immediately if the current
 `attempt_revision` is greater than `after_revision` or the attempt is terminal
 (`confirmed`, `expired`, or `rejected`). A pending attempt refuses a revision
-ahead of its current revision with code `status-wait-revision-ahead`; the reply's
+ahead of its current revision with code `status_wait_revision_ahead`; the reply's
 `status.attempt_revision` identifies the current revision. This is not a transition.
 Otherwise it waits for a revision change or terminal transition. One absolute
 deadline, the earlier of the original attempt deadline and 30 seconds, covers

@@ -1753,7 +1753,7 @@ mod tests {
             let reply =
                 tokio::time::timeout(Duration::from_secs(5), wait_status(&state, peer, &request))
                     .await??;
-            assert_eq!(reply.error.unwrap().code, "status-wait-revision-ahead");
+            assert_eq!(reply.error.unwrap().code, "status_wait_revision_ahead");
             assert_eq!(
                 reply.status.unwrap().attempt_revision,
                 confirmation.expected_attempt_revision

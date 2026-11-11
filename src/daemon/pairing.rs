@@ -524,7 +524,7 @@ async fn read_remote_reply(
             && reply
                 .error
                 .as_ref()
-                .is_none_or(|error| error.code == "status-wait-revision-ahead")
+                .is_none_or(|error| error.code == "status_wait_revision_ahead")
             && status.attempt_id == attempt
             && status.bound_node_id == Some(node),
         "unbound pairing reply"
@@ -662,7 +662,7 @@ async fn serve_stream(
         if reply
             .error
             .as_ref()
-            .is_some_and(|error| error.code != "status-wait-revision-ahead")
+            .is_some_and(|error| error.code != "status_wait_revision_ahead")
         {
             return Err(refused());
         }

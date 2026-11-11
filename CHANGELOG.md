@@ -26,7 +26,7 @@ Deprecated, Fixed or Security.
   The same absolute bound covers runtime reads and capacity waits; a stalled
   read returns the last authenticated snapshot. Live reconciliation preserves
   notifications. Ahead-of-current pending revisions receive the typed
-  `status-wait-revision-ahead` refusal with the current revision.
+  `status_wait_revision_ahead` refusal with the current revision.
 
 ### Fixed
 
