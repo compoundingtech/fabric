@@ -1486,7 +1486,7 @@ mod tests {
                 };
                 let waiter = remote(&joining_state, owner.id(), Some(owner.addr()), request);
                 tokio::pin!(waiter);
-                if !matches!(mode, "queued" | "cap" | "expiry") {
+                if !matches!(mode, "queued" | "cap") {
                     tokio::select! {
                         reply = &mut waiter => panic!("receive ended before enqueue: {reply:?}"),
                         result = async {
@@ -1498,6 +1498,15 @@ mod tests {
                             }
                             Ok::<_, anyhow::Error>(())
                         } => result?,
+                    }
+                    if mode == "expiry" {
+                        assert!(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)?
+                                .as_secs()
+                                < pending.deadline,
+                            "expiry must occur after the registered pending read"
+                        );
                     }
                     match mode {
                         "busy" => {
@@ -1576,7 +1585,9 @@ mod tests {
                     }
                 }
                 let started = tokio::time::Instant::now();
-                let reply = tokio::time::timeout(Duration::from_secs(35), waiter).await?;
+                let response_bound = if mode == "queued" { 3 } else { 35 };
+                let reply =
+                    tokio::time::timeout(Duration::from_secs(response_bound), waiter).await?;
                 assert!(reply.error.is_none(), "{:?}", reply.error);
                 if mode == "cap" {
                     assert!(started.elapsed() >= Duration::from_secs(30));
