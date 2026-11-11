@@ -207,8 +207,9 @@ Restricted `receive` additionally accepts `"wait": true`, also forwarded by
 `pairing_remote`. It registers before checking the queue and holds an empty
 receive until an enqueue notification or a 30-second server cap. Already queued
 messages return immediately. No policy mutex is held while waiting. At the cap,
-the last completed empty exchange reply is returned; if no queue read completed,
-the operation fails with a typed timeout. Ordinary owner receives are unchanged.
+the last completed empty exchange reply is returned. If no queue read completed,
+the stream fails; the bridge may report unreachable, not a typed wire timeout.
+Ordinary owner receives are unchanged.
 
 Replies add `exchange` with `sent_sequence`, `message`, `total_bytes`, and
 `total_messages`. A message carries `direction` (`node_to_owner` or
