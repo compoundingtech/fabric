@@ -504,6 +504,8 @@ pub struct DaemonState {
     /// Network read permits live inside blocking workers, not socket futures.
     /// A timed-out read waiting for the runtime mutex still consumes its permit.
     pairing_read_slots: Arc<Semaphore>,
+    #[cfg(test)]
+    pairing_wait_read: tokio::sync::watch::Sender<Option<String>>,
     dial_slots: Arc<Semaphore>,
     mux_stream_slots: Arc<Semaphore>,
     peer_connections: Arc<mux::PeerConnections>,
@@ -1355,6 +1357,8 @@ impl DaemonState {
             handshake_slots: Arc::new(Semaphore::new(MAX_INCOMING_HANDLERS)),
             pairing_slots: Arc::new(Semaphore::new(pairing::MAX_CONNECTIONS)),
             pairing_read_slots: Arc::new(Semaphore::new(pairing::MAX_CONNECTIONS)),
+            #[cfg(test)]
+            pairing_wait_read: tokio::sync::watch::channel(None).0,
             dial_slots: Arc::new(Semaphore::new(MAX_DIAL_HANDLERS)),
             mux_stream_slots: Arc::new(Semaphore::new(MAX_INCOMING_HANDLERS)),
             peer_connections,

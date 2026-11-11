@@ -16,6 +16,18 @@ Deprecated, Fixed or Security.
 
 ## [Unreleased]
 
+### Added
+
+- **Provisional:** restricted pairing `status` accepts optional
+  `wait: {after_revision: <u64>}` for notification-driven waits bounded by the
+  attempt deadline or 30 seconds. Advanced revisions and terminal states return
+  immediately; consumers reissue after an unchanged response. Joining-daemon
+  `pairing_remote` forwards waits with a 45-second total response deadline.
+  The same absolute bound covers runtime reads and capacity waits; a stalled
+  read returns the last authenticated snapshot. Live reconciliation preserves
+  notifications. Ahead-of-current pending revisions receive the typed
+  `status_wait_revision_ahead` refusal with the current revision.
+
 ### Fixed
 
 - **Provisional:** restricted pairing terminal replies use an independent

@@ -243,9 +243,22 @@ fn decode_request(bytes: &[u8]) -> Result<NetworkRequest> {
         digest: Option<String>,
         payload: Option<Payload>,
         ack: Option<u64>,
+        wait: Option<crate::runtime_peers::pairing::StatusWait>,
     }
     let frame: Frame = serde_json::from_slice(bytes).map_err(|_| refused())?;
-    let Frame { operation, attempt_id, secret, sequence, digest, payload, ack } = frame;
+    let Frame {
+        operation,
+        attempt_id,
+        secret,
+        sequence,
+        digest,
+        payload,
+        ack,
+        wait,
+    } = frame;
+    if wait.is_some() && !matches!(operation, Operation::Status) {
+        return Err(refused());
+    }
     match operation {
         Operation::Present
             if sequence.is_none() && digest.is_none() && payload.is_none() && ack.is_none() =>
@@ -256,7 +269,7 @@ fn decode_request(bytes: &[u8]) -> Result<NetworkRequest> {
             if secret.is_none() && sequence.is_none() && digest.is_none()
                 && payload.is_none() && ack.is_none() =>
         {
-            Ok(NetworkRequest::Status { attempt_id })
+            Ok(NetworkRequest::Status { attempt_id, wait })
         }
         Operation::Send if secret.is_none() && ack.is_none() => Ok(NetworkRequest::Send {
             attempt_id,
@@ -390,7 +403,7 @@ pub(super) async fn remote(
             })?;
         let attempt = match &request {
             NetworkRequest::Present { attempt_id, .. }
-            | NetworkRequest::Status { attempt_id }
+            | NetworkRequest::Status { attempt_id, .. }
             | NetworkRequest::Send { attempt_id, .. }
             | NetworkRequest::Receive { attempt_id, .. } => attempt_id,
         };
@@ -403,7 +416,9 @@ pub(super) async fn remote(
             .into());
         }
         let endpoint = state.current_endpoint();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let waiting = matches!(&request, NetworkRequest::Status { wait: Some(_), .. });
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(if waiting { 45 } else { 30 });
         let connection = tokio::time::timeout_at(
             deadline,
             endpoint.connect(
@@ -425,6 +440,7 @@ pub(super) async fn remote(
                 // Reconnect authenticates a small frame before a large exchange.
                 let prime = serde_json::to_vec(&NetworkRequest::Status {
                     attempt_id: attempt.clone(),
+                    wait: None,
                 })?;
                 send.write_all(&(prime.len() as u32).to_be_bytes()).await?;
                 send.write_all(&prime).await?;
@@ -501,15 +517,27 @@ async fn read_remote_reply(
     );
     let mut bytes = vec![0; length];
     recv.read_exact(&mut bytes).await?;
-    let reply: Reply = serde_json::from_slice(&bytes)?;
+    let mut reply: Reply = serde_json::from_slice(&bytes)?;
     let status = reply.status.as_ref().context("missing pairing status")?;
     anyhow::ensure!(
         reply.secret.is_none()
-            && reply.error.is_none()
+            && reply
+                .error
+                .as_ref()
+                .is_none_or(|error| error.code == "status_wait_revision_ahead")
             && status.attempt_id == attempt
             && status.bound_node_id == Some(node),
         "unbound pairing reply"
     );
+    if reply.error.is_some() {
+        reply.error = Some(crate::runtime_peers::PolicyError::of(
+            &FabricError::new(
+                ErrorCode::StatusWaitRevisionAhead,
+                "status wait revision is ahead of the current attempt_revision",
+            )
+            .into(),
+        ));
+    }
     Ok(reply.restricted())
 }
 
@@ -599,7 +627,7 @@ async fn serve_stream(
         }
         let attempt = match &request {
             NetworkRequest::Present { attempt_id, .. }
-            | NetworkRequest::Status { attempt_id }
+            | NetworkRequest::Status { attempt_id, .. }
             | NetworkRequest::Send { attempt_id, .. }
             | NetworkRequest::Receive { attempt_id, .. } => attempt_id,
         };
@@ -611,7 +639,14 @@ async fn serve_stream(
             lease = Some(state.pairing_gate.lease(attempt).ok_or_else(refused)?);
         }
         let exchange = matches!(&request, NetworkRequest::Send { .. } | NetworkRequest::Receive { .. });
-        let reply = if !exchange && validated.is_some() {
+        let waiting = matches!(&request, NetworkRequest::Status { wait: Some(_), .. });
+        let reply = if waiting {
+            tokio::select! {
+                result = state.pairing_status_wait(connection.remote_id(), &request,
+                    validated.context("missing authenticated status")?) => result?,
+                _ = connection.closed() => return Ok(()),
+            }
+        } else if !exchange && validated.is_some() {
             validated.expect("checked read-only reply")
         } else {
             // A timeout or disconnect must not cancel durable publication and
@@ -624,22 +659,28 @@ async fn serve_stream(
             tokio::time::timeout(FIRST_HEADER, commit).await??
         };
         // The restricted path never reports fault internals or any unbound attempt.
-        if reply.error.is_some() {
+        if reply
+            .error
+            .as_ref()
+            .is_some_and(|error| error.code != "status_wait_revision_ahead")
+        {
             return Err(refused());
         }
         let status = reply.status.as_ref().ok_or_else(refused)?;
         if status.bound_node_id == Some(connection.remote_id()) {
             state.pairing_gate.remember_bound(connection.remote_id(), Instant::now());
         }
-        let terminal = !matches!(status.state, State::Pending);
         let wall = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
+        let terminal = reply.error.is_some()
+            || !matches!(status.state, State::Pending)
+            || waiting && wall >= status.deadline;
         deadline = tokio::time::Instant::now()
             + Duration::from_secs(status.deadline.saturating_sub(wall).min(600));
         let bytes = serde_json::to_vec(&reply.restricted())?;
-        // Retained terminal receipts outlive the permit's original deadline.
-        let write_deadline = if terminal {
+        // A last-known pending snapshot must also survive the wait's deadline.
+        let write_deadline = if terminal || waiting {
             tokio::time::Instant::now() + IDLE
         } else {
             deadline.min(tokio::time::Instant::now() + IDLE)
@@ -794,9 +835,14 @@ mod tests {
         // Start a full refill interval at the barrier, independent of how long
         // endpoint startup took on the runner.
         state.pairing_gate.rates.lock().global.last = now;
-        let response = rpc(&mut send, &mut recv, NetworkRequest::Status {
-            attempt_id: "unknown".into(),
-        });
+        let response = rpc(
+            &mut send,
+            &mut recv,
+            NetworkRequest::Status {
+                attempt_id: "unknown".into(),
+                wait: None,
+            },
+        );
         let refused = tokio::time::timeout(Duration::from_millis(500), response).await;
         release.send(())?;
         blocker.await?;
@@ -893,9 +939,7 @@ mod tests {
         let client = client().await?;
         let connection = client.connect(gateway.addr(), PAIR_ALPN).await?;
         let (mut send, _recv) = connection.open_bi().await?;
-        let request = serde_json::to_vec(&NetworkRequest::Status {
-            attempt_id: "unknown".into(),
-        })?;
+        let request = serde_json::to_vec(&NetworkRequest::Status { attempt_id: "unknown".into(), wait: None })?;
         send.write_all(&(request.len() as u32).to_be_bytes()).await?;
         send.write_all(&request).await?;
         let closed = tokio::time::timeout(Duration::from_secs(4), connection.closed()).await;
@@ -933,7 +977,10 @@ mod tests {
         // the dedicated read semaphore: after each caller future is dropped,
         // its extra owners are the permits retained inside blocking workers.
         let owners_before = Arc::strong_count(&state.pairing_read_slots);
-        let request = NetworkRequest::Status { attempt_id: "unknown".into() };
+        let request = NetworkRequest::Status {
+            attempt_id: "unknown".into(),
+            wait: None,
+        };
         let mut observations = Vec::new();
         // The first pool's worth start real blocking workers. Later requests
         // time out waiting asynchronously for worker capacity, without spawning.
@@ -1100,6 +1147,7 @@ mod tests {
             &mut recv,
             NetworkRequest::Status {
                 attempt_id: attempt_id.clone(),
+                wait: None,
             },
         )
         .await?;
@@ -1128,7 +1176,10 @@ mod tests {
             rpc(
                 &mut other_send,
                 &mut other_recv,
-                NetworkRequest::Status { attempt_id }
+                NetworkRequest::Status {
+                    attempt_id,
+                    wait: None
+                }
             )
             .await
             .is_err()
@@ -1219,6 +1270,7 @@ mod tests {
             &mut recv,
             NetworkRequest::Status {
                 attempt_id: attempt_id.clone(),
+                wait: None,
             },
         )
         .await?;
@@ -1242,6 +1294,104 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn status_wait_bridge_caps_expires_and_reads_restart_recovery() -> Result<()> {
+        use crate::runtime_peers::pairing::{Policy, Request, StatusWait};
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let owner_dir = tempfile::tempdir()?;
+            let owner_home = FabricHome::new(owner_dir.path());
+            let mut owner = gateway(owner_home.clone()).await?;
+            let joining_dir = tempfile::tempdir()?;
+            let joining = gateway(FabricHome::new(joining_dir.path())).await?;
+            for mode in ["cap", "expiry", "restart"] {
+                let deadline = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs()
+                    + if mode == "expiry" { 2 } else { 600 };
+                let issued = owner
+                    .state()
+                    .pairing_request(Request::Issue {
+                        owner: "test".into(),
+                        creation_id: mode.into(),
+                        deadline,
+                        policy: Policy {
+                            grants: vec![],
+                            name: None,
+                            direction: crate::runtime_peers::Direction::Normal,
+                        },
+                    })
+                    .await;
+                assert!(issued.error.is_none(), "{:?}", issued.error);
+                let attempt_id = issued.status.unwrap().attempt_id;
+                let pending = remote(
+                    &joining.state(),
+                    owner.id(),
+                    Some(owner.addr()),
+                    NetworkRequest::Present {
+                        attempt_id: attempt_id.clone(),
+                        secret: issued.secret.unwrap(),
+                    },
+                )
+                .await;
+                assert!(pending.error.is_none(), "{:?}", pending.error);
+                let pending = pending.status.unwrap();
+                if mode == "restart" {
+                    owner.shutdown().await?;
+                    owner = gateway(owner_home.clone()).await?;
+                }
+                let started = tokio::time::Instant::now();
+                let reply = remote(
+                    &joining.state(),
+                    owner.id(),
+                    Some(owner.addr()),
+                    NetworkRequest::Status {
+                        attempt_id: attempt_id.clone(),
+                        wait: Some(StatusWait {
+                            after_revision: pending.attempt_revision,
+                        }),
+                    },
+                )
+                .await;
+                assert!(reply.error.is_none(), "{mode}: {:?}", reply.error);
+                let mut status = reply.status.unwrap();
+                if mode == "expiry" && status.state == State::Pending {
+                    // A bounded read may return its last authenticated snapshot.
+                    status = remote(
+                        &joining.state(),
+                        owner.id(),
+                        Some(owner.addr()),
+                        NetworkRequest::Status {
+                            attempt_id,
+                            wait: None,
+                        },
+                    )
+                    .await
+                    .status
+                    .unwrap();
+                }
+                match mode {
+                    "cap" => {
+                        assert_eq!(status, pending);
+                        assert!(started.elapsed() >= Duration::from_secs(30));
+                        assert!(started.elapsed() < Duration::from_secs(40));
+                    }
+                    "expiry" => {
+                        assert_eq!(status.state, State::Expired);
+                        assert!(status.attempt_revision > pending.attempt_revision);
+                    }
+                    _ => {
+                        assert_eq!(status.state, State::Rejected);
+                        assert_eq!(status.terminal_reason.as_deref(), Some("exchange_lost"));
+                        assert!(started.elapsed() < Duration::from_secs(3));
+                    }
+                }
+            }
+            joining.shutdown().await?;
+            owner.shutdown().await?;
+            Ok(())
+        })
+        .await?
+    }
     #[tokio::test]
     async fn disabled_pairing_and_oversized_frames_create_no_pending_record() -> Result<()> {
         use crate::runtime_peers::pairing::PAIR_ALPN;
@@ -1271,7 +1421,14 @@ mod tests {
                 attempt_id: "attempt".into(),
                 secret: Secret::new("secret"),
             },
-            NetworkRequest::Status { attempt_id: "attempt".into() },
+            NetworkRequest::Status {
+                attempt_id: "attempt".into(),
+                wait: None,
+            },
+            NetworkRequest::Status {
+                attempt_id: "attempt".into(),
+                wait: Some(crate::runtime_peers::pairing::StatusWait { after_revision: 1 }),
+            },
             NetworkRequest::Send {
                 attempt_id: "attempt".into(),
                 sequence: 1,
@@ -1288,6 +1445,9 @@ mod tests {
             br#"{"operation":"status","attempt_id":"a","payload":[1]}"#,
             br#"{"operation":"status","attempt_id":"a","unknown":1}"#,
             br#"{"operation":"status","attempt_id":"a","attempt_id":"b"}"#,
+            br#"{"operation":"receive","attempt_id":"a","wait":{"after_revision":1}}"#,
+            br#"{"operation":"status","attempt_id":"a","wait":{"after_revision":-1}}"#,
+            br#"{"operation":"status","attempt_id":"a","wait":{"after_revision":1,"unknown":1}}"#,
         ] {
             assert!(decode_request(bytes).is_err());
         }
@@ -1660,7 +1820,15 @@ mod tests {
         assert_eq!(&bytes, b"proof");
         let unrelated = client.connect(gateway.addr(), b"not-granted").await?;
         tokio::time::timeout(Duration::from_secs(3), unrelated.closed()).await?;
-        let own_status = rpc(&mut send, &mut recv, NetworkRequest::Status { attempt_id }).await?;
+        let own_status = rpc(
+            &mut send,
+            &mut recv,
+            NetworkRequest::Status {
+                attempt_id,
+                wait: None,
+            },
+        )
+        .await?;
         assert!(own_status.access.is_empty());
         let own_status = own_status.status.unwrap();
         assert_eq!(own_status.state, State::Confirmed);
@@ -1916,6 +2084,7 @@ mod tests {
         control_ready(&joining_home).await?;
         let request = NetworkRequest::Status {
             attempt_id: "unknown".into(),
+            wait: None,
         };
         let reply = remote_request(&joining_home, &owner, request).await?;
         assert_eq!(reply.error.unwrap().code, "runtime_peers_disabled");
@@ -1944,6 +2113,7 @@ mod tests {
                 addr: Some(spoofed),
                 request: NetworkRequest::Status {
                     attempt_id: "unknown".into(),
+                    wait: None,
                 },
             },
         )
@@ -1986,7 +2156,7 @@ mod tests {
                 anyhow::ensure!(length <= MAX_REQUEST, "oversized request");
                 let mut bytes = vec![0; length];
                 recv.read_exact(&mut bytes).await?;
-                let NetworkRequest::Status { attempt_id } = serde_json::from_slice(&bytes)? else {
+                let NetworkRequest::Status { attempt_id, .. } = serde_json::from_slice(&bytes)? else {
                     bail!("expected status request");
                 };
                 let reply = Reply {
@@ -2040,9 +2210,7 @@ mod tests {
             ControlRequest::PairingRemote {
                 gateway: malicious.id(),
                 addr: Some(malicious.addr()),
-                request: NetworkRequest::Status {
-                    attempt_id: "bound-attempt".into(),
-                },
+                request: NetworkRequest::Status { attempt_id: "bound-attempt".into(), wait: None },
             },
         )
         .await?

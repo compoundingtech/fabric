@@ -82,9 +82,12 @@ Only a reply bound to the requested attempt and this daemon's NodeID is returned
 
 Each call makes one restricted connection using the daemon's current endpoint,
 with at most 32 outbound operations and one 30-second deadline covering connect,
-request, and completion. On exchange reconnect, a small status frame first
-authenticates the bound attempt on the same stream before the larger send/receive
-frame. Pre-auth present/status frames remain capped at 4 KiB; replies are bounded
+request, and completion for nonwaiting calls. A `status` request's optional `wait`
+is forwarded unchanged; waiting calls have a 45-second total deadline to leave
+time for the gateway's bounded wait and response. On exchange reconnect, a small
+status frame first authenticates the bound attempt on the same stream before the
+larger send/receive frame. Pre-auth present/status frames remain capped at 4 KiB;
+replies are bounded
 to 1 MiB before allocation. The stream is half-closed after the final request;
 the gateway releases its attempt lease before closing, so a subsequent call can
 reconnect safely. Serialize calls for the same
@@ -110,6 +113,7 @@ maximum encoded exchange request length 266,240 bytes after authentication):
 ```json
 {"operation":"present","attempt_id":"<attempt>","secret":"<creation secret>"}
 {"operation":"status","attempt_id":"<attempt>"}
+{"operation":"status","attempt_id":"<attempt>","wait":{"after_revision":2}}
 ```
 
 Replies are length-prefixed pairing reply objects, without the local-control
@@ -121,6 +125,28 @@ extending its deadline; another NodeID cannot take its binding. Status requests
 are accepted only for the authenticated bound node, including retained terminal
 status. Unknown, wrong-node, wrong-token and malformed requests close with a
 generic reason and expose no attempt status.
+
+Omitting `wait` preserves immediate status reads. With
+`wait: {"after_revision": <u64>}`, status returns immediately if the current
+`attempt_revision` is greater than `after_revision` or the attempt is terminal
+(`confirmed`, `expired`, or `rejected`). A pending attempt refuses a revision
+ahead of its current revision with code `status_wait_revision_ahead`; the reply's
+`status.attempt_revision` identifies the current revision. This is not a transition.
+Otherwise it waits for a revision change or terminal transition. One absolute
+deadline, the earlier of the original attempt deadline and 30 seconds, covers
+subscription, read-capacity acquisition, every state read, and notification waits.
+At the bound it returns the last authenticated status snapshot normally, with
+an unchanged revision if no transition was observed, even if a concurrent disk
+operation prevents a fresh read. That snapshot may still be pending at expiry;
+reissue with the returned revision to read projected expiry or keep waiting.
+This notification re-arm is not polling. Bind, confirm, reject, cancel, expiry,
+and recovery (`exchange_lost`) are observable; live reconciliation preserves
+subscriptions. Opaque exchange activity does not wake status. A pending wait is
+not an idle framing read. Its completed response has a separate ten-second write
+budget, including a last-known pending snapshot returned at permit expiry;
+the stream then finishes at expiry. Waiting does not extend the permit deadline
+or grant access; the same bound-node checks and connection limits, including
+the 600-second connection lifetime, still apply.
 
 There are at most 32 accepted pairing connections and one active connection per
 attempt. Unknown identities need global credit before parsing or runtime work:
