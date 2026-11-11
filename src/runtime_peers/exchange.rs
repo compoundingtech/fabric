@@ -277,7 +277,7 @@ impl RuntimePeers {
         let (attempt_id, operation) = match request {
             pairing::NetworkRequest::Send { attempt_id, sequence, digest, payload } =>
                 (attempt_id, Operation::Send { sequence: *sequence, digest: digest.clone(), payload: payload.clone() }),
-            pairing::NetworkRequest::Receive { attempt_id, ack } =>
+            pairing::NetworkRequest::Receive { attempt_id, ack, .. } =>
                 (attempt_id, Operation::Receive { ack: *ack }),
             _ => return Err(invalid("not an exchange operation")),
         };
@@ -420,6 +420,13 @@ impl RuntimePeers {
             .entry(attempt_id.into())
             .or_insert_with(|| Exchange::new(attempt.owner.clone(), status.clone()));
         let result = exchange.apply(owner.is_some(), operation);
+        if owner.is_some()
+            && result
+                .as_ref()
+                .is_ok_and(|reply| reply.sent_sequence.is_some())
+        {
+            self.pairing_changes.send_replace(());
+        }
         match result {
             Ok(exchange) => Ok(pairing::Reply {
                 access: self.access_for(status.bound_node_id.as_slice()),
@@ -570,6 +577,7 @@ mod tests {
                     pairing::NetworkRequest::Receive {
                         attempt_id: status.attempt_id,
                         ack: None,
+                        wait: None,
                     },
                 )
                 .unwrap();

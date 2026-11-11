@@ -18,6 +18,11 @@ Deprecated, Fixed or Security.
 
 ### Added
 
+- **Provisional:** restricted `receive` and its `pairing_remote` bridge accept
+  `wait: true` to hold an empty exchange read reactively for up to 30 seconds.
+  Enqueue-before-read and enqueue-after-registration both return the message;
+  ordinary receives remain nonblocking.
+
 - **Provisional:** restricted pairing `status` accepts optional
   `wait: {after_revision: <u64>}` for notification-driven waits bounded by the
   attempt deadline or 30 seconds. Advanced revisions and terminal states return

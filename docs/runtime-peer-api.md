@@ -202,8 +202,13 @@ operations are `send` and `receive`. Each selects `attempt_id`. Local operations
 also select `owner`. Send takes `sequence` (starting at 1 in each direction),
 `digest` (BLAKE3 lowercase hex of the payload), and `payload` (a JSON byte array).
 Receive takes optional `ack`: the sequence of a previously delivered message.
-Receives are nonblocking; no message returns `message: null` rather than holding
-the policy writer open.
+Without `wait`, receives are nonblocking: no message returns `message: null`.
+Restricted `receive` additionally accepts `"wait": true`, also forwarded by
+`pairing_remote`. It registers before checking the queue and holds an empty
+receive until an enqueue notification or a 30-second server cap. Already queued
+messages return immediately. No policy mutex is held while waiting. At the cap,
+the last completed empty exchange reply is returned; if no queue read completed,
+the operation fails with a typed timeout. Ordinary owner receives are unchanged.
 
 Replies add `exchange` with `sent_sequence`, `message`, `total_bytes`, and
 `total_messages`. A message carries `direction` (`node_to_owner` or

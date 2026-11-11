@@ -568,6 +568,93 @@ impl DaemonState {
         }
     }
 
+    pub(super) async fn pairing_receive_wait(
+        self: &Arc<Self>,
+        node: EndpointId,
+        request: &runtime_peers::pairing::NetworkRequest,
+        initial: runtime_peers::pairing::Reply,
+    ) -> Result<runtime_peers::pairing::Reply> {
+        use runtime_peers::pairing::{NetworkRequest, State};
+        anyhow::ensure!(
+            matches!(
+                request,
+                NetworkRequest::Receive {
+                    wait: Some(true),
+                    ..
+                }
+            ),
+            "held receive requires wait:true"
+        );
+        if initial
+            .status
+            .as_ref()
+            .is_none_or(|status| status.state != State::Pending)
+        {
+            return Ok(initial);
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut last = None;
+        let operation = async {
+            let permit = self.pairing_read_slots.clone().acquire_owned().await?;
+            // Subscribe before consuming the queue: an enqueue cannot fall
+            // between an empty read and registration.
+            let mut changes = self
+                .read_pairing_result(move |runtime| {
+                    let _permit = permit;
+                    Ok(runtime.pairing_changes.subscribe())
+                })
+                .await?;
+            let mut closed = false;
+            loop {
+                changes.borrow_and_update();
+                let permit = self.pairing_read_slots.clone().acquire_owned().await?;
+                let state = self.clone();
+                let request = request.clone();
+                // Disconnect/deadline must not cancel durable acknowledgement.
+                // The worker retains its capacity until publication completes.
+                let reply = tokio::spawn(async move {
+                    let _permit = permit;
+                    state.pairing_network_request(node, request).await
+                })
+                .await?;
+                if reply.error.is_some()
+                    || reply
+                        .status
+                        .as_ref()
+                        .is_none_or(|status| status.state != State::Pending)
+                    || reply
+                        .exchange
+                        .as_ref()
+                        .is_some_and(|exchange| exchange.message.is_some())
+                {
+                    return Ok(reply);
+                }
+                #[cfg(test)]
+                self.pairing_wait_read.send_replace(
+                    reply
+                        .status
+                        .as_ref()
+                        .map(|status| status.attempt_id.clone()),
+                );
+                last = Some(reply);
+                if closed {
+                    return Ok(last.take().expect("completed receive"));
+                }
+                closed = changes.changed().await.is_err();
+            }
+        };
+        match tokio::time::timeout_at(deadline, operation).await {
+            Ok(result) => result,
+            Err(_) => last.ok_or_else(|| {
+                FabricError::new(
+                    ErrorCode::Timeout,
+                    "pairing receive did not complete before its bound",
+                )
+                .into()
+            }),
+        }
+    }
+
     async fn confirm_pairing(
         &self,
         confirmation: runtime_peers::pairing::ConfirmRequest,
