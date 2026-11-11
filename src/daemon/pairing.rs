@@ -1367,10 +1367,7 @@ mod tests {
 
     // Shared real gateway/bridge fixture for held-receive behavior and edges.
     async fn held_receive_core(mode: &str) -> Result<()> {
-        use crate::runtime_peers::{
-            exchange::Payload,
-            pairing::{Policy, Request},
-        };
+        use crate::runtime_peers::pairing::{Payload, Policy, Request};
         tokio::time::timeout(Duration::from_secs(60), async {
             let owner_dir = tempfile::tempdir()?;
             let owner = gateway(FabricHome::new(owner_dir.path())).await?;
