@@ -211,8 +211,9 @@ Disconnect cancels the hold and releases its attempt lease; an already-started
 durable acknowledgement still completes. One operation per attempt remains
 active: a second held receive gets `pairing_wait_busy`, with authenticated
 status and no queue consumption. No policy mutex is held while waiting. At the cap,
-the last completed empty exchange reply is returned; if no queue read completed,
-the operation fails with a typed timeout. Ordinary owner receives are unchanged.
+the last completed empty exchange reply is returned. If no queue read completed,
+the stream fails; the bridge may report unreachable, not a typed wire timeout.
+Ordinary owner receives are unchanged.
 
 Replies add `exchange` with `sent_sequence`, `message`, `total_bytes`, and
 `total_messages`. A message carries `direction` (`node_to_owner` or
