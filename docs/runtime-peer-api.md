@@ -205,8 +205,12 @@ Receive takes optional `ack`: the sequence of a previously delivered message.
 Without `wait`, receives are nonblocking: no message returns `message: null`.
 Restricted `receive` additionally accepts `"wait": true`, also forwarded by
 `pairing_remote`. It registers before checking the queue and holds an empty
-receive until an enqueue notification or a 30-second server cap. Already queued
-messages return immediately. No policy mutex is held while waiting. At the cap,
+receive until enqueue, a terminal transition, or the earlier of the permit
+deadline and a 30-second server cap. Already queued messages return immediately.
+Disconnect cancels the hold and releases its attempt lease; an already-started
+durable acknowledgement still completes. One operation per attempt remains
+active: a second held receive gets `pairing_wait_busy`, with authenticated
+status and no queue consumption. No policy mutex is held while waiting. At the cap,
 the last completed empty exchange reply is returned. If no queue read completed,
 the stream fails; the bridge may report unreachable, not a typed wire timeout.
 Ordinary owner receives are unchanged.

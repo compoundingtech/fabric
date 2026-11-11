@@ -43,6 +43,7 @@ Each code has a class, and the class says what a caller should do:
 | `runtime_receipt_capacity` | fault | 69 | The applicable retained receipt capacity is full: 960 ordinary slots, 64 more for withdrawal-only mutations. No-ops use no slot. Wait for retention expiry or reconcile through an existing receipt. |
 | `pairing_exchange_inactive` | refusal | 77 | The attempt is not pending and cannot exchange messages. No delivery occurred; reconcile its status rather than assuming an empty success. |
 | `status_wait_revision_ahead` | refusal | 77 | A pending pairing status wait specifies a revision ahead of the current attempt. Reconcile using the returned `status.attempt_revision`; no transition occurred. |
+| `pairing_wait_busy` | refusal | 77 | Another connection holds this attempt's restricted pairing operation. Retry only after that operation completes or disconnects; no message was consumed. |
 | `request_id_conflict` | usage | 2 | A retained request ID was reused with different contents. |
 | `cancellation_timeout` | fault | 69 | Policy committed, but selected work did not finish within two seconds. The receipt lists remaining admissions and sessions; policy is not rolled back. |
 | `identity_mismatch` | usage | 2 | Active or prepared identity does not match the activation guards; nothing changed. |

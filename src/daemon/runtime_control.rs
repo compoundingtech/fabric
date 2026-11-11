@@ -592,7 +592,16 @@ impl DaemonState {
         {
             return Ok(initial);
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+        let remaining = Duration::from_secs(
+            initial
+                .status
+                .as_ref()
+                .expect("authenticated pending status")
+                .deadline,
+        )
+        .saturating_sub(wall);
+        let deadline = tokio::time::Instant::now() + remaining.min(Duration::from_secs(30));
         let mut last = None;
         let operation = async {
             let permit = self.pairing_read_slots.clone().acquire_owned().await?;
