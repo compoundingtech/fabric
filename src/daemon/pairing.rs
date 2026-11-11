@@ -639,7 +639,8 @@ async fn serve_stream(
             lease = Some(state.pairing_gate.lease(attempt).ok_or_else(refused)?);
         }
         let exchange = matches!(&request, NetworkRequest::Send { .. } | NetworkRequest::Receive { .. });
-        let reply = if matches!(&request, NetworkRequest::Status { wait: Some(_), .. }) {
+        let waiting = matches!(&request, NetworkRequest::Status { wait: Some(_), .. });
+        let reply = if waiting {
             tokio::select! {
                 result = state.pairing_status_wait(connection.remote_id(), &request,
                     validated.context("missing authenticated status")?) => result?,
@@ -669,15 +670,17 @@ async fn serve_stream(
         if status.bound_node_id == Some(connection.remote_id()) {
             state.pairing_gate.remember_bound(connection.remote_id(), Instant::now());
         }
-        let terminal = reply.error.is_some() || !matches!(status.state, State::Pending);
         let wall = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
+        let terminal = reply.error.is_some()
+            || !matches!(status.state, State::Pending)
+            || waiting && wall >= status.deadline;
         deadline = tokio::time::Instant::now()
             + Duration::from_secs(status.deadline.saturating_sub(wall).min(600));
         let bytes = serde_json::to_vec(&reply.restricted())?;
-        // Retained terminal receipts outlive the permit's original deadline.
-        let write_deadline = if terminal {
+        // A last-known pending snapshot must also survive the wait's deadline.
+        let write_deadline = if terminal || waiting {
             tokio::time::Instant::now() + IDLE
         } else {
             deadline.min(tokio::time::Instant::now() + IDLE)
@@ -1294,97 +1297,100 @@ mod tests {
     #[tokio::test]
     async fn status_wait_bridge_caps_expires_and_reads_restart_recovery() -> Result<()> {
         use crate::runtime_peers::pairing::{Policy, Request, StatusWait};
-        let owner_dir = tempfile::tempdir()?;
-        let owner_home = FabricHome::new(owner_dir.path());
-        let mut owner = gateway(owner_home.clone()).await?;
-        let joining_dir = tempfile::tempdir()?;
-        let joining = gateway(FabricHome::new(joining_dir.path())).await?;
-        for mode in ["cap", "expiry", "restart"] {
-            let deadline = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs()
-                + if mode == "expiry" { 2 } else { 600 };
-            let issued = owner
-                .state()
-                .pairing_request(Request::Issue {
-                    owner: "test".into(),
-                    creation_id: mode.into(),
-                    deadline,
-                    policy: Policy {
-                        grants: vec![],
-                        name: None,
-                        direction: crate::runtime_peers::Direction::Normal,
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let owner_dir = tempfile::tempdir()?;
+            let owner_home = FabricHome::new(owner_dir.path());
+            let mut owner = gateway(owner_home.clone()).await?;
+            let joining_dir = tempfile::tempdir()?;
+            let joining = gateway(FabricHome::new(joining_dir.path())).await?;
+            for mode in ["cap", "expiry", "restart"] {
+                let deadline = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs()
+                    + if mode == "expiry" { 2 } else { 600 };
+                let issued = owner
+                    .state()
+                    .pairing_request(Request::Issue {
+                        owner: "test".into(),
+                        creation_id: mode.into(),
+                        deadline,
+                        policy: Policy {
+                            grants: vec![],
+                            name: None,
+                            direction: crate::runtime_peers::Direction::Normal,
+                        },
+                    })
+                    .await;
+                assert!(issued.error.is_none(), "{:?}", issued.error);
+                let attempt_id = issued.status.unwrap().attempt_id;
+                let pending = remote(
+                    &joining.state(),
+                    owner.id(),
+                    Some(owner.addr()),
+                    NetworkRequest::Present {
+                        attempt_id: attempt_id.clone(),
+                        secret: issued.secret.unwrap(),
                     },
-                })
+                )
                 .await;
-            assert!(issued.error.is_none(), "{:?}", issued.error);
-            let attempt_id = issued.status.unwrap().attempt_id;
-            let pending = remote(
-                &joining.state(),
-                owner.id(),
-                Some(owner.addr()),
-                NetworkRequest::Present {
-                    attempt_id: attempt_id.clone(),
-                    secret: issued.secret.unwrap(),
-                },
-            )
-            .await;
-            assert!(pending.error.is_none(), "{:?}", pending.error);
-            let pending = pending.status.unwrap();
-            if mode == "restart" {
-                owner.shutdown().await?;
-                owner = gateway(owner_home.clone()).await?;
-            }
-            let started = tokio::time::Instant::now();
-            let reply = remote(
-                &joining.state(),
-                owner.id(),
-                Some(owner.addr()),
-                NetworkRequest::Status {
-                    attempt_id: attempt_id.clone(),
-                    wait: Some(StatusWait {
-                        after_revision: pending.attempt_revision,
-                    }),
-                },
-            )
-            .await;
-            assert!(reply.error.is_none(), "{mode}: {:?}", reply.error);
-            let mut status = reply.status.unwrap();
-            if mode == "expiry" && status.state == State::Pending {
-                // A bounded read may return its last authenticated snapshot.
-                status = remote(
+                assert!(pending.error.is_none(), "{:?}", pending.error);
+                let pending = pending.status.unwrap();
+                if mode == "restart" {
+                    owner.shutdown().await?;
+                    owner = gateway(owner_home.clone()).await?;
+                }
+                let started = tokio::time::Instant::now();
+                let reply = remote(
                     &joining.state(),
                     owner.id(),
                     Some(owner.addr()),
                     NetworkRequest::Status {
-                        attempt_id,
-                        wait: None,
+                        attempt_id: attempt_id.clone(),
+                        wait: Some(StatusWait {
+                            after_revision: pending.attempt_revision,
+                        }),
                     },
                 )
-                .await
-                .status
-                .unwrap();
+                .await;
+                assert!(reply.error.is_none(), "{mode}: {:?}", reply.error);
+                let mut status = reply.status.unwrap();
+                if mode == "expiry" && status.state == State::Pending {
+                    // A bounded read may return its last authenticated snapshot.
+                    status = remote(
+                        &joining.state(),
+                        owner.id(),
+                        Some(owner.addr()),
+                        NetworkRequest::Status {
+                            attempt_id,
+                            wait: None,
+                        },
+                    )
+                    .await
+                    .status
+                    .unwrap();
+                }
+                match mode {
+                    "cap" => {
+                        assert_eq!(status, pending);
+                        assert!(started.elapsed() >= Duration::from_secs(30));
+                        assert!(started.elapsed() < Duration::from_secs(40));
+                    }
+                    "expiry" => {
+                        assert_eq!(status.state, State::Expired);
+                        assert!(status.attempt_revision > pending.attempt_revision);
+                    }
+                    _ => {
+                        assert_eq!(status.state, State::Rejected);
+                        assert_eq!(status.terminal_reason.as_deref(), Some("exchange_lost"));
+                        assert!(started.elapsed() < Duration::from_secs(3));
+                    }
+                }
             }
-            match mode {
-                "cap" => {
-                    assert_eq!(status, pending);
-                    assert!(started.elapsed() >= Duration::from_secs(30));
-                    assert!(started.elapsed() < Duration::from_secs(40));
-                }
-                "expiry" => {
-                    assert_eq!(status.state, State::Expired);
-                    assert!(status.attempt_revision > pending.attempt_revision);
-                }
-                _ => {
-                    assert_eq!(status.state, State::Rejected);
-                    assert_eq!(status.terminal_reason.as_deref(), Some("exchange_lost"));
-                    assert!(started.elapsed() < Duration::from_secs(3));
-                }
-            }
-        }
-        joining.shutdown().await?;
-        owner.shutdown().await?;
-        Ok(())
+            joining.shutdown().await?;
+            owner.shutdown().await?;
+            Ok(())
+        })
+        .await?
     }
     #[tokio::test]
     async fn disabled_pairing_and_oversized_frames_create_no_pending_record() -> Result<()> {

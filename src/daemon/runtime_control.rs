@@ -1615,91 +1615,95 @@ mod tests {
             NetworkRequest, RejectRequest, Request as PairRequest, State, StatusWait,
         };
         let _serial = SERIAL.lock().await;
-        let dir = tempfile::tempdir()?;
-        let node =
-            FabricNode::start_with_daemon_options(FabricHome::new(dir.path()), options()).await?;
-        let state = node.state();
-        let peer = iroh::SecretKey::from_bytes(&[86; 32]).public();
-        let confirmation = pending_confirmation(&state, action, peer, None).await?;
-        let request = NetworkRequest::Status {
-            attempt_id: confirmation.attempt_id.clone(),
-            wait: Some(StatusWait {
-                after_revision: confirmation.expected_attempt_revision - 1,
-            }),
-        };
-        let advanced =
-            tokio::time::timeout(Duration::from_secs(1), wait_status(&state, peer, &request))
-                .await??;
-        assert_eq!(advanced.status.unwrap().state, State::Pending);
-        let request = NetworkRequest::Status {
-            attempt_id: confirmation.attempt_id.clone(),
-            wait: Some(StatusWait {
-                after_revision: confirmation.expected_attempt_revision,
-            }),
-        };
-        let mut reads = state.pairing_wait_read.subscribe();
-        let waiting = wait_status(&state, peer, &request);
-        tokio::pin!(waiting);
-        tokio::select! {
-            result = &mut waiting => panic!("wait completed before transition: {result:?}"),
-            result = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    reads.changed().await.unwrap();
-                    if reads.borrow().as_ref() == Some(&confirmation.attempt_id) { break; }
-                }
-            }) => { result?; }
-        }
-        let transition = match action {
-            "confirm" => PairRequest::Confirm { confirmation },
-            "reject" => PairRequest::Reject {
-                rejection: RejectRequest {
-                    owner: confirmation.owner,
-                    attempt_id: confirmation.attempt_id,
-                    expected_node_id: peer,
-                    expected_attempt_revision: confirmation.expected_attempt_revision,
-                    request_id: "reject-wait".into(),
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir()?;
+            let node =
+                FabricNode::start_with_daemon_options(FabricHome::new(dir.path()), options())
+                    .await?;
+            let state = node.state();
+            let peer = iroh::SecretKey::from_bytes(&[86; 32]).public();
+            let confirmation = pending_confirmation(&state, action, peer, None).await?;
+            let request = NetworkRequest::Status {
+                attempt_id: confirmation.attempt_id.clone(),
+                wait: Some(StatusWait {
+                    after_revision: confirmation.expected_attempt_revision - 1,
+                }),
+            };
+            let advanced =
+                tokio::time::timeout(Duration::from_secs(1), wait_status(&state, peer, &request))
+                    .await??;
+            assert_eq!(advanced.status.unwrap().state, State::Pending);
+            let request = NetworkRequest::Status {
+                attempt_id: confirmation.attempt_id.clone(),
+                wait: Some(StatusWait {
+                    after_revision: confirmation.expected_attempt_revision,
+                }),
+            };
+            let mut reads = state.pairing_wait_read.subscribe();
+            let waiting = wait_status(&state, peer, &request);
+            tokio::pin!(waiting);
+            tokio::select! {
+                result = &mut waiting => panic!("wait completed before transition: {result:?}"),
+                result = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        reads.changed().await.unwrap();
+                        if reads.borrow().as_ref() == Some(&confirmation.attempt_id) { break; }
+                    }
+                }) => { result?; }
+            }
+            let transition = match action {
+                "confirm" => PairRequest::Confirm { confirmation },
+                "reject" => PairRequest::Reject {
+                    rejection: RejectRequest {
+                        owner: confirmation.owner,
+                        attempt_id: confirmation.attempt_id,
+                        expected_node_id: peer,
+                        expected_attempt_revision: confirmation.expected_attempt_revision,
+                        request_id: "reject-wait".into(),
+                    },
                 },
-            },
-            _ => PairRequest::Cancel {
-                owner: confirmation.owner,
-                creation_id: action.into(),
-            },
-        };
-        let committed = if action == "expiry" {
-            let request = request.clone();
-            state
-                .commit_pairing(move |runtime| {
-                    let timestamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)?
-                        .as_secs()
-                        + 601;
-                    runtime.advance_pairing_clock_for_test(timestamp);
-                    runtime.pairing_expire()?;
-                    runtime
-                        .pairing_network_read(peer, &request)?
-                        .context("expired status")
-                })
-                .await
-        } else {
-            state.pairing_request(transition).await
-        };
-        assert!(committed.error.is_none(), "{:?}", committed.error);
-        let terminal = committed.status.unwrap();
-        let observed = tokio::time::timeout(Duration::from_secs(1), &mut waiting).await??;
-        assert_eq!(observed.status.unwrap(), terminal);
-        // Terminal always returns, even if the client's revision is ahead.
-        let request = NetworkRequest::Status {
-            attempt_id: terminal.attempt_id,
-            wait: Some(StatusWait {
-                after_revision: u64::MAX,
-            }),
-        };
-        let observed =
-            tokio::time::timeout(Duration::from_secs(1), wait_status(&state, peer, &request))
-                .await??;
-        assert_eq!(observed.status.unwrap().state, terminal.state);
-        node.shutdown().await?;
-        Ok(())
+                _ => PairRequest::Cancel {
+                    owner: confirmation.owner,
+                    creation_id: action.into(),
+                },
+            };
+            let committed = if action == "expiry" {
+                let request = request.clone();
+                state
+                    .commit_pairing(move |runtime| {
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)?
+                            .as_secs()
+                            + 601;
+                        runtime.advance_pairing_clock_for_test(timestamp);
+                        runtime.pairing_expire()?;
+                        runtime
+                            .pairing_network_read(peer, &request)?
+                            .context("expired status")
+                    })
+                    .await
+            } else {
+                state.pairing_request(transition).await
+            };
+            assert!(committed.error.is_none(), "{:?}", committed.error);
+            let terminal = committed.status.unwrap();
+            let observed = tokio::time::timeout(Duration::from_secs(1), &mut waiting).await??;
+            assert_eq!(observed.status.unwrap(), terminal);
+            // Terminal always returns, even if the client's revision is ahead.
+            let request = NetworkRequest::Status {
+                attempt_id: terminal.attempt_id,
+                wait: Some(StatusWait {
+                    after_revision: u64::MAX,
+                }),
+            };
+            let observed =
+                tokio::time::timeout(Duration::from_secs(1), wait_status(&state, peer, &request))
+                    .await??;
+            assert_eq!(observed.status.unwrap().state, terminal.state);
+            node.shutdown().await?;
+            Ok(())
+        })
+        .await?
     }
 
     async fn wait_status(
@@ -1732,85 +1736,93 @@ mod tests {
     async fn status_wait_ahead_is_typed_and_terminal_is_normal() -> Result<()> {
         use runtime_peers::pairing::{NetworkRequest, StatusWait};
         let _serial = SERIAL.lock().await;
-        let dir = tempfile::tempdir()?;
-        let node =
-            FabricNode::start_with_daemon_options(FabricHome::new(dir.path()), options()).await?;
-        let state = node.state();
-        let peer = iroh::SecretKey::from_bytes(&[87; 32]).public();
-        let confirmation = pending_confirmation(&state, "ahead", peer, None).await?;
-        let request = NetworkRequest::Status {
-            attempt_id: confirmation.attempt_id,
-            wait: Some(StatusWait {
-                after_revision: u64::MAX,
-            }),
-        };
-        let reply =
-            tokio::time::timeout(Duration::from_secs(5), wait_status(&state, peer, &request))
-                .await??;
-        assert_eq!(reply.error.unwrap().code, "status-wait-revision-ahead");
-        assert_eq!(
-            reply.status.unwrap().attempt_revision,
-            confirmation.expected_attempt_revision
-        );
-        node.shutdown().await?;
-        Ok(())
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir()?;
+            let node =
+                FabricNode::start_with_daemon_options(FabricHome::new(dir.path()), options())
+                    .await?;
+            let state = node.state();
+            let peer = iroh::SecretKey::from_bytes(&[87; 32]).public();
+            let confirmation = pending_confirmation(&state, "ahead", peer, None).await?;
+            let request = NetworkRequest::Status {
+                attempt_id: confirmation.attempt_id,
+                wait: Some(StatusWait {
+                    after_revision: u64::MAX,
+                }),
+            };
+            let reply =
+                tokio::time::timeout(Duration::from_secs(5), wait_status(&state, peer, &request))
+                    .await??;
+            assert_eq!(reply.error.unwrap().code, "status-wait-revision-ahead");
+            assert_eq!(
+                reply.status.unwrap().attempt_revision,
+                confirmation.expected_attempt_revision
+            );
+            node.shutdown().await?;
+            Ok(())
+        })
+        .await?
     }
 
     #[tokio::test]
     async fn status_wait_mutex_stall_keeps_absolute_cap_and_worker_permit() -> Result<()> {
         use runtime_peers::pairing::{NetworkRequest, StatusWait};
         let _serial = SERIAL.lock().await;
-        let dir = tempfile::tempdir()?;
-        let node =
-            FabricNode::start_with_daemon_options(FabricHome::new(dir.path()), options()).await?;
-        let state = node.state();
-        let peer = iroh::SecretKey::from_bytes(&[88; 32]).public();
-        let confirmation = pending_confirmation(&state, "stalled", peer, None).await?;
-        let request = NetworkRequest::Status {
-            attempt_id: confirmation.attempt_id,
-            wait: Some(StatusWait {
-                after_revision: confirmation.expected_attempt_revision,
-            }),
-        };
-        let mut reads = state.pairing_wait_read.subscribe();
-        let waiting = wait_status(&state, peer, &request);
-        tokio::pin!(waiting);
-        tokio::select! {
-            result = &mut waiting => panic!("premature reply: {result:?}"),
-            result = reads.changed() => { result?; }
-        }
-        let runtime = state.runtime_peers.as_ref().unwrap();
-        let guard = runtime.lock().unwrap();
-        guard.pairing_changes.send_replace(());
-        tokio::time::pause();
-        queue_policy_writer(waiting.as_mut()).await;
-        tokio::time::advance(Duration::from_secs(30)).await;
-        let reply = waiting.await?;
-        assert_eq!(
-            reply.status.unwrap().attempt_revision,
-            confirmation.expected_attempt_revision
-        );
-        assert!(reply.error.is_none());
-        assert_eq!(
-            state.pairing_read_slots.available_permits(),
-            pairing::MAX_CONNECTIONS - 1
-        );
-        drop(guard);
-        tokio::time::resume();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while state.pairing_read_slots.available_permits() != pairing::MAX_CONNECTIONS {
-                tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir()?;
+            let node =
+                FabricNode::start_with_daemon_options(FabricHome::new(dir.path()), options())
+                    .await?;
+            let state = node.state();
+            let peer = iroh::SecretKey::from_bytes(&[88; 32]).public();
+            let confirmation = pending_confirmation(&state, "stalled", peer, None).await?;
+            let request = NetworkRequest::Status {
+                attempt_id: confirmation.attempt_id,
+                wait: Some(StatusWait {
+                    after_revision: confirmation.expected_attempt_revision,
+                }),
+            };
+            let mut reads = state.pairing_wait_read.subscribe();
+            let started = tokio::time::Instant::now();
+            let waiting = wait_status(&state, peer, &request);
+            tokio::pin!(waiting);
+            tokio::select! {
+                result = &mut waiting => panic!("premature reply: {result:?}"),
+                result = reads.changed() => { result?; }
             }
+            let runtime = state.runtime_peers.as_ref().unwrap();
+            let guard = runtime.lock().unwrap();
+            guard.pairing_changes.send_replace(());
+            queue_policy_writer(waiting.as_mut()).await;
+            let reply = tokio::time::timeout(Duration::from_secs(35), waiting).await??;
+            assert!(started.elapsed() >= Duration::from_secs(30));
+            assert_eq!(
+                reply.status.unwrap().attempt_revision,
+                confirmation.expected_attempt_revision
+            );
+            assert!(reply.error.is_none());
+            assert_eq!(
+                state.pairing_read_slots.available_permits(),
+                pairing::MAX_CONNECTIONS - 1
+            );
+            drop(guard);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while state.pairing_read_slots.available_permits() != pairing::MAX_CONNECTIONS {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            node.shutdown().await?;
+            Ok(())
         })
-        .await?;
-        node.shutdown().await?;
-        Ok(())
+        .await?
     }
 
     #[tokio::test]
     async fn status_wait_live_reconcile_preserves_subscription() -> Result<()> {
         use runtime_peers::pairing::{NetworkRequest, Request as PairRequest, State, StatusWait};
         let _serial = SERIAL.lock().await;
+        tokio::time::timeout(Duration::from_secs(60), async {
         let dir = tempfile::tempdir()?;
         let home = FabricHome::new(dir.path());
         let node = FabricNode::start_with_daemon_options(home.clone(), options()).await?;
@@ -1849,6 +1861,7 @@ mod tests {
         assert_eq!(reply.status.unwrap().state, State::Rejected);
         node.shutdown().await?;
         Ok(())
+        }).await?
     }
 
     #[tokio::test]

@@ -142,9 +142,11 @@ reissue with the returned revision to read projected expiry or keep waiting.
 This notification re-arm is not polling. Bind, confirm, reject, cancel, expiry,
 and recovery (`exchange_lost`) are observable; live reconciliation preserves
 subscriptions. Opaque exchange activity does not wake status. A pending wait is
-not an idle framing read. Waiting
-does not extend the permit deadline or grant access; the same bound-node checks
-and connection limits, including the 600-second connection lifetime, still apply.
+not an idle framing read. Its completed response has a separate ten-second write
+budget, including a last-known pending snapshot returned at permit expiry;
+the stream then finishes at expiry. Waiting does not extend the permit deadline
+or grant access; the same bound-node checks and connection limits, including
+the 600-second connection lifetime, still apply.
 
 There are at most 32 accepted pairing connections and one active connection per
 attempt. Unknown identities need global credit before parsing or runtime work:
